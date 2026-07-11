@@ -30,7 +30,7 @@ curl -fsSL https://biopb.org/install.sh | bash
 
 ## Deploy to data server
 ```bash
-docker run -d --rm \
+docker run -d --rm --init \
     --name biopb-tensor \
     -p 8813:8813 -p 8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
@@ -41,7 +41,9 @@ docker run -d --rm \
 The container runs the **control plane** as its single web origin: open
 `http://localhost:8813` for the data viewer (`:8813` → `/data_plane/viewer`). The
 Arrow Flight gRPC endpoint stays on `:8815` for SDK clients. The HTTP sidecar
-(`:8814`) is now internal to the container and is not published.
+(`:8814`) is now internal to the container and is not published. `--init` gives
+the container a reaping init as PID 1 — optional, since the control plane (PID 1)
+handles `docker stop` and reaps its own child, but it cleans up any stray orphans.
 
 See [deploy.md](deploy.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 

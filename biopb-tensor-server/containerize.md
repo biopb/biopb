@@ -4,9 +4,10 @@
 
 This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container includes:
 
-- **FastAPI HTTP Server** (port 8814) - Serves React webapp, API endpoints, and health checks
+- **Control plane** (port 8813) - The single public web origin: serves the data viewer (`/data_plane/viewer`), reverse-proxies the API + health checks, and forwards the access token to the private sidecar
 - **TensorFlightServer** (gRPC on port 8815) - Arrow Flight server for tensor data
-- **Webapp** - React-based image browser UI (served by FastAPI)
+- **HTTP sidecar** (port 8814, internal) - FastAPI server behind the control plane; bound to loopback and not published
+- **Webapp** - React-based image browser UI (served by the control plane under `/data_plane/viewer`)
 
 ## Build Instructions
 
@@ -65,7 +66,7 @@ docker build --memory=4g --memory-swap=8g -t biopb-tensor-server:latest -f biopb
 ## Docker Usage
 
 ```bash
-docker run -d \
+docker run -d --init \
     --name biopb-tensor \
     -p 8813:8813 \
     -p 8815:8815 \
@@ -74,14 +75,20 @@ docker run -d \
     biopb-tensor-server:latest
 ```
 
+> `--init` runs a small init as PID 1 to reap zombies. The container's PID 1 is
+> the control plane, which handles `docker stop` (SIGTERM) gracefully and reaps
+> its own tensor-server child; `--init` is optional belt-and-suspenders for any
+> unrelated orphaned grandchildren. Publish `8813` (the web origin) and `8815`
+> (Flight gRPC); the HTTP sidecar `8814` is loopback-internal — do not publish it.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored |
+| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored. Its `[server].port` **must equal gRPC=`BIOPB_BASE_PORT`+5** and `[server].host` must be loopback-reachable (`0.0.0.0`/`127.0.0.1`), or the control plane's liveness probe won't see the data plane as serving |
 | `DATA_DIR` | `/data` | Container path of microscopy files; mount the host dir onto it with `-v /host/data:/data` (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
-| `BIOPB_BASE_PORT` | `8810` | Base port in container - HTTP=BASE+4, gRPC=BASE+5 |
+| `BIOPB_BASE_PORT` | `8810` | Base port in container. Derived: **control web origin=BASE+3** (publish this), HTTP sidecar=BASE+4 (loopback-internal), gRPC Flight=BASE+5 (publish for SDK clients) |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written. **Not to be confused with**  `$TMPDIR` |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
@@ -116,13 +123,16 @@ docker run \
 ### Examples
 
 ```bash
-# Custom base port (HTTP=9004, gRPC=9005)
-docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
+# Custom base port (BIOPB_BASE_PORT=9000 -> web origin=9003, gRPC=9005;
+# the HTTP sidecar 9004 stays loopback-internal and is not published)
+docker run -d -p 9003:9003 -p 9005:9005 -v ~/data:/data \
     -e BIOPB_BASE_PORT=9000 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
-# With custom config file
+# With custom config file. Its [server].port must match gRPC=BASE+5 (8815 here)
+# and bind a loopback-reachable host (0.0.0.0 or 127.0.0.1); otherwise the control
+# plane's liveness probe never sees the data plane. See the CONFIG_FILE note below.
 docker run -d -p 8813:8813 -p 8815:8815 \
     -v ~/my-config.json:/custom.json \
     -v ~/data:/data \

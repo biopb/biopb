@@ -49,7 +49,13 @@ if [ "${BIOPB_BIND_LOCALHOST}" = "true" ] || [ "${BIOPB_BIND_LOCALHOST}" = "1" ]
     fi
 fi
 
-# Use existing config file if provided, otherwise generate from env vars
+# Use existing config file if provided, otherwise generate from env vars.
+# NOTE: a supplied CONFIG_FILE owns [server].host/port, and the control probes the
+# data plane's liveness at 127.0.0.1:$GRPC_PORT (BIOPB_BASE_PORT+5). Keep
+# [server].port == BASE+5 and [server].host reachable over loopback (0.0.0.0 or
+# 127.0.0.1); a config that binds Flight elsewhere leaves the control unable to
+# see the plane as "serving" (the sidecar HTTP port is overridden to $HTTP_PORT
+# regardless). The generated config below already satisfies this.
 if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     echo "Using config file: $CONFIG_FILE"
 else
@@ -124,6 +130,11 @@ fi
 # loopback subprocess (sidecar on 127.0.0.1:$HTTP_PORT, never exposed) and
 # reverse-proxies it under /data_plane (dataviewer at /data_plane/viewer). The
 # Flight gRPC port stays directly exposed for SDK clients.
+#
+# PID 1 note: run_control installs SIGTERM/SIGINT handlers so `docker stop` tears
+# down gracefully, and the supervisor reaps its own tensor-server child. But PID 1
+# does not reap *unrelated* orphaned grandchildren -- run the container with
+# `docker run --init` (or a tini shim) if you want a reaping init as PID 1.
 #   --control-host $BIND_ADDR : bind the public origin (0.0.0.0 -> reachable via -p)
 #   --grpc-host 127.0.0.1     : the liveness-probe CONNECT address; the server BINDs
 #                               server.host from the config (0.0.0.0 above), so
