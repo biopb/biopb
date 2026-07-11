@@ -401,8 +401,17 @@ background daemon is retired rather than reshaped**:
   per-session-log "single shared file" override). Their comments note the reduced
   role.
 
-The eventual control-registration + control-fronted observe link remain future work
-(Layers 2–3); `biopb mcp view` prints the direct `/mcp` URL in the meantime.
+**Decided 2026-07-11 — `biopb mcp view` does NOT register with the control.** L3
+shipped the session registry + control-fronted `/session/<id>/observe` + the
+dashboard's session list, so wiring `view` into them became *possible* — but it
+buys `view` nothing. `view` is a foreground, in-process, **agentless** session:
+with no agent driving it there is nothing to *observe* (the observe UI exists to
+watch/steer an agent's `execute_code` history), and being a foreground process the
+user Ctrl-C's directly there is no lifecycle to control remotely. So `view` stays
+fully standalone — it prints its direct `/mcp` URL and works whether or not the
+control is running; registration/observe/lifecycle-control remain **shim-only**
+(the agent path). This keeps `view` a self-contained convenience with no dependency
+on the control.
 
 ---
 

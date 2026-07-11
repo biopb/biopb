@@ -167,7 +167,7 @@ understanding in detail.
 ```
         AI agent (Claude)                              Scientist
               │  MCP tools + resources                      ▲
-              │  (streamable-http, 127.0.0.1:8765/mcp)      │ watches / prompts
+              │  (stdio shim → child's dynamic /mcp)        │ watches / prompts
               ▼                                             │
    ┌────────────────────────┐                               │
    │  MCP server process    │                               │
@@ -228,6 +228,18 @@ Key properties of the coupling:
   and saves it through napari. The agent orchestrates; the human stays in
   control of the canvas and of what becomes a durable artifact.
 
+- **The session is ephemeral and shim-owned; the planes are durable and
+  control-supervised.** Each MCP client's stdio shim spawns and owns *its own*
+  session child (kernel + viewer) on a dynamic port and reaps it when the client
+  disconnects; the child inherits the shim's live environment, so the viewer
+  always lands on the user's real display. The data/compute planes the session
+  uses are *not* part of it — a lean **control plane** supervises them as durable
+  subprocesses and is the single web origin, fronting the dataviewer and each
+  session's observe page (`/session/<id>/observe`) so N dynamic-port sessions need
+  no N bookmarks. The agentless `biopb mcp view` is the exception: a self-contained
+  foreground viewer that stays off the control entirely. See
+  `biopb-mcp/docs/mcp-dedaemonization-migration.md`.
+
 This coupling — *arbitrary agent code against a live, shared session* — is
 exactly why the kernel-isolation choices in §3 exist: the session must survive
 the agent doing something wrong, so the kernel is a separate, interruptible,
@@ -247,7 +259,12 @@ editing the code.
   arbitrary and may hang or crash; isolating it in a child kernel means a runaway
   execution can be interrupted (`SIGINT`) or hard-restarted (process-group
   `SIGKILL` + respawn) without killing the MCP server. A single `RLock`
-  serializes access to the one kernel.
+  serializes access to the one kernel. **That MCP server process is itself an
+  ephemeral, shim-owned child:** the client's stdio shim spawns it per connection
+  on a dynamic port (inheriting the shim's live environment — the #98 display fix)
+  and reaps it — plus the kernel grandchild — on disconnect, so the whole
+  session tree is client-scoped, not a shared daemon (see the de-daemonization /
+  control-plane migration doc).
 
 - **The kernel is bootstrapped via `IPKernelApp.exec_lines`.** A startup line
   injected at launch runs `biopb_mcp.mcp._bootstrap`, which enables Qt, opens
