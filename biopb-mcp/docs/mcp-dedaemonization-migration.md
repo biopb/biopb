@@ -343,13 +343,19 @@ machine boundary.)
 *Implemented:* the on-disk contract lives in a shared, **stdlib-only**
 `biopb._config_sessions` (core SDK — the shim writes it, the control reads it, and
 neither can import the other, exactly like `_config_control`). `register()` writes
-atomically (temp + `os.replace`); `unregister()` is tied to the shim's single reap
-path (`_shim._reap_session`, so even the SIGTERM/SIGHUP signal handler that
-`os._exit`s past `serve`'s `finally` still de-registers — no routing ghost);
-`list_sessions()` **self-heals** by pruning + unlinking any record whose owning
-pid is dead (fail-open on an undecidable pid, and cross-platform — `os.kill(pid, 0)`
-on POSIX, `OpenProcess`/`GetExitCodeProcess` on Windows, never signal-0 on Windows
-where it would kill the target). This is the backstop for gotchas 2/3 above.
+atomically (temp + `os.replace`) and records a **create-time identity token** for
+the child pid; `unregister()` is tied to the shim's single reap path
+(`_shim._reap_session`, so even the SIGTERM/SIGHUP signal handler that `os._exit`s
+past `serve`'s `finally` still de-registers — no routing ghost); `list_sessions()`
+/ `resolve()` **self-heal** by pruning + unlinking any record whose owning process
+is gone — the pid is dead, *or* alive but a different process on a recycled pid
+(create-time mismatch). That PID-reuse guard is the same one the daemon PID files
+use (biopb#138): without it a recycled pid would keep a ghost "alive" and could
+route `/session/<id>` traffic to an unrelated process. Liveness/identity is
+delegated to the shared, dependency-free `biopb._proc` (`is_process_running` +
+`process_create_time` — the latter handles the Windows signal-0 hazard and the
+macOS "no token → degrade to liveness-only" case), fail-open on an undecidable
+pid. This is the backstop for gotchas 2/3 above.
 
 **Why it is worth more than one bookmark:**
 - **Security win.** The observe UI currently fronts an `execute_code` RCE behind

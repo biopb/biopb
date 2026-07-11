@@ -33,6 +33,8 @@ class TestRegisterRead:
         assert rec["mcp_url"] == "http://x/mcp"
         assert rec["host"] == "127.0.0.1"
         assert isinstance(rec["started_at"], (int, float))
+        # An identity token for the pid is recorded (None where unavailable).
+        assert "create_time" in rec
 
     def test_extra_fields_are_stored(self):
         reg.register("s1", port=1, pid=_live_pid(), base_path="/session/s1/")
@@ -98,18 +100,47 @@ class TestListSessions:
         assert reg.list_sessions() == []
 
 
-class TestPidAlive:
-    def test_live_pid(self):
-        assert reg._pid_alive(os.getpid()) is True
+class TestRecordIsLive:
+    def test_live_pid_with_matching_token(self):
+        rec = {"pid": os.getpid(), "create_time": reg.process_create_time(os.getpid())}
+        assert reg._record_is_live(rec) is True
 
     def test_dead_pid(self):
-        assert reg._pid_alive(_dead_pid()) is False
+        assert reg._record_is_live({"pid": _dead_pid(), "create_time": None}) is False
 
     def test_nonsense_pid_fails_open(self):
-        assert reg._pid_alive(0) is True
-        assert reg._pid_alive(-1) is True
-        assert reg._pid_alive("abc") is True
-        assert reg._pid_alive(None) is True
+        for pid in (0, -1, "abc", None):
+            assert reg._record_is_live({"pid": pid}) is True
+
+    def test_missing_token_degrades_to_liveness(self):
+        # No recorded create_time (e.g. registered on a platform without one) ->
+        # liveness-only; a live pid is kept.
+        assert reg._record_is_live({"pid": os.getpid()}) is True
+
+    def test_pid_reuse_detected_via_create_time(self):
+        # An alive pid whose recorded identity token no longer matches is a
+        # recycled pid naming a different process -> treated as gone (biopb#138).
+        real = reg.process_create_time(os.getpid())
+        if real is None:
+            pytest.skip("platform has no create-time token (e.g. macOS)")
+        assert (
+            reg._record_is_live({"pid": os.getpid(), "create_time": real + 1}) is False
+        )
+        assert reg._record_is_live({"pid": os.getpid(), "create_time": real}) is True
+
+
+def test_resolve_prunes_a_pid_reused_ghost():
+    # End to end: a record for a live pid but a stale identity token must not
+    # resolve, and the ghost is unlinked -- so the control never routes a session
+    # to an unrelated process that inherited the recycled pid.
+    real = reg.process_create_time(os.getpid())
+    if real is None:
+        pytest.skip("platform has no create-time token (e.g. macOS)")
+    (reg.sessions_dir() / "ghost.json").write_text(
+        json.dumps({"session_id": "ghost", "pid": os.getpid(), "create_time": real + 1})
+    )
+    assert reg.resolve("ghost") is None
+    assert not (reg.sessions_dir() / "ghost.json").exists()
 
 
 def _dead_pid():

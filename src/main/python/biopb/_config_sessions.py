@@ -23,6 +23,15 @@ gone, so a shim killed hard enough to skip its reap (§6.1 gotcha 3) leaves no
 routing ghost. (HTTP self-registration would be the alternative only if the
 front and the sessions could later cross a machine boundary.)
 
+Liveness is an **identity** check, not a bare PID probe: a record stores the
+child's per-process create-time token (``biopb._proc.process_create_time``), and a
+reader treats the session as gone if the PID is dead *or* the PID is alive but now
+names a different process (create-time mismatch → the OS recycled the PID). This
+is the same PID-reuse guard as the daemon PID files (biopb#138); without it a
+recycled PID would keep a ghost "alive" and, worse, could route ``/session/<id>``
+traffic to an unrelated process. Delegated to ``biopb._proc`` (itself
+dependency-free) so the liveness/identity computation matches the CLI's exactly.
+
 Concurrency: writes are atomic (temp file + ``os.replace`` in the same dir), so a
 reader never observes a half-written record; a record unlinked between listing
 and reading is simply skipped. Records are owned by whoever wrote them; anyone
@@ -38,6 +47,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+from ._proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
 
@@ -82,17 +93,21 @@ def register(
 ) -> Path:
     """Publish a live session's routing record and return its path.
 
-    ``pid`` is the *child* (port-owning) process — the liveness signal
-    :func:`list_sessions` prunes on. ``port`` is the session child's http port on
-    ``host`` (loopback); the control proxies ``/session/<id>/*`` there. Written
-    atomically so a concurrent reader never sees a partial record. Any ``extra``
-    keys are stored verbatim (forward room for e.g. an observe base path).
+    ``pid`` is the *child* (port-owning) process — the liveness/identity signal
+    readers prune on. A ``create_time`` identity token for that pid is recorded
+    alongside it (``None`` where the platform can't produce one, e.g. macOS) so a
+    reader can tell the original child from an unrelated process that later
+    inherited a recycled PID (biopb#138). ``port`` is the session child's http
+    port on ``host`` (loopback); the control proxies ``/session/<id>/*`` there.
+    Written atomically so a concurrent reader never sees a partial record. Any
+    ``extra`` keys are stored verbatim (forward room for e.g. an observe base path).
     """
     record = {
         "session_id": session_id,
         "host": host,
         "port": int(port),
         "pid": int(pid),
+        "create_time": process_create_time(int(pid)),
         "mcp_url": mcp_url,
         "started_at": time.time(),
         **extra,
@@ -150,7 +165,7 @@ def resolve(session_id: str) -> Optional[dict]:
     rec = read_session(session_id)
     if rec is None:
         return None
-    if not _pid_alive(rec.get("pid")):
+    if not _record_is_live(rec):
         unregister(session_id)
         return None
     return rec
@@ -159,11 +174,12 @@ def resolve(session_id: str) -> Optional[dict]:
 def list_sessions(prune: bool = True) -> list[dict]:
     """All live session records, newest first (session id sorts by timestamp).
 
-    With ``prune`` (the default) a record whose owning ``pid`` is no longer alive
-    is dropped *and its file unlinked* — this is the registry's self-heal: a shim
-    that died without running its reap (§6.1 gotcha 3) leaves a ghost record that
-    the first reader cleans up, so the control never proxies to a dead port. A
-    record missing a pid, or one we cannot decide on, is kept (fail-open, so a
+    With ``prune`` (the default) a record whose owning process is gone — the pid
+    is dead, or alive but a different process on a recycled pid — is dropped *and
+    its file unlinked*. This is the registry's self-heal: a shim that died without
+    running its reap (§6.1 gotcha 3) leaves a ghost record that the first reader
+    cleans up, so the control never proxies to a dead (or reused) port. A record
+    with no usable pid, or one we cannot decide on, is kept (fail-open, so a
     transient probe error never hides a live session).
     """
     dir_ = sessions_dir()
@@ -180,7 +196,7 @@ def list_sessions(prune: bool = True) -> list[dict]:
             # Vanished mid-scan or corrupt; skip. A corrupt record is left in
             # place — unlinking on parse failure could race a concurrent write.
             continue
-        if prune and not _pid_alive(rec.get("pid")):
+        if prune and not _record_is_live(rec):
             try:
                 p.unlink()
             except OSError:
@@ -193,52 +209,28 @@ def list_sessions(prune: bool = True) -> list[dict]:
     return out
 
 
-def _pid_alive(pid) -> bool:
-    """Whether ``pid`` names a live process on this host.
+def _record_is_live(rec: dict) -> bool:
+    """Whether ``rec``'s owning process is still the session child we registered.
 
-    Fail-open: an unknown/malformed pid or an unexpected probe error returns
-    ``True`` so :func:`list_sessions` never drops a session it cannot disprove.
+    Liveness *and* identity (biopb#138), delegated to :mod:`biopb._proc` so the
+    computation matches the daemon PID files exactly:
+
+    - No usable pid -> ``True`` (fail-open: can't disprove, so never drop it).
+    - Dead pid -> ``False``.
+    - Alive pid but the recorded ``create_time`` token no longer matches the live
+      one -> ``False`` (the OS recycled the pid onto an unrelated process).
+    - Alive pid and either the token matches or one side is unavailable (e.g.
+      macOS has no cheap source) -> ``True`` (degrade to liveness-only, never a
+      false "dead").
     """
+    pid = rec.get("pid")
     if not isinstance(pid, int) or pid <= 0:
-        return True  # no usable pid -> can't disprove liveness, keep the record
-    if os.name == "nt":
-        return _pid_alive_windows(pid)
-    # NB: never signal 0 on Windows (CPython maps it to TerminateProcess — it
-    # would *kill* the process); the POSIX-only branch is guarded above.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return True  # unexpected; keep the record
-    return True
-
-
-def _pid_alive_windows(pid: int) -> bool:
-    """Windows liveness via OpenProcess + GetExitCodeProcess (stdlib ctypes).
-
-    Avoids ``os.kill(pid, 0)``, which on Windows terminates the target. Any
-    ctypes/OS hiccup falls open (returns ``True``) so a probe error never drops a
-    live session.
-    """
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False  # no such process (same-user localhost: not access-denied)
-        try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception:
         return True
+    if not is_process_running(pid):
+        return False
+    recorded = rec.get("create_time")
+    if recorded is not None:
+        live = process_create_time(pid)
+        if live is not None and live != recorded:
+            return False  # pid reused -> different process now
+    return True
