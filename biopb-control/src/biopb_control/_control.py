@@ -96,10 +96,13 @@ def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
     """A loopback-reachable base URL for a server that may bind a wildcard.
 
     A tensor server bound to ``0.0.0.0`` / ``::`` is reached over its loopback
-    address; anything else (an explicit host) is used as given. Mirrors the
+    address; anything else (an explicit host) is used as given. An IPv6 literal
+    is bracketed so the ``:port`` suffix stays unambiguous. Mirrors the
     supervisor's liveness-probe convention.
     """
     reachable = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
+    if ":" in reachable:  # IPv6 literal must be bracketed in a URL (e.g. [::1])
+        reachable = f"[{reachable}]"
     return f"{scheme}://{reachable}:{port}"
 
 
@@ -186,13 +189,20 @@ def build_app(
             resp = await proxy_client.send(upstream, stream=True)
         except httpx.ConnectError:
             return JSONResponse({"error": "data plane not reachable"}, status_code=502)
+        # HTTP headers are latin-1 on the wire (RFC 9110 / ASGI). A header value
+        # may carry a legitimate high byte (e.g. a non-ASCII Content-Disposition
+        # filename); decoding it as UTF-8 would raise and 500 the proxy. latin-1
+        # is total and round-trips -- Starlette re-encodes response headers as
+        # latin-1 too.
         resp_headers = [
-            (k, v) for k, v in resp.headers.raw if k.lower().decode() not in _HOP_BY_HOP
+            (k, v)
+            for k, v in resp.headers.raw
+            if k.decode("latin-1").lower() not in _HOP_BY_HOP
         ]
         return StreamingResponse(
             resp.aiter_raw(),
             status_code=resp.status_code,
-            headers={k.decode(): v.decode() for k, v in resp_headers},
+            headers={k.decode("latin-1"): v.decode("latin-1") for k, v in resp_headers},
             background=BackgroundTask(resp.aclose),
         )
 

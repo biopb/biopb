@@ -20,7 +20,7 @@ import pytest
 import websockets.sync.server
 from websockets.sync.client import connect as ws_connect
 
-from biopb_control._control import serve_control_api
+from biopb_control._control import _loopback_url, serve_control_api
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
 
 
@@ -51,6 +51,9 @@ class _EchoHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("X-From-Upstream", "yes")
+        # A latin-1 (non-ASCII) header value, e.g. a Content-Disposition filename.
+        # The proxy must decode it as latin-1; UTF-8 would raise on the 0xE9 byte.
+        self.send_header("Content-Disposition", 'attachment; filename="café.tiff"')
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -149,6 +152,24 @@ def test_dataviewer_static_is_proxied_with_prefix_stripped(control):
     assert json.loads(body)["path"] == "/assets/app.js"
     _status, _headers, root_body = _get(f"{control}/data_plane/viewer/")
     assert json.loads(root_body)["path"] == "/"  # index.html at the sidecar root
+
+
+def test_latin1_response_header_is_proxied_not_500(control):
+    # A non-ASCII (latin-1) upstream header must round-trip, not crash the proxy.
+    # UTF-8-decoding the 0xE9 byte in "café.tiff" would raise -> 500.
+    status, headers, _body = _get(f"{control}/data_plane/api/x")
+    assert status == 200
+    assert "café.tiff" in (headers.get("Content-Disposition") or "")
+
+
+def test_loopback_url_maps_wildcards_and_brackets_ipv6():
+    assert _loopback_url("0.0.0.0", 8814) == "http://127.0.0.1:8814"
+    assert _loopback_url("", 8814) == "http://127.0.0.1:8814"
+    assert _loopback_url("192.168.1.5", 8814) == "http://192.168.1.5:8814"
+    # IPv6 must be bracketed so the :port suffix is unambiguous.
+    assert _loopback_url("::", 8814) == "http://[::1]:8814"
+    assert _loopback_url("::1", 8814) == "http://[::1]:8814"
+    assert _loopback_url("fe80::1", 8814) == "http://[fe80::1]:8814"
 
 
 def test_post_body_is_proxied(control):
