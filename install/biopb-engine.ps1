@@ -696,14 +696,14 @@ function Start-ControlPlane {
     $ErrorActionPreference = 'Continue'
 
     # Retire a prior control plane (+ the data plane it owns) and any legacy
-    # standalone data server, so the new admin can bind a fresh plane it owns --
-    # it refuses an in-use gRPC port. Best-effort; no-ops on a clean machine.
+    # standalone data server, so the new control plane can bind a fresh plane it
+    # owns -- it refuses an in-use gRPC port. Best-effort; no-ops on a clean machine.
     try { & biopb control stop  *> $null } catch { }
     try { & biopb server stop *> $null } catch { }
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
-    # process makes the admin refuse, and the CLI prints the real cause.
+    # process makes the control plane refuse, and the CLI prints the real cause.
     $startOut = @()
     try { $startOut = @(& biopb control start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
     if ($LASTEXITCODE -ne 0) {
@@ -719,21 +719,23 @@ function Start-ControlPlane {
         return
     }
 
-    # `admin start` returns once its control API is listening but before the data
-    # plane finishes booting, so poll the admin until the plane reports serving.
+    # `control start` returns once its control API is listening but before the data
+    # plane finishes booting, so poll `control status` until the plane reports serving.
     # Progressive discovery (biopb/biopb#212) reaches SERVING as soon as the
     # server binds and scans in the background, so not-serving after 60s points to
-    # a real startup failure. `admin status --json` carries only the plane's state
-    # (the lean admin does no Flight query, so no source_count -- it climbs later).
-    $serving = $false; $conflict = $false
+    # a real startup failure. `control status --json` carries only the plane's state
+    # (the lean control plane does no Flight query, so no source_count -- it climbs later).
+    $serving = $false; $conflict = $false; $controlUp = $false
     for ($i = 0; $i -lt 60; $i++) {
         $out = ""
         try { $out = (& biopb control status --json 2>$null | Out-String) } catch { $out = "" }
         try {
-            $state = ($out | ConvertFrom-Json).data_plane.state
+            $status = $out | ConvertFrom-Json
+            $controlUp = [bool]$status.control_api
+            $state = $status.data_plane.state
             if ($state -eq "serving")  { $serving = $true;  break }
             if ($state -eq "conflict") { $conflict = $true; break }
-        } catch { }
+        } catch { $controlUp = $false }
         Start-Sleep -Seconds 1
     }
     $ErrorActionPreference = $prevEAP
@@ -741,13 +743,24 @@ function Start-ControlPlane {
     if ($serving) {
         Report-Ok "Control plane started - data plane serving; catalog + pre-cache building in the background"
     } elseif ($conflict) {
-        Report-Warn "Data-plane gRPC port is held by another process; the admin will not adopt it"
+        Report-Warn "Data-plane gRPC port is held by another process; the control plane will not adopt it"
         Report-Detail "stop that server, then: biopb control start"
-    } else {
+    } elseif ($controlUp) {
+        # Control plane up but its tensor server never reached serving: the fault
+        # is in the data plane, so surface the tensor-server log.
         Report-Warn "Data plane did not reach serving within 60s"
-        Report-Detail "it likely failed to start or is wedged:"
+        Report-Detail "the control plane is up but its tensor server failed to start or is wedged:"
         Show-LogTail -LogFile $serverLog
         Report-Detail "full log: $serverLog"
+        Report-Detail "recheck with: biopb control status"
+    } else {
+        # `control start` returned (its API was listening) but the control API is
+        # now unreachable: the control process itself crashed -- its log, not the
+        # tensor server's, has the cause.
+        Report-Warn "Control plane stopped responding within 60s"
+        Report-Detail "it started but its control API is now unreachable (the control process likely crashed):"
+        Show-LogTail -LogFile $controlLog
+        Report-Detail "full log: $controlLog"
         Report-Detail "recheck with: biopb control status"
     }
 }

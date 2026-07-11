@@ -715,9 +715,9 @@ _tail_log() {
 # Start the control plane (biopb control), which spawns and supervises the data
 # plane. Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
 # Starting now lets the pre-cache warm overviews before the user opens anything.
-# The admin owns the data plane exclusively, so we first retire any prior admin
-# AND any legacy standalone data server (`biopb server start`) so the freshly
-# installed admin can spawn and own a new plane -- it refuses an in-use gRPC port.
+# The control plane owns the data plane exclusively, so we first retire any prior
+# control plane AND any legacy standalone data server (`biopb server start`) so the
+# freshly installed one can spawn and own a new plane -- it refuses an in-use gRPC port.
 _start_control_plane() {
     local control_log="$HOME/.local/share/biopb/logs/control.log"
     local server_log="$HOME/.local/share/biopb/logs/tensor-server.log"
@@ -734,14 +734,14 @@ _start_control_plane() {
     fi
 
     # Retire a prior control plane (+ the data plane it owns) and any legacy
-    # standalone data server, so the new admin can bind a fresh plane it owns.
-    # Best-effort; both are no-ops on a clean machine.
+    # standalone data server, so the new control plane can bind a fresh plane it
+    # owns. Best-effort; both are no-ops on a clean machine.
     biopb control stop >/dev/null 2>&1 || true
     biopb server stop >/dev/null 2>&1 || true
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
-    # process makes the admin refuse, and the CLI prints the real cause.
+    # process makes the control plane refuse, and the CLI prints the real cause.
     local start_out
     if ! start_out=$(biopb control start 2>&1); then
         _warn "Control plane failed to start:"
@@ -758,13 +758,13 @@ _start_control_plane() {
         return 0
     fi
 
-    # `admin start` returns once its control API is listening but before the data
-    # plane finishes booting, so poll the admin until the plane reports serving.
+    # `control start` returns once its control API is listening but before the data
+    # plane finishes booting, so poll `control status` until the plane reports serving.
     # Progressive discovery (biopb/biopb#212) reaches SERVING as soon as the
     # server binds and scans in the background, so not-serving after 60s points to
     # a real startup failure (crash, port in use, wedged bind), not a slow scan.
-    # `admin status --json` carries only the plane's state (the lean admin does no
-    # Flight health query, so no source_count here -- it climbs in the background).
+    # `control status --json` carries only the plane's state (the lean control plane
+    # does no Flight health query, so no source_count here -- it climbs in the background).
     local out i=0
     while [ "$i" -lt 60 ]; do
         out=$(biopb control status --json 2>/dev/null || echo "")
@@ -773,17 +773,31 @@ _start_control_plane() {
             return 0
         fi
         if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"conflict"'; then
-            _warn "Data-plane gRPC port is held by another process; the admin will not adopt it"
+            _warn "Data-plane gRPC port is held by another process; the control plane will not adopt it"
             _info "  stop that server, then: ${CYAN}biopb control start${RESET}"
             return 0
         fi
         i=$((i + 1))
         sleep 1
     done
-    _warn "Data plane did not reach serving within 60s"
-    _info "  it likely failed to start or is wedged:"
-    _tail_log "$server_log"
-    _info "  full log: ${CYAN}$server_log${RESET}"
+    # Timed out. Attribute the failure to the right layer instead of always
+    # blaming the tensor server: `biopb control start` returned only once the
+    # control API was listening, but the control process can crash afterwards --
+    # and then `control status` is unreachable, never reports serving, and we'd
+    # time out here pointing at the wrong log. The last status seen tells us
+    # which: control_api:true means the control plane is up and the fault is in
+    # the tensor server it supervises; otherwise the control plane itself died.
+    if printf '%s' "$out" | grep -q '"control_api"[[:space:]]*:[[:space:]]*true'; then
+        _warn "Data plane did not reach serving within 60s"
+        _info "  the control plane is up but its tensor server failed to start or is wedged:"
+        _tail_log "$server_log"
+        _info "  full log: ${CYAN}$server_log${RESET}"
+    else
+        _warn "Control plane stopped responding within 60s"
+        _info "  it started but its control API is now unreachable (the control process likely crashed):"
+        _tail_log "$control_log"
+        _info "  full log: ${CYAN}$control_log${RESET}"
+    fi
     _info "  recheck with: ${CYAN}biopb control status${RESET}"
 }
 
