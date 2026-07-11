@@ -185,6 +185,46 @@ def test_data_plane_stop_is_a_control_verb(control):
     assert payload["data_plane"]["state"] == "stopped"
 
 
+def test_data_plane_restart_stops_then_ensures(tmp_path):
+    # /restart must stop() BEFORE ensure() (so a racing supervision tick sees
+    # want=False and backs off, rather than mistaking the down port for a
+    # conflict), then wait for the plane and return the snapshot. Spy the
+    # supervisor so the endpoint's orchestration is checked without spawning a
+    # real tensor server.
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_port=_free_port(),
+        web_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    sup = DataPlaneSupervisor(spec)
+    calls = []
+    sup.stop = lambda: calls.append("stop")
+    sup.ensure = lambda: calls.append("ensure")
+    sup.wait_until_up = lambda w: (calls.append("wait"), True)[1]
+    sup.snapshot = lambda: {"state": "serving", "restarts": 1, "last_error": None}
+
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1",
+        api_port,
+        sup,
+        ensure_timeout=8.0,
+        data_web_url="http://127.0.0.1:1",
+    )
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/api/data_plane/restart", method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read())
+        assert resp.status == 200
+        assert payload["data_plane"]["state"] == "serving"  # the returned snapshot
+        assert calls == ["stop", "ensure", "wait"]  # order matters
+    finally:
+        server.shutdown()
+
+
 def test_data_api_is_proxied_with_prefix_stripped_query_and_auth(control):
     status, headers, body = _get(
         f"{control}/data_plane/api/sources?limit=5",

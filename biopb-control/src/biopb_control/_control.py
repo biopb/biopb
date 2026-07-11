@@ -622,7 +622,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 const POLL = 3000;
 
 function el(id) { return document.getElementById(id); }
-function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+// Escape for BOTH text and attribute (href="...") contexts: the textContent
+// trick only covers &<>, not quotes, so an interpolated value in an attribute
+// could break out. Server-built values are trusted today (session ids are
+// <ts>-<pid>), but escape totally so a future registry field can't inject.
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
 async function jpost(url) {
   try {
