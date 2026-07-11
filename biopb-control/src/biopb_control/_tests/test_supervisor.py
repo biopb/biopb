@@ -241,6 +241,20 @@ def test_backoff_grows_then_resets_on_recovery(spec, monkeypatch):
 # --------------------------------------------------------------------------- #
 # control API
 # --------------------------------------------------------------------------- #
+def test_bounded_ensure_wait():
+    # The server's ensure wait must stay strictly below the client's HTTP timeout
+    # (by the margin), be capped by the server's own configured ensure_timeout,
+    # floored at the minimum, and fall back to the configured value with no hint.
+    from biopb_control._control import _RESPONSE_MARGIN, _bounded_ensure_wait
+
+    assert _bounded_ensure_wait(60, 60) == 60 - _RESPONSE_MARGIN  # below client's
+    assert _bounded_ensure_wait(60, 60) < 60
+    assert _bounded_ensure_wait(10, 60) == 10  # server's own cap wins
+    w = _bounded_ensure_wait(60, 3)  # tiny client timeout -> floor, still < client
+    assert w == 1.0 and w < 3
+    assert _bounded_ensure_wait(30, 0) == 30  # no hint -> configured value
+
+
 def test_control_api_health_and_ensure(spec, monkeypatch):
     import json
     import urllib.request

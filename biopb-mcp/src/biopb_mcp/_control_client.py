@@ -39,14 +39,22 @@ def control_reachable(timeout: float = 1.0) -> bool:
 def ensure_data_plane(timeout: float = 60.0) -> dict | None:
     """Ask the control to ensure the data plane is up; return its snapshot.
 
-    POSTs ``/data_plane/ensure`` — idempotent on the control side (spawn or adopt,
-    then wait until listening). Returns the ``data_plane`` snapshot dict on
-    success, or ``None`` if the control is unreachable (not running) or errored, so
-    the caller can fall back to surfacing "start the control" rather than raising.
+    POSTs ``/data_plane/ensure`` — idempotent on the control side (spawn the plane
+    it owns, then wait until listening). Returns the ``data_plane`` snapshot dict
+    on success, or ``None`` if the control is unreachable (not running) or errored,
+    so the caller can fall back to surfacing "start the control" rather than
+    raising.
+
+    ``timeout`` is BOTH our HTTP timeout and the hint we pass the server as
+    ``?client_timeout``: the server caps its own ensure wait below this so it
+    always returns a verdict before our ``urlopen`` times out — otherwise a
+    slow-but-working control plane would look unreachable and we'd wrongly report
+    "no control plane".
     """
-    req = urllib.request.Request(
-        f"{_base_url()}/data_plane/ensure", data=b"", method="POST"
-    )
+    from urllib.parse import urlencode
+
+    url = f"{_base_url()}/data_plane/ensure?{urlencode({'client_timeout': timeout})}"
+    req = urllib.request.Request(url, data=b"", method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())

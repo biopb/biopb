@@ -20,10 +20,31 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from ._supervisor import DataPlaneSupervisor
 
 logger = logging.getLogger(__name__)
+
+# Headroom (seconds) between the server's ensure wait and the client's HTTP
+# timeout: the server must send its verdict BEFORE the client's urlopen times
+# out, else the client treats a working-but-slow control plane as unreachable.
+_RESPONSE_MARGIN = 5.0
+_MIN_ENSURE_WAIT = 1.0
+
+
+def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
+    """How long ``/data_plane/ensure`` should wait for the plane to come up.
+
+    Bounded strictly below the client's HTTP timeout (by ``_RESPONSE_MARGIN``) so
+    the server always answers first; also capped by the server's own configured
+    ``ensure_timeout``, and floored at ``_MIN_ENSURE_WAIT``. A missing/invalid
+    client hint (``<= 0``) falls back to the configured ``ensure_timeout`` (the
+    client then relies on its own urlopen timeout being generous).
+    """
+    if client_timeout <= 0:
+        return ensure_timeout
+    return max(_MIN_ENSURE_WAIT, min(ensure_timeout, client_timeout - _RESPONSE_MARGIN))
 
 
 class _ControlHTTPServer(ThreadingHTTPServer):
@@ -68,16 +89,30 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self._write_json(404, {"error": "not found", "path": self.path})
 
     def do_POST(self):  # noqa: N802 - stdlib hook name
-        if self.path == "/data_plane/ensure":
+        parsed = urlparse(self.path)
+        if parsed.path == "/data_plane/ensure":
             self._drain_body()
             sup = self._supervisor
+            # The client passes ?client_timeout=<its HTTP timeout>; cap our wait
+            # below it so we return a verdict before the client gives up (and
+            # wrongly treats a slow-but-working control plane as unreachable).
+            try:
+                client_timeout = float(
+                    parse_qs(parsed.query).get("client_timeout", ["0"])[0]
+                )
+            except ValueError:
+                client_timeout = 0.0
+            wait = _bounded_ensure_wait(
+                self.server.ensure_timeout,  # type: ignore[attr-defined]
+                client_timeout,
+            )
             # ensure()/_spawn_locked count a spawn failure toward the backoff and
             # do not raise, but wrap defensively so any unexpected error still
             # returns a clean JSON verdict (with the snapshot that reflects the
             # counted failure) rather than an unhandled 500.
             try:
                 sup.ensure()
-                sup.wait_until_up(self.server.ensure_timeout)  # type: ignore[attr-defined]
+                sup.wait_until_up(wait)
                 self._write_json(200, {"data_plane": sup.snapshot()})
             except Exception as exc:  # noqa: BLE001 - report, never crash the handler
                 logger.exception("data_plane/ensure failed")
