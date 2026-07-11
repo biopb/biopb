@@ -71,7 +71,9 @@ _add_optional_typer("image", "biopb.image.cli", "ProcessImage client operations"
 # Tensor server daemon management
 server_app = typer.Typer(
     name="server",
-    help="Biopb server daemon management (start/stop/restart/status)",
+    help="Biopb tensor-server diagnostics. The standalone-daemon commands "
+    "(start/stop/restart/status/logs) are deprecated -- the control plane "
+    "(`biopb control`) now owns the data plane; cache-stats/migrate-config remain.",
 )
 app.add_typer(server_app, name="server")
 
@@ -106,19 +108,28 @@ MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
 
+# biopb-control (control plane) management. The control plane is a separate, lean package
+# (`biopb-control`) started as `python -m biopb_control run` by `biopb control start`;
+# the lifecycle plumbing (pidfile / detach / stop-sentinel) lives here, reused
+# from the tensor-server / mcp daemons, so the package itself stays a pure
+# supervisor. It supervises the tensor server, which keeps writing the canonical
+# tensor-server.log (LOG_DIR), so `biopb server logs` still shows the data plane;
+# the control plane's own supervision/control-API log is control.log.
+CONTROL_PID_FILE = Path.home() / ".local" / "share" / "biopb" / "control.pid"
+
 
 # The installer records the release-v* deployment version it pulled the wheels
 # from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
 # auto-updater's baseline. This is the *deployment* version and is distinct from
 # any single package's version: one release bundles the mutually-paired
-# biopb / biopb-tensor-server / biopb-mcp triple. Kept in sync with
+# biopb / biopb-tensor-server / biopb-mcp / biopb-control set. Kept in sync with
 # CONFIG_DIR/release.version in install/install.sh.
 _RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
 
-# The three wheels the installer bundles in one release-v* deployment (see
+# The wheels the installer bundles in one release-v* deployment (see
 # install/install.sh). `biopb version` reports each separately so a version skew
 # within the installed set is visible; any may be absent, hence "not installed".
-_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp")
+_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp", "biopb-control")
 
 
 def _read_release_version() -> str:
@@ -563,6 +574,28 @@ def _detach_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _warn_server_daemon_deprecated() -> None:
+    """Print the standalone-tensor-server deprecation notice (to stderr).
+
+    Since Layer 2 of the de-daemonization migration
+    (biopb-mcp/docs/mcp-dedaemonization-migration.md), the data plane is owned
+    and supervised by the control plane: ``biopb control start`` brings it up and
+    owns its lifecycle (restart-on-crash, complete teardown on stop), so the
+    standalone ``biopb server`` daemon is superseded. ``start``/``stop``/
+    ``restart``/``status``/``logs`` still work but will be removed in a future
+    release. Goes to stderr so it never corrupts ``status --json`` stdout.
+    (``cache-stats`` and ``migrate-config`` are diagnostics/utilities, not daemon
+    management, and are not deprecated.)
+    """
+    err_console.print(
+        "[yellow]Deprecated:[/yellow] the standalone biopb tensor-server daemon "
+        "is superseded by the control plane. Use [bold]biopb control start[/bold] "
+        "(it owns and supervises the data plane) and [bold]biopb control "
+        "status[/bold]. These commands still work but will be removed in a future "
+        "release."
+    )
+
+
 @server_app.command("start")
 def start(
     config: Path = typer.Option(
@@ -598,7 +631,8 @@ def start(
         help="Access token (auto-generated if not provided)",
     ),
 ):
-    """Start TensorFlight server as a background daemon."""
+    """(Deprecated) Start TensorFlight server as a background daemon."""
+    _warn_server_daemon_deprecated()
     _ensure_dirs()
 
     # Check if already running (identity-checked, so a reused stale PID does not
@@ -749,7 +783,8 @@ def stop(
         help="Seconds to wait for graceful shutdown",
     ),
 ):
-    """Stop TensorFlight server daemon."""
+    """(Deprecated) Stop TensorFlight server daemon."""
+    _warn_server_daemon_deprecated()
     pid, token = _read_pid_record(PID_FILE)
 
     if not pid:
@@ -815,7 +850,8 @@ def restart(
         help="Seconds to wait for graceful shutdown",
     ),
 ):
-    """Restart TensorFlight server daemon."""
+    """(Deprecated) Restart TensorFlight server daemon."""
+    _warn_server_daemon_deprecated()
     # Stop first. Use id_token (the PID-record identity token) so we don't clobber
     # the `token` access-token parameter, which must be passed through to start().
     pid, id_token = _read_pid_record(PID_FILE)
@@ -1013,7 +1049,8 @@ def status(
         help="Seconds to poll for the server to reach SERVING (0 = check once)",
     ),
 ):
-    """Check TensorFlight server daemon status and live health."""
+    """(Deprecated) Check TensorFlight server daemon status and live health."""
+    _warn_server_daemon_deprecated()
     pid, id_token = _read_pid_record(PID_FILE)
     running = _is_our_daemon(pid, id_token)
     stale = bool(pid and not running)
@@ -1098,7 +1135,8 @@ def logs(
     ),
     path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
 ):
-    """Show the TensorFlight server daemon log."""
+    """(Deprecated) Show the TensorFlight server daemon log."""
+    _warn_server_daemon_deprecated()
     log_file = _get_log_file()
     if path:
         print(log_file)
@@ -1757,6 +1795,447 @@ def mcp_view(
 
 
 app.add_typer(mcp_app, name="mcp")
+
+
+# ---------------------------------------------------------------------------
+# biopb control: the control plane (supervises the durable planes)
+# ---------------------------------------------------------------------------
+# `biopb control` manages the lean control-plane process (the `biopb-control`
+# package). Layer 2 of the de-daemonization migration
+# (biopb-mcp/docs/mcp-dedaemonization-migration.md): the control plane becomes the
+# durable root that supervises the tensor server, so `_connection` no longer
+# shells out `biopb server start` -- it asks the control plane to ensure the data plane.
+control_app = typer.Typer(
+    name="control",
+    help="Biopb control plane: supervise the data plane (start/stop/status/run)",
+)
+
+
+def _require_biopb_control() -> None:
+    """Exit(1) with an install hint if the biopb-control package is absent.
+
+    Checks the import *spec* (not a real import), matching _require_biopb_mcp, so
+    gating a command never imports the package.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("biopb_control") is None:
+        console.print(
+            "[red]The 'control' commands require the biopb-control package, which "
+            "is not installed.[/red]\n"
+            r"[yellow]Install it with: pip install biopb-control[/yellow]"
+        )
+        raise typer.Exit(1)
+
+
+def _control_endpoint() -> Tuple[str, int]:
+    """The control-API (host, port) from the shared core-SDK location."""
+    from ._config_control import control_host, control_port
+
+    return control_host(), control_port()
+
+
+def _control_log_file() -> Path:
+    """The control plane's own supervision / control-API log (distinct from the data
+    plane's tensor-server.log, which the supervised server keeps writing)."""
+    return LOG_DIR / "control.log"
+
+
+def _write_control_pid(pid: int) -> None:
+    _ensure_dirs()
+    _write_pid_file(CONTROL_PID_FILE, pid, _process_create_time(pid))
+
+
+def _remove_control_pid() -> None:
+    _remove_pid_file(CONTROL_PID_FILE)
+
+
+def _control_shutdown_sentinel() -> Path:
+    """The control plane's Windows stop-sentinel path (watched by biopb_control._run).
+    A single fixed name under the biopb data dir, like the other daemons'."""
+    return CONTROL_PID_FILE.parent / "control.stop"
+
+
+def _resolve_dataplane_token(
+    config: Path, web_host: str, token: Optional[str]
+) -> Tuple[Optional[str], bool]:
+    """Resolve the tensor server's token / local-only-bypass, as `server start`
+    does, so the control-supervised server applies the identical policy.
+
+    Returns ``(token, local_bypass)``: a token to enforce (from --token,
+    BIOPB_TENSOR_TOKEN, or freshly generated + printed for a non-local bind), or
+    ``local_bypass=True`` when the all-localhost no-token case skips enforcement.
+    """
+    _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
+    if not token:
+        token = os.environ.get("BIOPB_TENSOR_TOKEN")
+
+    grpc_host = "0.0.0.0"  # safe default: assume public if config unreadable
+    if config.exists():
+        try:
+            from biopb_tensor_server.core.config import (
+                load_config as _load_server_config,
+            )
+
+            grpc_host = _load_server_config(config).host
+        except Exception:
+            pass
+
+    local_only = (
+        not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    )
+    if not token and not local_only:
+        import secrets as _secrets
+
+        token = _secrets.token_urlsafe(32)
+        console.print(f"[bold green]Generated access token:[/bold green] {token}")
+    return token, local_only
+
+
+def _query_control_health(host: str, port: int, timeout: float = 2.0) -> Optional[dict]:
+    """GET the control API's /health, or None if unreachable."""
+    import json as _json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/health", timeout=timeout
+        ) as resp:
+            return _json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _control_run_argv(
+    *,
+    config: Path,
+    static_dir: Optional[Path],
+    web_host: str,
+    web_port: int,
+    log_level: str,
+    data_plane: bool,
+    token: Optional[str],
+    local_bypass: bool,
+) -> List[str]:
+    """Build the `python -m biopb_control run ...` argv `control start` spawns.
+
+    The core CLI resolves everything (grpc endpoint, token policy, endpoint,
+    log paths) and passes it explicitly, so biopb_control imports no server config
+    (invariant I2). The supervised tensor server logs to tensor-server.log; the
+    control plane's own output is redirected by the caller to control.log.
+    """
+    grpc_host, grpc_port = _resolve_grpc_hostport(config)
+    control_host, control_port = _control_endpoint()
+    argv = [
+        sys.executable,
+        "-m",
+        "biopb_control",
+        "run",
+        "--config",
+        str(config),
+        "--grpc-host",
+        grpc_host,
+        "--grpc-port",
+        str(grpc_port),
+        "--web-host",
+        web_host,
+        "--web-port",
+        str(web_port),
+        "--log-level",
+        str(log_level),
+        "--server-log",
+        str(_get_log_file()),
+        "--control-host",
+        control_host,
+        "--control-port",
+        str(control_port),
+        "--win-sentinel",
+        str(_control_shutdown_sentinel()),
+    ]
+    if static_dir and static_dir.exists():
+        argv += ["--static-dir", str(static_dir)]
+    if not data_plane:
+        argv.append("--no-data-plane")
+    if token:
+        argv += ["--token", token]
+    elif local_bypass:
+        argv.append("--local-bypass")
+    return argv
+
+
+@control_app.command("start")
+def control_start(
+    config: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+    ),
+    static_dir: Optional[Path] = typer.Option(
+        DEFAULT_WEBAPP, "--static-dir", help="Tensor-server static webapp directory"
+    ),
+    web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
+    web_host: str = typer.Option(
+        "127.0.0.1", "--web-host", help="Tensor-server HTTP bind address"
+    ),
+    log_level: str = typer.Option(
+        "INFO", "--log-level", "-l", help="Control log level"
+    ),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="Tensor-server access token (auto for non-local binds)"
+    ),
+    data_plane: bool = typer.Option(
+        True,
+        "--data-plane/--no-data-plane",
+        help="Bring the data plane up on start (default). With --no-data-plane "
+        "the control plane starts without it; a client brings it up on demand via the "
+        "control API.",
+    ),
+):
+    """Start the biopb control plane as a background daemon.
+
+    The control plane supervises the tensor (data) plane -- and by default brings it up
+    on start, so `biopb control start` is the single command that stands up a local
+    deployment. It is the *sole owner* of the plane: it always spawns and manages
+    its own tensor server, restarts it on crash, and answers clients that ask it
+    to ensure the plane is up. It does not adopt a server it did not start -- if
+    the gRPC port is already in use, `control start` refuses (stop the stray server
+    first), so `biopb control stop` is always a complete data-plane teardown.
+    """
+    _require_biopb_control()
+    _ensure_dirs()
+
+    existing_pid, existing_token = _read_pid_record(CONTROL_PID_FILE)
+    if _is_our_daemon(existing_pid, existing_token):
+        console.print(
+            f"[yellow]biopb control already running (PID {existing_pid})[/yellow]"
+        )
+        raise typer.Exit(0)
+    if existing_pid:
+        console.print(
+            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
+        )
+        _remove_control_pid()
+
+    control_host, control_port = _control_endpoint()
+    if _port_listening(control_host, control_port):
+        console.print(
+            f"[red]Control-plane port {control_host}:{control_port} is already in use.[/red]"
+        )
+        console.print(
+            "It is held by a process biopb is not tracking (an orphaned control plane, or "
+            "another login session), so [bold]biopb control stop[/bold] cannot reach "
+            "it. Identify and stop the owner, then retry."
+        )
+        raise typer.Exit(1)
+
+    # The control plane owns the data plane exclusively, so refuse to start into a gRPC
+    # port a stray server already holds -- otherwise the supervised child would
+    # crash-loop on EADDRINUSE. Mirrors `biopb server start`'s port guard. Skipped
+    # for --no-data-plane (the plane comes up on demand, guarded there too).
+    if data_plane:
+        grpc_host, grpc_port = _resolve_grpc_hostport(config)
+        if _port_listening(grpc_host, grpc_port):
+            console.print(
+                f"[red]Data-plane gRPC port {grpc_host}:{grpc_port} is already "
+                "in use.[/red]"
+            )
+            console.print(
+                "The control plane owns the data plane exclusively and will not adopt a "
+                "server it did not start. Stop the process holding that port "
+                f"(`lsof -i :{grpc_port}` / `netstat -ano | findstr {grpc_port}`), "
+                "then retry -- or start with [bold]--no-data-plane[/bold]."
+            )
+            raise typer.Exit(1)
+
+    resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
+    argv = _control_run_argv(
+        config=config,
+        static_dir=static_dir,
+        web_host=web_host,
+        web_port=web_port,
+        log_level=log_level,
+        data_plane=data_plane,
+        token=resolved_token,
+        local_bypass=local_bypass,
+    )
+
+    log_file = _control_log_file()
+    _rotate_log(log_file)
+    console.print("[green]Starting biopb control plane...[/green]")
+    console.print(f"  Config: {config}")
+    env = os.environ.copy()
+    if resolved_token:
+        env["BIOPB_TENSOR_TOKEN"] = resolved_token
+    with open(log_file, "a") as log:
+        log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        process = subprocess.Popen(
+            argv, stdout=log, stderr=log, env=env, **_detach_kwargs()
+        )
+
+    _write_control_pid(process.pid)
+
+    if not _await_listening(process.pid, control_host, control_port, 15.0):
+        if _is_process_running(process.pid):
+            console.print(
+                f"[red]Control plane started but its control API is not listening on "
+                f"{control_host}:{control_port} after 15s.[/red]"
+            )
+            console.print(f"Check the log: {log_file}")
+        else:
+            console.print("[red]Failed to start biopb control plane[/red]")
+            _remove_control_pid()
+            console.print(f"Check the log: {log_file}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]biopb control plane started (PID {process.pid})[/green]")
+    console.print(f"  Control: http://{control_host}:{control_port}")
+    if data_plane:
+        console.print("  Data plane: starting (see 'biopb control status')")
+    else:
+        console.print("  Data plane: not started (--no-data-plane; on-demand)")
+    console.print(f"  Logs: {log_file}")
+
+
+@control_app.command("stop")
+def control_stop(
+    timeout: int = typer.Option(
+        10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
+    ),
+):
+    """Stop the biopb control plane and the data plane it owns.
+
+    The control plane owns the data plane exclusively, so stopping it is a complete
+    teardown: the supervised tensor server is shut down too. This is the single
+    command an installer/upgrade uses to free the control-managed processes before
+    replacing files. (Legacy standalone daemons started with `biopb server start`
+    / `biopb mcp start` are stopped by their own `stop` commands.)
+    """
+    _require_biopb_control()
+    pid, token = _read_pid_record(CONTROL_PID_FILE)
+    if not pid:
+        console.print("[yellow]No biopb control plane running[/yellow]")
+        raise typer.Exit(0)
+    if not _is_our_daemon(pid, token):
+        console.print(
+            f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
+        )
+        _remove_control_pid()
+        raise typer.Exit(0)
+
+    console.print(f"[green]Stopping biopb control plane (PID {pid})...[/green]")
+    if _stop_daemon(
+        pid,
+        timeout,
+        token,
+        sentinel=_control_shutdown_sentinel(),
+        remove_pid=_remove_control_pid,
+    ):
+        console.print("[green]biopb control plane stopped[/green]")
+    else:
+        console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
+    raise typer.Exit(0)
+
+
+@control_app.command("status")
+def control_status(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show the control plane's status and the data plane it supervises."""
+    _require_biopb_control()
+    pid, token = _read_pid_record(CONTROL_PID_FILE)
+    running = _is_our_daemon(pid, token)
+    stale = bool(pid and not running)
+
+    control_host, control_port = _control_endpoint()
+    health = _query_control_health(control_host, control_port) if running else None
+    data_plane = (health or {}).get("data_plane") or {}
+    dp_state = data_plane.get("state", "unknown")
+
+    _emit_daemon_status(
+        title="biopb Control Plane Status",
+        pid=pid,
+        running=running,
+        stale=stale,
+        pid_file=CONTROL_PID_FILE,
+        log_file=_control_log_file(),
+        json_output=json_output,
+        json_fields={
+            "control_url": f"http://{control_host}:{control_port}" if running else None,
+            "control_api": bool(health) if running else False,
+            "data_plane": (data_plane or None) if running else None,
+        },
+        table_rows=[
+            ("Control", f"http://{control_host}:{control_port}"),
+            ("Control API", "responding" if health else "not responding"),
+            ("Data plane", dp_state),
+            ("Data plane URL", data_plane.get("grpc_url", "-")),
+            ("Restarts", str(data_plane.get("restarts", 0))),
+        ],
+    )
+
+
+@control_app.command("run")
+def control_run(
+    config: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+    ),
+    static_dir: Optional[Path] = typer.Option(
+        DEFAULT_WEBAPP, "--static-dir", help="Tensor-server static webapp directory"
+    ),
+    web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
+    web_host: str = typer.Option(
+        "127.0.0.1", "--web-host", help="Tensor-server HTTP bind address"
+    ),
+    log_level: str = typer.Option(
+        "INFO", "--log-level", "-l", help="Control log level"
+    ),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="Tensor-server access token (auto for non-local binds)"
+    ),
+    data_plane: bool = typer.Option(
+        True,
+        "--data-plane/--no-data-plane",
+        help="Bring the data plane up (default), or start without it (on-demand).",
+    ),
+):
+    """Run the control plane in the foreground (Ctrl-C to stop).
+
+    The foreground counterpart of `biopb control start`: no PID file, blocks this
+    terminal, tears everything down on Ctrl-C. Useful for a systemd/launchd unit
+    (let the service manager own the process) or for debugging supervision.
+    """
+    _require_biopb_control()
+    _ensure_dirs()
+    from biopb_control import run_control
+    from biopb_control._supervisor import DataPlaneSpec
+
+    grpc_host, grpc_port = _resolve_grpc_hostport(config)
+    control_host, control_port = _control_endpoint()
+    resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
+    spec = DataPlaneSpec(
+        config=config,
+        grpc_host=grpc_host,
+        grpc_port=grpc_port,
+        web_host=web_host,
+        web_port=web_port,
+        static_dir=static_dir if (static_dir and static_dir.exists()) else None,
+        log_level=log_level,
+        server_log=_get_log_file(),
+        token=resolved_token,
+        local_bypass=local_bypass,
+    )
+    code = run_control(
+        spec,
+        control_host=control_host,
+        control_port=control_port,
+        data_plane=data_plane,
+        win_sentinel=_control_shutdown_sentinel(),
+        log_level=log_level,
+    )
+    raise typer.Exit(code)
+
+
+app.add_typer(control_app, name="control")
 
 
 # ---------------------------------------------------------------------------

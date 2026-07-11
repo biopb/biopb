@@ -21,19 +21,16 @@ thread at a time.
 
 import logging
 import os
-import shutil
-import subprocess
 import threading
 import time
-from pathlib import Path
 from typing import Dict, Tuple
 from urllib.parse import urlparse
 
-from biopb._config_location import find_config
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
 from ._config import CONFIG, get_setting
+from ._control_client import ensure_data_plane
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +38,8 @@ logger = logging.getLogger(__name__)
 SERVER_QUERY_THRESHOLD = 1000
 
 
-# Default location of the biopb server's config (matches the `biopb server
-# start` CLI default). Prefers JSON over legacy TOML and warns when both exist;
-# resolution is shared with the tensor server and the umbrella CLI via the core
-# `biopb` package (biopb/biopb#34).
-DEFAULT_SERVER_CONFIG = find_config()
-
-# Hosts considered "local" — auto-starting a server only makes sense for these.
+# Hosts considered "local" — asking the control to bring up the data plane only
+# makes sense for a server on this machine (a remote one is not ours to start).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -85,11 +77,6 @@ def _starting_message(health) -> str:
         if bits:
             msg += " (" + ", ".join(bits) + ")"
     return msg
-
-
-def biopb_cli_available() -> bool:
-    """Return True if the ``biopb`` command-line tool is on PATH."""
-    return shutil.which("biopb") is not None
 
 
 def is_local_url(url: str) -> bool:
@@ -591,15 +578,6 @@ class TensorConnection:
                 return 0
         return 0
 
-    def can_autostart_server(self) -> bool:
-        """Whether a local biopb server could be auto-started for this URL.
-
-        True only when the configured URL is local *and* the ``biopb`` CLI is
-        installed. Used as a last-resort fallback when the initial connect
-        fails — see :meth:`start_local_server`.
-        """
-        return is_local_url(self.url) and biopb_cli_available()
-
     def connect_when_booted(
         self,
         url: str,
@@ -644,8 +622,16 @@ class TensorConnection:
 
         The single connect policy shared by **both** faces: try the resolved
         ``(url, token)``, wait the server through a ``STARTING`` data-folder
-        scan, and — with no prompt — auto-start a local biopb server as a last
-        resort when the URL is local and the ``biopb`` CLI is on PATH.
+        scan, and — when the URL is local and unreachable — ask the biopb
+        **control** (control plane) to bring the data plane up, then wait for it.
+
+        ``_connection`` is a **pure client** since Layer 2 of the
+        de-daemonization migration (docs/mcp-dedaemonization-migration.md §5): it
+        never spawns a server itself, so the dependent no longer starts its
+        dependency (the §1.1 bootstrap loop). The control is the durable root that
+        owns the data plane; here we only *ask* it to ensure the plane. If no
+        control is running, we record an actionable "start the control" status and
+        return — best-effort, no exception out.
 
         Lives here, on the GUI-independent service, rather than in the MCP
         bootstrap or the widget so the policy is unit-testable without Qt/napari
@@ -658,8 +644,7 @@ class TensorConnection:
         from ``_conn.client`` per job, so a late connect is still picked up), the
         widget on a worker thread that signals the tree render back to the Qt
         main thread (``_start_connect``) — because a blocking connect on the
-        kernel's Qt loop would wedge ``start_kernel`` (and a modal prompt used
-        to, which is why the prompt is gone).
+        kernel's Qt loop would wedge ``start_kernel``.
 
         Fully best-effort: every failure path is swallowed (``last_status`` and
         ``last_message`` already record the outcome for ``server_status`` and the
@@ -682,75 +667,29 @@ class TensorConnection:
         except Exception:  # noqa: BLE001
             logger.info("auto_connect: %s unreachable", url)
 
-        # Unreachable and no dialog to offer autostart: start a local server
-        # ourselves when the URL is local and the biopb CLI is available.
-        if self.can_autostart_server():
-            try:
-                logger.info("auto_connect: auto-starting local biopb server")
-                self.start_local_server()
-            except Exception:  # noqa: BLE001
-                logger.exception("auto_connect: local server autostart failed")
+        # Unreachable. Do NOT start a server ourselves (that is the bootstrap
+        # loop this migration removes). A remote URL is not ours to start.
+        if not is_local_url(url):
+            return
 
-    def launch_local_server(
-        self,
-        config_path: str | None = None,
-        startup_timeout: float | None = None,
-    ) -> None:
-        """Spawn ``biopb server start`` and return as soon as it is launched.
-
-        Runs ``biopb server start`` (with ``--config`` when the file exists).
-        The daemon detaches immediately, so this returns quickly *without*
-        waiting for the server to become reachable — callers poll for readiness
-        themselves (the GUI does so non-blockingly; see
-        :meth:`connect_when_booted` for the blocking equivalent). Raises on a
-        non-zero exit. *startup_timeout* (defaulting to
-        ``mcp.server_start_timeout``) bounds only the launch subprocess.
-
-        Token handling is left entirely to the CLI: a default local server
-        needs none, and if the user's config enables token generation the CLI
-        prints it to the console. Output is not captured so any such printed
-        token reaches the console.
-        """
-        if not biopb_cli_available():
-            raise RuntimeError("biopb CLI not found on PATH")
-
-        if startup_timeout is None:
-            startup_timeout = self.server_start_timeout()
-
-        config = Path(config_path) if config_path else DEFAULT_SERVER_CONFIG
-        cmd = ["biopb", "server", "start"]
-        if config.exists():
-            cmd += ["--config", str(config)]
-
-        logger.info("Starting local biopb server: %s", " ".join(cmd))
-        result = subprocess.run(cmd, timeout=startup_timeout)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "`biopb server start` failed (exit "
-                f"{result.returncode}); see the console and server logs"
+        # Ask the control (control plane) to ensure the data plane, then wait it
+        # through boot. `ensure_data_plane` returns None when no control answers.
+        # NOTE: server_start_timeout is spent on BOTH phases below (ensure, then
+        # connect_when_booted), so the worst-case wall wait is ~2x it — see the
+        # `mcp.server_start_timeout` config note.
+        logger.info("auto_connect: %s down; asking the control to ensure it", url)
+        snapshot = ensure_data_plane(timeout=self.server_start_timeout())
+        if snapshot is None:
+            self.last_status = "error"
+            self.last_message = (
+                "No data plane, and no biopb control (control plane) to start one. "
+                "Run `biopb control start`."
             )
-
-    def start_local_server(
-        self,
-        config_path: str | None = None,
-        startup_timeout: float | None = None,
-    ) -> Dict[str, DataSourceDescriptor]:
-        """Launch a local biopb server daemon and block until it is ready.
-
-        Convenience for headless/programmatic use: :meth:`launch_local_server`
-        followed by :meth:`connect_when_booted`. The GUI uses the two steps
-        separately so it can poll without freezing. Returns the source catalog
-        on success; raises on failure.
-        """
-        # launch_local_server resolves a None timeout itself; we only need a
-        # concrete value for connect_when_booted's deadline arithmetic below.
-        self.launch_local_server(
-            config_path=config_path, startup_timeout=startup_timeout
-        )
-        # The daemon detaches immediately; poll until it is reachable AND past
-        # its data-folder scan (SERVING), tolerating refused/STARTING meanwhile.
-        return self.connect_when_booted(
-            self.url,
-            self.token,
-            timeout=startup_timeout or self.server_start_timeout(),
-        )
+            logger.info("auto_connect: data plane down and no control reachable")
+            return
+        try:
+            self.connect_when_booted(url, token, timeout=self.server_start_timeout())
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "auto_connect: data plane did not become ready after control ensure"
+            )

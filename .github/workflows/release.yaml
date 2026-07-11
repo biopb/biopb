@@ -1,6 +1,6 @@
 # All-in-one product deployment, triggered by a single `release-v*` tag.
 # See docs/release-model.md. Produces, from the tagged commit:
-#   - a GitHub release (wheel triple + mcp sdist + webapp + installers) — the
+#   - a GitHub release (wheel set + mcp sdist + webapp + installers) — the
 #     installer's single source of truth;
 #   - Docker images for biopb-tensor-server and biopb-image-base, each tagged
 #     with ITS OWN package version (+ :latest), published idempotently (skipped
@@ -172,12 +172,16 @@ jobs:
 
       # wheels/ feeds the Docker builds (both Dockerfiles COPY
       # wheels/biopb-*.whl + wheels/biopb_tensor_server-*.whl). release-wheels/
-      # holds the GitHub-release assets (the triple + mcp sdist + webapp).
+      # holds the GitHub-release assets (the wheel set + mcp sdist + webapp).
       - name: Build wheels
         run: |
           uv build --package biopb --wheel --out-dir wheels
           uv build --package biopb-tensor-server --wheel --out-dir wheels
           uv build --package biopb-mcp --out-dir release-wheels
+          # biopb-control (control plane) ships in the bundle too, but is NOT in the
+          # Docker context (it is a local supervisor, not a containerized plane),
+          # so it builds straight to release-wheels/ and never into wheels/.
+          uv build --package biopb-control --wheel --out-dir release-wheels
           cp wheels/*.whl release-wheels/
 
       - name: Build webapp
@@ -381,7 +385,7 @@ jobs:
           path: release-wheels
 
       # One digest file over every attached binary asset. The installers verify
-      # the wheel triple against it before file://-installing (issue #87 trust
+      # the wheel set against it before file://-installing (issue #87 trust
       # item); a future release-signing step would sign this file. Bare basenames
       # (cd into the dir) so the lines match the names the installer sees on disk.
       - name: Checksums (SHA256SUMS)
@@ -421,15 +425,16 @@ jobs:
             ```
 
             ### Assets
-            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
-              version-paired wheel triple (installer `file://`-installs these)
+            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
+              `biopb_control-*.whl` — the version-paired wheel set (installer
+              `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
             - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install
               seeds so the viewer opens onto real data (see `LICENSES.txt` inside)
             - `versions.json` — release manifest (pins `napari`; carries the
               `release` version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
-              the wheel triple against it before installing
+              the wheel set against it before installing
             - `install.sh` / `install.ps1` — bootstrap installers
             - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
               will warn "Unknown publisher" until a signing cert is provisioned)

@@ -1,0 +1,74 @@
+[project]
+name = "biopb-control"
+dynamic = ["version"]
+description = "biopb control plane: supervises the durable planes and fronts a single web origin"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Ji Yu"},
+  {email = "jyu@uchc.edu"},
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+# Match the rest of the stack (biopb / biopb-tensor-server / biopb-mcp are all
+# >=3.10,<3.13). The control is deliberately lean: it *supervises* the durable
+# planes as subprocesses and never imports them (invariant I2 in
+# biopb-mcp/docs/mcp-dedaemonization-migration.md), so its only dependency is the
+# dependency-light core SDK, for the shared control-endpoint location
+# (biopb._config_control). No napari / dask / Qt / tensor-server / mcp imports.
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "biopb",
+]
+
+# Test/dev deps live in a PEP 735 group (kept out of published metadata), same
+# convention as biopb-mcp. Minimal on purpose: the supervisor/control tests are
+# stdlib-only (TCP-liveness, urllib), so no tensor/pyarrow/Qt is pulled in.
+# Install from the workspace with uv:
+#   uv sync --package biopb-control --group testing
+[dependency-groups]
+testing = [
+    "pytest",
+]
+
+# The persistent supervisor is spawned as `python -m biopb_control run` by the
+# core CLI's `biopb control start` (which owns the pidfile/detach/stop plumbing),
+# but a console script is provided too so the package is runnable standalone.
+[project.scripts]
+biopb-control = "biopb_control.__main__:main"
+
+[project.urls]
+"Bug Tracker" = "https://github.com/biopb/biopb/issues"
+"Source Code" = "https://github.com/biopb/biopb/tree/main/biopb-control"
+
+[build-system]
+requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Versioned off its OWN tag prefix (control-v*) so it never picks up the client's
+# `v*`, the server's `server-v*`, or mcp's `mcp-v*` tags. root = ".." because the
+# package lives in a monorepo subdir. Prerelease suffixes work (control-v0.1.0a1).
+[tool.setuptools_scm]
+version_file = "src/biopb_control/_version.py"
+root = ".."
+tag_regex = "^control-v(?P<version>.+)$"
+
+[tool.setuptools_scm.scm.git]
+describe_command = "git describe --tags --match 'control-v*'"

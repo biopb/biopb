@@ -90,13 +90,14 @@ describe_command = "git describe --tags --match 'v*'"
 # by pip/setuptools, so the legacy `pip install -e` flow into the shared root
 # .venv keeps working; `uv sync` is the canonical setup.
 [tool.uv.workspace]
-members = ["biopb-image-runtime", "biopb-tensor-server", "biopb-mcp"]
+members = ["biopb-image-runtime", "biopb-tensor-server", "biopb-mcp", "biopb-control"]
 
 [tool.uv.sources]
 biopb = { workspace = true }
 biopb-image-base = { workspace = true }
 biopb-tensor-server = { workspace = true }
 biopb-mcp = { workspace = true }
+biopb-control = { workspace = true }
 
 # ---------------------------------------------------------------------------
 # Single source of truth for Python lint + format across the whole monorepo.

@@ -63,6 +63,7 @@ def installer_requirements(target: str) -> list[str]:
         ".[tensor]",
         f"./biopb-tensor-server[{','.join(extras)}]",
         "./biopb-mcp[mcp]",
+        "./biopb-control",
         "napari[all]",
     ]
 
