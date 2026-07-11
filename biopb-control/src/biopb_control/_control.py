@@ -33,9 +33,20 @@ Keeping the control lean (invariant I2) still holds: the ASGI stack
 pyarrow, and the tensor server is still a *supervised subprocess* the control
 never imports — the proxy reaches it over loopback like any other client.
 
-Session ``/session/<id>/`` routing (per-session dynamic ports via the filesystem
-registry) and the buildless dashboard are later steps of Layer 3; this module
-lands the namespaced origin + the data-plane proxy.
+- ``/session/<id>/*`` is reverse-proxied to the shim-owned MCP session child on
+  its dynamic loopback port, resolved per-request from the filesystem registry
+  (``biopb._config_sessions``). The observe UI (``/session/<id>/observe`` +
+  ``/session/<id>/api/*``) is the consumer; an unknown or dead session yields a
+  clean 404 (and the dead record is pruned). Unlike the data-plane proxy, this
+  hop drops both ``Host`` and ``Origin``: httpx then sets ``Host`` to the
+  loopback target (satisfying the child's own loopback Host guard) and the absent
+  ``Origin`` passes its Origin guard — so the trusted control→child hop is
+  accepted regardless of which external hostname the browser used to reach the
+  control. (Rebinding/token protection for the origin as a whole is a §6.1
+  follow-up, same as the data-plane proxy's.)
+
+The buildless dashboard at ``/`` is the remaining Layer-3 step; this module lands
+the namespaced origin, the data-plane proxy, and per-session observe routing.
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ import threading
 
 import httpx
 import uvicorn
+from biopb import _config_sessions
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.requests import Request
@@ -128,6 +140,12 @@ def build_app(
     # sub-app whose ``request.app`` is the sub-app, not this one -- ``app.state``
     # would read the wrong app's state. Closed by the app lifespan below.
     proxy_client = httpx.AsyncClient(base_url=data_web_url, timeout=None)
+
+    # A second pooled client for the session proxy. No base_url: each session's
+    # target is a *different* dynamic loopback port resolved per-request from the
+    # registry, so the proxy builds absolute URLs (httpx pools connections per
+    # host:port automatically). Also closed by the lifespan below.
+    session_client = httpx.AsyncClient(timeout=None)
 
     # --- control-owned endpoints (sync: they take the supervisor lock and do a
     # blocking TCP liveness probe, so Starlette runs them in its threadpool) --- #
@@ -223,6 +241,52 @@ def build_app(
             with contextlib.suppress(Exception):
                 await client_ws.close()
 
+    async def session_proxy(request: Request) -> Response:
+        # The outer Mount captured {session_id}; the inner catch-all captured the
+        # rest into {path} (both survive in path_params). Resolve the session to a
+        # live loopback target via the registry — an unknown/dead one is a clean
+        # 404 (and the dead record is pruned by resolve()).
+        session_id = request.path_params["session_id"]
+        rec = _config_sessions.resolve(session_id)
+        if rec is None:
+            return JSONResponse(
+                {"error": f"session {session_id!r} not found or ended"},
+                status_code=404,
+            )
+        base = _loopback_url(rec.get("host", "127.0.0.1"), rec["port"])
+        target = base + "/" + request.path_params["path"]
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        # Drop Host AND Origin: httpx sets Host from the target (127.0.0.1:<port>,
+        # matching the child's loopback Host allowlist) and an absent Origin
+        # passes the child's Origin guard, so the trusted control->child hop is
+        # accepted whatever external host the browser used. Everything else
+        # forwards verbatim.
+        headers = [
+            (k, v)
+            for k, v in request.headers.raw
+            if k.lower() not in (b"host", b"origin")
+        ]
+        body = await request.body()
+        upstream = session_client.build_request(
+            request.method, target, headers=headers, content=body
+        )
+        try:
+            resp = await session_client.send(upstream, stream=True)
+        except httpx.ConnectError:
+            return JSONResponse({"error": "session not reachable"}, status_code=502)
+        resp_headers = [
+            (k, v)
+            for k, v in resp.headers.raw
+            if k.decode("latin-1").lower() not in _HOP_BY_HOP
+        ]
+        return StreamingResponse(
+            resp.aiter_raw(),
+            status_code=resp.status_code,
+            headers={k.decode("latin-1"): v.decode("latin-1") for k, v in resp_headers},
+            background=BackgroundTask(resp.aclose),
+        )
+
     # One sub-app proxying to the sidecar root, mounted at BOTH /data_plane/viewer
     # (the dataviewer's static base) and /data_plane (its /api, /ws, health). Each
     # Mount strips its own prefix, so the same handlers serve both without the
@@ -239,6 +303,18 @@ def build_app(
         ]
     )
 
+    # A session sub-app mounted under /session/{session_id}; its catch-all strips
+    # nothing further (session_proxy reads {session_id} + {path} from path_params).
+    session_app = Starlette(
+        routes=[
+            Route(
+                "/{path:path}",
+                session_proxy,
+                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+            ),
+        ]
+    )
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/api/data_plane/ensure", data_plane_ensure, methods=["POST"]),
@@ -246,6 +322,10 @@ def build_app(
         # /data_plane/viewer FIRST so it wins over the broader /data_plane mount.
         Mount("/data_plane/viewer", sidecar),
         Mount("/data_plane", sidecar),
+        # Per-session observe: /session/<id>/observe + /session/<id>/api/*. The
+        # {session_id} convertor is slash-free (session ids are), so it stops at
+        # the first slash and the remainder falls to the catch-all.
+        Mount("/session/{session_id}", session_app),
     ]
 
     @contextlib.asynccontextmanager
@@ -254,6 +334,7 @@ def build_app(
             yield
         finally:
             await proxy_client.aclose()
+            await session_client.aclose()
 
     return Starlette(routes=routes, lifespan=lifespan)
 

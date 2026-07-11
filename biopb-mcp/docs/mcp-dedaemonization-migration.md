@@ -240,8 +240,8 @@ longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
 **own root dashboard** and reverse-proxies each downstream plane under its own
 namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
-> **Status: namespaced origin + data-plane proxy + session registry built
-> (§6.1); dashboard and observe remain.** The control API is a Starlette/uvicorn app on
+> **Status: namespaced origin + data-plane proxy + session registry +
+> per-session observe built (§6.1); only the dashboard remains.** The control API is a Starlette/uvicorn app on
 > `127.0.0.1:8813` (replacing the stdlib `ThreadingHTTPServer`). It answers bare
 > `/health` and control verbs under `/api/*` (`/api/data_plane/ensure`), redirects
 > `/` to the dataviewer for now, and reverse-proxies the tensor sidecar under the
@@ -250,9 +250,8 @@ namespace; no upstream owns the root, and no two upstreams share a path prefix.
 > prefix `Mount`s that strip the namespace (`biopb_control/_control.py`). The
 > catch-all is retired. The dataviewer is built base-path-aware for it
 > (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
-> **Remaining:** the control-owned buildless dashboard + control API
-> (`/api/status`, `/api/sessions` — reading the registry below), and
-> per-session `/session/<id>/` observe routing.
+> **Remaining:** only the control-owned buildless dashboard at `/` + its control
+> API (`/api/status`, `/api/sessions` — reading the registry below).
 
 ### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
 
@@ -317,6 +316,17 @@ observe's root-absolute `/api/*` fetches (`_observe.py`) rebase under
 `/session/<id>/`. Observe needed this rework regardless, so all three frontends
 (control dashboard, dataviewer, observe) become uniformly prefix-aware. CI/release
 env changes accordingly (`tensor-server-ci.yaml`, `release.yaml`).
+
+*Implemented for observe (per-session routing):* the control resolves
+`/session/<id>/*` to the child's dynamic loopback port per-request via
+`biopb._config_sessions.resolve()` (unknown/dead → clean 404, ghost pruned), and
+proxies with **Host + Origin dropped** so the child's own loopback Host/Origin
+guard passes on the trusted hop whatever external host reached the control. The
+`_observe.py` base-path fix needs **no build step and no child env**: the page
+derives `BASE = location.pathname.replace(/\/observe\/?$/, '')` at runtime and
+prefixes every `/api/*` call, so the same static page works served directly
+(`BASE = ""`) or behind `/session/<id>/`. The control never rewrites the HTML
+(keeps I2 — it stays oblivious to observe's contents).
 
 **Session discovery — a filesystem registry (BUILT).** Each session writes
 `~/.local/share/biopb/sessions/<id>.json` (host + port + pid + `/mcp` url) once

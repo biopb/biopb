@@ -138,6 +138,24 @@ def read_session(session_id: str) -> Optional[dict]:
         return None
 
 
+def resolve(session_id: str) -> Optional[dict]:
+    """The record for a *live* ``session_id``, or ``None`` — for routers.
+
+    Unlike :func:`read_session` this applies the liveness policy: a record whose
+    owning pid is gone is treated as absent *and pruned* (so the front returns a
+    clean "session ended" and the ghost is cleaned up), while a record we cannot
+    disprove is returned (fail-open). This is the single entry point the control
+    uses to turn a ``/session/<id>/`` request into a target.
+    """
+    rec = read_session(session_id)
+    if rec is None:
+        return None
+    if not _pid_alive(rec.get("pid")):
+        unregister(session_id)
+        return None
+    return rec
+
+
 def list_sessions(prune: bool = True) -> list[dict]:
     """All live session records, newest first (session id sorts by timestamp).
 

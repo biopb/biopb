@@ -10,14 +10,17 @@ no real tensor server is needed.
 """
 
 import json
+import os
 import socket
 import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import pytest
 import websockets.sync.server
+from biopb import _config_sessions
 from websockets.sync.client import connect as ws_connect
 
 from biopb_control._control import _loopback_url, serve_control_api
@@ -45,6 +48,8 @@ class _EchoHandler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "method": self.command,
                 "auth": self.headers.get("Authorization"),
+                "host": self.headers.get("Host"),
+                "origin": self.headers.get("Origin"),
                 "body": body.decode() if body else "",
             }
         ).encode()
@@ -76,6 +81,13 @@ def upstream():
         yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
         server.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_sessions(tmp_path, monkeypatch):
+    """Point the session registry at a per-test dir (resolve() reads the env per
+    request, so setting it here reaches the in-process uvicorn thread too)."""
+    monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
 
 
 @pytest.fixture
@@ -238,6 +250,71 @@ def ws_upstream():
         yield f"http://127.0.0.1:{port}"
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Per-session observe proxy (/session/<id>/*)
+# --------------------------------------------------------------------------- #
+def _register_session(session_id, upstream_url):
+    """Register a live session whose loopback target is the echo ``upstream``."""
+    u = urlparse(upstream_url)
+    _config_sessions.register(session_id, host=u.hostname, port=u.port, pid=os.getpid())
+
+
+def test_session_observe_is_proxied_prefix_stripped(control, upstream):
+    _register_session("20260101-000000-42", upstream)
+    _status, _headers, body = _get(f"{control}/session/20260101-000000-42/observe")
+    # /session/<id> stripped by the Mount; the child sees a root-relative path.
+    assert json.loads(body)["path"] == "/observe"
+
+
+def test_session_api_is_proxied_with_query(control, upstream):
+    _register_session("s1", upstream)
+    _status, _headers, body = _get(f"{control}/session/s1/api/jobs?limit=5")
+    echoed = json.loads(body)
+    assert echoed["path"] == "/api/jobs?limit=5"
+    assert echoed["method"] == "GET"
+
+
+def test_session_proxy_drops_host_and_origin(control, upstream):
+    # The child's loopback Host/Origin guard must pass on the trusted hop even
+    # when the browser reached the control via some other host with an Origin.
+    _register_session("s1", upstream)
+    port = urlparse(upstream).port
+    _status, _headers, body = _get(
+        f"{control}/session/s1/api/status",
+        headers={"Origin": "http://evil.example:8813", "Host": "evil.example:8813"},
+    )
+    echoed = json.loads(body)
+    assert echoed["origin"] is None  # Origin stripped -> absent -> child allows it
+    assert echoed["host"] == f"127.0.0.1:{port}"  # Host set to the loopback target
+
+
+def test_unknown_session_returns_404(control):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/session/nope/observe")
+    assert exc.value.code == 404
+
+
+def test_dead_session_returns_404_and_is_pruned(control, upstream):
+    # A record whose pid is gone must not be proxied; resolve() prunes it.
+    dead = subprocess_dead_pid()
+    u = urlparse(upstream)
+    _config_sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/session/ghost/observe")
+    assert exc.value.code == 404
+    assert _config_sessions.read_session("ghost") is None  # pruned
+
+
+def subprocess_dead_pid():
+    """A pid that is (almost certainly) dead: spawn a child, reap it, reuse pid."""
+    import subprocess
+    import sys
+
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
 
 
 def test_websocket_render_is_proxied(ws_upstream, tmp_path):
