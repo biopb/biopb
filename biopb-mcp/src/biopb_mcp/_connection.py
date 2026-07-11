@@ -30,7 +30,7 @@ from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
 from ._config import CONFIG, get_setting
-from ._control_client import ensure_data_plane
+from ._control_client import data_plane_url, ensure_data_plane
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,10 @@ class TensorConnection:
         self.last_health: dict | None = None
 
         cfg = config if config is not None else CONFIG.as_dict()
+        # This is only the *fallback* endpoint: the data-plane URL's source of
+        # truth is the control (#413), asked for at connect time
+        # (:meth:`_resolve_data_plane_url`). ``self.url`` starts at the config/env
+        # value and is overwritten with the live endpoint once connected.
         self.url, self.token = self.resolve_from_config(cfg)
 
         # Optional callback invoked after every successful connect with the
@@ -182,15 +186,38 @@ class TensorConnection:
 
     @staticmethod
     def resolve_from_config(config: dict) -> Tuple[str, str | None]:
-        """Resolve tensor server URL and token.
+        """Resolve the *fallback* tensor-server URL and the token.
 
-        Fallback order: environment variables -> config file -> default.
+        Since #413 the data-plane endpoint's single source of truth is the
+        control (see :meth:`_resolve_data_plane_url`); this resolves only the
+        fallback used when no control is reachable. Fallback order for the URL:
+        ``BIOPB_TENSOR_URL`` env -> ``tensor_browser.server_url`` config ->
+        default. The token still comes from ``BIOPB_TENSOR_TOKEN`` (the control
+        does not mint one for localhost planes).
         """
         url = os.environ.get("BIOPB_TENSOR_URL") or get_setting(
             config, "tensor_browser.server_url"
         )
         token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
         return url, token
+
+    def _resolve_data_plane_url(self) -> str:
+        """The gRPC URL to connect to: the control's data plane, else the fallback.
+
+        The control (control plane) owns the data plane and resolves its endpoint
+        from the tensor-server ``[server]`` config, so it is the single source of
+        truth (#413). Ask it first (``GET /health`` -> ``data_plane.grpc_url``, a
+        cheap read that never spawns anything). Only when no control answers do we
+        fall back to :attr:`url` -- the config/env value at startup, or the last
+        endpoint we connected to -- covering the pre-control behavior and the
+        standalone-tensor-server dev case.
+        """
+        url = data_plane_url()
+        if url:
+            if url != self.url:
+                logger.info("data-plane URL resolved from control: %s", url)
+            return url
+        return self.url
 
     @property
     def is_connected(self) -> bool:
@@ -650,7 +677,12 @@ class TensorConnection:
         ``last_message`` already record the outcome for ``server_status`` and the
         widget's error label), so a propagated error never aborts the caller.
         """
-        url, token = self.url, self.token
+        # Resolve where the data plane lives from the control (single source of
+        # truth, #413), falling back to the config/env URL only when no control
+        # answers. Publish it on self.url so the widget/server_status show the
+        # endpoint we are actually targeting.
+        url = self.url = self._resolve_data_plane_url()
+        token = self.token
         try:
             self.connect(url, token)
             return
@@ -687,6 +719,12 @@ class TensorConnection:
             )
             logger.info("auto_connect: data plane down and no control reachable")
             return
+        # The ensure response carries the endpoint the control actually owns/
+        # brought up (same snapshot as /health); trust it over our earlier guess
+        # -- they agree unless the control's config changed between the two reads.
+        ensured_url = snapshot.get("grpc_url") if isinstance(snapshot, dict) else None
+        if ensured_url:
+            url = self.url = ensured_url
         try:
             self.connect_when_booted(url, token, timeout=self.server_start_timeout())
         except Exception:  # noqa: BLE001
