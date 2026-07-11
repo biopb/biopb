@@ -475,6 +475,17 @@ class TestStartKernel:
         assert "ready" in result.lower()
         assert "execute_code" in result
 
+    def test_ready_headless_reports_no_viewer(self, server_with_host):
+        # In a headless session there is no napari window and take_screenshot is
+        # unavailable, so the ready message must say so and not promise a viewer.
+        _server.set_headless(True)
+        server_with_host.ensure_started.return_value = {"state": "ready"}
+        result = _server.start_kernel()
+        assert "ready" in result.lower()
+        assert "headless" in result.lower()
+        assert "execute_code" in result
+        assert "take_screenshot" not in result  # not offered when headless
+
     def test_error_state_message(self, server_with_host):
         server_with_host.ensure_started.return_value = {
             "state": "error",

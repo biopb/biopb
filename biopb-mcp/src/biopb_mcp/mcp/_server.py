@@ -716,6 +716,14 @@ def start_kernel() -> str:
         return "Error: kernel host not initialized"
     result = host.ensure_started()
     if result.get("state") == "ready":
+        if _headless:
+            # No napari window in a headless session, so take_screenshot is
+            # unavailable -- say so rather than claiming a viewer that isn't there.
+            return (
+                "Kernel ready (headless -- no napari viewer; screenshots "
+                "unavailable). dask and the tensor client are up; use "
+                "execute_code / inspect_object now."
+            )
         return (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
             "use execute_code / take_screenshot now."

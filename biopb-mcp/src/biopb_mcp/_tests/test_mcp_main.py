@@ -5,6 +5,7 @@ and the stdio-vs-http dispatch) without starting a real kernel, viewer, or
 daemon.
 """
 
+import logging
 import os
 import sys
 import threading
@@ -19,6 +20,7 @@ from biopb_mcp.mcp.__main__ import (
     _parse_args,
     _remove_pidfile,
     _resolve_headless,
+    _resolve_headless_logged,
     _setup_observe,
     _shutdown_sentinel_path,
     _write_pidfile,
@@ -182,6 +184,26 @@ class TestResolveHeadless:
     def test_auto_follows_display(self):
         assert _resolve_headless("auto", True) is False
         assert _resolve_headless("auto", False) is True
+
+
+class TestResolveHeadlessLogged:
+    def test_auto_no_display_warns(self, caplog):
+        # The silent auto->headless degrade (#98/#408) must emit a WARNING.
+        with caplog.at_level(logging.WARNING):
+            assert _resolve_headless_logged("auto", False) is True
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert "headless" in caplog.text.lower()
+
+    def test_auto_with_display_is_silent(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _resolve_headless_logged("auto", True) is False
+        assert caplog.records == []
+
+    def test_explicit_headless_is_silent(self, caplog):
+        # An intentional headless choice is not a surprise -- no warning.
+        with caplog.at_level(logging.WARNING):
+            assert _resolve_headless_logged("headless", False) is True
+        assert caplog.records == []
 
 
 class TestSetupObserve:
