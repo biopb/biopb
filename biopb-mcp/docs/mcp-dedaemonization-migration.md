@@ -240,32 +240,32 @@ longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
 **own root dashboard** and reverse-proxies each downstream plane under its own
 namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
-> **Status: namespaced origin + data-plane proxy + session registry +
-> per-session observe built (§6.1); only the dashboard remains.** The control API is a Starlette/uvicorn app on
-> `127.0.0.1:8813` (replacing the stdlib `ThreadingHTTPServer`). It answers bare
-> `/health` and control verbs under `/api/*` (`/api/data_plane/ensure`), redirects
-> `/` to the dataviewer for now, and reverse-proxies the tensor sidecar under the
-> `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data API at
-> `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via explicit
-> prefix `Mount`s that strip the namespace (`biopb_control/_control.py`). The
-> catch-all is retired. The dataviewer is built base-path-aware for it
+> **Status: complete.** Namespaced origin + data-plane proxy + session registry +
+> per-session observe + the control-owned dashboard are all built (§6.1). The
+> control API is a Starlette/uvicorn app on `127.0.0.1:8813` (replacing the stdlib
+> `ThreadingHTTPServer`). It answers bare `/health`, the control API under `/api/*`
+> (`/api/status`, `/api/sessions`, `/api/data_plane/{ensure,stop,restart}`), serves
+> its **own buildless dashboard** at `/`, and reverse-proxies the tensor sidecar
+> under the `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data
+> API at `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via
+> explicit prefix `Mount`s that strip the namespace (`biopb_control/_control.py`).
+> The catch-all is retired. The dataviewer is built base-path-aware for it
 > (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
-> **Remaining:** only the control-owned buildless dashboard at `/` + its control
-> API (`/api/status`, `/api/sessions` — reading the registry below).
 
 ### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
 
 Three decisions fix the routing shape:
 
-1. **Root `/` is the control's own dashboard, not the dataviewer.** A
+1. **Root `/` is the control's own dashboard, not the dataviewer. (BUILT.)** A
    **self-contained, buildless page** — a single embedded HTML+vanilla-JS
    document served in-process, exactly the pattern `_observe.py` already uses (no
    Vite/npm build, so the lean control stays buildless; a real SPA build is
-   deferred until the dashboard outgrows status+links). It shows each
-   sub-component's status, lists live MCP sessions, exposes the data-plane
-   `ensure`/`stop`/`restart` controls, and links to the dataviewer + its admin
-   page (enabled only when the data plane is `serving`) and to each session's
-   observe page.
+   deferred until the dashboard outgrows status+links). It polls `/api/status`
+   (the data-plane snapshot + a live-session count) and `/api/sessions`, exposes
+   the data-plane `ensure`/`stop`/`restart` controls (POSTing the
+   `/api/data_plane/*` verbs), links to the dataviewer (enabled only when the
+   data plane is `serving`), and lists each live session with its
+   `/session/<id>/observe` link.
 
 2. **Every downstream plane owns a path prefix; the root catch-all is retired.**
    The flat "proxy everything else" mount is replaced by explicit `Mount`s. Each
@@ -333,7 +333,9 @@ child's `/mcp` directly (§6.1 decision 3). The
 derives `BASE = location.pathname.replace(/\/observe\/?$/, '')` at runtime and
 prefixes every `/api/*` call, so the same static page works served directly
 (`BASE = ""`) or behind `/session/<id>/`. The control never rewrites the HTML
-(keeps I2 — it stays oblivious to observe's contents).
+(keeps I2 — it stays oblivious to observe's contents). Origin-wide token auth is
+now implemented for the control's own `/api/*` (see "Origin auth — step 1" below);
+`/session/<id>/*` gating is the remaining piece.
 
 **Session discovery — a filesystem registry (BUILT).** Each session writes
 `~/.local/share/biopb/sessions/<id>.json` (host + port + pid + `/mcp` url) once
@@ -368,6 +370,23 @@ pid. This is the backstop for gotchas 2/3 above.
 - **No CORS** — same origin for dataviewer + observe → shared token/cookie, no
   cross-origin config, no per-session-port CORS churn.
 
+**Origin auth — step 1 implemented.** The control's **own** API (`/api/*`) is now
+gated at the origin: when a data-plane token is configured it is required
+(`Authorization: Bearer` / `X-Biopb-Token`); when it isn't (the all-localhost
+dev-bypass) a **loopback Host** check is the rebinding backstop; and every
+state-changing verb additionally refuses a forgeable cross-site request (CSRF),
+mirroring the sidecar's `_require_same_origin`. The decisions live in a shared,
+**stdlib-only `biopb._web_auth`** — predicates the control, the tensor sidecar, and
+observe can all import (none can import another, I2), so a later
+behavior-preserving refactor can fold the sidecar's `check_token` /
+`_require_same_origin` onto it. This closes the stop/restart CSRF-DoS and the
+`/api/sessions` enumeration that the dashboard (#14) opened. `/api/data_plane/ensure`
+stays open (idempotent; biopb-mcp's token-less `_control_client` posts it), and the
+dashboard sends the token from the dataviewer's same-origin `sessionStorage`.
+**Remaining:** gate `/session/<id>/*` (needs observe to learn to send the token —
+pairs with the sidecar refactor) and teach `_control_client` to carry the token so
+`ensure` can be gated too; TLS termination stays a front-proxy concern (§1).
+
 **Gotchas (same class as the merge audit):**
 1. **Streaming + explicit mounts.** Observe uses SSE; its proxy must stream (no
    buffering). With the root catch-all retired for explicit prefix `Mount`s
@@ -401,8 +420,17 @@ background daemon is retired rather than reshaped**:
   per-session-log "single shared file" override). Their comments note the reduced
   role.
 
-The eventual control-registration + control-fronted observe link remain future work
-(Layers 2–3); `biopb mcp view` prints the direct `/mcp` URL in the meantime.
+**Decided 2026-07-11 — `biopb mcp view` does NOT register with the control.** L3
+shipped the session registry + control-fronted `/session/<id>/observe` + the
+dashboard's session list, so wiring `view` into them became *possible* — but it
+buys `view` nothing. `view` is a foreground, in-process, **agentless** session:
+with no agent driving it there is nothing to *observe* (the observe UI exists to
+watch/steer an agent's `execute_code` history), and being a foreground process the
+user Ctrl-C's directly there is no lifecycle to control remotely. So `view` stays
+fully standalone — it prints its direct `/mcp` URL and works whether or not the
+control is running; registration/observe/lifecycle-control remain **shim-only**
+(the agent path). This keeps `view` a self-contained convenience with no dependency
+on the control.
 
 ---
 
@@ -439,9 +467,10 @@ flips it. Suggested order (value-first):
    namespaces each plane under its prefix (`/data_plane/*`, `/session/<id>/*`),
    moves the dataviewer to `/data_plane/viewer`, routes per-session observe, and
    terminates auth/TLS. Downgrade `biopb mcp` to the standalone wrapper.
-   *(Partial: the ASGI origin + the namespaced `/data_plane/*` proxy + dataviewer
-   at `/data_plane/viewer` shipped; the control dashboard + control API, session
-   registry, and per-session observe are the remaining sub-steps — §6.1.)*
+   *(Built: the ASGI origin, the namespaced `/data_plane/*` proxy, the dataviewer
+   at `/data_plane/viewer`, the session registry, per-session observe, and the
+   control dashboard + control API — §6.1. Auth/TLS termination and the `biopb mcp`
+   downgrade loose ends remain.)*
 4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---

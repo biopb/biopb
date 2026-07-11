@@ -9,14 +9,24 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      the control's own liveness (what
                                      ``_control_client`` and the installer poll).
                                      Bare, kept byte-for-byte.
-- ``POST /api/data_plane/ensure`` -> ensure the plane is up (bounded wait), then
-                                     the snapshot; ``biopb-mcp`` calls this in
-                                     place of shelling out ``biopb server start``.
-                                     Moved under ``/api/`` — control *verbs about*
+- ``POST /api/data_plane/{ensure,stop,restart}`` -> supervisor verbs: ensure the
+                                     plane is up (bounded wait), stop it, or bounce
+                                     it, each returning the snapshot. ``biopb-mcp``
+                                     calls ``ensure`` in place of shelling out
+                                     ``biopb server start``; the dashboard drives all
+                                     three. Under ``/api/`` — control *verbs about*
                                      the plane live there.
-- ``GET  /``                      -> redirect to the dataviewer for now; the
-                                     control's own buildless dashboard lands here
-                                     in a later Layer-3 step.
+- ``GET  /api/status``            -> the control's own liveness + the data-plane
+                                     snapshot + a live-session count (what the
+                                     dashboard polls).
+- ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
+                                     with its ``/session/<id>/observe`` link.
+- ``GET  /``                      -> the control's own **buildless dashboard** — a
+                                     single embedded HTML+vanilla-JS page (the
+                                     ``_observe.py`` pattern, no Vite/npm build) that
+                                     polls the two APIs above, exposes the data-plane
+                                     controls, and links to the dataviewer + each
+                                     session's observe page.
 - ``/data_plane/viewer[/*]`` and ``/data_plane/{api,ws,livez,...}`` are
   reverse-proxied to the supervised tensor server's HTTP sidecar. Each is a
   ``Mount`` that strips its prefix, so the sidecar (which serves ``/`` +
@@ -45,8 +55,8 @@ never imports — the proxy reaches it over loopback like any other client.
   control. (Rebinding/token protection for the origin as a whole is a §6.1
   follow-up, same as the data-plane proxy's.)
 
-The buildless dashboard at ``/`` is the remaining Layer-3 step; this module lands
-the namespaced origin, the data-plane proxy, and per-session observe routing.
+This module lands the namespaced origin, the data-plane proxy, per-session observe
+routing, and the control-owned dashboard — the full Layer-3 single-origin front.
 """
 
 from __future__ import annotations
@@ -59,17 +69,20 @@ import threading
 
 import httpx
 import uvicorn
-from biopb import _config_sessions
+from biopb import _config_sessions, _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import (
+    HTMLResponse,
     JSONResponse,
-    RedirectResponse,
     Response,
     StreamingResponse,
 )
 from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect as ws_connect
 
@@ -97,6 +110,76 @@ _HOP_BY_HOP = frozenset(
 # traversal like `api/../mcp` (or its %2e%2e form, already decoded by the ASGI
 # server) collapses to /mcp past a naive "startswith('mcp')" check.
 _SESSION_ALLOWED_ROOTS = frozenset({"observe", "api"})
+
+# HTTP methods that change state (so they carry a CSRF risk); safe verbs
+# (GET/HEAD/OPTIONS) don't.
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# The one /api/ route left unauthenticated: biopb-mcp's _control_client POSTs it
+# to bring the plane up, and it is idempotent (spawns the plane the control
+# already owns), so it stays open rather than forcing the mcp client to carry the
+# token (the accepted #417 posture). The dangerous verbs (stop/restart) and the
+# enumerating reads (status/sessions) are gated.
+_AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
+
+
+class _ControlAuthMiddleware:
+    """Gate the control's **own** API (``/api/*``) at the single origin (§6.1).
+
+    A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches *only*
+    ``/api/*`` requests and leaves the streaming ``/data_plane`` and ``/session``
+    proxies to pass straight through untouched — wrapping those in
+    ``BaseHTTPMiddleware`` would interfere with their ``StreamingResponse`` +
+    background-close.
+
+    Policy, mirroring the tensor sidecar so the two agree:
+
+    - **Token configured** → require a valid ``Authorization: Bearer`` /
+      ``X-Biopb-Token`` (401 otherwise). This is the whole point of the single
+      origin: the token that already gates the data plane now also gates the
+      control's stop/restart verbs and the session enumeration.
+    - **No token** (the all-localhost dev-bypass) → require a **loopback Host**
+      (421 otherwise), so a DNS-rebinding page can't drive the token-less origin.
+    - **Unsafe method** (POST/…) → additionally refuse a forgeable cross-site
+      request (403) — a token header or a same-origin ``Sec-Fetch-Site`` passes,
+      a browser's cross-site POST does not (CSRF).
+
+    ``/data_plane/*`` keeps its own gate (the sidecar re-validates the forwarded
+    token) and ``/session/*`` is deferred to step 3 (observe must learn to send
+    the token first); neither is touched here.
+    """
+
+    def __init__(self, app: ASGIApp, token: str | None) -> None:
+        self.app = app
+        self._token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and self._guarded(scope["path"]):
+            get = Headers(scope=scope).get
+            denial = self._deny(scope["method"], get)
+            if denial is not None:
+                await denial(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _guarded(path: str) -> bool:
+        return path.startswith("/api/") and path not in _AUTH_EXEMPT_API_PATHS
+
+    def _deny(self, method: str, get: _web_auth.HeaderGetter) -> Response | None:
+        """The response to send if the request is refused, else ``None``."""
+        if self._token:
+            if not _web_auth.token_valid(get, self._token):
+                return JSONResponse(
+                    {"error": "invalid or missing token"}, status_code=401
+                )
+        elif not _web_auth.host_is_loopback(get("host")):
+            return JSONResponse({"error": "invalid Host header"}, status_code=421)
+        if method in _UNSAFE_METHODS and _web_auth.is_forgeable_cross_site(get):
+            return JSONResponse(
+                {"error": "cross-site request refused"}, status_code=403
+            )
+        return None
 
 
 def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
@@ -131,13 +214,16 @@ def build_app(
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
     data_web_url: str,
+    token: str | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
     ``data_web_url`` is the loopback base URL of the supervised tensor server's
-    HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. Split out
-    from :func:`serve_control_api` so it is unit-testable against a fake upstream
-    without binding uvicorn.
+    HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. ``token``
+    is the data-plane access token (``None`` in the all-localhost dev-bypass
+    case); the ``/api/*`` gate enforces it when set, else falls back to a loopback
+    Host check. Split out from :func:`serve_control_api` so it is unit-testable
+    against a fake upstream without binding uvicorn.
     """
     ws_base = data_web_url.replace("http://", "ws://", 1).replace(
         "https://", "wss://", 1
@@ -186,11 +272,76 @@ def build_app(
                 status_code=500,
             )
 
+    def data_plane_stop(_request: Request) -> JSONResponse:
+        # Full teardown of the data plane (want=False): the control stays up, but
+        # its supervised child is stopped and won't be respawned until an ensure.
+        try:
+            supervisor.stop()
+            return JSONResponse({"data_plane": supervisor.snapshot()})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("data_plane/stop failed")
+            return JSONResponse(
+                {"error": str(exc), "data_plane": supervisor.snapshot()},
+                status_code=500,
+            )
+
+    def data_plane_restart(request: Request) -> JSONResponse:
+        # Bounce the plane: stop() (want=False, so a racing supervision tick backs
+        # off instead of seeing the down port as a conflict) then ensure() flips
+        # want back on and spawns a fresh child, bounded like /ensure so we answer
+        # before the client's HTTP timeout.
+        try:
+            client_timeout = float(request.query_params.get("client_timeout", "0"))
+        except ValueError:
+            client_timeout = 0.0
+        wait = _bounded_ensure_wait(ensure_timeout, client_timeout)
+        try:
+            supervisor.stop()
+            supervisor.ensure()
+            supervisor.wait_until_up(wait)
+            return JSONResponse({"data_plane": supervisor.snapshot()})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("data_plane/restart failed")
+            return JSONResponse(
+                {"error": str(exc), "data_plane": supervisor.snapshot()},
+                status_code=500,
+            )
+
+    def api_status(_request: Request) -> JSONResponse:
+        # What the dashboard polls: the control is up (it answered), the data
+        # plane's supervisor snapshot, and how many sessions are live. Sync (the
+        # snapshot probes the port and list_sessions() touches the filesystem), so
+        # Starlette runs it in the threadpool.
+        return JSONResponse(
+            {
+                "control": "ok",
+                "data_plane": supervisor.snapshot(),
+                "sessions": len(_config_sessions.list_sessions()),
+            }
+        )
+
+    def api_sessions(_request: Request) -> JSONResponse:
+        # The live MCP sessions, newest first, projected to what the dashboard
+        # needs — the id, when it started, its loopback port, and the control-
+        # relative observe link. list_sessions() self-heals (prunes dead/reused
+        # records) on read, so a stale session never lingers on the page.
+        sessions = [
+            {
+                "session_id": rec["session_id"],
+                "started_at": rec.get("started_at"),
+                "port": rec.get("port"),
+                "observe_url": f"/session/{rec['session_id']}/observe",
+            }
+            for rec in _config_sessions.list_sessions()
+            if rec.get("session_id")
+        ]
+        return JSONResponse({"sessions": sessions})
+
     async def root(_request: Request) -> Response:
-        # The control's own buildless dashboard lands here in a later Layer-3
-        # step; until then send the origin root to the dataviewer so `/` is not a
-        # dead end.
-        return RedirectResponse(url="/data_plane/viewer/")
+        # The control's own buildless dashboard (single embedded page, no build
+        # step). It polls /api/status + /api/sessions and drives the data-plane
+        # verbs above.
+        return HTMLResponse(_DASHBOARD_HTML)
 
     # --- reverse proxy into the tensor server's HTTP sidecar ---------------- #
     # Handlers forward the *mount-relative* path (``Mount`` has already stripped
@@ -338,7 +489,11 @@ def build_app(
 
     routes = [
         Route("/health", health, methods=["GET"]),
+        Route("/api/status", api_status, methods=["GET"]),
+        Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/data_plane/ensure", data_plane_ensure, methods=["POST"]),
+        Route("/api/data_plane/stop", data_plane_stop, methods=["POST"]),
+        Route("/api/data_plane/restart", data_plane_restart, methods=["POST"]),
         Route("/", root, methods=["GET"]),
         # /data_plane/viewer FIRST so it wins over the broader /data_plane mount.
         Mount("/data_plane/viewer", sidecar),
@@ -357,7 +512,10 @@ def build_app(
             await proxy_client.aclose()
             await session_client.aclose()
 
-    return Starlette(routes=routes, lifespan=lifespan)
+    # The /api/* auth gate wraps the whole app but acts only on /api/* (pure ASGI,
+    # so the streaming proxies pass through untouched).
+    middleware = [Middleware(_ControlAuthMiddleware, token=token)]
+    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 async def _pump_websocket(client_ws: WebSocket, upstream) -> None:
@@ -429,11 +587,14 @@ def serve_control_api(
 
     Returns ``(server, thread)``; the caller stops it with ``server.shutdown()``.
     """
+    spec = supervisor._spec
     if data_web_url is None:
-        spec = supervisor._spec
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
-    app = build_app(supervisor, ensure_timeout, data_web_url)
+    # The data-plane token gates the control's own /api/* too (single origin,
+    # §6.1). None in the all-localhost dev-bypass case -> the gate falls back to a
+    # loopback Host check instead.
+    app = build_app(supervisor, ensure_timeout, data_web_url, token=spec.token)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -461,3 +622,189 @@ def serve_control_api(
     thread.start()
     logger.info("Control plane origin listening on http://%s:%d", host, port)
     return _ControlServer(server), thread
+
+
+# ---------------------------------------------------------------------------
+# The control's own root dashboard (single static page; vanilla JS, no build
+# step -- the same buildless pattern as biopb_mcp's _observe.py, so the lean
+# control needs no Vite/npm toolchain). It polls /api/status + /api/sessions and
+# POSTs the data-plane verbs. Served at "/", which is this origin's root, so its
+# API calls are plain root-absolute "/api/*".
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>biopb · control</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
+  header { padding: 10px 16px; background: #1b1b1b; border-bottom: 1px solid #333;
+           display: flex; align-items: center; gap: 12px; position: sticky; top: 0; }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a8;
+       margin: 0 0 10px; }
+  #conn { font-size: 12px; color: #9aa; margin-left: auto; }
+  main { padding: 16px; max-width: 760px; }
+  .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
+          background: #161616; }
+  .badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; text-transform: uppercase;
+           vertical-align: middle; }
+  .serving { background: #243; color: #7e7; }
+  .starting { background: #234; color: #8bf; }
+  .down, .conflict { background: #422; color: #f99; }
+  .stopped, .unknown { background: #333; color: #aaa; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 12px 0 0; }
+  dt { color: #888; }
+  dd { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .err { color: #f99; }
+  .controls { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; padding: 4px 12px; border: 1px solid #444; border-radius: 4px;
+           background: #222; color: #ddd; cursor: pointer; }
+  button:hover:not(:disabled) { background: #2c2c2c; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.danger { border-color: #844; }
+  a.link { color: #8bf; text-decoration: none; margin-left: auto; }
+  a.link:hover { text-decoration: underline; }
+  a.link.off { color: #667; pointer-events: none; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid #262626; }
+  li:first-child { border-top: 0; }
+  .sid { font-family: ui-monospace, Menlo, monospace; font-weight: 600; }
+  .when { color: #888; font-size: 12px; }
+  .empty { color: #777; padding: 6px 0; }
+  a.obs { margin-left: auto; color: #7e7; text-decoration: none; }
+  a.obs:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>biopb · control</h1>
+  <span id="conn">…</span>
+</header>
+<main>
+  <div class="card">
+    <h2>Data plane</h2>
+    <div><span id="dp-badge" class="badge unknown">unknown</span></div>
+    <dl id="dp-fields"></dl>
+    <div class="controls">
+      <button id="ensure">Ensure up</button>
+      <button id="restart">Restart</button>
+      <button id="stop" class="danger">Stop</button>
+      <a id="viewer" class="link off" href="/data_plane/viewer/">Open dataviewer →</a>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Live sessions</h2>
+    <ul id="sessions"><li class="empty">loading…</li></ul>
+  </div>
+</main>
+<script>
+const POLL = 3000;
+
+function el(id) { return document.getElementById(id); }
+// Escape for BOTH text and attribute (href="...") contexts: the textContent
+// trick only covers &<>, not quotes, so an interpolated value in an attribute
+// could break out. Server-built values are trusted today (session ids are
+// <ts>-<pid>), but escape totally so a future registry field can't inject.
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// The control's own /api/* is token-gated at this single origin. Reuse the
+// dataviewer's sessionStorage token (same origin now, key 'biopb_token') as an
+// Authorization: Bearer header; on a 401, prompt once and retry. In the common
+// no-token localhost deployment there is no token and the header is just absent.
+async function fetchAuth(url, opts) {
+  opts = opts || {};
+  const t = sessionStorage.getItem('biopb_token');
+  opts.headers = Object.assign({}, opts.headers,
+                               t ? {Authorization: 'Bearer ' + t} : {});
+  const r = await fetch(url, opts);
+  if (r.status === 401 && !opts._retried) {
+    const nt = prompt('Access token required:');
+    if (nt) {
+      sessionStorage.setItem('biopb_token', nt);
+      opts._retried = true;
+      return fetchAuth(url, opts);
+    }
+  }
+  return r;
+}
+
+async function jpost(url) {
+  try {
+    const r = await fetchAuth(url, {method: 'POST'});
+    return await r.json().catch(() => ({}));
+  } catch (e) { return {error: String(e)}; }
+}
+
+function renderDataPlane(dp) {
+  const state = (dp && dp.state) || 'unknown';
+  const badge = el('dp-badge');
+  badge.textContent = state;
+  badge.className = 'badge ' + state;
+  const rows = [
+    ['gRPC', dp.grpc_url],
+    ['Web', dp.web_url],
+    ['PID', dp.pid == null ? '—' : dp.pid],
+    ['Restarts', dp.restarts == null ? 0 : dp.restarts],
+  ];
+  let html = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + esc(v) + '</dd>').join('');
+  if (dp.last_error) html += '<dt>Error</dt><dd class="err">' + esc(dp.last_error) + '</dd>';
+  el('dp-fields').innerHTML = html;
+  // The dataviewer is only reachable once the sidecar is up behind a serving plane.
+  el('viewer').classList.toggle('off', state !== 'serving');
+}
+
+async function pollStatus() {
+  let s;
+  try { s = await (await fetchAuth('/api/status')).json(); }
+  catch (e) { el('conn').textContent = 'control unreachable'; return; }
+  el('conn').textContent = 'control: ok · ' + (s.sessions || 0) + ' session(s)';
+  renderDataPlane(s.data_plane || {});
+}
+
+async function pollSessions() {
+  let data;
+  try { data = await (await fetchAuth('/api/sessions')).json(); }
+  catch (e) { return; }
+  const list = (data && data.sessions) || [];
+  const box = el('sessions');
+  if (!list.length) { box.innerHTML = '<li class="empty">no live sessions</li>'; return; }
+  box.innerHTML = list.map(s => {
+    const when = s.started_at ? new Date(s.started_at * 1000).toLocaleTimeString() : '';
+    return '<li><span class="sid">' + esc(s.session_id) + '</span>'
+      + '<span class="when">:' + esc(s.port) + (when ? ' · ' + esc(when) : '') + '</span>'
+      + '<a class="obs" href="' + esc(s.observe_url) + '">observe →</a></li>';
+  }).join('');
+}
+
+function refresh() { pollStatus(); pollSessions(); }
+
+// A data-plane verb button: disable the trio while the request is in flight (a
+// restart blocks server-side until the plane is back up), then refresh.
+async function verb(url, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  const btns = [el('ensure'), el('restart'), el('stop')];
+  btns.forEach(b => b.disabled = true);
+  const res = await jpost(url);
+  btns.forEach(b => b.disabled = false);
+  if (res && res.error) alert('Failed: ' + res.error);
+  if (res && res.data_plane) renderDataPlane(res.data_plane);
+  refresh();
+}
+
+el('ensure').onclick = () => verb('/api/data_plane/ensure');
+el('restart').onclick = () => verb('/api/data_plane/restart', 'Restart the data plane?');
+el('stop').onclick = () => verb('/api/data_plane/stop', 'Stop the data plane? Clients lose it until an Ensure.');
+
+refresh();
+setInterval(refresh, POLL);
+</script>
+</body>
+</html>
+"""

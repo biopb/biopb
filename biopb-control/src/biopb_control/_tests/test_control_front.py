@@ -4,9 +4,10 @@ Concerns beyond the health/ensure control API (covered in ``test_supervisor``):
 (1) the control's own routes win, (2) the ``/data_plane`` namespace faithfully
 reverse-proxies to the tensor web sidecar -- method, path, query, headers,
 request/response bodies, and the ``/ws/render`` WebSocket -- with the mount
-prefix stripped, and (3) ``/`` redirects to the dataviewer. A trivial stdlib
-HTTP server and a ``websockets`` echo server stand in for the tensor sidecar so
-no real tensor server is needed.
+prefix stripped, and (3) ``/`` serves the control's own dashboard, which is
+backed by the in-process ``/api/status`` + ``/api/sessions`` control API. A
+trivial stdlib HTTP server and a ``websockets`` echo server stand in for the
+tensor sidecar so no real tensor server is needed.
 """
 
 import json
@@ -118,11 +119,6 @@ def _get(url, headers=None):
         return resp.status, resp.headers, resp.read()
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_a, **_k):
-        return None  # surface the 3xx as an HTTPError instead of following it
-
-
 def test_control_health_is_not_proxied(control):
     # /health is the control's own endpoint and must win over the proxy mounts.
     status, _headers, body = _get(f"{control}/health")
@@ -134,13 +130,214 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_root_redirects_to_dataviewer(control):
-    # `/` sends the origin root to the dataviewer (until the dashboard lands).
-    opener = urllib.request.build_opener(_NoRedirect)
+def test_root_serves_the_control_dashboard(control):
+    # `/` is the control's own buildless dashboard, not a redirect or the proxy.
+    status, headers, body = _get(f"{control}/")
+    assert status == 200
+    assert "text/html" in (headers.get("Content-Type") or "")
+    html = body.decode()
+    assert "biopb · control" in html  # its title/header
+    # It polls the in-process control API, not the data-plane proxy.
+    assert "/api/status" in html
+    assert "/api/sessions" in html
+    assert "path" not in html  # not the echo upstream's response
+
+
+def test_api_status_reports_control_and_data_plane(control):
+    status, _headers, body = _get(f"{control}/api/status")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["control"] == "ok"
+    assert "state" in payload["data_plane"]  # the supervisor snapshot
+    assert payload["sessions"] == 0  # none registered in this test
+
+
+def test_api_sessions_lists_live_sessions(control, upstream):
+    # Empty to start, then a registered session shows up with its observe link.
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    assert json.loads(body)["sessions"] == []
+
+    _register_session("20260101-000000-42", upstream)
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    sessions = json.loads(body)["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "20260101-000000-42"
+    assert sessions[0]["observe_url"] == "/session/20260101-000000-42/observe"
+
+
+def test_api_sessions_omits_dead_records(control, upstream):
+    # A session whose pid is gone is pruned by list_sessions() on read.
+    dead = subprocess_dead_pid()
+    u = urlparse(upstream)
+    _config_sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    assert json.loads(body)["sessions"] == []
+    assert _config_sessions.read_session("ghost") is None  # pruned
+
+
+def test_data_plane_stop_is_a_control_verb(control):
+    # POST /api/data_plane/stop returns the snapshot; with no data plane wired in
+    # this test it just reports a stopped plane rather than proxying anywhere.
+    req = urllib.request.Request(f"{control}/api/data_plane/stop", method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        payload = json.loads(resp.read())
+    assert resp.status == 200
+    assert payload["data_plane"]["state"] == "stopped"
+
+
+def test_data_plane_restart_stops_then_ensures(tmp_path):
+    # /restart must stop() BEFORE ensure() (so a racing supervision tick sees
+    # want=False and backs off, rather than mistaking the down port for a
+    # conflict), then wait for the plane and return the snapshot. Spy the
+    # supervisor so the endpoint's orchestration is checked without spawning a
+    # real tensor server.
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_port=_free_port(),
+        web_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    sup = DataPlaneSupervisor(spec)
+    calls = []
+    sup.stop = lambda: calls.append("stop")
+    sup.ensure = lambda: calls.append("ensure")
+    sup.wait_until_up = lambda w: (calls.append("wait"), True)[1]
+    sup.snapshot = lambda: {"state": "serving", "restarts": 1, "last_error": None}
+
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1",
+        api_port,
+        sup,
+        ensure_timeout=8.0,
+        data_web_url="http://127.0.0.1:1",
+    )
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/api/data_plane/restart", method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read())
+        assert resp.status == 200
+        assert payload["data_plane"]["state"] == "serving"  # the returned snapshot
+        assert calls == ["stop", "ensure", "wait"]  # order matters
+    finally:
+        server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# /api/* auth gate (§6.1 — the control's own API on the single origin)
+# --------------------------------------------------------------------------- #
+_TOKEN = "test-control-token-123"
+
+
+@pytest.fixture
+def tokened_control(upstream, tmp_path):
+    """A control configured with a data-plane token; its /api/* is gated by it."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        token=_TOKEN,
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        yield f"http://127.0.0.1:{api_port}"
+    finally:
+        server.shutdown()
+
+
+def test_control_api_requires_token_when_configured(tokened_control):
+    # Missing token -> 401.
     with pytest.raises(urllib.error.HTTPError) as exc:
-        opener.open(f"{control}/", timeout=5)
-    assert exc.value.code in (302, 307)
-    assert exc.value.headers["Location"] == "/data_plane/viewer/"
+        _get(f"{tokened_control}/api/status")
+    assert exc.value.code == 401
+    # Wrong token -> 401.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/api/status", headers={"Authorization": "Bearer nope"})
+    assert exc.value.code == 401
+    # Correct Bearer -> 200; the X-Biopb-Token scheme is accepted too.
+    status, _h, body = _get(
+        f"{tokened_control}/api/status", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+    assert status == 200 and json.loads(body)["control"] == "ok"
+    status, _h, _b = _get(
+        f"{tokened_control}/api/sessions", headers={"X-Biopb-Token": _TOKEN}
+    )
+    assert status == 200
+
+
+def test_ensure_verb_is_exempt_from_token(tmp_path, upstream):
+    # biopb-mcp's _control_client POSTs ensure with no token; it stays open even
+    # on a tokened control (idempotent, spawns the already-owned plane). Spy the
+    # supervisor so the gate is exercised without actually launching a plane.
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        token=_TOKEN,
+    )
+    sup = DataPlaneSupervisor(spec)
+    sup.ensure = lambda: None
+    sup.wait_until_up = lambda w: True
+    sup.snapshot = lambda: {"state": "serving"}
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/api/data_plane/ensure",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:  # no token -> 200
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+
+
+def test_health_and_dashboard_are_exempt_from_token(tokened_control):
+    # The liveness probe and the dashboard shell must load without a token (the
+    # shell then sends the token on its /api/* fetches).
+    assert _get(f"{tokened_control}/health")[0] == 200
+    assert _get(f"{tokened_control}/")[0] == 200
+
+
+def test_data_plane_proxy_is_not_gated_by_the_control_token(tokened_control):
+    # /data_plane/* is the sidecar's surface (it re-validates the forwarded
+    # token); the control's /api/ gate must not touch it, so it still proxies.
+    status, _h, body = _get(f"{tokened_control}/data_plane/api/sources")
+    assert status == 200
+    assert json.loads(body)["path"] == "/api/sources"
+
+
+def test_token_less_api_rejects_non_loopback_host(control):
+    # No token -> /api/* falls back to a loopback Host guard (rebinding backstop);
+    # a forged external Host is refused.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/api/status", headers={"Host": "evil.example:8813"})
+    assert exc.value.code == 421
+
+
+def test_token_less_api_refuses_forgeable_cross_site_write(control):
+    # A browser cross-site POST (Sec-Fetch-Site: cross-site, no token header) is
+    # refused as CSRF before it can reach the stop side-effect -- even though the
+    # loopback Host would otherwise pass.
+    req = urllib.request.Request(
+        f"{control}/api/data_plane/stop",
+        data=b"",
+        method="POST",
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
 
 
 def test_data_api_is_proxied_with_prefix_stripped_query_and_auth(control):
