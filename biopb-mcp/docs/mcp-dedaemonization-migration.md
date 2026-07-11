@@ -322,11 +322,13 @@ env changes accordingly (`tensor-server-ci.yaml`, `release.yaml`).
 `biopb._config_sessions.resolve()` (unknown/dead → clean 404, ghost pruned), and
 proxies with **Host + Origin dropped** so the child's own loopback Host/Origin
 guard passes on the trusted hop whatever external host reached the control.
-`/session/<id>/mcp` is **explicitly refused (404)**, not proxied: that same
-Host/Origin strip is the child's *entire* `/mcp` auth boundary, so proxying the
-agent transport would expose the `execute_code` RCE through the public control
-origin — and no agent needs it (they reach the child's `/mcp` directly; §6.1
-decision 3). Only the browser surfaces (`/observe`, `/api/*`) are routed. The
+Only an **allowlist** of the observe surface is proxied — the first path segment
+must be `observe` or `api`, and any parent-traversal is rejected. The child's
+`/mcp` agent transport (RCE) is on the same port and this Host/Origin strip is its
+*entire* auth, so nothing else may through; a *denylist* would be unsafe because
+httpx normalizes dot-segments, collapsing `api/../mcp` (or its ASGI-decoded
+`%2e%2e` form) to `/mcp`. No agent needs `/mcp` routed here anyway — they reach the
+child's `/mcp` directly (§6.1 decision 3). The
 `_observe.py` base-path fix needs **no build step and no child env**: the page
 derives `BASE = location.pathname.replace(/\/observe\/?$/, '')` at runtime and
 prefixes every `/api/*` call, so the same static page works served directly

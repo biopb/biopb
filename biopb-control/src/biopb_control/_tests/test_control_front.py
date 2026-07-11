@@ -290,16 +290,23 @@ def test_session_proxy_drops_host_and_origin(control, upstream):
     assert echoed["host"] == f"127.0.0.1:{port}"  # Host set to the loopback target
 
 
-def test_session_mcp_transport_is_not_served(control, upstream):
-    # The agent transport is deliberately off this origin (§6.1): proxying it
-    # would defeat the child's /mcp Host/Origin auth (this hop strips both) and
-    # expose the execute_code RCE through the public control origin. A live,
-    # registered session must still 404 /mcp -- and NOT reach the upstream.
+def test_session_proxy_allowlists_observe_surface(control, upstream):
+    # Only /observe + /api/* are proxied. The child's /mcp agent transport (RCE,
+    # and this hop strips its Host/Origin auth) must never be reachable -- not
+    # directly, and not via a dot-traversal that httpx would collapse to /mcp.
     _register_session("s1", upstream)
-    for path in ("mcp", "mcp/messages"):
+    forbidden = [
+        "mcp",  # direct
+        "mcp/messages",  # under /mcp
+        "",  # bare session root
+        "healthz",  # any non-allowlisted root
+        "api/../mcp",  # raw traversal
+        "api/%2e%2e/mcp",  # encoded traversal (ASGI-decoded to `..` before the check)
+    ]
+    for path in forbidden:
         with pytest.raises(urllib.error.HTTPError) as exc:
             _get(f"{control}/session/s1/{path}")
-        assert exc.value.code == 404
+        assert exc.value.code == 404, path
 
 
 def test_unknown_session_returns_404(control):

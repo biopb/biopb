@@ -89,6 +89,15 @@ _HOP_BY_HOP = frozenset(
     {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade"}
 )
 
+# The only session-child surfaces the control will proxy: the observe page and
+# its data API (matched by first path segment). This is an ALLOWLIST on purpose —
+# the child also serves /mcp (the agent RCE transport) on the same port, and this
+# hop strips its only auth (Host/Origin), so anything not explicitly allowed must
+# be refused. A denylist would be unsafe: httpx normalizes dot-segments, so a
+# traversal like `api/../mcp` (or its %2e%2e form, already decoded by the ASGI
+# server) collapses to /mcp past a naive "startswith('mcp')" check.
+_SESSION_ALLOWED_ROOTS = frozenset({"observe", "api"})
+
 
 def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
     """How long ``/data_plane/ensure`` should wait for the plane to come up.
@@ -248,19 +257,17 @@ def build_app(
         # 404 (and the dead record is pruned by resolve()).
         session_id = request.path_params["session_id"]
         sub_path = request.path_params["path"]
-        # The agent JSON-RPC transport (/mcp) is deliberately NOT served on this
-        # origin (§6.1): every agent reaches the child's /mcp directly on its own
-        # loopback port (stdio shim bridge / `biopb mcp view`), never via the
-        # control. Proxying it here would be actively unsafe — this hop strips
-        # Host/Origin (below), which is the child's *entire* /mcp auth boundary,
-        # so a proxied /mcp would expose the execute_code RCE through the public
-        # control origin. Refuse it; only the browser surfaces (/observe, /api/*)
-        # are routed.
-        if sub_path == "mcp" or sub_path.startswith("mcp/"):
-            return JSONResponse(
-                {"error": "the agent transport (/mcp) is not served on this origin"},
-                status_code=404,
-            )
+        # Allowlist the browser observe surface only (§6.1). The child's /mcp
+        # agent transport is deliberately off this origin — agents reach it
+        # directly on the child's own loopback port (stdio shim bridge /
+        # `biopb mcp view`), never via the control — and this hop strips /mcp's
+        # entire auth (Host/Origin), so exposing it would be an RCE hole on the
+        # public origin. Require an allowed first segment AND reject any
+        # parent-traversal, so no path (raw, encoded, or dot-collapsed by httpx)
+        # can escape /observe + /api/* into /mcp.
+        segments = sub_path.split("/")
+        if segments[0] not in _SESSION_ALLOWED_ROOTS or ".." in segments:
+            return JSONResponse({"error": "not found"}, status_code=404)
         rec = _config_sessions.resolve(session_id)
         if rec is None:
             return JSONResponse(
