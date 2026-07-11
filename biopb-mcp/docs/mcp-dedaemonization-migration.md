@@ -240,33 +240,32 @@ longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
 **own root dashboard** and reverse-proxies each downstream plane under its own
 namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
-> **Status: namespaced origin + data-plane proxy built (§6.1); dashboard,
-> registry, and observe remain.** The control API is a Starlette/uvicorn app on
-> `127.0.0.1:8813` (replacing the stdlib `ThreadingHTTPServer`). It answers bare
-> `/health` and control verbs under `/api/*` (`/api/data_plane/ensure`), redirects
-> `/` to the dataviewer for now, and reverse-proxies the tensor sidecar under the
-> `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data API at
-> `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via explicit
-> prefix `Mount`s that strip the namespace (`biopb_control/_control.py`). The
-> catch-all is retired. The dataviewer is built base-path-aware for it
+> **Status: complete.** Namespaced origin + data-plane proxy + session registry +
+> per-session observe + the control-owned dashboard are all built (§6.1). The
+> control API is a Starlette/uvicorn app on `127.0.0.1:8813` (replacing the stdlib
+> `ThreadingHTTPServer`). It answers bare `/health`, the control API under `/api/*`
+> (`/api/status`, `/api/sessions`, `/api/data_plane/{ensure,stop,restart}`), serves
+> its **own buildless dashboard** at `/`, and reverse-proxies the tensor sidecar
+> under the `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data
+> API at `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via
+> explicit prefix `Mount`s that strip the namespace (`biopb_control/_control.py`).
+> The catch-all is retired. The dataviewer is built base-path-aware for it
 > (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
-> **Remaining:** the control-owned buildless dashboard + control API
-> (`/api/status`, `/api/sessions`), the filesystem session registry, and
-> per-session `/session/<id>/` observe routing.
 
 ### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
 
 Three decisions fix the routing shape:
 
-1. **Root `/` is the control's own dashboard, not the dataviewer.** A
+1. **Root `/` is the control's own dashboard, not the dataviewer. (BUILT.)** A
    **self-contained, buildless page** — a single embedded HTML+vanilla-JS
    document served in-process, exactly the pattern `_observe.py` already uses (no
    Vite/npm build, so the lean control stays buildless; a real SPA build is
-   deferred until the dashboard outgrows status+links). It shows each
-   sub-component's status, lists live MCP sessions, exposes the data-plane
-   `ensure`/`stop`/`restart` controls, and links to the dataviewer + its admin
-   page (enabled only when the data plane is `serving`) and to each session's
-   observe page.
+   deferred until the dashboard outgrows status+links). It polls `/api/status`
+   (the data-plane snapshot + a live-session count) and `/api/sessions`, exposes
+   the data-plane `ensure`/`stop`/`restart` controls (POSTing the
+   `/api/data_plane/*` verbs), links to the dataviewer (enabled only when the
+   data plane is `serving`), and lists each live session with its
+   `/session/<id>/observe` link.
 
 2. **Every downstream plane owns a path prefix; the root catch-all is retired.**
    The flat "proxy everything else" mount is replaced by explicit `Mount`s. Each
@@ -318,11 +317,47 @@ observe's root-absolute `/api/*` fetches (`_observe.py`) rebase under
 (control dashboard, dataviewer, observe) become uniformly prefix-aware. CI/release
 env changes accordingly (`tensor-server-ci.yaml`, `release.yaml`).
 
-**Session discovery:** a **filesystem registry** (recommended for localhost) —
-each session writes `~/.local/share/biopb/sessions/<id>.json` (port + pid) on
-startup, removes it on reap; the control reads/watches that dir. Matches the
-existing sentinel/PID-file idioms; no new endpoint. (HTTP self-registration is
-the alternative if the front and children may later cross a machine boundary.)
+*Implemented for observe (per-session routing):* the control resolves
+`/session/<id>/*` to the child's dynamic loopback port per-request via
+`biopb._config_sessions.resolve()` (unknown/dead → clean 404, ghost pruned), and
+proxies with **Host + Origin dropped** so the child's own loopback Host/Origin
+guard passes on the trusted hop whatever external host reached the control.
+Only an **allowlist** of the observe surface is proxied — the first path segment
+must be `observe` or `api`, and any parent-traversal is rejected. The child's
+`/mcp` agent transport (RCE) is on the same port and this Host/Origin strip is its
+*entire* auth, so nothing else may through; a *denylist* would be unsafe because
+httpx normalizes dot-segments, collapsing `api/../mcp` (or its ASGI-decoded
+`%2e%2e` form) to `/mcp`. No agent needs `/mcp` routed here anyway — they reach the
+child's `/mcp` directly (§6.1 decision 3). The
+`_observe.py` base-path fix needs **no build step and no child env**: the page
+derives `BASE = location.pathname.replace(/\/observe\/?$/, '')` at runtime and
+prefixes every `/api/*` call, so the same static page works served directly
+(`BASE = ""`) or behind `/session/<id>/`. The control never rewrites the HTML
+(keeps I2 — it stays oblivious to observe's contents).
+
+**Session discovery — a filesystem registry (BUILT).** Each session writes
+`~/.local/share/biopb/sessions/<id>.json` (host + port + pid + `/mcp` url) once
+its child is fully reachable, and removes it on reap; the control reads that dir.
+Matches the existing sentinel/PID-file idioms; no new endpoint. (HTTP
+self-registration is the alternative if the front and children may later cross a
+machine boundary.)
+
+*Implemented:* the on-disk contract lives in a shared, **stdlib-only**
+`biopb._config_sessions` (core SDK — the shim writes it, the control reads it, and
+neither can import the other, exactly like `_config_control`). `register()` writes
+atomically (temp + `os.replace`) and records a **create-time identity token** for
+the child pid; `unregister()` is tied to the shim's single reap path
+(`_shim._reap_session`, so even the SIGTERM/SIGHUP signal handler that `os._exit`s
+past `serve`'s `finally` still de-registers — no routing ghost); `list_sessions()`
+/ `resolve()` **self-heal** by pruning + unlinking any record whose owning process
+is gone — the pid is dead, *or* alive but a different process on a recycled pid
+(create-time mismatch). That PID-reuse guard is the same one the daemon PID files
+use (biopb#138): without it a recycled pid would keep a ghost "alive" and could
+route `/session/<id>` traffic to an unrelated process. Liveness/identity is
+delegated to the shared, dependency-free `biopb._proc` (`is_process_running` +
+`process_create_time` — the latter handles the Windows signal-0 hazard and the
+macOS "no token → degrade to liveness-only" case), fail-open on an undecidable
+pid. This is the backstop for gotchas 2/3 above.
 
 **Why it is worth more than one bookmark:**
 - **Security win.** The observe UI currently fronts an `execute_code` RCE behind
@@ -404,9 +439,10 @@ flips it. Suggested order (value-first):
    namespaces each plane under its prefix (`/data_plane/*`, `/session/<id>/*`),
    moves the dataviewer to `/data_plane/viewer`, routes per-session observe, and
    terminates auth/TLS. Downgrade `biopb mcp` to the standalone wrapper.
-   *(Partial: the ASGI origin + the namespaced `/data_plane/*` proxy + dataviewer
-   at `/data_plane/viewer` shipped; the control dashboard + control API, session
-   registry, and per-session observe are the remaining sub-steps — §6.1.)*
+   *(Built: the ASGI origin, the namespaced `/data_plane/*` proxy, the dataviewer
+   at `/data_plane/viewer`, the session registry, per-session observe, and the
+   control dashboard + control API — §6.1. Auth/TLS termination and the `biopb mcp`
+   downgrade loose ends remain.)*
 4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---

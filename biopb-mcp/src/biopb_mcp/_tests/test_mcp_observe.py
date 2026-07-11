@@ -91,6 +91,19 @@ def test_observe_page_serves_html(client):
     assert "3000" in r.text
 
 
+def test_observe_page_rebases_api_calls_for_fronting(client):
+    # Behind the control front the page is served at /session/<id>/observe, so its
+    # API calls must target /session/<id>/api/* -- not the control's own root
+    # /api/*. It derives the base from window.location and prefixes every call, so
+    # the same page works served directly (BASE "") or behind the prefix.
+    html = client.get("/observe").text
+    assert "const BASE = window.location.pathname" in html
+    assert "BASE + '/api/jobs'" in html  # calls go through BASE
+    # No bare root-absolute API call is left that would escape the session prefix.
+    assert "fetch('/api" not in html
+    assert "jpost('/api" not in html
+
+
 def test_api_jobs_lists_summary(client, host):
     host.execute.return_value = _reply(
         [

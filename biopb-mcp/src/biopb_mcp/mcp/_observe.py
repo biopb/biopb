@@ -27,7 +27,11 @@ Host/Origin guard (:func:`_check_origin`) — FastMCP's transport-security only
 wraps the ``/mcp`` mount, not sibling custom routes. The guard reuses the SDK's
 :class:`TransportSecurityMiddleware` host/origin validators with the same
 loopback allowlist as the MCP port. There is no token: loopback bind + Host/Origin
-is the whole boundary (same trust model as the MCP server).
+is the whole boundary (same trust model as the MCP server). When the control
+front reverse-proxies this UI at ``/session/<id>/observe`` (Layer 3), that trusted
+loopback hop presents a loopback Host and no Origin, so the guard still passes;
+the frontend derives its API base from ``window.location`` so the same page works
+served directly or behind the prefix, without this process knowing its prefix.
 """
 
 import functools
@@ -395,6 +399,11 @@ _OBSERVE_HTML = """<!DOCTYPE html>
 <main><div id="jobs"><div class="empty">loading…</div></div></main>
 <script>
 const POLL = __POLL_MS__;
+// The API base, derived from where this page was actually loaded, so the same
+// page works served directly ("/observe" -> BASE "") and behind the control
+// front ("/session/<id>/observe" -> BASE "/session/<id>"). The child needs no
+// knowledge of its external prefix, and the control never rewrites this HTML.
+const BASE = window.location.pathname.replace(/\\/observe\\/?$/, '');
 const expanded = new Set();
 const rows = new Map();          // job_id -> row record (DOM kept across polls)
 let lastNewest = null;
@@ -440,7 +449,7 @@ function makeRow(id) {
 async function renderDetail(rec, id) {
   let d;
   try {
-    const r = await fetch('/api/jobs/' + encodeURIComponent(id));
+    const r = await fetch(BASE + '/api/jobs/' + encodeURIComponent(id));
     if (!r.ok) return;
     d = await r.json();
   } catch (e) { return; }
@@ -475,7 +484,7 @@ async function renderDetail(rec, id) {
 
 async function poll() {
   let data;
-  try { data = await (await fetch('/api/jobs')).json(); }
+  try { data = await (await fetch(BASE + '/api/jobs')).json(); }
   catch (e) { setStatus('unreachable'); return; }
   if (data.busy) return;                 // transient; keep current render
   const jobs = data.jobs || [];
@@ -531,7 +540,7 @@ async function poll() {
 
 async function pollStatus() {
   try {
-    const s = await (await fetch('/api/status')).json();
+    const s = await (await fetch(BASE + '/api/status')).json();
     const bits = [s.alive ? 'alive' : 'dead'];
     if (s.headless) bits.push('headless');
     if (s.busy) bits.push('busy');
@@ -542,7 +551,7 @@ async function pollStatus() {
 
 document.getElementById('save').onclick = async () => {
   let r;
-  try { r = await fetch('/api/notebook'); }
+  try { r = await fetch(BASE + '/api/notebook'); }
   catch (e) { alert('Save failed: ' + e); return; }
   if (!r.ok) { alert('Save failed (' + r.status + ')'); return; }
   const blob = await r.blob();
@@ -576,13 +585,13 @@ document.getElementById('save').onclick = async () => {
   URL.revokeObjectURL(url);
 };
 document.getElementById('interrupt').onclick = async () => {
-  const d = await jpost('/api/kernel/interrupt');
+  const d = await jpost(BASE + '/api/kernel/interrupt');
   if (d && d.interrupted === false && d.status === 'idle') alert('No running job.');
   poll();
 };
 document.getElementById('restart').onclick = async () => {
   if (!confirm('Hard-restart the kernel? All variables and layers are lost.')) return;
-  await jpost('/api/kernel/restart');
+  await jpost(BASE + '/api/kernel/restart');
   document.getElementById('jobs').innerHTML = '';
   rows.clear(); expanded.clear(); lastNewest = null; poll();
 };
