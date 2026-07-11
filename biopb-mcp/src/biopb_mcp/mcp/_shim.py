@@ -51,6 +51,7 @@ import time
 from pathlib import Path
 
 import anyio
+from biopb import _config_sessions
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -233,7 +234,7 @@ def _await_listening(proc, port, timeout):
 
 
 def spawn_session(config, timeout=SESSION_START_TIMEOUT):
-    """Spawn a private http session child this shim owns; return (proc, url, job).
+    """Spawn a private http child this shim owns; return (proc, url, job, session_id).
 
     See the module docstring for the ownership model. Inherits this shim's live
     environment (the #98 fix), binds a dynamic port the child reports back, and
@@ -318,10 +319,21 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
         except OSError:
             pass
 
-    return proc, f"http://127.0.0.1:{port}/mcp", job
+    url = f"http://127.0.0.1:{port}/mcp"
+    # Publish the now-reachable session so the control can list it and proxy
+    # /session/<id>/* to it. Registered only after the child is fully up (a
+    # failed bring-up above reaps and never reaches here, so it leaves no
+    # record); the reap path unregisters. Best-effort — a registry write failure
+    # must not fail an otherwise-working session, only cost its discoverability.
+    try:
+        _config_sessions.register(session_id, port=port, pid=proc.pid, mcp_url=url)
+    except OSError as e:
+        logger.warning("Could not register session %s: %s", session_id, e)
+
+    return proc, url, job, session_id
 
 
-def _reap_session(proc, job):
+def _reap_session(proc, job, session_id=None):
     """Tear down the owned child (and its kernel grandchild).
 
     The bridge-close / signal counterpart to the OS-level ties set at spawn.
@@ -331,7 +343,16 @@ def _reap_session(proc, job):
     death still reaps it. Windows: TerminateJobObject force-reaps the whole tree
     (no catchable signal there), then the handle is released. Idempotent and
     best-effort — safe to call more than once and on an already-dead child.
+
+    ``session_id`` (when this reaps a registered session) is dropped from the
+    filesystem registry here so teardown and de-registration are one path — a
+    force-killed child leaves no routing ghost; the registry's own pid-liveness
+    prune (:func:`biopb._config_sessions.list_sessions`) is the backstop for the
+    case where even this reap is skipped.
     """
+    if session_id is not None:
+        _config_sessions.unregister(session_id)
+
     if proc.poll() is not None:
         if job is not None:
             _winjob.close_job(job)  # release the handle for an already-gone child
@@ -374,7 +395,7 @@ def _reap_session(proc, job):
         pass
 
 
-def _install_shim_reaper(proc, job):
+def _install_shim_reaper(proc, job, session_id=None):
     """POSIX: reap the child if this shim is signalled to exit.
 
     A SIGTERM/SIGHUP delivered to the shim *alone* (not its whole group) would
@@ -383,12 +404,16 @@ def _install_shim_reaper(proc, job):
     KeyboardInterrupt out of ``run_bridge`` and the ``finally`` reaps. On Windows
     there are no such signals — the Job Object reaps on any shim death — so this
     is a no-op there.
+
+    ``session_id`` is passed through so the signal path de-registers too (it
+    ``os._exit``s past ``serve``'s ``finally``, so it must clean the registry
+    itself).
     """
     if os.name == "nt":
         return
 
     def _on_signal(signum, frame):
-        _reap_session(proc, job)
+        _reap_session(proc, job, session_id)
         os._exit(0)
 
     for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
@@ -560,10 +585,10 @@ def serve(config, port=None):
         "`claude mcp add --transport http biopb http://127.0.0.1:<port>/mcp` "
         "against a `biopb mcp start` session."
     )
-    proc, url, job = spawn_session(config)
-    _install_shim_reaper(proc, job)
+    proc, url, job, session_id = spawn_session(config)
+    _install_shim_reaper(proc, job, session_id)
     logger.info("Bridging stdio to %s (owned session pid %s)", url, proc.pid)
     try:
         run_bridge(url)
     finally:
-        _reap_session(proc, job)
+        _reap_session(proc, job, session_id)

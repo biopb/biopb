@@ -240,8 +240,8 @@ longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
 **own root dashboard** and reverse-proxies each downstream plane under its own
 namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
-> **Status: namespaced origin + data-plane proxy built (§6.1); dashboard,
-> registry, and observe remain.** The control API is a Starlette/uvicorn app on
+> **Status: namespaced origin + data-plane proxy + session registry built
+> (§6.1); dashboard and observe remain.** The control API is a Starlette/uvicorn app on
 > `127.0.0.1:8813` (replacing the stdlib `ThreadingHTTPServer`). It answers bare
 > `/health` and control verbs under `/api/*` (`/api/data_plane/ensure`), redirects
 > `/` to the dataviewer for now, and reverse-proxies the tensor sidecar under the
@@ -251,7 +251,7 @@ namespace; no upstream owns the root, and no two upstreams share a path prefix.
 > catch-all is retired. The dataviewer is built base-path-aware for it
 > (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
 > **Remaining:** the control-owned buildless dashboard + control API
-> (`/api/status`, `/api/sessions`), the filesystem session registry, and
+> (`/api/status`, `/api/sessions` — reading the registry below), and
 > per-session `/session/<id>/` observe routing.
 
 ### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
@@ -318,11 +318,23 @@ observe's root-absolute `/api/*` fetches (`_observe.py`) rebase under
 (control dashboard, dataviewer, observe) become uniformly prefix-aware. CI/release
 env changes accordingly (`tensor-server-ci.yaml`, `release.yaml`).
 
-**Session discovery:** a **filesystem registry** (recommended for localhost) —
-each session writes `~/.local/share/biopb/sessions/<id>.json` (port + pid) on
-startup, removes it on reap; the control reads/watches that dir. Matches the
-existing sentinel/PID-file idioms; no new endpoint. (HTTP self-registration is
-the alternative if the front and children may later cross a machine boundary.)
+**Session discovery — a filesystem registry (BUILT).** Each session writes
+`~/.local/share/biopb/sessions/<id>.json` (host + port + pid + `/mcp` url) once
+its child is fully reachable, and removes it on reap; the control reads that dir.
+Matches the existing sentinel/PID-file idioms; no new endpoint. (HTTP
+self-registration is the alternative if the front and children may later cross a
+machine boundary.)
+
+*Implemented:* the on-disk contract lives in a shared, **stdlib-only**
+`biopb._config_sessions` (core SDK — the shim writes it, the control reads it, and
+neither can import the other, exactly like `_config_control`). `register()` writes
+atomically (temp + `os.replace`); `unregister()` is tied to the shim's single reap
+path (`_shim._reap_session`, so even the SIGTERM/SIGHUP signal handler that
+`os._exit`s past `serve`'s `finally` still de-registers — no routing ghost);
+`list_sessions()` **self-heals** by pruning + unlinking any record whose owning
+pid is dead (fail-open on an undecidable pid, and cross-platform — `os.kill(pid, 0)`
+on POSIX, `OpenProcess`/`GetExitCodeProcess` on Windows, never signal-0 on Windows
+where it would kill the target). This is the backstop for gotchas 2/3 above.
 
 **Why it is worth more than one bookmark:**
 - **Security win.** The observe UI currently fronts an `execute_code` RCE behind

@@ -21,6 +21,7 @@ import time
 
 import anyio
 import pytest
+from biopb import _config_sessions
 from mcp import types
 
 from biopb_mcp.mcp import _shim
@@ -178,19 +179,27 @@ class TestSpawnSession:
             _shim, "_session_command", lambda: [sys.executable, "-c", _FAKE_CHILD]
         )
         cfg = _cfg(kernel_log=str(tmp_path / "d.log"))
-        proc, url, job = _shim.spawn_session(cfg, timeout=15)
+        proc, url, job, session_id = _shim.spawn_session(cfg, timeout=15)
         try:
             m = re.match(r"http://127\.0\.0\.1:(\d+)/mcp$", url)
             assert m, url
-            assert _shim._port_listening(int(m.group(1))) is True
+            port = int(m.group(1))
+            assert _shim._port_listening(port) is True
             assert proc.poll() is None  # still running while we bridge
             if os.name == "nt":
                 assert job is not None  # Windows: a kill-on-close Job Object
             else:
                 assert job is None  # POSIX: reaped via the process group, not a job
+            # Self-registered so the control can discover + proxy to it.
+            rec = _config_sessions.read_session(session_id)
+            assert rec is not None
+            assert rec["port"] == port and rec["pid"] == proc.pid
+            assert rec["mcp_url"] == url
         finally:
-            _shim._reap_session(proc, job)
+            _shim._reap_session(proc, job, session_id)
         assert proc.poll() is not None  # reaped on the way out
+        # Reap de-registers, so the record is gone.
+        assert _config_sessions.read_session(session_id) is None
 
     def test_inherits_live_env_and_wires_dynamic_port(self, tmp_path, monkeypatch):
         # The #98 fix: the child inherits THIS shim's current environment, so a
@@ -216,7 +225,7 @@ class TestSpawnSession:
         monkeypatch.setattr(_shim.subprocess, "Popen", _fake_popen)
         monkeypatch.setattr(_shim, "_await_listening", lambda *a, **k: None)
 
-        proc, url, job = _shim.spawn_session(
+        proc, url, job, session_id = _shim.spawn_session(
             _cfg(kernel_log=str(tmp_path / "d.log")), timeout=5
         )
         assert url == "http://127.0.0.1:54321/mcp"
@@ -461,12 +470,22 @@ class TestEndToEnd:
             assert _pid_alive(child_pid)  # up now
             assert _shim._port_listening(port) is True
 
+            # Self-registered for control discovery while up (the shared biopb
+            # data tree, isolated here via HOME).
+            reg_dir = tmp_path / ".local/share/biopb/sessions"
+            records = list(reg_dir.glob("*.json"))
+            assert len(records) == 1, records
+            rec = json.loads(records[0].read_text())
+            assert rec["port"] == port and rec["pid"] == child_pid
+
             # Client hangs up: the shim must exit AND reap its private child
             # (the shared daemon used to survive — that is exactly what changed).
             shim.stdin.close()
             assert shim.wait(timeout=40) == 0
             _await_dead(child_pid, timeout=20)
             assert _shim._port_listening(port) is False  # server truly gone
+            # Reap de-registered it — no routing ghost left behind.
+            assert list(reg_dir.glob("*.json")) == []
         finally:
             if shim.poll() is None:
                 shim.kill()
