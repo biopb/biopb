@@ -14,10 +14,15 @@ share — the endpoint — lives here in the dependency-light core ``biopb`` SDK
 next to ``_config_location`` / ``_config_constraints``. Kept stdlib-only so
 importing it never drags in the heavy server/mcp stacks.
 
-This is the seed of the Layer-3 single-origin web front (see
-``biopb-mcp/docs/mcp-dedaemonization-migration.md``): for now the control serves
-only a control API here; later the same origin fronts the dataviewer + observe
-routes.
+This is the anchor of the Layer-3 single-origin web front (see
+``biopb-mcp/docs/mcp-dedaemonization-migration.md`` §6.1): the control serves a
+Starlette/uvicorn app on this port that answers its own control API (bare
+``/health``; control verbs under ``/api/*``, e.g. ``/api/data_plane/ensure``) and
+reverse-proxies the supervised tensor server's HTTP sidecar under a
+``/data_plane/*`` namespace (dataviewer at ``/data_plane/viewer``, data API at
+``/data_plane/api/*``, ``/data_plane/ws/render``). Each plane owns a path prefix
+so the ``/api/*`` namespaces never collide; per-session ``/session/<id>/`` routing
+joins the same origin in a later Layer-3 step.
 """
 
 import os

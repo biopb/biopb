@@ -1384,7 +1384,7 @@ install_biopb() {
     # Headlines via _info (indent 2, matching _ok/_warn), detail lines indent 4.
     # --- informational blocks ---
     if [ "$INSTALL_WEBAPP" = "1" ]; then
-        _info "Web interface available at http://localhost:8814"
+        _info "Web interface available at http://localhost:8813"
         echo ""
     fi
 

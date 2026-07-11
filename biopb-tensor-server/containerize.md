@@ -4,9 +4,10 @@
 
 This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container includes:
 
-- **FastAPI HTTP Server** (port 8814) - Serves React webapp, API endpoints, and health checks
+- **Control plane** (port 8813) - The single public web origin: serves the data viewer (`/data_plane/viewer`), reverse-proxies the API + health checks, and forwards the access token to the private sidecar
 - **TensorFlightServer** (gRPC on port 8815) - Arrow Flight server for tensor data
-- **Webapp** - React-based image browser UI (served by FastAPI)
+- **HTTP sidecar** (port 8814, internal) - FastAPI server behind the control plane; bound to loopback and not published
+- **Webapp** - React-based image browser UI (served by the control plane under `/data_plane/viewer`)
 
 ## Build Instructions
 
@@ -65,23 +66,29 @@ docker build --memory=4g --memory-swap=8g -t biopb-tensor-server:latest -f biopb
 ## Docker Usage
 
 ```bash
-docker run -d \
+docker run -d --init \
     --name biopb-tensor \
-    -p 8814:8814 \
+    -p 8813:8813 \
     -p 8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
     biopb-tensor-server:latest
 ```
 
+> `--init` runs a small init as PID 1 to reap zombies. The container's PID 1 is
+> the control plane, which handles `docker stop` (SIGTERM) gracefully and reaps
+> its own tensor-server child; `--init` is optional belt-and-suspenders for any
+> unrelated orphaned grandchildren. Publish `8813` (the web origin) and `8815`
+> (Flight gRPC); the HTTP sidecar `8814` is loopback-internal — do not publish it.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored |
+| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored. Its `[server].port` **must equal gRPC=`BIOPB_BASE_PORT`+5** and `[server].host` must be loopback-reachable (`0.0.0.0`/`127.0.0.1`), or the control plane's liveness probe won't see the data plane as serving |
 | `DATA_DIR` | `/data` | Container path of microscopy files; mount the host dir onto it with `-v /host/data:/data` (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
-| `BIOPB_BASE_PORT` | `8810` | Base port in container - HTTP=BASE+4, gRPC=BASE+5 |
+| `BIOPB_BASE_PORT` | `8810` | Base port in container. Derived: **control web origin=BASE+3** (publish this), HTTP sidecar=BASE+4 (loopback-internal), gRPC Flight=BASE+5 (publish for SDK clients) |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written. **Not to be confused with**  `$TMPDIR` |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
@@ -116,14 +123,17 @@ docker run \
 ### Examples
 
 ```bash
-# Custom base port (HTTP=9004, gRPC=9005)
-docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
+# Custom base port (BIOPB_BASE_PORT=9000 -> web origin=9003, gRPC=9005;
+# the HTTP sidecar 9004 stays loopback-internal and is not published)
+docker run -d -p 9003:9003 -p 9005:9005 -v ~/data:/data \
     -e BIOPB_BASE_PORT=9000 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
-# With custom config file
-docker run -d -p 8814:8814 -p 8815:8815 \
+# With custom config file. Its [server].port must match gRPC=BASE+5 (8815 here)
+# and bind a loopback-reachable host (0.0.0.0 or 127.0.0.1); otherwise the control
+# plane's liveness probe never sees the data plane. See the CONFIG_FILE note below.
+docker run -d -p 8813:8813 -p 8815:8815 \
     -v ~/my-config.json:/custom.json \
     -v ~/data:/data \
     -e CONFIG_FILE=/custom.json \
@@ -132,7 +142,7 @@ docker run -d -p 8814:8814 -p 8815:8815 \
 
 # Localhost-only access. A token is still required.
 docker run -d \
-    -p 127.0.0.1:8814:8814 \
+    -p 127.0.0.1:8813:8813 \
     -p 127.0.0.1:8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=mytoken \
@@ -216,11 +226,12 @@ singularity run \
 These checks report service readiness, not completion of monitored dataset discovery. A healthy container can still have zero visible monitored sources briefly after startup while stability gating defers initial registration.
 
 ```bash
-# Liveness (HTTP)
-curl http://localhost:8814/livez
+# Control-plane liveness (the container's web origin)
+curl http://localhost:8813/health
 
-# Readiness (HTTP)
-curl http://localhost:8814/readyz
+# Tensor-server liveness/readiness, proxied under the /data_plane namespace
+curl http://localhost:8813/data_plane/livez
+curl http://localhost:8813/data_plane/readyz
 
 # Flight server health action (gRPC)
 # Use Flight's do_action("health") for gRPC health status
@@ -228,7 +239,7 @@ curl http://localhost:8814/readyz
 
 ## Access the Webapp
 
-1. Open `http://localhost:8814/` in browser
+1. Open `http://localhost:8813/` in browser (redirects to `/data_plane/viewer`)
 2. Enter the token (shown once in container logs, or set via `BIOPB_TENSOR_TOKEN`)
 3. Browse microscopy datasets
 
@@ -247,7 +258,7 @@ Container (external ports 8814, 8815)
     └── do_get                 → fetch tensor data
 ```
 
-FastAPI serves both the webapp and API endpoints on port 8814. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
+The **control plane** is the container's single web origin (port 8813): it serves the webapp + API under `/data_plane` by reverse-proxying the FastAPI sidecar, which now binds privately to `127.0.0.1:8814` inside the container. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
 
 ### Network Binding Control
 
@@ -257,7 +268,7 @@ all interfaces (`0.0.0.0`) inside the container. Docker's port forwarding
 token-authenticated. The HTTP sidecar connects to the Flight server over loopback whenever it binds to a wildcard address — which is what this entrypoint always generates — so the bind change never affects the sidecar.
 
 **For localhost-only access:**
-- **Docker**: Use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` to restrict to host's localhost
+- **Docker**: Use `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` to restrict to host's localhost
 - **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind both HTTP and gRPC to localhost (useful on shared nodes)
 
 Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since it would break external access (services bound to 127.0.0.1 inside a container cannot be reached from outside).

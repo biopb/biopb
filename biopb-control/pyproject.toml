@@ -24,12 +24,24 @@ classifiers = [
 # Match the rest of the stack (biopb / biopb-tensor-server / biopb-mcp are all
 # >=3.10,<3.13). The control is deliberately lean: it *supervises* the durable
 # planes as subprocesses and never imports them (invariant I2 in
-# biopb-mcp/docs/mcp-dedaemonization-migration.md), so its only dependency is the
-# dependency-light core SDK, for the shared control-endpoint location
-# (biopb._config_control). No napari / dask / Qt / tensor-server / mcp imports.
+# biopb-mcp/docs/mcp-dedaemonization-migration.md). Its deps are the
+# dependency-light core SDK (for the shared control-endpoint location,
+# biopb._config_control) plus a light ASGI stack for the Layer-3 single-origin
+# web front (biopb_control._control): Starlette + uvicorn serve the origin,
+# httpx + websockets reverse-proxy the supervised tensor server's HTTP sidecar.
+# None of these drag in napari / dask / Qt / pyarrow / tensor-server / mcp, so
+# the lean-control discipline holds.
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "biopb",
+    "starlette>=0.37",
+    # >=0.34 for the sansio websockets server impl (ws="websockets-sansio"),
+    # which keeps the /ws/render proxy off the deprecated websockets.legacy path.
+    "uvicorn>=0.34",
+    "httpx>=0.27",
+    # >=13 for websockets.asyncio.client (the modern client the proxy dials the
+    # tensor sidecar's /ws/render with).
+    "websockets>=13",
 ]
 
 # Test/dev deps live in a PEP 735 group (kept out of published metadata), same

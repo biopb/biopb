@@ -170,18 +170,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # wheels/ feeds the Docker builds (both Dockerfiles COPY
-      # wheels/biopb-*.whl + wheels/biopb_tensor_server-*.whl). release-wheels/
-      # holds the GitHub-release assets (the wheel set + mcp sdist + webapp).
+      # wheels/ feeds the Docker builds. The tensor-server Dockerfile COPYs
+      # biopb-*.whl + biopb_tensor_server-*.whl + biopb_control-*.whl (the image
+      # runs the control as its single web origin); the image-runtime Dockerfile
+      # installs only biopb + biopb_tensor_server by name, ignoring the extra
+      # control wheel. release-wheels/ holds the GitHub-release assets.
       - name: Build wheels
         run: |
           uv build --package biopb --wheel --out-dir wheels
           uv build --package biopb-tensor-server --wheel --out-dir wheels
           uv build --package biopb-mcp --out-dir release-wheels
-          # biopb-control (control plane) ships in the bundle too, but is NOT in the
-          # Docker context (it is a local supervisor, not a containerized plane),
-          # so it builds straight to release-wheels/ and never into wheels/.
-          uv build --package biopb-control --wheel --out-dir release-wheels
+          # biopb-control now feeds the Docker image too (it is the container's web
+          # origin, supervising the tensor server), so it builds into wheels/ like
+          # the others; the cp below still lands it in the release-wheels/ bundle.
+          uv build --package biopb-control --wheel --out-dir wheels
           cp wheels/*.whl release-wheels/
 
       - name: Build webapp
@@ -189,7 +191,9 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm sync-version
           pnpm --filter @biopb/tensor-flight-client build
-          VITE_TENSOR_API="" pnpm --filter @biopb/web build
+          # Built for the control front (migration doc §6.1): served under
+          # /data_plane/viewer, data API + WS under /data_plane (both relative).
+          VITE_BASE_PATH="/data_plane/viewer/" VITE_TENSOR_API="/data_plane" pnpm --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
 
       # Curated CC0 sample images (docs/release-model.md). A fresh, config-less

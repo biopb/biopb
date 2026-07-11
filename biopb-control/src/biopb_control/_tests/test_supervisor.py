@@ -45,10 +45,15 @@ def _listener(port: int) -> socket.socket:
 
 @pytest.fixture
 def spec(tmp_path):
+    # web_port points at a free (closed) port so the control's reverse proxy to
+    # the tensor web sidecar fails deterministically (connection refused -> 502)
+    # in tests that exercise a path the control does not own itself.
     return DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
         grpc_port=_free_port(),
+        web_host="127.0.0.1",
+        web_port=_free_port(),
         server_log=tmp_path / "server.log",
     )
 
@@ -260,7 +265,7 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
     import urllib.request
 
     sup = DataPlaneSupervisor(spec)
-    # POST /data_plane/ensure spawns a real (binder) child the control owns.
+    # POST /api/data_plane/ensure spawns a real (binder) child the control owns.
     monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
     api_port = _free_port()
     server, _thread = serve_control_api("127.0.0.1", api_port, sup, ensure_timeout=8.0)
@@ -273,18 +278,20 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
 
         # Ensure spawns and waits until the port is up.
         req = urllib.request.Request(
-            f"{base}/data_plane/ensure", data=b"", method="POST"
+            f"{base}/api/data_plane/ensure", data=b"", method="POST"
         )
         ensured = json.loads(urllib.request.urlopen(req, timeout=10).read())
         assert ensured["data_plane"]["state"] == "serving"
         assert ensured["data_plane"]["pid"] is not None
 
-        # Unknown path -> 404 JSON, not a hang.
+        # A path under the /data_plane namespace is reverse-proxied to the tensor
+        # web sidecar. None is running (the fixture's web_port is closed), so the
+        # proxy returns a clean 502 -- not a control 404, not a hang.
         try:
-            urllib.request.urlopen(f"{base}/nope", timeout=3)
-            raise AssertionError("expected 404")
+            urllib.request.urlopen(f"{base}/data_plane/nope", timeout=3)
+            raise AssertionError("expected an HTTP error from the proxy")
         except urllib.error.HTTPError as exc:
-            assert exc.code == 404
+            assert exc.code == 502
     finally:
         server.shutdown()
         sup.stop()  # reap the binder child
