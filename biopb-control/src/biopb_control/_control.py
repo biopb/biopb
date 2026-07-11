@@ -71,9 +71,17 @@ class _ControlHandler(BaseHTTPRequestHandler):
         if self.path == "/data_plane/ensure":
             self._drain_body()
             sup = self._supervisor
-            sup.ensure()
-            sup.wait_until_up(self.server.ensure_timeout)  # type: ignore[attr-defined]
-            self._write_json(200, {"data_plane": sup.snapshot()})
+            # ensure()/_spawn_locked count a spawn failure toward the backoff and
+            # do not raise, but wrap defensively so any unexpected error still
+            # returns a clean JSON verdict (with the snapshot that reflects the
+            # counted failure) rather than an unhandled 500.
+            try:
+                sup.ensure()
+                sup.wait_until_up(self.server.ensure_timeout)  # type: ignore[attr-defined]
+                self._write_json(200, {"data_plane": sup.snapshot()})
+            except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+                logger.exception("data_plane/ensure failed")
+                self._write_json(500, {"error": str(exc), "data_plane": sup.snapshot()})
         else:
             self._write_json(404, {"error": "not found", "path": self.path})
 
@@ -99,7 +107,7 @@ def serve_control_api(
     """
     server = _ControlHTTPServer((host, port), supervisor, ensure_timeout)
     thread = threading.Thread(
-        target=server.serve_forever, name="control-control-api", daemon=True
+        target=server.serve_forever, name="control-api", daemon=True
     )
     thread.start()
     logger.info("Control API listening on http://%s:%d", host, port)

@@ -196,6 +196,28 @@ def test_ensure_after_crash_is_not_fooled_by_dead_handle(spec, monkeypatch):
     assert sup._proc is None  # (spawn is mocked, so no new handle set)
 
 
+def test_spawn_failure_counts_toward_backoff(spec, monkeypatch):
+    # A Popen that raises (bad executable, ENOMEM, EAGAIN) must NOT escape
+    # ensure()/the /data_plane/ensure handler: it is counted toward the backoff
+    # (failures bumped, retry window armed, last_error recorded) so repeated
+    # ensures don't hammer with no backoff.
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: False)  # port down
+
+    def boom(*_a, **_k):
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr("biopb_control._supervisor.subprocess.Popen", boom)
+
+    sup.ensure()  # must not raise
+    assert sup._proc is None
+    assert sup._state.failures == 1
+    assert sup._state.next_attempt_at > 0  # backoff armed
+    assert "failed to spawn" in (sup._state.last_error or "")
+    # snapshot stays clean/serviceable (the endpoint returns it as its verdict).
+    assert sup.snapshot()["state"] == "down"
+
+
 def test_backoff_grows_then_resets_on_recovery(spec, monkeypatch):
     sup = DataPlaneSupervisor(spec)
     sup._state.failures = 3

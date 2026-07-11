@@ -154,7 +154,17 @@ class DataPlaneSupervisor:
 
     # --- lifecycle ------------------------------------------------------- #
 
-    def _spawn_locked(self) -> None:
+    def _spawn_locked(self) -> bool:
+        """(Re)spawn the data plane. Returns True on success, False on a spawn
+        failure that has been counted toward the backoff.
+
+        A ``Popen`` that raises (OSError: a bad executable, ENOMEM, EAGAIN/too
+        many processes) is treated like a failed attempt -- ``failures`` is
+        bumped, the backoff window is armed, and ``last_error`` records it --
+        rather than propagating. That keeps a failing spawn from escaping
+        ``ensure`` / ``tick`` (and the ``/data_plane/ensure`` handler) uncounted
+        and hammering with no backoff.
+        """
         argv = self._build_argv()
         log = self._open_log()
         try:
@@ -166,18 +176,27 @@ class DataPlaneSupervisor:
             pass
         logger.info("Spawning data plane: %s", " ".join(argv))
         # No detachment: the plane is a *tracked* child of the control -- if the
-        # control dies the plane stays serving (already-spawned planes survive an
+        # control dies the plane stays serving (already-spawned planes survive a
         # control blip, migration doc S3), but while the control lives it owns and
         # can reap this child directly.
-        self._proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            env=self._child_env(),
-            close_fds=True,
-        )
+        try:
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                env=self._child_env(),
+                close_fds=True,
+            )
+        except OSError as exc:
+            st = self._state
+            st.failures += 1
+            st.last_error = f"failed to spawn data plane: {exc}"
+            st.next_attempt_at = time.monotonic() + self._backoff()
+            logger.error(st.last_error)
+            return False
         self._state.up_since = None
+        return True
 
     def _child_alive(self) -> bool:
         """Whether we hold a spawned child that is still running.
@@ -243,8 +262,10 @@ class DataPlaneSupervisor:
                 logger.error(st.last_error)
                 return
             st.last_error = None
-            self._spawn_locked()
-            st.next_attempt_at = time.monotonic() + self._backoff()
+            # On success arm the next-restart window; on a spawn failure
+            # _spawn_locked already counted it and armed the retry backoff.
+            if self._spawn_locked():
+                st.next_attempt_at = time.monotonic() + self._backoff()
 
     def _backoff(self) -> float:
         idx = min(self._state.failures, len(_BACKOFF_SCHEDULE) - 1)
@@ -295,8 +316,8 @@ class DataPlaneSupervisor:
             now = time.monotonic()
             if now < st.next_attempt_at:
                 return
-            self._spawn_locked()
-            st.next_attempt_at = now + self._backoff()
+            if self._spawn_locked():
+                st.next_attempt_at = now + self._backoff()
 
     def wait_until_up(self, timeout: float) -> bool:
         """Block until the plane's port is listening, or ``timeout`` elapses.
