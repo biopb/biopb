@@ -9,9 +9,15 @@ import "./index.css";
 
 const root = document.getElementById("root")!;
 
+// Router basename tracks the Vite base (import.meta.env.BASE_URL, e.g.
+// "/data_plane/viewer/" when the control front serves us under a namespace, "/"
+// when root-served). Strip the trailing slash React Router does not want; "" ->
+// "/" (its default) for the root-served case.
+const basename = import.meta.env.BASE_URL.replace(/\/$/, "") || "/";
+
 createRoot(root).render(
   <StrictMode>
-    <BrowserRouter>
+    <BrowserRouter basename={basename}>
       <ClientBootstrap />
       <Routes>
         <Route path="/" element={<HomePage />} />

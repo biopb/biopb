@@ -219,13 +219,15 @@ The structural fix. Highest value; unblocks single origin.
   exposes `GET /health` and `POST /data_plane/ensure` — the endpoint `_connection`
   calls in place of the old shell-out. This is the seed of the Layer-3 origin; it
   stays stdlib until the front replaces it with an ASGI app on the same port.
-- **The tensor server's HTTP sidecar is now fronted by the control**, no longer
-  meant as its own public origin: the Layer-3 front reverse-proxies the
-  dataviewer + `/api/*` + `/ws/render` through 8813, forwarding the Bearer token
-  *(done — Layer-3 origin step)*. Trimming the sidecar further to a minimal,
-  control-only internal HTTP (dropping its public web role entirely) is a later
-  refinement; the proxying that makes the data plane a private upstream is in
-  place.
+- **The tensor server's HTTP sidecar becomes a private upstream fronted by the
+  control**, no longer its own public origin. The Layer-3 front reverse-proxies
+  the data API + `/ws/render` (and the dataviewer static app) through 8813 under
+  a `/data_plane/*` namespace, forwarding the Bearer token *(origin + a flat
+  proxy done; the `/data_plane/*` namespacing + demoting the dataviewer to
+  `/data_plane/viewer` is the finalized Layer-3 target, see §6.1)*. Once the
+  control serves its own root dashboard and the dataviewer lives under
+  `/data_plane/viewer`, the sidecar has **no public web role left** — the trim is
+  complete, not a separate later refinement.
 
 Result: the cycle in §1.1 becomes a tree rooted at the control.
 
@@ -234,30 +236,87 @@ Result: the cycle in §1.1 becomes a tree rooted at the control.
 ## 6. Layer 3 — Single-origin web front (a facet of the control)
 
 The control *is* the durable web origin, so single origin falls out — it is no
-longer a reverse-proxy bolted onto the ephemeral sidecar.
+longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
+**own root dashboard** and reverse-proxies each downstream plane under its own
+namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
-> **Status: origin + data-plane proxy landed.** The control API is now a
-> Starlette/uvicorn app on `127.0.0.1:8813` (replacing the stdlib
-> `ThreadingHTTPServer`) that answers its own `/health` + `/data_plane/ensure`
-> and reverse-proxies everything else to the supervised tensor server's HTTP
-> sidecar — dataviewer static app, `/api/*`, health probes, and the `/ws/render`
-> WebSocket — with the Bearer token forwarded through (`biopb_control/_control.py`).
-> One origin now fronts the dataviewer. **Remaining:** session `/observe` routing
-> — the filesystem session registry + per-session reverse proxy (needs the
-> observe frontend's base-path fix, §3-gotcha-1).
+> **Status: namespaced origin + data-plane proxy built (§6.1); dashboard,
+> registry, and observe remain.** The control API is a Starlette/uvicorn app on
+> `127.0.0.1:8813` (replacing the stdlib `ThreadingHTTPServer`). It answers bare
+> `/health` and control verbs under `/api/*` (`/api/data_plane/ensure`), redirects
+> `/` to the dataviewer for now, and reverse-proxies the tensor sidecar under the
+> `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data API at
+> `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via explicit
+> prefix `Mount`s that strip the namespace (`biopb_control/_control.py`). The
+> catch-all is retired. The dataviewer is built base-path-aware for it
+> (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
+> **Remaining:** the control-owned buildless dashboard + control API
+> (`/api/status`, `/api/sessions`), the filesystem session registry, and
+> per-session `/session/<id>/` observe routing.
 
-**Routing:**
+### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
+
+Three decisions fix the routing shape:
+
+1. **Root `/` is the control's own dashboard, not the dataviewer.** A
+   **self-contained, buildless page** — a single embedded HTML+vanilla-JS
+   document served in-process, exactly the pattern `_observe.py` already uses (no
+   Vite/npm build, so the lean control stays buildless; a real SPA build is
+   deferred until the dashboard outgrows status+links). It shows each
+   sub-component's status, lists live MCP sessions, exposes the data-plane
+   `ensure`/`stop`/`restart` controls, and links to the dataviewer + its admin
+   page (enabled only when the data plane is `serving`) and to each session's
+   observe page.
+
+2. **Every downstream plane owns a path prefix; the root catch-all is retired.**
+   The flat "proxy everything else" mount is replaced by explicit `Mount`s. Each
+   plane's API lives under its own prefix, so the three `/api/*` namespaces that
+   used to collide at the root never meet:
+
+   | Whose API | Prefix |
+   |---|---|
+   | control (the root dashboard) | `/api/*` |
+   | data plane (tensor sidecar) | `/data_plane/api/*` |
+   | each MCP session (observe) | `/session/<id>/api/*` |
+
+3. **`/observe` stops being a magic singleton.** In the shim-owned, N-session
+   model "the current session" is under-defined, so the canonical route is
+   per-session — `/session/<id>/observe` (+ `/session/<id>/api/*`). A control-owned
+   `/sessions` list page (rendered from the registry) replaces the "current
+   session" guess; `/observe` at most becomes a convenience redirect to the sole
+   session when exactly one is live. `/mcp` is **not** reused as a session prefix —
+   it is the agent JSON-RPC transport, deliberately kept off this origin.
+
+**Routing (finalized target):**
 
 | Path | Target | Hop |
 |---|---|---|
-| `/`, control UI, dataviewer | control's own static app | in-process |
-| `/api/slice`, data API | tensor server's internal HTTP | loopback proxy |
-| `/observe`, observe API | the registered session's dynamic port | loopback proxy |
-| `/session/<id>/*` | that session's port (multi-session) | loopback proxy |
+| `/`, `/assets/*` | control's own dashboard | in-process (static, buildless) |
+| `/api/status` | all sub-components' state | in-process |
+| `/api/sessions` | live-session list (from the registry) | in-process |
+| `/api/data_plane/ensure` \| `stop` \| `restart` | supervisor verbs | in-process |
+| `/health` | bare liveness (installer / `_control_client`) | in-process |
+| `/data_plane/viewer`, `/data_plane/viewer/*` | tensor sidecar static (dataviewer) | loopback proxy |
+| `/data_plane/api/*` | tensor sidecar data API | loopback proxy |
+| `/data_plane/ws/render` | tensor sidecar render WebSocket | loopback proxy |
+| `/session/<id>/observe` | that session's observe page | loopback proxy |
+| `/session/<id>/api/*` | that session's observe API | loopback proxy |
 | `/mcp` (agent JSON-RPC) | **not routed here** — shim → child, direct/private | — |
 
-Keep the common case trivial: one active session → `/observe` → "the current
-session"; `/session/<id>/` is the multi-session refinement.
+`/data_plane/*` is a **pure proxy** into the tensor sidecar (prefix stripped
+before forwarding, since the sidecar serves `/api/*` at its own root); all
+control *verbs about* the plane live under `/api/data_plane/*`, so the two never
+mix. During the rewrite `/data_plane/ensure` moves to `/api/data_plane/ensure`
+(pre-release, so no legacy alias is kept); bare `/health` stays put as the
+load-bearing liveness probe.
+
+**Frontend base paths.** Serving the dataviewer under `/data_plane/viewer` and
+observe under `/session/<id>/` makes both base-path-dependent: the dataviewer
+builds with `base: '/data_plane/viewer/'` + `VITE_TENSOR_API="/data_plane"`, and
+observe's root-absolute `/api/*` fetches (`_observe.py`) rebase under
+`/session/<id>/`. Observe needed this rework regardless, so all three frontends
+(control dashboard, dataviewer, observe) become uniformly prefix-aware. CI/release
+env changes accordingly (`tensor-server-ci.yaml`, `release.yaml`).
 
 **Session discovery:** a **filesystem registry** (recommended for localhost) —
 each session writes `~/.local/share/biopb/sessions/<id>.json` (port + pid) on
@@ -275,10 +334,12 @@ the alternative if the front and children may later cross a machine boundary.)
   cross-origin config, no per-session-port CORS churn.
 
 **Gotchas (same class as the merge audit):**
-1. **Streaming.** Observe uses SSE; the proxy must stream (no buffering) and be
-   **exempt from any SPA 404→`index.html` fallback and the StaticFiles catch-all**
-   — register proxied routes first; use a streaming ASGI passthrough, not a
-   buffering fetch.
+1. **Streaming + explicit mounts.** Observe uses SSE; its proxy must stream (no
+   buffering). With the root catch-all retired for explicit prefix `Mount`s
+   (§6.1), the old "exempt observe from the StaticFiles 404→`index.html`
+   fallback" hazard goes away — the control dashboard's static fallback is scoped
+   to `/` and cannot swallow `/session/<id>/*` or `/data_plane/*`. Still use a
+   streaming ASGI passthrough, not a buffering fetch.
 2. **Stale upstreams.** A dead session must expire from the registry (file removed
    on reap / TTL) so the front returns a clean "session ended", not a hang.
 3. **Reap/registry consistency.** Tie registry cleanup to the shim's child-reap
@@ -339,11 +400,13 @@ flips it. Suggested order (value-first):
    refactor, shim ownership, dynamic-port handoff. Closes #98 (env inheritance)
    and lands #403/#402 in the shim-owned model. Session self-registration with the
    control is the remaining registry piece, folded into Layer 3.
-3. **Single-origin front (Layer 3).** Control routes `/observe`, absorbs the
-   dataviewer + control UI, terminates auth/TLS. Downgrade `biopb mcp` to the
-   standalone wrapper. *(Partial: the ASGI origin + the tensor-sidecar reverse
-   proxy — dataviewer, `/api/*`, `/ws/render` — shipped; `/observe` + the session
-   registry are the remaining sub-step.)*
+3. **Single-origin front (Layer 3).** Control serves its own root dashboard,
+   namespaces each plane under its prefix (`/data_plane/*`, `/session/<id>/*`),
+   moves the dataviewer to `/data_plane/viewer`, routes per-session observe, and
+   terminates auth/TLS. Downgrade `biopb mcp` to the standalone wrapper.
+   *(Partial: the ASGI origin + the namespaced `/data_plane/*` proxy + dataviewer
+   at `/data_plane/viewer` shipped; the control dashboard + control API, session
+   registry, and per-session observe are the remaining sub-steps — §6.1.)*
 4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---

@@ -1,29 +1,41 @@
 """The control plane's single web origin — a Starlette/uvicorn ASGI app on 8813.
 
 This is the Layer-3 front of the de-daemonization migration
-(``biopb-mcp/docs/mcp-dedaemonization-migration.md``). It replaces the earlier
-stdlib ``ThreadingHTTPServer`` control API with a real ASGI app **on the same
-port**, so one origin fronts everything a browser or client needs:
+(``biopb-mcp/docs/mcp-dedaemonization-migration.md``, §6.1). It replaces the
+earlier stdlib ``ThreadingHTTPServer`` control API with a real ASGI app **on the
+same port**, and routes by namespace so no two upstreams share a path prefix:
 
-- ``GET  /health``            -> ``{"control": "ok", "data_plane": {...}}`` — the
-                                 control's own liveness (what ``_control_client``
-                                 and the installer poll). Kept byte-for-byte.
-- ``POST /data_plane/ensure`` -> ensure the plane is up (bounded wait), then the
-                                 snapshot; ``biopb-mcp`` calls this in place of
-                                 shelling out ``biopb server start``. Unchanged.
-- **everything else** is reverse-proxied to the supervised tensor server's HTTP
-  sidecar (dataviewer static app, ``/api/*`` data API, ``/livez|/readyz|/healthz``
-  health probes, and the ``/ws/render`` WebSocket). The browser talks to one
-  origin; auth headers pass straight through to the sidecar, which re-validates.
+- ``GET  /health``                -> ``{"control": "ok", "data_plane": {...}}`` —
+                                     the control's own liveness (what
+                                     ``_control_client`` and the installer poll).
+                                     Bare, kept byte-for-byte.
+- ``POST /api/data_plane/ensure`` -> ensure the plane is up (bounded wait), then
+                                     the snapshot; ``biopb-mcp`` calls this in
+                                     place of shelling out ``biopb server start``.
+                                     Moved under ``/api/`` — control *verbs about*
+                                     the plane live there.
+- ``GET  /``                      -> redirect to the dataviewer for now; the
+                                     control's own buildless dashboard lands here
+                                     in a later Layer-3 step.
+- ``/data_plane/viewer[/*]`` and ``/data_plane/{api,ws,livez,...}`` are
+  reverse-proxied to the supervised tensor server's HTTP sidecar. Each is a
+  ``Mount`` that strips its prefix, so the sidecar (which serves ``/`` +
+  ``/api/*`` + ``/ws/render`` at its own root) needs no knowledge of the
+  ``/data_plane`` namespace. Auth headers pass straight through; the sidecar
+  re-validates.
+
+The three ``/api/*`` namespaces therefore never collide: the control's own API is
+``/api/*``, the data plane's is ``/data_plane/api/*``, and (later) each session's
+is ``/session/<id>/api/*``.
 
 Keeping the control lean (invariant I2) still holds: the ASGI stack
 (starlette/uvicorn/httpx/websockets) is light and pulls in no napari/dask/Qt/
 pyarrow, and the tensor server is still a *supervised subprocess* the control
 never imports — the proxy reaches it over loopback like any other client.
 
-Session ``/observe`` routing (per-session dynamic ports via the filesystem
-registry) is a later step of Layer 3; this module lands the origin + the
-data-plane proxy first.
+Session ``/session/<id>/`` routing (per-session dynamic ports via the filesystem
+registry) and the buildless dashboard are later steps of Layer 3; this module
+lands the namespaced origin + the data-plane proxy.
 """
 
 from __future__ import annotations
@@ -39,8 +51,13 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route, WebSocketRoute
+from starlette.responses import (
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect as ws_connect
 
@@ -94,13 +111,20 @@ def build_app(
     """Build the control-plane ASGI app.
 
     ``data_web_url`` is the loopback base URL of the supervised tensor server's
-    HTTP sidecar; every route the control does not own itself is reverse-proxied
-    there. Split out from :func:`serve_control_api` so it is unit-testable
-    against a fake upstream without binding uvicorn.
+    HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. Split out
+    from :func:`serve_control_api` so it is unit-testable against a fake upstream
+    without binding uvicorn.
     """
     ws_base = data_web_url.replace("http://", "ws://", 1).replace(
         "https://", "wss://", 1
     )
+
+    # One pooled client to the sidecar for the process lifetime; no timeout so
+    # large slice responses and long-poll probes are never cut off. Held in a
+    # closure (not ``app.state``) because the proxy runs inside a *mounted*
+    # sub-app whose ``request.app`` is the sub-app, not this one -- ``app.state``
+    # would read the wrong app's state. Closed by the app lifespan below.
+    proxy_client = httpx.AsyncClient(base_url=data_web_url, timeout=None)
 
     # --- control-owned endpoints (sync: they take the supervisor lock and do a
     # blocking TCP liveness probe, so Starlette runs them in its threadpool) --- #
@@ -132,14 +156,21 @@ def build_app(
                 status_code=500,
             )
 
-    # --- reverse proxy to the tensor server's HTTP sidecar ------------------ #
+    async def root(_request: Request) -> Response:
+        # The control's own buildless dashboard lands here in a later Layer-3
+        # step; until then send the origin root to the dataviewer so `/` is not a
+        # dead end.
+        return RedirectResponse(url="/data_plane/viewer/")
+
+    # --- reverse proxy into the tensor server's HTTP sidecar ---------------- #
+    # Handlers forward the *mount-relative* path (``Mount`` has already stripped
+    # the ``/data_plane[/viewer]`` prefix into ``path_params``), so the sidecar
+    # always sees a root-relative path regardless of which mount matched.
 
     async def proxy(request: Request) -> Response:
-        client: httpx.AsyncClient = request.app.state.proxy_client
-        # Preserve the exact path+query; base_url carries the tensor host:port.
+        target = "/" + request.path_params["path"]
         # Append the query only when present -- an empty one would render a bare
         # trailing "?" that changes the path the sidecar sees.
-        target = request.url.path
         if request.url.query:
             target = f"{target}?{request.url.query}"
         # Drop Host so httpx sets it from base_url; forward everything else
@@ -148,11 +179,11 @@ def build_app(
         # Request bodies here are small JSON (e.g. POST /api/slice params); read
         # fully so GETs carry no chunked body. Responses (images) are streamed.
         body = await request.body()
-        upstream = client.build_request(
+        upstream = proxy_client.build_request(
             request.method, target, headers=headers, content=body
         )
         try:
-            resp = await client.send(upstream, stream=True)
+            resp = await proxy_client.send(upstream, stream=True)
         except httpx.ConnectError:
             return JSONResponse({"error": "data plane not reachable"}, status_code=502)
         resp_headers = [
@@ -166,10 +197,11 @@ def build_app(
         )
 
     async def ws_proxy(client_ws: WebSocket) -> None:
-        # The dataviewer's render channel. Token travels as a ?token= query param
-        # (browsers can't set WS headers), so forwarding path+query authenticates.
+        # The dataviewer's render channel; the sidecar serves it at /ws/render.
+        # Token travels as a ?token= query param (browsers can't set WS headers),
+        # so forwarding the query authenticates.
         await client_ws.accept()
-        target = ws_base + client_ws.url.path
+        target = ws_base + "/ws/render"
         if client_ws.url.query:
             target += "?" + client_ws.url.query
         try:
@@ -181,28 +213,37 @@ def build_app(
             with contextlib.suppress(Exception):
                 await client_ws.close()
 
+    # One sub-app proxying to the sidecar root, mounted at BOTH /data_plane/viewer
+    # (the dataviewer's static base) and /data_plane (its /api, /ws, health). Each
+    # Mount strips its own prefix, so the same handlers serve both without the
+    # sidecar knowing the namespace. Reusing one instance is safe -- it is
+    # stateless (routes only). /ws/render must precede the catch-all.
+    sidecar = Starlette(
+        routes=[
+            WebSocketRoute("/ws/render", ws_proxy),
+            Route(
+                "/{path:path}",
+                proxy,
+                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+            ),
+        ]
+    )
+
     routes = [
         Route("/health", health, methods=["GET"]),
-        Route("/data_plane/ensure", data_plane_ensure, methods=["POST"]),
-        WebSocketRoute("/ws/render", ws_proxy),
-        # Catch-all LAST so the control's own endpoints win; everything else
-        # (/, static dataviewer, /api/*, /livez|/readyz|/healthz) proxies through.
-        Route(
-            "/{path:path}",
-            proxy,
-            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-        ),
+        Route("/api/data_plane/ensure", data_plane_ensure, methods=["POST"]),
+        Route("/", root, methods=["GET"]),
+        # /data_plane/viewer FIRST so it wins over the broader /data_plane mount.
+        Mount("/data_plane/viewer", sidecar),
+        Mount("/data_plane", sidecar),
     ]
 
     @contextlib.asynccontextmanager
-    async def lifespan(app: Starlette):
-        # One pooled client for the process lifetime; no timeout so large slice
-        # responses and long-poll health probes are never cut off by the proxy.
-        app.state.proxy_client = httpx.AsyncClient(base_url=data_web_url, timeout=None)
+    async def lifespan(_app: Starlette):
         try:
             yield
         finally:
-            await app.state.proxy_client.aclose()
+            await proxy_client.aclose()
 
     return Starlette(routes=routes, lifespan=lifespan)
 

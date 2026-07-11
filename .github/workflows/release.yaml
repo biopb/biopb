@@ -189,7 +189,9 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm sync-version
           pnpm --filter @biopb/tensor-flight-client build
-          VITE_TENSOR_API="" pnpm --filter @biopb/web build
+          # Built for the control front (migration doc §6.1): served under
+          # /data_plane/viewer, data API + WS under /data_plane (both relative).
+          VITE_BASE_PATH="/data_plane/viewer/" VITE_TENSOR_API="/data_plane" pnpm --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
 
       # Curated CC0 sample images (docs/release-model.md). A fresh, config-less

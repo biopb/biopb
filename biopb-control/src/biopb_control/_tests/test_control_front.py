@@ -1,11 +1,12 @@
 """Tests for the Layer-3 single-origin front (``_control`` ASGI app).
 
-Two concerns beyond the health/ensure control API (covered in
-``test_supervisor``): (1) the control's own routes win over the catch-all, and
-(2) everything else is faithfully reverse-proxied to the tensor web sidecar --
-method, path, query, headers, request/response bodies, and the ``/ws/render``
-WebSocket. A trivial stdlib HTTP server and a ``websockets`` echo server stand
-in for the tensor sidecar so no real tensor server is needed.
+Concerns beyond the health/ensure control API (covered in ``test_supervisor``):
+(1) the control's own routes win, (2) the ``/data_plane`` namespace faithfully
+reverse-proxies to the tensor web sidecar -- method, path, query, headers,
+request/response bodies, and the ``/ws/render`` WebSocket -- with the mount
+prefix stripped, and (3) ``/`` redirects to the dataviewer. A trivial stdlib
+HTTP server and a ``websockets`` echo server stand in for the tensor sidecar so
+no real tensor server is needed.
 """
 
 import json
@@ -102,8 +103,13 @@ def _get(url, headers=None):
         return resp.status, resp.headers, resp.read()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_a, **_k):
+        return None  # surface the 3xx as an HTTPError instead of following it
+
+
 def test_control_health_is_not_proxied(control):
-    # /health is the control's own endpoint and must win over the catch-all.
+    # /health is the control's own endpoint and must win over the proxy mounts.
     status, _headers, body = _get(f"{control}/health")
     assert status == 200
     payload = json.loads(body)
@@ -113,22 +119,41 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_get_is_proxied_with_path_query_and_auth(control):
+def test_root_redirects_to_dataviewer(control):
+    # `/` sends the origin root to the dataviewer (until the dashboard lands).
+    opener = urllib.request.build_opener(_NoRedirect)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        opener.open(f"{control}/", timeout=5)
+    assert exc.value.code in (302, 307)
+    assert exc.value.headers["Location"] == "/data_plane/viewer/"
+
+
+def test_data_api_is_proxied_with_prefix_stripped_query_and_auth(control):
     status, headers, body = _get(
-        f"{control}/api/sources?limit=5",
+        f"{control}/data_plane/api/sources?limit=5",
         headers={"Authorization": "Bearer sekret"},
     )
     assert status == 200
     assert headers.get("X-From-Upstream") == "yes"  # response came from upstream
     echoed = json.loads(body)
+    # /data_plane stripped by the Mount; the sidecar sees a root-relative path.
     assert echoed["path"] == "/api/sources?limit=5"  # path + query preserved
     assert echoed["method"] == "GET"
     assert echoed["auth"] == "Bearer sekret"  # auth forwarded for re-validation
 
 
+def test_dataviewer_static_is_proxied_with_prefix_stripped(control):
+    # The /data_plane/viewer mount strips its (longer) prefix down to the sidecar
+    # root, where the static app lives -- so assets resolve.
+    _status, _headers, body = _get(f"{control}/data_plane/viewer/assets/app.js")
+    assert json.loads(body)["path"] == "/assets/app.js"
+    _status, _headers, root_body = _get(f"{control}/data_plane/viewer/")
+    assert json.loads(root_body)["path"] == "/"  # index.html at the sidecar root
+
+
 def test_post_body_is_proxied(control):
     req = urllib.request.Request(
-        f"{control}/api/slice",
+        f"{control}/data_plane/api/slice",
         data=b'{"z": 3}',
         method="POST",
         headers={"Content-Type": "application/json"},
@@ -159,7 +184,10 @@ def test_unknown_upstream_returns_502(tmp_path):
     )
     try:
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(f"http://127.0.0.1:{api_port}/x", timeout=5)
+            # Under the /data_plane namespace so it reaches the (down) proxy.
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{api_port}/data_plane/x", timeout=5
+            )
         assert exc.value.code == 502
     finally:
         server.shutdown()
@@ -203,7 +231,9 @@ def test_websocket_render_is_proxied(ws_upstream, tmp_path):
         "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=ws_upstream
     )
     try:
-        with ws_connect(f"ws://127.0.0.1:{api_port}/ws/render?token=t") as ws:
+        with ws_connect(
+            f"ws://127.0.0.1:{api_port}/data_plane/ws/render?token=t"
+        ) as ws:
             ws.send("hello")
             assert ws.recv() == "echo:hello"  # text both ways
             assert ws.recv() == b"\x00\x01\x02"  # binary upstream -> client

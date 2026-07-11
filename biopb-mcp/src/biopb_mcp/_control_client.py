@@ -39,8 +39,8 @@ def control_reachable(timeout: float = 1.0) -> bool:
 def ensure_data_plane(timeout: float = 60.0) -> dict | None:
     """Ask the control to ensure the data plane is up; return its snapshot.
 
-    POSTs ``/data_plane/ensure`` — idempotent on the control side (spawn the plane
-    it owns, then wait until listening). Returns the ``data_plane`` snapshot dict
+    POSTs ``/api/data_plane/ensure`` — idempotent on the control side (spawn the
+    plane it owns, then wait until listening). Returns the ``data_plane`` snapshot dict
     on success, or ``None`` if the control is unreachable (not running) or errored,
     so the caller can fall back to surfacing "start the control" rather than
     raising.
@@ -53,7 +53,9 @@ def ensure_data_plane(timeout: float = 60.0) -> dict | None:
     """
     from urllib.parse import urlencode
 
-    url = f"{_base_url()}/data_plane/ensure?{urlencode({'client_timeout': timeout})}"
+    url = (
+        f"{_base_url()}/api/data_plane/ensure?{urlencode({'client_timeout': timeout})}"
+    )
     req = urllib.request.Request(url, data=b"", method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

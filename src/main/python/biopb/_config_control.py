@@ -15,11 +15,14 @@ next to ``_config_location`` / ``_config_constraints``. Kept stdlib-only so
 importing it never drags in the heavy server/mcp stacks.
 
 This is the anchor of the Layer-3 single-origin web front (see
-``biopb-mcp/docs/mcp-dedaemonization-migration.md``): the control now serves a
-Starlette/uvicorn app on this port that answers its own control API
-(``/health``, ``/data_plane/ensure``) and reverse-proxies everything else to the
-supervised tensor server's HTTP sidecar (dataviewer + ``/api/*`` + ``/ws/render``).
-Per-session ``/observe`` routing joins the same origin in a later Layer-3 step.
+``biopb-mcp/docs/mcp-dedaemonization-migration.md`` §6.1): the control serves a
+Starlette/uvicorn app on this port that answers its own control API (bare
+``/health``; control verbs under ``/api/*``, e.g. ``/api/data_plane/ensure``) and
+reverse-proxies the supervised tensor server's HTTP sidecar under a
+``/data_plane/*`` namespace (dataviewer at ``/data_plane/viewer``, data API at
+``/data_plane/api/*``, ``/data_plane/ws/render``). Each plane owns a path prefix
+so the ``/api/*`` namespaces never collide; per-session ``/session/<id>/`` routing
+joins the same origin in a later Layer-3 step.
 """
 
 import os
