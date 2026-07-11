@@ -240,32 +240,32 @@ longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
 **own root dashboard** and reverse-proxies each downstream plane under its own
 namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
-> **Status: namespaced origin + data-plane proxy + session registry +
-> per-session observe built (§6.1); only the dashboard remains.** The control API is a Starlette/uvicorn app on
-> `127.0.0.1:8813` (replacing the stdlib `ThreadingHTTPServer`). It answers bare
-> `/health` and control verbs under `/api/*` (`/api/data_plane/ensure`), redirects
-> `/` to the dataviewer for now, and reverse-proxies the tensor sidecar under the
-> `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data API at
-> `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via explicit
-> prefix `Mount`s that strip the namespace (`biopb_control/_control.py`). The
-> catch-all is retired. The dataviewer is built base-path-aware for it
+> **Status: complete.** Namespaced origin + data-plane proxy + session registry +
+> per-session observe + the control-owned dashboard are all built (§6.1). The
+> control API is a Starlette/uvicorn app on `127.0.0.1:8813` (replacing the stdlib
+> `ThreadingHTTPServer`). It answers bare `/health`, the control API under `/api/*`
+> (`/api/status`, `/api/sessions`, `/api/data_plane/{ensure,stop,restart}`), serves
+> its **own buildless dashboard** at `/`, and reverse-proxies the tensor sidecar
+> under the `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data
+> API at `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via
+> explicit prefix `Mount`s that strip the namespace (`biopb_control/_control.py`).
+> The catch-all is retired. The dataviewer is built base-path-aware for it
 > (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
-> **Remaining:** only the control-owned buildless dashboard at `/` + its control
-> API (`/api/status`, `/api/sessions` — reading the registry below).
 
 ### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
 
 Three decisions fix the routing shape:
 
-1. **Root `/` is the control's own dashboard, not the dataviewer.** A
+1. **Root `/` is the control's own dashboard, not the dataviewer. (BUILT.)** A
    **self-contained, buildless page** — a single embedded HTML+vanilla-JS
    document served in-process, exactly the pattern `_observe.py` already uses (no
    Vite/npm build, so the lean control stays buildless; a real SPA build is
-   deferred until the dashboard outgrows status+links). It shows each
-   sub-component's status, lists live MCP sessions, exposes the data-plane
-   `ensure`/`stop`/`restart` controls, and links to the dataviewer + its admin
-   page (enabled only when the data plane is `serving`) and to each session's
-   observe page.
+   deferred until the dashboard outgrows status+links). It polls `/api/status`
+   (the data-plane snapshot + a live-session count) and `/api/sessions`, exposes
+   the data-plane `ensure`/`stop`/`restart` controls (POSTing the
+   `/api/data_plane/*` verbs), links to the dataviewer (enabled only when the
+   data plane is `serving`), and lists each live session with its
+   `/session/<id>/observe` link.
 
 2. **Every downstream plane owns a path prefix; the root catch-all is retired.**
    The flat "proxy everything else" mount is replaced by explicit `Mount`s. Each
@@ -439,9 +439,10 @@ flips it. Suggested order (value-first):
    namespaces each plane under its prefix (`/data_plane/*`, `/session/<id>/*`),
    moves the dataviewer to `/data_plane/viewer`, routes per-session observe, and
    terminates auth/TLS. Downgrade `biopb mcp` to the standalone wrapper.
-   *(Partial: the ASGI origin + the namespaced `/data_plane/*` proxy + dataviewer
-   at `/data_plane/viewer` shipped; the control dashboard + control API, session
-   registry, and per-session observe are the remaining sub-steps — §6.1.)*
+   *(Built: the ASGI origin, the namespaced `/data_plane/*` proxy, the dataviewer
+   at `/data_plane/viewer`, the session registry, per-session observe, and the
+   control dashboard + control API — §6.1. Auth/TLS termination and the `biopb mcp`
+   downgrade loose ends remain.)*
 4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---
