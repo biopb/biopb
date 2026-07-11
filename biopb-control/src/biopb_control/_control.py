@@ -247,6 +247,20 @@ def build_app(
         # live loopback target via the registry — an unknown/dead one is a clean
         # 404 (and the dead record is pruned by resolve()).
         session_id = request.path_params["session_id"]
+        sub_path = request.path_params["path"]
+        # The agent JSON-RPC transport (/mcp) is deliberately NOT served on this
+        # origin (§6.1): every agent reaches the child's /mcp directly on its own
+        # loopback port (stdio shim bridge / `biopb mcp view`), never via the
+        # control. Proxying it here would be actively unsafe — this hop strips
+        # Host/Origin (below), which is the child's *entire* /mcp auth boundary,
+        # so a proxied /mcp would expose the execute_code RCE through the public
+        # control origin. Refuse it; only the browser surfaces (/observe, /api/*)
+        # are routed.
+        if sub_path == "mcp" or sub_path.startswith("mcp/"):
+            return JSONResponse(
+                {"error": "the agent transport (/mcp) is not served on this origin"},
+                status_code=404,
+            )
         rec = _config_sessions.resolve(session_id)
         if rec is None:
             return JSONResponse(
@@ -254,7 +268,7 @@ def build_app(
                 status_code=404,
             )
         base = _loopback_url(rec.get("host", "127.0.0.1"), rec["port"])
-        target = base + "/" + request.path_params["path"]
+        target = base + "/" + sub_path
         if request.url.query:
             target = f"{target}?{request.url.query}"
         # Drop Host AND Origin: httpx sets Host from the target (127.0.0.1:<port>,
