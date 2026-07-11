@@ -69,9 +69,11 @@ import threading
 
 import httpx
 import uvicorn
-from biopb import _config_sessions
+from biopb import _config_sessions, _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -80,6 +82,7 @@ from starlette.responses import (
     StreamingResponse,
 )
 from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect as ws_connect
 
@@ -107,6 +110,76 @@ _HOP_BY_HOP = frozenset(
 # traversal like `api/../mcp` (or its %2e%2e form, already decoded by the ASGI
 # server) collapses to /mcp past a naive "startswith('mcp')" check.
 _SESSION_ALLOWED_ROOTS = frozenset({"observe", "api"})
+
+# HTTP methods that change state (so they carry a CSRF risk); safe verbs
+# (GET/HEAD/OPTIONS) don't.
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# The one /api/ route left unauthenticated: biopb-mcp's _control_client POSTs it
+# to bring the plane up, and it is idempotent (spawns the plane the control
+# already owns), so it stays open rather than forcing the mcp client to carry the
+# token (the accepted #417 posture). The dangerous verbs (stop/restart) and the
+# enumerating reads (status/sessions) are gated.
+_AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
+
+
+class _ControlAuthMiddleware:
+    """Gate the control's **own** API (``/api/*``) at the single origin (§6.1).
+
+    A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches *only*
+    ``/api/*`` requests and leaves the streaming ``/data_plane`` and ``/session``
+    proxies to pass straight through untouched — wrapping those in
+    ``BaseHTTPMiddleware`` would interfere with their ``StreamingResponse`` +
+    background-close.
+
+    Policy, mirroring the tensor sidecar so the two agree:
+
+    - **Token configured** → require a valid ``Authorization: Bearer`` /
+      ``X-Biopb-Token`` (401 otherwise). This is the whole point of the single
+      origin: the token that already gates the data plane now also gates the
+      control's stop/restart verbs and the session enumeration.
+    - **No token** (the all-localhost dev-bypass) → require a **loopback Host**
+      (421 otherwise), so a DNS-rebinding page can't drive the token-less origin.
+    - **Unsafe method** (POST/…) → additionally refuse a forgeable cross-site
+      request (403) — a token header or a same-origin ``Sec-Fetch-Site`` passes,
+      a browser's cross-site POST does not (CSRF).
+
+    ``/data_plane/*`` keeps its own gate (the sidecar re-validates the forwarded
+    token) and ``/session/*`` is deferred to step 3 (observe must learn to send
+    the token first); neither is touched here.
+    """
+
+    def __init__(self, app: ASGIApp, token: str | None) -> None:
+        self.app = app
+        self._token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and self._guarded(scope["path"]):
+            get = Headers(scope=scope).get
+            denial = self._deny(scope["method"], get)
+            if denial is not None:
+                await denial(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _guarded(path: str) -> bool:
+        return path.startswith("/api/") and path not in _AUTH_EXEMPT_API_PATHS
+
+    def _deny(self, method: str, get: _web_auth.HeaderGetter) -> Response | None:
+        """The response to send if the request is refused, else ``None``."""
+        if self._token:
+            if not _web_auth.token_valid(get, self._token):
+                return JSONResponse(
+                    {"error": "invalid or missing token"}, status_code=401
+                )
+        elif not _web_auth.host_is_loopback(get("host")):
+            return JSONResponse({"error": "invalid Host header"}, status_code=421)
+        if method in _UNSAFE_METHODS and _web_auth.is_forgeable_cross_site(get):
+            return JSONResponse(
+                {"error": "cross-site request refused"}, status_code=403
+            )
+        return None
 
 
 def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
@@ -141,13 +214,16 @@ def build_app(
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
     data_web_url: str,
+    token: str | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
     ``data_web_url`` is the loopback base URL of the supervised tensor server's
-    HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. Split out
-    from :func:`serve_control_api` so it is unit-testable against a fake upstream
-    without binding uvicorn.
+    HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. ``token``
+    is the data-plane access token (``None`` in the all-localhost dev-bypass
+    case); the ``/api/*`` gate enforces it when set, else falls back to a loopback
+    Host check. Split out from :func:`serve_control_api` so it is unit-testable
+    against a fake upstream without binding uvicorn.
     """
     ws_base = data_web_url.replace("http://", "ws://", 1).replace(
         "https://", "wss://", 1
@@ -436,7 +512,10 @@ def build_app(
             await proxy_client.aclose()
             await session_client.aclose()
 
-    return Starlette(routes=routes, lifespan=lifespan)
+    # The /api/* auth gate wraps the whole app but acts only on /api/* (pure ASGI,
+    # so the streaming proxies pass through untouched).
+    middleware = [Middleware(_ControlAuthMiddleware, token=token)]
+    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 async def _pump_websocket(client_ws: WebSocket, upstream) -> None:
@@ -508,11 +587,14 @@ def serve_control_api(
 
     Returns ``(server, thread)``; the caller stops it with ``server.shutdown()``.
     """
+    spec = supervisor._spec
     if data_web_url is None:
-        spec = supervisor._spec
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
-    app = build_app(supervisor, ensure_timeout, data_web_url)
+    # The data-plane token gates the control's own /api/* too (single origin,
+    # §6.1). None in the all-localhost dev-bypass case -> the gate falls back to a
+    # loopback Host check instead.
+    app = build_app(supervisor, ensure_timeout, data_web_url, token=spec.token)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -632,9 +714,30 @@ function esc(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// The control's own /api/* is token-gated at this single origin. Reuse the
+// dataviewer's sessionStorage token (same origin now, key 'biopb_token') as an
+// Authorization: Bearer header; on a 401, prompt once and retry. In the common
+// no-token localhost deployment there is no token and the header is just absent.
+async function fetchAuth(url, opts) {
+  opts = opts || {};
+  const t = sessionStorage.getItem('biopb_token');
+  opts.headers = Object.assign({}, opts.headers,
+                               t ? {Authorization: 'Bearer ' + t} : {});
+  const r = await fetch(url, opts);
+  if (r.status === 401 && !opts._retried) {
+    const nt = prompt('Access token required:');
+    if (nt) {
+      sessionStorage.setItem('biopb_token', nt);
+      opts._retried = true;
+      return fetchAuth(url, opts);
+    }
+  }
+  return r;
+}
+
 async function jpost(url) {
   try {
-    const r = await fetch(url, {method: 'POST'});
+    const r = await fetchAuth(url, {method: 'POST'});
     return await r.json().catch(() => ({}));
   } catch (e) { return {error: String(e)}; }
 }
@@ -659,7 +762,7 @@ function renderDataPlane(dp) {
 
 async function pollStatus() {
   let s;
-  try { s = await (await fetch('/api/status')).json(); }
+  try { s = await (await fetchAuth('/api/status')).json(); }
   catch (e) { el('conn').textContent = 'control unreachable'; return; }
   el('conn').textContent = 'control: ok · ' + (s.sessions || 0) + ' session(s)';
   renderDataPlane(s.data_plane || {});
@@ -667,7 +770,7 @@ async function pollStatus() {
 
 async function pollSessions() {
   let data;
-  try { data = await (await fetch('/api/sessions')).json(); }
+  try { data = await (await fetchAuth('/api/sessions')).json(); }
   catch (e) { return; }
   const list = (data && data.sessions) || [];
   const box = el('sessions');

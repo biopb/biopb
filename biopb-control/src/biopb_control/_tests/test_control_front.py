@@ -225,6 +225,121 @@ def test_data_plane_restart_stops_then_ensures(tmp_path):
         server.shutdown()
 
 
+# --------------------------------------------------------------------------- #
+# /api/* auth gate (§6.1 — the control's own API on the single origin)
+# --------------------------------------------------------------------------- #
+_TOKEN = "test-control-token-123"
+
+
+@pytest.fixture
+def tokened_control(upstream, tmp_path):
+    """A control configured with a data-plane token; its /api/* is gated by it."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        token=_TOKEN,
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        yield f"http://127.0.0.1:{api_port}"
+    finally:
+        server.shutdown()
+
+
+def test_control_api_requires_token_when_configured(tokened_control):
+    # Missing token -> 401.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/api/status")
+    assert exc.value.code == 401
+    # Wrong token -> 401.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/api/status", headers={"Authorization": "Bearer nope"})
+    assert exc.value.code == 401
+    # Correct Bearer -> 200; the X-Biopb-Token scheme is accepted too.
+    status, _h, body = _get(
+        f"{tokened_control}/api/status", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+    assert status == 200 and json.loads(body)["control"] == "ok"
+    status, _h, _b = _get(
+        f"{tokened_control}/api/sessions", headers={"X-Biopb-Token": _TOKEN}
+    )
+    assert status == 200
+
+
+def test_ensure_verb_is_exempt_from_token(tmp_path, upstream):
+    # biopb-mcp's _control_client POSTs ensure with no token; it stays open even
+    # on a tokened control (idempotent, spawns the already-owned plane). Spy the
+    # supervisor so the gate is exercised without actually launching a plane.
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        token=_TOKEN,
+    )
+    sup = DataPlaneSupervisor(spec)
+    sup.ensure = lambda: None
+    sup.wait_until_up = lambda w: True
+    sup.snapshot = lambda: {"state": "serving"}
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/api/data_plane/ensure",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:  # no token -> 200
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+
+
+def test_health_and_dashboard_are_exempt_from_token(tokened_control):
+    # The liveness probe and the dashboard shell must load without a token (the
+    # shell then sends the token on its /api/* fetches).
+    assert _get(f"{tokened_control}/health")[0] == 200
+    assert _get(f"{tokened_control}/")[0] == 200
+
+
+def test_data_plane_proxy_is_not_gated_by_the_control_token(tokened_control):
+    # /data_plane/* is the sidecar's surface (it re-validates the forwarded
+    # token); the control's /api/ gate must not touch it, so it still proxies.
+    status, _h, body = _get(f"{tokened_control}/data_plane/api/sources")
+    assert status == 200
+    assert json.loads(body)["path"] == "/api/sources"
+
+
+def test_token_less_api_rejects_non_loopback_host(control):
+    # No token -> /api/* falls back to a loopback Host guard (rebinding backstop);
+    # a forged external Host is refused.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/api/status", headers={"Host": "evil.example:8813"})
+    assert exc.value.code == 421
+
+
+def test_token_less_api_refuses_forgeable_cross_site_write(control):
+    # A browser cross-site POST (Sec-Fetch-Site: cross-site, no token header) is
+    # refused as CSRF before it can reach the stop side-effect -- even though the
+    # loopback Host would otherwise pass.
+    req = urllib.request.Request(
+        f"{control}/api/data_plane/stop",
+        data=b"",
+        method="POST",
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
+
+
 def test_data_api_is_proxied_with_prefix_stripped_query_and_auth(control):
     status, headers, body = _get(
         f"{control}/data_plane/api/sources?limit=5",

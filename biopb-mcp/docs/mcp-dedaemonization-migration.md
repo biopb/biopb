@@ -333,7 +333,9 @@ child's `/mcp` directly (§6.1 decision 3). The
 derives `BASE = location.pathname.replace(/\/observe\/?$/, '')` at runtime and
 prefixes every `/api/*` call, so the same static page works served directly
 (`BASE = ""`) or behind `/session/<id>/`. The control never rewrites the HTML
-(keeps I2 — it stays oblivious to observe's contents).
+(keeps I2 — it stays oblivious to observe's contents). Origin-wide token auth is
+now implemented for the control's own `/api/*` (see "Origin auth — step 1" below);
+`/session/<id>/*` gating is the remaining piece.
 
 **Session discovery — a filesystem registry (BUILT).** Each session writes
 `~/.local/share/biopb/sessions/<id>.json` (host + port + pid + `/mcp` url) once
@@ -367,6 +369,23 @@ pid. This is the backstop for gotchas 2/3 above.
   hardening — **one origin to front, not N dynamic ports.**
 - **No CORS** — same origin for dataviewer + observe → shared token/cookie, no
   cross-origin config, no per-session-port CORS churn.
+
+**Origin auth — step 1 implemented.** The control's **own** API (`/api/*`) is now
+gated at the origin: when a data-plane token is configured it is required
+(`Authorization: Bearer` / `X-Biopb-Token`); when it isn't (the all-localhost
+dev-bypass) a **loopback Host** check is the rebinding backstop; and every
+state-changing verb additionally refuses a forgeable cross-site request (CSRF),
+mirroring the sidecar's `_require_same_origin`. The decisions live in a shared,
+**stdlib-only `biopb._web_auth`** — predicates the control, the tensor sidecar, and
+observe can all import (none can import another, I2), so a later
+behavior-preserving refactor can fold the sidecar's `check_token` /
+`_require_same_origin` onto it. This closes the stop/restart CSRF-DoS and the
+`/api/sessions` enumeration that the dashboard (#14) opened. `/api/data_plane/ensure`
+stays open (idempotent; biopb-mcp's token-less `_control_client` posts it), and the
+dashboard sends the token from the dataviewer's same-origin `sessionStorage`.
+**Remaining:** gate `/session/<id>/*` (needs observe to learn to send the token —
+pairs with the sidecar refactor) and teach `_control_client` to carry the token so
+`ensure` can be gated too; TLS termination stays a front-proxy concern (§1).
 
 **Gotchas (same class as the merge audit):**
 1. **Streaming + explicit mounts.** Observe uses SSE; its proxy must stream (no
