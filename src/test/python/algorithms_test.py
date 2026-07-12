@@ -155,6 +155,28 @@ def test_probe_unreachable_on_closed_port():
     assert result["error"]  # a code/detail string, not None
 
 
+@pytest.mark.parametrize("url", ["grpc://[::1", "grpcs://[bad"])
+def test_probe_does_not_raise_on_malformed_url(url):
+    # urlparse raises ValueError on a malformed bracketed IPv6 literal; probe()
+    # must fold that into a result, never propagate (it would tank the sweep).
+    result = _algorithms.probe(url, timeout=1.0)
+    assert result["state"] == "invalid"
+    assert result["error"]
+
+
+def test_probe_folds_channel_creation_failure(monkeypatch):
+    # Channel creation can raise (bad target / TLS init); probe() must catch it.
+    import grpc
+
+    def boom(*a, **k):
+        raise RuntimeError("channel init blew up")
+
+    monkeypatch.setattr(grpc, "insecure_channel", boom)
+    result = _algorithms.probe("grpc://host:50051", timeout=1.0)
+    assert result["state"] == "error"
+    assert "channel init blew up" in result["error"]
+
+
 # --------------------------------------------------------------------------- #
 # probe()/statuses(): against a real in-process ProcessImage server
 # --------------------------------------------------------------------------- #
@@ -247,3 +269,14 @@ def test_statuses_probes_all_configured_in_order(home, grpc_server, monkeypatch)
 def test_statuses_is_empty_with_no_servers(home):
     _write_config(home, {"mcp": {"services": {"process_image_servers": []}}})
     assert _algorithms.statuses(timeout=1.0) == []
+
+
+def test_statuses_survives_a_malformed_configured_url(home, grpc_server):
+    # A malformed URL alongside a good one must not abort the concurrent sweep
+    # (pool.map re-raises) -- it comes back as an "invalid" row instead.
+    up = grpc_server(_Servicer(op_names=["ok"]))
+    _write_config(
+        home, {"mcp": {"services": {"process_image_servers": ["grpc://[::1", up]}}}
+    )
+    rows = _algorithms.statuses(timeout=2.0)
+    assert [r["state"] for r in rows] == ["invalid", "serving"]

@@ -177,19 +177,30 @@ def probe(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
     except ImportError as exc:  # pragma: no cover - grpc is a base biopb dependency
         return _result("unknown", error=f"gRPC support unavailable: {exc}")
 
-    scheme = _scheme(url)
-    parsed = urlparse(url)
-    target = parsed.netloc or parsed.path
+    # urlparse raises ValueError on a malformed bracketed IPv6 literal
+    # (e.g. "grpc://[::1"), so the parse itself must be guarded, not just the
+    # scheme check.
+    try:
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").lower()
+        target = parsed.netloc or parsed.path
+    except ValueError as exc:
+        return _result("invalid", error=f"unparseable URL: {exc}")
     if not target or scheme not in ("grpc", "grpcs"):
         return _result(
             "invalid", error="URL must be grpc://host:port or grpcs://host:port"
         )
 
-    if scheme == "grpcs":
-        channel = grpc.secure_channel(target, grpc.ssl_channel_credentials())
-    else:
-        channel = grpc.insecure_channel(target)
+    # Channel creation can raise too (a bad target, or TLS credential init), and
+    # any non-RpcError raised during the probe must fold into a result as well —
+    # probe() never raises, so one bad server can't break the concurrent sweep in
+    # statuses() (pool.map re-raises) or 500 the dashboard endpoint.
+    channel = None
     try:
+        if scheme == "grpcs":
+            channel = grpc.secure_channel(target, grpc.ssl_channel_credentials())
+        else:
+            channel = grpc.insecure_channel(target)
         stub = proto.ProcessImageStub(channel)
         try:
             response = stub.GetOpNames(empty_pb2.Empty(), timeout=timeout)
@@ -207,8 +218,11 @@ def probe(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
             return _result("error", error=_rpc_message(exc))
         ops = [name for name in response.names if name]
         return _result("serving", ops=ops)
+    except Exception as exc:  # noqa: BLE001 - probe() never raises; fold into a row
+        return _result("error", error=str(exc))
     finally:
-        channel.close()
+        if channel is not None:
+            channel.close()
 
 
 # --------------------------------------------------------------------------- #
