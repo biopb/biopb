@@ -30,7 +30,7 @@ from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
 from ._config import CONFIG, get_setting
-from ._control_client import data_plane_url, ensure_data_plane
+from ._control_client import ensure_data_plane
 
 logger = logging.getLogger(__name__)
 
@@ -158,9 +158,9 @@ class TensorConnection:
 
         cfg = config if config is not None else CONFIG.as_dict()
         # This is only the *fallback* endpoint: the data-plane URL's source of
-        # truth is the control (#413), asked for at connect time
-        # (:meth:`_resolve_data_plane_url`). ``self.url`` starts at the config/env
-        # value and is overwritten with the live endpoint once connected.
+        # truth is the control (#413), asked for at connect time via
+        # ``ensure_data_plane`` in :meth:`auto_connect`. ``self.url`` starts at the
+        # config/env value and is overwritten with the live endpoint once connected.
         self.url, self.token = self.resolve_from_config(cfg)
 
         # Optional callback invoked after every successful connect with the
@@ -189,8 +189,8 @@ class TensorConnection:
         """Resolve the *fallback* tensor-server URL and the token.
 
         Since #413 the data-plane endpoint's single source of truth is the
-        control (see :meth:`_resolve_data_plane_url`); this resolves only the
-        fallback used when no control is reachable. Fallback order for the URL:
+        control (see :meth:`auto_connect`); this resolves only the fallback used
+        when no control is reachable. Fallback order for the URL:
         ``BIOPB_TENSOR_URL`` env -> ``tensor_browser.server_url`` config ->
         default. The token still comes from ``BIOPB_TENSOR_TOKEN`` (the control
         does not mint one for localhost planes).
@@ -200,24 +200,6 @@ class TensorConnection:
         )
         token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
         return url, token
-
-    def _resolve_data_plane_url(self) -> str:
-        """The gRPC URL to connect to: the control's data plane, else the fallback.
-
-        The control (control plane) owns the data plane and resolves its endpoint
-        from the tensor-server ``[server]`` config, so it is the single source of
-        truth (#413). Ask it first (``GET /health`` -> ``data_plane.grpc_url``, a
-        cheap read that never spawns anything). Only when no control answers do we
-        fall back to :attr:`url` -- the config/env value at startup, or the last
-        endpoint we connected to -- covering the pre-control behavior and the
-        standalone-tensor-server dev case.
-        """
-        url = data_plane_url()
-        if url:
-            if url != self.url:
-                logger.info("data-plane URL resolved from control: %s", url)
-            return url
-        return self.url
 
     @property
     def is_connected(self) -> bool:
@@ -645,12 +627,15 @@ class TensorConnection:
         return CONFIG.get("mcp.server_start_timeout")
 
     def auto_connect(self) -> None:
-        """Connect using the resolved URL, with an automatic fallback policy.
+        """Connect to the data plane, bringing it up through the control if needed.
 
-        The single connect policy shared by **both** faces: try the resolved
-        ``(url, token)``, wait the server through a ``STARTING`` data-folder
-        scan, and — when the URL is local and unreachable — ask the biopb
-        **control** (control plane) to bring the data plane up, then wait for it.
+        The single connect policy shared by **both** faces (MCP kernel + widget).
+        The control (control plane) is the single source of truth for the data
+        plane since #413, so we ask it **first**: one :func:`ensure_data_plane`
+        call both brings the plane up if it is down (idempotent when already
+        serving) and returns the authoritative gRPC endpoint. Only when no control
+        answers do we fall back to the config/env URL and a direct connect — the
+        standalone / pre-control case.
 
         ``_connection`` is a **pure client** since Layer 2 of the
         de-daemonization migration (docs/mcp-dedaemonization-migration.md §5): it
@@ -677,58 +662,50 @@ class TensorConnection:
         ``last_message`` already record the outcome for ``server_status`` and the
         widget's error label), so a propagated error never aborts the caller.
         """
-        # Resolve where the data plane lives from the control (single source of
-        # truth, #413), falling back to the config/env URL only when no control
-        # answers. Publish it on self.url so the widget/server_status show the
-        # endpoint we are actually targeting.
-        url = self.url = self._resolve_data_plane_url()
         token = self.token
+        timeout = self.server_start_timeout()
+
+        # Ask the control first (single source of truth, #413): this one POST both
+        # ensures the plane is up (idempotent when already serving) and returns the
+        # endpoint it actually bound. `None` => no control is running, so fall
+        # through to the standalone path. The control *owns* the plane and may bind
+        # it off-loopback (a lab intranet), so locality is never the gate -- if a
+        # control answered, its endpoint is authoritative.
+        # NOTE: `timeout` is spent on BOTH the ensure and the connect_when_booted
+        # below, so the worst-case wall wait is ~2x it (see the
+        # `mcp.server_start_timeout` config note).
+        snapshot = ensure_data_plane(timeout=timeout)
+        if isinstance(snapshot, dict):
+            # Control answered: it ensured the plane and reports where it bound it.
+            # Trust that endpoint (a real snapshot always carries it); fall back to
+            # our current url only if it somehow omitted it. Wait it through boot.
+            url = self.url = snapshot.get("grpc_url") or self.url
+            try:
+                self.connect_when_booted(url, token, timeout=timeout)
+            except Exception:  # noqa: BLE001 - best-effort; status already recorded
+                logger.exception(
+                    "auto_connect: data plane did not become ready after control ensure"
+                )
+            return
+
+        # No control answered -> standalone / pre-control fallback: connect to the
+        # config/env URL (or the last endpoint we used) directly. We never spawn a
+        # server ourselves (the §1.1 bootstrap loop this migration removes), and
+        # there is no control to defer to, so an unreachable URL is a terminal,
+        # actionable error rather than something to wait on.
+        url = self.url
         try:
             self.connect(url, token)
-            return
         except ServerStarting:
-            # Server is up but still scanning its data folder: keep waiting with
-            # capped backoff until it reports SERVING (or the budget elapses).
+            # Up but still scanning its data folder: wait it through to SERVING.
             try:
-                self.connect_when_booted(
-                    url, token, timeout=self.server_start_timeout()
-                )
+                self.connect_when_booted(url, token, timeout=timeout)
             except Exception:  # noqa: BLE001
                 logger.exception("auto_connect: %s did not finish starting", url)
-            return
         except Exception:  # noqa: BLE001
-            logger.info("auto_connect: %s unreachable", url)
-
-        # Unreachable. Ask the control (control plane) to ensure the data plane,
-        # then wait it through boot. The control *owns* the data plane and may
-        # bind it off-loopback (a lab intranet), so locality is not the gate --
-        # reachability is: if we couldn't reach it, the control is the only party
-        # that can bring it up. We never start a server ourselves (that is the
-        # bootstrap loop this migration removes); `ensure_data_plane` returns None
-        # when no control answers, which covers the standalone/remote case with no
-        # control to defer to (-> the actionable status below).
-        # NOTE: server_start_timeout is spent on BOTH phases below (ensure, then
-        # connect_when_booted), so the worst-case wall wait is ~2x it — see the
-        # `mcp.server_start_timeout` config note.
-        logger.info("auto_connect: %s down; asking the control to ensure it", url)
-        snapshot = ensure_data_plane(timeout=self.server_start_timeout())
-        if snapshot is None:
             self.last_status = "error"
             self.last_message = (
                 "No data plane, and no biopb control (control plane) to start one. "
                 "Run `biopb control start`."
             )
-            logger.info("auto_connect: data plane down and no control reachable")
-            return
-        # The ensure response carries the endpoint the control actually owns/
-        # brought up (same snapshot as /health); trust it over our earlier guess
-        # -- they agree unless the control's config changed between the two reads.
-        ensured_url = snapshot.get("grpc_url") if isinstance(snapshot, dict) else None
-        if ensured_url:
-            url = self.url = ensured_url
-        try:
-            self.connect_when_booted(url, token, timeout=self.server_start_timeout())
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "auto_connect: data plane did not become ready after control ensure"
-            )
+            logger.info("auto_connect: no data plane and no control reachable")
