@@ -1,10 +1,12 @@
 """CLI client for ProcessImage gRPC services.
 
 Commands:
+    servers     List the configured algorithm-plane servers with health + ops
     ops         List available operations from a ProcessImage server
     process     Execute an operation on input image data
 """
 
+import json
 import sys
 import time
 from typing import Literal, Optional
@@ -16,6 +18,7 @@ from google.protobuf import empty_pb2
 from rich.console import Console
 from rich.table import Table
 
+from biopb import _algorithms
 from biopb.image import (
     ImageData,
     OpNames,
@@ -248,6 +251,75 @@ def _write_output(
     else:
         stderr_console.print(f"[red]Error:[/red] Unknown data type: {data_type}")
         raise typer.Exit(1)
+
+
+def _state_style(state: str) -> str:
+    """Rich colour for a probe state, so the table reads at a glance."""
+    return {
+        "serving": "green",
+        "unreachable": "red",
+        "error": "red",
+        "invalid": "yellow",
+        "unknown": "yellow",
+    }.get(state, "white")
+
+
+@app.command()
+def servers(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+    timeout: float = typer.Option(
+        4.0, "--timeout", help="Per-server probe deadline in seconds"
+    ),
+) -> None:
+    """List the configured algorithm-plane servers with a health + ops probe.
+
+    Reads the ProcessImage servers wired into the biopb-mcp config (under
+    mcp.services.process_image_servers) -- the same set an agent kernel exposes as
+    ops -- and probes each for liveness and its advertised operations. This is the
+    CLI face of the control dashboard's Algorithm plane section: read-only (no
+    lifecycle control), never writes config.
+
+    Examples:
+        biopb image servers
+        biopb image servers --json --timeout 2
+    """
+    rows = _algorithms.statuses(timeout=timeout)
+
+    if json_output:
+        print(json.dumps({"servers": rows}))
+        raise typer.Exit(0)
+
+    if not rows:
+        stderr_console.print(
+            "[yellow]No algorithm servers configured.[/yellow] Add ProcessImage "
+            "server URLs under [bold]mcp.services.process_image_servers[/bold] in "
+            "the biopb-mcp config."
+        )
+        raise typer.Exit(0)
+
+    table = Table(title="Algorithm plane servers")
+    table.add_column("Server", style="cyan")
+    table.add_column("Scheme", style="blue")
+    table.add_column("State", style="green")
+    table.add_column("Ops", style="magenta")
+
+    for r in rows:
+        if r["state"] == "serving":
+            ops_cell = (
+                "(single-op)" if r.get("single_op") else ", ".join(r["ops"]) or "-"
+            )
+        else:
+            ops_cell = r.get("error") or "-"
+        state = f"[{_state_style(r['state'])}]{r['state']}[/]"
+        table.add_row(r["target"], r["scheme"], state, ops_cell)
+
+    console.print(table)
+    n_serving = sum(1 for r in rows if r["state"] == "serving")
+    stderr_console.print(
+        f"\n[green]Servers:[/green] {len(rows)}  [green]serving:[/green] {n_serving}"
+    )
 
 
 @app.command()

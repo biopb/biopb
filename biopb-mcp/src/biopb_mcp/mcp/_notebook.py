@@ -31,6 +31,7 @@ BOOTSTRAP_SRC = """\
 import numpy as np
 import dask.array as da
 
+from biopb import _algorithms
 from biopb_mcp._config import load_config, get_setting
 from biopb_mcp._connection import TensorConnection
 from biopb_mcp.mcp._process_ops import build_ops
@@ -43,7 +44,7 @@ client = _conn.client
 _mb = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
 ops = build_ops(
     client_getter=lambda: _conn.client,
-    server_urls=get_setting(config, "mcp.services.process_image_servers"),
+    server_urls=_algorithms.servers_from_config(config),
     op_names_timeout=get_setting(config, "timeout.get_op_names"),
     run_timeout=get_setting(config, "timeout.process_image"),
     channel_options=[

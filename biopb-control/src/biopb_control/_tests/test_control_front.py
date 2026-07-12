@@ -140,6 +140,7 @@ def test_root_serves_the_control_dashboard(control):
     # It polls the in-process control API, not the data-plane proxy.
     assert "/api/status" in html
     assert "/api/sessions" in html
+    assert "/api/algorithms" in html  # the algorithm-plane section polls it
     assert "path" not in html  # not the echo upstream's response
 
 
@@ -511,6 +512,55 @@ def test_api_agents_is_token_gated(tokened_control, monkeypatch):
     # Correct token -> 200.
     status, _h, _b = _get(
         f"{tokened_control}/api/agents", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+    assert status == 200
+
+
+# --------------------------------------------------------------------------- #
+# Algorithm-plane inspection API (/api/algorithms)
+# --------------------------------------------------------------------------- #
+# A thin, read-only front over biopb._algorithms; we stub that core so the tests
+# never dial a real gRPC server, and assert the wiring: GET returns the probed
+# server rows, a core error is a clean 500, and the surface is token-gated.
+
+
+def test_api_algorithms_lists_probed_servers(control, monkeypatch):
+    fake = [
+        {
+            "url": "grpc://localhost:50051",
+            "target": "localhost:50051",
+            "scheme": "grpc",
+            "state": "serving",
+            "ops": ["threshold", "segment"],
+            "op_count": 2,
+            "error": None,
+            "single_op": False,
+        },
+    ]
+    monkeypatch.setattr("biopb._algorithms.statuses", lambda: fake)
+    status, _h, body = _get(f"{control}/api/algorithms")
+    assert status == 200
+    assert json.loads(body)["servers"] == fake
+
+
+def test_api_algorithms_core_error_is_500(control, monkeypatch):
+    def boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr("biopb._algorithms.statuses", boom)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/api/algorithms")
+    assert exc.value.code == 500
+
+
+def test_api_algorithms_is_token_gated(tokened_control, monkeypatch):
+    monkeypatch.setattr("biopb._algorithms.statuses", list)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/api/algorithms")
+    assert exc.value.code == 401
+    status, _h, _b = _get(
+        f"{tokened_control}/api/algorithms",
+        headers={"Authorization": f"Bearer {_TOKEN}"},
     )
     assert status == 200
 

@@ -70,7 +70,7 @@ import threading
 
 import httpx
 import uvicorn
-from biopb import _agents, _config_sessions, _web_auth
+from biopb import _agents, _algorithms, _config_sessions, _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -369,6 +369,20 @@ def build_app(
     def agent_unregister(request: Request) -> JSONResponse:
         return _agent_action(request, _agents.unregister)
 
+    def api_algorithms(_request: Request) -> JSONResponse:
+        # The configured algorithm-plane servers (biopb.image ProcessImage
+        # servicers listed in the biopb-mcp config) with a live health + ops
+        # probe. Read-only inspection — no lifecycle control (that is Layer 4).
+        # Sync: statuses() reads a config file and makes blocking gRPC calls (run
+        # concurrently, bounded by one probe timeout), so Starlette runs it in the
+        # threadpool. Polled on demand (a dashboard button), not on the interval,
+        # because it dials external servers.
+        try:
+            return JSONResponse({"servers": _algorithms.statuses()})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
     async def root(_request: Request) -> Response:
         # The control's own buildless dashboard (single embedded page, no build
         # step). It polls /api/status + /api/sessions and drives the data-plane
@@ -529,6 +543,7 @@ def build_app(
         Route("/api/agents", api_agents, methods=["GET"]),
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
+        Route("/api/algorithms", api_algorithms, methods=["GET"]),
         Route("/", root, methods=["GET"]),
         # /data_plane/viewer FIRST so it wins over the broader /data_plane mount.
         Mount("/data_plane/viewer", sidecar),
@@ -741,6 +756,14 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .dot.drift { background: #fb4; }
   .agent-btns { margin-left: auto; display: flex; gap: 6px; }
   button.warn { border-color: #a83; color: #fc9; }
+  .dot.serving { background: #7e7; }
+  .dot.down { background: #f77; }
+  .tls { font-size: 10px; color: #8bf; border: 1px solid #345; border-radius: 3px;
+         padding: 0 4px; margin-left: 6px; vertical-align: middle; }
+  .ops { margin-left: auto; color: #789; font-size: 12px; max-width: 55%;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+         font-family: ui-monospace, Menlo, monospace; }
+  .ops.err { color: #d88; }
 </style>
 </head>
 <body>
@@ -762,6 +785,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <a id="config" class="link off" href="/data_plane/viewer/admin"
          target="_blank" rel="noopener">Config →</a>
     </div>
+  </div>
+  <div class="card">
+    <h2>Algorithm plane<button id="algos-refresh" class="mini">↻</button></h2>
+    <ul id="algos"><li class="empty">loading…</li></ul>
+    <p class="note">Read-only view of the biopb.image ProcessImage servers
+       configured for agent kernels, with a live health + ops probe. Lifecycle
+       control is not offered here.</p>
   </div>
   <div class="card">
     <h2>Agent clients<button id="agents-refresh" class="mini">↻</button></h2>
@@ -913,6 +943,46 @@ el('agents').addEventListener('click', async (ev) => {
 });
 el('agents-refresh').onclick = pollAgents;
 
+// One algorithm-plane row: a status dot, the host:port (a TLS tag for grpcs),
+// the state + op count, and an ops preview (full list in the hover title). A
+// non-serving server shows its error message in the preview slot instead.
+function algoRow(s) {
+  const serving = s.state === 'serving';
+  const dot = 'dot ' + (serving ? 'serving' : (s.state === 'unknown' ? '' : 'down'));
+  let stateLabel = s.state;
+  if (serving) stateLabel = s.single_op ? 'serving · single-op'
+    : 'serving · ' + (s.op_count || 0) + ' op' + (s.op_count === 1 ? '' : 's');
+  else if (s.state === 'invalid') stateLabel = 'invalid URL';
+  else if (s.state === 'unknown') stateLabel = 'gRPC unavailable';
+  const tls = s.scheme === 'grpcs' ? '<span class="tls">TLS</span>' : '';
+  let tail = '';
+  if (serving && s.ops && s.ops.length) {
+    const joined = s.ops.join(', ');
+    tail = '<span class="ops" title="' + esc(joined) + '">' + esc(joined) + '</span>';
+  } else if (!serving && s.error) {
+    tail = '<span class="ops err" title="' + esc(s.error) + '">' + esc(s.error) + '</span>';
+  }
+  return '<li><span class="' + dot + '"></span>'
+    + '<span class="sid">' + esc(s.target) + '</span>' + tls
+    + '<span class="state">' + esc(stateLabel) + '</span>' + tail + '</li>';
+}
+
+// Fetched on load / via the ↻ button -- like the agent block, deliberately NOT on
+// the status+sessions interval: each refresh dials every configured gRPC server.
+async function pollAlgos() {
+  let data;
+  try { data = await (await fetchAuth('/api/algorithms')).json(); }
+  catch (e) { return; }
+  const list = (data && data.servers) || [];
+  const box = el('algos');
+  if (!list.length) {
+    box.innerHTML = '<li class="empty">no algorithm servers configured</li>';
+    return;
+  }
+  box.innerHTML = list.map(algoRow).join('');
+}
+el('algos-refresh').onclick = pollAlgos;
+
 function refresh() { pollStatus(); pollSessions(); }
 
 // A data-plane verb button: disable the trio while the request is in flight (a
@@ -934,6 +1004,7 @@ el('stop').onclick = () => verb('/api/data_plane/stop', 'Stop the data plane? Cl
 
 refresh();
 pollAgents();
+pollAlgos();
 setInterval(refresh, POLL);
 </script>
 </body>
