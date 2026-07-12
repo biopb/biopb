@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ._config_location import DEFAULT_CONFIG_DIR, find_config
+from ._filelock import LockTimeout, file_lock
 from ._proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
@@ -216,11 +218,29 @@ def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
 def _write_pid_file(pid_file: Path, pid: int, token: Optional[int] = None):
     """Write `pid` (and, when known, its create-time `token`) to `pid_file`.
 
-    The two-line `pid\\ntoken` form is read back by _read_pid_record; a None token
-    falls back to the legacy bare-PID form (callers then verify by liveness only).
+    Written atomically (sibling temp file + os.replace on the same filesystem) so a
+    concurrent reader -- or a racing writer, now that several processes can start
+    the control plane on demand at once -- never observes a half-written or
+    interleaved file. A torn read parses as "no daemon" (_read_pid_record) and
+    would trigger a spurious extra spawn. The two-line `pid\\ntoken` form is read
+    back by _read_pid_record; a None token falls back to the legacy bare-PID form
+    (callers then verify by liveness only).
     """
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(f"{pid}\n{token}" if token is not None else str(pid))
+    content = f"{pid}\n{token}" if token is not None else str(pid)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{pid_file.name}-", suffix=".tmp", dir=str(pid_file.parent)
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, pid_file)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _remove_pid_file(pid_file: Path):
@@ -1856,6 +1876,19 @@ def _control_shutdown_sentinel() -> Path:
     return CONTROL_PID_FILE.parent / "control.stop"
 
 
+def _control_start_lock() -> Path:
+    """Cross-process lock file serializing `biopb control start`.
+
+    The launcher, the installer, and -- once the shim starts the control on demand
+    -- racing agent sessions can all invoke `control start` at once. Holding this
+    lock across the check-then-spawn below makes it atomic between processes:
+    without it two starters can both see "no pidfile", both spawn a control, and
+    the bind-loser's parent overwrite/remove the live winner's pidfile, orphaning a
+    control that `control stop` can no longer reach. See biopb._filelock.
+    """
+    return CONTROL_PID_FILE.parent / "control.start.lock"
+
+
 def _resolve_dataplane_token(
     config: Path, web_host: str, token: Optional[str]
 ) -> Tuple[Optional[str], bool]:
@@ -2002,96 +2035,116 @@ def control_start(
     _require_biopb_control()
     _ensure_dirs()
 
-    existing_pid, existing_token = _read_pid_record(CONTROL_PID_FILE)
-    if _is_our_daemon(existing_pid, existing_token):
-        console.print(
-            f"[yellow]biopb control already running (PID {existing_pid})[/yellow]"
-        )
-        raise typer.Exit(0)
-    if existing_pid:
-        console.print(
-            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
-        )
-        _remove_control_pid()
+    # Serialize concurrent starts so the check-then-spawn below is atomic across
+    # processes (see _control_start_lock / biopb._filelock). Held through the
+    # readiness wait too, so a second starter that was blocked wakes to a fully
+    # started control (pidfile written, port listening) and reports the idempotent
+    # "already running" rather than racing a half-up one. The lock auto-releases if
+    # a holder dies, so a crashed starter leaves nothing to clean up.
+    try:
+        with file_lock(_control_start_lock(), timeout=30.0):
+            existing_pid, existing_token = _read_pid_record(CONTROL_PID_FILE)
+            if _is_our_daemon(existing_pid, existing_token):
+                console.print(
+                    f"[yellow]biopb control already running (PID {existing_pid})[/yellow]"
+                )
+                raise typer.Exit(0)
+            if existing_pid:
+                console.print(
+                    f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
+                )
+                _remove_control_pid()
 
-    control_host, control_port = _control_endpoint()
-    if _port_listening(control_host, control_port):
+            control_host, control_port = _control_endpoint()
+            if _port_listening(control_host, control_port):
+                console.print(
+                    f"[red]Control-plane port {control_host}:{control_port} is already in use.[/red]"
+                )
+                console.print(
+                    "It is held by a process biopb is not tracking (an orphaned control plane, or "
+                    "another login session), so [bold]biopb control stop[/bold] cannot reach "
+                    "it. Identify and stop the owner, then retry."
+                )
+                raise typer.Exit(1)
+
+            # The control plane owns the data plane exclusively, so refuse to start into a gRPC
+            # port a stray server already holds -- otherwise the supervised child would
+            # crash-loop on EADDRINUSE. Mirrors `biopb server start`'s port guard. Skipped
+            # for --no-data-plane (the plane comes up on demand, guarded there too).
+            if data_plane:
+                grpc_host, grpc_port = _resolve_grpc_hostport(config)
+                if _port_listening(grpc_host, grpc_port):
+                    console.print(
+                        f"[red]Data-plane gRPC port {grpc_host}:{grpc_port} is already "
+                        "in use.[/red]"
+                    )
+                    console.print(
+                        "The control plane owns the data plane exclusively and will not adopt a "
+                        "server it did not start. Stop the process holding that port "
+                        f"(`lsof -i :{grpc_port}` / `netstat -ano | findstr {grpc_port}`), "
+                        "then retry -- or start with [bold]--no-data-plane[/bold]."
+                    )
+                    raise typer.Exit(1)
+
+            resolved_token, local_bypass = _resolve_dataplane_token(
+                config, web_host, token
+            )
+            argv = _control_run_argv(
+                config=config,
+                static_dir=static_dir,
+                web_host=web_host,
+                web_port=web_port,
+                log_level=log_level,
+                data_plane=data_plane,
+                token=resolved_token,
+                local_bypass=local_bypass,
+            )
+
+            log_file = _control_log_file()
+            _rotate_log(log_file)
+            console.print("[green]Starting biopb control plane...[/green]")
+            console.print(f"  Config: {config}")
+            env = os.environ.copy()
+            if resolved_token:
+                env["BIOPB_TENSOR_TOKEN"] = resolved_token
+            with open(log_file, "a") as log:
+                log.write(
+                    f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+                )
+                process = subprocess.Popen(
+                    argv, stdout=log, stderr=log, env=env, **_detach_kwargs()
+                )
+
+            _write_control_pid(process.pid)
+
+            if not _await_listening(process.pid, control_host, control_port, 15.0):
+                if _is_process_running(process.pid):
+                    console.print(
+                        f"[red]Control plane started but its control API is not listening on "
+                        f"{control_host}:{control_port} after 15s.[/red]"
+                    )
+                    console.print(f"Check the log: {log_file}")
+                else:
+                    console.print("[red]Failed to start biopb control plane[/red]")
+                    _remove_control_pid()
+                    console.print(f"Check the log: {log_file}")
+                raise typer.Exit(1)
+
+            console.print(
+                f"[green]biopb control plane started (PID {process.pid})[/green]"
+            )
+            console.print(f"  Control: http://{control_host}:{control_port}")
+            if data_plane:
+                console.print("  Data plane: starting (see 'biopb control status')")
+            else:
+                console.print("  Data plane: not started (--no-data-plane; on-demand)")
+            console.print(f"  Logs: {log_file}")
+    except LockTimeout:
         console.print(
-            f"[red]Control-plane port {control_host}:{control_port} is already in use.[/red]"
-        )
-        console.print(
-            "It is held by a process biopb is not tracking (an orphaned control plane, or "
-            "another login session), so [bold]biopb control stop[/bold] cannot reach "
-            "it. Identify and stop the owner, then retry."
+            "[red]Another 'biopb control start' is already in progress and did not "
+            "finish within 30s.[/red] Retry shortly, or check 'biopb control status'."
         )
         raise typer.Exit(1)
-
-    # The control plane owns the data plane exclusively, so refuse to start into a gRPC
-    # port a stray server already holds -- otherwise the supervised child would
-    # crash-loop on EADDRINUSE. Mirrors `biopb server start`'s port guard. Skipped
-    # for --no-data-plane (the plane comes up on demand, guarded there too).
-    if data_plane:
-        grpc_host, grpc_port = _resolve_grpc_hostport(config)
-        if _port_listening(grpc_host, grpc_port):
-            console.print(
-                f"[red]Data-plane gRPC port {grpc_host}:{grpc_port} is already "
-                "in use.[/red]"
-            )
-            console.print(
-                "The control plane owns the data plane exclusively and will not adopt a "
-                "server it did not start. Stop the process holding that port "
-                f"(`lsof -i :{grpc_port}` / `netstat -ano | findstr {grpc_port}`), "
-                "then retry -- or start with [bold]--no-data-plane[/bold]."
-            )
-            raise typer.Exit(1)
-
-    resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
-    argv = _control_run_argv(
-        config=config,
-        static_dir=static_dir,
-        web_host=web_host,
-        web_port=web_port,
-        log_level=log_level,
-        data_plane=data_plane,
-        token=resolved_token,
-        local_bypass=local_bypass,
-    )
-
-    log_file = _control_log_file()
-    _rotate_log(log_file)
-    console.print("[green]Starting biopb control plane...[/green]")
-    console.print(f"  Config: {config}")
-    env = os.environ.copy()
-    if resolved_token:
-        env["BIOPB_TENSOR_TOKEN"] = resolved_token
-    with open(log_file, "a") as log:
-        log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        process = subprocess.Popen(
-            argv, stdout=log, stderr=log, env=env, **_detach_kwargs()
-        )
-
-    _write_control_pid(process.pid)
-
-    if not _await_listening(process.pid, control_host, control_port, 15.0):
-        if _is_process_running(process.pid):
-            console.print(
-                f"[red]Control plane started but its control API is not listening on "
-                f"{control_host}:{control_port} after 15s.[/red]"
-            )
-            console.print(f"Check the log: {log_file}")
-        else:
-            console.print("[red]Failed to start biopb control plane[/red]")
-            _remove_control_pid()
-            console.print(f"Check the log: {log_file}")
-        raise typer.Exit(1)
-
-    console.print(f"[green]biopb control plane started (PID {process.pid})[/green]")
-    console.print(f"  Control: http://{control_host}:{control_port}")
-    if data_plane:
-        console.print("  Data plane: starting (see 'biopb control status')")
-    else:
-        console.print("  Data plane: not started (--no-data-plane; on-demand)")
-    console.print(f"  Logs: {log_file}")
 
 
 @control_app.command("stop")
