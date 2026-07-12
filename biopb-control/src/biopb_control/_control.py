@@ -632,12 +632,19 @@ def serve_control_api(
 # API calls are plain root-absolute "/api/*".
 # ---------------------------------------------------------------------------
 
+# The biopb mark (the tensor server's favicon-32.png) embedded as a data URI so
+# the tab icon is self-contained -- the dashboard renders it whether or not the
+# data plane is up, and the control needs no static-asset route of its own. Kept
+# on one line so no accidental whitespace enters the base64 payload.
+_FAVICON = "data:image/png;base64,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"  # noqa: E501
+
 _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>biopb · control</title>
+<link rel="icon" type="image/png" href="__FAVICON__">
 <style>
   body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
   header { padding: 10px 16px; background: #1b1b1b; border-bottom: 1px solid #333;
@@ -666,6 +673,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   button:disabled { opacity: .45; cursor: default; }
   button.danger { border-color: #844; }
   a.link { color: #8bf; text-decoration: none; margin-left: auto; }
+  /* Only the first link in a run is right-pushed; siblings sit next to it. */
+  a.link + a.link { margin-left: 0; }
   a.link:hover { text-decoration: underline; }
   a.link.off { color: #667; pointer-events: none; }
   ul { list-style: none; margin: 0; padding: 0; }
@@ -692,11 +701,14 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <button id="ensure">Ensure up</button>
       <button id="restart">Restart</button>
       <button id="stop" class="danger">Stop</button>
-      <a id="viewer" class="link off" href="/data_plane/viewer/">Open dataviewer →</a>
+      <a id="viewer" class="link off" href="/data_plane/viewer/"
+         target="_blank" rel="noopener">View Data →</a>
+      <a id="config" class="link off" href="/data_plane/viewer/admin"
+         target="_blank" rel="noopener">Config →</a>
     </div>
   </div>
   <div class="card">
-    <h2>Live sessions</h2>
+    <h2>Agent sessions</h2>
     <ul id="sessions"><li class="empty">loading…</li></ul>
   </div>
 </main>
@@ -756,8 +768,11 @@ function renderDataPlane(dp) {
   let html = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + esc(v) + '</dd>').join('');
   if (dp.last_error) html += '<dt>Error</dt><dd class="err">' + esc(dp.last_error) + '</dd>';
   el('dp-fields').innerHTML = html;
-  // The dataviewer is only reachable once the sidecar is up behind a serving plane.
-  el('viewer').classList.toggle('off', state !== 'serving');
+  // The dataviewer and its admin/config page are only reachable once the sidecar
+  // is up behind a serving plane.
+  const off = state !== 'serving';
+  el('viewer').classList.toggle('off', off);
+  el('config').classList.toggle('off', off);
 }
 
 async function pollStatus() {
@@ -774,12 +789,12 @@ async function pollSessions() {
   catch (e) { return; }
   const list = (data && data.sessions) || [];
   const box = el('sessions');
-  if (!list.length) { box.innerHTML = '<li class="empty">no live sessions</li>'; return; }
+  if (!list.length) { box.innerHTML = '<li class="empty">no agent sessions</li>'; return; }
   box.innerHTML = list.map(s => {
     const when = s.started_at ? new Date(s.started_at * 1000).toLocaleTimeString() : '';
     return '<li><span class="sid">' + esc(s.session_id) + '</span>'
       + '<span class="when">:' + esc(s.port) + (when ? ' · ' + esc(when) : '') + '</span>'
-      + '<a class="obs" href="' + esc(s.observe_url) + '">observe →</a></li>';
+      + '<a class="obs" href="' + esc(s.observe_url) + '" target="_blank" rel="noopener">observe →</a></li>';
   }).join('');
 }
 
@@ -808,3 +823,6 @@ setInterval(refresh, POLL);
 </body>
 </html>
 """
+
+# Bake the favicon into the served page once at import (rather than per request).
+_DASHBOARD_HTML = _DASHBOARD_HTML.replace("__FAVICON__", _FAVICON)

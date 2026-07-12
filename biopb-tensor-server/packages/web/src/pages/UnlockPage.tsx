@@ -27,7 +27,7 @@ export function UnlockPage() {
       <div className="unlock-card">
         <img
           className="unlock-logo"
-          src="/biopb-logo.png"
+          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
           alt="BioPB"
           width={48}
           height={48}
