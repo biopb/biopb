@@ -456,6 +456,16 @@ class TestInterruptRestart:
         server_with_host.restart.assert_called_once()
         assert "restarted" in result.lower()
 
+    def test_restart_headless_reports_no_viewer(self, server_with_host):
+        # A headless restart rebuilds no napari window, so the message must not
+        # promise a rebuilt viewer that isn't there.
+        _server.set_headless(True)
+        result = _server.restart_kernel()
+        server_with_host.restart.assert_called_once()
+        assert "restarted" in result.lower()
+        assert "headless" in result.lower()
+        assert "rebuilt" not in result.lower()  # no viewer to rebuild
+
     def test_restart_reports_failure(self, server_with_host):
         server_with_host.restart.side_effect = RuntimeError("nope")
         result = _server.restart_kernel()

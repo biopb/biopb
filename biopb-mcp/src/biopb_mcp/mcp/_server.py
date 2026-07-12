@@ -751,6 +751,12 @@ def restart_kernel() -> str:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
+    if _headless:
+        # No napari window in a headless session -- don't claim a rebuilt viewer.
+        return (
+            "Kernel restarted (headless -- no napari viewer). dask and the "
+            "tensor client are up; previous variables are gone."
+        )
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
