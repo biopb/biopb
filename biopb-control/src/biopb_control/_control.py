@@ -65,6 +65,7 @@ import asyncio
 import contextlib
 import logging
 import socket
+import sys
 import threading
 
 import httpx
@@ -597,7 +598,18 @@ def serve_control_api(
     app = build_app(supervisor, ensure_timeout, data_web_url, token=spec.token)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sys.platform == "win32":
+        # On Windows SO_REUSEADDR lets a *second* bind to the same port SUCCEED and
+        # then delivers incoming connections to one of the sockets nondeterministically
+        # -- so it would defeat the single-owner guarantee a concurrent `control start`
+        # relies on (you could end up with two live controls on 8813). SO_EXCLUSIVEADDRUSE
+        # instead makes the second bind fail with EADDRINUSE, which is the behavior POSIX
+        # SO_REUSEADDR already gives here (it only reuses a TIME_WAIT port, never a live
+        # bind). So the eager bind stays the true arbiter of "one control per port" on
+        # both platforms.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))  # raises OSError on clash -> caller reports it
     sock.listen(128)
 
