@@ -498,3 +498,56 @@ class TestEndToEnd:
                 shim.kill()
             if child_pid is not None:
                 _force_kill(child_pid)
+
+
+class TestServe:
+    def test_fires_control_start_before_spawning_child(self, monkeypatch):
+        """serve() kicks off the control (fire-and-forget) BEFORE spawning the
+        child, so the lean control boots in parallel with the child's import-
+        dominated startup and is up by the time the child needs the data plane."""
+        calls = []
+
+        class _FakeProc:
+            pid = 4242
+
+        monkeypatch.setattr(
+            _shim._control_client,
+            "start_control_detached",
+            lambda: calls.append("control"),
+        )
+
+        def _fake_spawn(config, *a, **k):
+            calls.append("spawn")
+            return _FakeProc(), "http://127.0.0.1:1/mcp", None, "sid"
+
+        monkeypatch.setattr(_shim, "spawn_session", _fake_spawn)
+        monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
+        monkeypatch.setattr(_shim, "run_bridge", lambda url: calls.append("bridge"))
+        monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
+
+        _shim.serve(object())
+        assert calls == ["control", "spawn", "bridge"]
+
+    def test_control_start_failure_does_not_block_serve(self, monkeypatch):
+        """A control-start that raises must never abort the shim -- the bridge is
+        the priority; control errors surface later, from the session child."""
+
+        class _FakeProc:
+            pid = 4242
+
+        def _boom():
+            raise RuntimeError("control start blew up")
+
+        monkeypatch.setattr(_shim._control_client, "start_control_detached", _boom)
+        monkeypatch.setattr(
+            _shim,
+            "spawn_session",
+            lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", None, "sid"),
+        )
+        monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
+        bridged = []
+        monkeypatch.setattr(_shim, "run_bridge", lambda url: bridged.append(url))
+        monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
+
+        _shim.serve(object())
+        assert bridged == ["http://127.0.0.1:1/mcp"]
