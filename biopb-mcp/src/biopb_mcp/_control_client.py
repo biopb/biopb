@@ -111,7 +111,11 @@ def _biopb_executable() -> str | None:
     import shutil
 
     name = "biopb.exe" if os.name == "nt" else "biopb"
-    sibling = Path(sys.executable).resolve().parent / name
+    # Do NOT resolve() sys.executable: a venv's `python` is a symlink to the base
+    # interpreter, so resolving would follow it OUT of the venv bin/ (where the
+    # console script actually lives) to the base dir, and the sibling lookup would
+    # miss -- exactly the symlinked-venv + no-PATH case this is meant to cover.
+    sibling = Path(sys.executable).parent / name
     if sibling.exists():
         return str(sibling)
     return shutil.which("biopb")
