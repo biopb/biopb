@@ -971,7 +971,11 @@ class TestAutoConnect:
         ensure.assert_called_once_with(timeout=30.0)
         booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
 
-    def test_remote_unreachable_does_not_ask_control(self, monkeypatch):
+    def test_remote_unreachable_still_asks_control(self, monkeypatch):
+        # The control owns the data plane and may bind it off-loopback, so a
+        # non-loopback URL is NOT a reason to skip the control: reachability is
+        # the only gate. An unreachable off-loopback endpoint still asks the
+        # control to ensure it (the control decides whether it can).
         conn = TensorConnection(config={})
         conn.url = "grpc://remote:9"
         monkeypatch.setattr(
@@ -979,12 +983,16 @@ class TestAutoConnect:
             "connect",
             MagicMock(side_effect=RuntimeError("connection refused")),
         )
-        ensure = MagicMock()
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
+        ensure = MagicMock(return_value={"state": "serving"})
         monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
 
         conn.auto_connect()  # must not raise
-        # A remote server is not ours (or the control's) to start.
-        ensure.assert_not_called()
+
+        ensure.assert_called_once_with(timeout=30.0)
+        booted.assert_called_once_with("grpc://remote:9", None, timeout=30.0)
 
     def test_no_control_records_actionable_status(self, monkeypatch):
         conn = TensorConnection(config={})

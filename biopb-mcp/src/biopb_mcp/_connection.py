@@ -699,13 +699,14 @@ class TensorConnection:
         except Exception:  # noqa: BLE001
             logger.info("auto_connect: %s unreachable", url)
 
-        # Unreachable. Do NOT start a server ourselves (that is the bootstrap
-        # loop this migration removes). A remote URL is not ours to start.
-        if not is_local_url(url):
-            return
-
-        # Ask the control (control plane) to ensure the data plane, then wait it
-        # through boot. `ensure_data_plane` returns None when no control answers.
+        # Unreachable. Ask the control (control plane) to ensure the data plane,
+        # then wait it through boot. The control *owns* the data plane and may
+        # bind it off-loopback (a lab intranet), so locality is not the gate --
+        # reachability is: if we couldn't reach it, the control is the only party
+        # that can bring it up. We never start a server ourselves (that is the
+        # bootstrap loop this migration removes); `ensure_data_plane` returns None
+        # when no control answers, which covers the standalone/remote case with no
+        # control to defer to (-> the actionable status below).
         # NOTE: server_start_timeout is spent on BOTH phases below (ensure, then
         # connect_when_booted), so the worst-case wall wait is ~2x it — see the
         # `mcp.server_start_timeout` config note.
