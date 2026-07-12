@@ -29,10 +29,10 @@ def _clear_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_control(monkeypatch):
-    """Default: no control plane answers, so ``_resolve_data_plane_url`` returns
-    the config/env fallback and no real ``/health`` probe is made from unit tests.
-    Tests that exercise a live control override this with their own monkeypatch."""
-    monkeypatch.setattr(_connection, "data_plane_url", lambda *a, **k: None)
+    """Default: no control plane answers, so ``auto_connect`` falls back to the
+    config/env URL and makes no real ``ensure`` POST from unit tests. Tests that
+    exercise a live control override this with their own monkeypatch."""
+    monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
 
 
 def _fake_client(sources):
@@ -69,33 +69,21 @@ class TestResolveFromConfig:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_data_plane_url (control first, config fallback -- #413)
+# auto_connect URL resolution (control first via ensure, config fallback -- #413)
 # ---------------------------------------------------------------------------
-
-
-class TestResolveDataPlaneUrl:
-    def test_uses_control_url_when_control_alive(self, monkeypatch):
-        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
-        monkeypatch.setattr(
-            _connection, "data_plane_url", lambda *a, **k: "grpc://control:9"
-        )
-        assert conn._resolve_data_plane_url() == "grpc://control:9"
-
-    def test_falls_back_to_config_when_no_control(self, monkeypatch):
-        # No control answers -> the config/env URL (here the config one).
-        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
-        monkeypatch.setattr(_connection, "data_plane_url", lambda *a, **k: None)
-        assert conn._resolve_data_plane_url() == "grpc://cfg:2"
 
 
 class TestAutoConnectResolution:
     def test_targets_control_url(self, monkeypatch):
-        # Control alive + plane up: connect straight to the control's endpoint,
-        # ignoring the (different) config fallback.
+        # Control answers: ensure both brings the plane up and reports its
+        # endpoint, so we connect straight there -- ignoring the (different)
+        # config fallback.
         conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
         monkeypatch.setattr(
-            _connection, "data_plane_url", lambda *a, **k: "grpc://control:9"
+            _connection,
+            "ensure_data_plane",
+            lambda *a, **k: {"grpc_url": "grpc://control:9", "state": "serving"},
         )
         seen = []
         monkeypatch.setattr(
@@ -108,32 +96,21 @@ class TestAutoConnectResolution:
         assert conn.url == "grpc://control:9"
         assert seen == ["grpc://control:9"]
 
-    def test_prefers_ensure_snapshot_url_when_plane_down(self, monkeypatch):
-        # Control alive but plane down: the first connect fails, the control's
-        # ensure brings it up and its snapshot grpc_url is authoritative.
+    def test_falls_back_to_config_when_no_control(self, monkeypatch):
+        # No control answers: connect to the config/env URL directly.
         conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
-        monkeypatch.setattr(
-            _connection, "data_plane_url", lambda *a, **k: "grpc://localhost:9999"
-        )
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
+        seen = []
         monkeypatch.setattr(
             _connection,
-            "ensure_data_plane",
-            lambda *a, **k: {"grpc_url": "grpc://localhost:8888", "state": "serving"},
+            "TensorFlightClient",
+            lambda url, token=None: seen.append(url) or _fake_client({}),
         )
-        calls = []
-
-        def _client(url, token=None):
-            calls.append(url)
-            if len(calls) == 1:
-                raise ConnectionError("plane down")
-            return _fake_client({})
-
-        monkeypatch.setattr(_connection, "TensorFlightClient", _client)
         conn.auto_connect()
         assert conn.is_connected
-        assert conn.url == "grpc://localhost:8888"
-        assert calls == ["grpc://localhost:9999", "grpc://localhost:8888"]
+        assert conn.url == "grpc://cfg:2"
+        assert seen == ["grpc://cfg:2"]
 
 
 # ---------------------------------------------------------------------------
@@ -998,30 +975,89 @@ class TestAutoConnect:
     """The shared connect policy used by both the kernel and the widget.
 
     Since Layer 2 of the de-daemonization migration, ``_connection`` is a pure
-    client: when the local data plane is down it asks the control plane
-    to ensure it via ``ensure_data_plane``, and never spawns a server itself.
-    Both callers drive this off their own worker thread; here we call it directly
-    with ``connect`` and friends mocked.
+    client: it asks the control plane **first** to ensure the data plane (single
+    source of truth, #413) and never spawns a server itself; only when no control
+    answers does it fall back to the config/env URL. Both callers drive this off
+    their own worker thread; here we call it directly with ``connect`` and friends
+    mocked.
     """
 
-    def test_connects_on_first_try(self, monkeypatch):
+    # --- control answers (the normal path) --------------------------------- #
+
+    def test_control_ensures_then_connects(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url, conn.token = "grpc://cfg:2", "tok"
+        ensure = MagicMock(
+            return_value={"grpc_url": "grpc://control:9", "state": "serving"}
+        )
+        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+        connect = MagicMock()
+        monkeypatch.setattr(conn, "connect", connect)
+
+        conn.auto_connect()
+
+        # One control call brings the plane up AND resolves the endpoint; we wait
+        # that endpoint through boot and never take the standalone connect path.
+        ensure.assert_called_once_with(timeout=30.0)
+        booted.assert_called_once_with("grpc://control:9", "tok", timeout=30.0)
+        assert conn.url == "grpc://control:9"
+        connect.assert_not_called()
+
+    def test_control_snapshot_without_url_uses_current(self, monkeypatch):
+        # A real supervisor snapshot always carries grpc_url; if one omits it, the
+        # control still answered, so we wait our current url through boot rather
+        # than falling to the no-control error path.
+        conn = TensorConnection(config={})
+        conn.url = "grpc://localhost:8815"
+        monkeypatch.setattr(
+            _connection, "ensure_data_plane", lambda timeout: {"state": "serving"}
+        )
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+
+        conn.auto_connect()
+
+        booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
+
+    def test_control_boot_failure_is_swallowed(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url = "grpc://localhost:8815"
+        monkeypatch.setattr(
+            _connection,
+            "ensure_data_plane",
+            lambda timeout: {"grpc_url": "grpc://localhost:8815", "state": "serving"},
+        )
+        monkeypatch.setattr(
+            conn,
+            "connect_when_booted",
+            MagicMock(side_effect=RuntimeError("boot failed")),
+        )
+        # A post-ensure boot failure must not propagate out of the policy.
+        conn.auto_connect()
+
+    # --- no control answers (standalone / pre-control fallback) ------------ #
+
+    def test_no_control_connects_to_config(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url, conn.token = "grpc://host:9", "tok"
         connect = MagicMock(return_value={"a": MagicMock()})
         monkeypatch.setattr(conn, "connect", connect)
         booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
-        ensure = MagicMock()
-        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         conn.auto_connect()
 
+        # No control -> connect straight to the config/env URL; a clean connect
+        # needs no boot wait.
         connect.assert_called_once_with("grpc://host:9", "tok")
-        # A clean connect short-circuits -- no boot wait, no control call.
         booted.assert_not_called()
-        ensure.assert_not_called()
 
-    def test_starting_waits_through_boot(self, monkeypatch):
+    def test_no_control_starting_waits_through_boot(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url, conn.token = "grpc://host:9", None
         monkeypatch.setattr(
@@ -1032,16 +1068,14 @@ class TestAutoConnect:
         booted = MagicMock(return_value={"a": MagicMock()})
         monkeypatch.setattr(conn, "connect_when_booted", booted)
         monkeypatch.setattr(conn, "server_start_timeout", lambda: 42.0)
-        ensure = MagicMock()
-        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         conn.auto_connect()
 
-        # A STARTING server is waited through, not handed to the control.
+        # A STARTING server is waited through, not handed back as an error.
         booted.assert_called_once_with("grpc://host:9", None, timeout=42.0)
-        ensure.assert_not_called()
 
-    def test_starting_then_boot_timeout_is_swallowed(self, monkeypatch):
+    def test_no_control_starting_boot_timeout_swallowed(self, monkeypatch):
         conn = TensorConnection(config={})
         monkeypatch.setattr(
             conn,
@@ -1054,57 +1088,12 @@ class TestAutoConnect:
             MagicMock(side_effect=RuntimeError("did not become ready")),
         )
         monkeypatch.setattr(conn, "server_start_timeout", lambda: 1.0)
-        ensure = MagicMock()
-        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         # Best-effort: a boot timeout must not raise out of auto_connect.
         conn.auto_connect()
-        # Already up (just slow), so we do NOT fall through to the control.
-        ensure.assert_not_called()
 
-    def test_unreachable_asks_control_to_ensure(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url, conn.token = "grpc://localhost:8815", None
-        monkeypatch.setattr(
-            conn,
-            "connect",
-            MagicMock(side_effect=RuntimeError("connection refused")),
-        )
-        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
-        ensure = MagicMock(return_value={"state": "serving"})
-        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
-        booted = MagicMock(return_value={"a": MagicMock()})
-        monkeypatch.setattr(conn, "connect_when_booted", booted)
-
-        conn.auto_connect()
-
-        ensure.assert_called_once_with(timeout=30.0)
-        booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
-
-    def test_remote_unreachable_still_asks_control(self, monkeypatch):
-        # The control owns the data plane and may bind it off-loopback, so a
-        # non-loopback URL is NOT a reason to skip the control: reachability is
-        # the only gate. An unreachable off-loopback endpoint still asks the
-        # control to ensure it (the control decides whether it can).
-        conn = TensorConnection(config={})
-        conn.url = "grpc://remote:9"
-        monkeypatch.setattr(
-            conn,
-            "connect",
-            MagicMock(side_effect=RuntimeError("connection refused")),
-        )
-        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
-        ensure = MagicMock(return_value={"state": "serving"})
-        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
-        booted = MagicMock(return_value={"a": MagicMock()})
-        monkeypatch.setattr(conn, "connect_when_booted", booted)
-
-        conn.auto_connect()  # must not raise
-
-        ensure.assert_called_once_with(timeout=30.0)
-        booted.assert_called_once_with("grpc://remote:9", None, timeout=30.0)
-
-    def test_no_control_records_actionable_status(self, monkeypatch):
+    def test_no_control_unreachable_records_status(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url = "grpc://localhost:8815"
         monkeypatch.setattr(
@@ -1112,7 +1101,6 @@ class TestAutoConnect:
             "connect",
             MagicMock(side_effect=RuntimeError("connection refused")),
         )
-        # No control answers -> ensure returns None.
         monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
         booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
@@ -1122,25 +1110,6 @@ class TestAutoConnect:
         booted.assert_not_called()
         assert conn.last_status == "error"
         assert "biopb control start" in conn.last_message
-
-    def test_control_ensure_then_boot_failure_is_swallowed(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url = "grpc://localhost:8815"
-        monkeypatch.setattr(
-            conn,
-            "connect",
-            MagicMock(side_effect=RuntimeError("connection refused")),
-        )
-        monkeypatch.setattr(
-            _connection, "ensure_data_plane", lambda timeout: {"state": "serving"}
-        )
-        monkeypatch.setattr(
-            conn,
-            "connect_when_booted",
-            MagicMock(side_effect=RuntimeError("boot failed")),
-        )
-        # A post-ensure boot failure must not propagate out of the policy.
-        conn.auto_connect()
 
 
 # ---------------------------------------------------------------------------
