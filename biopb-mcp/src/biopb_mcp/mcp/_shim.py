@@ -29,7 +29,13 @@ role as a shared, client-outliving lifecycle root:
   process-group teardown takes it — and its kernel, via the kernel's own
   parent-death pipe — down with the shim; the bridge-close path also reaps it
   explicitly. Windows: this shim holds a kill-on-close Job Object the child is
-  assigned to, so a force-killed shim reaps the whole tree (see ``_winjob``).
+  assigned to, so a force-killed shim reaps the whole tree (see ``_winjob``);
+  and a client-death watchdog (``_install_client_death_watchdog``) reaps the
+  shim itself when its stdio *client* exits without the bridge seeing stdin EOF
+  -- e.g. when a multi-process client (Claude Code: a daemon + pty host) keeps a
+  duplicate of the shim's stdin write handle open in a surviving helper after
+  the launching process is gone, so the session would otherwise outlive every
+  real client (biopb#403, the client side).
 
 The bridge itself is vendored rather than delegated to ``mcp-proxy`` per the
 vetting report (docs/mcp-proxy-vet.md): mcp-proxy drops the initialize
@@ -47,6 +53,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -403,8 +410,9 @@ def _install_shim_reaper(proc, job, session_id=None):
     otherwise orphan the child, since Python's default handler exits without
     running ``serve``'s ``finally``. SIGINT is left to its default: it raises
     KeyboardInterrupt out of ``run_bridge`` and the ``finally`` reaps. On Windows
-    there are no such signals — the Job Object reaps on any shim death — so this
-    is a no-op there.
+    there are no such signals — the Job Object reaps on any shim *death*, and
+    ``_install_client_death_watchdog`` covers the shim being *orphaned* by its
+    client — so this is a no-op there.
 
     ``session_id`` is passed through so the signal path de-registers too (it
     ``os._exit``s past ``serve``'s ``finally``, so it must clean the registry
@@ -424,6 +432,105 @@ def _install_shim_reaper(proc, job, session_id=None):
             signal.signal(sig, _on_signal)
         except (ValueError, OSError):
             pass
+
+
+# Substrings that mark a process in *our own* stdio launcher chain (the shim and
+# any interpreter-launcher stubs above it), as opposed to the MCP client that
+# spawned it. The whole chain shares the argv the client invoked us with
+# (``... biopb[-_]mcp ... --transport stdio``), and re-exec launchers (e.g. a
+# venv built on Microsoft Store Python inserts one) preserve it. The client's own
+# cmdline (claude.exe, an editor, a shell) matches neither.
+_OURS_MARKERS = ("biopb", "stdio")
+
+
+def _find_client_process():
+    """Walk up past our own launcher chain to the MCP client that owns us.
+
+    ``os.getppid()`` is NOT the client when an interpreter-launcher stub sits
+    between us and it — the case that made a naive parent-watch useless: on a
+    venv built on Store Python the stub *outlives* the client (it only waits on
+    us), so watching it never fires. We instead climb ancestors while their
+    cmdline looks like our chain (:data:`_OURS_MARKERS`) and return the first
+    foreign one — the real client. ``None`` if it can't be determined (psutil
+    missing, an unreadable/inaccessible ancestor, or the chain reaches the top),
+    in which case the watchdog simply does not arm.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        node = psutil.Process().parent()
+        while node is not None:
+            cl = " ".join(node.cmdline()).lower()
+            if not all(m in cl for m in _OURS_MARKERS):
+                return node  # first ancestor not in our chain == the client
+            node = node.parent()
+    except Exception:
+        # AccessDenied / NoSuchProcess / a gone ancestor mid-walk: give up rather
+        # than risk watching the wrong process. stdin EOF stays the backstop.
+        return None
+    return None
+
+
+def _install_client_death_watchdog(proc, job, session_id=None):
+    """Windows: reap the owned child if the stdio *client* dies unseen by stdin.
+
+    Normal teardown runs when ``run_bridge`` returns on stdin EOF (client hung
+    up) or, on POSIX, when the client's process-group teardown / a SIGTERM fires
+    ``_install_shim_reaper``. Windows has neither group teardown nor those
+    signals, and a multi-process client can keep a duplicate of the shim's stdin
+    write handle open in a surviving helper after the launching process exits, so
+    EOF never arrives — the shim blocks forever in the bridge and the child +
+    kernel leak (they outlive every real client). This watchdog closes that gap:
+    it blocks on the client's process handle and, when the client exits for any
+    reason, reaps the owned tree (de-registering ``session_id``) and exits.
+
+    The client is found by :func:`_find_client_process` (walking past our own
+    launcher stubs — see its docstring for why ``os.getppid()`` is not enough).
+    We hold a handle to that exact process object, so the wait is immune to pid
+    reuse. If the client cannot be found or opened at arm time, we do not arm: a
+    live session is never reaped off an uncertain baseline; stdin EOF and the Job
+    Object remain the backstops. A no-op off Windows (POSIX is covered by the
+    process group + signal reaper).
+
+    Returns the watchdog thread (daemon), or ``None`` if not armed.
+    """
+    if os.name != "nt":
+        return None
+    client = _find_client_process()
+    if client is None:
+        logger.debug("client-death watchdog not armed (client not identifiable)")
+        return None
+    handle = _winjob.open_for_wait(client.pid)
+    if not handle:
+        logger.debug("client-death watchdog not armed (client pid %s un-openable)", client.pid)
+        return None
+    thread = threading.Thread(
+        target=_client_deathwatch,
+        args=(handle, client.pid, proc, job, session_id),
+        name="biopb-client-deathwatch",
+        daemon=True,
+    )
+    thread.start()
+    logger.info("client-death watchdog armed on client pid %s", client.pid)
+    return thread
+
+
+def _client_deathwatch(handle, client_pid, proc, job, session_id):
+    """Block on the client's ``handle``; on its exit, reap the tree and exit.
+
+    A wait error is treated as *undecided* — we do not reap, since a spurious
+    reap would tear down a live session. On a real exit this ``os._exit``s past
+    ``serve``'s ``finally`` (having already reaped), matching ``_on_signal``.
+    """
+    if not _winjob.wait_for_process(handle):
+        return  # undecided (wait errored) — leave teardown to the other paths
+    logger.info(
+        "stdio client (pid %s) exited; reaping owned session %s", client_pid, session_id
+    )
+    _reap_session(proc, job, session_id)
+    os._exit(0)
 
 
 def build_proxy(remote):
@@ -599,6 +706,7 @@ def serve(config, port=None):
         logger.info("control auto-start attempt failed", exc_info=True)
     proc, url, job, session_id = spawn_session(config)
     _install_shim_reaper(proc, job, session_id)
+    _install_client_death_watchdog(proc, job, session_id)
     logger.info("Bridging stdio to %s (owned session pid %s)", url, proc.pid)
     try:
         run_bridge(url)

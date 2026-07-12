@@ -1224,3 +1224,27 @@ class TestWinJobReal:
             _winjob.close_job(job)
             if proc.poll() is None:
                 proc.kill()
+
+    def test_wait_for_process_observes_exit(self):
+        # The client-death watchdog primitive: a handle-based wait must unblock
+        # with True exactly when the watched process exits (immune to pid reuse).
+        import threading
+
+        from biopb_mcp.mcp import _winjob
+
+        proc = self._sleeper()
+        handle = _winjob.open_for_wait(proc.pid)
+        assert handle is not None
+        result = {}
+        t = threading.Thread(target=lambda: result.update(done=_winjob.wait_for_process(handle)))
+        t.start()
+        try:
+            assert t.is_alive()  # still blocked while the process lives
+            proc.kill()
+            t.join(timeout=10)
+            assert not t.is_alive()
+            assert result.get("done") is True
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            t.join(timeout=5)
