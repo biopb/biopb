@@ -424,6 +424,98 @@ def test_unknown_upstream_returns_502(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Agent-client registration API (/api/agents)
+# --------------------------------------------------------------------------- #
+# The endpoints are a thin front over biopb._agents; we stub that core so the
+# tests never touch the machine's real client configs, and assert the wiring:
+# GET lists, POST register/unregister pass the path id through and return the
+# fresh status, an AgentError is a 400, and the whole surface is token-gated.
+
+
+def _post(url, headers=None):
+    req = urllib.request.Request(url, data=b"", method="POST", headers=headers or {})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.headers, resp.read()
+
+
+def test_api_agents_lists_client_status(control, monkeypatch):
+    fake = [
+        {
+            "id": "cursor",
+            "name": "Cursor",
+            "state": "installed",
+            "drifted": False,
+            "config_path": "/x/mcp.json",
+        },
+    ]
+    monkeypatch.setattr("biopb._agents.statuses", lambda: fake)
+    status, _h, body = _get(f"{control}/api/agents")
+    assert status == 200
+    assert json.loads(body)["agents"] == fake
+
+
+def test_agent_register_passes_id_and_returns_status(control, monkeypatch):
+    seen = {}
+
+    def fake_register(agent_id):
+        seen["id"] = agent_id
+        return {
+            "id": agent_id,
+            "name": "Cursor",
+            "state": "registered",
+            "drifted": False,
+            "config_path": "/x/mcp.json",
+        }
+
+    monkeypatch.setattr("biopb._agents.register", fake_register)
+    status, _h, body = _post(f"{control}/api/agents/cursor/register")
+    assert status == 200
+    assert seen["id"] == "cursor"
+    assert json.loads(body)["agent"]["state"] == "registered"
+
+
+def test_agent_unregister_passes_id_and_returns_status(control, monkeypatch):
+    monkeypatch.setattr(
+        "biopb._agents.unregister",
+        lambda agent_id: {
+            "id": agent_id,
+            "name": "Cursor",
+            "state": "installed",
+            "drifted": False,
+            "config_path": "/x/mcp.json",
+        },
+    )
+    status, _h, body = _post(f"{control}/api/agents/cursor/unregister")
+    assert status == 200
+    assert json.loads(body)["agent"]["state"] == "installed"
+
+
+def test_agent_action_error_is_400(control, monkeypatch):
+    from biopb._agents import AgentError
+
+    def boom(agent_id):
+        raise AgentError("unknown agent client 'nope'")
+
+    monkeypatch.setattr("biopb._agents.register", boom)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post(f"{control}/api/agents/nope/register")
+    assert exc.value.code == 400
+
+
+def test_api_agents_is_token_gated(tokened_control, monkeypatch):
+    monkeypatch.setattr("biopb._agents.statuses", list)
+    # No token -> 401 (it is /api/*, not exempt like /api/data_plane/ensure).
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/api/agents")
+    assert exc.value.code == 401
+    # Correct token -> 200.
+    status, _h, _b = _get(
+        f"{tokened_control}/api/agents", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+    assert status == 200
+
+
+# --------------------------------------------------------------------------- #
 # WebSocket proxy (/ws/render)
 # --------------------------------------------------------------------------- #
 @pytest.fixture

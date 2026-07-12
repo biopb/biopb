@@ -15,6 +15,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import _agents
 from ._config_location import DEFAULT_CONFIG_DIR, find_config
 from ._filelock import LockTimeout, file_lock
 from ._proc import (
@@ -2289,6 +2290,158 @@ def control_run(
 
 
 app.add_typer(control_app, name="control")
+
+
+# ---------------------------------------------------------------------------
+# biopb agents: register biopb-mcp with local AI agent clients
+# ---------------------------------------------------------------------------
+# The installer wires biopb into detected MCP clients once at install time; these
+# commands do the same afterwards (install Claude Code later, register it now),
+# over the shared, stdlib-only catalog in biopb._agents -- the single source of
+# truth both this CLI and the control-plane dashboard call.
+agents_app = typer.Typer(
+    name="agents",
+    help="Register biopb-mcp with local AI agent clients "
+    "(Claude Code, Claude Desktop, Cursor, opencode).",
+)
+
+# State -> rich style for the status column.
+_AGENT_STATE_STYLE = {
+    "registered": "green",
+    "installed": "yellow",
+    "not_installed": "dim",
+}
+
+
+def _agent_state_label(row: dict) -> str:
+    """Human label for a status row (``drifted`` annotated so a stale entry that
+    needs a Re-register is visible)."""
+    state = row["state"]
+    if state == "registered" and row.get("drifted"):
+        return "registered (drifted)"
+    return state.replace("_", " ")
+
+
+def _known_agent_ids() -> List[str]:
+    return [s.id for s in _agents.supported()]
+
+
+def _resolve_agent_targets(
+    client: Optional[str], all_: bool, *, states: Optional[set] = None
+) -> List[str]:
+    """The client ids a register/unregister should act on.
+
+    An explicit ``client`` acts on exactly that one (validated). ``--all`` acts on
+    every client whose current state is in ``states`` (e.g. skip ``not_installed``
+    for register, target only ``registered`` for unregister), matching the
+    installer's "only touch clients that are actually there" behavior. Exits 1 on
+    a bad/missing selector.
+    """
+    ids = _known_agent_ids()
+    if all_ and client:
+        console.print("[red]Pass either a client id or --all, not both.[/red]")
+        raise typer.Exit(1)
+    if not all_ and not client:
+        console.print(
+            "[red]Specify a client id or --all.[/red] Known clients: " + ", ".join(ids)
+        )
+        raise typer.Exit(1)
+    if client is not None:
+        if client not in ids:
+            console.print(
+                f"[red]Unknown client {client!r}.[/red] Known clients: "
+                + ", ".join(ids)
+            )
+            raise typer.Exit(1)
+        return [client]
+    # --all: filter by current state.
+    targets = [
+        row["id"]
+        for row in _agents.statuses()
+        if states is None or row["state"] in states
+    ]
+    return targets
+
+
+@agents_app.command("list")
+def agents_list(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show each supported client and whether biopb is registered."""
+    rows = _agents.statuses()
+    if json_output:
+        print(json.dumps({"agents": rows}))
+        raise typer.Exit(0)
+    table = Table(title="Agent clients")
+    table.add_column("Client", style="cyan")
+    table.add_column("Status")
+    table.add_column("Config", style="dim")
+    for row in rows:
+        style = _AGENT_STATE_STYLE.get(row["state"], "white")
+        table.add_row(
+            row["name"],
+            f"[{style}]{_agent_state_label(row)}[/{style}]",
+            row.get("config_path") or "-",
+        )
+    console.print(table)
+
+
+@agents_app.command("register")
+def agents_register(
+    client: Optional[str] = typer.Argument(
+        None, help="Client id (e.g. claude-code); omit when using --all"
+    ),
+    all_: bool = typer.Option(
+        False, "--all", help="Register with every detected client"
+    ),
+):
+    """Register biopb-mcp with a client (or every detected client with --all)."""
+    # For --all, skip clients that aren't even installed; an explicit id is
+    # attempted regardless (a "register anyway" escape hatch).
+    targets = _resolve_agent_targets(client, all_, states={"installed", "registered"})
+    if not targets:
+        console.print("[yellow]No agent clients detected to register.[/yellow]")
+        raise typer.Exit(0)
+    failures = 0
+    for cid in targets:
+        try:
+            st = _agents.register(cid)
+            console.print(f"[green]Registered[/green] {st['name']}")
+        except _agents.AgentError as exc:
+            failures += 1
+            console.print(f"[red]{cid}: {exc}[/red]")
+    console.print("[dim]Restart the client for the change to take effect.[/dim]")
+    raise typer.Exit(1 if failures else 0)
+
+
+@agents_app.command("unregister")
+def agents_unregister(
+    client: Optional[str] = typer.Argument(
+        None, help="Client id (e.g. claude-code); omit when using --all"
+    ),
+    all_: bool = typer.Option(
+        False, "--all", help="Unregister from every currently registered client"
+    ),
+):
+    """Remove biopb-mcp from a client (or every registered client with --all)."""
+    targets = _resolve_agent_targets(client, all_, states={"registered"})
+    if not targets:
+        console.print("[yellow]biopb is not registered with any client.[/yellow]")
+        raise typer.Exit(0)
+    failures = 0
+    for cid in targets:
+        try:
+            st = _agents.unregister(cid)
+            console.print(f"[green]Unregistered[/green] {st['name']}")
+        except _agents.AgentError as exc:
+            failures += 1
+            console.print(f"[red]{cid}: {exc}[/red]")
+    raise typer.Exit(1 if failures else 0)
+
+
+app.add_typer(agents_app, name="agents")
 
 
 # ---------------------------------------------------------------------------
