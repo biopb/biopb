@@ -262,6 +262,128 @@ class TestReapSession:
         assert proc.poll() is not None
 
 
+class _FakeProc:
+    """psutil.Process stand-in for the ancestor-walk: a cmdline + a parent link."""
+
+    def __init__(self, cmdline, parent=None):
+        self._cmdline = cmdline
+        self._parent = parent
+
+    def cmdline(self):
+        return self._cmdline
+
+    def parent(self):
+        return self._parent
+
+    @property
+    def pid(self):
+        return 4242
+
+
+def _fake_psutil(me):
+    import types as _types
+
+    mod = _types.SimpleNamespace(Process=lambda *a, **k: me)
+    return mod
+
+
+class TestFindClientProcess:
+    """The ancestor walk that skips our own launcher stubs to reach the real
+    client -- the fix's crux (``getppid()`` is the stub, not the client, on a
+    venv built atop Store Python, where the stub outlives the client)."""
+
+    def test_walks_past_our_launcher_chain_to_client(self, monkeypatch):
+        # serve (us) -> venv launcher stub -> the client (claude). Both of our
+        # processes carry the shim argv (biopb + stdio); the client carries none.
+        client = _FakeProc([r"C:\claude.exe", "mcp"])
+        stub = _FakeProc([r"C:\.venv\python.exe", "-m", "biopb_mcp.mcp",
+                          "--transport", "stdio"], parent=client)
+        me = _FakeProc([r"python3.10.exe", "-m", "biopb_mcp.mcp",
+                        "--transport", "stdio"], parent=stub)
+        monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
+        assert _shim._find_client_process() is client
+
+    def test_none_when_chain_reaches_top(self, monkeypatch):
+        # If every ancestor still looks like ours (no foreign client found), do
+        # not guess -- return None so the watchdog does not arm.
+        stub = _FakeProc(["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"])
+        me = _FakeProc(["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+                       parent=stub)
+        monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
+        assert _shim._find_client_process() is None
+
+    def test_none_on_unreadable_ancestor(self, monkeypatch):
+        class _Boom:
+            def cmdline(self):
+                raise RuntimeError("access denied")
+
+            def parent(self):
+                return None
+
+        me = _FakeProc(["python", "-m", "biopb_mcp.mcp", "stdio"], parent=_Boom())
+        monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
+        assert _shim._find_client_process() is None
+
+
+class TestClientDeathWatchdog:
+    """The Windows gap-filler: reap the owned session when the stdio client dies
+    without the bridge seeing stdin EOF (a surviving client helper holding the
+    stdin write handle). The reap/exit decision is tested OS-independently by
+    driving ``_client_deathwatch`` directly; arming is Windows-only."""
+
+    def test_installer_is_noop_off_windows(self):
+        if os.name == "nt":
+            pytest.skip("Windows arms a real watchdog thread")
+        assert _shim._install_client_death_watchdog(object(), None, "sid") is None
+
+    def test_not_armed_when_client_unidentifiable(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(_shim, "_find_client_process", lambda: None)
+        assert _shim._install_client_death_watchdog(object(), None, "sid") is None
+
+    def test_not_armed_when_client_handle_unopenable(self, monkeypatch):
+        # A client we found but cannot open (returns None) must not arm --
+        # never reap a live session off a baseline we could not establish.
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
+        monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: None)
+        assert _shim._install_client_death_watchdog(object(), None, "sid") is None
+
+    def test_arms_thread_when_client_found_and_openable(self, monkeypatch):
+        import threading
+
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
+        monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: "HANDLE")
+        monkeypatch.setattr(_shim, "_client_deathwatch", lambda *a, **k: None)
+        t = _shim._install_client_death_watchdog(object(), None, "sid")
+        assert isinstance(t, threading.Thread)
+        t.join(timeout=5)
+
+    def test_reaps_and_exits_when_client_exits(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: True)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda p, j, s=None: events.append(("reap", s))
+        )
+        monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append(("exit", code)))
+        _shim._client_deathwatch("HANDLE", 4242, object(), None, "sid")
+        # The client's exit must both reap (de-registering the session) and exit.
+        assert events == [("reap", "sid"), ("exit", 0)]
+
+    def test_does_not_reap_on_wait_error(self, monkeypatch):
+        # An undecided wait (error / not-signalled) must NOT tear down a session
+        # that may still be live -- the other teardown paths remain the backstop.
+        events = []
+        monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: False)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda *a, **k: events.append("reap")
+        )
+        monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append("exit"))
+        _shim._client_deathwatch("HANDLE", 4242, object(), None, "sid")
+        assert events == []
+
+
 class _FakeRemote:
     """ClientSession stand-in recording forwarded calls."""
 
@@ -522,6 +644,7 @@ class TestServe:
 
         monkeypatch.setattr(_shim, "spawn_session", _fake_spawn)
         monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
+        monkeypatch.setattr(_shim, "_install_client_death_watchdog", lambda *a, **k: None)
         monkeypatch.setattr(_shim, "run_bridge", lambda url: calls.append("bridge"))
         monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
 
@@ -545,6 +668,7 @@ class TestServe:
             lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", None, "sid"),
         )
         monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
+        monkeypatch.setattr(_shim, "_install_client_death_watchdog", lambda *a, **k: None)
         bridged = []
         monkeypatch.setattr(_shim, "run_bridge", lambda url: bridged.append(url))
         monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)

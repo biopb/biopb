@@ -15,6 +15,13 @@ handle and kills the whole job. ``TerminateJobObject`` additionally gives a
 from-outside tree-kill on the graceful teardown path, the Windows counterpart to
 ``os.killpg(pgid, SIGKILL)``.
 
+The module also exposes the *inverse* Windows primitive -- ``open_for_wait`` /
+``wait_for_process``, a blocking wait on some *other* process's exit -- so the
+shim can watch its stdio **client** die and reap the session it owns (the
+counterpart, in the other direction, to the kernel's parent-death pipe). A
+process handle names the process object, not its (reusable) pid, so the wait is
+immune to pid reuse.
+
 Every function is Windows-only and best-effort: it returns ``None`` / ``False``
 and logs at debug on any failure, so a ctypes/OS hiccup degrades to the
 pre-#403 behavior instead of breaking kernel bring-up.
@@ -33,6 +40,11 @@ _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 # OpenProcess access rights AssignProcessToJobObject requires
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
+# OpenProcess access right WaitForSingleObject requires, plus the infinite wait
+# and its "the object was signalled" (here: the process exited) return value.
+_SYNCHRONIZE = 0x00100000
+_INFINITE = 0xFFFFFFFF
+_WAIT_OBJECT_0 = 0x0
 
 
 if os.name == "nt":
@@ -88,6 +100,8 @@ if os.name == "nt":
         k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         k32.TerminateJobObject.restype = wintypes.BOOL
         k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         k32.CloseHandle.restype = wintypes.BOOL
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         return k32
@@ -178,3 +192,42 @@ def close_job(job):
             raise ctypes.WinError(ctypes.get_last_error())
     except Exception:
         logger.debug("CloseHandle(job) failed", exc_info=True)
+
+
+def open_for_wait(pid):
+    """Open a SYNCHRONIZE-only handle to ``pid`` for :func:`wait_for_process`.
+
+    Returns an opaque handle -- which names the *process object*, so the later
+    wait is immune to pid reuse -- or ``None`` if the process cannot be opened
+    (already gone, or access denied). The caller must pass the handle to
+    :func:`wait_for_process` (which closes it) exactly once. Windows-only.
+    """
+    if os.name != "nt" or not pid or pid <= 0:
+        return None
+    try:
+        handle = _kernel32.OpenProcess(_SYNCHRONIZE, False, int(pid))
+        return handle or None
+    except Exception:
+        logger.debug("OpenProcess(SYNCHRONIZE) failed (pid=%s)", pid, exc_info=True)
+        return None
+
+
+def wait_for_process(handle):
+    """Block until the process behind ``handle`` exits; then close ``handle``.
+
+    Returns ``True`` only when the exit was actually observed. Any wait error
+    (or a non-signalled return) yields ``False`` so the caller never treats an
+    uncertain result as a definite death. Windows-only.
+    """
+    if os.name != "nt" or not handle:
+        return False
+    try:
+        return _kernel32.WaitForSingleObject(handle, _INFINITE) == _WAIT_OBJECT_0
+    except Exception:
+        logger.debug("WaitForSingleObject failed", exc_info=True)
+        return False
+    finally:
+        try:
+            _kernel32.CloseHandle(handle)
+        except Exception:
+            logger.debug("CloseHandle(wait handle) failed", exc_info=True)
