@@ -318,15 +318,16 @@ class TestConnect:
         assert w._refresh_button.isEnabled()
         assert "SQL filter" in w._filter_input.placeholderText()
 
-    def test_connect_button_retargets_to_typed_url(self, widget):
+    def test_connect_button_applies_token_and_reconnects(self, widget):
         w, conn, workers = widget
-        w._server_input.setText("grpc://other:9")
+        # The data-plane URL is no longer user-editable (#413): the control owns
+        # it and auto_connect resolves it. The Connect button only picks up the
+        # typed token and reconnects; there is no Server URL field to type into.
+        assert not hasattr(w, "_server_input")
         w._token_input.setText("secret")
 
         w._on_connect_clicked()
 
-        # The typed URL/token are pushed onto the connection before connecting.
-        assert conn.url == "grpc://other:9"
         assert conn.token == "secret"
         assert len(workers) == 1  # a connect worker was started
 

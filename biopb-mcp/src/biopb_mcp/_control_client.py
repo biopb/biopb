@@ -36,6 +36,33 @@ def control_reachable(timeout: float = 1.0) -> bool:
         return False
 
 
+def data_plane_url(timeout: float = 1.0) -> str | None:
+    """The data-plane gRPC URL the control owns, or ``None`` if no control answers.
+
+    GETs the control's bare, unauthenticated ``/health`` and reads
+    ``data_plane.grpc_url`` from the supervisor snapshot. The control resolves
+    that endpoint from the tensor-server ``[server]`` config, so it is the single
+    source of truth for *where the data plane lives* (#413) -- the model in which
+    the admin owns the data plane. ``None`` when the control is unreachable (not
+    running) so the caller falls back to its own local config; this is a plain
+    read (unlike ``ensure_data_plane`` it never spawns the plane).
+    """
+    try:
+        with urllib.request.urlopen(f"{_base_url()}/health", timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            payload = json.loads(resp.read().decode())
+    except Exception as exc:  # noqa: BLE001 - best-effort; caller falls back to config
+        logger.debug("control data_plane_url probe failed: %s", exc)
+        return None
+    data_plane = payload.get("data_plane")
+    if isinstance(data_plane, dict):
+        url = data_plane.get("grpc_url")
+        if isinstance(url, str) and url:
+            return url
+    return None
+
+
 def ensure_data_plane(timeout: float = 60.0) -> dict | None:
     """Ask the control to ensure the data plane is up; return its snapshot.
 

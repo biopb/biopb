@@ -915,7 +915,7 @@ class TensorBrowserWidget(QWidget):
         # Compact connection summary row: a single clickable line showing the
         # server + state ("server_url — connected") with a trailing disclosure
         # caret. Clicking it toggles the advanced connection controls
-        # (URL/token/Connect/Refresh). Those controls are touched once at setup;
+        # (token/Connect/Refresh). Those controls are touched once at setup;
         # day-to-day the user only needs to see *that* they are connected, so
         # they are collapsed by default. The caret + pointing-hand cursor are the
         # affordance that the line is expandable (biopb/biopb-mcp).
@@ -929,20 +929,14 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._status_summary)
 
         # Advanced connection panel — hidden until the summary line is clicked.
-        # Holds the server URL, token, and Connect/Refresh controls.
+        # Holds the token and Connect/Refresh controls. The data-plane URL is NOT
+        # user-editable: the control (control plane) owns the data plane and is the
+        # single source of truth for its endpoint (#413), so the URL is resolved at
+        # connect time, not typed here. The summary line shows the resolved URL.
         self._advanced_panel = QWidget()
         adv_layout = QVBoxLayout(self._advanced_panel)
         adv_layout.setContentsMargins(0, 0, 0, 0)
         adv_layout.setSpacing(4)
-
-        # Server URL input (label and input on same row)
-        server_layout = QHBoxLayout()
-        server_layout.addWidget(QLabel("Server:"))
-        self._server_input = QLineEdit()
-        self._server_input.setText(self._conn.url)
-        self._server_input.setPlaceholderText("Flight server URL")
-        server_layout.addWidget(self._server_input)
-        adv_layout.addLayout(server_layout)
 
         # Token input (label, input, and toggle on same row)
         token_layout = QHBoxLayout()
@@ -1058,8 +1052,11 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._message_label)
 
     def _on_connect_clicked(self, *args):
-        """Connect button handler: retarget to the typed URL/token, connect."""
-        self._conn.url = self._server_input.text().strip()
+        """Connect button handler: (re)connect, picking up the typed token.
+
+        The data-plane URL is not typed here (#413) -- ``auto_connect`` resolves
+        it from the control -- so this only refreshes the token and reconnects.
+        """
         self._conn.token = self._token_input.text().strip() or None
         self._start_connect()
 
@@ -1171,7 +1168,7 @@ class TensorBrowserWidget(QWidget):
         connected without expanding the advanced panel. The caret signals that
         the line is clickable to reveal the connection settings.
         """
-        # The URL is user-supplied (Server field / config); it is embedded in a
+        # The URL is control-derived / config fallback (#413); it is embedded in a
         # rich-text QLabel, so escape it or a '&'/'<' would corrupt the markup.
         url = html.escape(self._conn.url or "(no server)")
         if self._connecting:

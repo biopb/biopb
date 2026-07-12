@@ -6,6 +6,8 @@ the GUI stack via the package ``__init__``, which eagerly imports the widgets;
 the service module itself imports no Qt/napari.)
 """
 
+import contextlib
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +25,14 @@ from biopb_mcp._connection import (
 def _clear_env(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_control(monkeypatch):
+    """Default: no control plane answers, so ``_resolve_data_plane_url`` returns
+    the config/env fallback and no real ``/health`` probe is made from unit tests.
+    Tests that exercise a live control override this with their own monkeypatch."""
+    monkeypatch.setattr(_connection, "data_plane_url", lambda *a, **k: None)
 
 
 def _fake_client(sources):
@@ -56,6 +66,123 @@ class TestResolveFromConfig:
         url, token = TensorConnection.resolve_from_config({})
         assert url == DEFAULT_CONFIG["tensor_browser"]["server_url"]
         assert token is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_data_plane_url (control first, config fallback -- #413)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDataPlaneUrl:
+    def test_uses_control_url_when_control_alive(self, monkeypatch):
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(
+            _connection, "data_plane_url", lambda *a, **k: "grpc://control:9"
+        )
+        assert conn._resolve_data_plane_url() == "grpc://control:9"
+
+    def test_falls_back_to_config_when_no_control(self, monkeypatch):
+        # No control answers -> the config/env URL (here the config one).
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(_connection, "data_plane_url", lambda *a, **k: None)
+        assert conn._resolve_data_plane_url() == "grpc://cfg:2"
+
+
+class TestAutoConnectResolution:
+    def test_targets_control_url(self, monkeypatch):
+        # Control alive + plane up: connect straight to the control's endpoint,
+        # ignoring the (different) config fallback.
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(
+            _connection, "data_plane_url", lambda *a, **k: "grpc://control:9"
+        )
+        seen = []
+        monkeypatch.setattr(
+            _connection,
+            "TensorFlightClient",
+            lambda url, token=None: seen.append(url) or _fake_client({}),
+        )
+        conn.auto_connect()
+        assert conn.is_connected
+        assert conn.url == "grpc://control:9"
+        assert seen == ["grpc://control:9"]
+
+    def test_prefers_ensure_snapshot_url_when_plane_down(self, monkeypatch):
+        # Control alive but plane down: the first connect fails, the control's
+        # ensure brings it up and its snapshot grpc_url is authoritative.
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(
+            _connection, "data_plane_url", lambda *a, **k: "grpc://localhost:9999"
+        )
+        monkeypatch.setattr(
+            _connection,
+            "ensure_data_plane",
+            lambda *a, **k: {"grpc_url": "grpc://localhost:8888", "state": "serving"},
+        )
+        calls = []
+
+        def _client(url, token=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise ConnectionError("plane down")
+            return _fake_client({})
+
+        monkeypatch.setattr(_connection, "TensorFlightClient", _client)
+        conn.auto_connect()
+        assert conn.is_connected
+        assert conn.url == "grpc://localhost:8888"
+        assert calls == ["grpc://localhost:9999", "grpc://localhost:8888"]
+
+
+# ---------------------------------------------------------------------------
+# _control_client.data_plane_url (the control /health probe)
+# ---------------------------------------------------------------------------
+
+
+class TestControlDataPlaneUrl:
+    @staticmethod
+    def _fake_urlopen(status, body):
+        @contextlib.contextmanager
+        def _cm(*_a, **_k):
+            resp = MagicMock()
+            resp.status = status
+            resp.read.return_value = json.dumps(body).encode()
+            yield resp
+
+        return _cm
+
+    def test_returns_grpc_url_from_health(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(
+            _control_client.urllib.request,
+            "urlopen",
+            self._fake_urlopen(
+                200, {"control": "ok", "data_plane": {"grpc_url": "grpc://x:5"}}
+            ),
+        )
+        assert _control_client.data_plane_url() == "grpc://x:5"
+
+    def test_none_when_control_unreachable(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        def _boom(*_a, **_k):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(_control_client.urllib.request, "urlopen", _boom)
+        assert _control_client.data_plane_url() is None
+
+    def test_none_when_snapshot_lacks_grpc_url(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(
+            _control_client.urllib.request,
+            "urlopen",
+            self._fake_urlopen(200, {"control": "ok", "data_plane": {}}),
+        )
+        assert _control_client.data_plane_url() is None
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +971,11 @@ class TestAutoConnect:
         ensure.assert_called_once_with(timeout=30.0)
         booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
 
-    def test_remote_unreachable_does_not_ask_control(self, monkeypatch):
+    def test_remote_unreachable_still_asks_control(self, monkeypatch):
+        # The control owns the data plane and may bind it off-loopback, so a
+        # non-loopback URL is NOT a reason to skip the control: reachability is
+        # the only gate. An unreachable off-loopback endpoint still asks the
+        # control to ensure it (the control decides whether it can).
         conn = TensorConnection(config={})
         conn.url = "grpc://remote:9"
         monkeypatch.setattr(
@@ -852,12 +983,16 @@ class TestAutoConnect:
             "connect",
             MagicMock(side_effect=RuntimeError("connection refused")),
         )
-        ensure = MagicMock()
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
+        ensure = MagicMock(return_value={"state": "serving"})
         monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
 
         conn.auto_connect()  # must not raise
-        # A remote server is not ours (or the control's) to start.
-        ensure.assert_not_called()
+
+        ensure.assert_called_once_with(timeout=30.0)
+        booted.assert_called_once_with("grpc://remote:9", None, timeout=30.0)
 
     def test_no_control_records_actionable_status(self, monkeypatch):
         conn = TensorConnection(config={})
