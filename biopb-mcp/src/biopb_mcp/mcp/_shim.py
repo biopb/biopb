@@ -59,6 +59,7 @@ from mcp.server.lowlevel.server import Server, request_ctx
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 
+from .. import _control_client
 from . import _winjob
 
 logger = logging.getLogger(__name__)
@@ -585,6 +586,17 @@ def serve(config, port=None):
         "`claude mcp add --transport http biopb http://127.0.0.1:<port>/mcp` "
         "against a `biopb mcp start` session."
     )
+    # Best-effort, non-blocking: get the durable control plane (which owns the data
+    # plane the kernel will talk to) coming up -- WITHOUT waiting for or verifying
+    # it, since the bridge below must be ready within the MCP client's handshake
+    # timeout. It boots in parallel with spawn_session's import-dominated child
+    # startup; if it is still not up when the child first needs the data plane, the
+    # child surfaces the error (see _control_client.start_control_detached). Fully
+    # guarded -- a control-start hiccup must never abort the shim's bridge.
+    try:
+        _control_client.start_control_detached()
+    except Exception:  # noqa: BLE001 - best-effort; the child surfaces real errors
+        logger.info("control auto-start attempt failed", exc_info=True)
     proc, url, job, session_id = spawn_session(config)
     _install_shim_reaper(proc, job, session_id)
     logger.info("Bridging stdio to %s (owned session pid %s)", url, proc.pid)
