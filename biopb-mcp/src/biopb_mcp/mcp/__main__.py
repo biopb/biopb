@@ -274,6 +274,26 @@ def _resolve_headless(display_mode, has_display):
     return not has_display
 
 
+def _resolve_headless_logged(display_mode, has_display):
+    """:func:`_resolve_headless`, but warn on a silent ``auto`` -> headless.
+
+    When ``display_mode='auto'`` degrades to headless purely because no display
+    was found, the viewer and screenshots silently go away -- the exact silent
+    path #98 named. Surface it once so the operator knows why. An explicit
+    ``'headless'`` choice is intentional and needs no warning; the ``'visible'``
+    + no-display case is handled (fatally) by the caller.
+    """
+    headless = _resolve_headless(display_mode, has_display)
+    if headless and display_mode != "headless" and not has_display:
+        logger.warning(
+            "display_mode='auto' resolved to headless: no display detected "
+            "($DISPLAY/$WAYLAND_DISPLAY are unset), so the kernel runs "
+            "compute-only (no napari viewer; screenshots unavailable). Set "
+            "mcp.transport.display_mode to 'visible' once a display is available."
+        )
+    return headless
+
+
 def _setup_observe(config):
     """Wire up the web observe UI.
 
@@ -418,7 +438,7 @@ def _serve_http(config, port, view=False):
             kernel_log_path,
         )
         return 2
-    headless = _resolve_headless(display_mode, has_display)
+    headless = _resolve_headless_logged(display_mode, has_display)
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]

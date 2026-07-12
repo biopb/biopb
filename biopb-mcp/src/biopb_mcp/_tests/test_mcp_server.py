@@ -456,6 +456,16 @@ class TestInterruptRestart:
         server_with_host.restart.assert_called_once()
         assert "restarted" in result.lower()
 
+    def test_restart_headless_reports_no_viewer(self, server_with_host):
+        # A headless restart rebuilds no napari window, so the message must not
+        # promise a rebuilt viewer that isn't there.
+        _server.set_headless(True)
+        result = _server.restart_kernel()
+        server_with_host.restart.assert_called_once()
+        assert "restarted" in result.lower()
+        assert "headless" in result.lower()
+        assert "rebuilt" not in result.lower()  # no viewer to rebuild
+
     def test_restart_reports_failure(self, server_with_host):
         server_with_host.restart.side_effect = RuntimeError("nope")
         result = _server.restart_kernel()
@@ -474,6 +484,17 @@ class TestStartKernel:
         server_with_host.ensure_started.assert_called_once()
         assert "ready" in result.lower()
         assert "execute_code" in result
+
+    def test_ready_headless_reports_no_viewer(self, server_with_host):
+        # In a headless session there is no napari window and take_screenshot is
+        # unavailable, so the ready message must say so and not promise a viewer.
+        _server.set_headless(True)
+        server_with_host.ensure_started.return_value = {"state": "ready"}
+        result = _server.start_kernel()
+        assert "ready" in result.lower()
+        assert "headless" in result.lower()
+        assert "execute_code" in result
+        assert "take_screenshot" not in result  # not offered when headless
 
     def test_error_state_message(self, server_with_host):
         server_with_host.ensure_started.return_value = {

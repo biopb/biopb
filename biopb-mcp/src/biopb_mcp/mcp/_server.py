@@ -701,10 +701,12 @@ def start_kernel() -> str:
     """Start the napari kernel on demand (it does not auto-start).
 
     The MCP server stays cheap and idle until you call this; it then brings up
-    the child IPython kernel, the napari viewer window, dask, and the tensor
-    client. This BLOCKS until the kernel is ready (or the bring-up fails), so on
-    return you can use execute_code / take_screenshot / inspect_object directly
-    (no polling needed). A ready kernel is a no-op.
+    the child IPython kernel, dask, the tensor client, and -- unless the session
+    is headless -- the napari viewer window. This BLOCKS until the kernel is
+    ready (or the bring-up fails), so on return you can use execute_code /
+    inspect_object directly, plus take_screenshot when a viewer is present (no
+    polling needed). A ready kernel is a no-op. The return message reports
+    whether the session is headless.
 
     Call this once at the start of a session. It is also the recovery path:
     after a failed start, a dead kernel, or the user closing the viewer window
@@ -716,6 +718,14 @@ def start_kernel() -> str:
         return "Error: kernel host not initialized"
     result = host.ensure_started()
     if result.get("state") == "ready":
+        if _headless:
+            # No napari window in a headless session, so take_screenshot is
+            # unavailable -- say so rather than claiming a viewer that isn't there.
+            return (
+                "Kernel ready (headless -- no napari viewer; screenshots "
+                "unavailable). dask and the tensor client are up; use "
+                "execute_code / inspect_object now."
+            )
         return (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
             "use execute_code / take_screenshot now."
@@ -732,9 +742,10 @@ def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the napari viewer and tensor client.
-    All variables defined in previous execute_code calls are lost, and a new
-    desktop viewer window replaces the old one.
+    respawns a fresh kernel, rebuilding the tensor client and -- unless the
+    session is headless -- the napari viewer. All variables defined in previous
+    execute_code calls are lost; when a viewer is present, a new desktop window
+    replaces the old one.
     """
     host = _kernel_host
     if host is None:
@@ -743,6 +754,12 @@ def restart_kernel() -> str:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
+    if _headless:
+        # No napari window in a headless session -- don't claim a rebuilt viewer.
+        return (
+            "Kernel restarted (headless -- no napari viewer). dask and the "
+            "tensor client are up; previous variables are gone."
+        )
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
