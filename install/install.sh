@@ -68,47 +68,6 @@ _py() {
     fi
 }
 
-# Merge a biopb stdio MCP entry into JSON <file> under top-level key <parent>
-# (e.g. "mcpServers" or "mcp"). <style> picks the entry shape: "stdio" for the
-# standard {command,args} form — no "type" (Claude Desktop, Cursor, the canonical
-# mcp.json) — and "opencode" for opencode's {type:"local", command:[...]} form.
-# <command> and the trailing args are the `biopb-mcp` invocation the client
-# spawns. Preserves all other content, creates the file (and parents) if absent,
-# and writes atomically. JSON-escaping happens in Python, so a command path with
-# spaces is safe. Uses Python (always present) instead of jq, which labs may not
-# have. Returns non-zero and leaves the file untouched on any error.
-_mcp_merge() {
-    local file="$1" parent="$2" style="$3" command="$4"; shift 4
-    mkdir -p "$(dirname "$file")"
-    _py - "$file" "$parent" "$style" "$command" "$@" 2>/dev/null <<'PY'
-import json, os, sys
-path, parent, style, command, *cmd_args = sys.argv[1:]
-try:
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-except FileNotFoundError:
-    data = {}
-if not isinstance(data, dict):
-    sys.exit("%s: top-level JSON is not an object" % path)
-if style == "opencode":
-    entry = {"type": "local", "command": [command, *cmd_args], "enabled": True}
-else:
-    # Standard mcpServers stdio form (Claude Desktop, Cursor, the canonical
-    # mcp.json): bare command+args, no "type" — that is the form every
-    # mcpServers client accepts (a stray "type" trips stricter validators).
-    entry = {"command": command, "args": cmd_args}
-section = data.get(parent)
-if not isinstance(section, dict):
-    section = data[parent] = {}
-section["biopb"] = entry
-tmp = path + ".biopb.tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
-PY
-}
-
 # Write the opencode zen API key into opencode's credential store
 # (~/.local/share/opencode/auth.json) under provider id "opencode" (the id zen
 # uses). Merges into any existing auth.json so other providers survive; writes
@@ -217,27 +176,12 @@ os.replace(tmp, out)
 PY
 }
 
-# Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
-# Cursor, …). biopb-mcp speaks stdio, so the client spawns the command itself.
-# Usage: _mcp_json_merge <config-file> <command> <label> [args...]
-# Returns 0 only if biopb was actually written into the client's config.
-_mcp_json_merge() {
-    local file="$1" command="$2" label="$3"; shift 3
-    if _mcp_merge "$file" "mcpServers" "stdio" "$command" "$@"; then
-        _ok "$label: registered biopb ($file)"
-        return 0
-    fi
-    _warn "$label: could not update $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
-    return 1
-}
-
 # Detect AI agents (MCP clients) already on the system that biopb-mcp can plug into.
 # Populates the DETECTED_AGENTS array with human-readable names; if it comes back empty,
 # the MCP-configuration step offers to install one (opencode) before registering biopb.
 _detect_agents() {
     DETECTED_AGENTS=()
     command -v claude &>/dev/null && DETECTED_AGENTS+=("Claude Code")
-    [ -d "$HOME/.hermes" ] && DETECTED_AGENTS+=("Hermes")
     case "$PLATFORM" in
         macOS)     [ -d "$HOME/Library/Application Support/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
         Linux|WSL) [ -d "$HOME/.config/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
@@ -331,17 +275,11 @@ _install_opencode() {
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
 _setup_mcp() {
+    # Resolve the absolute biopb-mcp path for the canonical mcp.json fallback
+    # (per-client registration resolves its own path inside `biopb agents`). GUI
+    # agents don't inherit the shell PATH, so the absolute path is what works.
     local mcp_cmd
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
-
-    # biopb-mcp speaks MCP over stdio: the AI agent spawns it as a child process
-    # (`biopb-mcp --transport stdio`). Recent biopb-mcp makes that child a thin
-    # bridge that brings up — and shares across clients — a local http daemon on
-    # demand (the daemon outlives any one client). The client contract is
-    # unchanged, so each client still needs the *command* to run, not a URL —
-    # and we register the resolved absolute path so GUI agents (e.g. Claude
-    # Desktop), which don't inherit the shell PATH, can still find it.
-    local mcp_args=(--transport stdio)
 
     # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
     # Preserved if it already exists so the user's tweaks survive a rerun.
@@ -395,79 +333,40 @@ EOF
         _ok "Created biopb-mcp config: $mcp_config"
     fi
 
-    # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
-    if _mcp_merge "$CONFIG_DIR/mcp.json" "mcpServers" "stdio" "$mcp_cmd" "${mcp_args[@]}"; then
-        _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+    # Canonical standalone definition (standard mcpServers JSON; most clients
+    # accept it) -- a manual fallback the summary points at if nothing auto-wired.
+    # A fixed-shape standalone file, so a plain heredoc suffices (no merge).
+    cat > "$CONFIG_DIR/mcp.json" << EOF
+{
+  "mcpServers": {
+    "biopb": {
+      "command": "$mcp_cmd",
+      "args": ["--transport", "stdio"]
+    }
+  }
+}
+EOF
+    _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+
+    # Register with every detected client through the single source of truth:
+    # `biopb agents` (core biopb._agents), the same catalog + write logic the
+    # control-plane dashboard uses. It resolves the absolute biopb-mcp path and
+    # writes each client's own config (Claude Code via its CLI, the rest via an
+    # atomic JSON merge that preserves the user's other servers), so this installer
+    # no longer carries a second copy. `|| true`: a per-client failure must never
+    # abort the install (set -e). Its per-client results print directly.
+    local biopb_cmd
+    biopb_cmd=$(command -v biopb 2>/dev/null || echo "biopb")
+    "$biopb_cmd" agents register --all || true
+
+    # Manual-fallback notice fires only if nothing ended up registered. Ask the
+    # same source of truth rather than tracking it ourselves; grep keeps us jq-free
+    # (the one-line --json carries `"state": "registered"` for any wired client).
+    if "$biopb_cmd" agents list --json 2>/dev/null | grep -q '"state": "registered"'; then
+        MCP_NEEDS_MANUAL=0
     else
-        _warn "Could not write $CONFIG_DIR/mcp.json"
+        MCP_NEEDS_MANUAL=1
     fi
-
-    # Assume the user has no working wiring until a branch below actually writes
-    # biopb into a client's config; cleared (0) only on a real registration, so a
-    # detected-but-unregistered client (failed `claude mcp add`, unwritable file,
-    # or Hermes' manual-only path) still gets the canonical fallback at the end.
-    local need_to_show_mcp_config=1
-
-    # --- Claude Code (managed through the `claude` CLI) ---
-    if command -v claude &>/dev/null; then
-        if claude mcp get biopb &>/dev/null; then
-            _ok "Claude Code: biopb already registered"
-            need_to_show_mcp_config=0
-        elif claude mcp add --scope user biopb -- "$mcp_cmd" "${mcp_args[@]}" &>/dev/null; then
-            _ok "Claude Code: registered biopb (user scope)"
-            need_to_show_mcp_config=0
-        else
-            _warn "Claude Code detected but registration failed — add it manually:"
-            _cmd "claude mcp add --scope user biopb -- $mcp_cmd ${mcp_args[*]}"
-        fi
-    fi
-
-    # --- Hermes (NousResearch) — YAML config at ~/.hermes/config.yaml ---
-    if [ -d "$HOME/.hermes" ]; then
-        if [ -f "$HOME/.hermes/config.yaml" ] && grep -qE '^\s*biopb:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
-            _ok "Hermes: biopb already present in config.yaml"
-            need_to_show_mcp_config=0
-        else
-            # We can't safely edit Hermes' YAML, so we only print the snippet — that
-            # is not an actual setup, so the flag stays set.
-            _ok "Hermes detected"
-            _info "Add the following under 'mcp_servers:' in $HOME/.hermes/config.yaml:"
-            printf "    %sbiopb:\n      command: \"%s\"\n      args: [\"--transport\", \"stdio\"]%s\n" "$DIM" "$mcp_cmd" "$RESET"
-        fi
-    fi
-
-    # --- Claude Desktop ---
-    local cd_cfg=""
-    case "$PLATFORM" in
-        macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
-        Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
-    esac
-    if [ -n "$cd_cfg" ] && [ -d "$(dirname "$cd_cfg")" ]; then
-        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop" "${mcp_args[@]}" && need_to_show_mcp_config=0
-    fi
-
-    # --- Cursor ---
-    if [ -d "$HOME/.cursor" ]; then
-        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor" "${mcp_args[@]}" && need_to_show_mcp_config=0
-    fi
-
-    # --- opencode ---
-    local opencode_cfg_dir="$HOME/.config/opencode"
-    if command -v opencode &>/dev/null || [ -d "$opencode_cfg_dir" ]; then
-        local opencode_cfg="$opencode_cfg_dir/opencode.json"
-        if _mcp_merge "$opencode_cfg" "mcp" "opencode" "$mcp_cmd" "${mcp_args[@]}"; then
-            _ok "opencode: registered biopb ($opencode_cfg)"
-            need_to_show_mcp_config=0
-        else
-            _warn "opencode: could not update $opencode_cfg — add biopb manually"
-            _info "Add under 'mcp' in $opencode_cfg:"
-            printf "    %s\"biopb\": {\"type\": \"local\", \"command\": [\"%s\", \"--transport\", \"stdio\"], \"enabled\": true}%s\n" "$DIM" "$mcp_cmd" "$RESET"
-        fi
-    fi
-
-    # Nothing auto-wired biopb into a client. Defer the notice to the final
-    # summary (via a global) so it groups with the other warnings there.
-    MCP_NEEDS_MANUAL="$need_to_show_mcp_config"
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -1341,14 +1240,12 @@ install_biopb() {
         fi
     fi
 
-    # ===== 6. Start the control plane (which owns the data plane) =====
-    # Before MCP wiring so a typo in the data dir (step 5) surfaces right after
-    # the choice, while pre-cache gets the earliest possible head start.
-    _step "[6/7] Starting control plane..."
-    _start_control_plane
-
-    # ===== 7. Wire biopb-mcp into the user's agent system =====
-    _step "[7/7] Configuring MCP client..."
+    # ===== 6. Wire biopb-mcp into the user's agent system =====
+    # Before starting the control plane: agent wiring is quick and self-contained,
+    # so the client is configured even if the (slower) control-plane start is
+    # interrupted -- and the control plane comes up on demand anyway when the agent
+    # first launches biopb-mcp.
+    _step "[6/7] Configuring MCP client..."
 
     # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
     # agents; if none is present, offer to install opencode so the user ends up
@@ -1371,6 +1268,10 @@ install_biopb() {
         fi
     fi
     _setup_mcp
+
+    # ===== 7. Start the control plane (which owns the data plane) =====
+    _step "[7/7] Starting control plane..."
+    _start_control_plane
 
     # ===== Summary =====
     # Two groups, in order: all informational blocks, then all warnings. Every
@@ -1455,7 +1356,9 @@ install_biopb() {
 # Remove the biopb stdio entry from a JSON MCP config: delete the "biopb" key
 # under top-level <parent> in <file>. No-op when the file, the parent section,
 # or the entry is absent (the file is left byte-for-byte untouched). Preserves
-# all other content and writes atomically — the exact inverse of _mcp_merge.
+# all other content and writes atomically — the inverse of the merge that
+# registration performs. Kept hand-rolled (not delegated to `biopb agents
+# unregister`) so teardown never depends on the biopb tool it is removing.
 # Prints "removed" iff it deleted an entry, so callers can report per client.
 _mcp_unmerge() {
     local file="$1" parent="$2"

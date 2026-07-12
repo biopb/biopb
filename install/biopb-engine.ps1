@@ -417,43 +417,6 @@ function Test-IsCloudPath {
 # because the engine marks any dir under a cloud root `cloud = true`
 # (Test-IsCloudPath), which admits placeholders as unresolved sources instead. A
 # Microscopy subfolder under a cloud root is preferred over the whole synced root.
-# Merge the biopb server into a standard mcpServers JSON config (Claude Desktop,
-# Cursor, ...). biopb-mcp speaks stdio, so the client spawns the command itself --
-# a bare command+args entry (no "type") is the form every mcpServers client
-# accepts. Returns $true only if biopb was actually written into the client config.
-function Merge-McpJson {
-    param([string]$File, [string]$Command, [string[]]$CmdArgs, [string]$Label, [string]$ConfigDir)
-    $dir = Split-Path -Parent $File
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-
-    $entry = [pscustomobject]@{ command = $Command; args = @($CmdArgs) }
-
-    if (Test-Path -LiteralPath $File) {
-        try {
-            $json = Get-Content -Raw -LiteralPath $File | ConvertFrom-Json
-            if ($null -eq $json.mcpServers) {
-                $json | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{}) -Force
-            }
-            if ($json.mcpServers.PSObject.Properties.Name -contains 'biopb') {
-                $json.mcpServers.biopb = $entry
-            } else {
-                $json.mcpServers | Add-Member -NotePropertyName biopb -NotePropertyValue $entry -Force
-            }
-            Set-FileUtf8NoBom -Path $File -Content ($json | ConvertTo-Json -Depth 20)
-            Report-Ok "${Label}: registered biopb (merged into $File)"
-        } catch {
-            Report-Warn "${Label}: could not merge $File - add biopb manually (see $ConfigDir\mcp.json)"
-            return $false
-        }
-        return $true
-    }
-
-    $obj = [pscustomobject]@{ mcpServers = [pscustomobject]@{ biopb = $entry } }
-    Set-FileUtf8NoBom -Path $File -Content ($obj | ConvertTo-Json -Depth 20)
-    Report-Ok "${Label}: created $File"
-    return $true
-}
-
 # Detect installed agent systems and register the biopb MCP server with each.
 # -NoRemotePlugins leaves process_image_servers empty when creating a fresh
 # config (the default off-site cellpose server logs client IPs, so enabling it is
@@ -519,89 +482,37 @@ $processImageServers
     Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "mcp.json") -Content ($canonical | ConvertTo-Json -Depth 20)
     Report-Ok "MCP definition written: $ConfigDir\mcp.json"
 
-    # Assume no working wiring until a branch below writes biopb into a client's
-    # config; cleared ($false) only on a real registration.
-    $needToShowMcpConfig = $true
+    # Register with every detected client through the single source of truth:
+    # `biopb agents` (core biopb._agents) -- the same catalog + write logic the
+    # control-plane dashboard uses. It resolves the absolute biopb-mcp path and
+    # writes each client's own config (Claude Code via its CLI -- windowless, so no
+    # stray console pops under the hidden GUI engine; the rest via an atomic JSON
+    # merge that preserves the user's other servers), so this engine no longer
+    # carries a second per-client copy. Output is captured; the summary flag below
+    # reads registration state back from the same source of truth.
+    & biopb agents register --all *> $null
+    Report-Ok "Registered biopb with detected agent clients (biopb agents)"
 
-    # --- Claude Code (managed through the `claude` CLI) ---
-    if (Get-Command claude -ErrorAction SilentlyContinue) {
-        # Register idempotently with config-only commands. Do NOT probe with
-        # `claude mcp get`: it runs a live CONNECTION test, which makes the claude
-        # CLI spawn `biopb-mcp`. claude is a Node app and launches that console
-        # child WITHOUT hiding its window, so under the GUI installer (engine runs
-        # hidden) a stray console window pops up and lingers after the install.
-        # `remove` (a harmless no-op when absent) followed by `add` only edits
-        # claude's config -- neither connects -- so it is idempotent and windowless.
-        & claude mcp remove biopb -s user *> $null
-        & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
-        if ($LASTEXITCODE -eq 0) {
-            Report-Ok "Claude Code: registered biopb (user scope)"
-            $needToShowMcpConfig = $false
-        } else {
-            Report-Warn "Claude Code detected but registration failed - add it manually:"
-            Report-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
+    # The "register manually" notice fires only if nothing ended up registered.
+    # Ask `biopb agents list --json` (clean JSON on stdout) rather than tracking it
+    # here -- one source of truth for the verdict too.
+    $script:McpNeedsManual = $true
+    try {
+        $agents = (((& biopb agents list --json 2>$null) | Out-String) | ConvertFrom-Json).agents
+        if ($agents | Where-Object { $_.state -eq 'registered' }) {
+            $script:McpNeedsManual = $false
         }
-    }
-
-    # --- Claude Desktop (Windows: %APPDATA%\Claude) ---
-    $cdCfg = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
-    if (Test-Path -LiteralPath (Split-Path -Parent $cdCfg)) {
-        if (Merge-McpJson -File $cdCfg -Command $mcpCmd -CmdArgs $mcpArgs -Label "Claude Desktop" -ConfigDir $ConfigDir) {
-            $needToShowMcpConfig = $false
-        }
-    }
-
-    # --- Cursor ---
-    $cursorDir = Join-Path $BiopbHome ".cursor"
-    if (Test-Path -LiteralPath $cursorDir) {
-        if (Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Command $mcpCmd -CmdArgs $mcpArgs -Label "Cursor" -ConfigDir $ConfigDir) {
-            $needToShowMcpConfig = $false
-        }
-    }
-
-    # --- opencode ---
-    $opencodeCfgDir = Join-Path $BiopbHome ".config\opencode"
-    if ((Get-Command opencode -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $opencodeCfgDir)) {
-        $opencodeCfg = Join-Path $opencodeCfgDir "opencode.json"
-        if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
-
-        $opencodeEntry = [pscustomobject]@{
-            type = "local"
-            command = @($mcpCmd) + $mcpArgs
-            enabled = $true
-        }
-
-        if (Test-Path -LiteralPath $opencodeCfg) {
-            try {
-                $json = Get-Content -Raw -LiteralPath $opencodeCfg | ConvertFrom-Json
-                if ($null -eq $json.mcp) {
-                    $json | Add-Member -NotePropertyName mcp -NotePropertyValue ([pscustomobject]@{}) -Force
-                }
-                if ($json.mcp.PSObject.Properties.Name -contains 'biopb') {
-                    $json.mcp.biopb = $opencodeEntry
-                } else {
-                    $json.mcp | Add-Member -NotePropertyName biopb -NotePropertyValue $opencodeEntry -Force
-                }
-                Set-FileUtf8NoBom -Path $opencodeCfg -Content ($json | ConvertTo-Json -Depth 20)
-                Report-Ok "opencode: registered biopb (merged into $opencodeCfg)"
-                $needToShowMcpConfig = $false
-            } catch {
-                Report-Warn "opencode: could not merge $opencodeCfg - add biopb manually"
-            }
-        } else {
-            $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
-            Set-FileUtf8NoBom -Path $opencodeCfg -Content ($opencodeObj | ConvertTo-Json -Depth 20)
-            Report-Ok "opencode: created $opencodeCfg"
-            $needToShowMcpConfig = $false
-        }
-    }
-
-    # Defer the "register manually" notice to the front-end's summary.
-    $script:McpNeedsManual = $needToShowMcpConfig
+    } catch { }
 }
 
 # Deregister the biopb MCP server from every client Set-McpClients touches.
 # Best-effort and idempotent: a client that was never registered is a no-op.
+#
+# Unlike registration (which delegates to `biopb agents register`), this stays
+# hand-rolled ON PURPOSE: uninstall removes the biopb uv tool -- and its `biopb`
+# shim -- in the step BEFORE this one (Invoke-BiopbUninstall), so `biopb agents
+# unregister` would no longer exist here. The per-client removal below needs only
+# the `claude` CLI and direct file edits, so it works after biopb is gone.
 function Remove-McpClients {
     param([string]$BiopbHome)
 
@@ -1472,13 +1383,17 @@ function Invoke-BiopbInstall {
         }
     }
 
-    # ===== 6. Start the control plane (which owns the data plane) =====
-    Report-Step 6 "Starting control plane..."
-    Start-ControlPlane -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
-
-    # ===== 7. Wire biopb-mcp into the user's agent system =====
-    Report-Step 7 "Configuring MCP client..."
+    # ===== 6. Wire biopb-mcp into the user's agent system =====
+    # Before starting the control plane: agent wiring is quick and self-contained,
+    # so the client is configured even if the (slower) control-plane start is
+    # interrupted -- and the control plane comes up on demand anyway when the agent
+    # first launches biopb-mcp.
+    Report-Step 6 "Configuring MCP client..."
     Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir -NoRemotePlugins:$NoRemotePlugins
+
+    # ===== 7. Start the control plane (which owns the data plane) =====
+    Report-Step 7 "Starting control plane..."
+    Start-ControlPlane -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
 
     # Result object: the front-end renders the human-facing summary from this, so
     # the summary wording is a front-end concern, not the engine's.
