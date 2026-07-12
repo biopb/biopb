@@ -70,7 +70,7 @@ import threading
 
 import httpx
 import uvicorn
-from biopb import _config_sessions, _web_auth
+from biopb import _agents, _config_sessions, _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -338,6 +338,37 @@ def build_app(
         ]
         return JSONResponse({"sessions": sessions})
 
+    def api_agents(_request: Request) -> JSONResponse:
+        # The supported MCP clients and whether biopb is registered with each.
+        # Reads are subprocess-free (biopb._agents), so the dashboard can poll
+        # this without spawning anything; still sync (filesystem), so Starlette
+        # runs it in the threadpool.
+        try:
+            return JSONResponse({"agents": _agents.statuses()})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/agents failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def _agent_action(request: Request, action) -> JSONResponse:
+        # Register/unregister biopb with one client, returning its fresh status.
+        # A bad request (unknown client, unparseable client config) is the
+        # caller's fault -> 400; anything else -> 500. Both write user config
+        # files (Claude Code via its CLI), so these are token-gated /api/* verbs.
+        agent_id = request.path_params["agent_id"]
+        try:
+            return JSONResponse({"agent": action(agent_id)})
+        except _agents.AgentError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("agent %s failed", getattr(action, "__name__", "action"))
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def agent_register(request: Request) -> JSONResponse:
+        return _agent_action(request, _agents.register)
+
+    def agent_unregister(request: Request) -> JSONResponse:
+        return _agent_action(request, _agents.unregister)
+
     async def root(_request: Request) -> Response:
         # The control's own buildless dashboard (single embedded page, no build
         # step). It polls /api/status + /api/sessions and drives the data-plane
@@ -495,6 +526,9 @@ def build_app(
         Route("/api/data_plane/ensure", data_plane_ensure, methods=["POST"]),
         Route("/api/data_plane/stop", data_plane_stop, methods=["POST"]),
         Route("/api/data_plane/restart", data_plane_restart, methods=["POST"]),
+        Route("/api/agents", api_agents, methods=["GET"]),
+        Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
+        Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/", root, methods=["GET"]),
         # /data_plane/viewer FIRST so it wins over the broader /data_plane mount.
         Mount("/data_plane/viewer", sidecar),
@@ -697,6 +731,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .empty { color: #777; padding: 6px 0; }
   a.obs { margin-left: auto; color: #7e7; text-decoration: none; }
   a.obs:hover { text-decoration: underline; }
+  .mini { padding: 0 8px; font-size: 12px; margin-left: 8px; vertical-align: middle; }
+  .state { color: #888; font-size: 12px; }
+  .note { color: #667; font-size: 12px; margin: 12px 0 0; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #555;
+         display: inline-block; flex: none; }
+  .dot.registered { background: #7e7; }
+  .dot.installed { background: #8bf; }
+  .dot.drift { background: #fb4; }
+  .agent-btns { margin-left: auto; display: flex; gap: 6px; }
+  button.warn { border-color: #a83; color: #fc9; }
 </style>
 </head>
 <body>
@@ -718,6 +762,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <a id="config" class="link off" href="/data_plane/viewer/admin"
          target="_blank" rel="noopener">Config →</a>
     </div>
+  </div>
+  <div class="card">
+    <h2>Agent clients<button id="agents-refresh" class="mini">↻</button></h2>
+    <ul id="agents"><li class="empty">loading…</li></ul>
+    <p class="note">Registers biopb-mcp with the client. Restart the client after
+       (un)registering for the change to take effect.</p>
   </div>
   <div class="card">
     <h2>Agent sessions</h2>
@@ -810,6 +860,59 @@ async function pollSessions() {
   }).join('');
 }
 
+// The agent-client buttons for one row. not_installed rows get none; a
+// registered row offers Re-register (amber when the stored command has drifted
+// from the current biopb-mcp location) + Unregister; installed offers Register.
+function agentButtons(a) {
+  if (a.state === 'not_installed') return '';
+  const id = esc(a.id);
+  if (a.state === 'registered') {
+    const cls = a.drifted ? ' class="warn"' : '';
+    const label = a.drifted ? 'Re-register (update)' : 'Re-register';
+    return '<button data-act="register" data-id="' + id + '"' + cls + '>' + label + '</button>'
+      + '<button data-act="unregister" data-id="' + id + '" class="danger">Unregister</button>';
+  }
+  return '<button data-act="register" data-id="' + id + '">Register</button>';
+}
+
+// Fetched on load / after an action / via the ↻ button -- deliberately NOT on
+// the status+sessions poll interval: reading agent status touches third-party
+// config files, and nothing here changes on its own between user actions.
+async function pollAgents() {
+  let data;
+  try { data = await (await fetchAuth('/api/agents')).json(); }
+  catch (e) { return; }
+  const list = (data && data.agents) || [];
+  const box = el('agents');
+  if (!list.length) { box.innerHTML = '<li class="empty">none</li>'; return; }
+  box.innerHTML = list.map(a => {
+    const label = a.state === 'registered'
+      ? (a.drifted ? 'registered · update available' : 'registered')
+      : a.state.replace('_', ' ');
+    const dot = 'dot ' + esc(a.state) + (a.drifted ? ' drift' : '');
+    return '<li><span class="' + dot + '"></span>'
+      + '<span class="sid">' + esc(a.name) + '</span>'
+      + '<span class="state">' + esc(label) + '</span>'
+      + '<span class="agent-btns">' + agentButtons(a) + '</span></li>';
+  }).join('');
+}
+
+// One delegated handler for every register/unregister button (rows are rebuilt
+// on each refresh, so per-button onclicks would go stale). Disable the whole
+// group while the write is in flight, then re-read status.
+el('agents').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = btn.getAttribute('data-id');
+  const act = btn.getAttribute('data-act');
+  if (act === 'unregister' && !confirm('Unregister biopb from ' + id + '?')) return;
+  el('agents').querySelectorAll('button').forEach(b => b.disabled = true);
+  const res = await jpost('/api/agents/' + encodeURIComponent(id) + '/' + act);
+  if (res && res.error) alert('Failed: ' + res.error);
+  await pollAgents();
+});
+el('agents-refresh').onclick = pollAgents;
+
 function refresh() { pollStatus(); pollSessions(); }
 
 // A data-plane verb button: disable the trio while the request is in flight (a
@@ -830,6 +933,7 @@ el('restart').onclick = () => verb('/api/data_plane/restart', 'Restart the data 
 el('stop').onclick = () => verb('/api/data_plane/stop', 'Stop the data plane? Clients lose it until an Ensure.');
 
 refresh();
+pollAgents();
 setInterval(refresh, POLL);
 </script>
 </body>
