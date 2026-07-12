@@ -353,6 +353,7 @@ def bootstrap():
 
 
 def _bootstrap_impl():
+    from biopb import _algorithms
     from IPython import get_ipython
 
     from .._config import get_setting, load_config
@@ -557,7 +558,7 @@ def _bootstrap_impl():
     try:
         ops = build_ops(
             client_getter=lambda: conn.client,
-            server_urls=get_setting(config, "mcp.services.process_image_servers"),
+            server_urls=_algorithms.servers_from_config(config),
             op_names_timeout=get_setting(config, "timeout.get_op_names"),
             run_timeout=get_setting(config, "timeout.process_image"),
             channel_options=channel_options,

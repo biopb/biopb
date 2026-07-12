@@ -99,6 +99,44 @@ def test_configured_tolerates_non_object_config(home):
 
 
 # --------------------------------------------------------------------------- #
+# servers_from_config(): the shared normalization seam (no disk)
+# --------------------------------------------------------------------------- #
+# The single source of truth the biopb-mcp kernel also calls with its live CONFIG
+# dict, so the key location + precedence live in exactly one place.
+
+
+def test_servers_from_config_reads_nested():
+    cfg = {"mcp": {"services": {"process_image_servers": ["grpc://a:1"]}}}
+    assert _algorithms.servers_from_config(cfg) == ["grpc://a:1"]
+
+
+def test_servers_from_config_falls_back_to_legacy_flat():
+    # An unmigrated dict (legacy flat only) still resolves — matching the raw read
+    # the control plane does, which never runs biopb-mcp's key migration.
+    cfg = {"mcp": {"process_image_servers": ["grpc://legacy:9"]}}
+    assert _algorithms.servers_from_config(cfg) == ["grpc://legacy:9"]
+
+
+def test_servers_from_config_nested_wins_over_legacy():
+    cfg = {
+        "mcp": {
+            "process_image_servers": ["grpc://legacy:9"],
+            "services": {"process_image_servers": ["grpc://nested:1"]},
+        }
+    }
+    assert _algorithms.servers_from_config(cfg) == ["grpc://nested:1"]
+
+
+def test_servers_from_config_filters_and_tolerates_bad_shapes():
+    assert _algorithms.servers_from_config(
+        {"mcp": {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}}}
+    ) == ["grpc://a:1"]
+    assert _algorithms.servers_from_config({}) == []
+    assert _algorithms.servers_from_config({"mcp": "nope"}) == []
+    assert _algorithms.servers_from_config(None) == []
+
+
+# --------------------------------------------------------------------------- #
 # probe(): URL validation (no server needed)
 # --------------------------------------------------------------------------- #
 

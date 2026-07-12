@@ -57,24 +57,23 @@ def _config_file() -> Path:
     return Path.home() / ".config" / "biopb-mcp" / "config.json"
 
 
-def configured() -> list[str]:
-    """The configured ProcessImage server URLs, in config order.
+def servers_from_config(config) -> list[str]:
+    """Extract the ProcessImage server URLs from an already-loaded config mapping.
+
+    The single normalization point for the list, shared by :func:`configured` (the
+    control plane, which reads the config file fresh) and the biopb-mcp kernel,
+    which passes its live ``CONFIG`` dict here instead of hand-reading the key — so
+    "where the algorithm-plane server list lives" is defined in exactly one place.
 
     Reads ``mcp.services.process_image_servers`` (the nested location), falling back
     to the legacy flat ``mcp.process_image_servers`` the installer once seeded — the
     same precedence ``biopb_mcp._config._migrate_legacy_keys`` applies (nested
-    wins). A missing / malformed / oddly-typed config reads as an empty list and
-    never raises: this feeds a status display, not a write. Non-string and blank
-    entries are dropped.
+    wins). Any non-mapping / missing / oddly-typed shape reads as an empty list;
+    non-string and blank entries are dropped. Never raises.
     """
-    path = _config_file()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    if not isinstance(config, dict):
         return []
-    if not isinstance(data, dict):
-        return []
-    mcp = data.get("mcp")
+    mcp = config.get("mcp")
     if not isinstance(mcp, dict):
         return []
     services = mcp.get("services")
@@ -85,6 +84,21 @@ def configured() -> list[str]:
     if not isinstance(servers, list):
         return []
     return [s for s in servers if isinstance(s, str) and s.strip()]
+
+
+def configured() -> list[str]:
+    """The configured ProcessImage server URLs, in config order.
+
+    Reads the biopb-mcp config file from disk (stdlib JSON) and normalizes it via
+    :func:`servers_from_config`. A missing / malformed / oddly-typed config reads as
+    an empty list and never raises: this feeds a status display, not a write.
+    """
+    path = _config_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return servers_from_config(data)
 
 
 # --------------------------------------------------------------------------- #
