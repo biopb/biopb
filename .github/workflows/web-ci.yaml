@@ -1,0 +1,90 @@
+name: Web CI
+
+# The web/ workspace (Vite SPA + tensor-flight-client) is served by biopb-control,
+# NOT the tensor server — which is API-only since the single-origin refactor
+# (biopb#440). So the JS unit suite and typecheck live here, on their own `web/**`
+# trigger, rather than bolted onto Tensor Server CI. The product Docker image's
+# webapp build still runs in tensor-server-ci.yaml (the image bundles the built
+# dist); this workflow is the fast per-PR feedback for web-only changes, which
+# otherwise ran no CI at all (no ruleset requires these checks).
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-ci.yaml'
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-ci.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # JS/TS unit suite. `-r run test` runs each package's test script; currently
+  # that's vitest in tensor-flight-client (the app has none yet).
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # The JS workspace lives in web/; the repo root has no package.json, so
+          # pin pnpm here (matches web/package.json's packageManager).
+          version: 9.12.3
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install JS dependencies
+        run: pnpm -C web install --frozen-lockfile
+
+      - name: Run JS tests
+        run: pnpm -C web -r run test
+
+  # Typecheck + compile the whole workspace. `-r run build` runs in topological
+  # order (tensor-flight-client first, then the app), and each package's build
+  # script runs `tsc` before emitting, so this fails on any type error — the real
+  # coverage a web-only PR needs.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.3
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install JS dependencies
+        run: pnpm -C web install --frozen-lockfile
+
+      - name: Typecheck + build
+        # Mirror the product build: the app bakes VITE_TENSOR_API=/data_plane (the
+        # proxied data plane behind control). This is verify-only — the shipped
+        # bundle is built by tensor-server-ci.yaml / release.yaml.
+        run: VITE_TENSOR_API="/data_plane" pnpm -C web -r run build
