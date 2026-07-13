@@ -14,11 +14,11 @@ export default defineConfig({
     dedupe: ["react", "react-dom"],
   },
   server: {
-    // `pnpm dev` runs against a live control on :8813. Forward the three API
-    // namespaces the SPA calls: the control's own /api/*, the proxied data plane
-    // /data_plane/* (incl. the /data_plane/ws/render websocket), and each
-    // session's /session/<id>/api/*. Run the viewer with VITE_TENSOR_API=/data_plane
-    // so ClientBootstrap targets the proxied plane.
+    // `pnpm dev` runs against a live control on :8813. Forward the API namespaces
+    // the SPA calls: the control's own /api/*, the proxied data plane /data_plane/*
+    // (incl. the /data_plane/ws/render websocket), and each session's
+    // /session/<id>/api/*. The viewer defaults to the proxied plane in dev
+    // (ClientBootstrap), so no env var is needed.
     proxy: {
       "/api": { target: "http://localhost:8813", changeOrigin: true },
       "/data_plane": {
@@ -26,7 +26,15 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
-      "/session": { target: "http://localhost:8813", changeOrigin: true },
+      // Only the session *API* proxies to control — NOT the observe page at
+      // /session/<id>/observe, which must fall through to vite's SPA fallback so
+      // the dev bundle + HMR serve it (a bare "/session" prefix would proxy the
+      // page HTML to control's built dist and break the dev module graph). A key
+      // beginning with ^ is matched as a RegExp by vite.
+      "^/session/[^/]+/api": {
+        target: "http://localhost:8813",
+        changeOrigin: true,
+      },
     },
   },
 });

@@ -101,14 +101,14 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
     // "The string did not match the expected pattern" — so build it ourselves.
     // apiBase may be an absolute http(s) URL (legacy standalone), a relative path
     // like "/data_plane" (control front, VITE_TENSOR_API="/data_plane"), or ""
-    // (same-origin). Resolve /ws/render against the page origin to an absolute
-    // http(s) URL first, then swap the scheme by string (the URL.protocol setter
-    // is unreliable for http->ws). Base origin:
-    //  - dev: the page origin, so the vite proxy forwards /ws to the backend.
-    //  - prod: the configured apiBase, or the page origin when same-origin.
-    const base = import.meta.env.DEV
-      ? window.location.origin
-      : apiBaseRef.current || window.location.origin;
+    // (same-origin). The render socket lives under the same base as the data API:
+    // the control proxies it at /data_plane/ws/render (stripping the prefix). So
+    // use apiBase in dev too — the vite proxy forwards /data_plane (ws:true) to the
+    // control, whereas a bare /ws/render matches no proxy rule and fails the
+    // upgrade. Resolve against the page origin to an absolute http(s) URL first,
+    // then swap the scheme by string (the URL.protocol setter is unreliable for
+    // http->ws).
+    const base = apiBaseRef.current || window.location.origin;
     const httpUrl = new URL(`${base}/ws/render`, window.location.origin).href;
     const url = httpUrl.replace(/^http/, "ws"); // http->ws, https->wss
     return tokenRef.current ? `${url}?token=${tokenRef.current}` : url;

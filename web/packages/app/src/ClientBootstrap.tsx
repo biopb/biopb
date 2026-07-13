@@ -62,8 +62,13 @@ export function ClientBootstrap() {
       setSearchParams(searchParams, { replace: true });
     }
 
+    // In dev, default to the proxied plane so plain `pnpm dev` works without an
+    // env var: vite.config forwards /data_plane (incl. the ws) to the control on
+    // :8813. Prod bakes VITE_TENSOR_API=/data_plane at build time; the absolute
+    // localhost:8814 default only serves the legacy standalone-sidecar case.
     const apiBase =
-      import.meta.env.VITE_TENSOR_API ?? "http://localhost:8814";
+      import.meta.env.VITE_TENSOR_API ??
+      (import.meta.env.DEV ? "/data_plane" : "http://localhost:8814");
 
     (async () => {
       try {
