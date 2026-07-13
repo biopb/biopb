@@ -21,13 +21,13 @@ carry no axis metadata. Re-encoding with deflate keeps the files close to their
 source size while making the whole set uniform.
 
 Usage:
-    python tools/build_samples.py --out samples/            # default lite set
-    python tools/build_samples.py --out samples/ --include-large
-    python tools/build_samples.py --out samples/ --only cells3d,cell   # dev
+    python .github/scripts/build_samples.py --out samples/            # default lite set
+    python .github/scripts/build_samples.py --out samples/ --include-large
+    python .github/scripts/build_samples.py --out samples/ --only cells3d,cell   # dev
 
 Run it in an isolated environment so it never perturbs the workspace, e.g.:
     uv run --no-project --with 'scikit-image==0.26.0' --with pooch --with tifffile \
-        python tools/build_samples.py --out samples/
+        python .github/scripts/build_samples.py --out samples/
 """
 
 from __future__ import annotations
