@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 // The control's own root dashboard, ported from the buildless _DASHBOARD_HTML
 // that _control.py used to serve. Talks to the control's own token-gated /api/*
@@ -74,6 +75,7 @@ async function jpost(url: string): Promise<{ error?: string; data_plane?: DataPl
 }
 
 export default function DashboardPage() {
+  useDocumentTitle("BioPB control - dashboard");
   const [conn, setConn] = useState("…");
   const [dataPlane, setDataPlane] = useState<DataPlane>({ state: "unknown" });
   const [sessions, setSessions] = useState<SessionRec[] | null>(null);
@@ -169,7 +171,13 @@ export default function DashboardPage() {
   return (
     <div className="ctrl-dash">
       <header>
-        <h1>biopb · control</h1>
+        <img
+          className="topbar-logo"
+          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          alt=""
+          aria-hidden="true"
+        />
+        <h1>BioPB control - dashboard</h1>
         <span id="conn">{conn}</span>
       </header>
       <main>
@@ -367,8 +375,10 @@ function AlgoRow({ s }: { s: AlgoRec }) {
 }
 
 // The agent-client buttons for one row. not_installed rows get none; a
-// registered row offers Re-register (amber when the stored command drifted from
-// the current biopb-mcp location) + Unregister; installed offers Register.
+// registered row offers Unregister, plus an amber "Re-register (update)" only
+// when the stored command drifted from the current biopb-mcp location — a plain
+// re-register on an up-to-date client is a no-op, so it's omitted; installed
+// offers Register.
 function AgentRowView({
   a,
   busy,
@@ -393,13 +403,15 @@ function AgentRowView({
       <span className="agent-btns">
         {a.state === "not_installed" ? null : a.state === "registered" ? (
           <>
-            <button
-              className={a.drifted ? "warn" : undefined}
-              disabled={busy}
-              onClick={() => onAction(a.id, "register")}
-            >
-              {a.drifted ? "Re-register (update)" : "Re-register"}
-            </button>
+            {a.drifted ? (
+              <button
+                className="warn"
+                disabled={busy}
+                onClick={() => onAction(a.id, "register")}
+              >
+                Re-register (update)
+              </button>
+            ) : null}
             <button
               className="danger"
               disabled={busy}

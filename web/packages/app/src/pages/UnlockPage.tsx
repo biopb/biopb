@@ -1,7 +1,9 @@
 import { useState, FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 export function UnlockPage() {
+  useDocumentTitle("BioPB tensor - unlock");
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const [value, setValue] = useState("");
@@ -34,7 +36,7 @@ export function UnlockPage() {
           width={48}
           height={48}
         />
-        <h1>BioPB Tensor Viewer</h1>
+        <h1>BioPB tensor - unlock</h1>
         <p className="subtitle">
           Enter the access token shown in the launcher terminal to continue.
           <br />

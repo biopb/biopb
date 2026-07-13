@@ -137,10 +137,6 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
           child.name = child.name + "/" + grandchild.name;
           child.id = grandchild.id;
           child.children = grandchild.children;
-          // Adjust depths of merged children
-          for (const gc of child.children) {
-            gc.depth = child.depth + 1;
-          }
         }
 
         // Continue flattening in case new structure allows more flattening
@@ -149,6 +145,18 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
     }
   }
   flattenPaths(root);
+
+  // Flattening rewires parent/child links but leaves stale depths behind (a
+  // merged node's deeper descendants keep their pre-merge level), which shows up
+  // as a subtree indented one extra step. Recompute every depth from the final
+  // tree level in one pass so indentation is exactly the nesting depth.
+  function recomputeDepths(node: TreeNode, depth: number): void {
+    node.depth = depth;
+    for (const child of node.children) {
+      recomputeDepths(child, depth + 1);
+    }
+  }
+  recomputeDepths(root, 0);
 
   return root;
 }
@@ -200,6 +208,18 @@ function Chevron({ expanded }: { expanded: boolean }) {
     >
       ▶
     </span>
+  );
+}
+
+// Empty gutter the width of a Chevron, so leaf (source/tensor) rows keep their
+// labels in the same column as folder labels — otherwise a folder's children
+// align left of the folder's own label and the indent steps unevenly.
+function ChevronSlot() {
+  return (
+    <span
+      aria-hidden="true"
+      style={{ display: "inline-block", width: 16, flexShrink: 0 }}
+    />
   );
 }
 
@@ -271,7 +291,6 @@ function TreeRow({
           textAlign: "left",
           display: "flex",
           alignItems: "center",
-          gap: 8,
           paddingLeft: indent,
         }}
         onClick={() => {
@@ -283,11 +302,18 @@ function TreeRow({
         }}
         title={src.source_url}
       >
-        <span style={{ flex: 1 }}>{node.name}</span>
+        <ChevronSlot />
+        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
         {hasMultipleTensors ? (
-          <span className="tensor-pill">{src.tensors.length}</span>
+          <span className="tensor-pill" style={{ marginLeft: 8 }}>
+            {src.tensors.length}
+          </span>
         ) : firstTensor ? (
-          <span className="dim-badge" title={formatShape(firstTensor.shape)}>
+          <span
+            className="dim-badge"
+            style={{ marginLeft: 8 }}
+            title={formatShape(firstTensor.shape)}
+          >
             {formatShape(firstTensor.shape)}
           </span>
         ) : null}
@@ -308,13 +334,13 @@ function TreeRow({
                 paddingLeft: indent + 12,
                 display: "flex",
                 alignItems: "center",
-                gap: 8,
                 fontSize: 12,
               }}
               onClick={() => selectSource(src.source_id, t.array_id)}
               title={`${t.array_id}\nShape: ${formatShape(t.shape)}\nDtype: ${t.dtype}`}
             >
-              <span style={{ flex: 1 }}>{tName}</span>
+              <ChevronSlot />
+              <span style={{ flex: 1, marginLeft: 4 }}>{tName}</span>
             </button>
           );
         })}

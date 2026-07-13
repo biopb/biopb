@@ -4,8 +4,10 @@ import { ImageViewer } from "../components/ImageViewer";
 import { MetaPanel } from "../components/MetaPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
+import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 export function HomePage() {
+  useDocumentTitle("BioPB tensor - viewer");
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
   const clearSession = useAppStore((s) => s.clearSession);
@@ -21,7 +23,7 @@ export function HomePage() {
           alt=""
           aria-hidden="true"
         />
-        <h1>BioPB Tensor Viewer</h1>
+        <h1>BioPB tensor - viewer</h1>
         <span className={`status-pill ${connectionState}`}>
           {connectionState === "connected"
             ? "Connected"
