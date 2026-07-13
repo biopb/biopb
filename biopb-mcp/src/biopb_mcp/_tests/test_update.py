@@ -40,17 +40,16 @@ class TestPureHelpers:
         assert _update.tag_to_version("release-v0.6.6") == "0.6.6"
 
     def test_tag_to_version_leaves_nonmatching(self):
-        # A v*/mcp-v* PyPI tag is not on the deployment line — left untouched
+        # A `v*` SDK tag is not on the product deployment line — left untouched
         # (and later rejected by the prefix filter in select_latest).
-        assert _update.tag_to_version("mcp-v0.7.2") == "mcp-v0.7.2"
+        assert _update.tag_to_version("v0.7.2") == "v0.7.2"
 
     def test_select_latest_picks_highest_clean(self):
         releases = [
             _release("release-v0.6.4"),
             _release("release-v0.6.6"),
             _release("release-v0.6.5"),
-            _release("v0.9.9"),  # PyPI library tag, wrong prefix -> ignored
-            _release("mcp-v9.9.9"),  # ditto
+            _release("v0.9.9"),  # SDK library tag, wrong prefix -> ignored
         ]
         chosen = _update.select_latest(releases)
         assert chosen["tag_name"] == "release-v0.6.6"

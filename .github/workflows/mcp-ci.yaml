@@ -1,16 +1,12 @@
 # CI for biopb-mcp (napari plugin + MCP server). Lives in the monorepo at
 # biopb-mcp/. This is a TEST-ONLY workflow: biopb-mcp is no longer published to
 # PyPI (the product ships as the release-v* wheel triple the installer
-# file://-installs — see docs/release-model.md). The `mcp-v*` tag is retained
-# purely as biopb-mcp's setuptools_scm version marker (it stamps the clean
-# X.Y.Z version onto the wheel built in release.yaml); it no longer triggers any
-# publish, so it does not appear as a workflow trigger here.
+# file://-installs — see docs/release-model.md). biopb-mcp is a product component,
+# so its version comes from the single `release-v*` tag (setuptools_scm stamps the
+# clean X.Y.Z onto the wheel built in release.yaml); there is no per-package tag.
 #
-# push and pull_request carry the SAME paths filter so branch-push and PR runs
-# are scoped identically (test-only, MCP-relevant changes). A paths filter under
-# push is now safe: it once had to be omitted because a filter there would also
-# gate the (now-removed) mcp-v* tag push and could silently skip a release —
-# with no tag trigger, that risk is gone.
+# push and pull_request carry the SAME paths filter so branch-push and PR runs are
+# scoped identically (test-only, MCP-relevant changes), with no tag trigger.
 name: MCP CI
 
 on:

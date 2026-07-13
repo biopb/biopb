@@ -1,15 +1,14 @@
 name: Tensor Server CI
 
-# Test/build only. Publishing (GitHub release + Docker) moved to the unified
-# release.yaml on `release-v*` tags — see docs/release-model.md. `server-v*` is
-# now just a version-marker tag; a push of it runs these CI checks.
+# Test/build only. Publishing (GitHub release + Docker) is the unified
+# release.yaml on `release-v*` tags — see docs/release-model.md. The tensor server
+# is a product component, so its version comes from that same `release-v*` tag;
+# there is no per-package tag (the old `server-v*` prefix is retired).
 on:
   push:
     branches:
       - main
       - dev
-    tags:
-      - 'server-v*'
   pull_request:
     branches:
       - main
@@ -182,9 +181,9 @@ jobs:
       - name: Build Docker image (verify only, no push)
         # Skipped on pull_request: the buildx multi-stage image build is the slow
         # part of this workflow and rarely breaks from a normal PR. It still runs
-        # on every push to main/dev (one build per merged PR), on server-v* tags,
-        # and on workflow_dispatch, so the image is verified before any
-        # release.yaml publish. Wheels/webapp above still build on PRs.
+        # on every push to main/dev (one build per merged PR) and on
+        # workflow_dispatch, so the image is verified before any release.yaml
+        # publish. Wheels/webapp above still build on PRs.
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:

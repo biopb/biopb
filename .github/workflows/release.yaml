@@ -265,18 +265,26 @@ jobs:
             PRERELEASE=true
           fi
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          # The tensor server is a product component: its wheel is versioned from
+          # this same release-v* tag, so tver == REL at a real release.
           tver=$(ls wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
-          # When the release commit is NOT also tagged server-v*, setuptools_scm
-          # yields a PEP 440 dev/local version (e.g. 0.4.6.dev6+gf7f1075). The '+'
-          # local segment is legal in a wheel name but ILLEGAL in a Docker
+          # On a dry-run (workflow_dispatch, no release-v* tag) setuptools_scm
+          # yields a PEP 440 dev/local version (e.g. 0.11.0rc2.dev6+gf7f1075). The
+          # '+' local segment is legal in a wheel name but ILLEGAL in a Docker
           # reference ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}), so tagging an image with
           # it fails the build. Map any out-of-set char to '_' for the Docker tag;
           # a clean X.Y.Z release is unchanged. The gate's manifest-inspect and the
           # image tags both use this so they agree on the same reference.
           tdocker=$(printf '%s' "$tver" | sed -E 's/[^A-Za-z0-9_.-]/_/g')
           echo "tensor_docker=$tdocker" >> "$GITHUB_OUTPUT"
-          ibver=$(grep -E '^version[[:space:]]*=' biopb-image-runtime/pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          # image-base is versioned off the SDK tag `v*` (docker-only; no wheel to
+          # read). The nearest v* tag name is the clean SDK version and is
+          # Docker-safe (no +local segment). A product-only release (no new v*)
+          # reuses the last v*, so the idempotent publish below skips image-base as
+          # unchanged — its image republishes only when the SDK bumps.
+          ibver=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed -E 's/^v//')
+          [ -n "$ibver" ] || ibver="0.0.0"
           echo "imagebase=$ibver" >> "$GITHUB_OUTPUT"
           # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
           # of truth). Surface it as a release attribute so the installer pins the

@@ -760,10 +760,10 @@ install_biopb() {
     BIOPB_REPO_URL="https://github.com/biopb/biopb"
     REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
     RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
-    # The monorepo hosts multiple release lines (release-v*, v*, mcp-v*,
-    # server-v*). The all-in-one deployment the installer wants is the
-    # release-v* one (see docs/release-model.md), so the release fetch filters
-    # by this prefix instead of using /releases/latest (which is repo-wide).
+    # The monorepo hosts two release lines: the product `release-v*` and the SDK
+    # `v*` (see docs/release-model.md). The all-in-one deployment the installer
+    # wants is the `release-v*` one, so the release fetch filters by this prefix
+    # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     SAMPLES_DIR="$HOME/.local/share/biopb/samples"

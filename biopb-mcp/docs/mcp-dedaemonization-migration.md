@@ -199,7 +199,8 @@ The structural fix. Highest value; unblocks single origin.
   never shelling out. With no control reachable it records an actionable
   "run `biopb control start`" status.
 - **A lean control supervises the data plane.** *(done)* New **`biopb-control`**
-  workspace package (own `control-v*` tag), managed by `biopb control
+  workspace package (a product component, versioned off the `release-v*` tag),
+  managed by `biopb control
   start/stop/status/run` in the core CLI (which owns the pidfile/detach/stop
   plumbing, reused from the server/mcp daemons). `DataPlaneSupervisor` spawns the
   tensor server (the same `python -m biopb_tensor_server.cli launch` argv `biopb
