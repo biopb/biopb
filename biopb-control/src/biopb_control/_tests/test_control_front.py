@@ -210,7 +210,9 @@ def test_api_sessions_kernel_unknown_when_child_unreachable(control):
     # A live-pid record whose port has no server: the probe fails fast and the
     # session still lists (kernel state is decorative, never drops the session).
     closed = _free_port()  # nothing listening
-    _config_sessions.register("s-unreach", host="127.0.0.1", port=closed, pid=os.getpid())
+    _config_sessions.register(
+        "s-unreach", host="127.0.0.1", port=closed, pid=os.getpid()
+    )
     _status, _headers, body = _get(f"{control}/api/sessions")
     sessions = json.loads(body)["sessions"]
     assert len(sessions) == 1
@@ -232,9 +234,7 @@ def test_probe_kernel_maps_child_health():
             pass
 
         def do_GET(self):  # noqa: N802
-            payload = json.dumps(
-                {"alive": True, "ready": True, "busy": False}
-            ).encode()
+            payload = json.dumps({"alive": True, "ready": True, "busy": False}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
