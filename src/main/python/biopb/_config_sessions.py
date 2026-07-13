@@ -172,7 +172,7 @@ def resolve(session_id: str) -> Optional[dict]:
 
 
 def list_sessions(prune: bool = True) -> list[dict]:
-    """All live session records, newest first (session id sorts by timestamp).
+    """All live session records, newest first (by each record's ``started_at``).
 
     With ``prune`` (the default) a record whose owning process is gone — the pid
     is dead, or alive but a different process on a recycled pid — is dropped *and
@@ -184,7 +184,7 @@ def list_sessions(prune: bool = True) -> list[dict]:
     """
     dir_ = sessions_dir()
     try:
-        paths = sorted(dir_.glob(f"*{_SUFFIX}"), reverse=True)
+        paths = list(dir_.glob(f"*{_SUFFIX}"))
     except OSError:
         return []
     out: list[dict] = []
@@ -206,6 +206,12 @@ def list_sessions(prune: bool = True) -> list[dict]:
             )
             continue
         out.append(rec)
+    # Newest first by the recorded wall-clock start, not by filename: session ids
+    # are ``<timestamp>-<pid>`` with an un-padded pid, so two sessions in the same
+    # second would otherwise sort by pid lexically (``-9`` after ``-42``) and
+    # mis-order (biopb/biopb#421). ``started_at`` is a float on every record; a
+    # record missing it (forward-compat) sorts last.
+    out.sort(key=lambda rec: rec.get("started_at") or 0.0, reverse=True)
     return out
 
 
