@@ -342,14 +342,14 @@ class TestClientDeathWatchdog:
         assert _shim._install_client_death_watchdog(object(), None, "sid") is None
 
     def test_not_armed_when_client_unidentifiable(self, monkeypatch):
-        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: None)
         assert _shim._install_client_death_watchdog(object(), None, "sid") is None
 
     def test_not_armed_when_client_handle_unopenable(self, monkeypatch):
         # A client we found but cannot open (returns None) must not arm --
         # never reap a live session off a baseline we could not establish.
-        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
         monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: None)
         assert _shim._install_client_death_watchdog(object(), None, "sid") is None
@@ -357,7 +357,7 @@ class TestClientDeathWatchdog:
     def test_arms_thread_when_client_found_and_openable(self, monkeypatch):
         import threading
 
-        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
         monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: "HANDLE")
         monkeypatch.setattr(_shim, "_client_deathwatch", lambda *a, **k: None)
