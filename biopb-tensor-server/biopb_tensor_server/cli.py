@@ -53,6 +53,69 @@ logger = logging.getLogger(__name__)
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
 
+# The bind address is the mode: a loopback bind is reachable same-machine only
+# (local mode); anything else is network-reachable. The wildcard binds
+# (``0.0.0.0`` / ``::`` / ``""``) and any real IP/hostname are public, so they are
+# *not* in this set and are treated as public — fail-closed.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_is_public(host: str) -> bool:
+    """True if ``host`` is a network-reachable bind address (not loopback)."""
+    return host not in _LOOPBACK_HOSTS
+
+
+def _resolve_launch_token(
+    server_host: str,
+    web_host: str,
+    token: Optional[str],
+    env_token: str,
+) -> Optional[str]:
+    """Decide the token ``launch`` enforces, fail-closed on every public listener.
+
+    The flight bind (config ``server.host``) is the single mode switch: a loopback
+    bind is **local mode** (tokenless); any public bind is **remote mode** and MUST
+    carry a token, so a public bind with none supplied auto-generates one rather
+    than serving data open.
+
+    The HTTP sidecar has its own, independent bind (``--web-host``). Because it
+    re-exposes the whole data API, a **public sidecar with no enforced token** is
+    exactly the "public + unauthenticated" combination the model makes
+    unrepresentable — so it is refused rather than served open. (This is the
+    ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the token would
+    otherwise resolve to ``None`` and the data API would bind public and open.)
+
+    Returns the effective token (``None`` = local mode). Raises ``typer.Exit(1)``
+    if the sidecar would bind public without a token.
+    """
+    if token and _web_auth.valid_token(token):
+        effective_token: Optional[str] = token.strip()
+    elif env_token and _web_auth.valid_token(env_token):
+        effective_token = env_token.strip()
+    elif _host_is_public(server_host):
+        effective_token = secrets.token_urlsafe(32)
+        console.print(
+            "[yellow]Auto-generated secure access token "
+            f"(server.host={server_host} is a public bind).[/yellow]"
+        )
+    else:
+        # Loopback flight bind, no token supplied: local mode. Every listener is
+        # same-machine only, so no token is enforced.
+        effective_token = None
+
+    if effective_token is None and _host_is_public(web_host):
+        console.print(
+            "[red]Refusing to bind the HTTP sidecar to a public address "
+            f"(--web-host {web_host}) with no access token.[/red]\n"
+            "The sidecar re-exposes the data API, so this would serve it "
+            "unauthenticated to the network. Either bind it to loopback "
+            "(--web-host 127.0.0.1), or make the flight server public "
+            "(server.host) so a token is enforced across both listeners."
+        )
+        raise typer.Exit(1)
+
+    return effective_token
+
 
 def _install_sigterm_handler() -> None:
     """Make SIGTERM behave like Ctrl+C (KeyboardInterrupt).
@@ -874,30 +937,16 @@ def launch(
     )
 
     # --- Token management ---
-    # The flight server's bind address (config ``server.host``) is the single
-    # fail-closed rule for whether a token is required — there is no separate dev
-    # flag. A loopback bind is reachable same-machine only (local mode → run
-    # tokenless); any other bind is network-reachable and MUST carry a token, so a
-    # public bind with no token supplied auto-generates one rather than serving
-    # data open. The wildcard binds (0.0.0.0 / ::) are public, not loopback.
-    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-    flight_is_public = server_config.host not in _LOOPBACK_HOSTS
-
-    env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
-    if token and _web_auth.valid_token(token):
-        effective_token = token.strip()
-    elif env_token and _web_auth.valid_token(env_token):
-        effective_token = env_token.strip()
-    elif flight_is_public:
-        effective_token = secrets.token_urlsafe(32)
-        console.print(
-            "[yellow]Auto-generated secure access token "
-            f"(server.host={server_config.host} is a public bind).[/yellow]"
-        )
-    else:
-        # Loopback bind, no token supplied: local mode. Every listener is
-        # same-machine only, so no token is enforced.
-        effective_token = None
+    # The flight bind (server.host) is the mode switch; the sidecar's own bind
+    # (--web-host) must never be public-and-unauthenticated. _resolve_launch_token
+    # decides the enforced token fail-closed (and refuses a public sidecar with no
+    # token). There is no separate dev flag.
+    effective_token = _resolve_launch_token(
+        server_config.host,
+        web_host,
+        token,
+        os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+    )
 
     if effective_token is not None:
         console.print(

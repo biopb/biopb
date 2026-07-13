@@ -1050,6 +1050,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 - The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
 - **Local mode** (loopback `server.host`) enforces no token — the 90% single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
+- **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `server.host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`server.host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
 - For Docker local mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
 - For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
