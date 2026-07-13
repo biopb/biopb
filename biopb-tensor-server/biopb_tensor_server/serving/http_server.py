@@ -49,7 +49,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from starlette.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +338,6 @@ class _SidecarContext:
         config_path: Optional[str] = None,
         web_host: Optional[str] = None,
         web_port: Optional[int] = None,
-        static_dir: Optional[str] = None,
     ) -> None:
         self.flight_location = flight_location
         self.token = token
@@ -351,7 +349,6 @@ class _SidecarContext:
         self.config_path = config_path
         self.web_host = web_host
         self.web_port = web_port
-        self.static_dir = static_dir
         self.diag = _DiagnosticsState()
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
@@ -1349,8 +1346,8 @@ async def admin_restart(request: Request) -> JSONResponse:
     from biopb.cli import _detach_kwargs
 
     # Echo this daemon's own launch args so the restart comes back identically
-    # (same config / port / host / static dir); a bare restart would fall back
-    # to defaults and return mismatched (biopb/biopb#237).
+    # (same config / port / host); a bare restart would fall back to defaults and
+    # return mismatched (biopb/biopb#237).
     cmd = [sys.executable, "-m", "biopb.cli", "server", "restart"]
     if ctx.config_path:
         cmd += ["--config", str(ctx.config_path)]
@@ -1358,8 +1355,6 @@ async def admin_restart(request: Request) -> JSONResponse:
         cmd += ["--web-port", str(ctx.web_port)]
     if ctx.web_host:
         cmd += ["--web-host", str(ctx.web_host)]
-    if ctx.static_dir:
-        cmd += ["--static-dir", str(ctx.static_dir)]
 
     # The token rides the child's environment (never the visible command
     # line), matching how `biopb server start` hands it to the daemon.
@@ -1381,42 +1376,6 @@ async def admin_restart(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Static files (optional)
-# ---------------------------------------------------------------------------
-
-
-def _mount_static(app: FastAPI, static_dir: str) -> None:
-    """Serve the React webapp from ``static_dir`` with SPA-fallback routing."""
-    from pathlib import Path as _Path
-
-    static_path = _Path(static_dir)
-    if not static_path.is_dir():
-        return
-
-    # SPA fallback middleware — serve index.html for non-API routes that 404.
-    @app.middleware("http")
-    async def spa_fallback(request: Request, call_next):
-        response = await call_next(request)
-        if response.status_code == 404:
-            path = request.url.path
-            if (
-                not path.startswith("/api")
-                and not path.startswith("/live")
-                and not path.startswith("/ready")
-                and not path.startswith("/health")
-            ):
-                index_file = static_path / "index.html"
-                if index_file.exists():
-                    return Response(
-                        content=index_file.read_bytes(), media_type="text/html"
-                    )
-        return response
-
-    # Mount static files at root (must be after all API routes)
-    app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
-
-
-# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -1427,9 +1386,6 @@ def create_app(
     dev_mode: bool = False,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
-    static_dir: Optional[
-        str
-    ] = None,  # Directory for static webapp files (None = API only)
     config_path: Optional[str] = None,
     web_host: Optional[str] = None,
     web_port: Optional[int] = None,
@@ -1437,10 +1393,11 @@ def create_app(
     """Create and return the FastAPI application.
 
     This only *wires* the app: it builds the per-app ``_SidecarContext`` (lazy
-    Flight client + diagnostics + auth config), adds CORS, includes the module
-    -level route ``_router``, and optionally mounts the static webapp. All
-    request logic lives in the module-level handlers, which read their context
-    off ``app.state.sidecar``.
+    Flight client + diagnostics + auth config), adds CORS, and includes the
+    module-level route ``_router``. All request logic lives in the module-level
+    handlers, which read their context off ``app.state.sidecar``. The sidecar is
+    API-only — the web UI is served by the control front, the single web origin,
+    which proxies here for the data API and /ws/render.
 
     Args:
         flight_location: Arrow Flight server to connect to.
@@ -1448,7 +1405,6 @@ def create_app(
         dev_mode: Whether the website token bypass is active.
         cache_bytes: Bytes for the in-process chunk cache.
         cors_origins: Allowed CORS origins. Defaults to localhost variants.
-        static_dir: Directory of static webapp files (None = API only).
         config_path: Path to the config file this daemon was launched with. The
             admin routes read/write it and echo it into the restart command so a
             self-restart comes back identically (biopb/biopb#237).
@@ -1474,7 +1430,6 @@ def create_app(
         config_path=config_path,
         web_host=web_host,
         web_port=web_port,
-        static_dir=static_dir,
     )
 
     app.add_middleware(
@@ -1496,9 +1451,6 @@ def create_app(
     # Note: WebSocket CORS is handled by the browser during the handshake.
 
     app.include_router(_router)
-
-    if static_dir:
-        _mount_static(app, static_dir)
 
     return app
 
@@ -1609,7 +1561,6 @@ def run(
     port: int = 8816,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
-    static_dir: Optional[str] = None,  # Directory for static webapp files
     config_path: Optional[str] = None,
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
@@ -1621,7 +1572,6 @@ def run(
         dev_mode=dev_mode,
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
-        static_dir=static_dir,
         config_path=config_path,
         web_host=host,
         web_port=port,

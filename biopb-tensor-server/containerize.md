@@ -4,10 +4,10 @@
 
 This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container includes:
 
-- **Control plane** (port 8813) - The single public web origin: serves the data viewer (`/data_plane/viewer`), reverse-proxies the API + health checks, and forwards the access token to the private sidecar
+- **Control plane** (port 8813) - The single public web origin: serves the browser UI (dashboard at `/`, data viewer at `/viewer`), reverse-proxies the data-plane API + health checks under `/data_plane/*`, and forwards the access token to the private sidecar
 - **TensorFlightServer** (gRPC on port 8815) - Arrow Flight server for tensor data
-- **HTTP sidecar** (port 8814, internal) - FastAPI server behind the control plane; bound to loopback and not published
-- **Webapp** - React-based image browser UI (served by the control plane under `/data_plane/viewer`)
+- **HTTP sidecar** (port 8814, internal) - FastAPI data-plane API behind the control plane; API-only, bound to loopback and not published
+- **Webapp** - React-based image browser UI (one SPA, served by the control plane at its root)
 
 ## Build Instructions
 
@@ -44,14 +44,17 @@ pip wheel ./biopb-tensor-server --no-deps -w wheels/
 
 ### Step 2: Build Webapp Locally
 
-The webapp is served directly by FastAPI. Build with:
+The webapp is served by the control plane (the container's web origin), not the
+FastAPI sidecar. Build the SPA for the control front — the viewer targets the
+control-proxied data plane:
 
 ```bash
 # From repository root
-VITE_TENSOR_API="" pnpm --filter @biopb/web build
+pnpm -C web install
+VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
 ```
 
-This creates `biopb-tensor-server/packages/web/dist/` which is copied into the Docker image.
+This creates `web/packages/app/dist/`, which the Docker image copies to `/app/webapp`.
 
 ### Step 3: Build Docker Image
 
@@ -239,18 +242,23 @@ curl http://localhost:8813/data_plane/readyz
 
 ## Access the Webapp
 
-1. Open `http://localhost:8813/` in browser (redirects to `/data_plane/viewer`)
+1. Open `http://localhost:8813/` in browser (the dashboard); the data viewer is at `/viewer`
 2. Enter the token (shown once in container logs, or set via `BIOPB_TENSOR_TOKEN`)
 3. Browse microscopy datasets
 
 ## Architecture
 
 ```
-Container (external ports 8814, 8815)
-├── FastAPI HTTP Server (8814)
-│   ├── /                      → React SPA (static files from /app/webapp)
+Container (external ports 8813, 8815)
+├── Control plane (8813, the single web origin)
+│   ├── /                      → React SPA (static files from /app/webapp): dashboard
+│   ├── /viewer, /admin        → the same SPA: dataviewer/admin
+│   ├── /data_plane/*          → reverse-proxied to the FastAPI sidecar (data API + /ws/render)
+│   └── /health                → control liveness
+│
+├── FastAPI HTTP Server (8814, internal/loopback — API-only, no static)
 │   ├── /api/*                 → API endpoints (sources, slice, render)
-│   ├── /livez, /readyz        → health endpoints
+│   └── /livez, /readyz        → health endpoints
 │
 └── TensorFlightServer (8815)  → Arrow Flight gRPC (direct access)
     ├── do_action("health")    → health check action
@@ -258,7 +266,7 @@ Container (external ports 8814, 8815)
     └── do_get                 → fetch tensor data
 ```
 
-The **control plane** is the container's single web origin (port 8813): it serves the webapp + API under `/data_plane` by reverse-proxying the FastAPI sidecar, which now binds privately to `127.0.0.1:8814` inside the container. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
+The **control plane** is the container's single web origin (port 8813): it serves the SPA bundle at its root (dashboard `/`, dataviewer `/viewer`) and reverse-proxies the data-plane API under `/data_plane/*` to the FastAPI sidecar, which is API-only and binds privately to `127.0.0.1:8814` inside the container. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
 
 ### Network Binding Control
 

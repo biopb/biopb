@@ -39,7 +39,8 @@ docker run -d --rm --init \
 ```
 
 The container runs the **control plane** as its single web origin: open
-`http://localhost:8813` for the data viewer (`:8813` → `/data_plane/viewer`). The
+`http://localhost:8813` for the dashboard, with the data viewer at
+`http://localhost:8813/viewer`. The
 Arrow Flight gRPC endpoint stays on `:8815` for SDK clients. The HTTP sidecar
 (`:8814`) is now internal to the container and is not published. `--init` gives
 the container a reaping init as PID 1 — optional, since the control plane (PID 1)
@@ -141,18 +142,22 @@ biopb-tensor-server serve --config biopb.json
 
 ### Web App
 
-The React web viewer is served directly by the FastAPI server. Build it before running the server:
+The browser UI is one Vite + React SPA in the top-level `web/` workspace (not the
+FastAPI sidecar, which is API-only). Build it before running the server:
 
 ```bash
-# Production build (output → packages/web/dist/)
-pnpm --filter @biopb/web build
+# Production build (output → web/packages/app/dist/)
+pnpm -C web install && pnpm -C web build
 ```
 
-The webapp files are copied into the Docker image and served by the **control plane** at the web origin (`:8813`, under `/data_plane/viewer`). On first load you will be prompted for the access token (printed in the container logs, or set via `BIOPB_TENSOR_TOKEN`).
+The bundle is copied into the Docker image and served by the **control plane**,
+the single web origin (`:8813`): the dashboard at `/` and the data viewer at
+`/viewer`. On first load you will be prompted for the access token (printed in
+the container logs, or set via `BIOPB_TENSOR_TOKEN`).
 
 For development with hot reload, run the dev server separately:
 ```bash
-pnpm --filter @biopb/web dev   # runs on :5173
+pnpm -C web dev   # runs on :5173, proxies to a live control on :8813
 ```
 
 ### CLI Reference
@@ -172,7 +177,6 @@ biopb-tensor-server version  Show version information
 | `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
 | `--web-port` | 8814 | HTTP server port |
 | `--web-host` | 127.0.0.1 | HTTP server bind address |
-| `--static-dir` | (none) | Directory with static webapp files (API-only if unset) |
 | `--token` | (prompt/auto) | Website access token |
 | `--dev` | false | Skip token check (localhost only) |
 | `--open` | false | Open browser after startup |
@@ -225,7 +229,7 @@ pip install -e ".[test]"
 pytest
 
 # http/web tests
-cd packages/tensor-flight-client
+cd web/packages/tensor-flight-client
 pnpm test
 ```
 

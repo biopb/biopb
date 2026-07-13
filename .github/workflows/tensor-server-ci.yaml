@@ -47,12 +47,13 @@ jobs:
         with:
           node-version: 24
           cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm -C web install --frozen-lockfile
 
       - name: Run JS tests
-        run: pnpm -r run test
+        run: pnpm -C web -r run test
 
   # Python suite. Sparse matrix: all versions on Linux (where version bugs
   # surface), plus one version on macOS/Windows (where platform bugs surface).
@@ -132,24 +133,25 @@ jobs:
         with:
           node-version: 24
           cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm -C web install --frozen-lockfile
 
       - name: Sync JS versions
-        run: pnpm sync-version
+        run: pnpm -C web run sync-version
 
       - name: Build packages
-        run: pnpm --filter @biopb/tensor-flight-client build
+        run: pnpm -C web --filter @biopb/tensor-flight-client build
 
       - name: Build webapp
-        # Built for the control front (migration doc §6.1): served under
-        # /data_plane/viewer, data API + WS under /data_plane. Both are relative
-        # so the single origin is the control, not the tensor sidecar.
-        run: VITE_BASE_PATH="/data_plane/viewer/" VITE_TENSOR_API="/data_plane" pnpm --filter @biopb/web build
+        # The control front is the single web origin: it serves this bundle at
+        # its root and proxies the data API + WS under /data_plane. Base is "/";
+        # VITE_TENSOR_API points the viewer at the proxied data plane.
+        run: VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
 
       - name: Create webapp tarball
-        run: tar -czf webapp.tar.gz -C biopb-tensor-server/packages/web dist
+        run: tar -czf webapp.tar.gz -C web/packages/app dist
 
       - name: Setup Python
         uses: actions/setup-python@v6
