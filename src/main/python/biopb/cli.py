@@ -1935,7 +1935,6 @@ def _control_run_argv(
     web_port: int,
     log_level: str,
     data_plane: bool,
-    token: Optional[str],
     local_bypass: bool,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
@@ -1944,6 +1943,12 @@ def _control_run_argv(
     log paths) and passes it explicitly, so biopb_control imports no server config
     (invariant I2). The supervised tensor server logs to tensor-server.log; the
     control plane's own output is redirected by the caller to control.log.
+
+    The access token is **not** on this argv: a command line is world-readable
+    (`ps aux`, Task Manager) on exactly the multi-user hosts a token is meant to
+    protect (biopb/biopb#414). It travels only via ``BIOPB_TENSOR_TOKEN`` in the
+    child env (set by the caller); ``--local-bypass`` — not a secret — remains the
+    explicit all-localhost no-token signal.
     """
     grpc_host, grpc_port = _resolve_grpc_hostport(config)
     control_host, control_port = _control_endpoint()
@@ -1977,9 +1982,7 @@ def _control_run_argv(
         argv += ["--static-dir", str(static_dir)]
     if not data_plane:
         argv.append("--no-data-plane")
-    if token:
-        argv += ["--token", token]
-    elif local_bypass:
+    if local_bypass:
         argv.append("--local-bypass")
     return argv
 
@@ -2086,7 +2089,6 @@ def control_start(
                 web_port=web_port,
                 log_level=log_level,
                 data_plane=data_plane,
-                token=resolved_token,
                 local_bypass=local_bypass,
             )
 
@@ -2096,6 +2098,9 @@ def control_start(
             console.print(f"  Config: {config}")
             env = os.environ.copy()
             if resolved_token:
+                # The token travels to the control child (and on to the tensor
+                # server) via the env only, never the argv (biopb/biopb#414):
+                # biopb_control reads it back off BIOPB_TENSOR_TOKEN.
                 env["BIOPB_TENSOR_TOKEN"] = resolved_token
             with open(log_file, "a") as log:
                 log.write(

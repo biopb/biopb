@@ -33,7 +33,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--static-dir", default=None)
     run.add_argument("--log-level", default="INFO")
     run.add_argument("--server-log", default=None, help="data-plane stdout/stderr log")
-    run.add_argument("--token", default=None, help="tensor-server access token")
+    run.add_argument(
+        "--token",
+        default=None,
+        help="tensor-server access token (prefer BIOPB_TENSOR_TOKEN in the env; "
+        "a command line is world-readable via `ps`)",
+    )
     run.add_argument(
         "--local-bypass",
         action="store_true",
@@ -51,9 +56,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import os
+
     args = _build_parser().parse_args(argv)
     if args.command != "run":  # argparse requires a subcommand; defensive
         return 2
+
+    # The token arrives via the env, not the argv, so it never appears in the
+    # process command line (biopb/biopb#414). `biopb control start` exports
+    # BIOPB_TENSOR_TOKEN into this child; --token stays honored for a direct
+    # `python -m biopb_control run` invocation.
+    token = args.token or os.environ.get("BIOPB_TENSOR_TOKEN")
 
     # Defaults for the control endpoint come from the shared core-SDK module so a
     # bare `python -m biopb_control run` and the CLI agree on 8813.
@@ -68,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         static_dir=Path(args.static_dir) if args.static_dir else None,
         log_level=args.log_level,
         server_log=Path(args.server_log) if args.server_log else None,
-        token=args.token,
+        token=token,
         local_bypass=args.local_bypass,
     )
     return run_control(
