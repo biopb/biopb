@@ -206,7 +206,7 @@ jobs:
       # (installer extracts with no strip). The default (lite) set omits the
       # ~250 MB palisades_of_vogt sample.
       #
-      # The bundle is STATIC -- it only changes when tools/build_samples.py (the
+      # The bundle is STATIC -- it only changes when .github/scripts/build_samples.py (the
       # curated set) or the skimage pin change -- so cache it keyed on exactly
       # those inputs. That keeps skimage's third-party pooch fetch OFF the release
       # critical path in the common case (unchanged set -> cache hit -> no build,
@@ -218,7 +218,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: release-wheels/biopb-samples.tar.gz
-          key: samples-${{ hashFiles('tools/build_samples.py') }}-${{ env.SAMPLES_SKIMAGE_PIN }}
+          key: samples-${{ hashFiles('.github/scripts/build_samples.py') }}-${{ env.SAMPLES_SKIMAGE_PIN }}
 
       - name: Build sample dataset
         if: steps.samplecache.outputs.cache-hit != 'true'
@@ -232,7 +232,7 @@ jobs:
           for attempt in 1 2 3; do
             if uv run --no-project \
                  --with "$SAMPLES_SKIMAGE_PIN" --with pooch --with tifffile \
-                 python tools/build_samples.py --out samples; then
+                 python .github/scripts/build_samples.py --out samples; then
               ok=1; break
             fi
             if [ "$attempt" -lt 3 ]; then
@@ -461,7 +461,7 @@ jobs:
       - name: Verify sample bundle present
         run: |
           if [ ! -f release-wheels/biopb-samples.tar.gz ]; then
-            echo "::error::Release built WITHOUT biopb-samples.tar.gz -- fresh installs will land on an empty folder. If a release published, cut a follow-up once this is green: re-run for a transient skimage/pooch outage, or fix tools/build_samples.py."
+            echo "::error::Release built WITHOUT biopb-samples.tar.gz -- fresh installs will land on an empty folder. If a release published, cut a follow-up once this is green: re-run for a transient skimage/pooch outage, or fix .github/scripts/build_samples.py."
             exit 1
           fi
           echo "sample bundle present: $(ls -l release-wheels/biopb-samples.tar.gz)"
