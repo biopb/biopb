@@ -446,6 +446,71 @@ core.
 - Ops (`ProcessImage` / `ObjectDetection`) remain wired into the kernel namespace
   as today; only *which servers exist and how they start* moves to the control.
 
+### 7.1 Config: federate, don't merge *(decided)*
+
+The config surfaces (data-plane `~/.config/biopb/biopb.json`, MCP
+`~/.config/biopb-mcp/config.json`, and a future control config) stay **separate
+files, each owned by one process** — they do **not** collapse into one
+control-owned file. The governing rule:
+
+> **One writer *domain* per file, where the domain is the process that validates
+> that file's schema.** Whoever validates a file owns writing it.
+
+Why merging is wrong:
+
+- **The data-plane config is written *and validated* by the data plane itself.**
+  `PUT /api/admin/config` (the dashboard's `/data_plane/viewer/admin`, blind-proxied
+  through the control) runs the tensor server's full load-time validation
+  (`build_config_schema` + `validate_config_dict`) **in the tensor-server process**
+  before `save_config`, so "the form accepted it" == "the server will load it". The
+  control **cannot** run that validation without importing `biopb_tensor_server` —
+  the I2 line — so it cannot own writing `biopb.json`. Merging would either move
+  tensor-schema validation into the control (I2 break) or put two writers on one
+  file with split validation and write races.
+- **Docker already runs the boundary.** The container runs the *control* as its
+  single public origin (8813) with the tensor sidecar private-loopback behind it,
+  and the control **blind-proxies** the admin config page to the sidecar without
+  ever parsing the config. Control and the data-plane config surface coexist as
+  separate ownership domains in the smallest real composition — the proof that
+  "control present, data-plane config still data-plane-owned" is the steady state,
+  not a compromise.
+- **A control config must be optional.** In the container the control is configured
+  entirely from **env/argv** (entrypoint derives ports; token from
+  `BIOPB_TENSOR_TOKEN`) and writes no file. So any `control.json` is
+  **env/argv-first, file-second** — an additive desktop surface, never a boot
+  dependency.
+
+Writer model:
+
+| File | Owning domain (writes + validates) |
+|---|---|
+| `~/.config/biopb/biopb.json` | **data plane** — installer seeds; `biopb server migrate-config`; the **admin API** at runtime; the container entrypoint (env→file). The control never writes or parses it (blind proxy). |
+| `control.json` *(new, optional)* | **control** — its own API is the sole writer; env/argv overrides and suffices. Holds the algorithm-server registry + session policy; empty/absent in the container. |
+| `~/.config/biopb-mcp/config.json` | **MCP** — per-session kernel/dask/viewer/timeout knobs. Absent in the container. |
+
+What actually moves in Layer 4 is **only the algorithm-server registry**, MCP →
+control. It is the one piece with a real reason to move: today it is
+installer-seeded in the MCP file with no runtime writer; under the control it gains
+one — a native control-owned admin surface (add/remove a server from the dashboard)
+that writes `control.json` and validates it *in the control*, exactly parallel to
+the tensor admin page writing `biopb.json` in the tensor process. Two admin
+surfaces, two files, two validators, one origin fronting both. Everything the
+tensor server validates stays in `biopb.json`; everything per-session stays in the
+MCP file.
+
+Sequencing note: a **read-only** algorithm-plane inspector already shipped (the
+control dashboard's Algorithm plane card + `biopb image servers`, both reading the
+current MCP location through the shared `biopb._algorithms.servers_from_config`
+seam). Because the control and the MCP kernel now source the list through that one
+seam, the Layer-4 flip is localized: repoint the seam at `control.json` (with a
+`_migrate_legacy_keys`-style read-old / warn / prefer-new shim), then add the
+control's write path + supervision.
+
+Open sub-decision: whether `biopb control start` reads `control.json` itself or
+keeps resolving via the CLI and passing argv (as it does for `biopb.json`'s
+host/port/token today). The env/argv-first rule allows either; letting the control
+read the file avoids serializing a rich registry through flags.
+
 ---
 
 ## 8. Phasing
@@ -496,9 +561,13 @@ flips it. Suggested order (value-first):
 - **What keeps the control alive** (systemd / launchd / Windows service vs. a
   detached process the installer manages) — the one place a persistent daemon is
   still wanted, now isolated to the lean control plane.
-- **Config unification.** Data-plane, algorithm-plane, and MCP config could
-  collapse into one control-owned surface, or stay per-plane with the control
-  referencing them. Decide during Layer 4.
+- **Config unification.** *Resolved (see §7.1): federate, don't merge.* Each
+  plane's config stays a separate file owned by the process that validates it
+  (data-plane `biopb.json` written by the tensor server / admin API; a new
+  *optional* control-owned `control.json`; the MCP file for per-session knobs).
+  Only the algorithm-server registry moves MCP → control. Merging is blocked by
+  I2 — the control can't validate the tensor schema, and whoever validates a file
+  owns writing it.
 - **Transition / back-compat.** `biopb server` / `biopb mcp` semantics during the
   migration. *Resolved (Layer 2 core): the control does NOT adopt an already-running
   tensor server.* Supervising both spawned and adopted servers made the state
