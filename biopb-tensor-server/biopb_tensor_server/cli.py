@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import typer
+from biopb import _web_auth
 from rich.console import Console
 from rich.table import Table
 
@@ -861,8 +862,6 @@ def launch(
         biopb-tensor-server launch -c config.toml --web-port 9000
         biopb-tensor-server launch -c config.toml --log-level DEBUG
     """
-    import re as _re
-
     # --- Load server config and setup logging ---
     server_config = load_config(config)
 
@@ -884,14 +883,10 @@ def launch(
     _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
     flight_is_public = server_config.host not in _LOOPBACK_HOSTS
 
-    def _valid_token(t: str) -> bool:
-        t = t.strip()
-        return bool(t) and 16 <= len(t) <= 128 and _re.fullmatch(r"[A-Za-z0-9_\-]+", t)
-
     env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
-    if token and _valid_token(token):
+    if token and _web_auth.valid_token(token):
         effective_token = token.strip()
-    elif env_token and _valid_token(env_token):
+    elif env_token and _web_auth.valid_token(env_token):
         effective_token = env_token.strip()
     elif flight_is_public:
         effective_token = secrets.token_urlsafe(32)

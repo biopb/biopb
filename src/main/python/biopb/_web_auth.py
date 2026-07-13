@@ -21,6 +21,7 @@ drift.
 
 from __future__ import annotations
 
+import re
 import secrets
 from typing import Callable, Optional
 
@@ -79,6 +80,32 @@ def token_valid_with_query(
         return True
     provided = extract_bearer(get) or (query_get("token") or "")
     return secrets.compare_digest(provided.encode(), expected.encode())
+
+
+_TOKEN_CHARS = re.compile(r"[A-Za-z0-9_\-]+")
+_TOKEN_MIN_LEN = 16
+_TOKEN_MAX_LEN = 128
+
+
+def valid_token(token: Optional[str]) -> bool:
+    """Whether ``token`` is a well-formed access token.
+
+    The single shared rule for what counts as a *usable* token — 16–128 URL-safe
+    characters (``[A-Za-z0-9_-]``), surrounding whitespace ignored. The tensor
+    ``launch`` and the control's ``_resolve_mode`` both apply it so the two layers
+    cannot disagree on whether a supplied token is acceptable: without a shared
+    rule, one layer could enforce a ``--token`` the other rejects and silently
+    regenerates, leaving the browser holding a token the data plane no longer
+    accepts. This is a *shape* check on a locally-supplied secret, not a
+    timing-sensitive comparison against a request (that is :func:`token_valid`),
+    so a plain ``fullmatch`` is fine.
+    """
+    if not token:
+        return False
+    token = token.strip()
+    return _TOKEN_MIN_LEN <= len(token) <= _TOKEN_MAX_LEN and bool(
+        _TOKEN_CHARS.fullmatch(token)
+    )
 
 
 def has_token_header(get: HeaderGetter) -> bool:

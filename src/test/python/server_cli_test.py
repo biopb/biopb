@@ -908,15 +908,26 @@ class TestResolveMode:
 
     def test_remote_uses_supplied_token(self, tmp_path):
         assert (
-            cli._resolve_mode(tmp_path / "c.json", remote=True, token="supplied-tok")
-            == "supplied-tok"
+            cli._resolve_mode(
+                tmp_path / "c.json", remote=True, token="supplied-token-0123"
+            )
+            == "supplied-token-0123"
         )
 
     def test_remote_reads_env_token(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-tok")
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token-0123456789")
         assert (
-            cli._resolve_mode(tmp_path / "c.json", remote=True, token=None) == "env-tok"
+            cli._resolve_mode(tmp_path / "c.json", remote=True, token=None)
+            == "env-token-0123456789"
         )
+
+    def test_remote_rejects_malformed_token(self, tmp_path):
+        # Validated with the shared `_web_auth.valid_token` rule the tensor
+        # `launch` also applies, so the layers can't drift: a too-short (or
+        # non-URL-safe) token is refused here rather than silently regenerated
+        # downstream, which would leave the browser holding a rejected token.
+        with pytest.raises(typer.Exit):
+            cli._resolve_mode(tmp_path / "c.json", remote=True, token="too-short")
 
     def test_remote_generates_token_when_absent(self, tmp_path, monkeypatch):
         monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
