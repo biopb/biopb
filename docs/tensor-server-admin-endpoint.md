@@ -176,7 +176,7 @@ command. Thread them `launch → create_app → the admin-route closure`:
   **web host/port** it was started with, and stash them on the app so the restart
   route can reconstruct the exact command.
 - The **access token** is passed through the environment the child inherits
-  (`BIOPB_TENSOR_TOKEN`, or `BIOPB_WEB_DEV_BYPASS=1` for the local-no-token case),
+  (`BIOPB_TENSOR_TOKEN`; local mode with a loopback bind needs no token),
   matching how `start()` already hands it to the daemon — so it is **not** placed
   on the visible command line.
 

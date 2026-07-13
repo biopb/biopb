@@ -822,13 +822,9 @@ def launch(
     token: Optional[str] = typer.Option(
         None,
         "--token",
-        help="Website access token (generated if blank)",
+        help="Access token (required when server.host is non-loopback; "
+        "auto-generated if blank on a public bind)",
         hide_input=True,
-    ),
-    dev_mode: bool = typer.Option(
-        False,
-        "--dev",
-        help="Enable dev mode (skips token check, localhost only)",
     ),
     open_browser: bool = typer.Option(
         False,
@@ -862,7 +858,7 @@ def launch(
 
     Example:
         biopb-tensor-server launch --config biopb-tensor.toml
-        biopb-tensor-server launch -c config.toml --web-port 9000 --dev
+        biopb-tensor-server launch -c config.toml --web-port 9000
         biopb-tensor-server launch -c config.toml --log-level DEBUG
     """
     import re as _re
@@ -878,61 +874,37 @@ def launch(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
 
-    # --- Determine dev mode ---
-    env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
-    effective_dev_mode = dev_mode or env_dev
-
-    # Enforce: bypass only on localhost
-    if effective_dev_mode and web_host not in ("127.0.0.1", "localhost", "::1"):
-        console.print(
-            "[bold red]SECURITY WARNING:[/bold red] "
-            "BIOPB_WEB_DEV_BYPASS ignored because host is non-local; "
-            "website token enforcement remains enabled."
-        )
-        effective_dev_mode = False
-
     # --- Token management ---
+    # The flight server's bind address (config ``server.host``) is the single
+    # fail-closed rule for whether a token is required — there is no separate dev
+    # flag. A loopback bind is reachable same-machine only (local mode → run
+    # tokenless); any other bind is network-reachable and MUST carry a token, so a
+    # public bind with no token supplied auto-generates one rather than serving
+    # data open. The wildcard binds (0.0.0.0 / ::) are public, not loopback.
+    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    flight_is_public = server_config.host not in _LOOPBACK_HOSTS
+
     def _valid_token(t: str) -> bool:
         t = t.strip()
         return bool(t) and 16 <= len(t) <= 128 and _re.fullmatch(r"[A-Za-z0-9_\-]+", t)
 
-    if effective_dev_mode:
-        effective_token = None
+    env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
+    if token and _valid_token(token):
+        effective_token = token.strip()
+    elif env_token and _valid_token(env_token):
+        effective_token = env_token.strip()
+    elif flight_is_public:
+        effective_token = secrets.token_urlsafe(32)
         console.print(
-            "[yellow]DEV MODE: Website token bypass is active (localhost only).[/yellow]"
+            "[yellow]Auto-generated secure access token "
+            f"(server.host={server_config.host} is a public bind).[/yellow]"
         )
     else:
-        env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
-        if token and _valid_token(token):
-            effective_token = token.strip()
-        elif env_token and _valid_token(env_token):
-            effective_token = env_token.strip()
-        else:
-            # Prompt up to 3 times, then auto-generate
-            effective_token = None
-            for attempt in range(3):
-                try:
-                    entered = typer.prompt(
-                        "Enter website access token (leave blank to auto-generate)",
-                        default="",
-                        hide_input=True,
-                    )
-                except Exception:
-                    break
-                entered = entered.strip()
-                if not entered:
-                    break
-                if _valid_token(entered):
-                    effective_token = entered
-                    break
-                console.print(
-                    f"[red]Invalid token (attempt {attempt + 1}/3): "
-                    "must be 16-128 URL-safe characters [A-Za-z0-9_-][/red]"
-                )
-            if effective_token is None:
-                effective_token = secrets.token_urlsafe(32)
-                console.print("[yellow]Auto-generated secure access token.[/yellow]")
+        # Loopback bind, no token supplied: local mode. Every listener is
+        # same-machine only, so no token is enforced.
+        effective_token = None
 
+    if effective_token is not None:
         console.print(
             "\n[bold green]Access URL (shown once — do not share):[/bold green]"
         )
@@ -946,6 +918,10 @@ def launch(
             markup=False,
         )
         console.print()
+    else:
+        console.print(
+            "[yellow]Local mode: no access token (loopback-only bind).[/yellow]"
+        )
 
     # --- Start Flight server ---
     flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
@@ -1016,7 +992,6 @@ def launch(
         run_http_server(
             flight_location=flight_location,
             token=effective_token,
-            dev_mode=effective_dev_mode,
             host=web_host,
             port=web_port,
             cors_origins=effective_cors,

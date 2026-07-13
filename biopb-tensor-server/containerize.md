@@ -187,8 +187,7 @@ singularity run \
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
-| `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check). **Takes effect only together with `BIOPB_BIND_LOCALHOST=true`** — dev bypass is permitted only on a loopback `--web-host`. Use only on a trusted node reached via localhost. |
-| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to localhost (useful on shared nodes; also the prerequisite for `BIOPB_WEB_DEV_BYPASS`). |
+| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to loopback → **local mode, no token** (useful on shared nodes reached via localhost). A public container bind still auto-generates a token. |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Singularity auto-binds host `/tmp`, so the cache lands at `/tmp/biopb-cache-<uid>` on host disk (persistent). Set it to relocate — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
@@ -216,10 +215,9 @@ srun --pty singularity run \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
-# Dev mode for debugging (no token, localhost only on shared HPC node)
+# Local mode (no token, loopback bind only on a shared HPC node)
 singularity run \
     --env DATA_DIR=$HOME/data \
-    --env BIOPB_WEB_DEV_BYPASS=true \
     --env BIOPB_BIND_LOCALHOST=true \
     biopb-tensor-server.sif
 ```
@@ -324,7 +322,7 @@ Common causes:
 
 - Verify token matches `BIOPB_TENSOR_TOKEN`
 - Check token is 16-128 characters, URL-safe (`[A-Za-z0-9_-]`)
-- Note: `BIOPB_WEB_DEV_BYPASS` (dev-mode no-token bypass) has **no effect in Docker** — the container always binds `0.0.0.0`, so token enforcement stays on. It works only under Singularity with `BIOPB_BIND_LOCALHOST=true`.
+- Note: a Docker container always binds `0.0.0.0` (remote mode), so token enforcement stays on. The tokenless local mode via `BIOPB_BIND_LOCALHOST=true` works only under Singularity.
 
 ### Files not appearing in webapp
 

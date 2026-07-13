@@ -715,12 +715,11 @@ def start(
     log_file = _get_log_file()
     _rotate_log(log_file)
 
-    # Build subprocess environment
+    # Build subprocess environment. With no token (local_only), the tensor
+    # `launch` runs tokenless on its own because the config binds the flight
+    # server to loopback — no bypass signal needed.
     env = os.environ.copy()
-    if local_only:
-        # No token: tell launch to skip token enforcement without prompting
-        env["BIOPB_WEB_DEV_BYPASS"] = "1"
-    elif token:
+    if token:
         env["BIOPB_TENSOR_TOKEN"] = token
 
     # Build command
@@ -1877,21 +1876,16 @@ def _control_start_lock() -> Path:
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
 
-def _resolve_dataplane_token(
-    config: Path, web_host: str, token: Optional[str]
-) -> Tuple[Optional[str], bool]:
-    """Resolve the tensor server's token / local-only-bypass, as `server start`
-    does, so the control-supervised server applies the identical policy.
+_LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
 
-    Returns ``(token, local_bypass)``: a token to enforce (from --token,
-    BIOPB_TENSOR_TOKEN, or freshly generated + printed for a non-local bind), or
-    ``local_bypass=True`` when the all-localhost no-token case skips enforcement.
+
+def _read_flight_host(config: Path) -> str:
+    """The flight (gRPC) server's configured bind address (``server.host``).
+
+    Defaults to ``0.0.0.0`` when the config can't be read, so an unreadable
+    config is treated as a *public* bind — the fail-closed direction.
     """
-    _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
-    if not token:
-        token = os.environ.get("BIOPB_TENSOR_TOKEN")
-
-    grpc_host = "0.0.0.0"  # safe default: assume public if config unreadable
+    grpc_host = "0.0.0.0"
     if config.exists():
         try:
             from biopb_tensor_server.core.config import (
@@ -1901,16 +1895,54 @@ def _resolve_dataplane_token(
             grpc_host = _load_server_config(config).host
         except Exception:
             pass
+    return grpc_host
 
-    local_only = (
-        not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
-    )
-    if not token and not local_only:
-        import secrets as _secrets
 
-        token = _secrets.token_urlsafe(32)
-        console.print(f"[bold green]Generated access token:[/bold green] {token}")
-    return token, local_only
+def _resolve_mode(config: Path, remote: bool, token: Optional[str]) -> Optional[str]:
+    """Resolve the data-plane token for the chosen deployment mode.
+
+    Two modes, and nothing in between (biopb/biopb#…, the security-model
+    simplification):
+
+    - **Local** (default): every listener binds loopback, so no token is
+      enforced — returns ``None``. Fail-closed: an explicit ``--token`` or a
+      config that binds the flight server publicly (``server.host`` non-loopback)
+      is refused, because that would expose data on the network without auth.
+    - **Remote** (``--remote``): the flight server + control bind publicly, so a
+      token is **required**. Uses ``--token`` / ``BIOPB_TENSOR_TOKEN``, else
+      generates and prints one.
+
+    Returns the token to enforce (``None`` in local mode).
+    """
+    grpc_host = _read_flight_host(config)
+    flight_public = grpc_host not in _LOCALHOST_ADDRS
+
+    if remote:
+        token = token or os.environ.get("BIOPB_TENSOR_TOKEN")
+        if not token:
+            import secrets as _secrets
+
+            token = _secrets.token_urlsafe(32)
+            console.print(f"[bold green]Generated access token:[/bold green] {token}")
+        return token
+
+    # Local mode — must not expose data without a token.
+    if token:
+        console.print(
+            "[red]--token requires --remote.[/red] Local mode is tokenless "
+            "(all listeners bind loopback). Re-run with [bold]--remote[/bold] to "
+            "serve on the network behind a token."
+        )
+        raise typer.Exit(1)
+    if flight_public:
+        console.print(
+            f"[red]The flight server config binds publicly (server.host="
+            f"{grpc_host}), but no token would be enforced in local mode.[/red] "
+            "Start with [bold]--remote[/bold] (adds token auth) or set "
+            "server.host to a loopback address (127.0.0.1)."
+        )
+        raise typer.Exit(1)
+    return None
 
 
 def _query_control_health(host: str, port: int, timeout: float = 2.0) -> Optional[dict]:
@@ -1935,23 +1967,31 @@ def _control_run_argv(
     web_port: int,
     log_level: str,
     data_plane: bool,
-    local_bypass: bool,
+    remote: bool,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
-    The core CLI resolves everything (grpc endpoint, token policy, endpoint,
-    log paths) and passes it explicitly, so biopb_control imports no server config
+    The core CLI resolves everything (grpc endpoint, mode, endpoint, log paths)
+    and passes it explicitly, so biopb_control imports no server config
     (invariant I2). The supervised tensor server logs to tensor-server.log; the
     control plane's own output is redirected by the caller to control.log.
 
     The access token is **not** on this argv: a command line is world-readable
     (`ps aux`, Task Manager) on exactly the multi-user hosts a token is meant to
     protect (biopb/biopb#414). It travels only via ``BIOPB_TENSOR_TOKEN`` in the
-    child env (set by the caller); ``--local-bypass`` — not a secret — remains the
-    explicit all-localhost no-token signal.
+    child env (set by the caller). ``--remote`` — not a secret — is the explicit
+    public-deployment signal; it also binds the control's own listener publicly
+    (0.0.0.0) so the browser UI is reachable off-box, while the local (default)
+    mode keeps every listener on loopback.
     """
     grpc_host, grpc_port = _resolve_grpc_hostport(config)
     control_host, control_port = _control_endpoint()
+    # Remote mode: bind the control's HTTP listener on all interfaces so the
+    # dashboard/dataviewer is reachable off-box (the token gates it). The starter
+    # still probes readiness over loopback, so _control_endpoint()'s host is kept
+    # only for that probe, not passed through here.
+    if remote:
+        control_host = "0.0.0.0"
     argv = [
         sys.executable,
         "-m",
@@ -1982,8 +2022,8 @@ def _control_run_argv(
         argv += ["--static-dir", str(static_dir)]
     if not data_plane:
         argv.append("--no-data-plane")
-    if local_bypass:
-        argv.append("--local-bypass")
+    if remote:
+        argv.append("--remote")
     return argv
 
 
@@ -1998,14 +2038,21 @@ def control_start(
         help="Web UI bundle the control serves at its root (the built web/ dist)",
     ),
     web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
-    web_host: str = typer.Option(
-        "127.0.0.1", "--web-host", help="Tensor-server HTTP bind address"
-    ),
     log_level: str = typer.Option(
         "INFO", "--log-level", "-l", help="Control log level"
     ),
+    remote: bool = typer.Option(
+        False,
+        "--remote",
+        help="Serve on the network behind a token: bind the control (browser UI) "
+        "and the flight server publicly, and require an access token. Without it "
+        "(the default) every listener binds loopback and no token is used.",
+    ),
     token: Optional[str] = typer.Option(
-        None, "--token", help="Tensor-server access token (auto for non-local binds)"
+        None,
+        "--token",
+        help="Access token for --remote (or set BIOPB_TENSOR_TOKEN); "
+        "auto-generated if omitted. Not allowed in local mode.",
     ),
     data_plane: bool = typer.Option(
         True,
@@ -2024,6 +2071,14 @@ def control_start(
     to ensure the plane is up. It does not adopt a server it did not start -- if
     the gRPC port is already in use, `control start` refuses (stop the stray server
     first), so `biopb control stop` is always a complete data-plane teardown.
+
+    Two deployment modes, nothing in between: **local** (default) binds every
+    listener to loopback and uses no token — the single-machine 90% case; and
+    **remote** (``--remote``) binds the control's browser UI and the flight server
+    publicly behind a required token, for serving a tensor deployment to other
+    machines. The tensor HTTP sidecar always stays on loopback (the control
+    proxies it), and the flight server's bind comes from the config's
+    ``server.host`` — local mode refuses to start if that is non-loopback.
     """
     _require_biopb_control()
     _ensure_dirs()
@@ -2079,17 +2134,17 @@ def control_start(
                     )
                     raise typer.Exit(1)
 
-            resolved_token, local_bypass = _resolve_dataplane_token(
-                config, web_host, token
-            )
+            resolved_token = _resolve_mode(config, remote, token)
             argv = _control_run_argv(
                 config=config,
                 static_dir=static_dir,
-                web_host=web_host,
+                # The sidecar always binds loopback; the control proxies it. Only
+                # the control (browser UI) and flight server go public in --remote.
+                web_host="127.0.0.1",
                 web_port=web_port,
                 log_level=log_level,
                 data_plane=data_plane,
-                local_bypass=local_bypass,
+                remote=remote,
             )
 
             log_file = _control_log_file()
@@ -2233,14 +2288,20 @@ def control_run(
         help="Web UI bundle the control serves at its root (the built web/ dist)",
     ),
     web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
-    web_host: str = typer.Option(
-        "127.0.0.1", "--web-host", help="Tensor-server HTTP bind address"
-    ),
     log_level: str = typer.Option(
         "INFO", "--log-level", "-l", help="Control log level"
     ),
+    remote: bool = typer.Option(
+        False,
+        "--remote",
+        help="Serve on the network behind a token (bind control + flight server "
+        "publicly). Without it every listener binds loopback and no token is used.",
+    ),
     token: Optional[str] = typer.Option(
-        None, "--token", help="Tensor-server access token (auto for non-local binds)"
+        None,
+        "--token",
+        help="Access token for --remote (or set BIOPB_TENSOR_TOKEN); "
+        "auto-generated if omitted. Not allowed in local mode.",
     ),
     data_plane: bool = typer.Option(
         True,
@@ -2252,7 +2313,8 @@ def control_run(
 
     The foreground counterpart of `biopb control start`: no PID file, blocks this
     terminal, tears everything down on Ctrl-C. Useful for a systemd/launchd unit
-    (let the service manager own the process) or for debugging supervision.
+    (let the service manager own the process) or for debugging supervision. See
+    `biopb control start` for the local/remote mode model.
     """
     _require_biopb_control()
     _ensure_dirs()
@@ -2261,18 +2323,21 @@ def control_run(
 
     grpc_host, grpc_port = _resolve_grpc_hostport(config)
     control_host, control_port = _control_endpoint()
-    resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
+    resolved_token = _resolve_mode(config, remote, token)
+    # Remote mode binds the control's own listener publicly so the browser UI is
+    # reachable off-box; the token gates it. The sidecar always stays on loopback.
+    if remote:
+        control_host = "0.0.0.0"
     spec = DataPlaneSpec(
         config=config,
         grpc_host=grpc_host,
         grpc_port=grpc_port,
-        web_host=web_host,
+        web_host="127.0.0.1",
         web_port=web_port,
         static_dir=static_dir if (static_dir and static_dir.exists()) else None,
         log_level=log_level,
         server_log=_get_log_file(),
         token=resolved_token,
-        local_bypass=local_bypass,
     )
     code = run_control(
         spec,

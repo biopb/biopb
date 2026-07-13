@@ -28,7 +28,7 @@ from typing import Callable, Optional
 # only coupling to the caller's framework, so these predicates stay pure.
 HeaderGetter = Callable[[str], Optional[str]]
 
-# Hosts honored when no token is configured (the loopback dev-bypass mode). Any
+# Hosts honored when no token is configured (local mode, loopback-only). Any
 # port is allowed; only the host part is checked.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -51,9 +51,9 @@ def extract_bearer(get: HeaderGetter) -> str:
 def token_valid(get: HeaderGetter, expected: Optional[str]) -> bool:
     """Timing-safe check that the request carries ``expected``.
 
-    A falsy ``expected`` (no token configured — the all-localhost dev-bypass
-    case) means "no token is enforced" and returns ``True``, matching the
-    sidecar's ``dev_mode or self.token is None`` path. Callers that want a
+    A falsy ``expected`` (no token configured — local mode, where every listener
+    is loopback-bound) means "no token is enforced" and returns ``True``,
+    matching the sidecar's ``self.token is None`` path. Callers that want a
     loopback backstop for that no-token case apply :func:`host_is_loopback`
     themselves.
     """

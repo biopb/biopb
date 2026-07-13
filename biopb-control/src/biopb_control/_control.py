@@ -148,8 +148,9 @@ class _ControlAuthMiddleware:
       ``X-Biopb-Token`` (401 otherwise). This is the whole point of the single
       origin: the token that already gates the data plane now also gates the
       control's stop/restart verbs and the session enumeration.
-    - **No token** (the all-localhost dev-bypass) → require a **loopback Host**
-      (421 otherwise), so a DNS-rebinding page can't drive the token-less origin.
+    - **No token** (local mode, all listeners loopback-bound) → require a
+      **loopback Host** (421 otherwise), so a DNS-rebinding page can't drive the
+      token-less origin.
     - **Unsafe method** (POST/…) → additionally refuse a forgeable cross-site
       request (403) — a token header or a same-origin ``Sec-Fetch-Site`` passes,
       a browser's cross-site POST does not (CSRF).
@@ -282,9 +283,9 @@ def build_app(
 
     ``data_web_url`` is the loopback base URL of the supervised tensor server's
     HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. ``token``
-    is the data-plane access token (``None`` in the all-localhost dev-bypass
-    case); the ``/api/*`` gate enforces it when set, else falls back to a loopback
-    Host check. ``static_dir`` is the built ``web/`` bundle (``web/packages/app/
+    is the data-plane access token (``None`` in local mode, where every listener
+    is loopback-bound); the ``/api/*`` gate enforces it when set, else falls back
+    to a loopback Host check. ``static_dir`` is the built ``web/`` bundle (``web/packages/app/
     dist``); when present the control serves it at its root as the single web
     origin — the dashboard (``/``), the dataviewer (``/viewer``), and each
     session's observe shell (``/session/<id>/observe``) are all React routes of
@@ -321,7 +322,17 @@ def build_app(
     # blocking TCP liveness probe, so Starlette runs them in its threadpool) --- #
 
     def health(_request: Request) -> JSONResponse:
-        return JSONResponse({"control": "ok", "data_plane": supervisor.snapshot()})
+        # `auth_required` is the SPA's public probe: the browser bundle + this
+        # endpoint stay unauthenticated always, and the app reads this to decide
+        # whether to gate itself behind the unlock page. True in remote mode (a
+        # token gates /api/* and the proxied data plane), False in local mode.
+        return JSONResponse(
+            {
+                "control": "ok",
+                "auth_required": token is not None,
+                "data_plane": supervisor.snapshot(),
+            }
+        )
 
     def data_plane_ensure(request: Request) -> JSONResponse:
         # The client passes ?client_timeout=<its HTTP timeout>; cap our wait
@@ -765,8 +776,8 @@ def serve_control_api(
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
     # The data-plane token gates the control's own /api/* too (single origin,
-    # §6.1). None in the all-localhost dev-bypass case -> the gate falls back to a
-    # loopback Host check instead.
+    # §6.1). None in local mode -> the gate falls back to a loopback Host check
+    # instead.
     app = build_app(
         supervisor,
         ensure_timeout,
