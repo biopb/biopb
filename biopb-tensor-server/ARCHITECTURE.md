@@ -877,17 +877,31 @@ Key responsibilities:
 ### Build
 
 ```sh
-pnpm run build   # tsc + vite build → dist/
-pnpm run dev     # vite dev server (HMR)
+pnpm run build           # tsc + vite build → dist/  (base "/", for the standalone :8814 sidecar)
+pnpm run build:control   # same, but VITE_BASE_PATH=/data_plane/viewer/ VITE_TENSOR_API=/data_plane
+pnpm run dev             # vite dev server (HMR)
 ```
 
 Output is `dist/` — plain HTML/CSS/JS, ready for FastAPI StaticFiles or any static file server.
 
 From repo root:
 ```bash
-pnpm --filter @biopb/web dev     # Vite dev server on :5173
-pnpm --filter @biopb/web build   # tsc + vite build → dist/
+pnpm --filter @biopb/web dev             # Vite dev server on :5173
+pnpm --filter @biopb/web build           # tsc + vite build → dist/  (base "/")
+pnpm --filter @biopb/web build:control   # namespaced build for control-fronted serving
 ```
+
+**Base-path gotcha — which build to use.** The control front (`biopb control`)
+mounts the dataviewer under the `/data_plane/viewer/` namespace, so it must be
+served a build whose `VITE_BASE_PATH=/data_plane/viewer/`. A plain `build` (or
+the `dev` HMR server) emits base `/`, whose `index.html` requests `/assets/...` —
+that resolves at the bare sidecar origin (`:8814/`) but 404s under the control's
+namespaced mount, leaving a **blank page** (`#root` never hydrates). Symptom:
+`:8814/` renders but `:8813/data_plane/viewer/` is empty. CI/release build with
+the namespaced base (`.github/workflows/{tensor-server-ci,release}.yaml`); for a
+local control, use `build:control` and point the control at the tree build:
+`biopb control run --static-dir <repo>/biopb-tensor-server/packages/web/dist`
+(`--static-dir` defaults to `~/.local/share/biopb/webapp`, but is not hardcoded).
 
 ### Static file deployment
 

@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json && vite build",
+    "build:control": "VITE_BASE_PATH=/data_plane/viewer/ VITE_TENSOR_API=/data_plane tsc -p tsconfig.json && VITE_BASE_PATH=/data_plane/viewer/ VITE_TENSOR_API=/data_plane vite build",
     "preview": "vite preview",
     "test": "echo \"No tests yet\"",
     "lint": "eslint src"
