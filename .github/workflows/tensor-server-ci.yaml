@@ -20,6 +20,11 @@ on:
       - 'buf.gen.yaml'
       - 'src/main/python/**'
       - 'pyproject.toml'
+      # This workflow hosts the JS suite (js-test) and the webapp build, so a
+      # web-only change must trigger it too — otherwise a web regression lands on
+      # dev with zero CI (no ruleset requires these checks) and only surfaces on
+      # the next tensor-server PR's merge-ref.
+      - 'web/**'
       - '.github/workflows/tensor-server-ci.yaml'
   workflow_dispatch:
 
