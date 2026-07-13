@@ -337,6 +337,7 @@ class _SidecarContext:
         config_path: Optional[str] = None,
         web_host: Optional[str] = None,
         web_port: Optional[int] = None,
+        supervised: bool = False,
     ) -> None:
         self.flight_location = flight_location
         self.token = token
@@ -347,6 +348,12 @@ class _SidecarContext:
         self.config_path = config_path
         self.web_host = web_host
         self.web_port = web_port
+        # True when the biopb control spawned + supervises this data plane (it
+        # sets BIOPB_DATA_PLANE_SUPERVISED in our env). The admin self-restart is
+        # then forbidden: the control is the sole owner, so a self-spawned
+        # `biopb server restart` would race the supervisor and silently hand the
+        # plane to a daemon the control did not start (biopb/biopb#418).
+        self.supervised = supervised
         self.diag = _DiagnosticsState()
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
@@ -1309,6 +1316,9 @@ async def admin_status(request: Request) -> JSONResponse:
             "running": running,
             "pid": os.getpid(),
             "version": _VERSION,
+            # Control-owned: the admin UI must route a restart through the
+            # control, not the sidecar self-restart (biopb/biopb#418).
+            "supervised": ctx.supervised,
             "config_path": str(ctx.config_path) if ctx.config_path else None,
             "health": _h("status"),
             "source_count": _h("source_count"),
@@ -1325,6 +1335,21 @@ async def admin_restart(request: Request) -> JSONResponse:
     ctx = _sidecar(request)
     ctx.check_token(request)
     _require_same_origin(request)
+    # Control-owned plane: the sidecar must NOT self-restart. The control is the
+    # sole owner (it spawned + supervises this process); a self-spawned `biopb
+    # server restart` would SIGTERM the control's tracked child, the supervisor
+    # would respawn its own replacement, and both would race for the gRPC port —
+    # if the standalone daemon won, the control would see a port it didn't spawn,
+    # mark it a conflict, and stop managing the plane (biopb/biopb#418). Restart
+    # is instead a request to the control (POST /api/data_plane/restart), which
+    # the admin UI routes to when it sees supervised=True in /api/admin/status.
+    if ctx.supervised:
+        raise HTTPException(
+            status_code=409,
+            detail="This data plane is supervised by the biopb control; restart "
+            "it via the control (POST /api/data_plane/restart), not the sidecar "
+            "self-restart, which would conflict with supervision.",
+        )
     # Refuse a second restart while one is already underway (e.g. a
     # double-click): two `biopb server restart` children would race on the
     # PID file and the freed port. This async handler has no await before the
@@ -1377,6 +1402,7 @@ def create_app(
     config_path: Optional[str] = None,
     web_host: Optional[str] = None,
     web_port: Optional[int] = None,
+    supervised: Optional[bool] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -1398,10 +1424,17 @@ def create_app(
             self-restart comes back identically (biopb/biopb#237).
         web_host: Host this HTTP sidecar was bound to (echoed into restart).
         web_port: Port this HTTP sidecar was bound to (echoed into restart).
+        supervised: Whether the biopb control owns/supervises this data plane;
+            when it does, the admin self-restart is refused (biopb/biopb#418).
+            Defaults to reading ``BIOPB_DATA_PLANE_SUPERVISED`` from the env the
+            control set, so a directly-launched ``biopb server start`` is not
+            supervised and keeps its self-restart.
 
     Returns:
         Configured FastAPI application.
     """
+    if supervised is None:
+        supervised = os.environ.get("BIOPB_DATA_PLANE_SUPERVISED") == "1"
     if cors_origins is None:
         cors_origins = [
             "http://localhost:8814",
@@ -1417,6 +1450,7 @@ def create_app(
         config_path=config_path,
         web_host=web_host,
         web_port=web_port,
+        supervised=supervised,
     )
 
     app.add_middleware(

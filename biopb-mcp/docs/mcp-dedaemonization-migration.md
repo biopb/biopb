@@ -313,6 +313,19 @@ mix. During the rewrite `/data_plane/ensure` moves to `/api/data_plane/ensure`
 (pre-release, so no legacy alias is kept); bare `/health` stays put as the
 load-bearing liveness probe.
 
+This split is exactly why the admin page's **Restart** must not go through the
+proxy. The sidecar's own `/api/admin/restart` self-restarts by spawning a
+detached `biopb server restart` daemon — correct for a standalone `biopb server
+start`, but under supervision it SIGTERMs the control's tracked child and races
+the supervisor for the gRPC port, silently handing ownership to a daemon the
+control did not spawn (biopb/biopb#418). So the control marks the plane it owns
+(`BIOPB_DATA_PLANE_SUPERVISED` in the child env), the sidecar surfaces that as
+`supervised` on `/api/admin/status` and **refuses** its self-restart (409), and
+the admin UI routes a supervised restart to the in-process supervisor verb
+`/api/data_plane/restart` instead — the same verb the dashboard's restart control
+uses. Config edits stay a blind proxy (the tensor process is the sole validator
++ writer of `biopb.json`); only *restart*, an ownership action, is control-routed.
+
 **Frontend serving (finalized).** The planned per-surface base paths were
 dropped. Rather than build the dataviewer under `base: '/data_plane/viewer/'`,
 the finalized model builds **one SPA with base `/`** that the control serves at
