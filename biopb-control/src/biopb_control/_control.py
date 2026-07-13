@@ -211,6 +211,57 @@ def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
     return f"{scheme}://{reachable}:{port}"
 
 
+# How long each per-session kernel probe may take. The dashboard polls the
+# session list every few seconds and the probes run concurrently, so this is
+# kept short: a slow or wedged child yields "unknown" rather than stalling the
+# whole list.
+_KERNEL_PROBE_TIMEOUT = 0.6
+
+
+def _kernel_state(health: dict) -> str:
+    """Map a session child's ``/api/status`` health dict to a dashboard kernel
+    state.
+
+    The kernel is the heavy component and starts on demand, so the useful bit is
+    attached-or-not. A *live* kernel always reports its live state (a stale
+    ``start_error`` from an earlier, since-recovered attempt never masks it):
+    ``ready`` (booted past its bootstrap probe), ``busy`` (executing), or
+    ``starting`` (process up, not yet ready). A kernel that is not alive is
+    ``error`` if it failed / died, else ``none`` (never started this session).
+    """
+    if health.get("alive"):
+        if not health.get("ready"):
+            return "starting"
+        return "busy" if health.get("busy") else "ready"
+    if health.get("start_error") or health.get("dead"):
+        return "error"
+    return "none"
+
+
+async def _probe_kernel(client: httpx.AsyncClient, rec: dict) -> str:
+    """Best-effort "is a kernel attached?" for one session.
+
+    A single cheap loopback GET to the child's ``/api/status`` — which returns
+    ``KernelHost.health()`` with no kernel round-trip and whose ``api`` observe
+    root the control already proxies. Never raises: a missing port, an
+    unreachable/slow child, a non-200, or unparseable JSON all degrade to
+    ``"unknown"`` so the session list is never blocked or truncated by a probe.
+    httpx sets ``Host`` from the target (satisfying the child's loopback guard)
+    and sends no ``Origin`` (passing its Origin guard), like the session proxy.
+    """
+    port = rec.get("port")
+    if not port:
+        return "unknown"
+    url = _loopback_url(rec.get("host", "127.0.0.1"), port) + "/api/status"
+    try:
+        resp = await client.get(url, timeout=_KERNEL_PROBE_TIMEOUT)
+        if resp.status_code != 200:
+            return "unknown"
+        return _kernel_state(resp.json())
+    except Exception:  # noqa: BLE001 - a probe is decorative; never fail the list
+        return "unknown"
+
+
 def build_app(
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
@@ -321,20 +372,29 @@ def build_app(
             }
         )
 
-    def api_sessions(_request: Request) -> JSONResponse:
+    async def api_sessions(_request: Request) -> JSONResponse:
         # The live MCP sessions, newest first, projected to what the dashboard
-        # needs — the id, when it started, its loopback port, and the control-
-        # relative observe link. list_sessions() self-heals (prunes dead/reused
-        # records) on read, so a stale session never lingers on the page.
+        # needs — the id, when it started, its loopback port, the control-relative
+        # observe link, and a best-effort "kernel" state (the heavy on-demand
+        # component, probed concurrently over one cheap GET each; see
+        # _probe_kernel). list_sessions() self-heals (prunes dead/reused records)
+        # on read, so a stale session never lingers on the page. Async so the
+        # per-session probes fan out concurrently rather than serializing.
+        records = [
+            rec for rec in _config_sessions.list_sessions() if rec.get("session_id")
+        ]
+        kernels = await asyncio.gather(
+            *(_probe_kernel(session_client, rec) for rec in records)
+        )
         sessions = [
             {
                 "session_id": rec["session_id"],
                 "started_at": rec.get("started_at"),
                 "port": rec.get("port"),
                 "observe_url": f"/session/{rec['session_id']}/observe",
+                "kernel": kernel,
             }
-            for rec in _config_sessions.list_sessions()
-            if rec.get("session_id")
+            for rec, kernel in zip(records, kernels)
         ]
         return JSONResponse({"sessions": sessions})
 
@@ -744,8 +804,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .sid { font-family: ui-monospace, Menlo, monospace; font-weight: 600; }
   .when { color: #888; font-size: 12px; }
   .empty { color: #777; padding: 6px 0; }
-  a.obs { margin-left: auto; color: #7e7; text-decoration: none; }
+  a.obs { color: #7e7; text-decoration: none; }
   a.obs:hover { text-decoration: underline; }
+  /* Kernel (the heavy, on-demand component) state per session. Pushed right so
+     it groups with the observe link. */
+  .kbadge { margin-left: auto; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+            white-space: nowrap; }
+  .k-ready { background: #243; color: #7e7; }
+  .k-busy { background: #143; color: #9d7; }
+  .k-starting { background: #234; color: #8bf; }
+  .k-none { background: #2a2a2a; color: #999; }
+  .k-error { background: #422; color: #f99; }
+  .k-unknown { background: #2a2a2a; color: #777; }
   .mini { padding: 0 8px; font-size: 12px; margin-left: 8px; vertical-align: middle; }
   .state { color: #888; font-size: 12px; }
   .note { color: #667; font-size: 12px; margin: 12px 0 0; }
@@ -875,6 +945,15 @@ async function pollStatus() {
   renderDataPlane(s.data_plane || {});
 }
 
+// A per-session kernel badge: the kernel is the heavy component and starts on
+// demand, so surfacing whether one is attached (and its state) is the useful
+// signal. 'none' reads as "no kernel"; every other state is shown verbatim.
+function kernelBadge(k) {
+  k = k || 'unknown';
+  const label = k === 'none' ? 'no kernel' : 'kernel: ' + k;
+  return '<span class="kbadge k-' + esc(k) + '">' + esc(label) + '</span>';
+}
+
 async function pollSessions() {
   let data;
   try { data = await (await fetchAuth('/api/sessions')).json(); }
@@ -886,6 +965,7 @@ async function pollSessions() {
     const when = s.started_at ? new Date(s.started_at * 1000).toLocaleTimeString() : '';
     return '<li><span class="sid">' + esc(s.session_id) + '</span>'
       + '<span class="when">:' + esc(s.port) + (when ? ' · ' + esc(when) : '') + '</span>'
+      + kernelBadge(s.kernel)
       + '<a class="obs" href="' + esc(s.observe_url) + '" target="_blank" rel="noopener">observe →</a></li>';
   }).join('');
 }

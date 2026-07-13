@@ -176,6 +176,85 @@ def test_api_sessions_omits_dead_records(control, upstream):
     assert _config_sessions.read_session("ghost") is None  # pruned
 
 
+@pytest.mark.parametrize(
+    "health, expected",
+    [
+        ({"alive": True, "ready": True, "busy": False}, "ready"),
+        ({"alive": True, "ready": True, "busy": True}, "busy"),
+        ({"alive": True, "ready": False}, "starting"),  # process up, not booted
+        ({"alive": False}, "none"),  # never started this session
+        ({"alive": False, "start_error": "boom"}, "error"),  # failed to start
+        ({"alive": False, "dead": True}, "error"),  # died
+        ({"alive": True, "ready": True, "start_error": "old"}, "ready"),  # recovered
+        ({}, "none"),  # missing keys -> not attached
+    ],
+)
+def test_kernel_state_mapping(health, expected):
+    from biopb_control._control import _kernel_state
+
+    assert _kernel_state(health) == expected
+
+
+def test_api_sessions_includes_kernel_state(control, upstream):
+    # A live session gets a probed "kernel" field. The echo upstream's /api/status
+    # is not a real health endpoint (it echoes the request), so no kernel keys are
+    # present -> "none"; the point is the field is present and the wiring probed.
+    _register_session("20260101-000000-42", upstream)
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    sessions = json.loads(body)["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["kernel"] == "none"
+
+
+def test_api_sessions_kernel_unknown_when_child_unreachable(control):
+    # A live-pid record whose port has no server: the probe fails fast and the
+    # session still lists (kernel state is decorative, never drops the session).
+    closed = _free_port()  # nothing listening
+    _config_sessions.register(
+        "s-unreach", host="127.0.0.1", port=closed, pid=os.getpid()
+    )
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    sessions = json.loads(body)["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "s-unreach"
+    assert sessions[0]["kernel"] == "unknown"
+
+
+def test_probe_kernel_maps_child_health():
+    # _probe_kernel over a real loopback GET to a stub child reporting a ready
+    # kernel returns "ready" (the full HTTP + parse + map path).
+    import asyncio
+
+    import httpx
+
+    from biopb_control._control import _probe_kernel
+
+    class _Health(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):  # noqa: N802
+            payload = json.dumps({"alive": True, "ready": True, "busy": False}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        rec = {"host": "127.0.0.1", "port": server.server_address[1]}
+
+        async def go():
+            async with httpx.AsyncClient(timeout=None) as c:
+                return await _probe_kernel(c, rec)
+
+        assert asyncio.run(go()) == "ready"
+    finally:
+        server.shutdown()
+
+
 def test_data_plane_stop_is_a_control_verb(control):
     # POST /api/data_plane/stop returns the snapshot; with no data plane wired in
     # this test it just reports a stopped plane rather than proxying anywhere.
