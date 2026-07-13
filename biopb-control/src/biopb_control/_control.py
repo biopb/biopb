@@ -260,6 +260,16 @@ def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
 # whole list.
 _KERNEL_PROBE_TIMEOUT = 0.6
 
+# Timeouts for the reverse proxies into the sidecar / session children. Not
+# ``None`` (biopb#420): a wedged upstream that accepts the connection but never
+# answers must fail eventually, not hang the request forever. The ``read`` bound
+# is per read-event, not total, and is set generously — every upstream buffers
+# its whole response before sending (no long-poll / SSE / chunked-with-gaps path,
+# so a large slice/render streams without inter-chunk stalls), so 300s only trips
+# on a genuinely stuck upstream, never on legitimately large or slow-computed
+# transfers. ``connect``/``write``/``pool`` are short since every hop is loopback.
+_PROXY_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+
 
 def _kernel_state(health: dict) -> str:
     """Map a session child's ``/api/status`` health dict to a dashboard kernel
@@ -338,18 +348,19 @@ def build_app(
         logger.warning("web bundle not found at %s; serving API only", web_root)
         web_root = None
 
-    # One pooled client to the sidecar for the process lifetime; no timeout so
-    # large slice responses and long-poll probes are never cut off. Held in a
+    # One pooled client to the sidecar for the process lifetime. Held in a
     # closure (not ``app.state``) because the proxy runs inside a *mounted*
     # sub-app whose ``request.app`` is the sub-app, not this one -- ``app.state``
-    # would read the wrong app's state. Closed by the app lifespan below.
-    proxy_client = httpx.AsyncClient(base_url=data_web_url, timeout=None)
+    # would read the wrong app's state. Closed by the app lifespan below. The
+    # generous ``_PROXY_TIMEOUT`` (not ``None``) keeps large slice responses
+    # flowing while ensuring a wedged sidecar fails cleanly (biopb#420).
+    proxy_client = httpx.AsyncClient(base_url=data_web_url, timeout=_PROXY_TIMEOUT)
 
     # A second pooled client for the session proxy. No base_url: each session's
     # target is a *different* dynamic loopback port resolved per-request from the
     # registry, so the proxy builds absolute URLs (httpx pools connections per
     # host:port automatically). Also closed by the lifespan below.
-    session_client = httpx.AsyncClient(timeout=None)
+    session_client = httpx.AsyncClient(timeout=_PROXY_TIMEOUT)
 
     # --- control-owned endpoints (sync: they take the supervisor lock and do a
     # blocking TCP liveness probe, so Starlette runs them in its threadpool) --- #
@@ -555,7 +566,14 @@ def build_app(
         )
         try:
             resp = await proxy_client.send(upstream, stream=True)
-        except httpx.ConnectError:
+        except httpx.HTTPError as exc:
+            # Any upstream/transport failure -- refused connect, an upstream that
+            # accepts then dies mid-response (RemoteProtocolError/ReadError), or a
+            # read/connect timeout on a wedged sidecar -- is a gateway error, not a
+            # control-plane bug: surface a clean 502, never a 500 traceback
+            # (biopb#420). A failure *after* the headers stream (in aiter_raw) can't
+            # be turned into a 502 anymore, but the timeout still bounds the hang.
+            logger.info("data plane proxy to %s failed: %s", target, exc)
             return JSONResponse({"error": "data plane not reachable"}, status_code=502)
         # HTTP headers are latin-1 on the wire (RFC 9110 / ASGI). A header value
         # may carry a legitimate high byte (e.g. a non-ASCII Content-Disposition
@@ -636,7 +654,11 @@ def build_app(
         )
         try:
             resp = await session_client.send(upstream, stream=True)
-        except httpx.ConnectError:
+        except httpx.HTTPError as exc:
+            # Same as the data-plane proxy: any upstream/transport failure or
+            # timeout on a wedged session child is a clean 502, not a 500
+            # traceback (biopb#420).
+            logger.info("session proxy to %s failed: %s", target, exc)
             return JSONResponse({"error": "session not reachable"}, status_code=502)
         resp_headers = [
             (k, v)

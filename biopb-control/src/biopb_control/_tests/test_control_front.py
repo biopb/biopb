@@ -564,6 +564,57 @@ def test_unknown_upstream_returns_502(tmp_path):
         server.shutdown()
 
 
+def test_upstream_dies_mid_response_returns_502(tmp_path):
+    # An upstream that ACCEPTS the connection and then closes it without a valid
+    # HTTP response raises httpx.RemoteProtocolError, not ConnectError. The
+    # broadened catch (biopb#420) must still turn it into a clean 502, never let it
+    # escape as a 500 traceback.
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    dead_port = listener.getsockname()[1]
+
+    def _accept_then_drop():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return  # listener closed by teardown
+            with conn:
+                try:
+                    conn.recv(65536)  # consume the request, then answer nothing
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=_accept_then_drop, daemon=True)
+    thread.start()
+
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_port=_free_port(),
+        web_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1",
+        api_port,
+        sup,
+        ensure_timeout=8.0,
+        data_web_url=f"http://127.0.0.1:{dead_port}",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{api_port}/data_plane/x", timeout=5
+            )
+        assert exc.value.code == 502
+    finally:
+        listener.close()
+        server.shutdown()
+
+
 # --------------------------------------------------------------------------- #
 # Agent-client registration API (/api/agents)
 # --------------------------------------------------------------------------- #
