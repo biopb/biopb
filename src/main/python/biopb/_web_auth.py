@@ -149,3 +149,17 @@ def host_is_loopback(host_header: Optional[str]) -> bool:
     else:
         host = host_header
     return host in _LOOPBACK_HOSTS
+
+
+def host_is_public_bind(host: str) -> bool:
+    """Whether a listener *bind address* is network-reachable (not loopback-only).
+
+    Unlike :func:`host_is_loopback`, which parses a request ``Host`` header, this
+    takes a bare bind address as handed to a listener: the wildcard binds
+    (``0.0.0.0`` / ``::`` / ``""`` — all interfaces) and any real IP/hostname are
+    public; only the loopback literals are same-machine. Fail-closed — anything
+    unrecognized counts as public. The single source the control (its own
+    listener) and the tensor sidecar (``--web-host``) share to decide whether a
+    token must be enforced, so the two can't drift on what "public" means.
+    """
+    return host not in _LOOPBACK_HOSTS

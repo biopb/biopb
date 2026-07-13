@@ -5,9 +5,11 @@ The security-relevant behavior:
 - the access token is read from the ``BIOPB_TENSOR_TOKEN`` env var, not required
   on the argv, so `biopb control start` never puts the secret on a world-readable
   command line (biopb/biopb#414). The explicit ``--token`` flag is still honored;
-- ``--remote`` binds the control's own listener publicly (0.0.0.0) and is
-  fail-closed: it refuses to run without a token, so a public control API can
-  never come up unauthenticated. Local mode (the default) binds loopback.
+- a control listener that is reachable off-box is fail-closed on the *resolved
+  bind*: it refuses to run token-less whether it went public via ``--remote``, an
+  explicit ``--control-host <public>``, or ``BIOPB_CONTROL_HOST`` — so a public
+  control API can never come up unauthenticated. Local mode (loopback) binds
+  token-less.
 """
 
 from unittest.mock import patch
@@ -77,3 +79,30 @@ def test_remote_without_token_is_fail_closed():
     rc, spec, _ = _capture(_BASE_ARGV + ["--remote"], {})
     assert rc == 2
     assert spec is None  # run_control never reached
+
+
+def test_public_control_host_without_token_is_fail_closed():
+    """An explicit public --control-host (no --remote, no token) must also refuse:
+    the guard keys on the resolved bind, not on --remote, so a token-less public
+    control API -- whose /api/* gate degrades to a spoofable Host check -- can't
+    come up."""
+    rc, spec, _ = _capture(_BASE_ARGV + ["--control-host", "0.0.0.0"], {})
+    assert rc == 2
+    assert spec is None
+
+
+def test_public_control_host_via_env_without_token_is_fail_closed():
+    """Same guard catches a public bind smuggled in through BIOPB_CONTROL_HOST."""
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_CONTROL_HOST": "0.0.0.0"})
+    assert rc == 2
+    assert spec is None
+
+
+def test_public_control_host_with_token_starts():
+    """A public control bind is fine once a token is present."""
+    rc, _, kwargs = _capture(
+        _BASE_ARGV + ["--control-host", "0.0.0.0"],
+        {"BIOPB_TENSOR_TOKEN": "s3cret"},
+    )
+    assert rc == 0
+    assert kwargs["control_host"] == "0.0.0.0"

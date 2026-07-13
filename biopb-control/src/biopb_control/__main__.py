@@ -70,25 +70,33 @@ def main(argv: list[str] | None = None) -> int:
     # `python -m biopb_control run` invocation.
     token = args.token or os.environ.get("BIOPB_TENSOR_TOKEN")
 
-    # Fail-closed: remote mode binds the control's HTTP listener publicly, so it
-    # must carry a token. (`biopb control start --remote` always resolves one and
-    # exports it here; this guards a direct `python -m biopb_control run --remote`.)
-    if args.remote and not token:
-        print(
-            "biopb-control: --remote requires an access token "
-            "(set BIOPB_TENSOR_TOKEN or pass --token).",
-            file=sys.stderr,
-        )
-        return 2
-
     # Defaults for the control endpoint come from the shared core-SDK module so a
     # bare `python -m biopb_control run` and the CLI agree on 8813. Remote mode
-    # binds all interfaces so the browser UI is reachable off-box.
+    # binds all interfaces so the browser UI is reachable off-box; an explicit
+    # --control-host (or BIOPB_CONTROL_HOST) can also make it public.
+    from biopb import _web_auth
     from biopb._config_control import control_host, control_port
 
     resolved_control_host = args.control_host or (
         "0.0.0.0" if args.remote else control_host()
     )
+
+    # Fail-closed: a control listener reachable off-box MUST carry a token. Without
+    # one, its /api/* gate falls back to only a loopback-`Host` check, which a
+    # non-browser client trivially spoofs (`Host: 127.0.0.1`) to drive the
+    # stop/restart/session verbs. Key the guard on the *resolved bind*, not on
+    # `--remote`: an explicit public `--control-host` (or BIOPB_CONTROL_HOST) is
+    # just as exposed. `--remote` is kept as a belt-and-suspenders trigger so it is
+    # never accepted token-less even if paired with a loopback --control-host.
+    control_is_public = _web_auth.host_is_public_bind(resolved_control_host)
+    if not token and (args.remote or control_is_public):
+        print(
+            "biopb-control: a network-reachable control bind requires an access "
+            "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --control-host to "
+            "loopback (127.0.0.1) for a tokenless local deployment.",
+            file=sys.stderr,
+        )
+        return 2
 
     spec = DataPlaneSpec(
         config=Path(args.config),
