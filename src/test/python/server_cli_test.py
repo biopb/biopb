@@ -831,6 +831,50 @@ class TestControlStatus:
             assert cmd in res.output
 
 
+class TestControlRunArgv:
+    """`_control_run_argv` must never put the access token on the child command
+    line -- a process command line is world-readable via `ps` / Task Manager,
+    which leaks the secret on exactly the multi-user hosts it protects
+    (biopb/biopb#414). The token travels via BIOPB_TENSOR_TOKEN in the env."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_helpers(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            cli, "_resolve_grpc_hostport", lambda _c: ("127.0.0.1", 8815)
+        )
+        monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
+        monkeypatch.setattr(
+            cli, "_get_log_file", lambda: tmp_path / "tensor-server.log"
+        )
+        monkeypatch.setattr(
+            cli, "_control_shutdown_sentinel", lambda: tmp_path / "control.stop"
+        )
+
+    def _argv(self, tmp_path, *, local_bypass):
+        return cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="0.0.0.0",
+            web_port=8814,
+            log_level="INFO",
+            data_plane=True,
+            local_bypass=local_bypass,
+        )
+
+    def test_token_never_on_argv(self, tmp_path):
+        argv = self._argv(tmp_path, local_bypass=False)
+        assert "--token" not in argv
+        # And no generated-looking secret slipped in as a bare positional.
+        assert not any("BIOPB_TENSOR_TOKEN" in a for a in argv)
+
+    def test_local_bypass_still_signalled_on_argv(self, tmp_path):
+        # --local-bypass is not a secret, so it stays explicit on the argv.
+        assert "--local-bypass" in self._argv(tmp_path, local_bypass=True)
+
+    def test_no_bypass_flag_when_token_enforced(self, tmp_path):
+        assert "--local-bypass" not in self._argv(tmp_path, local_bypass=False)
+
+
 class TestMcpLogs:
     """`mcp logs` reads ~/.local/share/biopb-mcp/log/mcp-server.log."""
 
