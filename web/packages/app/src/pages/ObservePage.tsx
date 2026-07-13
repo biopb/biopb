@@ -6,6 +6,7 @@ import {
   useState,
 } from "react";
 import { useParams } from "react-router-dom";
+import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 // Per-session observe UI, ported from the buildless _OBSERVE_HTML that each MCP
 // session child used to serve at /observe. The child now serves only /api/*; the
@@ -41,6 +42,9 @@ async function jpost(url: string): Promise<{ [k: string]: unknown }> {
 export default function ObservePage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const base = `/session/${sessionId}`;
+  useDocumentTitle(
+    `BioPB mcp - observe${sessionId ? ` · ${sessionId}` : ""}`,
+  );
 
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
   const [details, setDetails] = useState<Record<string, JobDetail>>({});
@@ -226,7 +230,13 @@ export default function ObservePage() {
   return (
     <div className="obs-page">
       <header>
-        <h1>biopb-mcp · observe</h1>
+        <img
+          className="topbar-logo"
+          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          alt=""
+          aria-hidden="true"
+        />
+        <h1>BioPB mcp - observe</h1>
         <span id="status">{status}</span>
         <button className="primary" onClick={saveNotebook}>
           ⤓ Save notebook

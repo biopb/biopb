@@ -17,6 +17,7 @@ import { AdvancedSections } from "../components/AdvancedSections";
 import { CredentialsEditor } from "../components/CredentialsEditor";
 import { Modal } from "../components/Modal";
 import { AdvancedJsonModal } from "../components/AdvancedJsonModal";
+import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 type Config = Record<string, unknown>;
 
@@ -39,6 +40,7 @@ function formatUptime(seconds: number | null): string {
 }
 
 export function AdminPage() {
+  useDocumentTitle("BioPB tensor - admin");
   const client = useAppStore((s) => s.client);
   const connectionState = useAppStore((s) => s.connectionState);
   const clearSession = useAppStore((s) => s.clearSession);
@@ -318,7 +320,7 @@ export function AdminPage() {
           alt=""
           aria-hidden="true"
         />
-        <h1>BioPB · Admin</h1>
+        <h1>BioPB tensor - admin</h1>
         <span className={`status-pill ${pill.cls}`}>{pill.text}</span>
         <div className="topbar-spacer" />
         <button
