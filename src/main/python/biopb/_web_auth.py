@@ -13,9 +13,10 @@ Starlette middleware, an MCP route wrapper).
 Kept **stdlib-only** (like ``_config_control`` / ``_config_sessions`` / ``_proc``)
 so importing it never drags a web framework into the SDK/CLI/client import path.
 
-The decisions mirror the tensor sidecar's existing ``check_token`` /
-``_require_same_origin`` so a later behavior-preserving refactor can fold that
-copy onto these predicates without changing what it accepts.
+The control binds these as a Starlette middleware and the tensor sidecar as
+FastAPI dependencies (``check_token`` / ``_require_same_origin`` / the render-WS
+guard), so the two are provably in agreement rather than carrying copies that can
+drift.
 """
 
 from __future__ import annotations
@@ -59,6 +60,24 @@ def token_valid(get: HeaderGetter, expected: Optional[str]) -> bool:
     if not expected:
         return True
     provided = extract_bearer(get)
+    return secrets.compare_digest(provided.encode(), expected.encode())
+
+
+def token_valid_with_query(
+    get: HeaderGetter, query_get: HeaderGetter, expected: Optional[str]
+) -> bool:
+    """Like :func:`token_valid`, but also accepts the token from a ``token``
+    query parameter when no header carries it.
+
+    Browsers cannot set request headers on a WebSocket handshake, so the token
+    arrives as ``?token=<t>``; header schemes still take precedence. ``query_get``
+    is a getter over the query params (e.g. Starlette ``ws.query_params.get``).
+    Mirrors the sidecar's ``_ws_authorized`` and the control's render-WS proxy,
+    both of which pass the token this way.
+    """
+    if not expected:
+        return True
+    provided = extract_bearer(get) or (query_get("token") or "")
     return secrets.compare_digest(provided.encode(), expected.encode())
 
 
