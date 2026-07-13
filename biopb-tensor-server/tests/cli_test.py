@@ -2,8 +2,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import biopb_tensor_server.cli as cli
+import pytest
+import typer
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import CacheConfig
+
+_VALID_TOKEN = "a" * 32  # 32 URL-safe chars: passes _web_auth.valid_token
 
 
 class _FakeServer:
@@ -129,6 +133,65 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     cli.serve(config=Path("unused.toml"))
 
     assert not lock_path.exists()
+
+
+class TestResolveLaunchToken:
+    """`launch`'s token decision is fail-closed on every public listener.
+
+    The flight bind (server.host) is the mode switch; the sidecar's own bind
+    (--web-host) must never be public *and* unauthenticated (biopb/biopb#424
+    follow-up: the ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun).
+    """
+
+    def test_local_mode_is_tokenless(self):
+        # Loopback flight + loopback sidecar + no token supplied → local mode.
+        assert cli._resolve_launch_token("127.0.0.1", "127.0.0.1", None, "") is None
+
+    def test_public_flight_autogenerates_token(self):
+        # Public flight bind with no token supplied → auto-generate (not open).
+        tok = cli._resolve_launch_token("0.0.0.0", "0.0.0.0", None, "")
+        assert tok and cli._web_auth.valid_token(tok)
+
+    def test_supplied_token_is_honored(self):
+        assert (
+            cli._resolve_launch_token("0.0.0.0", "0.0.0.0", _VALID_TOKEN, "")
+            == _VALID_TOKEN
+        )
+
+    def test_env_token_is_honored(self):
+        assert (
+            cli._resolve_launch_token("0.0.0.0", "127.0.0.1", None, _VALID_TOKEN)
+            == _VALID_TOKEN
+        )
+
+    def test_public_sidecar_loopback_flight_no_token_is_forbidden(self):
+        # The reported hole: a public HTTP sidecar with a loopback flight bind
+        # resolves to no token → would serve the data API unauthenticated. Refuse.
+        with pytest.raises(typer.Exit) as exc:
+            cli._resolve_launch_token("127.0.0.1", "0.0.0.0", None, "")
+        assert exc.value.exit_code == 1
+
+    def test_public_sidecar_allowed_when_token_supplied(self):
+        # A public sidecar is fine once a token is enforced across both listeners.
+        assert (
+            cli._resolve_launch_token("127.0.0.1", "0.0.0.0", _VALID_TOKEN, "")
+            == _VALID_TOKEN
+        )
+
+    def test_public_flight_and_sidecar_is_authenticated(self):
+        # Public flight auto-generates a token, so a co-public sidecar is covered.
+        tok = cli._resolve_launch_token("0.0.0.0", "0.0.0.0", None, "")
+        assert tok and cli._web_auth.valid_token(tok)
+
+    def test_empty_web_host_counts_as_public(self):
+        # An empty bind address means "all interfaces" — treat it as public.
+        with pytest.raises(typer.Exit):
+            cli._resolve_launch_token("127.0.0.1", "", None, "")
+
+    def test_malformed_supplied_token_falls_through_to_mode(self):
+        # A too-short --token is not a usable token; on a loopback flight bind it
+        # falls through to local mode (tokenless), not a silent accept.
+        assert cli._resolve_launch_token("127.0.0.1", "127.0.0.1", "short", "") is None
 
 
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):

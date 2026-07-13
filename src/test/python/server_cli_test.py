@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
 import pytest
+import typer
 from typer.testing import CliRunner
 
 
@@ -850,29 +851,88 @@ class TestControlRunArgv:
             cli, "_control_shutdown_sentinel", lambda: tmp_path / "control.stop"
         )
 
-    def _argv(self, tmp_path, *, local_bypass):
+    def _argv(self, tmp_path, *, remote):
         return cli._control_run_argv(
             config=tmp_path / "biopb.json",
             static_dir=None,
-            web_host="0.0.0.0",
+            web_host="127.0.0.1",
             web_port=8814,
             log_level="INFO",
             data_plane=True,
-            local_bypass=local_bypass,
+            remote=remote,
         )
 
     def test_token_never_on_argv(self, tmp_path):
-        argv = self._argv(tmp_path, local_bypass=False)
+        argv = self._argv(tmp_path, remote=True)
         assert "--token" not in argv
         # And no generated-looking secret slipped in as a bare positional.
         assert not any("BIOPB_TENSOR_TOKEN" in a for a in argv)
 
-    def test_local_bypass_still_signalled_on_argv(self, tmp_path):
-        # --local-bypass is not a secret, so it stays explicit on the argv.
-        assert "--local-bypass" in self._argv(tmp_path, local_bypass=True)
+    def test_remote_signalled_on_argv_and_binds_control_public(self, tmp_path):
+        # --remote is not a secret, so it stays explicit on the argv; it also
+        # flips the control's own listener to a public bind.
+        argv = self._argv(tmp_path, remote=True)
+        assert "--remote" in argv
+        assert argv[argv.index("--control-host") + 1] == "0.0.0.0"
 
-    def test_no_bypass_flag_when_token_enforced(self, tmp_path):
-        assert "--local-bypass" not in self._argv(tmp_path, local_bypass=False)
+    def test_local_mode_has_no_remote_flag_and_loopback_control(self, tmp_path):
+        argv = self._argv(tmp_path, remote=False)
+        assert "--remote" not in argv
+        assert argv[argv.index("--control-host") + 1] == "127.0.0.1"
+
+
+class TestResolveMode:
+    """`_resolve_mode` is the single fail-closed rule tying the token to the
+    deployment mode (the security-model simplification): local = tokenless +
+    loopback-only; remote = public + token required."""
+
+    @pytest.fixture(autouse=True)
+    def _loopback_flight(self, monkeypatch):
+        # Default the flight bind to loopback; individual tests override.
+        monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "127.0.0.1")
+
+    def test_local_loopback_is_tokenless(self, tmp_path):
+        assert cli._resolve_mode(tmp_path / "c.json", remote=False, token=None) is None
+
+    def test_local_rejects_explicit_token(self, tmp_path):
+        # A token only makes sense in remote mode; local + --token is a usage error.
+        with pytest.raises(typer.Exit):
+            cli._resolve_mode(tmp_path / "c.json", remote=False, token="abc123")
+
+    def test_local_refuses_public_flight_bind(self, tmp_path, monkeypatch):
+        # Fail-closed: a config that binds the flight server publicly must not run
+        # tokenless. This is the guard that makes "public + open" unrepresentable.
+        monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "0.0.0.0")
+        with pytest.raises(typer.Exit):
+            cli._resolve_mode(tmp_path / "c.json", remote=False, token=None)
+
+    def test_remote_uses_supplied_token(self, tmp_path):
+        assert (
+            cli._resolve_mode(
+                tmp_path / "c.json", remote=True, token="supplied-token-0123"
+            )
+            == "supplied-token-0123"
+        )
+
+    def test_remote_reads_env_token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token-0123456789")
+        assert (
+            cli._resolve_mode(tmp_path / "c.json", remote=True, token=None)
+            == "env-token-0123456789"
+        )
+
+    def test_remote_rejects_malformed_token(self, tmp_path):
+        # Validated with the shared `_web_auth.valid_token` rule the tensor
+        # `launch` also applies, so the layers can't drift: a too-short (or
+        # non-URL-safe) token is refused here rather than silently regenerated
+        # downstream, which would leave the browser holding a rejected token.
+        with pytest.raises(typer.Exit):
+            cli._resolve_mode(tmp_path / "c.json", remote=True, token="too-short")
+
+    def test_remote_generates_token_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+        tok = cli._resolve_mode(tmp_path / "c.json", remote=True, token=None)
+        assert tok and len(tok) >= 16
 
 
 class TestMcpLogs:

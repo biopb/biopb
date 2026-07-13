@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import typer
+from biopb import _web_auth
 from rich.console import Console
 from rich.table import Table
 
@@ -51,6 +52,69 @@ logger = logging.getLogger(__name__)
 
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
+
+# The bind address is the mode: a loopback bind is reachable same-machine only
+# (local mode); anything else is network-reachable. The wildcard binds
+# (``0.0.0.0`` / ``::`` / ``""``) and any real IP/hostname are public, so they are
+# *not* in this set and are treated as public — fail-closed.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_is_public(host: str) -> bool:
+    """True if ``host`` is a network-reachable bind address (not loopback)."""
+    return host not in _LOOPBACK_HOSTS
+
+
+def _resolve_launch_token(
+    server_host: str,
+    web_host: str,
+    token: Optional[str],
+    env_token: str,
+) -> Optional[str]:
+    """Decide the token ``launch`` enforces, fail-closed on every public listener.
+
+    The flight bind (config ``server.host``) is the single mode switch: a loopback
+    bind is **local mode** (tokenless); any public bind is **remote mode** and MUST
+    carry a token, so a public bind with none supplied auto-generates one rather
+    than serving data open.
+
+    The HTTP sidecar has its own, independent bind (``--web-host``). Because it
+    re-exposes the whole data API, a **public sidecar with no enforced token** is
+    exactly the "public + unauthenticated" combination the model makes
+    unrepresentable — so it is refused rather than served open. (This is the
+    ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the token would
+    otherwise resolve to ``None`` and the data API would bind public and open.)
+
+    Returns the effective token (``None`` = local mode). Raises ``typer.Exit(1)``
+    if the sidecar would bind public without a token.
+    """
+    if token and _web_auth.valid_token(token):
+        effective_token: Optional[str] = token.strip()
+    elif env_token and _web_auth.valid_token(env_token):
+        effective_token = env_token.strip()
+    elif _host_is_public(server_host):
+        effective_token = secrets.token_urlsafe(32)
+        console.print(
+            "[yellow]Auto-generated secure access token "
+            f"(server.host={server_host} is a public bind).[/yellow]"
+        )
+    else:
+        # Loopback flight bind, no token supplied: local mode. Every listener is
+        # same-machine only, so no token is enforced.
+        effective_token = None
+
+    if effective_token is None and _host_is_public(web_host):
+        console.print(
+            "[red]Refusing to bind the HTTP sidecar to a public address "
+            f"(--web-host {web_host}) with no access token.[/red]\n"
+            "The sidecar re-exposes the data API, so this would serve it "
+            "unauthenticated to the network. Either bind it to loopback "
+            "(--web-host 127.0.0.1), or make the flight server public "
+            "(server.host) so a token is enforced across both listeners."
+        )
+        raise typer.Exit(1)
+
+    return effective_token
 
 
 def _install_sigterm_handler() -> None:
@@ -822,13 +886,9 @@ def launch(
     token: Optional[str] = typer.Option(
         None,
         "--token",
-        help="Website access token (generated if blank)",
+        help="Access token (required when server.host is non-loopback; "
+        "auto-generated if blank on a public bind)",
         hide_input=True,
-    ),
-    dev_mode: bool = typer.Option(
-        False,
-        "--dev",
-        help="Enable dev mode (skips token check, localhost only)",
     ),
     open_browser: bool = typer.Option(
         False,
@@ -862,11 +922,9 @@ def launch(
 
     Example:
         biopb-tensor-server launch --config biopb-tensor.toml
-        biopb-tensor-server launch -c config.toml --web-port 9000 --dev
+        biopb-tensor-server launch -c config.toml --web-port 9000
         biopb-tensor-server launch -c config.toml --log-level DEBUG
     """
-    import re as _re
-
     # --- Load server config and setup logging ---
     server_config = load_config(config)
 
@@ -878,61 +936,19 @@ def launch(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
 
-    # --- Determine dev mode ---
-    env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
-    effective_dev_mode = dev_mode or env_dev
-
-    # Enforce: bypass only on localhost
-    if effective_dev_mode and web_host not in ("127.0.0.1", "localhost", "::1"):
-        console.print(
-            "[bold red]SECURITY WARNING:[/bold red] "
-            "BIOPB_WEB_DEV_BYPASS ignored because host is non-local; "
-            "website token enforcement remains enabled."
-        )
-        effective_dev_mode = False
-
     # --- Token management ---
-    def _valid_token(t: str) -> bool:
-        t = t.strip()
-        return bool(t) and 16 <= len(t) <= 128 and _re.fullmatch(r"[A-Za-z0-9_\-]+", t)
+    # The flight bind (server.host) is the mode switch; the sidecar's own bind
+    # (--web-host) must never be public-and-unauthenticated. _resolve_launch_token
+    # decides the enforced token fail-closed (and refuses a public sidecar with no
+    # token). There is no separate dev flag.
+    effective_token = _resolve_launch_token(
+        server_config.host,
+        web_host,
+        token,
+        os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+    )
 
-    if effective_dev_mode:
-        effective_token = None
-        console.print(
-            "[yellow]DEV MODE: Website token bypass is active (localhost only).[/yellow]"
-        )
-    else:
-        env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
-        if token and _valid_token(token):
-            effective_token = token.strip()
-        elif env_token and _valid_token(env_token):
-            effective_token = env_token.strip()
-        else:
-            # Prompt up to 3 times, then auto-generate
-            effective_token = None
-            for attempt in range(3):
-                try:
-                    entered = typer.prompt(
-                        "Enter website access token (leave blank to auto-generate)",
-                        default="",
-                        hide_input=True,
-                    )
-                except Exception:
-                    break
-                entered = entered.strip()
-                if not entered:
-                    break
-                if _valid_token(entered):
-                    effective_token = entered
-                    break
-                console.print(
-                    f"[red]Invalid token (attempt {attempt + 1}/3): "
-                    "must be 16-128 URL-safe characters [A-Za-z0-9_-][/red]"
-                )
-            if effective_token is None:
-                effective_token = secrets.token_urlsafe(32)
-                console.print("[yellow]Auto-generated secure access token.[/yellow]")
-
+    if effective_token is not None:
         console.print(
             "\n[bold green]Access URL (shown once — do not share):[/bold green]"
         )
@@ -946,6 +962,10 @@ def launch(
             markup=False,
         )
         console.print()
+    else:
+        console.print(
+            "[yellow]Local mode: no access token (loopback-only bind).[/yellow]"
+        )
 
     # --- Start Flight server ---
     flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
@@ -1016,7 +1036,6 @@ def launch(
         run_http_server(
             flight_location=flight_location,
             token=effective_token,
-            dev_mode=effective_dev_mode,
             host=web_host,
             port=web_port,
             cors_origins=effective_cors,

@@ -21,6 +21,7 @@ drift.
 
 from __future__ import annotations
 
+import re
 import secrets
 from typing import Callable, Optional
 
@@ -28,7 +29,7 @@ from typing import Callable, Optional
 # only coupling to the caller's framework, so these predicates stay pure.
 HeaderGetter = Callable[[str], Optional[str]]
 
-# Hosts honored when no token is configured (the loopback dev-bypass mode). Any
+# Hosts honored when no token is configured (local mode, loopback-only). Any
 # port is allowed; only the host part is checked.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -51,9 +52,9 @@ def extract_bearer(get: HeaderGetter) -> str:
 def token_valid(get: HeaderGetter, expected: Optional[str]) -> bool:
     """Timing-safe check that the request carries ``expected``.
 
-    A falsy ``expected`` (no token configured — the all-localhost dev-bypass
-    case) means "no token is enforced" and returns ``True``, matching the
-    sidecar's ``dev_mode or self.token is None`` path. Callers that want a
+    A falsy ``expected`` (no token configured — local mode, where every listener
+    is loopback-bound) means "no token is enforced" and returns ``True``,
+    matching the sidecar's ``self.token is None`` path. Callers that want a
     loopback backstop for that no-token case apply :func:`host_is_loopback`
     themselves.
     """
@@ -79,6 +80,32 @@ def token_valid_with_query(
         return True
     provided = extract_bearer(get) or (query_get("token") or "")
     return secrets.compare_digest(provided.encode(), expected.encode())
+
+
+_TOKEN_CHARS = re.compile(r"[A-Za-z0-9_\-]+")
+_TOKEN_MIN_LEN = 16
+_TOKEN_MAX_LEN = 128
+
+
+def valid_token(token: Optional[str]) -> bool:
+    """Whether ``token`` is a well-formed access token.
+
+    The single shared rule for what counts as a *usable* token — 16–128 URL-safe
+    characters (``[A-Za-z0-9_-]``), surrounding whitespace ignored. The tensor
+    ``launch`` and the control's ``_resolve_mode`` both apply it so the two layers
+    cannot disagree on whether a supplied token is acceptable: without a shared
+    rule, one layer could enforce a ``--token`` the other rejects and silently
+    regenerates, leaving the browser holding a token the data plane no longer
+    accepts. This is a *shape* check on a locally-supplied secret, not a
+    timing-sensitive comparison against a request (that is :func:`token_valid`),
+    so a plain ``fullmatch`` is fine.
+    """
+    if not token:
+        return False
+    token = token.strip()
+    return _TOKEN_MIN_LEN <= len(token) <= _TOKEN_MAX_LEN and bool(
+        _TOKEN_CHARS.fullmatch(token)
+    )
 
 
 def has_token_header(get: HeaderGetter) -> bool:
@@ -122,3 +149,17 @@ def host_is_loopback(host_header: Optional[str]) -> bool:
     else:
         host = host_header
     return host in _LOOPBACK_HOSTS
+
+
+def host_is_public_bind(host: str) -> bool:
+    """Whether a listener *bind address* is network-reachable (not loopback-only).
+
+    Unlike :func:`host_is_loopback`, which parses a request ``Host`` header, this
+    takes a bare bind address as handed to a listener: the wildcard binds
+    (``0.0.0.0`` / ``::`` / ``""`` — all interfaces) and any real IP/hostname are
+    public; only the loopback literals are same-machine. Fail-closed — anything
+    unrecognized counts as public. The single source the control (its own
+    listener) and the tensor sidecar (``--web-host``) share to decide whether a
+    token must be enforced, so the two can't drift on what "public" means.
+    """
+    return host not in _LOOPBACK_HOSTS

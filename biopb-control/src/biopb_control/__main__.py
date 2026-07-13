@@ -40,9 +40,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "a command line is world-readable via `ps`)",
     )
     run.add_argument(
-        "--local-bypass",
+        "--remote",
         action="store_true",
-        help="all-localhost, no token: set BIOPB_WEB_DEV_BYPASS in the child",
+        help="serve on the network behind a token: bind the control listener "
+        "publicly (0.0.0.0) and require a token. Without it the control binds "
+        "loopback and runs tokenless.",
     )
     run.add_argument(
         "--no-data-plane",
@@ -69,8 +71,32 @@ def main(argv: list[str] | None = None) -> int:
     token = args.token or os.environ.get("BIOPB_TENSOR_TOKEN")
 
     # Defaults for the control endpoint come from the shared core-SDK module so a
-    # bare `python -m biopb_control run` and the CLI agree on 8813.
+    # bare `python -m biopb_control run` and the CLI agree on 8813. Remote mode
+    # binds all interfaces so the browser UI is reachable off-box; an explicit
+    # --control-host (or BIOPB_CONTROL_HOST) can also make it public.
+    from biopb import _web_auth
     from biopb._config_control import control_host, control_port
+
+    resolved_control_host = args.control_host or (
+        "0.0.0.0" if args.remote else control_host()
+    )
+
+    # Fail-closed: a control listener reachable off-box MUST carry a token. Without
+    # one, its /api/* gate falls back to only a loopback-`Host` check, which a
+    # non-browser client trivially spoofs (`Host: 127.0.0.1`) to drive the
+    # stop/restart/session verbs. Key the guard on the *resolved bind*, not on
+    # `--remote`: an explicit public `--control-host` (or BIOPB_CONTROL_HOST) is
+    # just as exposed. `--remote` is kept as a belt-and-suspenders trigger so it is
+    # never accepted token-less even if paired with a loopback --control-host.
+    control_is_public = _web_auth.host_is_public_bind(resolved_control_host)
+    if not token and (args.remote or control_is_public):
+        print(
+            "biopb-control: a network-reachable control bind requires an access "
+            "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --control-host to "
+            "loopback (127.0.0.1) for a tokenless local deployment.",
+            file=sys.stderr,
+        )
+        return 2
 
     spec = DataPlaneSpec(
         config=Path(args.config),
@@ -82,11 +108,10 @@ def main(argv: list[str] | None = None) -> int:
         log_level=args.log_level,
         server_log=Path(args.server_log) if args.server_log else None,
         token=token,
-        local_bypass=args.local_bypass,
     )
     return run_control(
         spec,
-        control_host=args.control_host or control_host(),
+        control_host=resolved_control_host,
         control_port=args.control_port or control_port(),
         data_plane=args.data_plane,
         ensure_timeout=args.ensure_timeout,

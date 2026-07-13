@@ -333,7 +333,6 @@ class _SidecarContext:
         self,
         flight_location: str,
         token: Optional[str],
-        dev_mode: bool,
         cache_bytes: int,
         config_path: Optional[str] = None,
         web_host: Optional[str] = None,
@@ -341,7 +340,6 @@ class _SidecarContext:
     ) -> None:
         self.flight_location = flight_location
         self.token = token
-        self.dev_mode = dev_mode
         self.cache_bytes = cache_bytes
         # Admin-route config: the config file this daemon was launched with and
         # the bind args echoed into a self-restart so it comes back identically
@@ -388,10 +386,11 @@ class _SidecarContext:
         """Raise 401 if the request does not carry a valid token.
 
         Delegates the token decision to the shared ``biopb._web_auth`` policy
-        (the single source the control uses too). Dev mode / no configured token
-        is the "no token enforced" case, expressed as a falsy ``expected``.
+        (the single source the control uses too). A ``None`` token — local mode,
+        where every listener is loopback-bound — is the "no token enforced" case,
+        expressed as a falsy ``expected``.
         """
-        expected = None if self.dev_mode else self.token
+        expected = self.token
         if not _web_auth.token_valid(request.headers.get, expected):
             raise HTTPException(status_code=401, detail="Invalid or missing token")
 
@@ -523,7 +522,7 @@ async def readyz(request: Request) -> JSONResponse:
             "status": "ok" if ready else "degraded",
             "timestamp": _now_rfc3339(),
             "ready": ready,
-            "dev_mode": ctx.dev_mode,
+            "dev_mode": ctx.token is None,
             "service": _SERVICE,
             "version": _VERSION,
             "backend_health": backend_health,
@@ -558,7 +557,7 @@ async def diagnostics(request: Request) -> JSONResponse:
         info = client.cache_info()
         ctx.diag.cache_hits = info.get("hits", ctx.diag.cache_hits)
         ctx.diag.cache_misses = info.get("misses", ctx.diag.cache_misses)
-    return JSONResponse(ctx.diag.snapshot(dev_mode=ctx.dev_mode))
+    return JSONResponse(ctx.diag.snapshot(dev_mode=ctx.token is None))
 
 
 # -- Sources ----------------------------------------------------------------
@@ -971,10 +970,10 @@ def _ws_authorized(websocket: WebSocket, ctx: _SidecarContext) -> bool:
     """Validate the websocket token from headers or the ``token`` query param.
 
     Browsers can't set custom headers on a WebSocket handshake, so the shared
-    ``biopb._web_auth`` policy accepts the ``?token=`` fallback here; dev mode /
-    no configured token is the falsy-``expected`` bypass.
+    ``biopb._web_auth`` policy accepts the ``?token=`` fallback here; a ``None``
+    token (local mode) is the falsy-``expected`` bypass.
     """
-    expected = None if ctx.dev_mode else ctx.token
+    expected = ctx.token
     return _web_auth.token_valid_with_query(
         websocket.headers.get, websocket.query_params.get, expected
     )
@@ -1353,8 +1352,6 @@ async def admin_restart(request: Request) -> JSONResponse:
     env = dict(os.environ)
     if ctx.token:
         env["BIOPB_TENSOR_TOKEN"] = ctx.token
-    elif ctx.dev_mode:
-        env["BIOPB_WEB_DEV_BYPASS"] = "1"
 
     # Detach so the child outlives this dying parent: `restart` SIGTERMs us,
     # waits for the port to free, then relaunches a fresh daemon.
@@ -1375,7 +1372,6 @@ async def admin_restart(request: Request) -> JSONResponse:
 def create_app(
     flight_location: str = "grpc://localhost:8815",
     token: Optional[str] = None,
-    dev_mode: bool = False,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
@@ -1393,8 +1389,8 @@ def create_app(
 
     Args:
         flight_location: Arrow Flight server to connect to.
-        token: Shared secret token. ``None`` disables auth (only in dev_mode).
-        dev_mode: Whether the website token bypass is active.
+        token: Shared secret token. ``None`` disables auth (local mode, where
+            every listener is loopback-bound).
         cache_bytes: Bytes for the in-process chunk cache.
         cors_origins: Allowed CORS origins. Defaults to localhost variants.
         config_path: Path to the config file this daemon was launched with. The
@@ -1417,7 +1413,6 @@ def create_app(
     app.state.sidecar = _SidecarContext(
         flight_location=flight_location,
         token=token,
-        dev_mode=dev_mode,
         cache_bytes=cache_bytes,
         config_path=config_path,
         web_host=web_host,
@@ -1548,7 +1543,6 @@ def _install_windows_shutdown_listener(server) -> None:
 def run(
     flight_location: str = "grpc://localhost:8815",
     token: Optional[str] = None,
-    dev_mode: bool = False,
     host: str = "127.0.0.1",
     port: int = 8816,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
@@ -1561,7 +1555,6 @@ def run(
     app = create_app(
         flight_location=flight_location,
         token=token,
-        dev_mode=dev_mode,
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
         config_path=config_path,

@@ -90,7 +90,7 @@ def auth_client():
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
-        app = create_app(token=_TOKEN, dev_mode=False)
+        app = create_app(token=_TOKEN)
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, mock_fc
 
@@ -103,7 +103,7 @@ def dev_client():
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
-        app = create_app(token=None, dev_mode=True)
+        app = create_app(token=None)
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, mock_fc
 
@@ -325,7 +325,7 @@ class TestSliceEndpoint:
             "biopb_tensor_server.serving.http_server.TensorFlightClient",
             return_value=mock_fc,
         ):
-            app = create_app(token=_TOKEN, dev_mode=False)
+            app = create_app(token=_TOKEN)
             with TestClient(app, raise_server_exceptions=True) as tc:
                 r = tc.post(
                     "/api/slice",
@@ -685,7 +685,6 @@ class TestIntegration:
         app = create_app(
             flight_location=self._flight_loc,
             token=_TOKEN,
-            dev_mode=False,
         )
         return TestClient(app, raise_server_exceptions=True)
 
@@ -893,7 +892,6 @@ def admin_client(tmp_path):
     ):
         app = create_app(
             token=None,
-            dev_mode=True,
             config_path=str(config_path),
             web_host="127.0.0.1",
             web_port=8814,
@@ -1048,7 +1046,6 @@ def admin_client_with_creds(tmp_path):
     ):
         app = create_app(
             token=None,
-            dev_mode=True,
             config_path=str(config_path),
             web_host="127.0.0.1",
             web_port=8814,
@@ -1120,8 +1117,9 @@ class TestAdminRestartRoute:
         assert cmd[cmd.index("--web-port") + 1] == "8814"
         assert cmd[cmd.index("--web-host") + 1] == "127.0.0.1"
         assert "--config" in cmd
-        # dev-bypass token rides the child env (never the command line).
-        assert popen.call_args.kwargs["env"].get("BIOPB_WEB_DEV_BYPASS") == "1"
+        # Local mode (no token): no bypass signal rides the child env (the flag is
+        # gone), and nothing BIOPB* leaks onto the world-readable command line.
+        assert "BIOPB_WEB_DEV_BYPASS" not in popen.call_args.kwargs["env"]
         assert not any(str(arg).startswith("BIOPB") for arg in cmd)
 
     def test_restart_blocks_cross_origin(self, admin_client):

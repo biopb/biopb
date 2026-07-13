@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import {
+  authHeaders,
+  authRequired,
+  captureUrlToken,
+  getToken,
+  redirectToUnlock,
+} from "../auth";
 
 // The control's own root dashboard, ported from the buildless _DASHBOARD_HTML
 // that _control.py used to serve. Talks to the control's own token-gated /api/*
@@ -41,26 +48,20 @@ interface AlgoRec {
   error?: string;
 }
 
-// The control's /api/* is token-gated at this single origin. Reuse the
-// dataviewer's sessionStorage token ('biopb_token') as a Bearer header; on a 401,
-// prompt once and retry. In the common no-token localhost deployment the header
-// is simply absent.
+// The control's /api/* is token-gated at this single origin. Attach the stored
+// token ('biopb_token') as a Bearer header via the shared auth helper; in the
+// common local deployment there is no token and the header is simply absent. A
+// 401 means remote mode with a missing/stale token, so bounce to /unlock.
 async function fetchAuth(
   url: string,
-  opts: RequestInit & { _retried?: boolean } = {},
+  opts: RequestInit = {},
 ): Promise<Response> {
-  const t = sessionStorage.getItem("biopb_token");
-  opts.headers = {
-    ...(opts.headers || {}),
-    ...(t ? { Authorization: "Bearer " + t } : {}),
-  };
-  const r = await fetch(url, opts);
-  if (r.status === 401 && !opts._retried) {
-    const nt = prompt("Access token required:");
-    if (nt) {
-      sessionStorage.setItem("biopb_token", nt);
-      return fetchAuth(url, { ...opts, _retried: true });
-    }
+  const r = await fetch(url, {
+    ...opts,
+    headers: authHeaders(opts.headers as Record<string, string> | undefined),
+  });
+  if (r.status === 401) {
+    redirectToUnlock();
   }
   return r;
 }
@@ -118,6 +119,20 @@ export default function DashboardPage() {
       setAlgos((data && data.servers) || []);
     } catch {
       /* keep last */
+    }
+  }, []);
+
+  // Mode-driven unlock gate. Capture a ?token= handed over by the one-time
+  // access URL, then — only in remote mode, where the control's public /health
+  // advertises auth_required — bounce to /unlock if we still have no token. Local
+  // mode advertises auth_required=false, so this never redirects. The /api/*
+  // fetchAuth 401 path is the backstop for a stale/invalid token.
+  useEffect(() => {
+    captureUrlToken();
+    if (!getToken()) {
+      authRequired().then((req) => {
+        if (req && !getToken()) redirectToUnlock();
+      });
     }
   }, []);
 

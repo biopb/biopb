@@ -41,6 +41,22 @@ trusted intranet. Hardening for untrusted networks (TLS, authn/z, k8s) is
 expected to be handled by a separately-documented reverse proxy in front of the
 services, so the services themselves stay simple.
 
+**Two deployment modes, nothing in between** (the deliberately-small security
+surface). `biopb control start` runs **local mode** by default: every listener
+(control 8813, tensor HTTP sidecar 8814, flight gRPC 8815) binds loopback and no
+token is used — the single-machine 90% case, no unlock step. `biopb control
+start --remote` runs **remote mode**: the control's browser UI *and* the flight
+server bind publicly behind a **required** token (supplied via `--token` /
+`BIOPB_TENSOR_TOKEN`, else generated and printed), the sidecar stays on loopback
+(the control proxies it), and the browser UI gates itself behind an unlock page
+(driven by the control's public `GET /health` → `auth_required`). The bind
+address *is* the mode: it is **fail-closed** — local mode refuses to start if the
+config would bind the flight server publicly, and `--remote` refuses to run
+without a token, so "public + unauthenticated" is unrepresentable. The one
+policy lives in the stdlib-only `biopb._web_auth` predicates that the control and
+the sidecar both bind to (so they cannot drift); there is no separate "dev-mode"
+token bypass — a `None` token *is* local mode.
+
 ---
 
 ## 2. Architecture rationales

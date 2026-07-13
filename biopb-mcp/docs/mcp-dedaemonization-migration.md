@@ -377,22 +377,26 @@ pid. This is the backstop for gotchas 2/3 above.
 - **No CORS** — same origin for dataviewer + observe → shared token/cookie, no
   cross-origin config, no per-session-port CORS churn.
 
-**Origin auth — step 1 implemented.** The control's **own** API (`/api/*`) is now
-gated at the origin: when a data-plane token is configured it is required
-(`Authorization: Bearer` / `X-Biopb-Token`); when it isn't (the all-localhost
-dev-bypass) a **loopback Host** check is the rebinding backstop; and every
-state-changing verb additionally refuses a forgeable cross-site request (CSRF),
-mirroring the sidecar's `_require_same_origin`. The decisions live in a shared,
-**stdlib-only `biopb._web_auth`** — predicates the control, the tensor sidecar, and
-observe can all import (none can import another, I2), so a later
-behavior-preserving refactor can fold the sidecar's `check_token` /
-`_require_same_origin` onto it. This closes the stop/restart CSRF-DoS and the
-`/api/sessions` enumeration that the dashboard (#14) opened. `/api/data_plane/ensure`
-stays open (idempotent; biopb-mcp's token-less `_control_client` posts it), and the
-dashboard sends the token from the dataviewer's same-origin `sessionStorage`.
-**Remaining:** gate `/session/<id>/*` (needs observe to learn to send the token —
-pairs with the sidecar refactor) and teach `_control_client` to carry the token so
-`ensure` can be gated too; TLS termination stays a front-proxy concern (§1).
+**Origin auth — implemented.** The control's web API is gated at the origin —
+both the control's **own** `/api/*` and each session's proxied
+`/session/<id>/api/*`: when a data-plane token is configured it is required
+(`Authorization: Bearer` / `X-Biopb-Token`); when it isn't (local mode, all
+listeners loopback-bound) a **loopback Host** check is the rebinding backstop; and
+every state-changing verb additionally refuses a forgeable cross-site request
+(CSRF), mirroring the sidecar's `_require_same_origin`. The decisions live in a
+shared, **stdlib-only `biopb._web_auth`** — predicates the control, the tensor
+sidecar, and observe all import (none can import another, I2); the sidecar's
+`check_token` / `_require_same_origin` were folded onto it (#425). This closes the
+stop/restart CSRF-DoS, the `/api/sessions` enumeration the dashboard (#14) opened,
+and — with the session-API gate (biopb/biopb#424) — the guessable-session-id CSRF
+/ DNS-rebind against the observe kernel verbs; the proxy hop strips the child's own
+Host/Origin guard, so this control-side check is the only one. The `/observe` SPA
+shell stays open (a plain GET serving the app bundle). `/api/data_plane/ensure`
+stays open (idempotent; biopb-mcp's token-less `_control_client` posts it): under
+the two-mode model biopb-mcp is local-only and a local control is tokenless, so
+gating it would buy nothing (the only residual is that in remote mode it is an
+unauthenticated but idempotent public state-change — biopb/biopb#424 item 2). TLS
+termination stays a front-proxy concern (§1).
 
 **Gotchas (same class as the merge audit):**
 1. **Streaming + explicit mounts.** Observe uses SSE; its proxy must stream (no

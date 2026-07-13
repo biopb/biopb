@@ -129,18 +129,42 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # to bring the plane up, and it is idempotent (spawns the plane the control
 # already owns), so it stays open rather than forcing the mcp client to carry the
 # token (the accepted #417 posture). The dangerous verbs (stop/restart) and the
-# enumerating reads (status/sessions) are gated.
+# enumerating reads (status/sessions) are gated. Residual (biopb/biopb#424 item
+# 2): in remote mode this is an unauthenticated public state-change, but idempotent
+# and non-destructive, so it is accepted rather than gated — biopb-mcp (the only
+# caller) is local-only and a local control is tokenless, so gating it would buy
+# nothing in the supported modes.
 _AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
 
 
-class _ControlAuthMiddleware:
-    """Gate the control's **own** API (``/api/*``) at the single origin (§6.1).
+def _is_session_api_path(path: str) -> bool:
+    """True for ``/session/<id>/<root>/...`` where ``<root>`` is a proxied session
+    surface — i.e. exactly what ``session_proxy`` forwards to the child.
 
-    A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches *only*
-    ``/api/*`` requests and leaves the streaming ``/data_plane`` and ``/session``
-    proxies to pass straight through untouched — wrapping those in
-    ``BaseHTTPMiddleware`` would interfere with their ``StreamingResponse`` +
-    background-close.
+    Derived from the *same* ``_SESSION_ALLOWED_ROOTS`` the proxy's own gate uses,
+    so the guard and the thing it guards cannot drift: any path the proxy would
+    forward (including a bare ``/session/<id>/api`` with no further segment) is
+    gated, and any future root added to the allowlist is covered automatically.
+    Not ``/session/<id>/observe`` (the SPA shell), and not a bare
+    ``/session/<id>``."""
+    if not path.startswith("/session/"):
+        return False
+    rest = path[len("/session/") :]  # "<id>/<sub_path...>" (session ids are slash-free)
+    slash = rest.find("/")
+    if slash == -1:
+        return False  # bare /session/<id>
+    return rest[slash + 1 :].split("/")[0] in _SESSION_ALLOWED_ROOTS
+
+
+class _ControlAuthMiddleware:
+    """Gate the control's web API at the single origin (§6.1) — both the
+    control's **own** ``/api/*`` and each session's proxied ``/session/<id>/api/*``.
+
+    A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches only the
+    guarded API paths and leaves the streaming ``/data_plane`` proxy, the observe
+    SPA shell, and the static bundle to pass straight through untouched — wrapping
+    those in ``BaseHTTPMiddleware`` would interfere with the proxies'
+    ``StreamingResponse`` + background-close.
 
     Policy, mirroring the tensor sidecar so the two agree:
 
@@ -148,15 +172,21 @@ class _ControlAuthMiddleware:
       ``X-Biopb-Token`` (401 otherwise). This is the whole point of the single
       origin: the token that already gates the data plane now also gates the
       control's stop/restart verbs and the session enumeration.
-    - **No token** (the all-localhost dev-bypass) → require a **loopback Host**
-      (421 otherwise), so a DNS-rebinding page can't drive the token-less origin.
+    - **No token** (local mode, all listeners loopback-bound) → require a
+      **loopback Host** (421 otherwise), so a DNS-rebinding page can't drive the
+      token-less origin.
     - **Unsafe method** (POST/…) → additionally refuse a forgeable cross-site
       request (403) — a token header or a same-origin ``Sec-Fetch-Site`` passes,
       a browser's cross-site POST does not (CSRF).
 
-    ``/data_plane/*`` keeps its own gate (the sidecar re-validates the forwarded
-    token) and ``/session/*`` is deferred to step 3 (observe must learn to send
-    the token first); neither is touched here.
+    ``/session/<id>/api/*`` gets the *same* policy (biopb/biopb#424): the observe
+    API drives mutating kernel verbs (interrupt/restart, job cancel), the proxy
+    hop deliberately strips Host/Origin toward the child (so the child cannot
+    judge the browser origin itself), and session ids are guessable
+    (``<timestamp>-<pid>``) — so a guessed id must not be drivable cross-site or
+    via DNS-rebinding. The ``/observe`` shell (a plain SPA GET serving only the
+    app bundle) stays open. ``/data_plane/*`` keeps its own gate (the sidecar
+    re-validates the forwarded token), so it is not touched here.
     """
 
     def __init__(self, app: ASGIApp, token: str | None) -> None:
@@ -174,7 +204,11 @@ class _ControlAuthMiddleware:
 
     @staticmethod
     def _guarded(path: str) -> bool:
-        return path.startswith("/api/") and path not in _AUTH_EXEMPT_API_PATHS
+        if path in _AUTH_EXEMPT_API_PATHS:
+            return False
+        if path.startswith("/api/"):
+            return True
+        return _is_session_api_path(path)
 
     def _deny(self, method: str, get: _web_auth.HeaderGetter) -> Response | None:
         """The response to send if the request is refused, else ``None``."""
@@ -282,9 +316,9 @@ def build_app(
 
     ``data_web_url`` is the loopback base URL of the supervised tensor server's
     HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. ``token``
-    is the data-plane access token (``None`` in the all-localhost dev-bypass
-    case); the ``/api/*`` gate enforces it when set, else falls back to a loopback
-    Host check. ``static_dir`` is the built ``web/`` bundle (``web/packages/app/
+    is the data-plane access token (``None`` in local mode, where every listener
+    is loopback-bound); the ``/api/*`` gate enforces it when set, else falls back
+    to a loopback Host check. ``static_dir`` is the built ``web/`` bundle (``web/packages/app/
     dist``); when present the control serves it at its root as the single web
     origin — the dashboard (``/``), the dataviewer (``/viewer``), and each
     session's observe shell (``/session/<id>/observe``) are all React routes of
@@ -321,7 +355,17 @@ def build_app(
     # blocking TCP liveness probe, so Starlette runs them in its threadpool) --- #
 
     def health(_request: Request) -> JSONResponse:
-        return JSONResponse({"control": "ok", "data_plane": supervisor.snapshot()})
+        # `auth_required` is the SPA's public probe: the browser bundle + this
+        # endpoint stay unauthenticated always, and the app reads this to decide
+        # whether to gate itself behind the unlock page. True in remote mode (a
+        # token gates /api/* and the proxied data plane), False in local mode.
+        return JSONResponse(
+            {
+                "control": "ok",
+                "auth_required": token is not None,
+                "data_plane": supervisor.snapshot(),
+            }
+        )
 
     def data_plane_ensure(request: Request) -> JSONResponse:
         # The client passes ?client_timeout=<its HTTP timeout>; cap our wait
@@ -765,8 +809,8 @@ def serve_control_api(
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
     # The data-plane token gates the control's own /api/* too (single origin,
-    # §6.1). None in the all-localhost dev-bypass case -> the gate falls back to a
-    # loopback Host check instead.
+    # §6.1). None in local mode -> the gate falls back to a loopback Host check
+    # instead.
     app = build_app(
         supervisor,
         ensure_timeout,

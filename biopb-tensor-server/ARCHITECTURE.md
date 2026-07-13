@@ -201,7 +201,7 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 ## FastAPI HTTP Server
 
 **Module:** `biopb_tensor_server.serving.http_server`
-**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins, config_path, web_host, web_port) → FastAPI`
+**Factory:** `create_app(flight_location, token, cache_bytes, cors_origins, config_path, web_host, web_port) → FastAPI`
 **Default port:** `8814`
 
 ### Lifecycle
@@ -223,8 +223,11 @@ Authorization: Bearer <token>
 X-Biopb-Token: <token>
 ```
 
-`secrets.compare_digest` is used for timing-safe comparison.
-`dev_mode=True` skips the check entirely. Dev mode is enabled via `--dev` flag or `BIOPB_WEB_DEV_BYPASS` env var, and is only allowed when `--web-host` is a loopback address (enforced by CLI).
+`secrets.compare_digest` is used for timing-safe comparison. The auth check
+compares against `expected = self.token`; a `None` token means no enforcement —
+this is **local mode**, where every listener binds loopback and no token exists.
+A token is present (and enforced) only in **remote mode**, when the config's
+`server.host` is a public address. There is no separate dev flag.
 
 ### Endpoints
 
@@ -297,7 +300,7 @@ argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--open] [--web-url URL] [--cors ORIGIN]
 
 # for grpc only (no web server)
 biopb-tensor-server serve ...
@@ -305,11 +308,14 @@ biopb-tensor-server serve ...
 
 Startup sequence:
 
-1. Resolve `dev_mode` (flag or `BIOPB_WEB_DEV_BYPASS` env var). Force off if
-   `--web-host` is not a loopback address.
-2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var → interactive
-   prompt (3 attempts) → `secrets.token_urlsafe(32)` auto-generated.
-3. Print the one-time access token.
+1. Decide whether a token is enforced from the config's `server.host`: a
+   loopback `server.host` runs tokenless (**local mode**); a public
+   `server.host` (`0.0.0.0`/`::`/a real IP) **requires** a token (**remote
+   mode**).
+2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var →
+   `secrets.token_urlsafe(32)` auto-generated (public `server.host` only; local
+   mode uses no token). No interactive prompt.
+3. Print the one-time access token (remote mode only).
 4. Load `biopb.json` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
 6. Derive CORS origins from `--web-url` (default `http://localhost:8814`) or
@@ -1032,9 +1038,8 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | Variable | Where consumed | Purpose |
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
-| `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token (skips CLI prompt) |
-| `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor-server launch` (server) | Enable dev-mode token bypass (localhost only, enforced by CLI) |
-| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to localhost (Singularity/HPC only; ignored in Docker) |
+| `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
+| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
 | `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI server (default `http://localhost:8814`) |
 
 ---
@@ -1044,9 +1049,10 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 - Token is stored in `sessionStorage` (clears on tab close, never persisted to disk).
 - The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
-- Dev mode (`biopb-tensor-server launch --dev` or `BIOPB_WEB_DEV_BYPASS`) disables token enforcement; only allowed when `--web-host` is localhost (enforced by CLI).
-- For Docker dev mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
-- For Singularity/HPC dev mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
+- **Local mode** (loopback `server.host`) enforces no token — the 90% single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
+- **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `server.host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`server.host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
+- For Docker local mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
+- For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
 
 ---

@@ -88,11 +88,6 @@ EOF
     CONFIG_FILE="$BIOPB_TMP/runtime-config.json"
 fi
 
-# Enable debug logging if dev bypass mode is active
-if [ "${BIOPB_WEB_DEV_BYPASS}" = "true" ] || [ "${BIOPB_WEB_DEV_BYPASS}" = "1" ]; then
-    export BIOPB_LOG_LEVEL="${BIOPB_LOG_LEVEL:-DEBUG}"
-fi
-
 # Construct best-effort external URL for webapp access
 # Priority: env var override > hostname > IP from default route > localhost
 if [ -n "$BIOPB_EXTERNAL_HOST" ]; then
@@ -117,7 +112,9 @@ TOKEN_ARGS=()
 if [ -n "$BIOPB_TENSOR_TOKEN" ]; then
     TOKEN_ARGS=(--token "$BIOPB_TENSOR_TOKEN")
 elif [ "$BIND_ADDR" = "127.0.0.1" ]; then
-    TOKEN_ARGS=(--local-bypass)
+    # Loopback-only bind (Singularity BIOPB_BIND_LOCALHOST): local mode, no token.
+    # Every listener is same-machine, so no token is enforced -- pass nothing.
+    TOKEN_ARGS=()
 else
     GEN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
     export BIOPB_TENSOR_TOKEN="$GEN_TOKEN"

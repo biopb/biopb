@@ -53,7 +53,7 @@ See [deploy.md](deploy.md) for a complete list of deployment options, including 
 - Token-based authentication on both gRPC and HTTP for browser access
 - Transport is **unencrypted** by default! Only deploy on trusted intranet!
 - If BIOPB_TENSOR_TOKEN is not given, the server generates a random token that can be viewed with `docker logs biopb-tensor`
-- Dev mode (`--dev` flag or `BIOPB_WEB_DEV_BYPASS=1`) disables token enforcement!
+- **Local mode** (loopback `server.host`, the default) enforces no token — the single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
 - Bind to localhost-only `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
 
 ## Configuration
@@ -130,11 +130,11 @@ pip install -e "biopb-tensor-server/[web,aics,ome-zarr,medical]"
 ### Launch
 
 ```bash
-# Interactive launch with auto-generated token
+# Local mode (loopback server.host — no token required)
 biopb-tensor-server launch --config biopb.json
 
-# Dev mode (localhost, no token required)
-biopb-tensor-server launch --config biopb.json --dev
+# Remote mode (public server.host — token required, auto-generated if omitted)
+biopb-tensor-server launch --config biopb.json --token mytoken...
 
 # gRPC only (no web sidecar)
 biopb-tensor-server serve --config biopb.json
@@ -177,8 +177,7 @@ biopb-tensor-server version  Show version information
 | `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
 | `--web-port` | 8814 | HTTP server port |
 | `--web-host` | 127.0.0.1 | HTTP server bind address |
-| `--token` | (prompt/auto) | Website access token |
-| `--dev` | false | Skip token check (localhost only) |
+| `--token` | (auto) | Website access token (remote mode; auto-generated if omitted) |
 | `--open` | false | Open browser after startup |
 | `--web-url` | http://localhost:5173 | Base URL of web app (CORS + --open) |
 | `--cors` | (derived from --web-url) | Extra CORS origins (repeatable) |
