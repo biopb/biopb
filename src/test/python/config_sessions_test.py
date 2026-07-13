@@ -135,6 +135,50 @@ class TestListSessions:
         ids = [r["session_id"] for r in reg.list_sessions()]
         assert ids == ["20260101-000100-2", "20260101-000000-1"]  # newest first
 
+    def test_same_second_sessions_ordered_by_started_at(self):
+        # Two sessions in the same one-second bucket with un-padded pids: a
+        # filename reverse-sort puts "-9" after "-42" lexically and mis-orders
+        # them, so ordering must key on started_at, not the name (biopb/biopb#421).
+        pid, ct = _live_pid(), reg.process_create_time(_live_pid())
+        older = {
+            "session_id": "20260101-000000-9",
+            "port": 1,
+            "pid": pid,
+            "create_time": ct,
+            "started_at": 100.0,
+        }
+        newer = {
+            "session_id": "20260101-000000-42",
+            "port": 2,
+            "pid": pid,
+            "create_time": ct,
+            "started_at": 200.0,
+        }
+        (reg.sessions_dir() / "20260101-000000-9.json").write_text(json.dumps(older))
+        (reg.sessions_dir() / "20260101-000000-42.json").write_text(json.dumps(newer))
+        ids = [r["session_id"] for r in reg.list_sessions()]
+        assert ids == ["20260101-000000-42", "20260101-000000-9"]  # newest (200) 1st
+
+    def test_record_missing_started_at_sorts_last(self):
+        pid, ct = _live_pid(), reg.process_create_time(_live_pid())
+        (reg.sessions_dir() / "a.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "a",
+                    "port": 1,
+                    "pid": pid,
+                    "create_time": ct,
+                    "started_at": 50.0,
+                }
+            )
+        )
+        (reg.sessions_dir() / "b.json").write_text(
+            json.dumps(  # no started_at
+                {"session_id": "b", "port": 2, "pid": pid, "create_time": ct}
+            )
+        )
+        assert [r["session_id"] for r in reg.list_sessions()] == ["a", "b"]
+
     def test_prunes_and_unlinks_dead_pid_records(self):
         reg.register("dead", port=1, pid=_dead_pid())
         reg.register("live", port=2, pid=_live_pid())
