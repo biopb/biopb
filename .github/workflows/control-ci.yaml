@@ -1,7 +1,7 @@
 # CI for biopb-control (the control plane). Lives in the monorepo at biopb-control/.
 # It is a bundled component like biopb-tensor-server — shipped inside the
 # release-v* wheel bundle + installer, NOT published to PyPI — so this workflow
-# is test-only (no deploy job). Versioned off its own `control-v*` tag prefix.
+# is test-only (no deploy job). Versioned off the single product `release-v*` tag.
 name: Control CI
 
 on:

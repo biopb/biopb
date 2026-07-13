@@ -74,13 +74,14 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# Versioned off its OWN tag prefix (control-v*) so it never picks up the client's
-# `v*`, the server's `server-v*`, or mcp's `mcp-v*` tags. root = ".." because the
-# package lives in a monorepo subdir. Prerelease suffixes work (control-v0.1.0a1).
+# Product component: versioned off the single product tag `release-v*`, shared
+# with the tensor server, mcp, and the web bundle. root = ".." because the package
+# lives in a monorepo subdir. The --match keeps `git describe` off the SDK's `v*`
+# tags. Prerelease suffixes work (release-v0.11.0rc1).
 [tool.setuptools_scm]
 version_file = "src/biopb_control/_version.py"
 root = ".."
-tag_regex = "^control-v(?P<version>.+)$"
+tag_regex = "^release-v(?P<version>.+)$"
 
 [tool.setuptools_scm.scm.git]
-describe_command = "git describe --tags --match 'control-v*'"
+describe_command = "git describe --tags --match 'release-v*'"

@@ -10,15 +10,16 @@ answers *"is there a newer deployment than the one installed?"*.
 Design notes that pin this to the current release model (``docs/release-model.md``):
 
 * The product ships on the ``biopb/biopb`` ``release-v*`` line, NOT on
-  ``/releases/latest`` (repo-wide; would surface a ``v*``/``mcp-v*`` PyPI library
-  tag). We list releases and select the highest matching ``release-vX.Y.Z``,
-  skipping prereleases unless the user opts into the ``prerelease`` channel —
-  mirroring the installer's selection exactly.
+  ``/releases/latest`` (repo-wide; would surface a ``v*`` SDK/library tag). We
+  list releases and select the highest matching ``release-vX.Y.Z``, skipping
+  prereleases unless the user opts into the ``prerelease`` channel — mirroring the
+  installer's selection exactly.
 * The comparison baseline is the installer-written marker at
   ``~/.config/biopb/release.version`` (the deployment's ``versions.json``
-  ``release`` field). ``biopb_mcp.__version__`` is a decoupled *library* version
-  (its own ``mcp-v*`` cadence) and is deliberately NOT the comparison basis; it
-  is only consulted to suppress checks on a dev/editable build.
+  ``release`` field). ``biopb_mcp.__version__`` is now the product ``release-v*``
+  version too, but the marker file — not the running library version — is the
+  baseline; ``__version__`` is only consulted to suppress checks on a dev/editable
+  build.
 * The remote candidate version is taken from the chosen release's **tag** (strip
   ``release-v``), which equals that release's ``versions.json`` ``release`` by
   construction (``release.yaml`` derives the release version from the tag) — so

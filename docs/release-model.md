@@ -4,44 +4,48 @@ How the monorepo is released. The guiding split: **library distribution (PyPI)**
 and **product deployment (GitHub release + Docker)** are different things with
 different audiences and cadences, and are driven by different tags.
 
-## Two kinds of release
+## Two kinds of release, two tags
 
-| | Audience | Mechanism | Tag(s) |
-|---|---|---|---|
-| **Library distribution** | developers / integrators (`pip install`) | **PyPI** | `v*` (biopb) |
-| **Product deployment** | end users (`install.sh`), operators (Docker) | **GitHub release + Docker** | `release-v*` |
+The whole scheme is **two version lines, two tags**:
 
-PyPI is deliberately **excluded** from the `release-v*` deployment. `biopb`
-publishes to PyPI on its own `v*` tag, on its own cadence.
+| | Audience | Mechanism | Tag | Members |
+|---|---|---|---|---|
+| **SDK / library** | developers / integrators | **PyPI + Maven Central** (+ a Docker base image) | `v*` | `biopb` (Python → PyPI, Java → Maven Central) and `biopb-image-base` (Docker base image only) |
+| **Product / deployment** | end users (`install.sh`), operators (Docker) | **GitHub release + Docker** | `release-v*` | `biopb-tensor-server`, `biopb-mcp`, `biopb-control`, and the `web/` bundle |
 
-**biopb-mcp is no longer published to PyPI.** It only ever reached end users as
-part of the `release-v*` wheel triple the installer `file://`-installs (a plain
-`pip install biopb-mcp` could never pull the tensor server or the full-stack
-dependency groups anyway), so its PyPI upload carried no product weight and was
-retired. Its `mcp-v*` tag is kept purely as a **version marker** (below).
-(`biopb-tensor-server` and `biopb-image-base` were never on PyPI either.)
+Every product component reads the **single `release-v*` tag** (setuptools_scm /
+`sync-version.js`), so the tensor server, mcp, control, and the web bundle always
+share one product version — there are no per-package `server-v*` / `mcp-v*` /
+`control-v*` tags anymore. Everything on the SDK side reads `v*`.
 
-## A release is a coordinated set of tags on one commit
+PyPI is deliberately **excluded** from the `release-v*` deployment: `biopb`
+publishes to PyPI (and Maven Central) on its own `v*` tag, on its own cadence.
+`biopb-mcp`, `biopb-tensor-server`, and `biopb-control` are **not** on PyPI — they
+only reach end users as the `release-v*` wheel bundle the installer
+`file://`-installs. `biopb-image-base` is not on PyPI either; it ships **only** as
+a Docker base image, versioned off the SDK `v*` line (it's the foundation others
+build compute servers on).
 
-A release **bumps every (changed) subproject** — each on its own version line
-(independent numbers, fully traceable). Cut these tags **manually** on the
-release commit:
+## Cutting a release: at most two tags
 
-| Tag | Drives | Notes |
+At most **two tags** on the release commit — no per-package markers to keep in
+sync:
+
+| Tag | Cut it when | Drives |
 |---|---|---|
-| `v<A>` | `python-ci` → PyPI: `biopb` | also the client's version marker |
-| `mcp-v<C>` | (nothing on its own) | version marker only — mcp isn't on PyPI |
-| `server-v<B>` | (nothing on its own) | version marker only — tensor-server isn't on PyPI |
-| `release-v<R>` | `release.yaml` | the all-in-one deployment (below) |
+| `v<A>` | the SDK changed (or you want image-base rebuilt) | `python-ci` → PyPI (`biopb`), `java-ci` → Maven Central, and image-base's Docker version |
+| `release-v<R>` | the product changed | `release.yaml` — the all-in-one product deployment (below) |
 
-Because the per-package tags sit on the **same commit**, `release.yaml`'s
-`setuptools_scm` build produces **clean** wheel versions (`biopb 0.6.6`,
-`biopb_tensor_server 0.4.6`, `biopb_mcp 0.7.2`) — not `.devN+gSHA`. The wheel
-filename still pins the exact provenance.
+Because each package reads its tag from the **same release commit**,
+`release.yaml`'s `setuptools_scm` build produces **clean** wheel versions
+(`biopb_tensor_server 0.11.0`, `biopb_mcp 0.11.0`, `biopb_control 0.11.0` — all
+`R`) — not `.devN+gSHA`. The wheel filename still pins the exact provenance.
 
-`biopb-image-base` is the exception: it is the **most stable** component, carries
-a **static** version in `biopb-image-runtime/pyproject.toml`, and is bumped by
-hand only when it actually changes (see idempotent publish below). It has no tag.
+A product-only change needs only `release-v<R>`. An SDK/protocol change needs
+`v<A>` (which also rebuilds `image-base`, since it tracks the SDK line — see
+idempotent publish below); if that same commit also ships product changes, cut
+`release-v<R>` too. A commit that is not on a clean tag (a dry run) just yields a
+`.devN+gSHA` version, which is fine for testing.
 
 ### Release candidates (prereleases, e.g. off `dev`)
 
@@ -70,9 +74,10 @@ One pipeline, built from the tagged commit:
    source of truth** (it `file://`-installs the wheels; nothing from PyPI except
    `napari[all]`).
 3. **Docker publish** (ghcr.io + Docker Hub `jiyuuchc/`), each image tagged with
-   **its own package version** (not `R`) + `:latest`:
-   - `biopb-tensor-server:<B>`
-   - `biopb-image-base:<image-base static version>`
+   its version + `:latest`:
+   - `biopb-tensor-server:<R>` — the product/release version.
+   - `biopb-image-base:<A>` — the SDK `v*` version (image-base tracks the SDK
+     line, not the product), read from the nearest `v*` tag name.
 
 ### Idempotent Docker publish (the "did the version change?" check)
 
@@ -87,12 +92,14 @@ else
 fi
 ```
 
-Most releases don't touch `image-base`, so its static version is unchanged, the
-tag already exists, and CI **skips** it. Bump its static version and it
-publishes. The same guard applies to `tensor-server` (usually a fresh `server-v*`
-version, so it publishes; re-runs stay clean). This is why `image-base` keeps a
-**static** version — a `setuptools_scm` dev version changes every commit via
-`+gSHA` and would defeat the check.
+A **product-only** release doesn't cut a new `v*`, so image-base's version (the
+nearest `v*` tag) is unchanged, its tag already exists, and CI **skips** it — the
+same "rebuild only when it changes" property it had as a static version, now
+driven by the `v*` tag instead of a hand-bump. `tensor-server` gets a fresh `R`
+each release, so it publishes; re-runs stay clean. The check needs a **clean**
+version with no `+gSHA` local segment (a Docker reference forbids `+`): image-base
+uses the nearest `v*` **tag name** (always clean), and tensor-server's dev/local
+version is sanitized to a Docker-safe form on a dry run.
 
 ## Installer
 
@@ -112,16 +119,13 @@ single source of truth.
 
 | Tag | Workflow | Publishes |
 |---|---|---|
-| `v*` | `python-ci` | PyPI: biopb |
-| `mcp-v*` | — | (version marker only) |
-| `server-v*` | — | (version marker only) |
-| `release-v*` | `release.yaml` | GitHub release + Docker (tensor-server, image-base) |
+| `v*` | `python-ci`, `java-ci` | PyPI (`biopb`) + Maven Central (`biopb` Java); image-base's Docker version tracks this tag |
+| `release-v*` | `release.yaml` | GitHub release + Docker (`tensor-server:R`, `image-base:A`) |
 
-`mcp-ci`, `tensor-server-ci`, and `image-runtime-ci` keep their PR test/build
-jobs but **do not publish** — the only PyPI publish left is `python-ci` (biopb),
-and product publishing is consolidated in `release.yaml`. The old
-`mcp-release.yaml`, `mcp-ci`'s `deploy` job, and `tensor-server-ci`'s `publish`
-job are all retired.
+`mcp-ci`, `tensor-server-ci`, `control-ci`, and `image-runtime-ci` keep their PR
+test/build jobs but **do not publish** — the only PyPI/Maven publish is on `v*`
+(`python-ci` / `java-ci`), and product publishing is consolidated in
+`release.yaml`. There are no `server-v*` / `mcp-v*` / `control-v*` tags anymore.
 
 ## Open items
 

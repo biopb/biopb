@@ -452,7 +452,7 @@ hosting dependency**:
   `https://biopb.org/schemas/tensor-server-config.json`. To avoid hand-maintaining
   it against the emitter, generate it from `build_config_schema()` and publish it
   **out-of-band from the biopb release workflow** — the same pattern that already
-  owns `/docs/api/<lang>/` (generated on a `v*` / `server-v*` tag and rsynced into
+  owns `/docs/api/<lang>/` (generated on a `v*` / `release-v*` tag and rsynced into
   the site, carved out of the site's own `--delete`). So the offline relative
   `$schema` is the default; the hosted `$id` is the published canonical once that
   one-step CI job is added.

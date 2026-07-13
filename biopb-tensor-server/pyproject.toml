@@ -119,14 +119,19 @@ dependencies = [
 where = ["."]
 include = ["biopb_tensor_server*"]
 
-# Version derived from git tags (server-vX.Y.Z format)
+# Version derived from git tags (release-vX.Y.Z product tag)
 [tool.setuptools_scm]
 version_file = "biopb_tensor_server/_version.py"
 root = ".."
-tag_regex = "^server-v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+# Product component: versioned off the single product tag `release-v*` (not a
+# per-package prefix), so the whole product stack shares one version. `.+` so a
+# prerelease (`release-v0.11.0rc1`) is captured, not just X.Y.Z. The `--match`
+# below keeps `git describe` from grabbing the nearest tag of another prefix
+# (the SDK's `v*`) and mis-versioning the wheel.
+tag_regex = "^release-v(?P<version>.+)$"
 
 [tool.setuptools_scm.scm.git]
-describe_command = "git describe --tags --match 'server-v*'"
+describe_command = "git describe --tags --match 'release-v*'"
 
 # Lint/format config lives at the monorepo root [tool.ruff] (issue #82).
 

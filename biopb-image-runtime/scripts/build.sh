@@ -2,8 +2,8 @@
 # Build script for biopb-image-runtime Docker images
 #
 # By default builds wheels from the latest released git tags:
-#   biopb         → latest v* tag
-#   biopb-tensor-server → latest server-v* tag
+#   biopb         → latest v* tag (SDK line)
+#   biopb-tensor-server → latest release-v* tag (product line)
 #
 # Usage:
 #   ./build.sh [options]
@@ -73,14 +73,14 @@ if [ "$DEV" = true ]; then
     pip wheel biopb-tensor-server/ --no-deps -w wheels/ --quiet
 else
     BIOPB_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | head -1)
-    TENSOR_TAG=$(git tag --sort=-version:refname | grep -E '^server-v[0-9]' | head -1)
+    TENSOR_TAG=$(git tag --sort=-version:refname | grep -E '^release-v[0-9]' | head -1)
 
     if [ -z "$BIOPB_TAG" ]; then
-        echo "Error: no biopb release tag found (expected v*)"
+        echo "Error: no biopb SDK release tag found (expected v*)"
         exit 1
     fi
     if [ -z "$TENSOR_TAG" ]; then
-        echo "Error: no biopb-tensor-server release tag found (expected server-v*)"
+        echo "Error: no product release tag found (expected release-v*)"
         exit 1
     fi
 

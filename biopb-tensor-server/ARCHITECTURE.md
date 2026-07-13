@@ -1053,24 +1053,23 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
 ## Versioning
 
-Server components use `server-v*` tags (distinct from SDK `v*` tags):
+The tensor server is a **product component**, so its version comes from the single
+product tag `release-v*` (shared with mcp, control, and the web bundle) — not a
+per-package tag. This is distinct from the SDK line (`v*`, for `biopb` +
+`biopb-image-base`). See `docs/release-model.md`.
 
 ```
-git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
+git tags (release-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
                                                     ↓
                                     web/scripts/sync-version.js → JS packages
+                                    (also reads the release-v* tag)
 ```
 
-Version is derived from git tags via `setuptools_scm` with `tag_regex = "^server-v..."`.
-This mirrors the root SDK package's approach (which uses `v*` tags).
+Version is derived via `setuptools_scm` with `tag_regex = "^release-v..."` (and a
+matching `git describe --match 'release-v*'`).
 
-**Release:**
-```bash
-git tag server-v0.3.0 && git push --tags
-```
-
-CI automatically:
-1. Extracts version from tag (`server-v0.3.0` → `0.3.0`)
-2. Syncs JS package versions via `pnpm sync-version`
-3. Builds Docker image: `ghcr.io/.../biopb-tensor-server:0.3.0`, `:latest`
-4. Creates GitHub release with webapp tarball and install.sh
+**Release** (product): `git tag release-v0.11.0 && git push --tags`. `release.yaml`
+then builds the wheel bundle at version `0.11.0`, syncs the JS packages
+(`pnpm -C web run sync-version`), publishes `biopb-tensor-server:0.11.0` (+
+`:latest`), and cuts the GitHub release with the webapp tarball + installer. (The
+SDK, incl. image-base, releases separately on `v*`.)
