@@ -39,7 +39,10 @@ from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
     [
         ("/session/s1/api/jobs", True),
         ("/session/20260101-000000-42/api/kernel/restart", True),
-        ("/session/s1/api", False),  # no trailing surface -> the bare /api route
+        # Bare /session/<id>/api (no further segment) is still forwarded to the
+        # child by session_proxy (segments[0]=="api"), so it must be gated too --
+        # the guard derives from the same _SESSION_ALLOWED_ROOTS and can't drift.
+        ("/session/s1/api", True),
         ("/session/s1/observe", False),  # SPA shell, not the API
         ("/session/s1", False),  # bare session root
         ("/session/s1/mcp", False),  # non-API surface (proxy allowlist 404s it)
@@ -788,6 +791,17 @@ def test_session_api_rejects_non_loopback_host(control, upstream):
             f"{control}/session/s1/api/status",
             headers={"Host": "evil.example:8813"},
         )
+    assert exc.value.code == 421
+
+
+def test_session_api_bare_root_is_gated(control, upstream):
+    # The bare /session/<id>/api (no further segment) is still forwarded to the
+    # child by session_proxy, so the gate must catch it too -- a forged Host is
+    # refused here rather than reaching the child. Guards against the guard and
+    # the proxy allowlist drifting on this boundary.
+    _register_session("s1", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/session/s1/api", headers={"Host": "evil.example:8813"})
     assert exc.value.code == 421
 
 

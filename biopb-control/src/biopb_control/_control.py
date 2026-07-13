@@ -138,14 +138,22 @@ _AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
 
 
 def _is_session_api_path(path: str) -> bool:
-    """True for ``/session/<id>/api/...`` — the per-session observe API the
-    control proxies to a session child. Not ``/session/<id>/observe`` (the SPA
-    shell), and not a bare ``/session/<id>``."""
+    """True for ``/session/<id>/<root>/...`` where ``<root>`` is a proxied session
+    surface — i.e. exactly what ``session_proxy`` forwards to the child.
+
+    Derived from the *same* ``_SESSION_ALLOWED_ROOTS`` the proxy's own gate uses,
+    so the guard and the thing it guards cannot drift: any path the proxy would
+    forward (including a bare ``/session/<id>/api`` with no further segment) is
+    gated, and any future root added to the allowlist is covered automatically.
+    Not ``/session/<id>/observe`` (the SPA shell), and not a bare
+    ``/session/<id>``."""
     if not path.startswith("/session/"):
         return False
-    rest = path[len("/session/") :]  # "<id>/api/..." (session ids are slash-free)
+    rest = path[len("/session/") :]  # "<id>/<sub_path...>" (session ids are slash-free)
     slash = rest.find("/")
-    return slash != -1 and rest[slash:].startswith("/api/")
+    if slash == -1:
+        return False  # bare /session/<id>
+    return rest[slash + 1 :].split("/")[0] in _SESSION_ALLOWED_ROOTS
 
 
 class _ControlAuthMiddleware:
