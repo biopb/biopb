@@ -26,8 +26,29 @@ import websockets.sync.server
 from biopb import _config_sessions
 from websockets.sync.client import connect as ws_connect
 
-from biopb_control._control import _loopback_url, serve_control_api
+from biopb_control._control import (
+    _is_session_api_path,
+    _loopback_url,
+    serve_control_api,
+)
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
+
+
+@pytest.mark.parametrize(
+    "path, guarded",
+    [
+        ("/session/s1/api/jobs", True),
+        ("/session/20260101-000000-42/api/kernel/restart", True),
+        ("/session/s1/api", False),  # no trailing surface -> the bare /api route
+        ("/session/s1/observe", False),  # SPA shell, not the API
+        ("/session/s1", False),  # bare session root
+        ("/session/s1/mcp", False),  # non-API surface (proxy allowlist 404s it)
+        ("/sessionfoo/api/x", False),  # not a /session/<id>/ path
+        ("/api/status", False),  # control's own API, handled by the other branch
+    ],
+)
+def test_is_session_api_path(path, guarded):
+    assert _is_session_api_path(path) is guarded
 
 
 def _free_port() -> int:
@@ -739,17 +760,63 @@ def test_session_api_is_proxied_with_query(control, upstream):
 
 
 def test_session_proxy_drops_host_and_origin(control, upstream):
-    # The child's loopback Host/Origin guard must pass on the trusted hop even
-    # when the browser reached the control via some other host with an Origin.
+    # On the trusted hop to the child the proxy replaces Host with the loopback
+    # target and drops the browser's Origin, so the child's own loopback guard
+    # passes. (The browser-facing Host must itself be loopback now -- the control
+    # gates /session/<id>/api/* on it, see the rebinding test below -- so the
+    # forged-Host variant is exercised there as a *rejection*, not here.)
     _register_session("s1", upstream)
     port = urlparse(upstream).port
     _status, _headers, body = _get(
         f"{control}/session/s1/api/status",
-        headers={"Origin": "http://evil.example:8813", "Host": "evil.example:8813"},
+        headers={"Origin": "http://evil.example:8813", "Host": "127.0.0.1:8813"},
     )
     echoed = json.loads(body)
     assert echoed["origin"] is None  # Origin stripped -> absent -> child allows it
     assert echoed["host"] == f"127.0.0.1:{port}"  # Host set to the loopback target
+
+
+def test_session_api_rejects_non_loopback_host(control, upstream):
+    # biopb/biopb#424 item 1: /session/<id>/api/* is gated with the same
+    # same-origin + loopback-Host policy as /api/*, because the proxy hop strips
+    # the child's own Host/Origin guard and session ids are guessable. A forged
+    # external Host (DNS-rebinding) is refused at the control before it can reach
+    # the child -- even though the observe surface is otherwise unauthenticated.
+    _register_session("s1", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(
+            f"{control}/session/s1/api/status",
+            headers={"Host": "evil.example:8813"},
+        )
+    assert exc.value.code == 421
+
+
+def test_session_api_refuses_forgeable_cross_site_write(control, upstream):
+    # A browser cross-site POST to a mutating kernel verb (Sec-Fetch-Site:
+    # cross-site, no token header) is refused as CSRF -- a guessed session id must
+    # not let a visited page restart someone's kernel.
+    _register_session("s1", upstream)
+    req = urllib.request.Request(
+        f"{control}/session/s1/api/kernel/restart",
+        data=b"",
+        method="POST",
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
+
+
+def test_session_observe_shell_stays_open(control, upstream):
+    # Only the /api/* surface is gated; the observe SPA shell (a plain GET serving
+    # the app bundle) must still load even from a forged Host, so the app can
+    # bootstrap and then make its (gated) same-origin /api/* calls.
+    _register_session("20260101-000000-42", upstream)
+    status, _headers, _body = _get(
+        f"{control}/session/20260101-000000-42/observe",
+        headers={"Host": "evil.example:8813"},
+    )
+    assert status == 200
 
 
 def test_session_proxy_allowlists_api_surface(control, upstream):

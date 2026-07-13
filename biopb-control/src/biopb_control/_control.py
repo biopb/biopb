@@ -129,18 +129,34 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # to bring the plane up, and it is idempotent (spawns the plane the control
 # already owns), so it stays open rather than forcing the mcp client to carry the
 # token (the accepted #417 posture). The dangerous verbs (stop/restart) and the
-# enumerating reads (status/sessions) are gated.
+# enumerating reads (status/sessions) are gated. Residual (biopb/biopb#424 item
+# 2): in remote mode this is an unauthenticated public state-change, but idempotent
+# and non-destructive, so it is accepted rather than gated — biopb-mcp (the only
+# caller) is local-only and a local control is tokenless, so gating it would buy
+# nothing in the supported modes.
 _AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
 
 
-class _ControlAuthMiddleware:
-    """Gate the control's **own** API (``/api/*``) at the single origin (§6.1).
+def _is_session_api_path(path: str) -> bool:
+    """True for ``/session/<id>/api/...`` — the per-session observe API the
+    control proxies to a session child. Not ``/session/<id>/observe`` (the SPA
+    shell), and not a bare ``/session/<id>``."""
+    if not path.startswith("/session/"):
+        return False
+    rest = path[len("/session/") :]  # "<id>/api/..." (session ids are slash-free)
+    slash = rest.find("/")
+    return slash != -1 and rest[slash:].startswith("/api/")
 
-    A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches *only*
-    ``/api/*`` requests and leaves the streaming ``/data_plane`` and ``/session``
-    proxies to pass straight through untouched — wrapping those in
-    ``BaseHTTPMiddleware`` would interfere with their ``StreamingResponse`` +
-    background-close.
+
+class _ControlAuthMiddleware:
+    """Gate the control's web API at the single origin (§6.1) — both the
+    control's **own** ``/api/*`` and each session's proxied ``/session/<id>/api/*``.
+
+    A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches only the
+    guarded API paths and leaves the streaming ``/data_plane`` proxy, the observe
+    SPA shell, and the static bundle to pass straight through untouched — wrapping
+    those in ``BaseHTTPMiddleware`` would interfere with the proxies'
+    ``StreamingResponse`` + background-close.
 
     Policy, mirroring the tensor sidecar so the two agree:
 
@@ -155,9 +171,14 @@ class _ControlAuthMiddleware:
       request (403) — a token header or a same-origin ``Sec-Fetch-Site`` passes,
       a browser's cross-site POST does not (CSRF).
 
-    ``/data_plane/*`` keeps its own gate (the sidecar re-validates the forwarded
-    token) and ``/session/*`` is deferred to step 3 (observe must learn to send
-    the token first); neither is touched here.
+    ``/session/<id>/api/*`` gets the *same* policy (biopb/biopb#424): the observe
+    API drives mutating kernel verbs (interrupt/restart, job cancel), the proxy
+    hop deliberately strips Host/Origin toward the child (so the child cannot
+    judge the browser origin itself), and session ids are guessable
+    (``<timestamp>-<pid>``) — so a guessed id must not be drivable cross-site or
+    via DNS-rebinding. The ``/observe`` shell (a plain SPA GET serving only the
+    app bundle) stays open. ``/data_plane/*`` keeps its own gate (the sidecar
+    re-validates the forwarded token), so it is not touched here.
     """
 
     def __init__(self, app: ASGIApp, token: str | None) -> None:
@@ -175,7 +196,11 @@ class _ControlAuthMiddleware:
 
     @staticmethod
     def _guarded(path: str) -> bool:
-        return path.startswith("/api/") and path not in _AUTH_EXEMPT_API_PATHS
+        if path in _AUTH_EXEMPT_API_PATHS:
+            return False
+        if path.startswith("/api/"):
+            return True
+        return _is_session_api_path(path)
 
     def _deny(self, method: str, get: _web_auth.HeaderGetter) -> Response | None:
         """The response to send if the request is refused, else ``None``."""
