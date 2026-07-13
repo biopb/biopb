@@ -473,6 +473,18 @@ def _find_client_process():
     return None
 
 
+def _is_windows() -> bool:
+    """Platform check, isolated as a seam the watchdog tests patch.
+
+    Tests must exercise the Windows-only branch below *without* forcing the global
+    ``os.name = "nt"`` — on a POSIX runner that makes ``pathlib.Path`` build a
+    ``WindowsPath``, which raises on Python < 3.12 and crashes pytest itself (its
+    coverage / cache / location machinery calls ``Path``). See the same note in
+    ``_tests/test_update.py``.
+    """
+    return os.name == "nt"
+
+
 def _install_client_death_watchdog(proc, job, session_id=None):
     """Windows: reap the owned child if the stdio *client* dies unseen by stdin.
 
@@ -496,7 +508,7 @@ def _install_client_death_watchdog(proc, job, session_id=None):
 
     Returns the watchdog thread (daemon), or ``None`` if not armed.
     """
-    if os.name != "nt":
+    if not _is_windows():
         return None
     client = _find_client_process()
     if client is None:
@@ -504,7 +516,9 @@ def _install_client_death_watchdog(proc, job, session_id=None):
         return None
     handle = _winjob.open_for_wait(client.pid)
     if not handle:
-        logger.debug("client-death watchdog not armed (client pid %s un-openable)", client.pid)
+        logger.debug(
+            "client-death watchdog not armed (client pid %s un-openable)", client.pid
+        )
         return None
     thread = threading.Thread(
         target=_client_deathwatch,
