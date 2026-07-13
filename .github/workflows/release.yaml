@@ -160,6 +160,9 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
+          # The JS workspace lives in web/; the repo root has no package.json, so
+          # pin pnpm here (matches web/package.json's packageManager).
+          version: 9.12.3
           run_install: false
       - name: Setup Node.js
         uses: actions/setup-node@v4
