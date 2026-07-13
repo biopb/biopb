@@ -58,6 +58,13 @@ def spec(tmp_path):
     )
 
 
+def test_child_env_marks_the_plane_supervised(spec):
+    # The child (tensor server) must learn it is control-owned so its HTTP
+    # sidecar refuses the admin self-restart that would race us (biopb/biopb#418).
+    env = DataPlaneSupervisor(spec)._child_env()
+    assert env["BIOPB_DATA_PLANE_SUPERVISED"] == "1"
+
+
 # --------------------------------------------------------------------------- #
 # spawn (sole ownership) / conflict
 # --------------------------------------------------------------------------- #

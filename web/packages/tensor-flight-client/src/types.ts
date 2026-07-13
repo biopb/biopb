@@ -141,6 +141,11 @@ export interface AdminStatus {
   running: boolean;
   pid: number;
   version: string;
+  /** True when the biopb control owns/supervises this data plane. The admin UI
+   * then routes a restart through the control (POST /api/data_plane/restart)
+   * instead of the sidecar self-restart, which would conflict with supervision
+   * (biopb/biopb#418). Absent on an older sidecar → treated as false. */
+  supervised?: boolean;
   config_path: string | null;
   health: string | null;
   source_count: number | null;

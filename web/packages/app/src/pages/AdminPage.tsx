@@ -12,6 +12,7 @@ import type {
   ConfigSchema,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
+import { authHeaders, redirectToUnlock } from "../auth";
 import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
 import { AdvancedSections } from "../components/AdvancedSections";
 import { CredentialsEditor } from "../components/CredentialsEditor";
@@ -23,6 +24,25 @@ type Config = Record<string, unknown>;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const RESTART_TIMEOUT_MS = 60_000;
+
+/** Ask the control to bounce the data plane it owns. Root-relative, so it hits
+ * the control (this page's own origin) — not the `/data_plane`-proxied sidecar.
+ * The control's verb blocks until the plane is back (or errors); the caller's
+ * poll loop then confirms serving state. See biopb/biopb#418. */
+async function restartViaControl(): Promise<void> {
+  const r = await fetch("/api/data_plane/restart", {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (r.status === 401) {
+    redirectToUnlock();
+    throw new Error("Session locked — re-enter the access token.");
+  }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok || body?.error) {
+    throw new Error(body?.error || `Control restart failed (HTTP ${r.status}).`);
+  }
+}
 
 function getSources(config: Config | null): SourceEntry[] {
   const s = config?.sources;
@@ -199,7 +219,21 @@ export function AdminPage() {
     setRestartError(null);
     setRestartMsg("Restarting…");
     try {
-      await client.http.restartServer();
+      if (status?.supervised) {
+        // The biopb control owns this data plane, so restarting it is a request
+        // to the control — its own token-gated verb at this single origin —
+        // rather than the sidecar self-restart, which the supervisor would race
+        // for ownership (biopb/biopb#418). The control bounces + waits for the
+        // plane to come back, then the poll loop below confirms it's serving.
+        await restartViaControl();
+      } else {
+        // Not control-owned: either a standalone `biopb server start` (no
+        // control), a plane the control merely *adopts* (`--no-data-plane`, so
+        // the control must NOT ensure/spawn its own competing child), or an
+        // older sidecar without the `supervised` field. In all three the daemon
+        // owns its own lifecycle, so the sidecar self-restart is correct here.
+        await client.http.restartServer();
+      }
     } catch (err) {
       if (mounted.current) {
         setRestartError(err instanceof Error ? err.message : String(err));

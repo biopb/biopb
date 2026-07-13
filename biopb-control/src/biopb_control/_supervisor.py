@@ -128,6 +128,12 @@ class DataPlaneSupervisor:
         # No token (local mode): the tensor `launch` runs tokenless on its own
         # because the config binds the flight server to loopback — no bypass
         # signal is needed or read anymore.
+        #
+        # Mark the plane as control-owned so its HTTP sidecar refuses the admin
+        # self-restart (`biopb server restart`), which would race this supervisor
+        # for ownership; the admin UI routes restarts through the control instead
+        # (biopb/biopb#418).
+        env["BIOPB_DATA_PLANE_SUPERVISED"] = "1"
         return env
 
     def _open_log(self):

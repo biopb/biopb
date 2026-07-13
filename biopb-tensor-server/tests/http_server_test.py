@@ -900,6 +900,30 @@ def admin_client(tmp_path):
             yield tc, config_path
 
 
+@pytest.fixture()
+def supervised_admin_client(tmp_path):
+    """Like ``admin_client`` but control-owned (supervised=True): the admin
+    self-restart must be refused so it can't race the control (biopb/biopb#418).
+    """
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text('{"server": {"host": "127.0.0.1", "port": 8815}}')
+    mock_fc = _build_mock_client()
+    mock_fc.health_check.return_value = {"status": "SERVING", "source_count": 1}
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(
+            token=None,
+            config_path=str(config_path),
+            web_host="127.0.0.1",
+            web_port=8814,
+            supervised=True,
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, config_path
+
+
 class TestAdminConfigRoutes:
     def test_get_config_returns_path_config_and_schema(self, admin_client):
         tc, config_path = admin_client
@@ -1099,6 +1123,18 @@ class TestAdminStatusRoute:
         assert isinstance(body["pid"], int)
         assert body["version"]
 
+    def test_status_reports_not_supervised_by_default(self, admin_client):
+        # A directly-launched `biopb server start` is not control-owned, so its
+        # admin UI keeps the self-restart path (biopb/biopb#418).
+        tc, _ = admin_client
+        assert tc.get("/api/admin/status").json()["supervised"] is False
+
+    def test_status_reports_supervised_when_control_owned(
+        self, supervised_admin_client
+    ):
+        tc, _ = supervised_admin_client
+        assert tc.get("/api/admin/status").json()["supervised"] is True
+
 
 class TestAdminRestartRoute:
     def test_restart_spawns_detached_child_and_returns_202(self, admin_client):
@@ -1154,6 +1190,35 @@ class TestAdminRestartRoute:
             retry = tc.post("/api/admin/restart", headers=hdr)
         assert retry.status_code == 202
         popen.assert_called_once()
+
+    def test_supervised_restart_is_forbidden_and_spawns_nothing(
+        self, supervised_admin_client
+    ):
+        # Control-owned: the sidecar must refuse the self-restart (409) and spawn
+        # no `biopb server restart` child that would race the control for the
+        # gRPC port (biopb/biopb#418). The admin UI routes to the control instead.
+        tc, _ = supervised_admin_client
+        with patch("subprocess.Popen") as popen:
+            r = tc.post(
+                "/api/admin/restart",
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+        assert r.status_code == 409
+        popen.assert_not_called()
+
+
+class TestCreateAppSupervisedFromEnv:
+    def test_reads_supervised_from_env(self, monkeypatch):
+        # The control marks the plane control-owned via BIOPB_DATA_PLANE_SUPERVISED
+        # in the child env; create_app picks it up when not passed explicitly.
+        monkeypatch.setenv("BIOPB_DATA_PLANE_SUPERVISED", "1")
+        app = create_app(token=None)
+        assert app.state.sidecar.supervised is True
+
+    def test_defaults_unsupervised_without_env(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_DATA_PLANE_SUPERVISED", raising=False)
+        app = create_app(token=None)
+        assert app.state.sidecar.supervised is False
 
 
 # ===========================================================================
