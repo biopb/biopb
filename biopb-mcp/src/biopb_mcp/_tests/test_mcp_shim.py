@@ -296,10 +296,14 @@ class TestFindClientProcess:
         # serve (us) -> venv launcher stub -> the client (claude). Both of our
         # processes carry the shim argv (biopb + stdio); the client carries none.
         client = _FakeProc([r"C:\claude.exe", "mcp"])
-        stub = _FakeProc([r"C:\.venv\python.exe", "-m", "biopb_mcp.mcp",
-                          "--transport", "stdio"], parent=client)
-        me = _FakeProc([r"python3.10.exe", "-m", "biopb_mcp.mcp",
-                        "--transport", "stdio"], parent=stub)
+        stub = _FakeProc(
+            [r"C:\.venv\python.exe", "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+            parent=client,
+        )
+        me = _FakeProc(
+            [r"python3.10.exe", "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+            parent=stub,
+        )
         monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
         assert _shim._find_client_process() is client
 
@@ -307,8 +311,9 @@ class TestFindClientProcess:
         # If every ancestor still looks like ours (no foreign client found), do
         # not guess -- return None so the watchdog does not arm.
         stub = _FakeProc(["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"])
-        me = _FakeProc(["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"],
-                       parent=stub)
+        me = _FakeProc(
+            ["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"], parent=stub
+        )
         monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
         assert _shim._find_client_process() is None
 
@@ -366,7 +371,9 @@ class TestClientDeathWatchdog:
         monkeypatch.setattr(
             _shim, "_reap_session", lambda p, j, s=None: events.append(("reap", s))
         )
-        monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append(("exit", code)))
+        monkeypatch.setattr(
+            _shim.os, "_exit", lambda code: events.append(("exit", code))
+        )
         _shim._client_deathwatch("HANDLE", 4242, object(), None, "sid")
         # The client's exit must both reap (de-registering the session) and exit.
         assert events == [("reap", "sid"), ("exit", 0)]
@@ -644,7 +651,9 @@ class TestServe:
 
         monkeypatch.setattr(_shim, "spawn_session", _fake_spawn)
         monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
-        monkeypatch.setattr(_shim, "_install_client_death_watchdog", lambda *a, **k: None)
+        monkeypatch.setattr(
+            _shim, "_install_client_death_watchdog", lambda *a, **k: None
+        )
         monkeypatch.setattr(_shim, "run_bridge", lambda url: calls.append("bridge"))
         monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
 
@@ -668,7 +677,9 @@ class TestServe:
             lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", None, "sid"),
         )
         monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
-        monkeypatch.setattr(_shim, "_install_client_death_watchdog", lambda *a, **k: None)
+        monkeypatch.setattr(
+            _shim, "_install_client_death_watchdog", lambda *a, **k: None
+        )
         bridged = []
         monkeypatch.setattr(_shim, "run_bridge", lambda url: bridged.append(url))
         monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)

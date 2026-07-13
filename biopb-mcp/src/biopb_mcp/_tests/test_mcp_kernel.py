@@ -1236,7 +1236,9 @@ class TestWinJobReal:
         handle = _winjob.open_for_wait(proc.pid)
         assert handle is not None
         result = {}
-        t = threading.Thread(target=lambda: result.update(done=_winjob.wait_for_process(handle)))
+        t = threading.Thread(
+            target=lambda: result.update(done=_winjob.wait_for_process(handle))
+        )
         t.start()
         try:
             assert t.is_alive()  # still blocked while the process lives
