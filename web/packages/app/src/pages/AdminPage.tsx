@@ -227,6 +227,11 @@ export function AdminPage() {
         // plane to come back, then the poll loop below confirms it's serving.
         await restartViaControl();
       } else {
+        // Not control-owned: either a standalone `biopb server start` (no
+        // control), a plane the control merely *adopts* (`--no-data-plane`, so
+        // the control must NOT ensure/spawn its own competing child), or an
+        // older sidecar without the `supervised` field. In all three the daemon
+        // owns its own lifecycle, so the sidecar self-restart is correct here.
         await client.http.restartServer();
       }
     } catch (err) {
