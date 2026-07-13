@@ -26,7 +26,6 @@ import collections
 import logging
 import os
 import re
-import secrets
 import sys
 import threading
 import time
@@ -35,6 +34,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow.flight as flight
+from biopb import _web_auth
 from biopb.tensor.client import TensorFlightClient, _request_crop_slices
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
@@ -385,15 +385,14 @@ class _SidecarContext:
             return self._client_holder["client"]
 
     def check_token(self, request: Request) -> None:
-        """Raise 401 if the request does not carry a valid token."""
-        if self.dev_mode or self.token is None:
-            return  # bypass in dev mode
-        bearer = request.headers.get("Authorization", "")
-        if bearer.startswith("Bearer "):
-            provided = bearer[len("Bearer ") :]
-        else:
-            provided = request.headers.get("X-Biopb-Token", "")
-        if not secrets.compare_digest(provided.encode(), self.token.encode()):
+        """Raise 401 if the request does not carry a valid token.
+
+        Delegates the token decision to the shared ``biopb._web_auth`` policy
+        (the single source the control uses too). Dev mode / no configured token
+        is the "no token enforced" case, expressed as a falsy ``expected``.
+        """
+        expected = None if self.dev_mode else self.token
+        if not _web_auth.token_valid(request.headers.get, expected):
             raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
@@ -408,19 +407,15 @@ def _require_same_origin(request: Request) -> None:
     The admin routes are the sidecar's first *mutating* surface. A page the
     user merely visits can fire a cross-origin ``POST``/``PUT`` at the
     loopback sidecar; it cannot read the response (CORS) but a state change
-    does not need to. So require a signal a cross-origin browser ``fetch``
-    cannot forge without a CORS preflight (which the localhost-only allowlist
-    fails): an explicit token header, or ``Sec-Fetch-Site`` that is not
-    cross-origin. Non-browser clients (curl) send no ``Sec-Fetch-Site`` and
-    are not a CSRF vector, so a missing header is allowed -- a token-gated
-    server still enforces ``check_token`` independently.
+    does not need to. The CSRF decision lives in the shared
+    ``biopb._web_auth.is_forgeable_cross_site`` policy: a request carrying a
+    token header is not forgeable, and a browser that stamped
+    ``Sec-Fetch-Site`` cross-site is the vector; a non-browser client (curl)
+    sends none and is allowed -- a token-gated server still enforces
+    ``check_token`` independently.
     """
-    if request.headers.get("Authorization") or request.headers.get("X-Biopb-Token"):
-        return
-    sec_fetch_site = request.headers.get("Sec-Fetch-Site")
-    if sec_fetch_site is None or sec_fetch_site in ("same-origin", "none"):
-        return
-    raise HTTPException(status_code=403, detail="Cross-origin request refused")
+    if _web_auth.is_forgeable_cross_site(request.headers.get):
+        raise HTTPException(status_code=403, detail="Cross-origin request refused")
 
 
 # ---------------------------------------------------------------------------
@@ -973,19 +968,16 @@ async def render_tensor(req: RenderRequest, request: Request) -> Response:
 
 
 def _ws_authorized(websocket: WebSocket, ctx: _SidecarContext) -> bool:
-    """Validate the websocket token from headers or the ``token`` query param."""
-    if ctx.dev_mode or ctx.token is None:
-        return True
-    # Check headers first (Authorization or X-Biopb-Token)
-    bearer = websocket.headers.get("Authorization", "")
-    if bearer.startswith("Bearer "):
-        provided = bearer[len("Bearer ") :]
-    else:
-        provided = websocket.headers.get("X-Biopb-Token", "")
-    # Browsers can't set custom headers on a WebSocket → accept a query param
-    if not provided:
-        provided = websocket.query_params.get("token", "")
-    return secrets.compare_digest(provided.encode(), ctx.token.encode())
+    """Validate the websocket token from headers or the ``token`` query param.
+
+    Browsers can't set custom headers on a WebSocket handshake, so the shared
+    ``biopb._web_auth`` policy accepts the ``?token=`` fallback here; dev mode /
+    no configured token is the falsy-``expected`` bypass.
+    """
+    expected = None if ctx.dev_mode else ctx.token
+    return _web_auth.token_valid_with_query(
+        websocket.headers.get, websocket.query_params.get, expected
+    )
 
 
 def _ws_crop_to_request(dask_arr: Any, ctx_: Any, y_idx: int, x_idx: int) -> Any:

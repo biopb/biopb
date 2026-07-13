@@ -53,6 +53,47 @@ class TestTokenValid:
         assert wa.token_valid(_get(), "s3cret") is False
 
 
+class TestTokenValidWithQuery:
+    """The WS variant: a ``?token=`` fallback when no header carries the token
+    (browsers can't set headers on a WebSocket handshake)."""
+
+    def _q(self, **params):
+        return params.get
+
+    def test_no_expected_token_is_open(self):
+        assert wa.token_valid_with_query(_get(), self._q(), None) is True
+
+    def test_header_token_accepted(self):
+        assert (
+            wa.token_valid_with_query(
+                _get(authorization="Bearer s3cret"), self._q(), "s3cret"
+            )
+            is True
+        )
+
+    def test_query_token_fallback_when_no_header(self):
+        assert (
+            wa.token_valid_with_query(_get(), self._q(token="s3cret"), "s3cret") is True
+        )
+
+    def test_header_wins_over_query(self):
+        # A valid header must not be overridden by a wrong query param.
+        assert (
+            wa.token_valid_with_query(
+                _get(authorization="Bearer s3cret"), self._q(token="wrong"), "s3cret"
+            )
+            is True
+        )
+
+    def test_wrong_query_token(self):
+        assert (
+            wa.token_valid_with_query(_get(), self._q(token="nope"), "s3cret") is False
+        )
+
+    def test_missing_token_everywhere(self):
+        assert wa.token_valid_with_query(_get(), self._q(), "s3cret") is False
+
+
 class TestForgeableCrossSite:
     def test_token_header_is_never_forgeable(self):
         # A cross-origin no-cors fetch can't set Authorization, so its presence
