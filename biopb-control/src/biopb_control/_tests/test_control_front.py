@@ -4,10 +4,12 @@ Concerns beyond the health/ensure control API (covered in ``test_supervisor``):
 (1) the control's own routes win, (2) the ``/data_plane`` namespace faithfully
 reverse-proxies to the tensor web sidecar -- method, path, query, headers,
 request/response bodies, and the ``/ws/render`` WebSocket -- with the mount
-prefix stripped, and (3) ``/`` serves the control's own dashboard, which is
-backed by the in-process ``/api/status`` + ``/api/sessions`` control API. A
-trivial stdlib HTTP server and a ``websockets`` echo server stand in for the
-tensor sidecar so no real tensor server is needed.
+prefix stripped, and (3) the control is the single web origin: it serves the
+built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
+links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
+as real files. A trivial stdlib HTTP server and a ``websockets`` echo server
+stand in for the tensor sidecar so no real tensor server is needed; a tmp bundle
+stands in for ``web/packages/app/dist``.
 """
 
 import json
@@ -92,13 +94,29 @@ def _isolated_sessions(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def control(upstream, tmp_path):
-    """The control front, proxying to ``upstream``; yields its base URL."""
+def web_bundle(tmp_path):
+    """A minimal built SPA bundle for the control to serve (index.html + one
+    hashed asset). The real bundle is ``web/packages/app/dist``; here a stand-in
+    is enough to exercise static-file serving + the SPA shell fallback."""
+    d = tmp_path / "webapp"
+    (d / "assets").mkdir(parents=True)
+    (d / "index.html").write_text(
+        '<!doctype html><div id="root"></div><!-- biopb-spa-shell -->'
+    )
+    (d / "assets" / "app.js").write_text("console.log('biopb');")
+    return d
+
+
+@pytest.fixture
+def control(upstream, tmp_path, web_bundle):
+    """The control front, serving ``web_bundle`` and proxying the data plane to
+    ``upstream``; yields its base URL."""
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
         grpc_port=_free_port(),  # closed: no data plane needed for proxy tests
         server_log=tmp_path / "server.log",
+        static_dir=web_bundle,
     )
     sup = DataPlaneSupervisor(spec)
     api_port = _free_port()
@@ -130,18 +148,34 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_root_serves_the_control_dashboard(control):
-    # `/` is the control's own buildless dashboard, not a redirect or the proxy.
+def test_root_serves_the_spa_shell(control):
+    # `/` serves the SPA shell (index.html) from the bundle, not a redirect or
+    # the proxy. The React router then renders the dashboard for this path.
     status, headers, body = _get(f"{control}/")
     assert status == 200
     assert "text/html" in (headers.get("Content-Type") or "")
     html = body.decode()
-    assert "biopb · control" in html  # its title/header
-    # It polls the in-process control API, not the data-plane proxy.
-    assert "/api/status" in html
-    assert "/api/sessions" in html
-    assert "/api/algorithms" in html  # the algorithm-plane section polls it
+    assert "biopb-spa-shell" in html  # the served index.html
+    assert '<div id="root">' in html
     assert "path" not in html  # not the echo upstream's response
+
+
+def test_deep_link_falls_back_to_the_spa_shell(control):
+    # A client route that names no static file (/viewer) must serve index.html so
+    # the SPA boots and routes client-side, not 404.
+    for path in ("viewer", "admin", "unlock"):
+        status, headers, body = _get(f"{control}/{path}")
+        assert status == 200, path
+        assert "text/html" in (headers.get("Content-Type") or "")
+        assert "biopb-spa-shell" in body.decode(), path
+
+
+def test_static_asset_is_served_from_the_bundle(control):
+    # A real file in the bundle is served as itself (not the SPA shell), so the
+    # hashed JS/CSS resolve at the control root.
+    status, _headers, body = _get(f"{control}/assets/app.js")
+    assert status == 200
+    assert "console.log('biopb')" in body.decode()
 
 
 def test_api_status_reports_control_and_data_plane(control):
@@ -312,7 +346,7 @@ _TOKEN = "test-control-token-123"
 
 
 @pytest.fixture
-def tokened_control(upstream, tmp_path):
+def tokened_control(upstream, tmp_path, web_bundle):
     """A control configured with a data-plane token; its /api/* is gated by it."""
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
@@ -320,6 +354,7 @@ def tokened_control(upstream, tmp_path):
         grpc_port=_free_port(),
         server_log=tmp_path / "server.log",
         token=_TOKEN,
+        static_dir=web_bundle,
     )
     sup = DataPlaneSupervisor(spec)
     api_port = _free_port()
@@ -382,11 +417,12 @@ def test_ensure_verb_is_exempt_from_token(tmp_path, upstream):
         server.shutdown()
 
 
-def test_health_and_dashboard_are_exempt_from_token(tokened_control):
-    # The liveness probe and the dashboard shell must load without a token (the
-    # shell then sends the token on its /api/* fetches).
+def test_health_and_spa_shell_are_exempt_from_token(tokened_control):
+    # The liveness probe and the SPA shell must load without a token (the shell's
+    # JS then sends the token on its /api/* fetches).
     assert _get(f"{tokened_control}/health")[0] == 200
     assert _get(f"{tokened_control}/")[0] == 200
+    assert _get(f"{tokened_control}/viewer")[0] == 200  # deep link, still tokenless
 
 
 def test_data_plane_proxy_is_not_gated_by_the_control_token(tokened_control):
@@ -434,13 +470,14 @@ def test_data_api_is_proxied_with_prefix_stripped_query_and_auth(control):
     assert echoed["auth"] == "Bearer sekret"  # auth forwarded for re-validation
 
 
-def test_dataviewer_static_is_proxied_with_prefix_stripped(control):
-    # The /data_plane/viewer mount strips its (longer) prefix down to the sidecar
-    # root, where the static app lives -- so assets resolve.
-    _status, _headers, body = _get(f"{control}/data_plane/viewer/assets/app.js")
-    assert json.loads(body)["path"] == "/assets/app.js"
-    _status, _headers, root_body = _get(f"{control}/data_plane/viewer/")
-    assert json.loads(root_body)["path"] == "/"  # index.html at the sidecar root
+def test_data_plane_only_proxies_the_api_not_static(control):
+    # The sidecar no longer serves static assets (the control owns the whole UI),
+    # so there is no /data_plane/viewer mount. Only the data API/ws/health proxy
+    # under /data_plane; the viewer itself is a control-served SPA route (/viewer,
+    # covered above). A /data_plane/api/* call still reaches the sidecar.
+    status, _headers, body = _get(f"{control}/data_plane/api/sources")
+    assert status == 200
+    assert json.loads(body)["path"] == "/api/sources"
 
 
 def test_latin1_response_header_is_proxied_not_500(control):
@@ -679,11 +716,18 @@ def _register_session(session_id, upstream_url):
     _config_sessions.register(session_id, host=u.hostname, port=u.port, pid=os.getpid())
 
 
-def test_session_observe_is_proxied_prefix_stripped(control, upstream):
+def test_session_observe_serves_the_spa_shell(control, upstream):
+    # The observe *page* is the control-served SPA shell (React ObservePage), NOT
+    # proxied to the child -- only its /api/* calls are. A live session gets the
+    # shell; the SPA then reads its id from the path and calls /session/<id>/api/*.
+    # (An unknown/dead session -> 404, see test_unknown_session_returns_404.)
     _register_session("20260101-000000-42", upstream)
-    _status, _headers, body = _get(f"{control}/session/20260101-000000-42/observe")
-    # /session/<id> stripped by the Mount; the child sees a root-relative path.
-    assert json.loads(body)["path"] == "/observe"
+    status, headers, body = _get(f"{control}/session/20260101-000000-42/observe")
+    assert status == 200
+    assert "text/html" in (headers.get("Content-Type") or "")
+    html = body.decode()
+    assert "biopb-spa-shell" in html  # the control's index.html, not the child
+    assert "path" not in html  # not the echo upstream's proxied response
 
 
 def test_session_api_is_proxied_with_query(control, upstream):
@@ -708,10 +752,11 @@ def test_session_proxy_drops_host_and_origin(control, upstream):
     assert echoed["host"] == f"127.0.0.1:{port}"  # Host set to the loopback target
 
 
-def test_session_proxy_allowlists_observe_surface(control, upstream):
-    # Only /observe + /api/* are proxied. The child's /mcp agent transport (RCE,
-    # and this hop strips its Host/Origin auth) must never be reachable -- not
-    # directly, and not via a dot-traversal that httpx would collapse to /mcp.
+def test_session_proxy_allowlists_api_surface(control, upstream):
+    # Only /api/* is proxied to the child (the /observe page is the control's own
+    # SPA shell). The child's /mcp agent transport (RCE, and this hop strips its
+    # Host/Origin auth) must never be reachable -- not directly, and not via a
+    # dot-traversal that httpx would collapse to /mcp.
     _register_session("s1", upstream)
     forbidden = [
         "mcp",  # direct

@@ -1,4 +1,7 @@
-"""Tests for the observe web UI (_observe.py).
+"""Tests for the observe data API (_observe.py).
+
+The observe *page* is served by the control front (the React SPA in ``web/``);
+this module covers only the child's ``/api/*`` that the page calls.
 
 Routes are exercised over the standalone Starlette app via Starlette's
 ``TestClient`` — no real socket, no real kernel. The kernel is a ``MagicMock``
@@ -82,26 +85,10 @@ def client():
 # -- happy paths ------------------------------------------------------------
 
 
-def test_observe_page_serves_html(client):
-    r = client.get("/observe")
-    assert r.status_code == 200
-    assert "biopb-mcp" in r.text and "/api/jobs" in r.text
-    # The poll interval is baked into the page (placeholder substituted).
-    assert "__POLL_MS__" not in r.text
-    assert "3000" in r.text
-
-
-def test_observe_page_rebases_api_calls_for_fronting(client):
-    # Behind the control front the page is served at /session/<id>/observe, so its
-    # API calls must target /session/<id>/api/* -- not the control's own root
-    # /api/*. It derives the base from window.location and prefixes every call, so
-    # the same page works served directly (BASE "") or behind the prefix.
-    html = client.get("/observe").text
-    assert "const BASE = window.location.pathname" in html
-    assert "BASE + '/api/jobs'" in html  # calls go through BASE
-    # No bare root-absolute API call is left that would escape the session prefix.
-    assert "fetch('/api" not in html
-    assert "jpost('/api" not in html
+def test_observe_page_is_not_served_by_the_child(client):
+    # The observe *page* moved to the control-served SPA (web/); this child hosts
+    # only the /api/* the page calls, so the old /observe route is gone (404).
+    assert client.get("/observe").status_code == 404
 
 
 def test_api_jobs_lists_summary(client, host):
@@ -237,6 +224,9 @@ def test_api_status(client):
     body = r.json()
     assert body["alive"] is True and body["ready"] is True
     assert body["headless"] is False
+    # The observe SPA (served by the control, so unable to be server-templated)
+    # reads the launcher-tuned poll cadence off the status payload.
+    assert body["poll_interval_ms"] == 3000
 
 
 # -- no kernel host ---------------------------------------------------------
@@ -254,11 +244,6 @@ def test_api_503_without_host(client):
     ]:
         r = getattr(client, method)(path)
         assert r.status_code == 503, path
-
-
-def test_observe_page_without_host(client):
-    _server._kernel_host = None
-    assert client.get("/observe").status_code == 200
 
 
 # -- truncation -------------------------------------------------------------
@@ -358,7 +343,9 @@ def test_describe_http_uses_mcp_port():
     _observe._mounted_http = True
     d = _observe.describe(8765)
     assert d["running"] is True
-    assert d["url"] == "http://127.0.0.1:8765/observe"
+    # The child hosts the observe /api/* (the page itself is served by the
+    # control front), so describe() points at the API root.
+    assert d["url"] == "http://127.0.0.1:8765/api"
     assert "http" in d["mode"]
 
 

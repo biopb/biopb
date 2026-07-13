@@ -582,7 +582,9 @@ class TestServerStatus:
         monkeypatch.setattr(_observe, "_mounted_http", True)
         result = _server.server_status()
         assert "## Observe" in result
-        assert "/observe" in result
+        # The observe page is served by the control front; this child hosts only
+        # the /api/* it calls, so server_status points at the API mount.
+        assert "/api" in result
         assert "http://127.0.0.1:" in result
 
     def test_reports_observe_even_when_kernel_not_initialized(self, monkeypatch):
@@ -593,7 +595,7 @@ class TestServerStatus:
         monkeypatch.setattr(_observe, "_mounted_http", True)
         result = _server.server_status()
         assert "## Observe" in result
-        assert "/observe" in result
+        assert "/api" in result
 
     def test_starting_kernel_skips_query(self, server_with_host):
         # Kernel still booting (launcher serves the handshake first): report the

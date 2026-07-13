@@ -21,18 +21,23 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      dashboard polls).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
-- ``GET  /``                      -> the control's own **buildless dashboard** — a
-                                     single embedded HTML+vanilla-JS page (the
-                                     ``_observe.py`` pattern, no Vite/npm build) that
-                                     polls the two APIs above, exposes the data-plane
-                                     controls, and links to the dataviewer + each
-                                     session's observe page.
-- ``/data_plane/viewer[/*]`` and ``/data_plane/{api,ws,livez,...}`` are
-  reverse-proxied to the supervised tensor server's HTTP sidecar. Each is a
-  ``Mount`` that strips its prefix, so the sidecar (which serves ``/`` +
-  ``/api/*`` + ``/ws/render`` at its own root) needs no knowledge of the
-  ``/data_plane`` namespace. Auth headers pass straight through; the sidecar
-  re-validates.
+- ``GET  /`` (and every other non-API, non-proxy GET) -> the built ``web/``
+                                     SPA bundle (``static_dir``). The control is
+                                     the **single web origin**: it serves the
+                                     bundle's static assets and falls back to
+                                     ``index.html`` for deep links, so the
+                                     dashboard (``/``), the dataviewer
+                                     (``/viewer``), and each session's observe
+                                     shell (``/session/<id>/observe``) are all
+                                     React routes of that one SPA — no build-time
+                                     namespacing, base ``/``. (No bundle ->
+                                     API-only.)
+- ``/data_plane/{api,ws,livez,...}`` is reverse-proxied to the supervised tensor
+  server's HTTP sidecar — a ``Mount`` that strips its prefix, so the sidecar
+  (which serves ``/api/*`` + ``/ws/render`` at its own root) needs no knowledge of
+  the ``/data_plane`` namespace. The sidecar no longer serves static assets (the
+  control owns the whole UI), so there is no ``/data_plane/viewer`` mount. Auth
+  headers pass straight through; the sidecar re-validates.
 
 The three ``/api/*`` namespaces therefore never collide: the control's own API is
 ``/api/*``, the data plane's is ``/data_plane/api/*``, and (later) each session's
@@ -43,20 +48,21 @@ Keeping the control lean (invariant I2) still holds: the ASGI stack
 pyarrow, and the tensor server is still a *supervised subprocess* the control
 never imports — the proxy reaches it over loopback like any other client.
 
-- ``/session/<id>/*`` is reverse-proxied to the shim-owned MCP session child on
-  its dynamic loopback port, resolved per-request from the filesystem registry
-  (``biopb._config_sessions``). The observe UI (``/session/<id>/observe`` +
-  ``/session/<id>/api/*``) is the consumer; an unknown or dead session yields a
-  clean 404 (and the dead record is pruned). Unlike the data-plane proxy, this
-  hop drops both ``Host`` and ``Origin``: httpx then sets ``Host`` to the
-  loopback target (satisfying the child's own loopback Host guard) and the absent
-  ``Origin`` passes its Origin guard — so the trusted control→child hop is
+- ``/session/<id>/observe`` serves the control's own SPA shell (the React
+  ObservePage), while ``/session/<id>/api/*`` is reverse-proxied to the shim-owned
+  MCP session child on its dynamic loopback port, resolved per-request from the
+  filesystem registry (``biopb._config_sessions``); an unknown or dead session
+  yields a clean 404 (and the dead record is pruned). Unlike the data-plane proxy,
+  the ``/api/*`` hop drops both ``Host`` and ``Origin``: httpx then sets ``Host``
+  to the loopback target (satisfying the child's own loopback Host guard) and the
+  absent ``Origin`` passes its Origin guard — so the trusted control→child hop is
   accepted regardless of which external hostname the browser used to reach the
   control. (Rebinding/token protection for the origin as a whole is a §6.1
   follow-up, same as the data-plane proxy's.)
 
-This module lands the namespaced origin, the data-plane proxy, per-session observe
-routing, and the control-owned dashboard — the full Layer-3 single-origin front.
+This module lands the namespaced origin, the data-plane API proxy, per-session
+observe routing, and the control-served SPA bundle — the full Layer-3
+single-origin front.
 """
 
 from __future__ import annotations
@@ -67,6 +73,7 @@ import logging
 import socket
 import sys
 import threading
+from pathlib import Path
 
 import httpx
 import uvicorn
@@ -77,7 +84,7 @@ from starlette.datastructures import Headers
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import (
-    HTMLResponse,
+    FileResponse,
     JSONResponse,
     Response,
     StreamingResponse,
@@ -103,14 +110,16 @@ _HOP_BY_HOP = frozenset(
     {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade"}
 )
 
-# The only session-child surfaces the control will proxy: the observe page and
-# its data API (matched by first path segment). This is an ALLOWLIST on purpose —
-# the child also serves /mcp (the agent RCE transport) on the same port, and this
-# hop strips its only auth (Host/Origin), so anything not explicitly allowed must
-# be refused. A denylist would be unsafe: httpx normalizes dot-segments, so a
-# traversal like `api/../mcp` (or its %2e%2e form, already decoded by the ASGI
-# server) collapses to /mcp past a naive "startswith('mcp')" check.
-_SESSION_ALLOWED_ROOTS = frozenset({"observe", "api"})
+# The only session-child surface the control will proxy: its data API (matched by
+# first path segment). The observe *page* is now the SPA shell the control serves
+# itself (/session/<id>/observe -> index.html); only its /api/* data calls reach
+# the child. This is an ALLOWLIST on purpose — the child also serves /mcp (the
+# agent RCE transport) on the same port, and this hop strips its only auth
+# (Host/Origin), so anything not explicitly allowed must be refused. A denylist
+# would be unsafe: httpx normalizes dot-segments, so a traversal like
+# `api/../mcp` (or its %2e%2e form, already decoded by the ASGI server) collapses
+# to /mcp past a naive "startswith('mcp')" check.
+_SESSION_ALLOWED_ROOTS = frozenset({"api"})
 
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
 # (GET/HEAD/OPTIONS) don't.
@@ -267,6 +276,7 @@ def build_app(
     ensure_timeout: float,
     data_web_url: str,
     token: str | None = None,
+    static_dir: str | Path | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -274,12 +284,25 @@ def build_app(
     HTTP sidecar; the ``/data_plane`` namespace reverse-proxies there. ``token``
     is the data-plane access token (``None`` in the all-localhost dev-bypass
     case); the ``/api/*`` gate enforces it when set, else falls back to a loopback
-    Host check. Split out from :func:`serve_control_api` so it is unit-testable
+    Host check. ``static_dir`` is the built ``web/`` bundle (``web/packages/app/
+    dist``); when present the control serves it at its root as the single web
+    origin — the dashboard (``/``), the dataviewer (``/viewer``), and each
+    session's observe shell (``/session/<id>/observe``) are all React routes of
+    that one SPA. Split out from :func:`serve_control_api` so it is unit-testable
     against a fake upstream without binding uvicorn.
     """
     ws_base = data_web_url.replace("http://", "ws://", 1).replace(
         "https://", "wss://", 1
     )
+
+    # The built SPA bundle the control serves at its root (None / missing ->
+    # API-only: the control still answers /health + /api/* + the proxies, but
+    # serves no web UI). Resolved once; index.html is the SPA shell every
+    # non-API, non-proxy GET falls back to.
+    web_root = Path(static_dir) if static_dir else None
+    if web_root is not None and not (web_root / "index.html").is_file():
+        logger.warning("web bundle not found at %s; serving API only", web_root)
+        web_root = None
 
     # One pooled client to the sidecar for the process lifetime; no timeout so
     # large slice responses and long-poll probes are never cut off. Held in a
@@ -443,11 +466,28 @@ def build_app(
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
-    async def root(_request: Request) -> Response:
-        # The control's own buildless dashboard (single embedded page, no build
-        # step). It polls /api/status + /api/sessions and drives the data-plane
-        # verbs above.
-        return HTMLResponse(_DASHBOARD_HTML)
+    def _serve_shell() -> Response:
+        # The SPA shell (index.html) every non-API GET falls back to; the React
+        # router then renders the right surface for the URL. web_root is checked
+        # by the caller, so index.html exists here.
+        assert web_root is not None
+        return FileResponse(web_root / "index.html")
+
+    async def spa(request: Request) -> Response:
+        # Catch-all for the single web origin: serve a real static file from the
+        # bundle when the path names one (/assets/<hash>, /favicon.ico, …), else
+        # the SPA shell so a deep link like /viewer or /admin boots the router.
+        # Registered LAST, after every API route and proxy mount, so it never
+        # shadows them.
+        if web_root is None:
+            return JSONResponse({"error": "web bundle not installed"}, status_code=404)
+        rel = request.path_params["path"].lstrip("/")
+        if rel:
+            candidate = (web_root / rel).resolve()
+            # Contain traversal: only serve files that resolve inside web_root.
+            if web_root.resolve() in candidate.parents and candidate.is_file():
+                return FileResponse(candidate)
+        return _serve_shell()
 
     # --- reverse proxy into the tensor server's HTTP sidecar ---------------- #
     # Handlers forward the *mount-relative* path (``Mount`` has already stripped
@@ -514,14 +554,15 @@ def build_app(
         # 404 (and the dead record is pruned by resolve()).
         session_id = request.path_params["session_id"]
         sub_path = request.path_params["path"]
-        # Allowlist the browser observe surface only (§6.1). The child's /mcp
-        # agent transport is deliberately off this origin — agents reach it
-        # directly on the child's own loopback port (stdio shim bridge /
-        # `biopb mcp view`), never via the control — and this hop strips /mcp's
-        # entire auth (Host/Origin), so exposing it would be an RCE hole on the
-        # public origin. Require an allowed first segment AND reject any
-        # parent-traversal, so no path (raw, encoded, or dot-collapsed by httpx)
-        # can escape /observe + /api/* into /mcp.
+        # Allowlist the session data API only (§6.1) — the observe page itself is
+        # the control-served SPA shell (session_observe below), so only /api/*
+        # proxies here. The child's /mcp agent transport is deliberately off this
+        # origin — agents reach it directly on the child's own loopback port
+        # (stdio shim bridge / `biopb mcp view`), never via the control — and this
+        # hop strips /mcp's entire auth (Host/Origin), so exposing it would be an
+        # RCE hole on the public origin. Require an allowed first segment AND
+        # reject any parent-traversal, so no path (raw, encoded, or dot-collapsed
+        # by httpx) can escape /api/* into /mcp.
         segments = sub_path.split("/")
         if segments[0] not in _SESSION_ALLOWED_ROOTS or ".." in segments:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -565,11 +606,27 @@ def build_app(
             background=BackgroundTask(resp.aclose),
         )
 
-    # One sub-app proxying to the sidecar root, mounted at BOTH /data_plane/viewer
-    # (the dataviewer's static base) and /data_plane (its /api, /ws, health). Each
-    # Mount strips its own prefix, so the same handlers serve both without the
-    # sidecar knowing the namespace. Reusing one instance is safe -- it is
-    # stateless (routes only). /ws/render must precede the catch-all.
+    async def session_observe(request: Request) -> Response:
+        # The observe *page* is the control-served SPA shell (React ObservePage);
+        # only its /api/* data calls proxy to the child (session_proxy above).
+        # Resolve the session first so an unknown/dead id is a clean 404 rather
+        # than a shell wired to a session that no longer exists.
+        if web_root is None:
+            return JSONResponse({"error": "web bundle not installed"}, status_code=404)
+        session_id = request.path_params["session_id"]
+        if _config_sessions.resolve(session_id) is None:
+            return JSONResponse(
+                {"error": f"session {session_id!r} not found or ended"},
+                status_code=404,
+            )
+        return _serve_shell()
+
+    # One sub-app proxying to the sidecar root, mounted at /data_plane (the data
+    # plane's /api, /ws/render, health). It strips its prefix, so the sidecar
+    # needs no knowledge of the namespace. (The dataviewer's static assets are no
+    # longer proxied out of the sidecar — the control serves the whole SPA itself,
+    # so there is no /data_plane/viewer mount.) /ws/render must precede the
+    # catch-all.
     sidecar = Starlette(
         routes=[
             WebSocketRoute("/ws/render", ws_proxy),
@@ -581,10 +638,11 @@ def build_app(
         ]
     )
 
-    # A session sub-app mounted under /session/{session_id}; its catch-all strips
-    # nothing further (session_proxy reads {session_id} + {path} from path_params).
+    # A session sub-app mounted under /session/{session_id}: /observe serves the
+    # control's SPA shell, everything else (/api/*) proxies to the child.
     session_app = Starlette(
         routes=[
+            Route("/observe", session_observe, methods=["GET"]),
             Route(
                 "/{path:path}",
                 session_proxy,
@@ -604,14 +662,19 @@ def build_app(
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
-        Route("/", root, methods=["GET"]),
-        # /data_plane/viewer FIRST so it wins over the broader /data_plane mount.
-        Mount("/data_plane/viewer", sidecar),
         Mount("/data_plane", sidecar),
-        # Per-session observe: /session/<id>/observe + /session/<id>/api/*. The
-        # {session_id} convertor is slash-free (session ids are), so it stops at
-        # the first slash and the remainder falls to the catch-all.
+        # Per-session observe: /session/<id>/observe (SPA shell) + /session/<id>/
+        # api/* (proxied). The {session_id} convertor is slash-free (session ids
+        # are), so it stops at the first slash and the remainder falls to the
+        # session sub-app.
         Mount("/session/{session_id}", session_app),
+        # The single web origin's catch-all: static asset or SPA shell. LAST so
+        # every API route and proxy mount above wins first.
+        Route(
+            "/{path:path}",
+            spa,
+            methods=["GET", "HEAD"],
+        ),
     ]
 
     @contextlib.asynccontextmanager
@@ -704,7 +767,13 @@ def serve_control_api(
     # The data-plane token gates the control's own /api/* too (single origin,
     # §6.1). None in the all-localhost dev-bypass case -> the gate falls back to a
     # loopback Host check instead.
-    app = build_app(supervisor, ensure_timeout, data_web_url, token=spec.token)
+    app = build_app(
+        supervisor,
+        ensure_timeout,
+        data_web_url,
+        token=spec.token,
+        static_dir=spec.static_dir,
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":
@@ -743,353 +812,3 @@ def serve_control_api(
     thread.start()
     logger.info("Control plane origin listening on http://%s:%d", host, port)
     return _ControlServer(server), thread
-
-
-# ---------------------------------------------------------------------------
-# The control's own root dashboard (single static page; vanilla JS, no build
-# step -- the same buildless pattern as biopb_mcp's _observe.py, so the lean
-# control needs no Vite/npm toolchain). It polls /api/status + /api/sessions and
-# POSTs the data-plane verbs. Served at "/", which is this origin's root, so its
-# API calls are plain root-absolute "/api/*".
-# ---------------------------------------------------------------------------
-
-# The biopb mark (the tensor server's favicon-32.png) embedded as a data URI so
-# the tab icon is self-contained -- the dashboard renders it whether or not the
-# data plane is up, and the control needs no static-asset route of its own. Kept
-# on one line so no accidental whitespace enters the base64 payload.
-_FAVICON = "data:image/png;base64,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"  # noqa: E501
-
-_DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>biopb · control</title>
-<link rel="icon" type="image/png" href="__FAVICON__">
-<style>
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
-  header { padding: 10px 16px; background: #1b1b1b; border-bottom: 1px solid #333;
-           display: flex; align-items: center; gap: 12px; position: sticky; top: 0; }
-  h1 { font-size: 15px; margin: 0; font-weight: 600; }
-  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a8;
-       margin: 0 0 10px; }
-  #conn { font-size: 12px; color: #9aa; margin-left: auto; }
-  main { padding: 16px; max-width: 760px; }
-  .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
-          background: #161616; }
-  .badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; text-transform: uppercase;
-           vertical-align: middle; }
-  .serving { background: #243; color: #7e7; }
-  .starting { background: #234; color: #8bf; }
-  .down, .conflict { background: #422; color: #f99; }
-  .stopped, .unknown { background: #333; color: #aaa; }
-  dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 12px 0 0; }
-  dt { color: #888; }
-  dd { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
-  .err { color: #f99; }
-  .controls { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  button { font: inherit; padding: 4px 12px; border: 1px solid #444; border-radius: 4px;
-           background: #222; color: #ddd; cursor: pointer; }
-  button:hover:not(:disabled) { background: #2c2c2c; }
-  button:disabled { opacity: .45; cursor: default; }
-  button.danger { border-color: #844; }
-  a.link { color: #8bf; text-decoration: none; margin-left: auto; }
-  /* Only the first link in a run is right-pushed; siblings sit next to it. */
-  a.link + a.link { margin-left: 0; }
-  a.link:hover { text-decoration: underline; }
-  a.link.off { color: #667; pointer-events: none; }
-  ul { list-style: none; margin: 0; padding: 0; }
-  li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid #262626; }
-  li:first-child { border-top: 0; }
-  .sid { font-family: ui-monospace, Menlo, monospace; font-weight: 600; }
-  .when { color: #888; font-size: 12px; }
-  .empty { color: #777; padding: 6px 0; }
-  a.obs { color: #7e7; text-decoration: none; }
-  a.obs:hover { text-decoration: underline; }
-  /* Kernel (the heavy, on-demand component) state per session. Pushed right so
-     it groups with the observe link. */
-  .kbadge { margin-left: auto; font-size: 11px; padding: 1px 8px; border-radius: 10px;
-            white-space: nowrap; }
-  .k-ready { background: #243; color: #7e7; }
-  .k-busy { background: #143; color: #9d7; }
-  .k-starting { background: #234; color: #8bf; }
-  .k-none { background: #2a2a2a; color: #999; }
-  .k-error { background: #422; color: #f99; }
-  .k-unknown { background: #2a2a2a; color: #777; }
-  .mini { padding: 0 8px; font-size: 12px; margin-left: 8px; vertical-align: middle; }
-  .state { color: #888; font-size: 12px; }
-  .note { color: #667; font-size: 12px; margin: 12px 0 0; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #555;
-         display: inline-block; flex: none; }
-  .dot.registered { background: #7e7; }
-  .dot.installed { background: #8bf; }
-  .dot.drift { background: #fb4; }
-  .agent-btns { margin-left: auto; display: flex; gap: 6px; }
-  button.warn { border-color: #a83; color: #fc9; }
-  .dot.serving { background: #7e7; }
-  .dot.down { background: #f77; }
-  .tls { font-size: 10px; color: #8bf; border: 1px solid #345; border-radius: 3px;
-         padding: 0 4px; margin-left: 6px; vertical-align: middle; }
-  .ops { margin-left: auto; color: #789; font-size: 12px; max-width: 55%;
-         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-         font-family: ui-monospace, Menlo, monospace; }
-  .ops.err { color: #d88; }
-</style>
-</head>
-<body>
-<header>
-  <h1>biopb · control</h1>
-  <span id="conn">…</span>
-</header>
-<main>
-  <div class="card">
-    <h2>Data plane</h2>
-    <div><span id="dp-badge" class="badge unknown">unknown</span></div>
-    <dl id="dp-fields"></dl>
-    <div class="controls">
-      <button id="ensure">Ensure up</button>
-      <button id="restart">Restart</button>
-      <button id="stop" class="danger">Stop</button>
-      <a id="viewer" class="link off" href="/data_plane/viewer/"
-         target="_blank" rel="noopener">View Data →</a>
-      <a id="config" class="link off" href="/data_plane/viewer/admin"
-         target="_blank" rel="noopener">Config →</a>
-    </div>
-  </div>
-  <div class="card">
-    <h2>Algorithm plane<button id="algos-refresh" class="mini">↻</button></h2>
-    <ul id="algos"><li class="empty">loading…</li></ul>
-    <p class="note">Read-only view of the biopb.image ProcessImage servers
-       configured for agent kernels, with a live health + ops probe. Lifecycle
-       control is not offered here.</p>
-  </div>
-  <div class="card">
-    <h2>Agent clients<button id="agents-refresh" class="mini">↻</button></h2>
-    <ul id="agents"><li class="empty">loading…</li></ul>
-    <p class="note">Registers biopb-mcp with the client. Restart the client after
-       (un)registering for the change to take effect.</p>
-  </div>
-  <div class="card">
-    <h2>Agent sessions</h2>
-    <ul id="sessions"><li class="empty">loading…</li></ul>
-  </div>
-</main>
-<script>
-const POLL = 3000;
-
-function el(id) { return document.getElementById(id); }
-// Escape for BOTH text and attribute (href="...") contexts: the textContent
-// trick only covers &<>, not quotes, so an interpolated value in an attribute
-// could break out. Server-built values are trusted today (session ids are
-// <ts>-<pid>), but escape totally so a future registry field can't inject.
-function esc(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// The control's own /api/* is token-gated at this single origin. Reuse the
-// dataviewer's sessionStorage token (same origin now, key 'biopb_token') as an
-// Authorization: Bearer header; on a 401, prompt once and retry. In the common
-// no-token localhost deployment there is no token and the header is just absent.
-async function fetchAuth(url, opts) {
-  opts = opts || {};
-  const t = sessionStorage.getItem('biopb_token');
-  opts.headers = Object.assign({}, opts.headers,
-                               t ? {Authorization: 'Bearer ' + t} : {});
-  const r = await fetch(url, opts);
-  if (r.status === 401 && !opts._retried) {
-    const nt = prompt('Access token required:');
-    if (nt) {
-      sessionStorage.setItem('biopb_token', nt);
-      opts._retried = true;
-      return fetchAuth(url, opts);
-    }
-  }
-  return r;
-}
-
-async function jpost(url) {
-  try {
-    const r = await fetchAuth(url, {method: 'POST'});
-    return await r.json().catch(() => ({}));
-  } catch (e) { return {error: String(e)}; }
-}
-
-function renderDataPlane(dp) {
-  const state = (dp && dp.state) || 'unknown';
-  const badge = el('dp-badge');
-  badge.textContent = state;
-  badge.className = 'badge ' + state;
-  const rows = [
-    ['gRPC', dp.grpc_url],
-    ['Web', dp.web_url],
-    ['PID', dp.pid == null ? '—' : dp.pid],
-    ['Restarts', dp.restarts == null ? 0 : dp.restarts],
-  ];
-  let html = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + esc(v) + '</dd>').join('');
-  if (dp.last_error) html += '<dt>Error</dt><dd class="err">' + esc(dp.last_error) + '</dd>';
-  el('dp-fields').innerHTML = html;
-  // The dataviewer and its admin/config page are only reachable once the sidecar
-  // is up behind a serving plane.
-  const off = state !== 'serving';
-  el('viewer').classList.toggle('off', off);
-  el('config').classList.toggle('off', off);
-}
-
-async function pollStatus() {
-  let s;
-  try { s = await (await fetchAuth('/api/status')).json(); }
-  catch (e) { el('conn').textContent = 'control unreachable'; return; }
-  el('conn').textContent = 'control: ok · ' + (s.sessions || 0) + ' session(s)';
-  renderDataPlane(s.data_plane || {});
-}
-
-// A per-session kernel badge: the kernel is the heavy component and starts on
-// demand, so surfacing whether one is attached (and its state) is the useful
-// signal. 'none' reads as "no kernel"; every other state is shown verbatim.
-function kernelBadge(k) {
-  k = k || 'unknown';
-  const label = k === 'none' ? 'no kernel' : 'kernel: ' + k;
-  return '<span class="kbadge k-' + esc(k) + '">' + esc(label) + '</span>';
-}
-
-async function pollSessions() {
-  let data;
-  try { data = await (await fetchAuth('/api/sessions')).json(); }
-  catch (e) { return; }
-  const list = (data && data.sessions) || [];
-  const box = el('sessions');
-  if (!list.length) { box.innerHTML = '<li class="empty">no agent sessions</li>'; return; }
-  box.innerHTML = list.map(s => {
-    const when = s.started_at ? new Date(s.started_at * 1000).toLocaleTimeString() : '';
-    return '<li><span class="sid">' + esc(s.session_id) + '</span>'
-      + '<span class="when">:' + esc(s.port) + (when ? ' · ' + esc(when) : '') + '</span>'
-      + kernelBadge(s.kernel)
-      + '<a class="obs" href="' + esc(s.observe_url) + '" target="_blank" rel="noopener">observe →</a></li>';
-  }).join('');
-}
-
-// The agent-client buttons for one row. not_installed rows get none; a
-// registered row offers Re-register (amber when the stored command has drifted
-// from the current biopb-mcp location) + Unregister; installed offers Register.
-function agentButtons(a) {
-  if (a.state === 'not_installed') return '';
-  const id = esc(a.id);
-  if (a.state === 'registered') {
-    const cls = a.drifted ? ' class="warn"' : '';
-    const label = a.drifted ? 'Re-register (update)' : 'Re-register';
-    return '<button data-act="register" data-id="' + id + '"' + cls + '>' + label + '</button>'
-      + '<button data-act="unregister" data-id="' + id + '" class="danger">Unregister</button>';
-  }
-  return '<button data-act="register" data-id="' + id + '">Register</button>';
-}
-
-// Fetched on load / after an action / via the ↻ button -- deliberately NOT on
-// the status+sessions poll interval: reading agent status touches third-party
-// config files, and nothing here changes on its own between user actions.
-async function pollAgents() {
-  let data;
-  try { data = await (await fetchAuth('/api/agents')).json(); }
-  catch (e) { return; }
-  const list = (data && data.agents) || [];
-  const box = el('agents');
-  if (!list.length) { box.innerHTML = '<li class="empty">none</li>'; return; }
-  box.innerHTML = list.map(a => {
-    const label = a.state === 'registered'
-      ? (a.drifted ? 'registered · update available' : 'registered')
-      : a.state.replace('_', ' ');
-    const dot = 'dot ' + esc(a.state) + (a.drifted ? ' drift' : '');
-    return '<li><span class="' + dot + '"></span>'
-      + '<span class="sid">' + esc(a.name) + '</span>'
-      + '<span class="state">' + esc(label) + '</span>'
-      + '<span class="agent-btns">' + agentButtons(a) + '</span></li>';
-  }).join('');
-}
-
-// One delegated handler for every register/unregister button (rows are rebuilt
-// on each refresh, so per-button onclicks would go stale). Disable the whole
-// group while the write is in flight, then re-read status.
-el('agents').addEventListener('click', async (ev) => {
-  const btn = ev.target.closest('button[data-act]');
-  if (!btn) return;
-  const id = btn.getAttribute('data-id');
-  const act = btn.getAttribute('data-act');
-  if (act === 'unregister' && !confirm('Unregister biopb from ' + id + '?')) return;
-  el('agents').querySelectorAll('button').forEach(b => b.disabled = true);
-  const res = await jpost('/api/agents/' + encodeURIComponent(id) + '/' + act);
-  if (res && res.error) alert('Failed: ' + res.error);
-  await pollAgents();
-});
-el('agents-refresh').onclick = pollAgents;
-
-// One algorithm-plane row: a status dot, the host:port (a TLS tag for grpcs),
-// the state + op count, and an ops preview (full list in the hover title). A
-// non-serving server shows its error message in the preview slot instead.
-function algoRow(s) {
-  const serving = s.state === 'serving';
-  const dot = 'dot ' + (serving ? 'serving' : (s.state === 'unknown' ? '' : 'down'));
-  let stateLabel = s.state;
-  if (serving) stateLabel = s.single_op ? 'serving · single-op'
-    : 'serving · ' + (s.op_count || 0) + ' op' + (s.op_count === 1 ? '' : 's');
-  else if (s.state === 'invalid') stateLabel = 'invalid URL';
-  else if (s.state === 'unknown') stateLabel = 'gRPC unavailable';
-  const tls = s.scheme === 'grpcs' ? '<span class="tls">TLS</span>' : '';
-  let tail = '';
-  if (serving && s.ops && s.ops.length) {
-    const joined = s.ops.join(', ');
-    tail = '<span class="ops" title="' + esc(joined) + '">' + esc(joined) + '</span>';
-  } else if (!serving && s.error) {
-    tail = '<span class="ops err" title="' + esc(s.error) + '">' + esc(s.error) + '</span>';
-  }
-  return '<li><span class="' + dot + '"></span>'
-    + '<span class="sid">' + esc(s.target) + '</span>' + tls
-    + '<span class="state">' + esc(stateLabel) + '</span>' + tail + '</li>';
-}
-
-// Fetched on load / via the ↻ button -- like the agent block, deliberately NOT on
-// the status+sessions interval: each refresh dials every configured gRPC server.
-async function pollAlgos() {
-  let data;
-  try { data = await (await fetchAuth('/api/algorithms')).json(); }
-  catch (e) { return; }
-  const list = (data && data.servers) || [];
-  const box = el('algos');
-  if (!list.length) {
-    box.innerHTML = '<li class="empty">no algorithm servers configured</li>';
-    return;
-  }
-  box.innerHTML = list.map(algoRow).join('');
-}
-el('algos-refresh').onclick = pollAlgos;
-
-function refresh() { pollStatus(); pollSessions(); }
-
-// A data-plane verb button: disable the trio while the request is in flight (a
-// restart blocks server-side until the plane is back up), then refresh.
-async function verb(url, confirmMsg) {
-  if (confirmMsg && !confirm(confirmMsg)) return;
-  const btns = [el('ensure'), el('restart'), el('stop')];
-  btns.forEach(b => b.disabled = true);
-  const res = await jpost(url);
-  btns.forEach(b => b.disabled = false);
-  if (res && res.error) alert('Failed: ' + res.error);
-  if (res && res.data_plane) renderDataPlane(res.data_plane);
-  refresh();
-}
-
-el('ensure').onclick = () => verb('/api/data_plane/ensure');
-el('restart').onclick = () => verb('/api/data_plane/restart', 'Restart the data plane?');
-el('stop').onclick = () => verb('/api/data_plane/stop', 'Stop the data plane? Clients lose it until an Ensure.');
-
-refresh();
-pollAgents();
-pollAlgos();
-setInterval(refresh, POLL);
-</script>
-</body>
-</html>
-"""
-
-# Bake the favicon into the served page once at import (rather than per request).
-_DASHBOARD_HTML = _DASHBOARD_HTML.replace("__FAVICON__", _FAVICON)

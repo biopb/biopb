@@ -33,7 +33,7 @@ been folded in as the `biopb-mcp/` subdirectory (see
 
 | Repo / component | Role |
 |------|------|
-| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the client, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), and the **client/agent** (`biopb-mcp/`, the napari plugin + MCP server). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`) so they resolve each other from the tree. Each still versions and releases independently off its own git-tag prefix: client `v*`, tensor server `server-v*`, mcp `mcp-v*`. |
+| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the clients, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), the **agent client** (`biopb-mcp/`, the napari plugin + MCP server), the **control plane** (`biopb-control/`, the single web origin that supervises the data plane and serves the browser UI), and the **browser front end** (`web/`, one Vite + React SPA — dataviewer, admin, dashboard, observe — served by the control). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`); `web/` is a separate **pnpm workspace**. Each still versions and releases independently off its own git-tag prefix: client `v*`, tensor server `server-v*`, mcp `mcp-v*`. |
 | **`biopb-server`** | Concrete algorithm servers implementing the compute plane: `cellpose`, `cellpose-sam`, `lacss`, `samcell`, `ucell`. Each is a thin model wrapper on the shared image-runtime base, shipped as a container. |
 
 The intended deployment is **personal or small-lab** use, on localhost or a
@@ -234,10 +234,13 @@ Key properties of the coupling:
   disconnects; the child inherits the shim's live environment, so the viewer
   always lands on the user's real display. The data/compute planes the session
   uses are *not* part of it — a lean **control plane** supervises them as durable
-  subprocesses and is the single web origin, fronting the dataviewer and each
-  session's observe page (`/session/<id>/observe`) so N dynamic-port sessions need
-  no N bookmarks. The agentless `biopb mcp view` is the exception: a self-contained
-  foreground viewer that stays off the control entirely. See
+  subprocesses and is the single web origin. It **serves the whole browser UI
+  itself** — one Vite SPA (`web/`) with the dashboard at `/`, the dataviewer at
+  `/viewer`, and each session's observe page at `/session/<id>/observe` — while
+  proxying the data plane (`/data_plane/*`) and each session's API
+  (`/session/<id>/api/*`), so N dynamic-port sessions need no N bookmarks. The
+  agentless `biopb mcp view` is the exception: a self-contained foreground viewer
+  that stays off the control entirely. See
   `biopb-mcp/docs/mcp-dedaemonization-migration.md`.
 
 This coupling — *arbitrary agent code against a live, shared session* — is
@@ -390,3 +393,10 @@ editing the code.
   service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
   `_server.py`). See `biopb/biopb-mcp/docs/monorepo-migration.md` for how this
   was merged in and how it is built/released.
+- **Control plane / web origin:** `biopb/biopb-control/src/biopb_control/` —
+  `_control.py` (the ASGI app: serves the `web/` SPA + proxies the data plane and
+  sessions), `_supervisor.py` (data-plane subprocess lifecycle).
+- **Browser front end:** `biopb/web/` — one Vite + React SPA served by the
+  control. `packages/app/src/` (`main.tsx` routes; `pages/{HomePage,AdminPage,
+  DashboardPage,ObservePage}.tsx`) and `packages/tensor-flight-client/` (the TS
+  data-plane SDK). See `web/README.md`.

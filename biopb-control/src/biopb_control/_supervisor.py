@@ -61,6 +61,9 @@ class DataPlaneSpec:
     grpc_port: int = 8815
     web_host: str = "127.0.0.1"
     web_port: int = 8814
+    # The built web/ SPA bundle. Consumed by the *control* (it is the single web
+    # origin and serves the bundle itself, see _control.build_app), NOT forwarded
+    # to the tensor subprocess — the sidecar no longer serves static assets.
     static_dir: Optional[Path] = None
     log_level: str = "INFO"
     server_log: Optional[Path] = None
@@ -116,8 +119,6 @@ class DataPlaneSupervisor:
             "--log-level",
             str(s.log_level),
         ]
-        if s.static_dir and Path(s.static_dir).exists():
-            argv += ["--static-dir", str(s.static_dir)]
         return argv
 
     def _child_env(self) -> dict:

@@ -845,11 +845,6 @@ def launch(
         "--cors",
         help="Extra CORS origin to allow (repeatable). Defaults to --web-url variants.",
     ),
-    static_dir: Optional[Path] = typer.Option(
-        None,
-        "--static-dir",
-        help="Directory containing static webapp files. If empty, serves API only.",
-    ),
     log_file: Optional[str] = typer.Option(
         None,
         "--log-file",
@@ -1003,13 +998,11 @@ def launch(
 
         effective_cors = _expand_origin(web_url)
 
-        # When serving the webapp from this same server (--static-dir), also
-        # allow all loopback variants of the server's own address so users
-        # can reach it via localhost or 127.0.0.1 interchangeably.
-        if static_dir:
-            for origin in _expand_origin(f"http://{web_host}:{web_port}"):
-                if origin not in effective_cors:
-                    effective_cors.append(origin)
+        # The control front reaches this sidecar over loopback for the data API +
+        # /ws/render, so allow all loopback variants of the server's own address.
+        for origin in _expand_origin(f"http://{web_host}:{web_port}"):
+            if origin not in effective_cors:
+                effective_cors.append(origin)
 
     # --- Start HTTP sidecar (blocks) ---
     console.print(
@@ -1027,7 +1020,6 @@ def launch(
             host=web_host,
             port=web_port,
             cors_origins=effective_cors,
-            static_dir=str(static_dir) if static_dir else None,
             config_path=str(config),
         )
     except KeyboardInterrupt:

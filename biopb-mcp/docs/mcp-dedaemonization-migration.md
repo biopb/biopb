@@ -221,13 +221,12 @@ The structural fix. Highest value; unblocks single origin.
   stays stdlib until the front replaces it with an ASGI app on the same port.
 - **The tensor server's HTTP sidecar becomes a private upstream fronted by the
   control**, no longer its own public origin. The Layer-3 front reverse-proxies
-  the data API + `/ws/render` (and the dataviewer static app) through 8813 under
-  a `/data_plane/*` namespace, forwarding the Bearer token *(origin + a flat
-  proxy done; the `/data_plane/*` namespacing + demoting the dataviewer to
-  `/data_plane/viewer` is the finalized Layer-3 target, see §6.1)*. Once the
-  control serves its own root dashboard and the dataviewer lives under
-  `/data_plane/viewer`, the sidecar has **no public web role left** — the trim is
-  complete, not a separate later refinement.
+  the data API + `/ws/render` through 8813 under a `/data_plane/*` namespace,
+  forwarding the Bearer token. In the **finalized** Layer-3 model the sidecar is
+  **API-only** and serves no browser asset: the control owns the whole UI as one
+  base-`/` SPA (dashboard `/`, dataviewer `/viewer`, observe
+  `/session/<id>/observe`), so there is **no `/data_plane/viewer`** mount and the
+  sidecar has no public web role left (see §6.1).
 
 Result: the cycle in §1.1 becomes a tree rooted at the control.
 
@@ -241,16 +240,18 @@ longer a reverse-proxy bolted onto the ephemeral sidecar. The control serves its
 namespace; no upstream owns the root, and no two upstreams share a path prefix.
 
 > **Status: complete.** Namespaced origin + data-plane proxy + session registry +
-> per-session observe + the control-owned dashboard are all built (§6.1). The
+> per-session observe + the control-served SPA are all built (§6.1). The
 > control API is a Starlette/uvicorn app on `127.0.0.1:8813` (replacing the stdlib
 > `ThreadingHTTPServer`). It answers bare `/health`, the control API under `/api/*`
-> (`/api/status`, `/api/sessions`, `/api/data_plane/{ensure,stop,restart}`), serves
-> its **own buildless dashboard** at `/`, and reverse-proxies the tensor sidecar
-> under the `/data_plane/*` namespace — dataviewer at `/data_plane/viewer`, data
-> API at `/data_plane/api/*`, and the `/data_plane/ws/render` WebSocket — via
-> explicit prefix `Mount`s that strip the namespace (`biopb_control/_control.py`).
-> The catch-all is retired. The dataviewer is built base-path-aware for it
-> (`VITE_BASE_PATH=/data_plane/viewer/`, `VITE_TENSOR_API=/data_plane`).
+> (`/api/status`, `/api/sessions`, `/api/data_plane/{ensure,stop,restart}`), and
+> **serves the built `web/` SPA bundle at its root** (from `--static-dir`) — one
+> base-`/` app whose routes are the dashboard (`/`), the dataviewer (`/viewer`),
+> and each session's observe shell (`/session/<id>/observe`). It reverse-proxies
+> the tensor sidecar under the `/data_plane/*` namespace — **API-only**: data API
+> at `/data_plane/api/*` and the `/data_plane/ws/render` WebSocket, with **no
+> `/data_plane/viewer`** — via explicit prefix `Mount`s that strip the namespace
+> (`biopb_control/_control.py`). The catch-all is retired. The SPA is built with
+> base `/` (`VITE_TENSOR_API=/data_plane`; no `VITE_BASE_PATH`).
 
 ### 6.1 Decided 2026-07-11 — namespace discipline + a control-owned root
 
@@ -265,7 +266,10 @@ Three decisions fix the routing shape:
    the data-plane `ensure`/`stop`/`restart` controls (POSTing the
    `/api/data_plane/*` verbs), links to the dataviewer (enabled only when the
    data plane is `serving`), and lists each live session with its
-   `/session/<id>/observe` link.
+   `/session/<id>/observe` link. *(Finalized: this buildless vanilla-JS page was
+   subsequently rewritten into a React route (`DashboardPage.tsx`) of the one
+   base-`/` `web/` SPA the control serves — the deferred "real SPA build" — with
+   its behavior carried over unchanged.)*
 
 2. **Every downstream plane owns a path prefix; the root catch-all is retired.**
    The flat "proxy everything else" mount is replaced by explicit `Mount`s. Each
@@ -290,15 +294,14 @@ Three decisions fix the routing shape:
 
 | Path | Target | Hop |
 |---|---|---|
-| `/`, `/assets/*` | control's own dashboard | in-process (static, buildless) |
+| `/`, `/viewer`, `/admin`, `/assets/*` | control-served base-`/` `web/` SPA (dashboard + dataviewer/admin) | in-process (static + SPA fallback) |
 | `/api/status` | all sub-components' state | in-process |
 | `/api/sessions` | live-session list (from the registry) | in-process |
 | `/api/data_plane/ensure` \| `stop` \| `restart` | supervisor verbs | in-process |
 | `/health` | bare liveness (installer / `_control_client`) | in-process |
-| `/data_plane/viewer`, `/data_plane/viewer/*` | tensor sidecar static (dataviewer) | loopback proxy |
 | `/data_plane/api/*` | tensor sidecar data API | loopback proxy |
 | `/data_plane/ws/render` | tensor sidecar render WebSocket | loopback proxy |
-| `/session/<id>/observe` | that session's observe page | loopback proxy |
+| `/session/<id>/observe` | control-served SPA shell (observe route) | in-process (static + SPA fallback) |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
 | `/mcp` (agent JSON-RPC) | **not routed here** — shim → child, direct/private | — |
 
@@ -309,13 +312,16 @@ mix. During the rewrite `/data_plane/ensure` moves to `/api/data_plane/ensure`
 (pre-release, so no legacy alias is kept); bare `/health` stays put as the
 load-bearing liveness probe.
 
-**Frontend base paths.** Serving the dataviewer under `/data_plane/viewer` and
-observe under `/session/<id>/` makes both base-path-dependent: the dataviewer
-builds with `base: '/data_plane/viewer/'` + `VITE_TENSOR_API="/data_plane"`, and
-observe's root-absolute `/api/*` fetches (`_observe.py`) rebase under
-`/session/<id>/`. Observe needed this rework regardless, so all three frontends
-(control dashboard, dataviewer, observe) become uniformly prefix-aware. CI/release
-env changes accordingly (`tensor-server-ci.yaml`, `release.yaml`).
+**Frontend serving (finalized).** The planned per-surface base paths were
+dropped. Rather than build the dataviewer under `base: '/data_plane/viewer/'`,
+the finalized model builds **one SPA with base `/`** that the control serves at
+its root, and every surface — dashboard `/`, dataviewer `/viewer`, observe
+`/session/<id>/observe` — is a client route of it. Because assets are requested
+from the absolute root (`/assets/*`), they resolve no matter which prefix the
+shell was served under, so there is **no `VITE_BASE_PATH`**;
+`VITE_TENSOR_API="/data_plane"` still points the viewer at the control-proxied
+data plane. CI/release build that single bundle accordingly
+(`tensor-server-ci.yaml`, `release.yaml`).
 
 *Implemented for observe (per-session routing):* the control resolves
 `/session/<id>/*` to the child's dynamic loopback port per-request via
@@ -528,14 +534,15 @@ flips it. Suggested order (value-first):
    refactor, shim ownership, dynamic-port handoff. Closes #98 (env inheritance)
    and lands #403/#402 in the shim-owned model. Session self-registration with the
    control is the remaining registry piece, folded into Layer 3.
-3. **Single-origin front (Layer 3).** Control serves its own root dashboard,
-   namespaces each plane under its prefix (`/data_plane/*`, `/session/<id>/*`),
-   moves the dataviewer to `/data_plane/viewer`, routes per-session observe, and
-   terminates auth/TLS. Downgrade `biopb mcp` to the standalone wrapper.
-   *(Built: the ASGI origin, the namespaced `/data_plane/*` proxy, the dataviewer
-   at `/data_plane/viewer`, the session registry, per-session observe, and the
-   control dashboard + control API — §6.1. Auth/TLS termination and the `biopb mcp`
-   downgrade loose ends remain.)*
+3. **Single-origin front (Layer 3).** Control serves the whole browser UI as one
+   base-`/` SPA at its root (dashboard `/`, dataviewer `/viewer`, observe
+   `/session/<id>/observe`), namespaces each plane under its prefix
+   (`/data_plane/*` API-only, `/session/<id>/api/*`), routes per-session observe,
+   and terminates auth/TLS. Downgrade `biopb mcp` to the standalone wrapper.
+   *(Built: the ASGI origin, the control-served SPA bundle, the namespaced
+   API-only `/data_plane/*` proxy, the session registry, per-session observe, and
+   the control API — §6.1. Auth/TLS termination and the `biopb mcp` downgrade
+   loose ends remain.)*
 4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---

@@ -111,8 +111,8 @@ def _get_path_parts(url: str) -> List[str]:
     also avoids netloc/port misparsing of a basename like ``exp:2.zarr``.
 
     Mirror of the web viewer's ``getPathParts`` in
-    ``biopb-tensor-server/packages/web/src/components/SourceTree.tsx`` — keep the
-    two behaviorally in lockstep.
+    ``web/packages/app/src/components/SourceTree.tsx`` — keep the two
+    behaviorally in lockstep.
     """
     if not url:
         return []

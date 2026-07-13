@@ -625,11 +625,6 @@ def start(
         "-c",
         help="Path to config file (JSON or TOML)",
     ),
-    static_dir: Optional[Path] = typer.Option(
-        DEFAULT_WEBAPP,
-        "--static-dir",
-        help="Directory containing static webapp files",
-    ),
     web_port: int = typer.Option(
         8814,
         "--web-port",
@@ -743,8 +738,6 @@ def start(
         "--log-level",
         str(log_level),
     ]
-    if static_dir and static_dir.exists():
-        cmd.extend(["--static-dir", str(static_dir)])
 
     # Start subprocess
     console.print("[green]Starting TensorFlight server...[/green]")
@@ -838,11 +831,6 @@ def restart(
         "-c",
         help="Path to config file (JSON or TOML)",
     ),
-    static_dir: Optional[Path] = typer.Option(
-        DEFAULT_WEBAPP,
-        "--static-dir",
-        help="Directory containing static webapp files",
-    ),
     web_port: int = typer.Option(
         8814,
         "--web-port",
@@ -890,7 +878,6 @@ def restart(
     # Start with same options
     start(
         config=config,
-        static_dir=static_dir,
         web_port=web_port,
         web_host=web_host,
         log_level=log_level,
@@ -2003,7 +1990,9 @@ def control_start(
         DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
     ),
     static_dir: Optional[Path] = typer.Option(
-        DEFAULT_WEBAPP, "--static-dir", help="Tensor-server static webapp directory"
+        DEFAULT_WEBAPP,
+        "--static-dir",
+        help="Web UI bundle the control serves at its root (the built web/ dist)",
     ),
     web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
     web_host: str = typer.Option(
@@ -2234,7 +2223,9 @@ def control_run(
         DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
     ),
     static_dir: Optional[Path] = typer.Option(
-        DEFAULT_WEBAPP, "--static-dir", help="Tensor-server static webapp directory"
+        DEFAULT_WEBAPP,
+        "--static-dir",
+        help="Web UI bundle the control serves at its root (the built web/ dist)",
     ),
     web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
     web_host: str = typer.Option(

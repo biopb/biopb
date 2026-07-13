@@ -5,7 +5,7 @@
 `biopb-tensor-server` provides two complementary server components:
 
 1. **TensorFlightServer** — Arrow Flight / gRPC server for chunked array access (port 8815).
-2. **FastAPI HTTP Server** — Browser-accessible HTTP API that also serves the React webapp (port 8814).
+2. **FastAPI HTTP Server** — Browser-accessible HTTP API for the data plane (port 8814). **API-only** — the browser UI is served by the control plane (the single web origin); see the top-level `web/` workspace and `web/README.md`.
 
 ```
 Client (Python or TypeScript)
@@ -25,7 +25,7 @@ Client (Python or TypeScript)
                                               └──────────────────────────┘
 ```
 
-The FastAPI server handles both API requests and serves the static React webapp. It wraps the Python `TensorFlightClient` and re-exposes its operations as plain HTTP so that browsers can use it without a gRPC-Web proxy.
+The FastAPI server exposes the data-plane HTTP API. It wraps the Python `TensorFlightClient` and re-exposes its operations as plain HTTP so that browsers can use it without a gRPC-Web proxy. It does **not** serve the browser UI — the control plane owns that, as the single web origin, and reverse-proxies this sidecar under `/data_plane/*` (see `web/README.md`).
 
 ### Package layout
 
@@ -201,7 +201,7 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 ## FastAPI HTTP Server
 
 **Module:** `biopb_tensor_server.serving.http_server`
-**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins, static_dir) → FastAPI`
+**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins, config_path, web_host, web_port) → FastAPI`
 **Default port:** `8814`
 
 ### Lifecycle
@@ -297,7 +297,7 @@ argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--static-dir /app/webapp] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
 
 # for grpc only (no web server)
 biopb-tensor-server serve ...
@@ -314,8 +314,8 @@ Startup sequence:
 5. Start `TensorFlightServer` in a **daemon thread**.
 6. Derive CORS origins from `--web-url` (default `http://localhost:8814`) or
    explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
-7. Call `run_http_server(...)` — **blocking** uvicorn call.
-   - If `--static-dir` is provided, FastAPI also serves the React webapp.
+7. Call `run_http_server(...)` — **blocking** uvicorn call. The sidecar is
+   API-only; it serves no static assets (the control plane serves the browser UI).
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
@@ -748,16 +748,17 @@ discovery.
 
 ## Client Packages (TypeScript)
 
-The browser-facing side of biopb-tensor-server is split into two pnpm workspace
-packages:
+The browser-facing side of biopb lives in the **top-level `web/` pnpm workspace**
+(its own `pnpm-workspace.yaml` + `pnpm-lock.yaml`) — no longer under this repo's
+`packages/`:
 
-| Package | Purpose |
-|---------|---------|
-| `@biopb/tensor-flight-client` | HTTP client + lazy array API for the FastAPI sidecar |
-| `@biopb/web` | Vite + React static web application |
+| Package | Location | Purpose |
+|---------|----------|---------|
+| `@biopb/tensor-flight-client` | `web/packages/tensor-flight-client` | HTTP client + lazy array API for the FastAPI sidecar |
+| `@biopb/web` | `web/packages/app` | Vite + React SPA (dashboard + dataviewer/admin + observe) |
 
-Both packages live under `packages/` and are built together with
-`pnpm -r run build`.
+Both are built together with `pnpm -C web build`. See **`web/README.md`** for the
+full workspace layout, routes, and build/serve model.
 
 ---
 
@@ -866,59 +867,47 @@ returns `LazyTensorArray` instances (wrapping `TensorArray`).
 **State management:** Zustand
 **Rendering:** Pixi.js v8 (WebGL)
 
-`@biopb/web` is a static Vite + React frontend for the BioPB TensorFlight viewer.
+**The browser UI has moved out of this repo's package tree.** `@biopb/web` now
+lives at `web/packages/app` in the top-level `web/` workspace, and it is one
+Vite + React SPA covering all four surfaces (dashboard, dataviewer/admin,
+per-session observe) as client routes. It is **not** under
+`biopb-tensor-server/packages/`, and the tensor server no longer serves it. See
+**`web/README.md`** for the canonical description; the essentials that matter
+here:
 
-Key responsibilities:
-- serve the browser UI (pure static files — no Node.js at runtime)
-- gate access via a bearer token stored in `sessionStorage`
-- initialize the client-side TensorFlight HTTP client
-- call the FastAPI server (`VITE_TENSOR_API`, default `http://localhost:8814`) directly from the browser
+- **One SPA, base `/`.** The app is always built with base `/` — there is no
+  `VITE_BASE_PATH` and no `build:control` script. The surfaces are routes of the
+  same bundle: `/` (dashboard), `/viewer` + `/admin` + `/unlock`
+  (dataviewer/admin), and `/session/<id>/observe` (observe).
+- **The control plane serves it.** `biopb-control` (port 8813) is the single web
+  origin: it serves the built bundle (static assets + `index.html` SPA fallback)
+  from its `--static-dir` and reverse-proxies this data plane at `/data_plane/*`
+  (data API + `/ws/render`). The FastAPI sidecar here is **API-only** and serves
+  no static asset.
+- **The dataviewer still calls the control-proxied data plane** via
+  `VITE_TENSOR_API=/data_plane` (the one build-time env it needs).
 
 ### Build
 
 ```sh
-pnpm run build           # tsc + vite build → dist/  (base "/", for the standalone :8814 sidecar)
-pnpm run build:control   # same, but VITE_BASE_PATH=/data_plane/viewer/ VITE_TENSOR_API=/data_plane
-pnpm run dev             # vite dev server (HMR)
+pnpm -C web install && pnpm -C web build   # → web/packages/app/dist
 ```
 
-Output is `dist/` — plain HTML/CSS/JS, ready for FastAPI StaticFiles or any static file server.
-
-From repo root:
-```bash
-pnpm --filter @biopb/web dev             # Vite dev server on :5173
-pnpm --filter @biopb/web build           # tsc + vite build → dist/  (base "/")
-pnpm --filter @biopb/web build:control   # namespaced build for control-fronted serving
-```
-
-**Base-path gotcha — which build to use.** The control front (`biopb control`)
-mounts the dataviewer under the `/data_plane/viewer/` namespace, so it must be
-served a build whose `VITE_BASE_PATH=/data_plane/viewer/`. A plain `build` (or
-the `dev` HMR server) emits base `/`, whose `index.html` requests `/assets/...` —
-that resolves at the bare sidecar origin (`:8814/`) but 404s under the control's
-namespaced mount, leaving a **blank page** (`#root` never hydrates). Symptom:
-`:8814/` renders but `:8813/data_plane/viewer/` is empty. CI/release build with
-the namespaced base (`.github/workflows/{tensor-server-ci,release}.yaml`); for a
-local control, use `build:control` and point the control at the tree build:
-`biopb control run --static-dir <repo>/biopb-tensor-server/packages/web/dist`
-(`--static-dir` defaults to `~/.local/share/biopb/webapp`, but is not hardcoded).
+`VITE_TENSOR_API=/data_plane` is the only build-time env. CI tars
+`web/packages/app/dist` into `webapp.tar.gz` (same artifact name/consumers); the
+Docker image copies it to `/app/webapp`, and the installer unpacks it to
+`~/.local/share/biopb/webapp` (the control's default `--static-dir`). See
+`web/README.md` for dev-server, lint, and test commands.
 
 ### Static file deployment
 
-The webapp is served directly by FastAPI when `--static-dir` is provided. For standalone deployment with a dedicated static file server (e.g., nginx), configure SPA fallback:
-
-```nginx
-location / {
-    root /path/to/dist;
-    try_files $uri $uri/ /index.html;
-}
-
-location /api/ {
-    proxy_pass http://127.0.0.1:8814;
-}
-```
-
-The API server (`http://localhost:8814`) must be reachable from the browser — configure CORS origins accordingly:
+The sidecar does **not** serve the webapp. The control plane (`:8813`) is the
+single web origin: it serves the built bundle (dataviewer at `/viewer`) and
+reverse-proxies this sidecar's data API under `/data_plane/*`. Because the
+browser reaches the data API same-origin through that proxy, production needs no
+cross-origin setup. The Vite dev server (`:5173`) does call the API
+cross-origin, so it is covered by the default dev CORS origins; add others via
+`--cors` / `--web-url` when the browser origin differs:
 
 ```
 biopb-tensor-server launch config.json --web-url https://yourdomain.com --token mytoken...
@@ -973,14 +962,14 @@ main.tsx  (BrowserRouter + Routes)
 
 ### File map
 
-- `packages/web/package.json`
-- `packages/web/vite.config.ts`
-- `packages/web/src/main.tsx`
-- `packages/web/src/ClientBootstrap.tsx`
-- `packages/web/src/store.ts`
-- `packages/web/src/pages/HomePage.tsx`
-- `packages/web/src/pages/UnlockPage.tsx`
-- `packages/web/src/components/`
+- `web/packages/app/package.json`
+- `web/packages/app/vite.config.ts`
+- `web/packages/app/src/main.tsx`
+- `web/packages/app/src/ClientBootstrap.tsx`
+- `web/packages/app/src/store.ts`
+- `web/packages/app/src/pages/HomePage.tsx`
+- `web/packages/app/src/pages/UnlockPage.tsx`
+- `web/packages/app/src/components/`
 
 ---
 
@@ -1029,7 +1018,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
 ### Client tests
 
-**Location:** `packages/tensor-flight-client/`
+**Location:** `web/packages/tensor-flight-client/`
 **Runner:** vitest
 
 | Package | Tests |
@@ -1069,7 +1058,7 @@ Server components use `server-v*` tags (distinct from SDK `v*` tags):
 ```
 git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
                                                     ↓
-                                            sync-version.js → JS packages
+                                    web/scripts/sync-version.js → JS packages
 ```
 
 Version is derived from git tags via `setuptools_scm` with `tag_regex = "^server-v..."`.

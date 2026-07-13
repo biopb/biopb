@@ -506,8 +506,9 @@ admin" action.
 - **Scan-progress signal:** `docs/progressive-discovery.md` and the Flight
   `health` action's freshness fields.
 - **The web app to extend (shell, routes, idioms):**
-  `biopb-tensor-server/packages/web/src/` — `main.tsx` (routes `/`, `/unlock`;
-  add `/admin`), `pages/HomePage.tsx` (`app-shell` topbar/sidebar/main,
-  `status-pill`), `pages/UnlockPage.tsx` (token gate + reveal field),
+  `web/packages/app/src/` — `main.tsx` (routes `/viewer`, `/admin`, `/unlock`),
+  `pages/HomePage.tsx` (`app-shell` topbar/sidebar/main, `status-pill`),
+  `pages/AdminPage.tsx`, `pages/UnlockPage.tsx` (token gate + reveal field),
   `components/SourceTree.tsx` (read-only browse the editor mirrors), `store.ts`.
+  (Now the top-level `web/` workspace, served by the control; see `web/README.md`.)
 - **The broader GUI design this implements:** `docs/remote-tensor-cache.md` §§7–8.

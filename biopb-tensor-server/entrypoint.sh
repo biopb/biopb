@@ -126,10 +126,12 @@ else
 fi
 
 # Run the control plane in the foreground (container PID 1). It is the single
-# public web origin on $CONTROL_PORT: it supervises the tensor server as a PRIVATE
-# loopback subprocess (sidecar on 127.0.0.1:$HTTP_PORT, never exposed) and
-# reverse-proxies it under /data_plane (dataviewer at /data_plane/viewer). The
-# Flight gRPC port stays directly exposed for SDK clients.
+# public web origin on $CONTROL_PORT: it serves the web/ SPA bundle (/app/webapp,
+# passed via --static-dir above) at its root (dashboard /, dataviewer /viewer,
+# per-session observe), supervises the tensor server as a PRIVATE loopback
+# subprocess (sidecar on 127.0.0.1:$HTTP_PORT, never exposed), and reverse-proxies
+# its data API under /data_plane. The Flight gRPC port stays directly exposed for
+# SDK clients.
 #
 # PID 1 note: run_control installs SIGTERM/SIGINT handlers so `docker stop` tears
 # down gracefully, and the supervisor reaps its own tensor-server child. But PID 1

@@ -166,6 +166,7 @@ jobs:
         with:
           node-version: 24
           cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -188,13 +189,13 @@ jobs:
 
       - name: Build webapp
         run: |
-          pnpm install --frozen-lockfile
-          pnpm sync-version
-          pnpm --filter @biopb/tensor-flight-client build
-          # Built for the control front (migration doc §6.1): served under
-          # /data_plane/viewer, data API + WS under /data_plane (both relative).
-          VITE_BASE_PATH="/data_plane/viewer/" VITE_TENSOR_API="/data_plane" pnpm --filter @biopb/web build
-          tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
+          pnpm -C web install --frozen-lockfile
+          pnpm -C web run sync-version
+          pnpm -C web --filter @biopb/tensor-flight-client build
+          # The control front is the single web origin: it serves this bundle at
+          # its root and proxies the data API + WS under /data_plane. Base is "/".
+          VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
+          tar -czf release-wheels/webapp.tar.gz -C web/packages/app dist
 
       # Curated CC0 sample images (docs/release-model.md). A fresh, config-less
       # install seeds these so the product opens onto real microscopy data instead

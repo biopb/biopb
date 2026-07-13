@@ -3,9 +3,9 @@ FROM node:20-slim AS webapp-builder
 WORKDIR /app
 
 # Copy pre-built webapp. Built for the CONTROL FRONT (this image runs the control
-# as its web origin), so it is namespaced under /data_plane/viewer:
-#   VITE_BASE_PATH="/data_plane/viewer/" VITE_TENSOR_API="/data_plane" pnpm --filter @biopb/web build
-COPY biopb-tensor-server/packages/web/dist ./biopb-tensor-server/packages/web/dist
+# as its single web origin, which serves this bundle at its root):
+#   VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
+COPY web/packages/app/dist ./web/packages/app/dist
 
 # Stage 2: Python build
 FROM python:3.11-slim AS python-builder
@@ -47,8 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=python-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=python-builder /usr/local/bin /usr/local/bin
 
-# Copy webapp build output (for FastAPI StaticFiles)
-COPY --from=webapp-builder /app/biopb-tensor-server/packages/web/dist /app/webapp
+# Copy webapp build output (the control serves this at its root)
+COPY --from=webapp-builder /app/web/packages/app/dist /app/webapp
 
 # Copy entrypoint
 COPY biopb-tensor-server/entrypoint.sh /usr/local/bin/
