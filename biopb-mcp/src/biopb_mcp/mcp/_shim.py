@@ -333,9 +333,12 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     # failed bring-up above reaps and never reaches here, so it leaves no
     # record); the reap path unregisters. Best-effort — a registry write failure
     # must not fail an otherwise-working session, only cost its discoverability.
+    # Catch broadly (not just OSError): a serialization TypeError/ValueError, or
+    # register()'s own unsafe-id ValueError, must not escape and break the session
+    # either (biopb/biopb#422).
     try:
         _config_sessions.register(session_id, port=port, pid=proc.pid, mcp_url=url)
-    except OSError as e:
+    except Exception as e:
         logger.warning("Could not register session %s: %s", session_id, e)
 
     return proc, url, job, session_id

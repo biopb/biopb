@@ -64,6 +64,70 @@ class TestUnregister:
         reg.unregister("never")  # must not raise
 
 
+class TestSessionIdSafety:
+    """A session id becomes a filename stem and is reachable from a
+    ``/session/<id>/...`` URL, so the module self-sanitizes (biopb/biopb#422).
+    ``/`` is blocked by Starlette; ``\\`` (a Windows separator), ``..``, ``:``,
+    and NUL are not, so they are caught here."""
+
+    UNSAFE = [
+        "..",
+        ".",
+        "",
+        "../evil",
+        "a/b",
+        "..\\..\\evil",  # Windows traversal — `\` is not a POSIX separator
+        "a\\b",
+        "C:evil",  # Windows drive-relative
+        "a\x00b",
+    ]
+
+    @pytest.mark.parametrize("sid", ["20260101-000000-1", "s1", "a.b", "a-b_c.d"])
+    def test_real_ids_are_safe(self, sid):
+        assert reg._is_safe_session_id(sid)
+
+    @pytest.mark.parametrize("sid", UNSAFE)
+    def test_unsafe_ids_are_rejected(self, sid):
+        assert not reg._is_safe_session_id(sid)
+
+    @pytest.mark.parametrize("sid", UNSAFE)
+    def test_register_raises_on_unsafe_id(self, sid):
+        with pytest.raises(ValueError):
+            reg.register(sid, port=1, pid=_live_pid())
+
+    @pytest.mark.parametrize("sid", UNSAFE)
+    def test_read_session_unsafe_is_none(self, sid):
+        assert reg.read_session(sid) is None
+
+    @pytest.mark.parametrize("sid", UNSAFE)
+    def test_resolve_unsafe_is_none(self, sid):
+        assert reg.resolve(sid) is None
+
+    def test_read_does_not_escape_the_registry_dir(self, tmp_path):
+        # Without the guard, `../outside` would resolve to a sibling of the
+        # sessions dir and read a foreign JSON file.
+        (tmp_path / "outside.json").write_text('{"secret": 1}')
+        assert reg.read_session("../outside") is None
+
+    def test_unregister_does_not_delete_outside_the_registry_dir(self, tmp_path):
+        # `../victim` would unlink a file outside the registry if unguarded.
+        victim = tmp_path / "victim.json"
+        victim.write_text("{}")
+        reg.unregister("../victim")  # must be a no-op, not raise or unlink
+        assert victim.exists()
+
+
+def test_read_session_decodes_utf8_regardless_of_locale():
+    """Records are read as UTF-8 explicitly, not in the platform-default encoding
+    (biopb/biopb#422). A non-ASCII value written as raw UTF-8 bytes round-trips."""
+    reg.sessions_dir()  # ensure the dir exists
+    path = reg._record_path("s1")
+    # ensure_ascii=False so the file holds real multibyte UTF-8, not \uXXXX
+    # escapes — otherwise a locale-encoding read would pass anyway.
+    path.write_bytes(json.dumps({"note": "café–λ"}, ensure_ascii=False).encode("utf-8"))
+    assert reg.read_session("s1")["note"] == "café–λ"
+
+
 class TestListSessions:
     def test_lists_all_live_newest_first(self):
         reg.register("20260101-000000-1", port=1, pid=_live_pid())

@@ -78,6 +78,33 @@ def sessions_dir() -> Path:
     return d
 
 
+# Characters that would let a session id escape the registry dir when spliced
+# into a filename. Both platforms' separators are rejected regardless of the
+# host OS — a record is written by the shim and its id is read back from the
+# control's ``/session/<id>/...`` URL, and the two may run on different OSes — as
+# is ``:`` (a Windows drive / alternate-data-stream selector) and NUL.
+_UNSAFE_ID_CHARS = frozenset({"/", "\\", ":", "\x00"})
+
+
+def _is_safe_session_id(session_id: str) -> bool:
+    """Whether ``session_id`` is a bare filename stem safe to splice into a path.
+
+    Real ids are ``<timestamp>-<pid>`` (`_new_session_id`), but ``resolve`` /
+    ``read_session`` / ``unregister`` are reachable with an id taken straight from
+    a ``/session/<id>/...`` URL, so the core module self-sanitizes rather than
+    trusting the caller (biopb/biopb#422): reject anything that isn't a single,
+    non-traversing path component. The Starlette ``{session_id}`` convertor blocks
+    ``/`` but not ``\\`` (a separator on Windows), so both must be caught here.
+    """
+    return (
+        bool(session_id)
+        and session_id not in (".", "..")
+        and not _UNSAFE_ID_CHARS.intersection(session_id)
+        and os.sep not in session_id
+        and (os.altsep is None or os.altsep not in session_id)
+    )
+
+
 def _record_path(session_id: str) -> Path:
     return sessions_dir() / f"{session_id}{_SUFFIX}"
 
@@ -101,7 +128,13 @@ def register(
     port on ``host`` (loopback); the control proxies ``/session/<id>/*`` there.
     Written atomically so a concurrent reader never sees a partial record. Any
     ``extra`` keys are stored verbatim (forward room for e.g. an observe base path).
+
+    Raises ``ValueError`` for an unsafe ``session_id`` (biopb/biopb#422). The sole
+    writer only ever passes the safe ``<timestamp>-<pid>`` id, so this can only
+    trip on a programming error, and the shim's publish is best-effort anyway.
     """
+    if not _is_safe_session_id(session_id):
+        raise ValueError(f"unsafe session id: {session_id!r}")
     record = {
         "session_id": session_id,
         "host": host,
@@ -120,7 +153,7 @@ def register(
         prefix=f".{session_id}-", suffix=_SUFFIX, dir=str(dest.parent)
     )
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(record, f)
         os.replace(tmp, dest)
     except BaseException:
@@ -135,7 +168,10 @@ def register(
 
 def unregister(session_id: str) -> None:
     """Remove a session's record. Best-effort and idempotent — a missing record
-    (already reaped, never registered) is not an error."""
+    (already reaped, never registered) or an unsafe id (biopb/biopb#422) is not an
+    error, it just removes nothing."""
+    if not _is_safe_session_id(session_id):
+        return
     try:
         _record_path(session_id).unlink()
     except FileNotFoundError:
@@ -145,9 +181,15 @@ def unregister(session_id: str) -> None:
 
 
 def read_session(session_id: str) -> Optional[dict]:
-    """The record for ``session_id``, or ``None`` if absent/unreadable."""
+    """The record for ``session_id``, or ``None`` if absent/unreadable/unsafe.
+
+    An unsafe id (path traversal, biopb/biopb#422) reads nothing — it can never
+    name a legitimate record, so it is treated as absent rather than resolved to a
+    traversed path."""
+    if not _is_safe_session_id(session_id):
+        return None
     try:
-        with open(_record_path(session_id)) as f:
+        with open(_record_path(session_id), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -190,7 +232,7 @@ def list_sessions(prune: bool = True) -> list[dict]:
     out: list[dict] = []
     for p in paths:
         try:
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 rec = json.load(f)
         except (OSError, ValueError):
             # Vanished mid-scan or corrupt; skip. A corrupt record is left in
