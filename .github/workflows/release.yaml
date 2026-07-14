@@ -1,12 +1,11 @@
-# All-in-one product deployment, triggered by a single `release-v*` tag.
-# See docs/release-model.md. Produces, from the tagged commit:
-#   - a GitHub release (wheel set + mcp sdist + webapp + installers) — the
-#     installer's single source of truth;
-#   - Docker images for biopb-tensor-server and biopb-image-base, each tagged
-#     with ITS OWN package version (+ :latest), published idempotently (skipped
-#     if that version is already in the registry).
-# PyPI is intentionally NOT part of this — biopb publishes to PyPI on its own v*
-# tag (biopb-mcp is no longer on PyPI; it ships only as the wheel triple here).
+# Product deployment (the GitHub release bundle), triggered by a single
+# `release-v*` tag. See docs/release-model.md. Produces, from the tagged commit,
+# the GitHub release: wheel set + mcp sdist + webapp + samples + installers — the
+# installer's single source of truth.
+# Docker images are NOT built here: biopb-tensor-server ships on its own
+# `server-v*` tag (tensor-server-ci) and biopb-image-base on the SDK `v*` tag
+# (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI on its
+# own `v*` tag (biopb-mcp is no longer on PyPI; it ships only as the wheel set here).
 name: Release (deployment)
 
 on:
@@ -135,7 +134,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write   # create the GitHub release
-      packages: write   # push to ghcr.io
     env:
       # Single source of truth for the sample build's skimage pin: used by BOTH
       # the cache key and the build command below, so they can never drift (a bump
@@ -171,24 +169,15 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: web/pnpm-lock.yaml
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # wheels/ feeds the Docker builds. The tensor-server Dockerfile COPYs
-      # biopb-*.whl + biopb_tensor_server-*.whl + biopb_control-*.whl (the image
-      # runs the control as its single web origin); the image-runtime Dockerfile
-      # installs only biopb + biopb_tensor_server by name, ignoring the extra
-      # control wheel. release-wheels/ holds the GitHub-release assets.
+      # Build the wheel set the GitHub release ships (the installer file://-installs
+      # these). release-wheels/ holds the GitHub-release assets; biopb-mcp also
+      # ships an sdist.
       - name: Build wheels
         run: |
-          uv build --package biopb --wheel --out-dir wheels
-          uv build --package biopb-tensor-server --wheel --out-dir wheels
+          uv build --package biopb --wheel --out-dir release-wheels
+          uv build --package biopb-tensor-server --wheel --out-dir release-wheels
           uv build --package biopb-mcp --out-dir release-wheels
-          # biopb-control now feeds the Docker image too (it is the container's web
-          # origin, supervising the tensor server), so it builds into wheels/ like
-          # the others; the cp below still lands it in the release-wheels/ bundle.
-          uv build --package biopb-control --wheel --out-dir wheels
-          cp wheels/*.whl release-wheels/
+          uv build --package biopb-control --wheel --out-dir release-wheels
 
       - name: Build webapp
         run: |
@@ -228,7 +217,7 @@ jobs:
         run: |
           set -uo pipefail
           # Retry rides out a transient pooch/skimage blip. On persistent failure
-          # we do NOT abort here -- wheels/webapp/images are the shipped product and
+          # we do NOT abort here -- wheels/webapp are the shipped product and
           # are already built -- we leave the tarball absent and let the
           # "Verify sample bundle" step below fail the run loudly.
           ok=0
@@ -268,27 +257,11 @@ jobs:
             PRERELEASE=true
           fi
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          # The tensor server is a product component: its wheel is versioned from
-          # this same release-v* tag, so tver == REL at a real release.
-          tver=$(ls wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
+          # The tensor server has its own version line (server-v*), so its wheel
+          # version can differ from REL; read it off the built wheel for the
+          # versions.json manifest rather than assuming it equals REL.
+          tver=$(ls release-wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
-          # On a dry-run (workflow_dispatch, no release-v* tag) setuptools_scm
-          # yields a PEP 440 dev/local version (e.g. 0.11.0rc2.dev6+gf7f1075). The
-          # '+' local segment is legal in a wheel name but ILLEGAL in a Docker
-          # reference ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}), so tagging an image with
-          # it fails the build. Map any out-of-set char to '_' for the Docker tag;
-          # a clean X.Y.Z release is unchanged. The gate's manifest-inspect and the
-          # image tags both use this so they agree on the same reference.
-          tdocker=$(printf '%s' "$tver" | sed -E 's/[^A-Za-z0-9_.-]/_/g')
-          echo "tensor_docker=$tdocker" >> "$GITHUB_OUTPUT"
-          # image-base is versioned off the SDK tag `v*` (docker-only; no wheel to
-          # read). The nearest v* tag name is the clean SDK version and is
-          # Docker-safe (no +local segment). A product-only release (no new v*)
-          # reuses the last v*, so the idempotent publish below skips image-base as
-          # unchanged — its image republishes only when the SDK bumps.
-          ibver=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed -E 's/^v//')
-          [ -n "$ibver" ] || ibver="0.0.0"
-          echo "imagebase=$ibver" >> "$GITHUB_OUTPUT"
           # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
           # of truth). Surface it as a release attribute so the installer pins the
           # same napari the wheel was built/tested against (see install/install.sh).
@@ -302,94 +275,15 @@ jobs:
           nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[all\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
           [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
           echo "napari=$nver" >> "$GITHUB_OUTPUT"
-          # versions.json — the installer-readable release-attribute manifest.
+          # versions.json — the installer-readable release-attribute manifest. The
+          # installer reads `napari` (pins the tested Qt binding) and `release`
+          # (the update baseline); `tensor_server` reports the shipped wheel's
+          # version (its own server-v* line). Docker versions are NOT here — the
+          # images ship on their own tags (server-v* / v*), not from this bundle.
           cat > release-wheels/versions.json <<EOF
-          { "release": "$REL", "tensor_server": "$tver", "image_base": "$ibver", "napari": "$nver" }
+          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver" }
           EOF
-          # Docker tag lists. A version-pinned tag always; :latest is moved ONLY
-          # for a clean X.Y.Z release. An rc/a/b prerelease (e.g. cut off `dev`)
-          # publishes its pinned tag but must NOT clobber :latest — same guard the
-          # GitHub release / installer already apply to prereleases.
-          owner="${{ github.repository_owner }}"
-          {
-            echo "tensor_tags<<TAGS_EOF"
-            echo "ghcr.io/$owner/biopb-tensor-server:$tdocker"
-            echo "docker.io/jiyuuchc/biopb-tensor-server:$tdocker"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-tensor-server:latest"
-              echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
-            fi
-            echo "TAGS_EOF"
-            echo "imagebase_tags<<TAGS_EOF"
-            echo "ghcr.io/$owner/biopb-image-base:$ibver"
-            echo "docker.io/jiyuuchc/biopb-image-base:$ibver"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-image-base:latest"
-              echo "docker.io/jiyuuchc/biopb-image-base:latest"
-            fi
-            echo "TAGS_EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "tensor-server=$tver  image-base=$ibver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
-
-      - name: Login to ghcr.io
-        if: steps.ver.outputs.is_tag == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Login to Docker Hub
-        if: steps.ver.outputs.is_tag == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: jiyuuchc
-          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
-
-      # Idempotent publish: on a tag, build+push an image only if its version is
-      # not already in the registry (image-base, being stable, is normally
-      # skipped). On a dry run (workflow_dispatch), always build with --load to
-      # verify, never push.
-      - name: Decide which images to publish
-        id: gate
-        run: |
-          set -euo pipefail
-          owner="${{ github.repository_owner }}"
-          decide() {  # $1=image name  $2=version
-            if [[ "${{ steps.ver.outputs.is_tag }}" != "true" ]]; then echo verify; return; fi
-            if docker manifest inspect "ghcr.io/$owner/$1:$2" >/dev/null 2>&1; then echo skip; else echo push; fi
-          }
-          t=$(decide biopb-tensor-server "${{ steps.ver.outputs.tensor_docker }}")
-          i=$(decide biopb-image-base "${{ steps.ver.outputs.imagebase }}")
-          echo "tensor=$t" >> "$GITHUB_OUTPUT"
-          echo "imagebase=$i" >> "$GITHUB_OUTPUT"
-          echo "tensor-server: $t   image-base: $i"
-
-      - name: tensor-server image
-        if: steps.gate.outputs.tensor != 'skip'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: biopb-tensor-server/Dockerfile
-          push: ${{ steps.gate.outputs.tensor == 'push' }}
-          load: ${{ steps.gate.outputs.tensor == 'verify' }}
-          build-args: |
-            MEMORY=4g
-          tags: ${{ steps.ver.outputs.tensor_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: image-base image
-        if: steps.gate.outputs.imagebase != 'skip'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: biopb-image-runtime/Dockerfile
-          push: ${{ steps.gate.outputs.imagebase == 'push' }}
-          load: ${{ steps.gate.outputs.imagebase == 'verify' }}
-          tags: ${{ steps.ver.outputs.imagebase_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          echo "tensor-server=$tver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
@@ -456,14 +350,15 @@ jobs:
               will warn "Unknown publisher" until a signing cert is provisioned)
 
             ### Docker
-            - `ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}`
-            - `ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}`
+            The Docker images ship on their own tags, not from this release:
+            `biopb-tensor-server` on `server-v*` (tensor-server-ci) and
+            `biopb-image-base` on the SDK `v*` tag (image-runtime-ci).
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
       # Feedback gate for the sample bundle. The build above fails SOFT so a flaky
-      # third-party fetch never blocks shipping the real product (wheels/webapp/
-      # images), and the release publishes above regardless. But a MISSING bundle
+      # third-party fetch never blocks shipping the real product (wheels/webapp),
+      # and the release publishes above regardless. But a MISSING bundle
       # means every fresh install lands on an empty viewer, so make it loud rather
       # than a swallowed ::warning:: nobody reads on a green run: fail the run here
       # (GitHub emails the run's actor and the tag shows a red check) AFTER the

@@ -3,9 +3,10 @@ const fs = require('fs');
 const path = require('path');
 
 // Stamp the web packages with the PRODUCT release version. The web bundle ships
-// as part of the product (control + tensor server + mcp), so it shares the single
-// `release-v*` git tag — NOT the SDK's `v*`, and no longer the tensor server's
-// old `server-v*`. `git describe --abbrev=0 --match "release-v*"` returns the
+// as part of the product (control + mcp + the tensor-server wheel), so it shares
+// the product `release-v*` git tag — NOT the SDK's `v*`, and NOT the tensor
+// server's own `server-v*` (which versions only its Docker image, not the web
+// bundle). `git describe --abbrev=0 --match "release-v*"` returns the
 // nearest release tag *name* (no `-<N>-g<sha>` suffix), so at a clean
 // `release-vX.Y.Z` tag this is exactly `X.Y.Z` and between releases it is the last
 // release version. These packages are `private` (never published), so the base

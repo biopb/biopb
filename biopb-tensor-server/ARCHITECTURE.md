@@ -1059,23 +1059,22 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
 ## Versioning
 
-The tensor server is a **product component**, so its version comes from the single
-product tag `release-v*` (shared with mcp, control, and the web bundle) — not a
-per-package tag. This is distinct from the SDK line (`v*`, for `biopb` +
-`biopb-image-base`). See `docs/release-model.md`.
+The tensor server has its **own version line**, keyed to the per-package tag
+`server-v*`. Its Docker image is cut on that tag by `tensor-server-ci`, on its own
+cadence — distinct from the SDK line (`v*`, for `biopb` + `biopb-image-base`) and
+the product bundle line (`release-v*`, for mcp/control/web + the GitHub release).
+See `docs/release-model.md`.
 
 ```
-git tags (release-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
-                                                    ↓
-                                    web/scripts/sync-version.js → JS packages
-                                    (also reads the release-v* tag)
+git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
 ```
 
-Version is derived via `setuptools_scm` with `tag_regex = "^release-v..."` (and a
-matching `git describe --match 'release-v*'`).
+Version is derived via `setuptools_scm` with `tag_regex = "^server-v..."` (and a
+matching `git describe --match 'server-v*'`). The web JS packages instead track the
+product `release-v*` tag (`web/scripts/sync-version.js`), not this one.
 
-**Release** (product): `git tag release-v0.11.0 && git push --tags`. `release.yaml`
-then builds the wheel bundle at version `0.11.0`, syncs the JS packages
-(`pnpm -C web run sync-version`), publishes `biopb-tensor-server:0.11.0` (+
-`:latest`), and cuts the GitHub release with the webapp tarball + installer. (The
-SDK, incl. image-base, releases separately on `v*`.)
+**Docker image** (own cadence): `git tag server-v0.11.0 && git push --tags`.
+`tensor-server-ci`'s `publish` job then builds and pushes
+`biopb-tensor-server:0.11.0` (+ `:latest` for a clean X.Y.Z) to ghcr.io + Docker
+Hub. The **wheel** still ships in the `release-v*` GitHub bundle (versioned off
+this `server-v*` line), and the SDK (incl. image-base) releases on `v*`.
