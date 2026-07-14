@@ -125,11 +125,11 @@ def _new_session_id():
 
 def _session_log_path(config, session_id):
     """Where this session's child logs. Per-session by default; a single shared
-    file when ``mcp.transport.kernel_log`` is set (opt back into the old behavior).
+    file when ``transport.kernel_log`` is set (opt back into the old behavior).
     """
     from .._config import get_session_log_dir, get_setting
 
-    override = get_setting(config, "mcp.transport.kernel_log")
+    override = get_setting(config, "transport.kernel_log")
     if override:
         return str(override)
     return str(get_session_log_dir() / f"{session_id}.log")
@@ -261,8 +261,8 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     log_path = _session_log_path(config, session_id)
     log = _open_session_log(log_path)
     logged_to_file = log is not getattr(sys.stderr, "buffer", sys.stderr)
-    if logged_to_file and not get_setting(config, "mcp.transport.kernel_log"):
-        _prune_session_logs(get_setting(config, "mcp.transport.session_log_keep", 5))
+    if logged_to_file and not get_setting(config, "transport.kernel_log"):
+        _prune_session_logs(get_setting(config, "transport.session_log_keep", 5))
 
     cmd = _session_command()
     fd, port_file = tempfile.mkstemp(prefix="biopb-mcp-port-", suffix=".txt")
@@ -699,7 +699,7 @@ def run_bridge(url):
 def serve(config, port=None):
     """Launcher entry point for ``--transport stdio``: spawn, bridge, reap.
 
-    ``port`` (the configured ``mcp.transport.port``) is vestigial here — the
+    ``port`` (the configured ``transport.port``) is vestigial here — the
     owned child binds a dynamic port — and is accepted only for call-site
     compatibility with the launcher's dispatch.
     """

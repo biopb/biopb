@@ -69,7 +69,7 @@ class TestParseArgs:
 
 def _cfg(**transport):
     """Build a full config carrying only the given mcp.transport overrides."""
-    return {"mcp": {"transport": transport}}
+    return {"transport": transport}
 
 
 class TestConfigDefaults:
@@ -230,7 +230,7 @@ class TestSetupObserve:
         assert fake_observe["http"] == 1
 
     def test_explicitly_disabled(self, fake_observe):
-        cfg = {"mcp": {"observe": {"enabled": False}}}
+        cfg = {"observe": {"enabled": False}}
         assert _setup_observe(cfg) is False
         assert fake_observe == {"configure": 0, "http": 0}
 
@@ -242,7 +242,7 @@ class TestSetupObserve:
 
         monkeypatch.setattr(_observe, "configure", lambda **k: None)
         monkeypatch.setattr(_observe, "register_http_routes", _boom)
-        cfg = {"mcp": {"observe": {"enabled": True}}}
+        cfg = {"observe": {"enabled": True}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
 

@@ -28,6 +28,8 @@ import dataclasses
 import typing
 from typing import Any, Dict, Optional, Tuple
 
+from biopb._config_schema import scalar_property as _scalar_property_core
+
 from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
     _SECRET_PROFILE_KEYS,
@@ -97,18 +99,6 @@ _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
 _DEFAULT_INSTANCES = {cls.__name__: cls() for cls in _SECTION_CLASSES}
 
 
-def _json_type(value: Any) -> str:
-    # bool is an int subclass; check it first. None (e.g. write_dir) is a path
-    # string on the wire.
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    return "string"
-
-
 def ondisk_location(class_name: str, field: str) -> Tuple[str, str]:
     """The (section, key) a dataclass field is written as on disk."""
     override = _ONDISK_OVERRIDES.get((class_name, field))
@@ -122,34 +112,12 @@ def _empty_section() -> Dict[str, Any]:
 
 
 def _scalar_property(class_name: str, f: dataclasses.Field) -> Dict[str, Any]:
-    inst = _DEFAULT_INSTANCES[class_name]
-    value = getattr(inst, f.name)
-    prop: Dict[str, Any] = {"type": _json_type(value)}
-    # The dataclass default, so a config editor can render the effective value of
-    # an omitted key (e.g. show a default-true boolean checked) and only write a
-    # key when it diverges. None (e.g. write_dir) is left out -- it is "unset",
-    # not a meaningful default to echo. Non-JSON-native defaults (e.g. a Path
-    # file_cache_dir) are coerced to str to match their "string" wire type and
-    # stay JSON-serializable (the schema is sent over HTTP by GET /api/config).
-    if value is not None:
-        prop["default"] = (
-            value if isinstance(value, (bool, int, float, str)) else str(value)
-        )
-    # `description` is prose, sourced from the field's metadata["help"] -- the
-    # single source of truth (the dataclass field), so there is no second doc
-    # table here to drift from config.py.
-    help_text = f.metadata.get("help")
-    if help_text:
-        prop["description"] = help_text
+    # The per-field projection (type/default/help->description/constraint) is the
+    # shared core (biopb._config_schema); this wrapper only looks up the value +
+    # constraint for a (class, field) pair.
+    value = getattr(_DEFAULT_INSTANCES[class_name], f.name)
     constraint = _CONSTRAINTS.get(class_name, {}).get(f.name)
-    if constraint is not None:
-        prop.update(constraint.to_json_schema())
-        # The validation rule (bounds + accepted values -- incl. the
-        # case-insensitive enum sets the schema keeps out of `enum`) rides its
-        # own `constraint` key, so `description` stays pure prose. A config editor
-        # renders it as a secondary hint under the description.
-        prop["constraint"] = constraint.describe()
-    return prop
+    return _scalar_property_core(value, f.metadata.get("help"), constraint)
 
 
 def _source_type_enum() -> Optional[list]:

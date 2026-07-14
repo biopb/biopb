@@ -3,7 +3,7 @@
 Under the http transport this process *is* the MCP server: it owns a child
 Jupyter kernel that hosts a visible napari viewer when a display is available,
 or a compute-only headless kernel when none is (see
-``mcp.transport.display_mode``).  Under the (deprecated) stdio transport it is
+``transport.display_mode``).  Under the (deprecated) stdio transport it is
 instead a thin bridge: it ensures the http daemon is running on the configured
 loopback port — spawning it detached if needed — and pumps stdio JSON-RPC to
 it (see ``_shim``).  Run it with::
@@ -262,7 +262,7 @@ def _has_display():
 
 
 def _resolve_headless(display_mode, has_display):
-    """Map ``mcp.transport.display_mode`` + display availability to headless.
+    """Map ``transport.display_mode`` + display availability to headless.
 
     ``"headless"`` -> always; ``"visible"`` -> never (the caller fails fast if
     no display); ``"auto"`` / anything else -> headless only when no display.
@@ -289,7 +289,7 @@ def _resolve_headless_logged(display_mode, has_display):
             "display_mode='auto' resolved to headless: no display detected "
             "($DISPLAY/$WAYLAND_DISPLAY are unset), so the kernel runs "
             "compute-only (no napari viewer; screenshots unavailable). Set "
-            "mcp.transport.display_mode to 'visible' once a display is available."
+            "transport.display_mode to 'visible' once a display is available."
         )
     return headless
 
@@ -297,23 +297,23 @@ def _resolve_headless_logged(display_mode, has_display):
 def _setup_observe(config):
     """Wire up the web observe UI.
 
-    On by default (``mcp.observe.enabled``, opt-out); it mounts on the existing
+    On by default (``observe.enabled``, opt-out); it mounts on the existing
     MCP app and shares its loop/port. Fully guarded — an observe failure logs
     and is swallowed so it can never block the MCP server. Returns True if
     mounted.
     """
     from .._config import get_setting
 
-    if not get_setting(config, "mcp.observe.enabled"):
+    if not get_setting(config, "observe.enabled"):
         return False
     try:
         from . import _observe
 
         _observe.configure(
-            max_output_chars=get_setting(config, "mcp.observe.max_output_chars"),
-            poll_interval_ms=get_setting(config, "mcp.observe.poll_interval_ms"),
-            allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
-            allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
+            max_output_chars=get_setting(config, "observe.max_output_chars"),
+            poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
+            allowed_origins=get_setting(config, "transport.allowed_origins"),
+            allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         )
         _observe.register_http_routes()
         return True
@@ -333,16 +333,16 @@ def _config_defaults(config):
     """
     from .._config import get_setting
 
-    transport = get_setting(config, "mcp.transport.kind")
+    transport = get_setting(config, "transport.kind")
     if transport not in ("http", "stdio"):
-        logger.warning("Unknown mcp.transport.kind %r; using stdio", transport)
+        logger.warning("Unknown transport.kind %r; using stdio", transport)
         transport = "stdio"
     try:
-        port = int(get_setting(config, "mcp.transport.port"))
+        port = int(get_setting(config, "transport.port"))
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid mcp.transport.port %r; using 8765",
-            get_setting(config, "mcp.transport.port"),
+            "Invalid transport.port %r; using 8765",
+            get_setting(config, "transport.port"),
         )
         port = 8765
     return transport, port
@@ -422,18 +422,16 @@ def _serve_http(config, port, view=False):
     # viewer hard-aborts the kernel (SIGABRT, not a catchable error), so unless
     # the user demands "visible" we degrade to a compute-only headless kernel.
     # `--view` demands visible by definition (the human wants the window).
-    display_mode = (
-        "visible" if view else get_setting(config, "mcp.transport.display_mode")
-    )
+    display_mode = "visible" if view else get_setting(config, "transport.display_mode")
     has_display = _has_display()
     if display_mode == "visible" and not has_display:
         kernel_log_path = (
-            get_setting(config, "mcp.transport.kernel_log") or "the kernel log"
+            get_setting(config, "transport.kernel_log") or "the kernel log"
         )
         logger.error(
             "display_mode='visible' but no display detected "
             "($DISPLAY/$WAYLAND_DISPLAY are unset). Start an X/Wayland session, "
-            "or set mcp.transport.display_mode to 'auto' or 'headless'. "
+            "or set transport.display_mode to 'auto' or 'headless'. "
             "(Kernel output: %s)",
             kernel_log_path,
         )
@@ -495,17 +493,15 @@ def _serve_http(config, port, view=False):
 
     host = KernelHost(
         extra_arguments=extra_arguments,
-        kernel_name=get_setting(config, "mcp.kernel.name"),
-        startup_timeout=get_setting(config, "mcp.kernel.startup_timeout"),
-        execute_timeout=get_setting(config, "mcp.kernel.execute_timeout"),
-        busy_lock_timeout=get_setting(config, "mcp.kernel.busy_lock_timeout"),
+        kernel_name=get_setting(config, "kernel.name"),
+        startup_timeout=get_setting(config, "kernel.startup_timeout"),
+        execute_timeout=get_setting(config, "kernel.execute_timeout"),
+        busy_lock_timeout=get_setting(config, "kernel.busy_lock_timeout"),
         env=kernel_env,
-        watchdog_interval=get_setting(config, "mcp.kernel.watchdog_interval"),
-        watchdog_max_respawns=get_setting(config, "mcp.kernel.watchdog_max_respawns"),
-        watchdog_respawn_window=get_setting(
-            config, "mcp.kernel.watchdog_respawn_window"
-        ),
-        parent_death_pipe=get_setting(config, "mcp.kernel.parent_death_pipe"),
+        watchdog_interval=get_setting(config, "kernel.watchdog_interval"),
+        watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
+        watchdog_respawn_window=get_setting(config, "kernel.watchdog_respawn_window"),
+        parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
         # The window-close pipe only matters with a viewer; a headless kernel
         # has no window to close, so don't wire it up.
         window_close_pipe=not headless,
@@ -514,7 +510,7 @@ def _serve_http(config, port, view=False):
         cluster_host=cluster_host,
     )
     _server.set_kernel_host(host)
-    _server.set_promote_after(get_setting(config, "mcp.kernel.promote_after"))
+    _server.set_promote_after(get_setting(config, "kernel.promote_after"))
     # Surfaces headless state to the agent (initialize `instructions`) and the
     # viewer-dependent tools (take_screenshot / server_status).
     _server.set_headless(headless)
@@ -647,8 +643,8 @@ def _serve_http(config, port, view=False):
 
     _server.run(
         port,
-        allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
-        allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
+        allowed_origins=get_setting(config, "transport.allowed_origins"),
+        allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         sock=listen_sock,
     )
 

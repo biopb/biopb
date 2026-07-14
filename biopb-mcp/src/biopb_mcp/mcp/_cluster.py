@@ -20,7 +20,7 @@ import threading
 logger = logging.getLogger(__name__)
 
 # Env var carrying the daemon cluster's scheduler address into the kernel, read
-# by _bootstrap._configure_dask ahead of the mcp.dask.address config value.
+# by _bootstrap._configure_dask ahead of the dask.address config value.
 DASK_ADDRESS_ENV = "BIOPB_DASK_ADDRESS"
 
 
@@ -31,7 +31,7 @@ class DaskClusterHost:
     launch) and keeps it warm across kernel restarts.  :meth:`ensure` returns the
     scheduler address to inject into the kernel, or ``None`` when the daemon
     should not own a cluster (``owner != "daemon"``, a non-distributed scheduler,
-    an external ``mcp.dask.address``, or a spin failure) — the kernel then falls
+    an external ``dask.address``, or a spin failure) — the kernel then falls
     back per its own config (see ``_bootstrap._configure_dask``).
     """
 
@@ -54,15 +54,15 @@ class DaskClusterHost:
 
         Only when it is explicitly the daemon's job, the scheduler is
         distributed, and no external scheduler was configured (the kernel
-        attaches to an external ``mcp.dask.address`` directly, daemon owns
+        attaches to an external ``dask.address`` directly, daemon owns
         nothing).
         """
         from .._config import get_setting
 
         return (
-            get_setting(self._config, "mcp.dask.owner") == "daemon"
-            and get_setting(self._config, "mcp.dask.scheduler") == "distributed"
-            and not get_setting(self._config, "mcp.dask.address")
+            get_setting(self._config, "dask.owner") == "daemon"
+            and get_setting(self._config, "dask.scheduler") == "distributed"
+            and not get_setting(self._config, "dask.address")
         )
 
     def ensure(self):
@@ -98,18 +98,14 @@ class DaskClusterHost:
             return None
         try:
             # 0 -> None so dask picks ~n_cores, matching the kernel-owned path
-            # (mcp.dask.num_workers `or None`).
-            num_workers = get_setting(self._config, "mcp.dask.num_workers") or None
+            # (dask.num_workers `or None`).
+            num_workers = get_setting(self._config, "dask.num_workers") or None
             cluster = LocalCluster(
                 n_workers=num_workers,
                 processes=True,
-                threads_per_worker=get_setting(
-                    self._config, "mcp.dask.threads_per_worker"
-                ),
-                memory_limit=get_setting(self._config, "mcp.dask.memory_limit"),
-                dashboard_address=get_setting(
-                    self._config, "mcp.dask.dashboard_address"
-                ),
+                threads_per_worker=get_setting(self._config, "dask.threads_per_worker"),
+                memory_limit=get_setting(self._config, "dask.memory_limit"),
+                dashboard_address=get_setting(self._config, "dask.dashboard_address"),
                 local_directory=self._local_dir or None,
             )
         except Exception:

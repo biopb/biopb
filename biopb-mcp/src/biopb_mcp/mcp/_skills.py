@@ -199,15 +199,15 @@ def _setting(path: str, default=None):
 def load_catalog(*, force: bool = False) -> list[dict]:
     """Return the resolved skills list (metadata only), fail-open.
 
-    Honors the in-memory TTL cache first (``mcp.services.skills.cache_ttl``),
+    Honors the in-memory TTL cache first (``services.skills_cache_ttl``),
     then tries the network, then the on-disk cache (regardless of age — a stale
     cache beats nothing), then the bundled snapshot. Returns ``[]`` when the
     feature is disabled or every source fails.
     """
-    if not _setting("mcp.services.skills.enabled", True):
+    if not _setting("services.skills_enabled", True):
         return []
-    ttl = _setting("mcp.services.skills.cache_ttl", 3600)
-    url = _setting("mcp.services.skills.catalog_url", "")
+    ttl = _setting("services.skills_cache_ttl", 3600)
+    url = _setting("services.skills_catalog_url", "")
 
     with _lock:
         if (

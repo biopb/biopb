@@ -69,7 +69,7 @@ def viewer_window_alive(viewer) -> bool:
 def resync_view_for_capture(viewer, timeout: float = 30.0) -> None:
     """Wait for the current view's slice to load before a screenshot.
 
-    With async slicing on (``mcp.viewer.async_slicing``) a dims/zoom change
+    With async slicing on (``viewer.async_slicing``) a dims/zoom change
     fetches the new slice *off* the Qt main thread, so a screenshot taken right
     after could capture the previous (pre-load) frame -- fine for an interactive
     human, wrong for the agent, which expects ``take_screenshot`` to reflect the

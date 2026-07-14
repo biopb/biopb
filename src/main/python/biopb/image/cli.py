@@ -276,7 +276,7 @@ def servers(
     """List the configured algorithm-plane servers with a health + ops probe.
 
     Reads the ProcessImage servers wired into the biopb-mcp config (under
-    mcp.services.process_image_servers) -- the same set an agent kernel exposes as
+    services.process_image_servers) -- the same set an agent kernel exposes as
     ops -- and probes each for liveness and its advertised operations. This is the
     CLI face of the control dashboard's Algorithm plane section: read-only (no
     lifecycle control), never writes config.
@@ -294,7 +294,7 @@ def servers(
     if not rows:
         stderr_console.print(
             "[yellow]No algorithm servers configured.[/yellow] Add ProcessImage "
-            "server URLs under [bold]mcp.services.process_image_servers[/bold] in "
+            "server URLs under [bold]services.process_image_servers[/bold] in "
             "the biopb-mcp config."
         )
         raise typer.Exit(0)

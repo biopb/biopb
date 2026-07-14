@@ -442,7 +442,7 @@ class TensorConnection:
         Idempotent: a second call while a watcher is alive is a no-op. The
         thread is a daemon (never blocks interpreter shutdown); use
         :meth:`stop_source_watch` to end it early. Intervals default to the
-        ``mcp.tensor.health_poll_*`` config; ``min_interval <= 0`` disables the
+        ``tensor.health_poll_*`` config; ``min_interval <= 0`` disables the
         watcher.
 
         Deliberately thread-based (not a ``QTimer``): it must run in the kernel
@@ -450,9 +450,9 @@ class TensorConnection:
         its blocking ``health_check`` belongs off any GUI thread.
         """
         if min_interval is None:
-            min_interval = CONFIG.get("mcp.tensor.health_poll_min_interval")
+            min_interval = CONFIG.get("tensor.health_poll_min_interval")
         if max_interval is None:
-            max_interval = CONFIG.get("mcp.tensor.health_poll_max_interval")
+            max_interval = CONFIG.get("tensor.health_poll_max_interval")
         if not min_interval or min_interval <= 0:
             logger.info("Source watch disabled (min_interval=%s)", min_interval)
             return
@@ -557,7 +557,7 @@ class TensorConnection:
 
         A targeted ``CONFIG.set`` touches only ``tensor_browser.server_url``;
         keys this service does not own (e.g.
-        ``mcp.services.process_image_servers``) are preserved in the cached
+        ``services.process_image_servers``) are preserved in the cached
         merged config and re-persisted intact.
         """
         CONFIG.set("tensor_browser.server_url", self.url)
@@ -623,8 +623,8 @@ class TensorConnection:
             interval = min(interval * 2, max_interval)
 
     def server_start_timeout(self) -> float:
-        """The configured ``mcp.server_start_timeout`` boot-wait budget (s)."""
-        return CONFIG.get("mcp.server_start_timeout")
+        """The configured ``transport.server_start_timeout`` boot-wait budget (s)."""
+        return CONFIG.get("transport.server_start_timeout")
 
     def auto_connect(self) -> None:
         """Connect to the data plane, bringing it up through the control if needed.
@@ -673,7 +673,7 @@ class TensorConnection:
         # control answered, its endpoint is authoritative.
         # NOTE: `timeout` is spent on BOTH the ensure and the connect_when_booted
         # below, so the worst-case wall wait is ~2x it (see the
-        # `mcp.server_start_timeout` config note).
+        # `transport.server_start_timeout` config note).
         snapshot = ensure_data_plane(timeout=timeout)
         if isinstance(snapshot, dict):
             # Control answered: it ensured the plane and reports where it bound it.

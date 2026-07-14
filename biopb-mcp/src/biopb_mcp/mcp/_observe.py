@@ -3,7 +3,7 @@
 The ``/api/*`` calls behind the observe page: ``execute_code`` job history with
 truncated output plus global control knobs — interrupt the current job (force a
 KeyboardInterrupt into its thread), hard-restart the kernel, and save the session
-as a notebook. On by default (opt-out via ``mcp.observe.enabled``).
+as a notebook. On by default (opt-out via ``observe.enabled``).
 
 The observe **page** itself is served by the control front — it is the React
 ``ObservePage`` in the ``web/`` SPA, served at ``/session/<id>/observe`` — and it
@@ -18,7 +18,7 @@ no dependence on the dask scheduler/dashboard.
 
 **Mounted on the http server.** :func:`register_http_routes` mounts the routes
 on the *existing* FastMCP Starlette app via ``mcp.custom_route``, so they share
-the MCP loop and port (``mcp.transport.port``) with ``/mcp``. The server is
+the MCP loop and port (``transport.port``) with ``/mcp``. The server is
 http-only (daemon migration, docs/daemon-migration.md), so the API is always
 available — stdio clients reach it too: they connect through the launcher's
 stdio→http bridge (``mcp/_shim.py``) and so hit ``/api/*`` on the shared daemon
@@ -86,7 +86,7 @@ def configure(
     """Apply config before registering/serving (idempotent).
 
     ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
-    allowlist (e.g. a reverse-proxy front), mirroring ``mcp.transport``.
+    allowlist (e.g. a reverse-proxy front), mirroring the ``transport`` section.
     """
     global _max_output_chars, _poll_interval_ms, _extra_origins, _extra_hosts
     global _mw

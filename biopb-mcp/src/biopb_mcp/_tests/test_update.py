@@ -160,12 +160,12 @@ class TestCheckForUpdate:
         assert _update.check_for_update(config, installed="0.6.6") is None
 
     def test_skipped_version_suppressed(self, config, stub_releases):
-        config["mcp"]["update"]["skipped_version"] = "0.7.0"
+        config["update"]["skipped_version"] = "0.7.0"
         stub_releases([_release("release-v0.7.0")])
         assert _update.check_for_update(config, installed="0.6.6") is None
 
     def test_disabled_returns_none(self, config, stub_releases):
-        config["mcp"]["update"]["enabled"] = False
+        config["update"]["enabled"] = False
         stub_releases([_release("release-v0.7.0")])
         assert _update.check_for_update(config, installed="0.6.6") is None
 
@@ -204,7 +204,7 @@ class TestCheckForUpdate:
         assert _update.check_for_update(config, installed="0.6.6") is None
 
     def test_prerelease_channel_picks_rc(self, config, stub_releases):
-        config["mcp"]["update"]["channel"] = "prerelease"
+        config["update"]["channel"] = "prerelease"
         stub_releases(
             [
                 _release("release-v0.6.6"),
@@ -230,25 +230,25 @@ class TestHandleChoice:
     def test_skip_persists_skipped_version(self, info):
         # conftest isolates CONFIG to a tmp dir, so this write-through is hermetic.
         _update_apply.handle_choice("skip", info, get_default_config())
-        assert CONFIG.get("mcp.update.skipped_version") == "0.7.0"
+        assert CONFIG.get("update.skipped_version") == "0.7.0"
         # skip is per-version; the check stays enabled.
-        assert CONFIG.get("mcp.update.enabled") is True
+        assert CONFIG.get("update.enabled") is True
 
     def test_disable_turns_check_off(self, info):
         _update_apply.handle_choice("disable", info, get_default_config())
-        assert CONFIG.get("mcp.update.enabled") is False
+        assert CONFIG.get("update.enabled") is False
         # disable is not a per-version skip.
-        assert CONFIG.get("mcp.update.skipped_version") == ""
+        assert CONFIG.get("update.skipped_version") == ""
 
     def test_later_does_nothing(self, info):
         _update_apply.handle_choice("later", info, get_default_config())
-        assert CONFIG.get("mcp.update.skipped_version") == ""
-        assert CONFIG.get("mcp.update.enabled") is True
+        assert CONFIG.get("update.skipped_version") == ""
+        assert CONFIG.get("update.enabled") is True
 
     def test_unknown_action_is_noop(self, info):
         _update_apply.handle_choice("bogus", info, get_default_config())
-        assert CONFIG.get("mcp.update.skipped_version") == ""
-        assert CONFIG.get("mcp.update.enabled") is True
+        assert CONFIG.get("update.skipped_version") == ""
+        assert CONFIG.get("update.enabled") is True
 
     def test_handler_error_is_swallowed(self, info, monkeypatch):
         def _boom(*a, **k):

@@ -16,14 +16,16 @@ from biopb_mcp._config import (
     save_config,
 )
 
+CONFIG_NAME = "mcp-config.json"
+
 
 @pytest.fixture
 def mock_config_dir(monkeypatch, tmp_path):
-    """Redirect the home-relative config dir (~/.config/biopb-mcp) to a tmp path."""
+    """Redirect the home-relative config dir (~/.config/biopb) to a tmp path."""
     import pathlib
 
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
-    return tmp_path / ".config" / "biopb-mcp"
+    return tmp_path / ".config" / "biopb"
 
 
 class TestLoadConfig:
@@ -36,14 +38,11 @@ class TestLoadConfig:
 
     def test_loads_existing_config(self, mock_config_dir):
         """Loads and merges existing config file."""
-        # Create a config file with some custom values
         custom_config = {
-            "widget": {
-                "server_url": "custom.server.org",
-                "detection": {"min_score": 0.5},
-            },
+            "widget": {"server_url": "custom.server.org"},
+            "detection": {"min_score": 0.5},
         }
-        config_path = mock_config_dir / "config.json"
+        config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
             json.dump(custom_config, f)
@@ -52,34 +51,31 @@ class TestLoadConfig:
 
         # Custom values should override defaults
         assert config["widget"]["server_url"] == "custom.server.org"
-        assert config["widget"]["detection"]["min_score"] == 0.5
+        assert config["detection"]["min_score"] == 0.5
 
         # Deep merge: sibling leaves under the overridden section survive.
         defaults = get_default_config()
-        assert config["widget"]["grid"] == defaults["widget"]["grid"]
-        assert (
-            config["widget"]["detection"]["nms"]
-            == defaults["widget"]["detection"]["nms"]
-        )
+        assert config["grid"] == defaults["grid"]
+        assert config["detection"]["nms"] == defaults["detection"]["nms"]
 
     def test_deep_merge_preserves_sibling_leaves(self, mock_config_dir):
         """A partial nested override touches only its own leaf."""
-        custom_config = {"mcp": {"dask": {"num_workers": 4}}}
-        config_path = mock_config_dir / "config.json"
+        custom_config = {"dask": {"num_workers": 4}}
+        config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
             json.dump(custom_config, f)
 
         config = load_config()
 
-        assert config["mcp"]["dask"]["num_workers"] == 4
-        # Sibling dask defaults and other mcp sub-sections are intact.
-        assert config["mcp"]["dask"]["scheduler"] == "distributed"
-        assert config["mcp"]["transport"]["kind"] == "stdio"
+        assert config["dask"]["num_workers"] == 4
+        # Sibling dask defaults and other sections are intact.
+        assert config["dask"]["scheduler"] == "distributed"
+        assert config["transport"]["kind"] == "stdio"
 
     def test_handles_malformed_json(self, mock_config_dir):
         """Returns default config for malformed JSON."""
-        config_path = mock_config_dir / "config.json"
+        config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
             f.write("{ invalid json }")
@@ -90,7 +86,7 @@ class TestLoadConfig:
     def test_handles_missing_keys(self, mock_config_dir):
         """Merges with defaults for missing top-level keys."""
         custom_config = {"widget": {"server_url": "test.org"}}
-        config_path = mock_config_dir / "config.json"
+        config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
             json.dump(custom_config, f)
@@ -98,52 +94,13 @@ class TestLoadConfig:
         config = load_config()
 
         # Should have all expected keys
-        assert "widget" in config
-        assert "tensor_browser" in config
-        assert "timeout" in config
-        assert "grpc" in config
-        assert "mcp" in config
+        for key in ("widget", "tensor_browser", "timeout", "grpc", "transport"):
+            assert key in config
 
-    def test_migrates_installer_flat_process_image_servers(self, mock_config_dir):
-        """The installer's flat mcp.process_image_servers is relocated."""
-        # The shape the biopb installer writes (pre-nesting).
-        installer_config = {"mcp": {"process_image_servers": ["grpcs://cellpose:443"]}}
-        config_path = mock_config_dir / "config.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with config_path.open("w") as f:
-            json.dump(installer_config, f)
-
-        config = load_config()
-
-        assert config["mcp"]["services"]["process_image_servers"] == [
-            "grpcs://cellpose:443"
-        ]
-        # The legacy flat key is removed, not left as a dead duplicate.
-        assert "process_image_servers" not in config["mcp"]
-
-    def test_nested_process_image_servers_wins_over_legacy(self, mock_config_dir):
-        """An explicit nested value takes precedence over the legacy key."""
-        both = {
-            "mcp": {
-                "process_image_servers": ["grpcs://old:443"],
-                "services": {"process_image_servers": ["grpcs://new:443"]},
-            }
-        }
-        config_path = mock_config_dir / "config.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with config_path.open("w") as f:
-            json.dump(both, f)
-
-        config = load_config()
-
-        assert config["mcp"]["services"]["process_image_servers"] == ["grpcs://new:443"]
-        assert "process_image_servers" not in config["mcp"]
-
-    def test_mcp_has_server_start_timeout(self):
-        """The mcp section exposes the autostart boot-wait budget (issue #12)."""
+    def test_has_server_start_timeout(self):
+        """The transport section exposes the autostart boot-wait budget (#12)."""
         defaults = get_default_config()
-        assert "server_start_timeout" in defaults["mcp"]
-        assert defaults["mcp"]["server_start_timeout"] == 60.0
+        assert defaults["transport"]["server_start_timeout"] == 60.0
 
 
 class TestSaveConfig:
@@ -156,32 +113,30 @@ class TestSaveConfig:
 
         save_config(config)
 
-        config_path = mock_config_dir / "config.json"
-        assert config_path.exists()
+        assert (mock_config_dir / CONFIG_NAME).exists()
 
     def test_saves_valid_json(self, mock_config_dir):
         """Saves valid JSON that can be loaded."""
         config = get_default_config()
-        config["widget"]["detection"]["min_score"] = 0.6
+        config["detection"]["min_score"] = 0.6
 
         save_config(config)
 
         loaded = load_config()
-        assert loaded["widget"]["detection"]["min_score"] == 0.6
+        assert loaded["detection"]["min_score"] == 0.6
 
     def test_preserves_all_values(self, mock_config_dir):
         """Preserves all config values when saving."""
         config = get_default_config()
-        config["widget"]["grid"]["2d_size"] = [2048, 2048]
+        config["grid"]["size_2d"] = [2048, 2048]
         config["timeout"]["detection_2d"] = 30
 
         save_config(config)
 
-        config_path = mock_config_dir / "config.json"
-        with config_path.open("r") as f:
+        with (mock_config_dir / CONFIG_NAME).open("r") as f:
             saved = json.load(f)
 
-        assert saved["widget"]["grid"]["2d_size"] == [2048, 2048]
+        assert saved["grid"]["size_2d"] == [2048, 2048]
         assert saved["timeout"]["detection_2d"] == 30
 
 
@@ -189,7 +144,6 @@ class TestGetGridParams:
     """Tests for get_grid_params function."""
 
     def test_2d_grid_params(self):
-        """Returns correct 2D grid parameters."""
         defaults = get_default_config()
         grid_size, stride = get_grid_params(False, defaults)
 
@@ -199,7 +153,6 @@ class TestGetGridParams:
         assert np.array_equal(stride, np.array([4000, 4000]))
 
     def test_3d_grid_params(self):
-        """Returns correct 3D grid parameters."""
         defaults = get_default_config()
         grid_size, stride = get_grid_params(True, defaults)
 
@@ -209,12 +162,11 @@ class TestGetGridParams:
         assert np.array_equal(stride, np.array([48, 480, 480]))
 
     def test_custom_grid_params(self):
-        """Returns custom grid parameters from config."""
         config = get_default_config()
-        config["widget"]["grid"]["2d_size"] = [2048, 2048]
-        config["widget"]["grid"]["2d_stride"] = [2000, 2000]
-        config["widget"]["grid"]["3d_size"] = [32, 256, 256]
-        config["widget"]["grid"]["3d_stride"] = [24, 240, 240]
+        config["grid"]["size_2d"] = [2048, 2048]
+        config["grid"]["stride_2d"] = [2000, 2000]
+        config["grid"]["size_3d"] = [32, 256, 256]
+        config["grid"]["stride_3d"] = [24, 240, 240]
 
         grid_2d, stride_2d = get_grid_params(False, config)
         assert np.array_equal(grid_2d, np.array([2048, 2048]))
@@ -225,95 +177,74 @@ class TestGetGridParams:
         assert np.array_equal(stride_3d, np.array([24, 240, 240]))
 
     def test_returns_int_dtype(self):
-        """Returns arrays with int dtype."""
         defaults = get_default_config()
         grid_size, stride = get_grid_params(False, defaults)
-        assert grid_size.dtype == np.int64 or grid_size.dtype == np.int32
-        assert stride.dtype == np.int64 or stride.dtype == np.int32
+        assert grid_size.dtype in (np.int64, np.int32)
+        assert stride.dtype in (np.int64, np.int32)
 
     def test_handles_missing_grid_config(self):
         """Returns defaults when grid config is missing."""
-        config = {}  # Empty config
-        grid = get_default_config()["widget"]["grid"]
-        grid_size, stride = get_grid_params(False, config)
+        grid = get_default_config()["grid"]
+        grid_size, stride = get_grid_params(False, {})  # empty config
 
-        assert np.array_equal(grid_size, np.array(grid["2d_size"]))
-        assert np.array_equal(stride, np.array(grid["2d_stride"]))
+        assert np.array_equal(grid_size, np.array(grid["size_2d"]))
+        assert np.array_equal(stride, np.array(grid["stride_2d"]))
 
 
 class TestDefaultConfig:
     """Tests for DEFAULT_CONFIG structure."""
 
     def test_has_all_required_keys(self):
-        """DEFAULT_CONFIG contains all expected top-level keys."""
+        """DEFAULT_CONFIG contains all expected top-level (flat) sections."""
         required_keys = [
             "widget",
+            "detection",
+            "grid",
             "tensor_browser",
+            "pyramid",
             "timeout",
             "grpc",
             "memory",
-            "mcp",
-        ]
-        for key in required_keys:
-            assert key in DEFAULT_CONFIG
-
-    def test_widget_config_complete(self):
-        """Widget config groups the demo-widget settings."""
-        widget = DEFAULT_CONFIG["widget"]
-        # server.url + the orphan "3D" bool folded into the namespace.
-        assert widget["server_url"] == "localhost:50051"
-        assert widget["is_3d"] is False
-        for key in ("min_score", "size_hint", "nms", "z_aspect_ratio"):
-            assert key in widget["detection"]
-        for key in ("2d_size", "2d_stride", "3d_size", "3d_stride"):
-            assert key in widget["grid"]
-
-    def test_timeout_config_complete(self):
-        """Timeout config has all timeout fields."""
-        required = [
-            "health_check",
-            "get_op_names",
-            "detection_2d",
-            "detection_3d",
-        ]
-        for key in required:
-            assert key in DEFAULT_CONFIG["timeout"]
-
-    def test_no_dead_tensor_cache_keys(self):
-        """Removed tensor cache keys stay removed.
-
-        tensor_disable_shm (issue #10, no-op after biopb#9) and cache_local (the
-        localhost client-cache decision now lives entirely in the tensor client,
-        not overridden by the MCP kernel).
-        """
-        assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]
-        assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]["tensor"]
-        assert "cache_local" not in DEFAULT_CONFIG["mcp"]["tensor"]
-
-    def test_mcp_sub_sections_present(self):
-        """The mcp section is grouped into its concern sub-sections."""
-        mcp = DEFAULT_CONFIG["mcp"]
-        for section in (
             "transport",
             "kernel",
             "dask",
             "tensor",
             "viewer",
             "services",
-        ):
-            assert section in mcp
-        assert mcp["transport"]["kind"] == "stdio"
-        assert mcp["transport"]["port"] == 8765
+            "observe",
+            "update",
+        ]
+        for key in required_keys:
+            assert key in DEFAULT_CONFIG
 
-    def test_mcp_dask_defaults(self):
+    def test_widget_and_detection_and_grid(self):
+        """The demo-widget settings live in flat widget/detection/grid sections."""
+        assert DEFAULT_CONFIG["widget"]["server_url"] == "localhost:50051"
+        assert DEFAULT_CONFIG["widget"]["is_3d"] is False
+        for key in ("min_score", "size_hint", "nms", "z_aspect_ratio"):
+            assert key in DEFAULT_CONFIG["detection"]
+        for key in ("size_2d", "stride_2d", "size_3d", "stride_3d"):
+            assert key in DEFAULT_CONFIG["grid"]
+
+    def test_timeout_config_complete(self):
+        for key in ("health_check", "get_op_names", "detection_2d", "detection_3d"):
+            assert key in DEFAULT_CONFIG["timeout"]
+
+    def test_skills_are_flat_scalars(self):
+        """The former services.skills object is flattened to scalar leaves."""
+        services = DEFAULT_CONFIG["services"]
+        assert services["skills_enabled"] is True
+        assert services["skills_catalog_url"].startswith("https://")
+        assert services["skills_cache_ttl"] == 3600
+        # No nested object survives.
+        assert "skills" not in services
+
+    def test_dask_defaults(self):
         """MCP dask defaults to a daemon-owned distributed cluster."""
-        dask = DEFAULT_CONFIG["mcp"]["dask"]
-        # "distributed" + empty address -> auto-spun LocalCluster, owned by the
-        # daemon by default so it survives kernel restart.
+        dask = DEFAULT_CONFIG["dask"]
         assert dask["scheduler"] == "distributed"
         assert dask["address"] == ""
         assert dask["owner"] == "daemon"
-        # LocalCluster sizing knobs are present so they can be tuned.
         for key in (
             "num_workers",
             "threads_per_worker",
@@ -321,24 +252,22 @@ class TestDefaultConfig:
             "dashboard_address",
         ):
             assert key in dask
-        # Dashboard binds loopback only, matching the server security model.
         assert dask["dashboard_address"].startswith("127.0.0.1")
 
     def test_platform_dependent_bringup_defaults(self):
         """startup_timeout / num_workers defaults track the platform.
 
-        Windows has no fork(), so dask LocalCluster workers cold-spawn (a full
-        stack re-import each); the defaults widen the startup budget and cap the
-        worker count there, while POSIX keeps the lean values. Asserted against
-        the module's own platform constants so the test is correct on whichever
-        OS runs it, and guards that DEFAULT_CONFIG is actually wired to them.
+        Windows has no fork(), so dask LocalCluster workers cold-spawn; the
+        defaults widen the startup budget and cap the worker count there, while
+        POSIX keeps the lean values. Asserted against the module's own platform
+        constants so the test is correct on whichever OS runs it.
         """
         import os
 
         from biopb_mcp import _config
 
-        kernel = DEFAULT_CONFIG["mcp"]["kernel"]
-        dask = DEFAULT_CONFIG["mcp"]["dask"]
+        kernel = DEFAULT_CONFIG["kernel"]
+        dask = DEFAULT_CONFIG["dask"]
         if os.name == "nt":
             assert _config._IS_WINDOWS is True
             assert kernel["startup_timeout"] == 120.0
@@ -347,16 +276,14 @@ class TestDefaultConfig:
             assert _config._IS_WINDOWS is False
             assert kernel["startup_timeout"] == 60.0
             assert dask["num_workers"] == 0
-        # Either way DEFAULT_CONFIG uses the computed constants, not literals.
         assert kernel["startup_timeout"] == _config._DEFAULT_STARTUP_TIMEOUT
         assert dask["num_workers"] == _config._DEFAULT_DASK_NUM_WORKERS
 
-    def test_mcp_tensor_health_poll_defaults(self):
+    def test_tensor_health_poll_defaults(self):
         """The background source watcher's backoff bounds (issue #44)."""
-        tensor = DEFAULT_CONFIG["mcp"]["tensor"]
+        tensor = DEFAULT_CONFIG["tensor"]
         assert tensor["health_poll_min_interval"] == 2.0
         assert tensor["health_poll_max_interval"] == 60.0
-        # A sane backoff window: min below max so the interval can grow.
         assert tensor["health_poll_min_interval"] < tensor["health_poll_max_interval"]
 
 
@@ -364,33 +291,31 @@ class TestGetSetting:
     """Tests for the dotted-path accessor."""
 
     def test_reads_present_value(self):
-        config = {"mcp": {"transport": {"port": 9999}}}
-        assert get_setting(config, "mcp.transport.port") == 9999
+        config = {"transport": {"port": 9999}}
+        assert get_setting(config, "transport.port") == 9999
 
     def test_missing_falls_back_to_default_config(self):
-        # Empty config -> the value comes from DEFAULT_CONFIG.
-        assert get_setting({}, "mcp.transport.port") == 8765
+        assert get_setting({}, "transport.port") == 8765
         assert get_setting({}, "widget.server_url") == "localhost:50051"
-        assert get_setting({}, "mcp.dask.scheduler") == "distributed"
+        assert get_setting({}, "dask.scheduler") == "distributed"
 
     def test_partial_path_falls_back(self):
-        # A section present but the leaf missing still resolves the default.
-        config = {"mcp": {"dask": {"num_workers": 4}}}
-        assert get_setting(config, "mcp.dask.scheduler") == "distributed"
-        assert get_setting(config, "mcp.dask.num_workers") == 4
+        config = {"dask": {"num_workers": 4}}
+        assert get_setting(config, "dask.scheduler") == "distributed"
+        assert get_setting(config, "dask.num_workers") == 4
 
     def test_explicit_default_wins_over_default_config(self):
-        assert get_setting({}, "mcp.transport.port", default=42) == 42
+        assert get_setting({}, "transport.port", default=42) == 42
 
     def test_mutable_default_is_isolated_copy(self):
         """Mutating a returned mutable default must not touch DEFAULT_CONFIG."""
-        servers = get_setting({}, "mcp.services.process_image_servers")
+        servers = get_setting({}, "services.process_image_servers")
         servers.append("grpc://x:1")
-        assert DEFAULT_CONFIG["mcp"]["services"]["process_image_servers"] == []
+        assert DEFAULT_CONFIG["services"]["process_image_servers"] == []
 
     def test_unknown_path_without_default_raises(self):
         with pytest.raises(KeyError):
-            get_setting({}, "mcp.nope.nada")
+            get_setting({}, "nope.nada")
 
 
 class TestConfigSingleton:
@@ -415,7 +340,7 @@ class TestConfigSingleton:
 
         CONFIG.reload()
         CONFIG.get("pyramid.threshold")
-        CONFIG.get("mcp.transport.port")
+        CONFIG.get("transport.port")
         assert calls["n"] == 1  # second get hits the cache
 
         CONFIG.reload()
@@ -423,8 +348,7 @@ class TestConfigSingleton:
         assert calls["n"] == 2  # reload forces a fresh read
 
     def test_get_falls_back_to_default_config(self):
-        """With no file, get() resolves from DEFAULT_CONFIG."""
-        assert CONFIG.get("mcp.transport.port") == 8765
+        assert CONFIG.get("transport.port") == 8765
         assert CONFIG.get("widget.server_url") == "localhost:50051"
 
     def test_set_persist_updates_cache_and_file(self):
@@ -440,7 +364,6 @@ class TestConfigSingleton:
         """persist=False defers the write; save() flushes the batch."""
         CONFIG.set("widget.is_3d", True, persist=False)
         CONFIG.set("widget.server_url", "deferred:1", persist=False)
-        # Nothing written yet.
         assert not get_config_path().exists()
 
         CONFIG.save()
@@ -450,16 +373,12 @@ class TestConfigSingleton:
         assert on_disk["widget"]["server_url"] == "deferred:1"
 
     def test_set_creates_missing_intermediate_section(self):
-        """A dotted path through a missing section is created."""
         CONFIG.set("brandnew.section.leaf", 5, persist=False)
         assert CONFIG.get("brandnew.section.leaf") == 5
 
     def test_reload_picks_up_external_edit(self):
-        """After reload(), an externally-edited file is observed."""
-        # Prime the cache with defaults.
         assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
 
-        # Edit the file out-of-band; the cache is stale until reload().
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
@@ -470,28 +389,21 @@ class TestConfigSingleton:
         assert CONFIG.get("tensor_browser.server_url") == "grpc://ext:9"
 
     def test_load_config_returns_live_singleton(self):
-        """The load_config() shim returns the cached singleton dict."""
         assert load_config() is CONFIG.as_dict()
 
     def test_save_config_shim_refreshes_cache(self):
-        """save_config() persists and the next read reflects it."""
         config = get_default_config()
-        config["widget"]["detection"]["min_score"] = 0.9
+        config["detection"]["min_score"] = 0.9
         save_config(config)
 
-        assert CONFIG.get("widget.detection.min_score") == 0.9
+        assert CONFIG.get("detection.min_score") == 0.9
 
     def test_get_serialized_against_concurrent_reload(self, monkeypatch):
         """get() holds the lock across _ensure_loaded + the dotted-path walk.
 
         A reader paused *between* loading the cache and walking it must not let a
-        concurrent reload() null the cache out from under it (which would make
-        get() silently return the DEFAULT_CONFIG value instead of the on-disk
-        one). We force exactly that interleaving deterministically: a slow
-        _ensure_loaded blocks the reader at the critical point, then a reload
-        runs in another thread. With the lock held across the whole get(), the
-        reload blocks until the reader finishes; without it, the reload nulls
-        the cache mid-read.
+        concurrent reload() null the cache out from under it. We force exactly
+        that interleaving deterministically.
         """
         import threading
 
@@ -521,8 +433,6 @@ class TestConfigSingleton:
         g.start()
         assert at_critical_point.wait(2)
 
-        # Reader is parked mid-get(). Fire a reload from another thread: it must
-        # not take effect until the reader releases the lock.
         r = threading.Thread(target=CONFIG.reload)
         r.start()
         r.join(0.3)
@@ -534,8 +444,8 @@ class TestConfigSingleton:
 
 
 def _write_and_load(mock_config_dir, raw: dict) -> dict:
-    """Write *raw* as config.json under the mocked home and load it fresh."""
-    config_path = mock_config_dir / "config.json"
+    """Write *raw* as the config file under the mocked home and load it fresh."""
+    config_path = mock_config_dir / CONFIG_NAME
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w") as f:
         json.dump(raw, f)
@@ -548,8 +458,7 @@ class TestValidation:
 
     def test_pyramid_out_of_range_clamped_to_default(self, mock_config_dir):
         """The three shared pyramid knobs are the same bug as the tensor server:
-        a bad value would silently break build_pyramid_levels (no pyramid /
-        infinite loop). Each is reset to its default."""
+        a bad value would silently break build_pyramid_levels. Each resets."""
         defaults = get_default_config()
         config = _write_and_load(
             mock_config_dir,
@@ -561,52 +470,37 @@ class TestValidation:
                 }
             },
         )
-        assert (
-            get_setting(config, "pyramid.downscale_factor")
-            == defaults["pyramid"]["downscale_factor"]
-        )
-        assert (
-            get_setting(config, "pyramid.pixel_budget_cubic_root")
-            == defaults["pyramid"]["pixel_budget_cubic_root"]
-        )
-        assert (
-            get_setting(config, "pyramid.threshold") == defaults["pyramid"]["threshold"]
-        )
+        for key in ("downscale_factor", "pixel_budget_cubic_root", "threshold"):
+            assert get_setting(config, f"pyramid.{key}") == defaults["pyramid"][key]
 
     def test_bad_enum_clamped_to_default(self, mock_config_dir):
         config = _write_and_load(
             mock_config_dir,
             {
-                "mcp": {
-                    "transport": {"kind": "websocket"},
-                    "dask": {"scheduler": "bogus"},
-                }
+                "transport": {"kind": "websocket"},
+                "dask": {"scheduler": "bogus"},
             },
         )
-        assert get_setting(config, "mcp.transport.kind") == "stdio"
-        assert get_setting(config, "mcp.dask.scheduler") == "distributed"
+        assert get_setting(config, "transport.kind") == "stdio"
+        assert get_setting(config, "dask.scheduler") == "distributed"
 
     def test_port_out_of_range_clamped(self, mock_config_dir):
-        config = _write_and_load(
-            mock_config_dir, {"mcp": {"transport": {"port": 99999}}}
-        )
-        assert get_setting(config, "mcp.transport.port") == 8765
+        config = _write_and_load(mock_config_dir, {"transport": {"port": 99999}})
+        assert get_setting(config, "transport.port") == 8765
 
     def test_session_log_keep_default_is_five(self):
-        assert get_setting(DEFAULT_CONFIG, "mcp.transport.session_log_keep") == 5
+        assert get_setting(DEFAULT_CONFIG, "transport.session_log_keep") == 5
 
     def test_session_log_keep_below_one_reset_to_default(self, mock_config_dir):
-        # Range(min=1): must always keep at least the current session's log, so
-        # 0 is rejected and replaced by the default rather than pruning everything.
+        # Range(min=1): must always keep at least the current session's log.
         config = _write_and_load(
-            mock_config_dir, {"mcp": {"transport": {"session_log_keep": 0}}}
+            mock_config_dir, {"transport": {"session_log_keep": 0}}
         )
-        assert get_setting(config, "mcp.transport.session_log_keep") == 5
+        assert get_setting(config, "transport.session_log_keep") == 5
 
     def test_string_number_reset_to_default(self, mock_config_dir):
-        """The no-coercion wrinkle: a JSON string where a number is expected
-        would reach arithmetic as a str (TypeError). It fails the Range check
-        and is replaced by the numeric default before any hot path sees it."""
+        """The no-coercion wrinkle: a JSON string where a number is expected fails
+        the Range check and is replaced by the numeric default."""
         config = _write_and_load(
             mock_config_dir, {"pyramid": {"downscale_factor": "4"}}
         )
@@ -619,28 +513,26 @@ class TestValidation:
         config = _write_and_load(
             mock_config_dir,
             {
-                "mcp": {
-                    "dask": {"num_workers": 0},
-                    "kernel": {"watchdog_interval": 0},
-                    "tensor": {"health_poll_min_interval": 0},
-                }
+                "dask": {"num_workers": 0},
+                "kernel": {"watchdog_interval": 0},
+                "tensor": {"health_poll_min_interval": 0},
             },
         )
-        assert get_setting(config, "mcp.dask.num_workers") == 0
-        assert get_setting(config, "mcp.kernel.watchdog_interval") == 0
-        assert get_setting(config, "mcp.tensor.health_poll_min_interval") == 0
+        assert get_setting(config, "dask.num_workers") == 0
+        assert get_setting(config, "kernel.watchdog_interval") == 0
+        assert get_setting(config, "tensor.health_poll_min_interval") == 0
 
     def test_valid_values_untouched(self, mock_config_dir):
         config = _write_and_load(
             mock_config_dir,
             {
                 "pyramid": {"downscale_factor": 2},
-                "mcp": {"transport": {"kind": "http", "port": 9000}},
+                "transport": {"kind": "http", "port": 9000},
             },
         )
         assert get_setting(config, "pyramid.downscale_factor") == 2
-        assert get_setting(config, "mcp.transport.kind") == "http"
-        assert get_setting(config, "mcp.transport.port") == 9000
+        assert get_setting(config, "transport.kind") == "http"
+        assert get_setting(config, "transport.port") == 9000
 
     def test_health_poll_inverted_reset_to_defaults(self, mock_config_dir):
         """min > max would invert the exponential backoff; both reset."""
@@ -648,21 +540,19 @@ class TestValidation:
         config = _write_and_load(
             mock_config_dir,
             {
-                "mcp": {
-                    "tensor": {
-                        "health_poll_min_interval": 90.0,
-                        "health_poll_max_interval": 10.0,
-                    }
+                "tensor": {
+                    "health_poll_min_interval": 90.0,
+                    "health_poll_max_interval": 10.0,
                 }
             },
         )
         assert (
-            get_setting(config, "mcp.tensor.health_poll_min_interval")
-            == defaults["mcp"]["tensor"]["health_poll_min_interval"]
+            get_setting(config, "tensor.health_poll_min_interval")
+            == defaults["tensor"]["health_poll_min_interval"]
         )
         assert (
-            get_setting(config, "mcp.tensor.health_poll_max_interval")
-            == defaults["mcp"]["tensor"]["health_poll_max_interval"]
+            get_setting(config, "tensor.health_poll_max_interval")
+            == defaults["tensor"]["health_poll_max_interval"]
         )
 
     def test_warns_naming_key_value_and_range(self, mock_config_dir, caplog):
@@ -675,7 +565,7 @@ class TestValidation:
 
     def test_malformed_file_still_falls_back_to_defaults(self, mock_config_dir):
         """A non-dict-JSON file is unaffected by validation (still defaults)."""
-        config_path = mock_config_dir / "config.json"
+        config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text("not json {{{")
         CONFIG.reload()
@@ -683,14 +573,21 @@ class TestValidation:
 
     def test_shipped_defaults_satisfy_every_constraint(self):
         """DEFAULT_CONFIG must itself pass validation -- otherwise a bad leaf
-        would clamp to a default that is *also* invalid, and shipping defaults
-        that violate our own rules is a bug. This also pins the pyramid defaults
-        against the shared constraint rows, so a drift on either side fails."""
-        from biopb_mcp._config import _CONSTRAINTS, _MISSING, _walk_path
+        would clamp to a default that is *also* invalid. Iterates the class-keyed
+        _CONSTRAINTS through the section->class map, pinning the pyramid defaults
+        against the shared constraint rows too."""
+        from biopb_mcp._config import (
+            _CONSTRAINTS,
+            _MISSING,
+            _SECTION_CLASSES,
+            _walk_path,
+        )
 
-        for path, constraint in _CONSTRAINTS.items():
-            value = _walk_path(DEFAULT_CONFIG, path.split("."))
-            assert value is not _MISSING, f"{path} missing from DEFAULT_CONFIG"
-            assert constraint.ok(value), (
-                f"default {path}={value!r} violates {constraint.describe()}"
-            )
+        for section, cls in _SECTION_CLASSES.items():
+            for field_name, constraint in _CONSTRAINTS.get(cls.__name__, {}).items():
+                value = _walk_path(DEFAULT_CONFIG, (section, field_name))
+                assert value is not _MISSING, f"{section}.{field_name} missing"
+                assert constraint.ok(value), (
+                    f"default {section}.{field_name}={value!r} violates "
+                    f"{constraint.describe()}"
+                )

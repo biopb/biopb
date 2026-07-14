@@ -2,7 +2,7 @@
 
 The "algorithm plane" is the set of gRPC ``ProcessImage`` servicers an agent's
 kernel exposes as callable ``ops``. Their URLs live in the biopb-mcp config today
-(``mcp.services.process_image_servers``); each is queried via ``GetOpNames`` so its
+(``services.process_image_servers``); each is queried via ``GetOpNames`` so its
 ops surface in the kernel. Moving that config under the control is migration
 Layer 4 (``biopb-mcp/docs/mcp-dedaemonization-migration.md`` §7), deliberately
 *later*.
@@ -47,14 +47,17 @@ _DEFAULT_TIMEOUT = 4.0
 
 
 def _config_file() -> Path:
-    """The biopb-mcp config file location (``~/.config/biopb-mcp/config.json``).
+    """The biopb-mcp config file location (``~/.config/biopb/mcp-config.json``).
 
-    Reproduces ``biopb_mcp._config.get_config_path()`` — the same on every platform
-    — rather than importing ``biopb_mcp``: the control plane must not import the mcp
-    package (invariant I2), and the read is plain JSON. Resolved at call time (not
-    cached) so a test that repoints ``Path.home()`` gets an isolated location.
+    Uses the shared ``biopb._config_location.mcp_config_path`` -- the same location
+    ``biopb_mcp._config.get_config_path()`` returns -- rather than importing
+    ``biopb_mcp``: the control plane must not import the mcp package (invariant I2),
+    and the read is plain JSON. The helper resolves ``Path.home()`` at call time
+    (not cached) so a test that repoints it gets an isolated location.
     """
-    return Path.home() / ".config" / "biopb-mcp" / "config.json"
+    from biopb._config_location import mcp_config_path
+
+    return mcp_config_path()
 
 
 def servers_from_config(config) -> list[str]:
@@ -65,22 +68,16 @@ def servers_from_config(config) -> list[str]:
     which passes its live ``CONFIG`` dict here instead of hand-reading the key — so
     "where the algorithm-plane server list lives" is defined in exactly one place.
 
-    Reads ``mcp.services.process_image_servers`` (the nested location), falling back
-    to the legacy flat ``mcp.process_image_servers`` the installer once seeded — the
-    same precedence ``biopb_mcp._config._migrate_legacy_keys`` applies (nested
-    wins). Any non-mapping / missing / oddly-typed shape reads as an empty list;
-    non-string and blank entries are dropped. Never raises.
+    Reads the flat ``services.process_image_servers`` key. Any non-mapping /
+    missing / oddly-typed shape reads as an empty list; non-string and blank
+    entries are dropped. Never raises.
     """
     if not isinstance(config, dict):
         return []
-    mcp = config.get("mcp")
-    if not isinstance(mcp, dict):
+    services = config.get("services")
+    if not isinstance(services, dict):
         return []
-    services = mcp.get("services")
-    if isinstance(services, dict) and "process_image_servers" in services:
-        servers = services.get("process_image_servers")
-    else:  # legacy flat location (pre-nesting installer / hand-edited config)
-        servers = mcp.get("process_image_servers")
+    servers = services.get("process_image_servers")
     if not isinstance(servers, list):
         return []
     return [s for s in servers if isinstance(s, str) and s.strip()]

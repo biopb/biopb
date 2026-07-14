@@ -355,6 +355,6 @@ def test_describe_http_uses_mcp_port():
 def test_config_defaults():
     from biopb_mcp._config import get_setting
 
-    assert get_setting({}, "mcp.observe.enabled") is True  # opt-out
-    assert get_setting({}, "mcp.observe.max_output_chars") == 20000
-    assert get_setting({}, "mcp.observe.poll_interval_ms") == 3000
+    assert get_setting({}, "observe.enabled") is True  # opt-out
+    assert get_setting({}, "observe.max_output_chars") == 20000
+    assert get_setting({}, "observe.poll_interval_ms") == 3000

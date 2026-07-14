@@ -5,7 +5,7 @@ fully automatic cross-platform apply needs a staging step we don't handle
 gracefully yet (Windows can't reinstall into a tool dir held open by the running
 daemon), so for now the popup just tells the user a newer release exists and to
 run the install/upgrade script themselves. The user can opt out per-version
-(``skip``) or entirely (``disable`` -> ``mcp.update.enabled = false``).
+(``skip``) or entirely (``disable`` -> ``update.enabled = false``).
 
 ``handle_choice`` is pure control flow over the config seams so it is
 unit-testable; it runs on the Qt main thread (the popup's button signal delivers
@@ -44,9 +44,9 @@ def upgrade_command() -> str:
 def handle_choice(action: str, info, config: dict) -> None:
     """Dispatch a nagger choice (``skip`` / ``disable`` / ``later``).
 
-    * ``skip``    -> persist ``mcp.update.skipped_version`` so *this* version
+    * ``skip``    -> persist ``update.skipped_version`` so *this* version
                      never prompts again.
-    * ``disable`` -> turn the check off entirely (``mcp.update.enabled = false``).
+    * ``disable`` -> turn the check off entirely (``update.enabled = false``).
     * ``later``   -> do nothing; the check re-prompts on the next kernel start.
 
     (The ``copy`` button is handled in the popup itself.) Fail-open: a handler
@@ -71,18 +71,18 @@ def _persist_skip(version: str) -> None:
     try:
         from .._config import CONFIG
 
-        CONFIG.set("mcp.update.skipped_version", version)
+        CONFIG.set("update.skipped_version", version)
         logger.info("update %s skipped on user request", version)
     except Exception:
         logger.exception("failed to persist skipped update version %s", version)
 
 
 def _disable_checks() -> None:
-    """Opt out of update reminders entirely (``mcp.update.enabled = false``)."""
+    """Opt out of update reminders entirely (``update.enabled = false``)."""
     try:
         from .._config import CONFIG
 
-        CONFIG.set("mcp.update.enabled", False)
+        CONFIG.set("update.enabled", False)
         logger.info("update reminders disabled on user request")
     except Exception:
         logger.exception("failed to disable update reminders")
