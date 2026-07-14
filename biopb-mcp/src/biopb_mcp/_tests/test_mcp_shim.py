@@ -455,7 +455,7 @@ class TestReplayInitOptions:
     def test_instructions_and_identity_survive(self):
         # The whole point of vendoring the bridge: nothing from the child's
         # initialize result may be dropped on the floor (mcp-proxy loses
-        # `instructions`; docs/mcp-proxy-vet.md finding 2).
+        # `instructions`).
         init = types.InitializeResult(
             protocolVersion="2025-03-26",
             capabilities=types.ServerCapabilities(

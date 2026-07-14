@@ -14,14 +14,14 @@ Both are **idempotent** — rerun to upgrade or to add components you skipped.
 
 ## Release channels
 
-Both installers download the prebuilt `biopb-mcp`, `biopb`, and
-`biopb-tensor-server` wheels from a single **`biopb/biopb` `release-v*` GitHub
-deployment** — one release that carries all three as a mutually-paired set — and
-install them into one shared `uv` tool environment. Because the trio ships from
-one build, the server always runs against the exact `biopb` it was tested with
-and `biopb-mcp` against the exact pair it expects (the server wheel may use proto
-fields newer than any `biopb` on PyPI), with no PyPI-vs-release version skew.
-Only `napari` comes from PyPI.
+Both installers download the prebuilt `biopb-mcp`, `biopb`,
+`biopb-tensor-server`, and `biopb-control` wheels from a single **`biopb/biopb`
+`release-v*` GitHub deployment** — one release that carries all four as a
+mutually-paired set — and install them into one shared `uv` tool environment.
+Because the set ships from one build, the server always runs against the exact
+`biopb` it was tested with and `biopb-mcp` against the exact peers it expects (the
+server wheel may use proto fields newer than any `biopb` on PyPI), with no
+PyPI-vs-release version skew. Only `napari` comes from PyPI.
 
 Requirements: `curl`/`tar` (POSIX) or built-in PowerShell tooling (Windows), plus
 `uv` (installed automatically). **No git, buf, or compiler needed** — the release
@@ -69,7 +69,7 @@ are produced.
   can import and drive each other (`biopb control start`, `biopb server start`, the
   napari viewer, etc.).
 - **napari** — from PyPI, into the same environment.
-- **Web interface** — `webapp.tar.gz` from the same biopb-mcp release, unpacked to
+- **Web interface** — `webapp.tar.gz` from the same release, unpacked to
   `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin
   page; installed by default (set `BIOPB_INSTALL_WEBAPP=0` to skip).
 - The installer also registers the biopb MCP server with any detected agent
@@ -86,8 +86,6 @@ are produced.
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Webapp: `~/.local/share/biopb/webapp`
-
-Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
 
 ### Unattended / unmanned upgrades
 
@@ -127,11 +125,7 @@ On Windows, uninstall through Add/Remove Programs instead.
 ## Notes
 
 - Release assets are read from the `biopb/biopb` GitHub Releases API; the latest
-  `release-v*` deployment carries all three wheels (`biopb-mcp`, `biopb`,
-  `biopb-tensor-server`) plus the webapp tarball. The `release.yaml` CI builds
-  the trio from the tagged commit so they are shipped together as one matched
-  set (see `../docs/release-model.md`).
-- Migration rationale (why the installer and all three wheels now live in one
-  repo/release) lives in `../docs/installer-migration.md`.
-- Distribution rationale (why the server ships via Docker/GitHub release rather
-  than PyPI) lives in the architecture overview, `../development.md`.
+  `release-v*` deployment carries all four wheels (`biopb-mcp`, `biopb`,
+  `biopb-tensor-server`, `biopb-control`) plus the webapp tarball. The
+  `release.yaml` CI builds the set from the tagged commit so they are shipped
+  together as one matched set (see `../docs/release-model.md`).

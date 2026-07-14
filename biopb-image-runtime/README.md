@@ -125,8 +125,9 @@ Or manually (build wheels yourself):
 ```bash
 cd /path/to/biopb  # repo root
 
-# Build wheel first
+# Build wheels first (the Dockerfile installs both biopb and biopb_tensor_server)
 pip wheel . --no-deps -w wheels/
+pip wheel biopb-tensor-server/ --no-deps -w wheels/
 
 # Build Docker image
 docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
@@ -142,8 +143,13 @@ The mock servicer is available for pytest and explicit development workflows. Ru
 docker run --rm -p 50051:50051 -p 50052:8817 -v tensor-cache:/data/cache \
     biopb-image-base \
     python -m biopb_image_base.mock_servicer \
-    --cache-dir /data/cache --cache-size 32GB
+    --cache-dir /data/cache --cache-size 32GB \
+    --tensor-external-location grpc://localhost:50052
 ```
+
+`--tensor-external-location` is **required** when the embedded cache binds
+`0.0.0.0` — it is the address clients use to reach the cache (here the mapped host
+port). Pass `--local` instead to bind loopback and skip it.
 
 **With docker-compose:**
 

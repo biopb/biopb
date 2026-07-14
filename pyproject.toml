@@ -37,7 +37,7 @@ dependencies = [
     "cachey >= 0.1.0",
     "ome-zarr >= 0.6.1",
     # biopb's Zarr adapters target the zarr 2.x API (zarr 3 is a separate port).
-    # See docs/aicsimageio-to-bioio-migration.md.
+    # See biopb-tensor-server/docs/aicsimageio-to-bioio-migration.md.
     "zarr >= 2.0.0, <3",
   ]
   # SDK API-reference toolchain (mkdocstrings). Builds the static HTML that the
@@ -107,6 +107,11 @@ biopb-control = { workspace = true }
 # cffi / Rust / OpenSSL build surface fall out of the resolved set. Keeps this
 # checkout's `uv sync` closure aligned with what install.sh ships via --overrides.
 override-dependencies = ["pyjwt>=2.10.1"]
+
+# Exclude anyio 4.13.0: it ships a `fail_after` typo (yields an undefined
+# `cancel_scope` → NameError) that crashes any code path reaching it. Our
+# exercised paths don't hit it today, but constrain it out so a future one can't.
+constraint-dependencies = ["anyio != 4.13.0"]
 
 # ---------------------------------------------------------------------------
 # Single source of truth for Python lint + format across the whole monorepo.

@@ -12,8 +12,9 @@ console one-liner share **one install brain**.
 ## The core constraint
 
 `install.ps1` is **not a file-copy install** — it is a multi-minute network
-*orchestration*: install `uv`, provision Python ≥3.10, download the wheel triple
-from the latest `release-v*`, pull `napari[all]` from PyPI, unpack the webapp,
+*orchestration*: install `uv`, provision Python ≥3.10, download the wheel set
+(biopb + tensor-server + mcp + control) from the latest `release-v*`, pull
+`napari[all]` from PyPI, unpack the webapp,
 write `biopb.json`, start the tensor server, and wire MCP clients. It is
 idempotent and already handles the interactive choices.
 
@@ -54,7 +55,7 @@ install.ps1 (console front-end)        biopb-setup.iss (Inno GUI front-end)
                           │  calls Invoke-BiopbInstall / runs the .ps1
                           ▼
               install/biopb-engine.ps1  (headless engine)
-        uv → Python → wheel triple → webapp → config → server → MCP
+        uv → Python → wheel set → webapp → config → server → MCP
         every choice is a PARAMETER; no Read-Host / banner / exit
         emits progress through ONE reporter (console-colored OR tagged)
 ```
@@ -102,7 +103,7 @@ local checkout/unpacked installer it reads the sibling `biopb-engine.ps1`; when
 run via `irm | iex` (no file on disk, `$PSScriptRoot` empty) it downloads the
 engine from `https://biopb.org/biopb-engine.ps1`. CI publishes the engine as a
 release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring how
-`install.ps1`/`install.sh` are already hosted (see `release-model.md`).
+`install.ps1`/`install.sh` are already hosted (see `../../docs/release-model.md`).
 
 **ExecutionPolicy: the engine is dot-sourced in-memory, never from a temp file.**
 `Resolve-EngineSource` returns the engine's *text* (local `Get-Content` or the

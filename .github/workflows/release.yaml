@@ -81,7 +81,7 @@ jobs:
   # for now: no code-signing cert is provisioned yet, so the .exe trips a
   # SmartScreen "Unknown publisher" warning. Wire up signing later by registering
   # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss
-  # (see docs/windows-installer.md "Code signing").
+  # (see install/docs/windows-installer.md "Code signing").
   windows-installer:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
@@ -287,7 +287,7 @@ jobs:
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
-      # now (no cert yet — see docs/windows-installer.md).
+      # now (no cert yet — see install/docs/windows-installer.md).
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:

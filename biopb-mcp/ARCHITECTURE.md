@@ -1,70 +1,5 @@
 # biopb-mcp
 
-## Python Environment
-
-This project uses a **`uv`-managed virtualenv at `.venv/`**, pinned by `uv.lock`.
-Always run tooling through that interpreter — e.g. `.venv/bin/python -m pytest …`,
-`.venv/bin/python -m black …` — **not** the bare `python`/`pytest` on `PATH`. A
-system or user-site Python can shadow the project env with a *different* (often
-older) `biopb`, which silently breaks tests that depend on newer client APIs
-(e.g. `configure_cache`, added in `biopb >= 0.5.8`).
-
-biopb-mcp now lives in the **biopb monorepo** (`biopb/biopb-mcp/`) as a uv
-workspace member; see `docs/monorepo-migration.md`. `biopb` and
-`biopb-tensor-server` resolve to the sibling workspace members, so run uv from
-the **repo root**, selecting this package:
-
-```bash
-uv sync --package biopb-mcp --extra mcp --group testing
-```
-
-After pulling changes, re-run that to bring `.venv` back in line with the root
-`uv.lock`. If imports or versions look wrong, first check the interpreter
-(`which python` / `.venv/bin/python -c "import biopb; print(biopb.__version__)"`)
-before debugging the code; a stale `.venv` (missing `uv sync`) is the usual cause.
-
-Test/dev deps live in **PEP 735 dependency *groups*, not extras**, so they stay
-out of biopb-mcp's published metadata. Two groups:
-
-- **`integration`** — the runnable full stack with *no* test tooling: the MCP
-  server deps plus the in-tree `biopb-tensor-server[web]` and `biopb[tensor]`
-  workspace members. Sync this for a checkout that needs a real local tensor
-  server (`biopb server start` / autostart) without pytest:
-  `uv sync --package biopb-mcp --extra mcp --group integration`.
-- **`testing`** — `integration` **plus** pytest. The normal dev/CI profile.
-
-Because these are groups, select them with `--group <name>`, *not*
-`--extra <name>`. Version-pairing across the three packages is automatic from
-the checkout (the workspace resolves them from the tree) — there are no more
-release-asset URLs to bump.
-
-**Important — groups don't reach PyPI users.** A dependency group is not part of
-biopb-mcp's published wheel/sdist metadata, and the workspace resolution applies
-only to a source checkout. So `pip install biopb-mcp[...]` can never pull the
-tensor server (it is not on PyPI); the groups + workspace only help a checkout.
-
-## Build and Test Commands
-
-```bash
-# Install the package in development mode (uv — run from the repo root)
-uv sync --package biopb-mcp --extra mcp --group testing
-
-# Run all tests with coverage
-uv run pytest -v --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
-
-# Run a single test file
-uv run pytest biopb-mcp/src/biopb_mcp/_tests/test_mcp_kernel.py -v
-
-# Run a single test function
-uv run pytest biopb-mcp/src/biopb_mcp/_tests/test_grpc.py::test_encode_image -v
-
-# Format code with black (line-length 79)
-black biopb-mcp/src/
-
-# Run pre-commit hooks on all files
-pre-commit run --all-files
-```
-
 ## Architecture Overview
 
 `biopb-mcp` connects [napari](https://napari.org) and AI agents to
@@ -97,10 +32,15 @@ URL/token resolution fallback chain (`resolve_from_config`):
 3. **Default**: `grpc://localhost:8815`
 
 **Connect policy (`auto_connect`).** `auto_connect()` is the single connect
-policy shared by **both** faces: try the resolved `(url, token)`, wait the
-server through a `STARTING` data-folder scan, and — with no prompt — run
-`start_local_server()` (`biopb server start`) as a last resort when the URL is
-local *and* the `biopb` CLI is on PATH. It is best-effort (failures are recorded
+policy shared by **both** faces: it asks the **control plane** first to ensure
+the data plane (one `ensure_data_plane()` POST — the control is the single source
+of truth for the data plane since #413 — which brings it up if down, idempotently,
+and returns the authoritative gRPC endpoint), and only when no control answers
+falls back to the resolved `(url, token)` and a direct connect, waiting the server
+through a `STARTING` data-folder scan. `_connection` is a **pure client** (Layer 2
+of the de-daemonization migration): it never shells out `biopb server start`
+itself — bringing the plane up is the control's job (`biopb control start`). It is
+best-effort (failures are recorded
 in `last_status`/`last_message`, never raised) and **must be driven off the
 caller's main thread** because `connect()` blocks on network I/O: the MCP kernel
 runs it on a daemon thread (`_bootstrap`'s headless branch), the
@@ -119,7 +59,7 @@ complete but isn't. `start_source_watch()` spawns a **daemon thread** (not a
 `health_check()`s and re-lists (`refresh()`) whenever the server's
 `source_count` changes, reconciling against the count cached at connect on its
 first poll. The poll interval backs off exponentially from
-`mcp.tensor.health_poll_min_interval` to `health_poll_max_interval` while stable
+`tensor.health_poll_min_interval` to `health_poll_max_interval` while stable
 and snaps back to the min on a change. The watcher only ever *rebinds*
 `self.sources` to a fresh dict, so the agent (which reads `_conn.sources` live)
 and the widget (which wires `on_sources_changed` to a queued Qt signal to
@@ -138,28 +78,29 @@ The launcher comes up **idle**: the heavy kernel (and, with a display, the
 napari viewer window) is **not** spawned at boot — it starts on demand when an
 agent calls the `start_kernel` tool (see the kernel-lifecycle note below).
 
-**Transport.** The MCP server itself is **http-only** (loopback
-streamable-http on `transport.port`; daemon migration Direction 1,
-docs/daemon-migration.md). `--transport` / `config['mcp']['transport']['kind']`
-still accepts `stdio` (deprecated; still the default so installer-seeded
-client configs keep working unchanged), but stdio no longer serves MCP from
-the launcher process: it runs the **shim** (`mcp/_shim.py`) — a featherweight
-bridge that probes `127.0.0.1:<port>`, spawns the http daemon detached if
-nothing is listening (daemon + kernel output goes to `transport.kernel_log`,
-default `~/.local/share/biopb-mcp/log/mcp-server.log`), and pumps stdio JSON-RPC
-to `/mcp` until the client closes stdin. Concurrent shims race benignly (the
-port bind picks one daemon; losers exit on EADDRINUSE and every shim converges
-on the winner). The shim process owns fd 1 as a protocol channel but imports
-only the mcp SDK — no Qt/dask/uvicorn — so the old fd-1 corruption class is
-structurally impossible; it replays the daemon's initialize result verbatim
-(including `instructions` — the field the generic `mcp-proxy` bridge drops;
-see docs/mcp-proxy-vet.md for why the bridge is vendored), and any bridge
-failure exits the shim so the client sees EOF, never a hung server. Notable
-behavior shifts vs. the old direct-stdio serving: the daemon (and kernel)
-**outlives the client** and is **shared across concurrent clients** — one
-kernel, one viewer, the project thesis made literal — and the Host/Origin
-allowlist plus the observe UI now apply to stdio-bridged sessions too, since
-everything is the one http server. Native http
+**Transport.** The MCP server process is **http-only** (loopback streamable-http
+on `transport.port`). `--transport` / `config['transport']['kind']` still accepts
+`stdio` (still the default so installer-seeded client configs keep working
+unchanged), but stdio no longer serves MCP from the launcher process: it runs the
+**shim** (`mcp/_shim.py`) — a featherweight bridge that spawns its **own**
+ephemeral http session child (FastMCP/uvicorn + the kernel host) on a **dynamic
+OS-assigned port** (`--port 0`), inheriting the client's live environment (the #98
+display fix), pumps stdio JSON-RPC to that child's `/mcp` until the client closes
+stdin, then **reaps** the child (and its kernel grandchild) on the way out. There
+is **no probe-and-reuse, no shared daemon, and no fixed port**: each stdio client
+spawns and owns *its own* session, so N clients get N independent sessions (N
+viewers), by design (docs/mcp-dedaemonization-migration.md), which supersedes the
+earlier shared, client-outliving daemon. The shim
+process owns fd 1 as a protocol channel but imports only the mcp SDK — no
+Qt/dask/uvicorn — so the old fd-1 corruption class is structurally impossible; it
+replays the child's initialize result verbatim (including `instructions` — the
+field the generic `mcp-proxy` bridge drops — which is why the bridge is
+vendored), and any bridge failure exits the shim so the client sees EOF,
+never a hung server. The child's output goes to a **per-session** log
+(`transport.kernel_log` default empty → `~/.local/share/biopb-mcp/log/sessions/<id>.log`;
+set `kernel_log` to force one shared file). The Host/Origin allowlist and the
+observe UI apply to stdio-bridged sessions too, since each session child is a real
+http server. Native http
 (`claude mcp add --transport http biopb http://127.0.0.1:8765/mcp`) skips the
 shim entirely and is preferred where the client supports it.
 
@@ -216,9 +157,10 @@ output is not captured (code is exec'd, not run via `run_cell`).
   tools/resources and dispatches them to the `KernelHost`. `run()` serves
   streamable-http on `127.0.0.1:<port>/mcp` — the only serving path in this
   process.
-- `_shim.py` — the stdio bridge (`--transport stdio`): ensures the http
-  daemon is listening (spawning it detached if not) and pumps stdio JSON-RPC
-  to `/mcp`, replaying the daemon's initialize result verbatim.
+- `_shim.py` — the stdio bridge (`--transport stdio`): spawns its **own**
+  ephemeral http session child on a dynamic port (inheriting the client's live
+  env), pumps stdio JSON-RPC to its `/mcp`, and reaps the child on disconnect;
+  replays the child's initialize result verbatim.
 - `_kernel.py` — `KernelHost`: manages the one child kernel. A single
   `threading.RLock` serializes access to the kernel shell channel; with the job
   model it is held only for the *quick* snippets (submit/poll/screenshot/status)
@@ -268,7 +210,7 @@ output is not captured (code is exec'd, not run via `run_cell`).
   instead of crashing. Handle-set completeness is enforced by a graph-walk test
   (`_tests/test_viewer_proxy.py`); see `docs/viewer-thread-safety.md`.
 - `_observe.py` — runs *in the MCP server process* (not the kernel). The web
-  "observe" UI (`mcp.observe.enabled`, **on by default / opt-out**): job history
+  "observe" UI (`observe.enabled`, **on by default / opt-out**): job history
   (the submitted code + truncated output) + global cancel/interrupt/restart
   knobs. **http transport only** — the routes mount on the existing FastMCP app
   via `mcp.custom_route`
@@ -292,12 +234,12 @@ output is not captured (code is exec'd, not run via `run_cell`).
   `take_screenshot` / `execute_code` detect a user-closed window instead of
   silently mutating a destroyed viewer.
 
-**Tools (9):** `start_kernel`, `take_screenshot`, `execute_code`, `poll_job`,
-`cancel_job`, `inspect_object`, `interrupt_kernel`, `restart_kernel`,
+**Tools (10):** `find_skills`, `start_kernel`, `take_screenshot`, `execute_code`,
+`poll_job`, `cancel_job`, `inspect_object`, `interrupt_kernel`, `restart_kernel`,
 `server_status`.
 
-**Resources (5):** `guide://kernel`, `guide://viewer`, `guide://tensor`,
-`guide://annotations`, `guide://ops`.
+**Resources (6):** `guide://kernel`, `guide://viewer`, `guide://tensor`,
+`guide://annotations`, `guide://ops`, and the `skill://{skill_id}` template.
 
 **`execute_code` namespace** (populated by `_bootstrap.py`):
 - `viewer` — the live `napari.Viewer`
@@ -315,8 +257,8 @@ reverse proxy. The server **enforces a DNS-rebinding / `Origin` / `Host`
 allowlist** (loopback only, set explicitly in `_server.py` via
 `build_transport_security()`), so a malicious page in the user's browser is
 rejected (`403`/`421`) before it can reach the kernel. The allowlist is
-extensible via `config['mcp']['transport']['allowed_origins']` /
-`config['mcp']['transport']['allowed_hosts']` for a reverse-proxy front; there
+extensible via `config['transport']['allowed_origins']` /
+`config['transport']['allowed_hosts']` for a reverse-proxy front; there
 is no loopback token (the `Origin` check already
 blocks the browser-attacker threat). Do not describe this as sandboxed.
 
@@ -333,8 +275,8 @@ both contexts — napari's `notification_manager` in the standalone plugin (set 
 never called — the kernel's `%gui qt` inputhook drives the loop and `run()`
 early-returns under an IPython loop — so napari's hooks are absent but the kernel's
 own hook covers it). The only difference is *where the error surfaces*: a GUI
-notification in the plugin vs. a printed traceback in the kernel output (mcp-server.log
-under stdio) for MCP. Verified empirically: a slot exception aborts with SIGABRT
+notification in the plugin vs. a printed traceback in the kernel output (the
+per-session kernel log under stdio) for MCP. Verified empirically: a slot exception aborts with SIGABRT
 only under the default hook and exits cleanly under any override, and the ipykernel
 hook stays non-default through `enable_gui("qt")` and `napari.Viewer()`. Caveat:
 this only covers crash-safety — a propagated error in the MCP kernel produces a log
@@ -343,32 +285,38 @@ clean, reported failure.
 
 ### Configuration (`_config.py`)
 
-`DEFAULT_CONFIG` is stored under the home-relative config dir
-(`~/.config/biopb-mcp`, matching the biopb server and installer on all
-platforms) and **deep-merged** with defaults on load — a partial nested user
-section overrides only its own leaves and leaves sibling defaults intact. Read
-values with `get_setting(config, "dotted.path")`, which falls back to
-`DEFAULT_CONFIG` so call sites never restate a default literal.
+The config file lives at `~/.config/biopb/mcp-config.json` — co-located with the
+tensor server's `biopb.json` (via `biopb._config_location.mcp_config_path`), not
+in a separate `~/.config/biopb-mcp` directory. It is **deep-merged** with
+`DEFAULT_CONFIG` on load — a partial nested user section overrides only its own
+leaves and leaves sibling defaults intact. Read values with
+`get_setting(config, "dotted.path")`, which falls back to `DEFAULT_CONFIG` so
+call sites never restate a default literal.
 
-Top-level sections: `widget` (the experimental demo widgets' settings —
-`server_url`, `is_3d`, `detection`, and `grid` tiling — the only consumer is
-`image_processing/`), `tensor_browser.server_url` (data-plane URL, deliberately
+Sections are **flat / top-level** — there is no `mcp.` or `widget.` wrapper (each
+maps 1:1 to a section dataclass in `McpConfig`). The demo-widget knobs are
+`widget` (`server_url`, `is_3d`), `detection`, and `grid` (tiling; consumer is
+`image_processing/`); `tensor_browser.server_url` (data-plane URL, deliberately
 top-level because the GUI-independent `TensorConnection` reads it from the
-headless kernel too), `timeout`, `grpc.max_message_size_mb`, `memory`, and `mcp`.
-The `mcp` section is grouped by concern:
+headless kernel too), `pyramid`, `timeout`, `grpc.max_message_size_mb`, and
+`memory` are shared by the widgets and `ops`. The MCP-server knobs are the
+top-level sections `transport` / `kernel` / `dask` / `tensor` / `viewer` /
+`services` / `observe` / `update`:
 
-- **`mcp.transport`** — `kind` (`stdio`/`http`, default `stdio`; chosen at
+- **`transport`** — `kind` (`stdio`/`http`, default `stdio`; chosen at
   startup, also via `--transport`), `port` (8765), `display_mode`, `kernel_log`
-  (stdio-only; where the kernel's native stdout/stderr is redirected so it can't
-  corrupt fd 1, default `~/.local/share/biopb-mcp/log/mcp-server.log`), and
-  `allowed_origins`/`allowed_hosts` (extra Host/Origin values appended to the
-  loopback DNS-rebinding allowlist for a reverse-proxy front; http only).
-- **`mcp.kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; now
+  (stdio-only; **empty by default** → each shim session logs to its own
+  `~/.local/share/biopb-mcp/log/sessions/<id>.log`; set it to force ONE shared
+  file), `session_log_keep`, `allowed_origins`/`allowed_hosts` (extra Host/Origin
+  values appended to the loopback DNS-rebinding allowlist for a reverse-proxy
+  front; http only), and `server_start_timeout` (the down-plane control-ensure /
+  boot-wait budget, applied twice so the worst-case wall wait is ~2x it).
+- **`kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; now
   bounds only the quick in-band snippets), `busy_lock_timeout` (5s),
   `promote_after` (10s; how long `execute_code` waits inline before returning a
   job handle), `parent_death_pipe`, and the `watchdog_*` orphan-hardening knobs
   (issue #13).
-- **`mcp.dask`** — `scheduler` defaults to `distributed`, which with an empty
+- **`dask`** — `scheduler` defaults to `distributed`, which with an empty
   `address` auto-spins a multi-process `LocalCluster`; any distributed mode lets
   `cancel_job` stop an in-flight `.compute()`. Set a non-empty `address` to
   attach to an external scheduler, or `threads`/`synchronous` for a low-overhead
@@ -381,13 +329,13 @@ The `mcp` section is grouped by concern:
   `num_workers`/`threads_per_worker`/`memory_limit`/`dashboard_address` size the
   auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
   cluster-wide chunk cache (split across workers).
-- **`mcp.tensor`** — `health_poll_min_interval`/`health_poll_max_interval` (the
+- **`tensor`** — `health_poll_min_interval`/`health_poll_max_interval` (the
   background source watcher's backoff bounds; the kernel re-lists when
   `source_count` changes so a catalog cached mid-index self-heals — issue #44;
   min `<= 0` disables it). (The localhost client-cache decision lives in the
   tensor client itself — `_resolve_cache_bytes`, off by default with
   `BIOPB_CACHE_LOCAL=1` as the opt-out — the MCP kernel no longer overrides it.)
-- **`mcp.viewer`** — `compute_scheduler` (default `threads`; pins the napari
+- **`viewer`** — `compute_scheduler` (default `threads`; pins the napari
   viewer's *serial* slice reads to a single-process scheduler via
   `_viewer_compute.wrap_levels` so they share the one main-process `conn.client`
   chunk cache instead of scattering across the distributed cluster's per-worker
@@ -403,20 +351,14 @@ The `mcp` section is grouped by concern:
   current view first (`_helpers.resync_view_for_capture`) so the agent's capture
   reflects the state it set, not a pre-load frame. Set `False` to restore fully
   synchronous slicing.
-- **`mcp.services.process_image_servers`** — the `grpc://`/`grpcs://`
+- **`services.process_image_servers`** — the `grpc://`/`grpcs://`
   ProcessImage URLs exposed as `ops`.
-- **`mcp.observe`** — the web observe UI (`_observe.py`): `enabled` (**on by
+- **`observe`** — the web observe UI (`_observe.py`): `enabled` (**on by
   default / opt-out**; **http transport only** — it mounts on the MCP app so it
   adds no surface beyond `/mcp`; under stdio it is silently skipped, since a
   second HTTP server in the stdio process risks the fd-1 JSON-RPC channel and
   races the kernel), `max_output_chars` (detail-view stdout cap, tail kept),
   `poll_interval_ms` (page poll cadence).
-- **`mcp.server_start_timeout`** — the autostart boot-wait budget (issue #12).
-
-For back-compat, `load_config` relocates the one legacy flat key the biopb
-installer still seeds (`mcp.process_image_servers` →
-`mcp.services.process_image_servers`); the next `save_config` persists the nested
-form, so it self-heals.
 
 ### Plugin Entry Points
 

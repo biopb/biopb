@@ -18,6 +18,11 @@ BioPB uses **git tags** as the single source of truth for version numbers.
 3. CI automatically:
    - Builds and publishes Python package to PyPI
    - Builds and publishes Java package to Maven Central
+   - Builds and publishes the `biopb-image-base` Docker image (via `image-runtime-ci`)
+
+   This file covers only the SDK (`biopb`) `v*` line. The tensor-server image
+   (`server-v*`) and the product bundle (`release-v*`) are separate lines — see
+   `../docs/release-model.md` for the full three-line model.
 
 ## Local Development
 
