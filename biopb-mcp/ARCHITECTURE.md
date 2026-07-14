@@ -1,70 +1,5 @@
 # biopb-mcp
 
-## Python Environment
-
-This project uses a **`uv`-managed virtualenv at `.venv/`**, pinned by `uv.lock`.
-Always run tooling through that interpreter — e.g. `.venv/bin/python -m pytest …`,
-`.venv/bin/python -m black …` — **not** the bare `python`/`pytest` on `PATH`. A
-system or user-site Python can shadow the project env with a *different* (often
-older) `biopb`, which silently breaks tests that depend on newer client APIs
-(e.g. `configure_cache`, added in `biopb >= 0.5.8`).
-
-biopb-mcp now lives in the **biopb monorepo** (`biopb/biopb-mcp/`) as a uv
-workspace member; see `docs/monorepo-migration.md`. `biopb` and
-`biopb-tensor-server` resolve to the sibling workspace members, so run uv from
-the **repo root**, selecting this package:
-
-```bash
-uv sync --package biopb-mcp --extra mcp --group testing
-```
-
-After pulling changes, re-run that to bring `.venv` back in line with the root
-`uv.lock`. If imports or versions look wrong, first check the interpreter
-(`which python` / `.venv/bin/python -c "import biopb; print(biopb.__version__)"`)
-before debugging the code; a stale `.venv` (missing `uv sync`) is the usual cause.
-
-Test/dev deps live in **PEP 735 dependency *groups*, not extras**, so they stay
-out of biopb-mcp's published metadata. Two groups:
-
-- **`integration`** — the runnable full stack with *no* test tooling: the MCP
-  server deps plus the in-tree `biopb-tensor-server[web]` and `biopb[tensor]`
-  workspace members. Sync this for a checkout that needs a real local tensor
-  server (`biopb server start`, or the control plane's `biopb control start`) without pytest:
-  `uv sync --package biopb-mcp --extra mcp --group integration`.
-- **`testing`** — `integration` **plus** pytest. The normal dev/CI profile.
-
-Because these are groups, select them with `--group <name>`, *not*
-`--extra <name>`. Version-pairing across the three packages is automatic from
-the checkout (the workspace resolves them from the tree) — there are no more
-release-asset URLs to bump.
-
-**Important — groups don't reach PyPI users.** A dependency group is not part of
-biopb-mcp's published wheel/sdist metadata, and the workspace resolution applies
-only to a source checkout. So `pip install biopb-mcp[...]` can never pull the
-tensor server (it is not on PyPI); the groups + workspace only help a checkout.
-
-## Build and Test Commands
-
-```bash
-# Install the package in development mode (uv — run from the repo root)
-uv sync --package biopb-mcp --extra mcp --group testing
-
-# Run all tests with coverage
-uv run pytest -v --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
-
-# Run a single test file
-uv run pytest biopb-mcp/src/biopb_mcp/_tests/test_mcp_kernel.py -v
-
-# Run a single test function
-uv run pytest biopb-mcp/src/biopb_mcp/_tests/test_grpc.py::test_encode_image -v
-
-# Format code with black (line-length 79)
-black biopb-mcp/src/
-
-# Run pre-commit hooks on all files
-pre-commit run --all-files
-```
-
 ## Architecture Overview
 
 `biopb-mcp` connects [napari](https://napari.org) and AI agents to
@@ -159,8 +94,8 @@ earlier shared, client-outliving daemon. The shim
 process owns fd 1 as a protocol channel but imports only the mcp SDK — no
 Qt/dask/uvicorn — so the old fd-1 corruption class is structurally impossible; it
 replays the child's initialize result verbatim (including `instructions` — the
-field the generic `mcp-proxy` bridge drops; see docs/mcp-proxy-vet.md for why the
-bridge is vendored), and any bridge failure exits the shim so the client sees EOF,
+field the generic `mcp-proxy` bridge drops — which is why the bridge is
+vendored), and any bridge failure exits the shim so the client sees EOF,
 never a hung server. The child's output goes to a **per-session** log
 (`transport.kernel_log` default empty → `~/.local/share/biopb-mcp/log/sessions/<id>.log`;
 set `kernel_log` to force one shared file). The Host/Origin allowlist and the

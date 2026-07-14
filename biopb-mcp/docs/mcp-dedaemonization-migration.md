@@ -4,8 +4,11 @@ How a biopb deployment is structured at runtime: a durable **control plane** at
 the root, durable **data / algorithm planes** it supervises, and **ephemeral,
 shim-owned MCP sessions** that *use* those planes but never start them. This
 absorbs two earlier notes — why the shim/heavy split exists, and how sessions and
-the control relate. Everything below is built except the algorithm-plane-under-
-control piece (last section), which is still pending.
+the control relate. Everything below is built except the algorithm plane under
+the control (the `[pending]` node in the diagram), which is not yet done; when it
+lands, the plane configs stay **federated, not merged** — one writer domain per
+file (`biopb.json` / `control.json` / `mcp-config.json`), since only the process
+that validates a file's schema can own writing it.
 
 ## Why this shape
 
@@ -192,30 +195,6 @@ own Host/Origin guard, this control-side check is the child's *only* auth.
   (was one shared); startup latency is per-session (no daemon to amortize the
   http-stack import). Both accepted for session-scoped clients; a shared-cluster
   opt-in is the door left open.
-
-## Algorithm plane under the control (pending)
-
-The one unbuilt piece: move the **algorithm-server registry** out of the MCP config
-into the control, and have the control supervise algorithm-server lifecycles like
-the data plane (ops stay wired into the kernel namespace as today — only *which
-servers exist and how they start* moves).
-
-Config surfaces stay **federated, not merged** — one writer domain per file, where
-the domain is *the process that validates that file's schema*:
-
-| File | Owning domain (writes + validates) |
-|---|---|
-| `~/.config/biopb/biopb.json` | **data plane** — installer, `migrate-config`, the admin API, the container entrypoint. The control never parses it (blind proxy). |
-| `control.json` *(new, optional)* | **control** — algorithm-server registry + session policy; env/argv-first, file-second; absent in the container. |
-| `~/.config/biopb/mcp-config.json` | **MCP** — per-session kernel/dask/viewer knobs. |
-
-Merging is blocked by **I2**: `biopb.json` is validated *in the tensor process*
-(`build_config_schema` + `validate_config_dict` before `save_config`), which the
-control cannot run without importing `biopb_tensor_server`. A read-only
-algorithm-plane inspector already ships (the dashboard card + `biopb image servers`,
-both reading through the shared `biopb._algorithms.servers_from_config` seam), so the
-flip is localized: repoint that seam at `control.json`, then add the control's write
-path + supervision.
 
 ## Code anchors
 

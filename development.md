@@ -28,8 +28,8 @@ live napari session.
 ### The repositories
 
 The `biopb` repo is a **monorepo**. `biopb-mcp` was a separate repository and has
-been folded in as the `biopb-mcp/` subdirectory (see
-`biopb-mcp/docs/monorepo-migration.md`); only `biopb-server` remains external.
+been folded in as the `biopb-mcp/` subdirectory; only `biopb-server` remains
+external.
 
 | Repo / component | Role |
 |------|------|
@@ -453,8 +453,8 @@ editing the code.
   (the only remaining separate repo).
 - **Client / agent:** `biopb/biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
   service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
-  `_server.py`). See `biopb/biopb-mcp/docs/monorepo-migration.md` for how this
-  was merged in and how it is built/released.
+  `_server.py`). See `docs/release-model.md` for how the product is built and
+  released.
 - **Control plane / web origin:** `biopb/biopb-control/src/biopb_control/` —
   `_control.py` (the ASGI app: serves the `web/` SPA + proxies the data plane and
   sessions), `_supervisor.py` (data-plane subprocess lifecycle).

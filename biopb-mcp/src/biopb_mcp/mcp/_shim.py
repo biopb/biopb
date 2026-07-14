@@ -37,10 +37,10 @@ role as a shared, client-outliving lifecycle root:
   the launching process is gone, so the session would otherwise outlive every
   real client (biopb#403, the client side).
 
-The bridge itself is vendored rather than delegated to ``mcp-proxy`` per the
-vetting report (docs/mcp-proxy-vet.md): mcp-proxy drops the initialize
-``instructions`` field that carries biopb-mcp's operation guardrails, has no
-lifetime guard when the server dies, and floats its dependencies. Here the
+The bridge itself is vendored rather than delegated to ``mcp-proxy``: mcp-proxy
+drops the initialize ``instructions`` field that carries biopb-mcp's operation
+guardrails, has no lifetime guard when the server dies, and floats its
+dependencies. Here the
 remote's initialize result — capabilities, serverInfo, and ``instructions`` —
 is replayed to the stdio client verbatim, and any bridge failure exits the
 shim so the client sees EOF instead of a hung proxy.
@@ -661,7 +661,7 @@ def replay_init_options(init):
 
     Verbatim replay — most importantly ``instructions``, the handshake-time
     carrier for the operation guardrails and the headless notice (the field
-    mcp-proxy drops, per docs/mcp-proxy-vet.md), and the remote's capability
+    mcp-proxy drops), and the remote's capability
     set rather than one recomputed from the bridge's own handlers.
     """
     return InitializationOptions(
