@@ -166,6 +166,16 @@ export function AdminPage() {
     }
   }, [client]);
 
+  // Stable binding for the file chooser: FileBrowser's load effect depends on
+  // this, so an inline `(p) => client.http.browse(p)` (a fresh identity every
+  // render) would re-run the effect and reset the browser to its initial path on
+  // any AdminPage re-render. `client!` is safe — the modal only mounts past the
+  // `if (!client)` guard below. Bound to #244.
+  const browse = useCallback(
+    (p?: string) => client!.http.browse(p),
+    [client],
+  );
+
   // Initial load.
   useEffect(() => {
     if (!client) return;
@@ -525,7 +535,7 @@ export function AdminPage() {
 
       {browseRow !== null && config && (
         <FileBrowser
-          browse={(p) => client.http.browse(p)}
+          browse={browse}
           initialPath={String(sources[browseRow]?.url ?? "")}
           onPick={(picked) => {
             onSourcesChange(
