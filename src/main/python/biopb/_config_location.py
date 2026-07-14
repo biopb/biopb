@@ -31,6 +31,24 @@ DEFAULT_CONFIG_DIR = Path.home() / ".config" / "biopb"
 CANONICAL_CONFIG_NAME = "biopb.json"
 LEGACY_CONFIG_NAME = "biopb.toml"
 
+# biopb-mcp's own settings file, co-located in the same dir. Distinct from the
+# installer's client-definition ``mcp.json`` (which registers biopb-mcp with MCP
+# clients). Defined here so the three consumers that touch it -- biopb-mcp
+# (its config module) and the lean control plane + ``biopb._algorithms`` (which
+# read it WITHOUT importing biopb_mcp, invariant I2) -- agree on one location
+# and cannot drift. See biopb/biopb#34.
+MCP_CONFIG_NAME = "mcp-config.json"
+
+
+def mcp_config_path() -> Path:
+    """The biopb-mcp settings file (``~/.config/biopb/mcp-config.json``).
+
+    Computed from ``Path.home()`` at call time (not the import-time
+    ``DEFAULT_CONFIG_DIR`` constant) so a test that repoints ``Path.home()`` gets
+    an isolated location.
+    """
+    return Path.home() / ".config" / "biopb" / MCP_CONFIG_NAME
+
 
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     """Resolve the config file in *config_dir*, preferring JSON over TOML.

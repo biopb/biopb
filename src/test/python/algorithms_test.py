@@ -2,10 +2,10 @@
 
 Two concerns, mirroring the module's two layers:
 
-- **configured()** — a stdlib read of the biopb-mcp config's
-  ``process_image_servers`` (nested + legacy locations, precedence, and total
-  tolerance of a missing/malformed/mistyped config), against a monkeypatched
-  ``$HOME`` so the machine's real config can't leak in.
+- **configured()** — a stdlib read of the biopb-mcp config's flat
+  ``services.process_image_servers`` key (and total tolerance of a
+  missing/malformed/mistyped config), against a monkeypatched ``$HOME`` so the
+  machine's real config can't leak in.
 - **probe()/statuses()** — the gRPC path, exercised end-to-end against a *real*
   in-process ``ProcessImage`` server (grpcio + the ``biopb.image`` stubs are base
   ``biopb`` deps, so no mocking of grpc itself): a server that lists ops, one that
@@ -35,48 +35,29 @@ def home(tmp_path, monkeypatch):
 
 
 def _write_config(home: Path, data: dict) -> None:
-    cfg = home / ".config" / "biopb-mcp" / "config.json"
+    cfg = home / ".config" / "biopb" / "mcp-config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_configured_reads_nested_services_location(home):
+def test_configured_reads_flat_services_location(home):
     _write_config(
         home,
-        {"mcp": {"services": {"process_image_servers": ["grpc://a:1", "grpc://b:2"]}}},
+        {"services": {"process_image_servers": ["grpc://a:1", "grpc://b:2"]}},
     )
     assert _algorithms.configured() == ["grpc://a:1", "grpc://b:2"]
-
-
-def test_configured_reads_legacy_flat_location(home):
-    # The pre-nesting installer seeded mcp.process_image_servers directly.
-    _write_config(home, {"mcp": {"process_image_servers": ["grpc://legacy:9"]}})
-    assert _algorithms.configured() == ["grpc://legacy:9"]
-
-
-def test_configured_nested_wins_over_legacy(home):
-    _write_config(
-        home,
-        {
-            "mcp": {
-                "process_image_servers": ["grpc://legacy:9"],
-                "services": {"process_image_servers": ["grpc://nested:1"]},
-            }
-        },
-    )
-    assert _algorithms.configured() == ["grpc://nested:1"]
 
 
 def test_configured_drops_non_string_and_blank_entries(home):
     _write_config(
         home,
-        {"mcp": {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}}},
+        {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}},
     )
     assert _algorithms.configured() == ["grpc://a:1"]
 
 
 def test_configured_is_empty_when_unset(home):
-    _write_config(home, {"mcp": {"services": {}}})
+    _write_config(home, {"services": {}})
     assert _algorithms.configured() == []
 
 
@@ -85,14 +66,14 @@ def test_configured_tolerates_missing_file(home):
 
 
 def test_configured_tolerates_malformed_json(home):
-    cfg = home / ".config" / "biopb-mcp" / "config.json"
+    cfg = home / ".config" / "biopb" / "mcp-config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("{ not json", encoding="utf-8")
     assert _algorithms.configured() == []
 
 
 def test_configured_tolerates_non_object_config(home):
-    cfg = home / ".config" / "biopb-mcp" / "config.json"
+    cfg = home / ".config" / "biopb" / "mcp-config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("[1, 2, 3]", encoding="utf-8")
     assert _algorithms.configured() == []
@@ -102,37 +83,20 @@ def test_configured_tolerates_non_object_config(home):
 # servers_from_config(): the shared normalization seam (no disk)
 # --------------------------------------------------------------------------- #
 # The single source of truth the biopb-mcp kernel also calls with its live CONFIG
-# dict, so the key location + precedence live in exactly one place.
+# dict, so the key location lives in exactly one place.
 
 
-def test_servers_from_config_reads_nested():
-    cfg = {"mcp": {"services": {"process_image_servers": ["grpc://a:1"]}}}
+def test_servers_from_config_reads_flat():
+    cfg = {"services": {"process_image_servers": ["grpc://a:1"]}}
     assert _algorithms.servers_from_config(cfg) == ["grpc://a:1"]
-
-
-def test_servers_from_config_falls_back_to_legacy_flat():
-    # An unmigrated dict (legacy flat only) still resolves — matching the raw read
-    # the control plane does, which never runs biopb-mcp's key migration.
-    cfg = {"mcp": {"process_image_servers": ["grpc://legacy:9"]}}
-    assert _algorithms.servers_from_config(cfg) == ["grpc://legacy:9"]
-
-
-def test_servers_from_config_nested_wins_over_legacy():
-    cfg = {
-        "mcp": {
-            "process_image_servers": ["grpc://legacy:9"],
-            "services": {"process_image_servers": ["grpc://nested:1"]},
-        }
-    }
-    assert _algorithms.servers_from_config(cfg) == ["grpc://nested:1"]
 
 
 def test_servers_from_config_filters_and_tolerates_bad_shapes():
     assert _algorithms.servers_from_config(
-        {"mcp": {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}}}
+        {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}}
     ) == ["grpc://a:1"]
     assert _algorithms.servers_from_config({}) == []
-    assert _algorithms.servers_from_config({"mcp": "nope"}) == []
+    assert _algorithms.servers_from_config({"services": "nope"}) == []
     assert _algorithms.servers_from_config(None) == []
 
 
@@ -259,7 +223,7 @@ def test_statuses_probes_all_configured_in_order(home, grpc_server, monkeypatch)
     up = grpc_server(_Servicer(op_names=["only"]))
     down = "grpc://127.0.0.1:1"  # nothing listening
     # Configure both (order matters); statuses() reads them via configured().
-    _write_config(home, {"mcp": {"services": {"process_image_servers": [up, down]}}})
+    _write_config(home, {"services": {"process_image_servers": [up, down]}})
     rows = _algorithms.statuses(timeout=2.0)
     assert [r["url"] for r in rows] == [up, down]  # config order preserved
     assert rows[0]["state"] == "serving" and rows[0]["ops"] == ["only"]
@@ -267,7 +231,7 @@ def test_statuses_probes_all_configured_in_order(home, grpc_server, monkeypatch)
 
 
 def test_statuses_is_empty_with_no_servers(home):
-    _write_config(home, {"mcp": {"services": {"process_image_servers": []}}})
+    _write_config(home, {"services": {"process_image_servers": []}})
     assert _algorithms.statuses(timeout=1.0) == []
 
 
@@ -275,8 +239,6 @@ def test_statuses_survives_a_malformed_configured_url(home, grpc_server):
     # A malformed URL alongside a good one must not abort the concurrent sweep
     # (pool.map re-raises) -- it comes back as an "invalid" row instead.
     up = grpc_server(_Servicer(op_names=["ok"]))
-    _write_config(
-        home, {"mcp": {"services": {"process_image_servers": ["grpc://[::1", up]}}}
-    )
+    _write_config(home, {"services": {"process_image_servers": ["grpc://[::1", up]}})
     rows = _algorithms.statuses(timeout=2.0)
     assert [r["state"] for r in rows] == ["invalid", "serving"]

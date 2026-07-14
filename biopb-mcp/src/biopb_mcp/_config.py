@@ -25,6 +25,8 @@ Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` s
 call sites never duplicate a default literal.
 """
 
+from __future__ import annotations
+
 import copy
 import dataclasses
 import json
@@ -33,14 +35,16 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
-
-import numpy as np
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 # Shared with the tensor server: the constraint primitives (so the pyramid knobs
 # are validated by the exact same rules in both packages -- the same bug, not an
-# analogous one; biopb/biopb#182, #34) and the per-field schema projection.
+# analogous one; biopb/biopb#182, #34) and the config-file location.
 from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
+from biopb._config_location import mcp_config_path
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -573,8 +577,12 @@ def get_config_dir() -> Path:
 
 
 def get_config_path() -> Path:
-    """Path to the config file (``~/.config/biopb/mcp-config.json``)."""
-    return get_config_dir() / "mcp-config.json"
+    """Path to the config file (``~/.config/biopb/mcp-config.json``).
+
+    Delegates to :func:`biopb._config_location.mcp_config_path` so biopb-mcp and
+    the core-``biopb`` readers (control plane / ``_algorithms``) share one location.
+    """
+    return mcp_config_path()
 
 
 def get_log_dir() -> Path:
@@ -876,6 +884,8 @@ def save_config(config: dict) -> None:
 
 def get_grid_params(is_3d: bool, config: dict) -> Tuple[np.ndarray, np.ndarray]:
     """Get grid size and stride from config as (grid_size, stride) int arrays."""
+    import numpy as np
+
     suffix = "3d" if is_3d else "2d"
     grid_size = np.array(get_setting(config, f"grid.size_{suffix}"), dtype=int)
     stride = np.array(get_setting(config, f"grid.stride_{suffix}"), dtype=int)
