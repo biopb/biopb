@@ -130,8 +130,12 @@ def test_read_session_decodes_utf8_regardless_of_locale():
 
 class TestListSessions:
     def test_lists_all_live_newest_first(self):
-        reg.register("20260101-000000-1", port=1, pid=_live_pid())
-        reg.register("20260101-000100-2", port=2, pid=_live_pid())
+        # Pin started_at explicitly: list_sessions() orders by it (biopb#421), and
+        # two back-to-back register() calls land in the same coarse-clock tick on a
+        # fast host (Windows CI), so a real-time stamp would tie and let the stable
+        # sort fall back to filesystem order.
+        reg.register("20260101-000000-1", port=1, pid=_live_pid(), started_at=100.0)
+        reg.register("20260101-000100-2", port=2, pid=_live_pid(), started_at=200.0)
         ids = [r["session_id"] for r in reg.list_sessions()]
         assert ids == ["20260101-000100-2", "20260101-000000-1"]  # newest first
 
