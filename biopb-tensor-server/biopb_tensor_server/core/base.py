@@ -590,7 +590,9 @@ class TensorAdapter(ABC):
                 f"Bounds dimensionality mismatch: expected {ndim}, "
                 f"got start={len(bounds.start)}, stop={len(bounds.stop)}"
             )
-        for ax, (s, e, dim) in enumerate(zip(bounds.start, bounds.stop, shape)):
+        for ax, (s, e, dim) in enumerate(
+            zip(bounds.start, bounds.stop, shape, strict=True)
+        ):
             if s < 0:
                 raise ValueError(f"Bounds start[{ax}]={s} is negative")
             if e > dim:

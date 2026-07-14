@@ -658,7 +658,7 @@ class ArrowFileBackend(CacheBackend):
         pool_rates.sort(
             key=lambda x: (x[1], -len(x[2]))
         )  # Lowest rate, then most segments
-        for pool_key, rate, queue in pool_rates:
+        for pool_key, _rate, queue in pool_rates:
             if queue:
                 return pool_key
         return None
@@ -761,7 +761,7 @@ class ArrowFileBackend(CacheBackend):
             return  # Skip for small caches
 
         now = time.time()
-        for pool_key, pool in self._pool_queues.items():
+        for _pool_key, pool in self._pool_queues.items():
             for seg_id, seg_info in pool.segments.items():
                 age = now - seg_info.last_access_time
                 if (

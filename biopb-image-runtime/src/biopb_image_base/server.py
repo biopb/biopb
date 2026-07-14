@@ -86,7 +86,8 @@ def _iter_chunk_bounds(
     chunk_shape: Sequence[int],
 ) -> Iterator[ChunkBounds]:
     chunk_starts = [
-        range(0, int(dim), int(chunk)) for dim, chunk in zip(shape, chunk_shape)
+        range(0, int(dim), int(chunk))
+        for dim, chunk in zip(shape, chunk_shape, strict=True)
     ]
     for start_coords in product(*chunk_starts):
         stop_coords = [
@@ -97,7 +98,10 @@ def _iter_chunk_bounds(
 
 
 def _bounds_to_slices(bounds: ChunkBounds) -> tuple[slice, ...]:
-    return tuple(slice(start, stop) for start, stop in zip(bounds.start, bounds.stop))
+    return tuple(
+        slice(start, stop)
+        for start, stop in zip(bounds.start, bounds.stop, strict=True)
+    )
 
 
 def _build_registration_tensor(

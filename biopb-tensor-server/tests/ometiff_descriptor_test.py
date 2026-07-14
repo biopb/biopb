@@ -221,7 +221,7 @@ class TestPageAlignedChunkShape:
         with tifffile.TiffFile(path) as tf:
             s = tf.series[0]
             za = zarr.open(s.aszarr(level=0, chunkmode="page"), mode="r")
-            by_axis = {ax: int(c) for ax, c in zip(str(s.axes), za.chunks)}
+            by_axis = {ax: int(c) for ax, c in zip(str(s.axes), za.chunks, strict=True)}
         return [by_axis.get(d, 1) for d in dim_labels]
 
     def test_chunk_shape_is_page_grid(self, tmp_path):

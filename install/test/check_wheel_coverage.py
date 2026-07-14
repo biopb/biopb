@@ -221,6 +221,7 @@ def main() -> None:
                 pool.map(
                     lambda kv: missing_wheel(kv[0], kv[1], compatible), pinned.items()
                 ),
+                strict=True,
             )
             if bad
         ]

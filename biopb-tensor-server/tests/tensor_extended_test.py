@@ -18,7 +18,7 @@ def _zarr_available() -> bool:
         import zarr
 
         # Try to actually use zarr to catch numcodecs compatibility issues
-        zarr.open_array
+        _ = zarr.open_array
         return True
     except ImportError:
         return False
@@ -221,7 +221,7 @@ class TestOmeZarrAdapter:
         root = zarr.open_group(zarr_path, mode="r")
 
         # Level 0 should have value 0, level 1 should have value 1, etc.
-        for level_idx, level_path in enumerate(level_paths):
+        for level_idx, _level_path in enumerate(level_paths):
             level_name = str(level_idx)
             if level_name in root:
                 arr = root[level_name]

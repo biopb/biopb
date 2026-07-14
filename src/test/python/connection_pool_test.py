@@ -340,7 +340,7 @@ class TestPoolLocks:
         errors = []
 
         def access_registry(iterations):
-            for i in range(iterations):
+            for _i in range(iterations):
                 try:
                     with client_module._REGISTRY_LOCK:
                         # Just touch the registry

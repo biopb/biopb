@@ -120,8 +120,8 @@ def _per_level_transforms(levels, meta: dict) -> list[list[dict[str, Any]]]:
     shape0 = levels[0].shape
     out: list[list[dict[str, Any]]] = []
     for lv in levels:
-        factor = [round(s0 / sl) for s0, sl in zip(shape0, lv.shape)]
-        scale = [b * f for b, f in zip(base, factor)]
+        factor = [round(s0 / sl) for s0, sl in zip(shape0, lv.shape, strict=True)]
+        scale = [b * f for b, f in zip(base, factor, strict=True)]
         out.append([{"type": "scale", "scale": scale}])
     return out
 

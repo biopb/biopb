@@ -1437,7 +1437,7 @@ class ChunkFetcher:
             {start: index for index, start in enumerate(starts)}
             for starts in axis_starts
         ]
-        for chunk_id, bounds in zip(chunks, chunk_bounds):
+        for chunk_id, bounds in zip(chunks, chunk_bounds, strict=True):
             chunk_idx = tuple(
                 axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
             )

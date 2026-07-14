@@ -1053,7 +1053,9 @@ class TestBuildPyramidPlan:
         shape = [1000, 8000, 8000]
         levels = build_pyramid_plan(shape, ["z", "y", "x"])
         for level in levels:
-            expected = [ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)]
+            expected = [
+                ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint, strict=True)
+            ]
             assert list(level.shape) == expected
 
     def test_levels_strictly_coarsen(self):
@@ -1061,8 +1063,10 @@ class TestBuildPyramidPlan:
 
         levels = build_pyramid_plan([20000, 20000], ["y", "x"])
         # Each successive level downsamples at least one axis further.
-        for prev, nxt in zip(levels, levels[1:]):
-            assert any(b > a for a, b in zip(prev.scale_hint, nxt.scale_hint))
+        for prev, nxt in zip(levels, levels[1:], strict=False):
+            assert any(
+                b > a for a, b in zip(prev.scale_hint, nxt.scale_hint, strict=True)
+            )
 
     def test_small_source_is_single_full_res_level(self):
         from biopb_tensor_server.core.chunk import build_pyramid_plan

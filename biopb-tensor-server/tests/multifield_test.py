@@ -146,7 +146,8 @@ class MockSingleTensorAdapter(BackendAdapter):
         """Return mock data within bounds."""
         super().get_data(bounds)
         shape = tuple(
-            int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
+            int(stop - start)
+            for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
         return np.full(shape, self.value, dtype=self.dtype)
 
@@ -605,7 +606,8 @@ class MockImage0Adapter(BackendAdapter):
     def get_data(self, bounds) -> np.ndarray:
         super().get_data(bounds)
         shape = tuple(
-            int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
+            int(stop - start)
+            for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
         return np.zeros(shape, dtype="uint8")
 

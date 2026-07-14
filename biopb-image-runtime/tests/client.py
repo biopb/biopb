@@ -206,7 +206,7 @@ def streaming(
             response_count = 0
             start_time = time.perf_counter()
 
-            for response in stub.RunStream(
+            for _response in stub.RunStream(
                 _stream_messages(test_image, iterations),
                 metadata=METADATA,
                 timeout=60,

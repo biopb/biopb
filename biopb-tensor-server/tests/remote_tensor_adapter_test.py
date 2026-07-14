@@ -1291,6 +1291,7 @@ class TestUnreachableUpstream:
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from pyarrow import flight
 
         adapter = RemoteTensorAdapter(
             source_id="lab__img",
@@ -1298,7 +1299,8 @@ class TestUnreachableUpstream:
             upstream_source_id="img",
         )
         # the serve path must NOT silently degrade -- a missing chunk is an error
-        with pytest.raises(Exception):
+        # (a dead upstream surfaces as a Flight transport / socket error).
+        with pytest.raises((flight.FlightError, OSError)):
             adapter.get_data(ChunkBounds(start=[0, 0], stop=[8, 8]))
 
     def test_transparent_recovery_when_upstream_returns(self, simple_zarr_array):

@@ -300,7 +300,10 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
             Numpy array with data within the requested bounds
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         with self._io_lock:
             return self._dask_arr[slices].compute()

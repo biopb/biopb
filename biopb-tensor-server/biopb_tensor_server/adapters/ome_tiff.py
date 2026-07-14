@@ -184,7 +184,7 @@ def _tczyx_shape(series_shape, series_axes) -> Optional[List[int]]:
         return None
     if any(ax not in _CANONICAL_DIMS for ax in axes):
         return None
-    by_axis = {ax: int(n) for ax, n in zip(axes, series_shape)}
+    by_axis = {ax: int(n) for ax, n in zip(axes, series_shape, strict=True)}
     return [by_axis.get(ax, 1) for ax in _CANONICAL_DIMS]
 
 
@@ -210,7 +210,7 @@ def _ome_axes_shape(series_shape, series_axes) -> Optional[Tuple[List[str], List
         return None
     if any(ax not in _CANONICAL_DIMS + "S" for ax in axes):
         return None
-    by_axis = {ax: int(n) for ax, n in zip(axes, series_shape)}
+    by_axis = {ax: int(n) for ax, n in zip(axes, series_shape, strict=True)}
     dims = _CANONICAL_DIMS + "S"
     return list(dims), [by_axis.get(ax, 1) for ax in dims]
 
@@ -462,7 +462,10 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)  # validate bounds against the descriptor
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         with self._io_lock:
             opened = self._ensure_store()
             if opened is None:
@@ -661,7 +664,7 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                     # time (base.get_chunk_size -> _get_read_plan).
                     chunk_shape = [
                         n if d in ("Y", "X", "S") else 1
-                        for d, n in zip(dim_labels, shape)
+                        for d, n in zip(dim_labels, shape, strict=True)
                     ]
                     descriptors.append(
                         TensorDescriptor(

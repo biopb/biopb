@@ -275,7 +275,10 @@ class _BioioAdapterBase(SourceAdapter, TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         with self._io_lock:
             return self._dask_data[slices].compute()
 

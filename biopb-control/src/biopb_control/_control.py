@@ -570,7 +570,7 @@ def build_app(
                 "observe_url": f"/session/{rec['session_id']}/observe",
                 "kernel": kernel,
             }
-            for rec, kernel in zip(records, kernels)
+            for rec, kernel in zip(records, kernels, strict=True)
         ]
         return JSONResponse({"sessions": sessions})
 

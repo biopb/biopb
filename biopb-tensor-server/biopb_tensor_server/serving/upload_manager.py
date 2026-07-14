@@ -55,7 +55,7 @@ class UploadStatus(str, Enum):
 
 def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
     count = 1
-    for dim, chunk in zip(shape, chunk_shape):
+    for dim, chunk in zip(shape, chunk_shape, strict=True):
         count *= ceil(dim / chunk)
     return count
 
@@ -289,7 +289,7 @@ class UploadManager:
 
         bounds = upload.bounds
         expected_shape = tuple(
-            stop - start for start, stop in zip(bounds.start, bounds.stop)
+            stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
 
         # Dispatch the write polymorphically: each source format owns its write

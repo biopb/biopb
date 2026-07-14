@@ -79,7 +79,9 @@ def _serialize_from_numpy(
             )
 
     # Build size dict from input array (np_index_order is C-order: axis i -> letter i)
-    sizes = dict(zip(dimension_order, [1] * 5))  # default size 1 for all dimensions
+    sizes = dict(
+        zip(dimension_order, [1] * 5, strict=True)
+    )  # default size 1 for all dimensions
     for i, axis in enumerate(np_index_order):
         sizes[axis] = np_img.shape[i]
 
@@ -141,7 +143,8 @@ def _deserialize_to_numpy(
                 warnings.warn(
                     f"Endianness conflict: dtype={dtype_str} indicates {dtype_prefix}-endian "
                     f"but BinData.endianness={endianness_name}. "
-                    f"Using BinData.endianness as authoritative source."
+                    f"Using BinData.endianness as authoritative source.",
+                    stacklevel=2,
                 )
 
     def _get_dtype(pixels: Pixels) -> np.dtype:
@@ -501,7 +504,8 @@ def _np_from_pb(tensor: Tensor) -> np.ndarray:
                 warnings.warn(
                     f"Endianness conflict: dtype={dtype_str} indicates {dtype_prefix}-endian "
                     f"but BinData.endianness={endianness_name}. "
-                    f"Using BinData.endianness as authoritative source."
+                    f"Using BinData.endianness as authoritative source.",
+                    stacklevel=2,
                 )
 
     def _get_dtype() -> np.dtype:
@@ -643,7 +647,9 @@ def normalize_array_dims(
     if len(set(target_dim_labels_upper)) != len(target_dim_labels_upper):
         raise ValueError(f"target_dim_labels has duplicate labels: {target_dim_labels}")
 
-    shape_dict = {label.upper(): size for label, size in zip(dim_labels, arr.shape)}
+    shape_dict = {
+        label.upper(): size for label, size in zip(dim_labels, arr.shape, strict=True)
+    }
 
     squeeze_dims = set(dim_labels_upper) - set(target_dim_labels_upper)
     for label_upper in squeeze_dims:
