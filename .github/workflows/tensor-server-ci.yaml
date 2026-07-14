@@ -1,14 +1,18 @@
 name: Tensor Server CI
 
-# Test/build only. Publishing (GitHub release + Docker) is the unified
-# release.yaml on `release-v*` tags — see docs/release-model.md. The tensor server
-# is a product component, so its version comes from that same `release-v*` tag;
-# there is no per-package tag (the old `server-v*` prefix is retired).
+# Test/build on branch pushes & PRs; PUBLISH the tensor-server Docker image on a
+# `server-v*` tag. The tensor server has its own version line (docs/release-model.md):
+# the wheel bundle + GitHub release is still cut by release.yaml on `release-v*`,
+# but the Docker image is this workflow's job, on its own `server-v*` cadence.
+# (Path filters are not evaluated for tag pushes, so a `server-v*` tag triggers
+# this regardless of the pull_request `paths` below.)
 on:
   push:
     branches:
       - main
       - dev
+    tags:
+      - 'server-v*'
   pull_request:
     branches:
       - main
@@ -210,3 +214,138 @@ jobs:
             webapp.tar.gz
             wheels/biopb*.whl
           retention-days: 1
+
+  # Publish the tensor-server Docker image on a `server-v*` tag (ghcr.io + Docker
+  # Hub jiyuuchc/). The image's version IS the tag (biopb-tensor-server's
+  # setuptools_scm reads `server-v*`); a clean X.Y.Z also moves :latest, an
+  # rc/a/b prerelease publishes only its pinned tag. Idempotent: an already-
+  # published version is skipped, so re-running a tag is a noop. This is the ONLY
+  # place the tensor-server image is published — release.yaml no longer builds it.
+  publish:
+    needs: [js-test, test]
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # tags for setuptools_scm
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.3
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The tensor-server Dockerfile COPYs biopb-*.whl + biopb_tensor_server-*.whl
+      # + biopb_control-*.whl (the image runs the control as its single web
+      # origin) plus the built webapp. Build all four inputs here.
+      - name: Build wheels
+        run: |
+          uv build --package biopb --wheel --out-dir wheels
+          uv build --package biopb-tensor-server --wheel --out-dir wheels
+          uv build --package biopb-control --wheel --out-dir wheels
+
+      - name: Build webapp
+        run: |
+          pnpm -C web install --frozen-lockfile
+          pnpm -C web run sync-version
+          pnpm -C web --filter @biopb/tensor-flight-client build
+          # Base "/"; the control serves this bundle at its root and proxies the
+          # data API + WS under /data_plane.
+          VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
+
+      - name: Compute version + tags
+        id: ver
+        run: |
+          set -euo pipefail
+          # server-v* tag -> the tensor server's version (== its wheel version).
+          VER="${GITHUB_REF#refs/tags/server-v}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # PEP 440 prerelease (a/b/rc) does NOT move :latest.
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            PRERELEASE=false
+          else
+            PRERELEASE=true
+          fi
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          # A Docker reference forbids '+' (setuptools_scm's local segment); map any
+          # out-of-set char to '_'. A clean X.Y.Z is unchanged. The gate's
+          # manifest-inspect and the tags below both use this so they agree.
+          DOCKER=$(printf '%s' "$VER" | sed -E 's/[^A-Za-z0-9_.-]/_/g')
+          echo "docker=$DOCKER" >> "$GITHUB_OUTPUT"
+          owner="${{ github.repository_owner }}"
+          {
+            echo "tags<<TAGS_EOF"
+            echo "ghcr.io/$owner/biopb-tensor-server:$DOCKER"
+            echo "docker.io/jiyuuchc/biopb-tensor-server:$DOCKER"
+            if [[ "$PRERELEASE" == "false" ]]; then
+              echo "ghcr.io/$owner/biopb-tensor-server:latest"
+              echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "tensor-server $VER (docker tag $DOCKER, prerelease=$PRERELEASE)"
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: jiyuuchc
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      # Idempotent: skip if this version is already in the registry (re-run a tag
+      # -> noop) — the same "publish only when the version changed" property the
+      # unified release.yaml had.
+      - name: Check if already published
+        id: gate
+        run: |
+          set -euo pipefail
+          owner="${{ github.repository_owner }}"
+          if docker manifest inspect "ghcr.io/$owner/biopb-tensor-server:${{ steps.ver.outputs.docker }}" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.ver.outputs.docker }} already published — skip"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: tensor-server image
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: biopb-tensor-server/Dockerfile
+          push: true
+          build-args: |
+            MEMORY=4g
+          tags: ${{ steps.ver.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
