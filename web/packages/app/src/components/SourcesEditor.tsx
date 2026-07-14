@@ -1,12 +1,23 @@
 import { useState } from "react";
+import {
+  sourceItemProperties,
+  type ConfigSchema,
+  type SchemaProp,
+} from "@biopb/tensor-flight-client";
+import { SchemaField } from "./admin/SchemaField";
 
 /**
  * Structured editor for the config `sources` array (the admin page's headline).
  *
- * Pure-controlled: it never holds its own copy of the data — every edit calls
- * `onChange` with the next sources array, which AdminPage merges into the one
- * canonical `config` object (so the raw-JSON view stays in sync). Mirrors the
- * read-only browse rows in SourceTree.tsx visually.
+ * Schema-driven like the other editors: each field's label, control, enum,
+ * bounds, and help text come from the `sources` item schema
+ * (`sourceItemProperties(schema)`) via the shared `<SchemaField>`; this component
+ * only curates *which* fields a local vs. remote source shows (and adds the
+ * server-side "Browse…" chooser to a local path). Any other key already set on a
+ * source is still rendered so nothing is hidden.
+ *
+ * Pure-controlled: every edit calls `onChange` with the next sources array, which
+ * AdminPage merges into the one canonical `config` object.
  */
 
 export type SourceEntry = Record<string, unknown>;
@@ -14,26 +25,20 @@ export type SourceEntry = Record<string, unknown>;
 interface SourcesEditorProps {
   sources: SourceEntry[];
   onChange: (next: SourceEntry[]) => void;
+  /** The config JSON Schema (drives field labels/types/help). */
+  schema: ConfigSchema | null;
   /** Per-source-index validation messages from a rejected PUT (422). */
   errorsByIndex: Record<number, string[]>;
   disabled?: boolean;
   /** Open the server-side file chooser for local row `i`, seeded from its current
-   * URL. Provided only in local mode (biopb/biopb#244); when absent the row keeps
-   * the typed-path input alone. */
+   * URL. Provided only in local mode (biopb/biopb#244). */
   onBrowse?: (i: number) => void;
 }
 
-// Storage types accepted by SourceConfig.type (config.py). "" = auto-detect.
-const LOCAL_TYPES = [
-  "",
-  "zarr",
-  "hdf5",
-  "ome-tiff",
-  "ome-tiff-multifile",
-  "ome-zarr",
-  "ome-zarr-hcs",
-  "aics",
-];
+// Curated field order per source kind; every other *set* scalar key on a source
+// (source_id, cloud, dataset, path, …) is appended so nothing is hidden.
+const LOCAL_KEYS = ["url", "type", "monitor"];
+const REMOTE_KEYS = ["url", "alias", "credentials_profile", "monitor"];
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : v == null ? "" : String(v);
@@ -42,14 +47,22 @@ function str(v: unknown): string {
 export function SourcesEditor({
   sources,
   onChange,
+  schema,
   errorsByIndex,
   disabled,
   onBrowse,
 }: SourcesEditorProps) {
   const [addOpen, setAddOpen] = useState(false);
+  const sourceProps = sourceItemProperties(schema);
 
-  function update(i: number, patch: SourceEntry) {
-    const next = sources.map((s, idx) => (idx === i ? { ...s, ...patch } : s));
+  function update(i: number, key: string, value: unknown) {
+    const next = sources.map((s, idx) => {
+      if (idx !== i) return s;
+      const copy = { ...s };
+      if (value === undefined) delete copy[key];
+      else copy[key] = value;
+      return copy;
+    });
     onChange(next);
   }
 
@@ -68,17 +81,32 @@ export function SourcesEditor({
     setAddOpen(false);
   }
 
+  // A remote (tensor-server proxy) source is identified by its grpc:// URL or an
+  // explicit tensor-server type -- NOT by `alias`, which is also valid on a local
+  // source (there it is the catalog tree root), so keying on it mislabels a local
+  // dir as remote.
   const isRemote = (s: SourceEntry) =>
-    str(s.url).startsWith("grpc://") || s.alias != null;
+    str(s.url).startsWith("grpc://") || str(s.type) === "tensor-server";
 
-  // Canonical per-entry display title (e.g. "Local Source 1" / "Remote Source 2"),
-  // numbered within its kind — sources have no single name field, so this is the
-  // group heading shown above each entry's fields.
+  // Canonical per-entry display title, numbered within its kind.
   let localN = 0;
   let remoteN = 0;
   const titles = sources.map((s) =>
     isRemote(s) ? `Remote Source ${++remoteN}` : `Local Source ${++localN}`,
   );
+
+  function keysFor(s: SourceEntry, remote: boolean): string[] {
+    const base = remote ? REMOTE_KEYS : LOCAL_KEYS;
+    const extra = Object.keys(s).filter(
+      (k) =>
+        !k.startsWith("_") &&
+        !base.includes(k) &&
+        !Array.isArray(s[k]) &&
+        s[k] != null &&
+        s[k] !== "",
+    );
+    return [...base, ...extra];
+  }
 
   return (
     <section className="sources-editor">
@@ -131,133 +159,51 @@ export function SourcesEditor({
                   </button>
                 </div>
                 <div className="entry-fields">
-                <div className="source-row-grid">
-                  <label>
-                    {remote ? "URL (grpc://host:port)" : "Path / URL"}
-                    {!remote && onBrowse ? (
-                      <span className="source-row-path">
-                        <input
-                          type="text"
-                          value={str(s.url)}
+                  <div className="source-row-grid">
+                    {keysFor(s, remote).map((key) => {
+                      const prop: SchemaProp = sourceProps[key] ?? { type: "string" };
+                      const browseable = key === "url" && !remote && !!onBrowse;
+                      return (
+                        <SchemaField
+                          key={key}
+                          fieldKey={key}
+                          prop={prop}
+                          value={s[key]}
+                          errs={[]}
                           disabled={disabled}
-                          placeholder="/data/microscopy"
-                          onChange={(e) => update(i, { url: e.target.value })}
+                          unsetLabel={key === "type" ? "auto-detect" : undefined}
+                          placeholder={
+                            key === "url"
+                              ? remote
+                                ? "grpc://lab-nas:8815"
+                                : "/data/microscopy"
+                              : undefined
+                          }
+                          append={
+                            browseable ? (
+                              <button
+                                type="button"
+                                className="icon-btn"
+                                disabled={disabled}
+                                onClick={() => onBrowse!(i)}
+                              >
+                                Browse…
+                              </button>
+                            ) : undefined
+                          }
+                          onChange={(v) => update(i, key, v)}
                         />
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          disabled={disabled}
-                          onClick={() => onBrowse(i)}
-                        >
-                          Browse…
-                        </button>
-                      </span>
-                    ) : (
-                      <input
-                        type="text"
-                        value={str(s.url)}
-                        disabled={disabled}
-                        placeholder={remote ? "grpc://lab-nas:8815" : "/data/microscopy"}
-                        onChange={(e) => update(i, { url: e.target.value })}
-                      />
-                    )}
-                  </label>
+                      );
+                    })}
+                  </div>
 
-                  {remote ? (
-                    <>
-                      <label>
-                        Alias
-                        <input
-                          type="text"
-                          value={str(s.alias)}
-                          disabled={disabled}
-                          placeholder="nas"
-                          onChange={(e) => update(i, { alias: e.target.value })}
-                        />
-                      </label>
-                      <label>
-                        Credentials profile
-                        <input
-                          type="text"
-                          value={str(s.credentials_profile)}
-                          disabled={disabled}
-                          onChange={(e) =>
-                            update(i, { credentials_profile: e.target.value })
-                          }
-                        />
-                      </label>
-                    </>
-                  ) : (
-                    <>
-                      <label>
-                        Type
-                        <select
-                          value={str(s.type)}
-                          disabled={disabled}
-                          onChange={(e) =>
-                            update(i, { type: e.target.value || undefined })
-                          }
-                        >
-                          {LOCAL_TYPES.map((t) => (
-                            <option key={t || "auto"} value={t}>
-                              {t || "auto-detect"}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label>
-                        Source ID
-                        <input
-                          type="text"
-                          value={str(s.source_id)}
-                          disabled={disabled}
-                          placeholder="(auto)"
-                          onChange={(e) =>
-                            update(i, { source_id: e.target.value || undefined })
-                          }
-                        />
-                      </label>
-                    </>
+                  {errs.length > 0 && (
+                    <ul className="source-row-errors">
+                      {errs.map((m, k) => (
+                        <li key={k}>{m}</li>
+                      ))}
+                    </ul>
                   )}
-
-                  <label className="source-row-monitor">
-                    <input
-                      type="checkbox"
-                      checked={s.monitor === true}
-                      disabled={disabled}
-                      onChange={(e) => update(i, { monitor: e.target.checked })}
-                    />
-                    Monitor for changes
-                  </label>
-
-                  {"path" in s && (
-                    <label className="source-row-deprecated">
-                      <span className="adv-field-name">
-                        path <span className="deprecated-tag">deprecated</span>
-                      </span>
-                      <input
-                        type="text"
-                        value={str(s.path)}
-                        disabled={disabled}
-                        onChange={(e) =>
-                          update(i, { path: e.target.value || undefined })
-                        }
-                      />
-                      <span className="adv-field-help">
-                        Deprecated alias for <code>url</code> — set the URL field
-                        above and clear this.
-                      </span>
-                    </label>
-                  )}
-                </div>
-
-                {errs.length > 0 && (
-                  <ul className="source-row-errors">
-                    {errs.map((m, k) => (
-                      <li key={k}>{m}</li>
-                    ))}
-                  </ul>
-                )}
                 </div>
               </li>
             );

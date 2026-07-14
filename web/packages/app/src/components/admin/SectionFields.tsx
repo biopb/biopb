@@ -1,15 +1,13 @@
 import { useState } from "react";
 import {
-  enumValues,
   fieldErrors,
   isDeprecated,
-  primaryType,
   sectionProperties,
   type ConfigError,
   type ConfigSchema,
   type SchemaProp,
 } from "@biopb/tensor-flight-client";
-import { humanizeKey } from "./adminSections";
+import { SchemaField } from "./SchemaField";
 
 /**
  * Schema-driven field editor for one config section (server / cache / …), laid
@@ -98,9 +96,8 @@ export function SectionFields({
   }
 
   const renderField = ([key, prop]: [string, SchemaProp]) => (
-    <Field
+    <SchemaField
       key={key}
-      section={section}
       fieldKey={key}
       prop={prop}
       value={sectionCfg[key]}
@@ -144,125 +141,6 @@ export function SectionFields({
           )}
         </div>
       )}
-    </div>
-  );
-}
-
-interface FieldProps {
-  section: string;
-  fieldKey: string;
-  prop: SchemaProp;
-  value: unknown;
-  errs: string[];
-  disabled?: boolean;
-  onChange: (value: unknown) => void;
-}
-
-function Field({ fieldKey, prop, value, errs, disabled, onChange }: FieldProps) {
-  const deprecated = isDeprecated(prop);
-  const type = primaryType(prop);
-  const hardEnum = enumValues(prop);
-  const invalid = errs.length > 0;
-
-  let control;
-  if (type === "boolean" && deprecated) {
-    // A deprecated boolean (e.g. metadata_db.enabled) must be *removable* — the
-    // hint says to drop it — so it gets an unset-able tri-state.
-    control = (
-      <select
-        value={value === true ? "true" : value === false ? "false" : ""}
-        disabled={disabled}
-        className={invalid ? "invalid" : undefined}
-        onChange={(e) =>
-          onChange(e.target.value === "" ? undefined : e.target.value === "true")
-        }
-      >
-        <option value="">(unset)</option>
-        <option value="true">true</option>
-        <option value="false">false</option>
-      </select>
-    );
-  } else if (type === "boolean") {
-    // Render the *effective* value (schema default when the key is omitted);
-    // toggling back to the default drops the key rather than writing an override.
-    const def = prop.default === true;
-    const effective = value === undefined ? def : value === true;
-    control = (
-      <input
-        type="checkbox"
-        checked={effective}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked === def ? undefined : e.target.checked)}
-      />
-    );
-  } else if (hardEnum) {
-    control = (
-      <select
-        value={value == null ? "" : String(value)}
-        disabled={disabled}
-        className={invalid ? "invalid" : undefined}
-        onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}
-      >
-        <option value="">(unset)</option>
-        {hardEnum
-          .filter((v): v is string => typeof v === "string")
-          .map((v) => (
-            <option key={v} value={v}>
-              {v}
-            </option>
-          ))}
-      </select>
-    );
-  } else if (type === "integer" || type === "number") {
-    control = (
-      <input
-        type="number"
-        value={value == null ? "" : String(value)}
-        disabled={disabled}
-        min={prop.minimum}
-        max={prop.maximum}
-        step={type === "integer" ? 1 : "any"}
-        className={invalid ? "invalid" : undefined}
-        onChange={(e) => {
-          const raw = e.target.value;
-          onChange(raw === "" ? undefined : Number(raw));
-        }}
-      />
-    );
-  } else {
-    control = (
-      <input
-        type="text"
-        value={value == null ? "" : String(value)}
-        disabled={disabled}
-        className={invalid ? "invalid" : undefined}
-        onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}
-      />
-    );
-  }
-
-  const isCheckbox = type === "boolean" && !deprecated;
-
-  return (
-    <div
-      className={`setting-field${isCheckbox ? " setting-field-bool" : ""}${
-        invalid ? " has-error" : ""
-      }`}
-    >
-      <label className="setting-field-label">
-        <span className="setting-field-name">
-          <span className="setting-field-title">{humanizeKey(fieldKey)}</span>
-          <code>{fieldKey}</code>
-          {deprecated && <span className="deprecated-tag">deprecated</span>}
-        </span>
-        {control}
-      </label>
-      {prop.description && <p className="setting-field-help">{prop.description}</p>}
-      {errs.map((m, i) => (
-        <p key={i} className="setting-field-error">
-          {m}
-        </p>
-      ))}
     </div>
   );
 }

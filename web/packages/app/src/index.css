@@ -213,16 +213,8 @@ html, body {
 .entry-delete:hover:not(:disabled) { color: #fca5a5; text-decoration: underline; }
 .entry-delete:disabled { color: #475569; cursor: default; }
 .entry-fields { padding-left: 0.9rem; border-left: 2px solid #2d3748; }
-.source-row-grid {
-  display: flex; flex-direction: column; gap: 0.75rem; align-items: stretch;
-}
-.source-row-grid > label { max-width: 560px; }
-.source-row-grid label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 11px; color: #94a3b8; }
-.source-row-grid input[type="text"], .source-row-grid select {
-  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
-  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
-}
-.source-row-monitor { flex-direction: row !important; align-items: center; gap: 0.4rem !important; grid-column: 1 / -1; }
+/* Source entry fields are SchemaField (.setting-field); this only stacks them. */
+.source-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
 .source-row-errors { margin: 0.5rem 0 0; padding-left: 1.1rem; color: #fca5a5; font-size: 12px; }
 
 .admin-banner.degraded { background: #422006; color: #fcd34d; border: 1px solid #b45309; }
@@ -265,16 +257,6 @@ html, body {
   font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
   background: #422006; color: #fcd34d; border-radius: 4px; padding: 1px 5px;
 }
-.source-row-deprecated {
-  grid-column: 1 / -1; display: flex; flex-direction: column; gap: 0.25rem;
-  font-size: 11px; color: #94a3b8;
-}
-.source-row-deprecated input[type="text"] {
-  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
-  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
-}
-.source-row-deprecated .adv-field-help code { color: #cbd5e1; }
-
 /* Credentials editor (nested profiles array with masked secrets). */
 .creds-body { display: flex !important; flex-direction: column; gap: 0.85rem; }
 .creds-default { max-width: 260px; }
@@ -282,17 +264,8 @@ html, body {
   background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
   color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
 }
-.creds-row-grid {
-  display: flex; flex-direction: column; gap: 0.75rem;
-}
-.creds-row-grid .adv-field-label { max-width: 480px; }
-.creds-row-grid .adv-field-label input, .creds-row-grid .adv-field-label select {
-  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
-  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
-}
-.creds-row-grid .adv-field-label input.invalid, .creds-row-grid .adv-field-label select.invalid {
-  border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626;
-}
+/* Credential profile fields are SchemaField (.setting-field); this stacks them. */
+.creds-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
 .secret-tag {
   font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
   background: #1e3a5f; color: #93c5fd; border-radius: 4px; padding: 1px 5px;
@@ -328,7 +301,13 @@ html, body {
 .setting-field-bool .setting-field-name { order: 2; }
 .setting-field-bool input[type="checkbox"] { order: 1; width: 15px; height: 15px; accent-color: #4f8ef7; }
 .setting-field-help { margin: 0; font-size: 11px; color: #64748b; line-height: 1.45; }
+/* Validation-rule hint (min/max, accepted values) under the prose description. */
+.setting-field-constraint { margin: 0; font-size: 11px; color: #52607a; font-style: italic; }
 .setting-field-error { margin: 0; font-size: 11px; color: #fca5a5; }
+/* A control paired with an inline affordance (e.g. a path input + Browse…). */
+.setting-field-control-row { display: flex; gap: 0.4rem; align-items: stretch; }
+.setting-field-control-row > input { flex: 1; min-width: 0; }
+.setting-field-control-row > .icon-btn { flex-shrink: 0; white-space: nowrap; }
 
 .section-advanced { border-top: 1px solid #2d3748; padding-top: 0.85rem; }
 .section-advanced-toggle {
@@ -347,11 +326,6 @@ html, body {
 
 /* Credentials panel */
 .creds-panel { display: flex; flex-direction: column; }
-
-/* Sources row: path input paired with a Browse… button */
-.source-row-path { display: flex; gap: 0.4rem; align-items: stretch; }
-.source-row-path input { flex: 1; }
-.source-row-path .icon-btn { flex-shrink: 0; white-space: nowrap; }
 
 /* File browser modal (server-side chooser, local mode only) */
 .file-browser { display: flex; flex-direction: column; gap: 0.75rem; }

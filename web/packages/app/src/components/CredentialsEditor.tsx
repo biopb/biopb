@@ -1,13 +1,13 @@
 import { useState } from "react";
 import {
   credentialProfileProperties,
-  enumValues,
   fieldErrors,
   isSecretProfileKey,
   REDACTED_SENTINEL,
   type ConfigError,
   type ConfigSchema,
 } from "@biopb/tensor-flight-client";
+import { SchemaField } from "./admin/SchemaField";
 
 /**
  * Structured editor for the `credentials` block (remote-storage profiles that
@@ -212,76 +212,34 @@ export function CredentialsEditor({
                     {orderedKeys
                       .filter((k) => k !== "name")
                       .map((key) => {
-                      const secret = isSecretProfileKey(key);
-                      const errs = fieldErrors(errors, [
-                        "credentials",
-                        "profiles",
-                        i,
-                        key,
-                      ]);
-                      const invalid = errs.length > 0;
-                      const hardEnum = enumValues(props[key]);
-                      const value = str(p[key]);
-                      return (
-                        <label key={key} className="adv-field-label">
-                          <span className="adv-field-name">
-                            <code>{key}</code>
-                            {secret && <span className="secret-tag">secret</span>}
-                          </span>
-                          {hardEnum ? (
-                            <select
-                              value={value}
-                              disabled={disabled}
-                              className={invalid ? "invalid" : undefined}
-                              onChange={(e) =>
-                                updateProfile(
-                                  i,
-                                  key,
-                                  e.target.value === "" ? undefined : e.target.value,
-                                )
-                              }
-                            >
-                              <option value="">(unset)</option>
-                              {hardEnum
-                                .filter((v): v is string => typeof v === "string")
-                                .map((v) => (
-                                  <option key={v} value={v}>
-                                    {v}
-                                  </option>
-                                ))}
-                            </select>
-                          ) : (
-                            <input
-                              type={secret ? "password" : "text"}
-                              value={value}
-                              disabled={disabled}
-                              autoComplete={secret ? "new-password" : "off"}
-                              placeholder={
-                                secret ? "(stored — leave to keep)" : undefined
-                              }
-                              className={invalid ? "invalid" : undefined}
-                              onChange={(e) =>
-                                updateProfile(
-                                  i,
-                                  key,
-                                  e.target.value === "" ? undefined : e.target.value,
-                                )
-                              }
-                            />
-                          )}
-                          {secret && value === REDACTED_SENTINEL && (
-                            <span className="adv-field-help">
-                              Stored secret hidden — leave as-is to keep it.
-                            </span>
-                          )}
-                          {errs.map((m, k) => (
-                            <span key={k} className="adv-field-error">
-                              {m}
-                            </span>
-                          ))}
-                        </label>
-                      );
-                    })}
+                        const secret = isSecretProfileKey(key);
+                        const masked = secret && str(p[key]) === REDACTED_SENTINEL;
+                        return (
+                          <SchemaField
+                            key={key}
+                            fieldKey={key}
+                            prop={props[key] ?? { type: "string" }}
+                            value={p[key]}
+                            errs={fieldErrors(errors, [
+                              "credentials",
+                              "profiles",
+                              i,
+                              key,
+                            ])}
+                            disabled={disabled}
+                            secret={secret}
+                            placeholder={
+                              secret ? "(stored — leave to keep)" : undefined
+                            }
+                            note={
+                              masked
+                                ? "Stored secret hidden — leave as-is to keep it."
+                                : undefined
+                            }
+                            onChange={(v) => updateProfile(i, key, v)}
+                          />
+                        );
+                      })}
                   </div>
                   </div>
                 </li>

@@ -476,6 +476,7 @@ export function AdminPage() {
                 <SourcesEditor
                   sources={sources}
                   onChange={onSourcesChange}
+                  schema={schema}
                   errorsByIndex={sourceErrors}
                   disabled={restarting}
                   onBrowse={localMode ? (i) => setBrowseRow(i) : undefined}

@@ -23,7 +23,12 @@ export interface SchemaProp {
   enum?: unknown[];
   minimum?: number;
   maximum?: number;
+  /** Prose docstring (from the config field's `metadata["help"]`). */
   description?: string;
+  /** Human validation-rule hint (bounds / accepted values), rendered as a
+   * secondary line under the description. Separate from `description`, which is
+   * pure prose (biopb config schema emits both). */
+  constraint?: string;
   deprecated?: boolean;
   /** The dataclass default for this field (omitted when the default is null). */
   default?: unknown;
