@@ -109,7 +109,7 @@ DEFAULT_CONFIG = find_config()
 # around the shared serve-core is deferred to Layer 3.
 MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
-MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
+MCP_DEFAULT_PORT = 8765  # biopb_mcp default transport.port (loopback /mcp)
 
 # biopb-control (control plane) management. The control plane is a separate, lean package
 # (`biopb-control`) started as `python -m biopb_control run` by `biopb control start`;
@@ -1466,14 +1466,14 @@ def _resolve_mcp_log_for_read() -> Path:
 def _mcp_default_port() -> int:
     """Configured MCP transport port (biopb_mcp config), or the 8765 default.
 
-    Reads mcp.transport.port from biopb-mcp's config so `mcp start`/`status`
+    Reads transport.port from biopb-mcp's config so `mcp start`/`status`
     honor a user-set port; any failure (package absent, malformed config) falls
     back to the documented default.
     """
     try:
         from biopb_mcp._config import get_setting, load_config
 
-        return int(get_setting(load_config(), "mcp.transport.port"))
+        return int(get_setting(load_config(), "transport.port"))
     except Exception:
         return MCP_DEFAULT_PORT
 

@@ -32,8 +32,10 @@ class TestScalarProperty:
     def test_non_json_native_default_stringified(self):
         from pathlib import Path
 
-        p = scalar_property(Path("/tmp/x"))
-        assert p == {"type": "string", "default": "/tmp/x"}
+        # str() of a Path is platform-dependent (POSIX "/tmp/x" vs Windows
+        # "\\tmp\\x"); assert against str(p), not a hardcoded literal.
+        p = Path("/tmp/x")
+        assert scalar_property(p) == {"type": "string", "default": str(p)}
 
     def test_help_becomes_description(self):
         p = scalar_property(1, "how many")
