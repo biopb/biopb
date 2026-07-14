@@ -958,7 +958,8 @@ function Invoke-BiopbInstall {
 
     # Windows has a pylibczirw wheel, so the CZI reader ([czi]) is always included
     # here -- only Intel macOS lacks the wheel (handled in install.sh).
-    $tensorExtras = "web,aics,czi,medical,ndtiff,hdf5"
+    # HDF5 ([hdf5] -> h5py) is opt-in, not bundled by default (see install.sh).
+    $tensorExtras = "web,aics,czi,medical,ndtiff"
     if ($InstallBioformats) {
         $tensorExtras = "$tensorExtras,bioformats"
         Report-Info "including Bio-Formats (Java fetched on first use, not now)"

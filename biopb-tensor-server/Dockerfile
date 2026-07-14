@@ -31,7 +31,7 @@ WORKDIR /app
 RUN TENSOR_WHEEL=$(ls /app/wheels/biopb_tensor_server-*.whl) \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
     && pip install --no-cache-dir /app/wheels/biopb_control-*.whl \
-    && pip install --no-cache-dir "$TENSOR_WHEEL[web,aics,czi,bioformats,medical,ndtiff,hdf5]"
+    && pip install --no-cache-dir "$TENSOR_WHEEL[web,aics,czi,bioformats,medical,ndtiff]"
 
 # Stage 3: Runtime (nginx + python)
 FROM python:3.11-slim
