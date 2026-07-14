@@ -7,7 +7,7 @@ surprise a newcomer.
 
 ---
 
-## 1. Scope
+## Scope
 
 **biopb is an open protocol and toolchain for bioimage analysis** — moving large
 multidimensional microscopy images around and running analysis algorithms
@@ -59,9 +59,55 @@ token bypass — a `None` token *is* local mode.
 
 ---
 
-## 2. Architecture rationales
+## Environment
 
-### 2.1 Why split the data plane from the compute plane
+Two package managers, because the repo is polyglot.
+
+**Python — one `uv` workspace, one shared `.venv`.** The root `pyproject.toml`
+declares a [`tool.uv.workspace`] with four members (`biopb-image-runtime`,
+`biopb-tensor-server`, `biopb-mcp`, `biopb-control`); the root `biopb` package is
+the fifth. All resolve **in-tree** (`[tool.uv.sources]` … `workspace = true`),
+never from PyPI, so a checkout builds against sibling source, not a published
+release. Set the whole thing up — and restore it after adding a dependency — with
+a single **all-packages** sync from the repo root:
+
+```sh
+uv sync --all-packages --all-extras
+```
+
+Run everything (tests, CLIs, scripts) through that root `.venv`. **Do not**
+`uv sync --package <one>` against the shared venv — it *prunes* the venv down to
+that one package's deps; always sync `--all-packages`. Python is pinned to
+`>=3.10,<3.13`.
+
+**Browser front end — a separate `pnpm` workspace** under `web/` (`@biopb/web` +
+`@biopb/tensor-flight-client`): `pnpm -C web install`, then `pnpm -C web build` /
+`test` / `lint` / `dev`. It is *not* part of the uv workspace; the two toolchains
+are independent.
+
+**Protobuf / Flight stubs are generated, not committed.** `buf generate` (config
+in `buf.gen.yaml`, protos under `proto/`) writes the Python stubs into
+`src/main/python/` and the Java stubs under `target/`. Regenerating at build time
+keeps them from drifting in the tree — but a source checkout needs `buf` on PATH
+(end users installing from release wheels do not; the wheels ship the generated
+stubs).
+
+**Testing.** `pytest` per package — the data plane in `biopb-tensor-server/tests/`,
+the client in `src/test/python/`, and likewise `biopb-mcp` / `biopb-image-runtime`
+/ `biopb-control`. Java tests run under `mvn -B test`, web tests under
+`pnpm -C web test` (vitest). `src/test/python/README.md` has the map.
+
+**Lint & format run on commit, not by hand.** `pre-commit` drives `ruff check` +
+`ruff format` (v0.15.15) plus the end-of-file / trailing-whitespace / YAML /
+napari-plugin checks. The **root `[tool.ruff]` is the single source of truth** for
+all four Python packages (the per-package ruff/black blocks were removed), so
+don't run ruff as a separate step — committing formats and autofixes for you.
+
+---
+
+## Architecture rationales
+
+### Why split the data plane from the compute plane
 
 Bioimage analysis has two very different cost structures: **bulk data movement**
 (gigapixel images, multi-channel Z/T stacks) and **compute** (a GPU model run).
@@ -79,7 +125,7 @@ data store, and — crucially — lets an algorithm server **pull its input pixe
 directly from the data plane** instead of receiving them through the client (see
 the lazy-input framework below).
 
-### 2.2 The tensor plane: Arrow Flight, a catalog, and lazy dask
+### The tensor plane: Arrow Flight, a catalog, and lazy dask
 
 The data plane is an **Arrow Flight** server (`biopb-tensor-server`). Flight,
 rather than plain gRPC, because it is purpose-built for high-throughput,
@@ -106,7 +152,7 @@ The net effect: **the data plane is a complete I/O layer.** "Read any format,
 cache it, and hand me a lazy array" is a solved problem the rest of the system
 builds on — it is not something clients or tools should re-implement.
 
-### 2.3 The compute plane: stateless algorithm servers with an eager/lazy duality
+### The compute plane: stateless algorithm servers with an eager/lazy duality
 
 The compute plane is a gRPC contract (`proto/biopb/image`) with two services:
 
@@ -138,7 +184,7 @@ backends subclass a shared `BiopbServicerBase` from the image runtime and only
 provide the model-specific inference, so adding a new algorithm is "wrap a model
 + point it at the protocol," not "build a server."
 
-### 2.4 The client: "trust the agent," with tools only where they help
+### The client: "trust the agent," with tools only where they help
 
 `biopb-mcp` is built on a specific bet: **bench scientists' analysis tasks are
 open-ended, so an AI agent with a general-purpose compute environment beats a
@@ -165,7 +211,7 @@ The intended extension story is that different labs add their own
 domain-specific algorithm servers (compute plane) and tools (agent side) for
 their own problems.
 
-### 2.5 Polyglot by construction
+### Polyglot by construction
 
 There is one source of truth — the `.proto` files — and language stubs are
 generated with **buf**. This is why a Java (`pom.xml`), a JS/TS (pnpm), and a
@@ -173,7 +219,7 @@ Python toolchain all live in the `biopb` repo: the protocol is meant to be
 consumed from analysis ecosystems in any of those languages (napari/Python,
 ImageJ/Java, web/TS).
 
-### 2.6 The agentic coupling (biopb-mcp's main user-facing design)
+### The agentic coupling (biopb-mcp's main user-facing design)
 
 `biopb-mcp` is where a scientist actually meets the system, and its defining
 idea is *how* it couples an external AI agent to a live, shared analysis session
@@ -266,7 +312,7 @@ restartable process.
 
 ---
 
-## 3. Implementation notes (the notable choices)
+## Implementation notes (the notable choices)
 
 These are decisions a newcomer would not guess and that are worth knowing before
 editing the code.
@@ -396,7 +442,7 @@ editing the code.
 
 ---
 
-## 4. Where to look first
+## Where to look first
 
 - **Protocol:** `biopb/proto/biopb/{image,tensor}/` (ignore `ome/`).
 - **Data plane:** `biopb/biopb-tensor-server/biopb_tensor_server/` —
