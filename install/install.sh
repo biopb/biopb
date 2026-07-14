@@ -940,7 +940,11 @@ install_biopb() {
     # ===== 3. Install biopb packages =====
     _step "[3/7] Installing biopb packages..."
 
-    TENSOR_EXTRAS="web,aics,medical,ndtiff,hdf5"
+    # The HDF5 reader ([hdf5] -> h5py) is NOT bundled by default: .h5 is a niche
+    # source format here, and h5py is cleanly gated behind its own opt-in extra
+    # (nothing else in this set pulls it), so a user who needs it installs
+    # biopb-tensor-server[hdf5]. Kept out of the default to slim the install.
+    TENSOR_EXTRAS="web,aics,medical,ndtiff"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"

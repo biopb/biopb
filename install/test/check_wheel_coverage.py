@@ -42,7 +42,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # The format extras install.sh always installs (see install_biopb(): TENSOR_EXTRAS).
-_BASE_TENSOR_EXTRAS = ["web", "aics", "medical", "ndtiff", "hdf5"]
+_BASE_TENSOR_EXTRAS = ["web", "aics", "medical", "ndtiff"]
 
 # install.sh adds the Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw)
 # on every platform EXCEPT Intel macOS, where pylibczirw ships no wheel. Mirror that
