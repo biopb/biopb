@@ -4,6 +4,7 @@ import {
   authHeaders,
   authRequired,
   captureUrlToken,
+  clearToken,
   getToken,
   redirectToUnlock,
 } from "../auth";
@@ -84,6 +85,9 @@ export default function DashboardPage() {
   const [algos, setAlgos] = useState<AlgoRec[] | null>(null);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
+  // Whether a token is held (remote mode). Lock only means something when there
+  // is a token to drop; local mode has none, so the button is disabled.
+  const [hasToken, setHasToken] = useState(() => !!getToken());
 
   const pollStatus = useCallback(async () => {
     try {
@@ -129,11 +133,19 @@ export default function DashboardPage() {
   // fetchAuth 401 path is the backstop for a stale/invalid token.
   useEffect(() => {
     captureUrlToken();
+    setHasToken(!!getToken());
     if (!getToken()) {
       authRequired().then((req) => {
         if (req && !getToken()) redirectToUnlock();
       });
     }
+  }, []);
+
+  // Drop the stored token and return to the unlock page. Only reachable in remote
+  // mode (the button is disabled with no token).
+  const lock = useCallback(() => {
+    clearToken();
+    redirectToUnlock();
   }, []);
 
   // status + sessions poll on the interval; agents + algorithms are fetched on
@@ -194,6 +206,14 @@ export default function DashboardPage() {
         />
         <h1>BioPB control - dashboard</h1>
         <span id="conn">{conn}</span>
+        <button
+          className="lock-btn"
+          disabled={!hasToken}
+          onClick={lock}
+          title={hasToken ? "Lock session" : "No token to lock (local mode)"}
+        >
+          Lock
+        </button>
       </header>
       <main>
         <div className="card">

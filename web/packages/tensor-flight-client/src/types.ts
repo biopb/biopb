@@ -153,6 +153,29 @@ export interface AdminStatus {
   uptime_seconds: number | null;
   full_scan_in_progress: boolean | null;
   last_full_scan_finished_at: number | null;
+  /** True in local mode (no token enforced, loopback-only). The admin UI shows
+   * the server-side file/dir chooser only when this is true — in local mode the
+   * server's filesystem is the user's own machine (biopb/biopb#244). Absent on an
+   * older sidecar → treated as false. */
+  local?: boolean;
+}
+
+/** One entry in a `GET /api/admin/browse` directory listing. */
+export interface BrowseEntry {
+  name: string;
+  is_dir: boolean;
+}
+
+/** Response of `GET /api/admin/browse`: one directory level of the server's FS.
+ * Local-mode only; `parent` is null at the filesystem root (biopb/biopb#244). */
+export interface BrowseResponse {
+  /** Absolute path of the listed directory. */
+  path: string;
+  /** Absolute path of the parent directory, or null at the FS root. */
+  parent: string | null;
+  entries: BrowseEntry[];
+  /** True when the listing hit the server's per-directory entry cap. */
+  truncated: boolean;
 }
 
 /** Parameters for backend rendering request. */

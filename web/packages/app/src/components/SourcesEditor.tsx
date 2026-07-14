@@ -17,6 +17,10 @@ interface SourcesEditorProps {
   /** Per-source-index validation messages from a rejected PUT (422). */
   errorsByIndex: Record<number, string[]>;
   disabled?: boolean;
+  /** Open the server-side file chooser for local row `i`, seeded from its current
+   * URL. Provided only in local mode (biopb/biopb#244); when absent the row keeps
+   * the typed-path input alone. */
+  onBrowse?: (i: number) => void;
 }
 
 // Storage types accepted by SourceConfig.type (config.py). "" = auto-detect.
@@ -40,6 +44,7 @@ export function SourcesEditor({
   onChange,
   errorsByIndex,
   disabled,
+  onBrowse,
 }: SourcesEditorProps) {
   const [addOpen, setAddOpen] = useState(false);
 
@@ -66,10 +71,18 @@ export function SourcesEditor({
   const isRemote = (s: SourceEntry) =>
     str(s.url).startsWith("grpc://") || s.alias != null;
 
+  // Canonical per-entry display title (e.g. "Local Source 1" / "Remote Source 2"),
+  // numbered within its kind — sources have no single name field, so this is the
+  // group heading shown above each entry's fields.
+  let localN = 0;
+  let remoteN = 0;
+  const titles = sources.map((s) =>
+    isRemote(s) ? `Remote Source ${++remoteN}` : `Local Source ${++localN}`,
+  );
+
   return (
     <section className="sources-editor">
       <div className="sources-editor-head">
-        <h2>Sources</h2>
         <div className="add-menu">
           <button
             type="button"
@@ -105,17 +118,49 @@ export function SourcesEditor({
             const remote = isRemote(s);
             const errs = errorsByIndex[i] ?? [];
             return (
-              <li key={i} className={`source-row${errs.length ? " has-error" : ""}`}>
+              <li key={i} className={`entry-row${errs.length ? " has-error" : ""}`}>
+                <div className="entry-head">
+                  <span className="entry-title">{titles[i]}</span>
+                  <button
+                    type="button"
+                    className="entry-delete"
+                    disabled={disabled}
+                    onClick={() => remove(i)}
+                  >
+                    Delete
+                  </button>
+                </div>
+                <div className="entry-fields">
                 <div className="source-row-grid">
                   <label>
                     {remote ? "URL (grpc://host:port)" : "Path / URL"}
-                    <input
-                      type="text"
-                      value={str(s.url)}
-                      disabled={disabled}
-                      placeholder={remote ? "grpc://lab-nas:8815" : "/data/microscopy"}
-                      onChange={(e) => update(i, { url: e.target.value })}
-                    />
+                    {!remote && onBrowse ? (
+                      <span className="source-row-path">
+                        <input
+                          type="text"
+                          value={str(s.url)}
+                          disabled={disabled}
+                          placeholder="/data/microscopy"
+                          onChange={(e) => update(i, { url: e.target.value })}
+                        />
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          disabled={disabled}
+                          onClick={() => onBrowse(i)}
+                        >
+                          Browse…
+                        </button>
+                      </span>
+                    ) : (
+                      <input
+                        type="text"
+                        value={str(s.url)}
+                        disabled={disabled}
+                        placeholder={remote ? "grpc://lab-nas:8815" : "/data/microscopy"}
+                        onChange={(e) => update(i, { url: e.target.value })}
+                      />
+                    )}
                   </label>
 
                   {remote ? (
@@ -206,16 +251,6 @@ export function SourcesEditor({
                   )}
                 </div>
 
-                <button
-                  type="button"
-                  className="source-row-remove"
-                  title="Remove source"
-                  disabled={disabled}
-                  onClick={() => remove(i)}
-                >
-                  ✕
-                </button>
-
                 {errs.length > 0 && (
                   <ul className="source-row-errors">
                     {errs.map((m, k) => (
@@ -223,6 +258,7 @@ export function SourcesEditor({
                     ))}
                   </ul>
                 )}
+                </div>
               </li>
             );
           })}

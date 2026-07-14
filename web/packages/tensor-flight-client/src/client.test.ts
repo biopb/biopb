@@ -440,3 +440,39 @@ describe("TensorHttpClient.restartServer", () => {
     expect(r.restarting).toBe(true);
   });
 });
+
+describe("TensorHttpClient.browse", () => {
+  it("GETs /api/admin/browse with no query when path omitted", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ path: "/home/u", parent: "/home", entries: [], truncated: false }),
+    );
+    const c = new TensorHttpClient(BASE, null);
+    const r = await c.browse();
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/admin/browse`);
+    expect(r.path).toBe("/home/u");
+    expect(r.parent).toBe("/home");
+  });
+
+  it("URL-encodes the path query parameter", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        path: "/data/my images",
+        parent: "/data",
+        entries: [{ name: "a.zarr", is_dir: true }],
+        truncated: false,
+      }),
+    );
+    const c = new TensorHttpClient(BASE, null);
+    const r = await c.browse("/data/my images");
+    expect(mockFetch.mock.calls[0]![0]).toBe(
+      `${BASE}/api/admin/browse?path=%2Fdata%2Fmy%20images`,
+    );
+    expect(r.entries[0]!.is_dir).toBe(true);
+  });
+
+  it("throws TensorApiError when browsing is unavailable (remote mode 404)", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(404, "File browsing is available only in local mode"));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await expect(c.browse("/data")).rejects.toThrow(TensorApiError);
+  });
+});
