@@ -22,8 +22,8 @@ def _isolate_config(monkeypatch, tmp_path):
     This autouse fixture points ``Path.home()`` at a per-test ``tmp_path`` (so an
     untouched config resolves to defaults) and invalidates the cache before and
     after each test. ``monkeypatch`` is function-scoped, so tests that set their
-    own ``Path.home`` / ``get_config_dir`` compose with this -- their setattr
-    runs later and wins, sharing the same ``tmp_path``.
+    own ``Path.home`` compose with this -- their setattr runs later and wins,
+    sharing the same ``tmp_path``.
     """
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     CONFIG.reload()
