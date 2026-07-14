@@ -1,6 +1,6 @@
 # Tensor-Server Admin Endpoint — Config / Status / Restart over HTTP
 
-**Status:** Design / not yet implemented
+**Status:** Implemented (v1 scope shipped — `biopb/biopb#245`)
 **Component:** `biopb-tensor-server` (`http_server.py`, config model), `biopb`
 umbrella CLI (`server restart` lever), `biopb-mcp` (napari "open admin" action)
 **Related:** `biopb/biopb#34` (config validation + JSON Schema emitter),
@@ -256,7 +256,7 @@ existing `idle|connecting|connected|error` vocabulary with `scanning` and
 `restarting`.
 
 > **Implemented (biopb/biopb#245).** The structured advanced sections
-> (`AdvancedSections.tsx`) render one collapsible pane per schema section
+> (`SectionFields.tsx` + `adminSections.ts`) render one collapsible pane per schema section
 > (`server`/`cache`/`pyramid`/`precache`/`metadata_db`), each field a
 > schema-driven control (checkbox / enum `select` / bounded number / text) with
 > its `description` as helper text; the raw-JSON modal stays as an escape hatch.
@@ -494,15 +494,15 @@ admin" action.
 
 ## Where to look first
 
-- **Sidecar app + auth + lifecycle:** `biopb-tensor-server/biopb_tensor_server/http_server.py`
+- **Sidecar app + auth + lifecycle:** `biopb-tensor-server/biopb_tensor_server/serving/http_server.py`
   (`create_app`, `_check_token`, `run`, `shutdown_sentinel_path`,
   `_install_windows_shutdown_listener`).
 - **The restart lever:** `src/main/python/biopb/cli.py`
   (`server start` / `stop` / `restart` / `status`, `_detach_kwargs`,
   `_read_pid_record`, `_graceful_stop`).
-- **Config model + schema:** `biopb-tensor-server/biopb_tensor_server/config.py`
-  (`_CONSTRAINTS`, `load_config`, `parse_config`; new `save_config`) and
-  `config_schema.py` (`build_config_schema`).
+- **Config model + schema:** `biopb-tensor-server/biopb_tensor_server/core/config.py`
+  (`_CONSTRAINTS`, `load_config`, `parse_config`, `save_config`) and
+  `core/config_schema.py` (`build_config_schema`).
 - **Scan-progress signal:** `progressive-discovery.md` and the Flight
   `health` action's freshness fields.
 - **The web app to extend (shell, routes, idioms):**

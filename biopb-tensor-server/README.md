@@ -46,7 +46,7 @@ Arrow Flight gRPC endpoint stays on `:8815` for SDK clients. The HTTP sidecar
 the container a reaping init as PID 1 — optional, since the control plane (PID 1)
 handles `docker stop` and reaps its own child, but it cleans up any stray orphans.
 
-See [deploy.md](deploy.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
+See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
 ## Security
 
@@ -111,7 +111,7 @@ Directory monitoring uses a claim-based discovery protocol with periodic rescans
 
 ### Requirements
 
-- Python >= 3.8
+- Python >= 3.10, < 3.13
 - pyarrow >= 14.0.0
 - Node.js / pnpm (for web app and TS client)
 
@@ -166,7 +166,7 @@ pnpm -C web dev   # runs on :5173, proxies to a live control on :8813
 biopb-tensor-server serve    Start the gRPC Flight server only
 biopb-tensor-server launch   Start Flight server + HTTP sidecar for web
 biopb-tensor-server validate Check a config file (JSON; legacy TOML)
-biopb-tensor-server list     List all data sources and tensors in a config
+biopb-tensor-server list-tensors  List all data sources and tensors in a config
 biopb-tensor-server version  Show version information
 ```
 

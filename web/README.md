@@ -19,7 +19,7 @@ web/
     tensor-flight-client/      # @biopb/tensor-flight-client — browser Arrow-Flight/HTTP SDK
 ```
 
-## The four surfaces (one SPA, base `/`)
+## The surfaces (one SPA, base `/`)
 
 The control serves `index.html` for any non-API, non-proxy GET, so every surface
 is a client route of the same bundle:
@@ -28,6 +28,7 @@ is a client route of the same bundle:
 |--------------------------------|------------------|---------------------------------------|
 | `/`                            | `DashboardPage`  | control's own `/api/*`                 |
 | `/viewer`, `/admin`, `/unlock` | viewer + admin   | `/data_plane/*` (proxied to sidecar)  |
+| `/mcp/admin`                   | `McpAdminPage`   | control's `/api/mcp_config`            |
 | `/session/:id/observe`         | `ObservePage`    | `/session/:id/api/*` (proxied to child)|
 
 `main.tsx` wires the routes; the dashboard and observe pages are `React.lazy`

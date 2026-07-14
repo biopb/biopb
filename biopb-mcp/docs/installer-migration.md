@@ -3,7 +3,7 @@
 > **Historical / partly superseded.** This note predates the monorepo merge and
 > still describes a two-repo world (e.g. `RELEASE_REPO = biopb/biopb-mcp`). After
 > the merge the installer points at `biopb/biopb` and selects releases by the
-> `mcp-v*` tag prefix — see `monorepo-migration.md` for the current state.
+> `release-v*` tag prefix — see `monorepo-migration.md` for the current state.
 
 **Status:** **In progress.** Phase 0 + Phase 1 landed in this change; Phases 2–4
 are tracked in the linked issue. This note records the plan and the decisions
@@ -24,7 +24,7 @@ auto-updater can point at. biopb-mcp turned out **too tightly coupled to biopb**
 to publish independently, yet it never lived in the monorepo — so the natural fix
 is to make biopb-mcp the **distribution hub**: one repo owns the release that
 carries the whole matched set, the installer that consumes it, and the
-auto-updater that re-applies it (see `autoupdater.md`).
+auto-updater that re-applies it (the updater lives in `../src/biopb_mcp/mcp/_update*.py`).
 
 The precondition was bundling all three wheels into one biopb-mcp release
 (`release_bundle.yml`); this migration builds on it.
@@ -46,7 +46,7 @@ The precondition was bundling all three wheels into one biopb-mcp release
 Installs the stack into **one `uv` tool environment** so the components can import
 and drive each other (`biopb server start`, the napari viewer, `ops`), unpacks
 the data-browser webapp, writes default config
-(`~/.config/biopb/biopb.toml`, `~/.config/biopb/mcp-config.json`,
+(`~/.config/biopb/biopb.json`, `~/.config/biopb/mcp-config.json`,
 `~/.config/biopb/mcp.json`), wires biopb-mcp into any detected AI agent
 (Claude Code/Desktop, Cursor, opencode, Hermes) as a **stdio** MCP server, and
 starts the data server. Idempotent; rerun to upgrade. By default it tracks the
@@ -97,7 +97,7 @@ carries the three wheels + webapp + both installers.
   biopb-mcp's copy; delete `biopb/biopb`'s `install/` and stop attaching
   `install.sh` in its `tensor-server-ci.yaml`; fix biopb-site links if the URL
   shape changes.
-- **Phase 4 — auto-updater apply step** (`autoupdater.md` / its tracking issue):
+- **Phase 4 — auto-updater apply step** (`mcp/_update*.py` / its tracking issue):
   the installer's launch wrapper grows the "apply a staged update on clean start"
   path, so the updater and the installer share one install routine.
 

@@ -65,13 +65,18 @@ For runtime/server changes, check:
 - process/kernel isolation assumptions (where relevant);
 - cleanup of cache/temp resources.
 
-### 6. Security posture (trusted network model)
+### 6. Security posture (local/remote two-mode model)
 
-The project assumes localhost/trusted intranet by default.
+Deployment is two fail-closed modes: **local** (every listener binds loopback, no
+token — the default) and **remote** (`biopb control start --remote`: public bind
+behind a *required* token). The bind address *is* the mode, so "public +
+unauthenticated" is unrepresentable; there is no dev-mode token bypass (a `None`
+token is local mode).
 
 Still flag:
 
-- accidental token bypass in non-dev paths;
+- any change that could bind the flight server or control UI publicly without a
+  required token, or that weakens the local/remote fail-closed split;
 - insecure defaults introduced in deployment docs/scripts;
 - leaks of credentials/tokens in logs.
 

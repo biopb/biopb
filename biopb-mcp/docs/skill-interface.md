@@ -1,7 +1,10 @@
 # Skill Interface — Curated Agent Workflows Sourced from biopb.org
 
-**Status:** Proposed. P0 contract delivered in `biopb-site` (schema, builder/validator,
-3 example skills, generated `catalog.json` — see Appendices A/B); P1–P4 not started.
+**Status:** Partly implemented. P0 contract delivered in `biopb-site` (schema,
+builder/validator, 3 example skills, generated `catalog.json` — see Appendices
+A/B); **P2 (MCP retrieval) shipped** — the `find_skills` tool, the
+`skill://{skill_id}` resource, and the `services.skills_*` config are live in
+`biopb-mcp` (`mcp/_skills.py`, `mcp/_server.py`). P1 and P3–P4 not started.
 **Component:** `biopb-mcp` (discovery + retrieval), `biopb-site` (authoring + publishing)
 **Related:** the MCP `guide://*` resources and `find_skills`-style discovery, the
 `mcp.services` config block, the fail-open remote fetch in
@@ -211,16 +214,18 @@ the body from `url`, verifies `sha256`, and caches it.
   and **a single malformed entry is skipped, not fatal** — one bad skill must never
   sink `find_skills` or the resource list.
 
-### 3d. Config (extend the `mcp.services` block in `_config.py`)
+### 3d. Config (flat keys on the `services` block in `_config.py`)
+
+As shipped, the keys are flat on `ServicesConfig` — no nested `skills` sub-block
+and no `mcp.` wrapper (the config was flattened onto the tensor-server's dataclass
+machinery):
 
 ```python
-"mcp": {"services": {
-    "skills": {
-        "enabled": True,
-        "catalog_url": "https://biopb.org/skills/catalog.json",
-        "cache_ttl": 3600,
-    },
-}}
+"services": {
+    "skills_enabled": True,
+    "skills_catalog_url": "https://biopb.org/skills/catalog.json",
+    "skills_cache_ttl": 3600,
+}
 ```
 
 ### 3e. Instructions

@@ -102,8 +102,8 @@ which may expose multiple tensors (e.g., multi-field).
 | `DoGet` | Fetches a single chunk identified by a `TensorTicket`; reads from the adapter and returns a `RecordBatch` stream |
 
 Custom `do_action` verbs extend these: `health`, `create_source`,
-`upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, and
-`add_source` (below).
+`upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,
+`add_source`, and `remove_source` (below).
 
 #### Runtime source registration (`add_source`)
 
@@ -173,9 +173,10 @@ All adapters implement `BackendAdapter`:
 
 | Method | Returns |
 |--------|---------|
+| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors |
+| `get_source_descriptor()` | `DataSourceDescriptor` proto |
 | `get_tensor_descriptor()` | `TensorDescriptor` proto |
-| `get_chunk_endpoints(ticket)` | List of `ChunkBounds` |
-| `read_chunk(bounds)` | `np.ndarray` |
+| `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
 | `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native on-disk levels (default `None`; `OmeZarrAdapter` overrides) |
 
 Concrete adapters:
@@ -201,7 +202,7 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 ## FastAPI HTTP Server
 
 **Module:** `biopb_tensor_server.serving.http_server`
-**Factory:** `create_app(flight_location, token, cache_bytes, cors_origins, config_path, web_host, web_port) → FastAPI`
+**Factory:** `create_app(flight_location, token, cache_bytes, cors_origins, config_path, web_host, web_port, supervised) → FastAPI`
 **Default port:** `8814`
 
 ### Lifecycle
@@ -240,7 +241,15 @@ A token is present (and enforced) only in **remote mode**, when the config's
 | `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
 | `GET` | `/api/sources/{id}` | ✓ | Single descriptor |
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
+| `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
+| `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
+| `POST` | `/api/render` | ✓ | Server-rendered RGB image of a slice |
+| `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
+| `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
+| `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
+| `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker |
+| `POST` | `/api/admin/restart` | ✓ | Restart the server (same-origin guarded) |
 
 > **Route ordering:** `/api/sources/{id}/metadata` is registered *before* the
 > greedy `{id:path}` catch-all to avoid Starlette first-match shadowing.
@@ -318,7 +327,7 @@ Startup sequence:
 3. Print the one-time access token (remote mode only).
 4. Load `biopb.json` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
-6. Derive CORS origins from `--web-url` (default `http://localhost:8814`) or
+6. Derive CORS origins from `--web-url` (default `http://localhost:5173`) or
    explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
 7. Call `run_http_server(...)` — **blocking** uvicorn call. The sidecar is
    API-only; it serves no static assets (the control plane serves the browser UI).
@@ -1063,7 +1072,7 @@ The tensor server has its **own version line**, keyed to the per-package tag
 `server-v*`. Its Docker image is cut on that tag by `tensor-server-ci`, on its own
 cadence — distinct from the SDK line (`v*`, for `biopb` + `biopb-image-base`) and
 the product bundle line (`release-v*`, for mcp/control/web + the GitHub release).
-See `docs/release-model.md`.
+See `../docs/release-model.md`.
 
 ```
 git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py

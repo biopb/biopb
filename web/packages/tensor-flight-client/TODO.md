@@ -1,27 +1,12 @@
 # tensor-flight-client TODO
 
-## Move hysteresis out of the library into web/
+## ~~Move hysteresis out of the library into web/~~ — DONE (library side)
 
-`computeScaleHint` currently accepts `prevFactors` and applies a 20% hysteresis band
-to avoid scale-level flickering near power-of-two boundaries. This is a render-loop
-stability concern, not a tensor/data concern:
-
-- Non-web consumers (e.g. server-side thumbnail generators) have no need for it and
-  must pass `undefined` to opt out.
-- The library cannot know when a zoom gesture has ended — the ideal time to commit to
-  a new scale level — so the fixed 20% band is a blunt proxy for gesture state that
-  only the web layer can reason about properly.
-
-Proposed split:
-- Remove `prevFactors` parameter and hysteresis from `computeScaleHint`. The function
-  returns the optimal power-of-two factor for the given viewport/data size.
-- `web/` adds a `useScaleHint()` hook (or a small stateful wrapper) that retains
-  `prevFactors` across frames and applies hysteresis before calling `compute()`.
-- `ScaleVector.snapped` can be removed from the public API along with the `HYSTERESIS`
-  constant once they are no longer needed by library callers.
-
-Low priority — current placement is functional and tested. Revisit if the library gains
-non-web consumers.
+The library-side removal is complete: `computeScaleHint` is now a **pure function**
+with no `prevFactors` parameter and no hysteresis band (`src/tensor-array.ts` —
+"computes optimal scale factors without hysteresis"), and the `HYSTERESIS` constant
+is gone. Any gesture-aware hysteresis / render-loop stability now belongs entirely
+to the `web/` layer. Only the `ScaleVector.snapped` hint field remains.
 
 ---
 

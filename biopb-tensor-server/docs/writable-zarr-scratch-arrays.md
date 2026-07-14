@@ -30,7 +30,8 @@ teardown — with no permanent artifact left behind.
 
 The server already exposes two server-created source primitives behind the same
 `create_source` Flight action + `do_put` chunk upload + `upload_status`
-lifecycle (`biopb-tensor-server/biopb_tensor_server/server.py:1006-1180`):
+lifecycle (`biopb-tensor-server/biopb_tensor_server/serving/server.py`, with the
+`_create_source` prefix handling in `serving/upload_manager.py`):
 
 | | `cache:` (`CachedSourceAdapter`) | `ome_zarr:` (`OmeZarrAdapter`) |
 |---|---|---|
@@ -58,10 +59,11 @@ Neither primitive delivers the target UX:
    chunk. A true `z[sl] = data` needs server-side **read-modify-write** of
    boundary chunks. No client region-assignment API exists (only whole-array
    `upload_array`).
-2. **Ephemeral lifecycle + teardown.** No `delete_source` / `drop` Flight action
-   exists — only an internal `unregister_source()` (`server.py:267`), not
-   exposed. Scratch arrays need a temp dir, a client-callable delete, and
-   optionally TTL/idle eviction.
+2. **Ephemeral lifecycle + teardown.** A `remove_source` Flight action now exists
+   (`serving/server.py`), but it tears down a drag-dropped source root — not the
+   per-array scratch `delete_source` proposed here; the internal
+   `unregister_source()` is otherwise not client-exposed. Scratch arrays still
+   need a temp dir, a client-callable delete, and optionally TTL/idle eviction.
 3. **Write concurrency safety.** Read-modify-write on a zarr v2 chunk from
    concurrent `do_put`s racing the same chunk is unsafe; needs a write lock.
 4. **Client writable-array handle.** No object supports `z[sl] = data` / `z[sl]`

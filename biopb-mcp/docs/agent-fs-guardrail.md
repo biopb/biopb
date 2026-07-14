@@ -116,7 +116,7 @@ So agent file I/O performed *inside a dask task* —
 on a worker and **bypasses the kernel's hook entirely**. To actually bound FS the
 same guard must be installed in each worker via a **`WorkerPlugin` / worker-init**
 — the exact mechanism already used to split `cache_budget` across workers
-(`CLAUDE.md` §3, `mcp.dask.cache_budget`). Kernel-only enforcement is a partial
+(`CLAUDE.md` §3, `dask.cache_budget`). Kernel-only enforcement is a partial
 guard and must be documented as such.
 
 Both sites read the **same allowlist** from config so they cannot drift.

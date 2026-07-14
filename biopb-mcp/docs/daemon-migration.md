@@ -1,5 +1,12 @@
 # Design note: http-only transport + on-demand kernel (daemon model)
 
+> **Superseded (historical).** The detached, shared, fixed-port daemon this note
+> describes was replaced by the shim-owned *ephemeral, per-connection,
+> dynamic-port* session model — each stdio client now spawns and reaps its own
+> session (kernel + viewer). See `mcp-dedaemonization-migration.md` (Layer 1) for
+> the current design. This doc is kept only as the record of *why* the shim /
+> heavy-process split exists; read it for rationale, not for current behavior.
+
 **Status:** Direction 2 (on-demand kernel) is **implemented** — though as
 *explicit* start (a `start_kernel` tool the agent calls), **not** the implicit
 lazy-on-first-`execute()` trigger this note sketches; see the "Direction 2"
