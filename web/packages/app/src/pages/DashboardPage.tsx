@@ -283,6 +283,12 @@ export default function DashboardPage() {
             >
               Config →
             </a>
+            {/* The data-plane log tail. Available regardless of plane state (a
+                crashed plane's log is exactly what you want to read), so unlike
+                the viewer/config links it is never disabled. */}
+            <a className="link" href="/logs" target="_blank" rel="noopener">
+              Logs →
+            </a>
           </div>
         </div>
 
