@@ -69,6 +69,15 @@ class TestEnum:
     def test_case_sensitive_by_default(self):
         assert not Enum({"INFO"}).ok("info")
 
+    def test_ok_is_total_on_bad_types(self):
+        # ok() must never raise -- a bad-typed config leaf is rejected, not a
+        # crash (the control's PUT validator calls ok() on arbitrary JSON). This
+        # includes unhashable values (list/dict), which a naive `in set` raises on.
+        e = Enum({"http", "stdio"})
+        for bad in (None, 5, True, 1.5, [1, 2], {"a": 1}, (1, 2)):
+            assert e.ok(bad) is False
+        assert Enum({"INFO"}, case_insensitive=True).ok(["x"]) is False
+
     def test_json_schema_only_for_case_sensitive(self):
         assert Enum({"http", "stdio"}).to_json_schema() == {"enum": ["http", "stdio"]}
         # A case-insensitive enum emits no hard `enum` (it would reject casings

@@ -94,7 +94,14 @@ class Enum:
     def ok(self, value) -> bool:
         if self.case_insensitive and isinstance(value, str):
             value = value.strip().lower()
-        return value in self.allowed
+        try:
+            return value in self.allowed
+        except TypeError:
+            # An unhashable value (list / dict) can never be an enum member. Return
+            # False rather than letting the membership test raise, so ok() is total
+            # like Range.ok -- a bad-typed config leaf is rejected, not a crash
+            # (e.g. the control's PUT validator would otherwise 500 on it).
+            return False
 
     def describe(self) -> str:
         return "one of: " + ", ".join(sorted(map(str, self._display)))

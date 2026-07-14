@@ -1029,6 +1029,16 @@ def test_mcp_config_put_rejects_bad_enum_and_range(control, mcp_home):
     assert not (mcp_home / ".config" / "biopb" / "mcp-config.json").exists()
 
 
+def test_mcp_config_put_rejects_unhashable_enum_value_as_422_not_500(control, mcp_home):
+    # A list/dict where an enum scalar is expected must be a clean 422, not a 500
+    # (Enum.ok is total, so the PUT validator never raises on unhashable input).
+    status, payload = _put(
+        f"{control}/api/mcp_config", {"transport": {"kind": ["http"]}}
+    )
+    assert status == 422, payload
+    assert ("transport", "kind") in {tuple(e["path"]) for e in payload["errors"]}
+
+
 def test_mcp_config_put_rejects_inverted_health_poll(control, mcp_home):
     status, payload = _put(
         f"{control}/api/mcp_config",
