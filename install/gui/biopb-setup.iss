@@ -18,7 +18,7 @@
 ;   diagnostics in view.) The engine's terminal ::biopb::DONE|<code> record ends
 ;   the loop. A full transcript is also written to <LogFile>.full.log.
 ;
-; Compiles with Inno Setup 6.x (iscc). See docs/windows-installer.md.
+; Compiles with Inno Setup 6.x (iscc). See ../docs/windows-installer.md.
 ;
 ; Design decisions (per planning):
 ;   * Online bootstrapper  -> ship the tiny engine .ps1; it downloads wheels.
@@ -56,7 +56,7 @@ OutputBaseFilename=biopb-setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; CI signs the output (see docs/windows-installer.md). Once a signer is
+; CI signs the output (see ../docs/windows-installer.md). Once a signer is
 ; registered with iscc, uncomment to sign installer + uninstaller:
 ; SignTool=biopbsign
 

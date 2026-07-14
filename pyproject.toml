@@ -37,7 +37,7 @@ dependencies = [
     "cachey >= 0.1.0",
     "ome-zarr >= 0.6.1",
     # biopb's Zarr adapters target the zarr 2.x API (zarr 3 is a separate port).
-    # See docs/aicsimageio-to-bioio-migration.md.
+    # See biopb-tensor-server/docs/aicsimageio-to-bioio-migration.md.
     "zarr >= 2.0.0, <3",
   ]
   # SDK API-reference toolchain (mkdocstrings). Builds the static HTML that the

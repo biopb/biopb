@@ -10,7 +10,7 @@ loose-file case).
 message).
 **Related:** `TiffSequenceAdapter` / `DicomSeriesAdapter` (`adapters/tiff.py`,
 `adapters/dicom.py`), the multi-field/HCS machinery, the `array_id`-is-authoritative
-policy (`proto/biopb/tensor/descriptor.proto`), `docs/cloud-storage-support.md`
+policy (`proto/biopb/tensor/descriptor.proto`), `cloud-storage-support.md`
 (multi-file content-membership formats already degrade to N single-file sources
 under cloud), the localhost `chunk_locate` mmap fast path (`#9`).
 
@@ -535,7 +535,7 @@ only in **how the aggregate view is served** (RPC vs virtual tensor).
 - **Cloud/unresolved sources.** Enumerating members is a content read, so an
   unresolved (dehydrated) directory cannot populate its field list until resolved
   — the same limitation the cloud path already documents
-  (`docs/cloud-storage-support.md`: multi-file content-membership formats degrade
+  (`cloud-storage-support.md`: multi-file content-membership formats degrade
   to N single-file sources under cloud). No worse than today; not solved here.
 - **A file that is itself multi-field** (a multi-scene loose `.tif`) collapses to
   one field showing its first series. Judged rare and acceptable; the escape hatch

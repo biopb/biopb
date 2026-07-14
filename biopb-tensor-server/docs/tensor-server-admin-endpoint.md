@@ -4,9 +4,9 @@
 **Component:** `biopb-tensor-server` (`http_server.py`, config model), `biopb`
 umbrella CLI (`server restart` lever), `biopb-mcp` (napari "open admin" action)
 **Related:** `biopb/biopb#34` (config validation + JSON Schema emitter),
-`biopb/biopb#212` + `docs/progressive-discovery.md` (startup-scan progress /
-freshness `health` fields), `docs/remote-tensor-cache.md` §8 (the config-GUI
-design this realizes), `docs/config-format-migration.md` (JSON-canonical config).
+`biopb/biopb#212` + `progressive-discovery.md` (startup-scan progress /
+freshness `health` fields), `remote-tensor-cache.md` §8 (the config-GUI
+design this realizes), `config-format-migration.md` (JSON-canonical config).
 
 ---
 
@@ -23,7 +23,7 @@ terminal. Concretely, three capabilities:
    **once at startup**; there is no hot-reload).
 
 This is the **`/api/config` web-app frontend** from
-`docs/remote-tensor-cache.md` §8.6, chosen over a napari Qt form. The backend is
+`remote-tensor-cache.md` §8.6, chosen over a napari Qt form. The backend is
 a small set of HTTP routes on the **existing FastAPI sidecar** (`:8814`); napari
 integration is a single menu action that opens a browser window at the admin
 page. No second form to keep in sync with `_CONSTRAINTS`.
@@ -116,7 +116,7 @@ Merges the Flight `health` action with process facts:
 ```
 
 `source_count`, `full_scan_in_progress`, and `last_full_scan_finished_at` are the
-progressive-discovery freshness fields (`docs/progressive-discovery.md`) — they
+progressive-discovery freshness fields (`progressive-discovery.md`) — they
 drive the post-restart "scanning…" UX below.
 
 ### `POST /api/admin/restart`
@@ -358,7 +358,7 @@ blind wait. Using the freshness fields:
   "**Ready — N sources**"
 
 The daemon reaches `SERVING` immediately (backgrounded scan,
-`docs/progressive-discovery.md`), so the page watches the catalog **populate
+`progressive-discovery.md`), so the page watches the catalog **populate
 live** rather than waiting on a complete scan. `#212` (server-side progress
 logging) and the progressive-discovery freshness `health` fields are the
 **server-side signal**; this page is their **consumer**.
@@ -503,7 +503,7 @@ admin" action.
 - **Config model + schema:** `biopb-tensor-server/biopb_tensor_server/config.py`
   (`_CONSTRAINTS`, `load_config`, `parse_config`; new `save_config`) and
   `config_schema.py` (`build_config_schema`).
-- **Scan-progress signal:** `docs/progressive-discovery.md` and the Flight
+- **Scan-progress signal:** `progressive-discovery.md` and the Flight
   `health` action's freshness fields.
 - **The web app to extend (shell, routes, idioms):**
   `web/packages/app/src/` — `main.tsx` (routes `/viewer`, `/admin`, `/unlock`),
@@ -511,4 +511,4 @@ admin" action.
   `pages/AdminPage.tsx`, `pages/UnlockPage.tsx` (token gate + reveal field),
   `components/SourceTree.tsx` (read-only browse the editor mirrors), `store.ts`.
   (Now the top-level `web/` workspace, served by the control; see `web/README.md`.)
-- **The broader GUI design this implements:** `docs/remote-tensor-cache.md` §§7–8.
+- **The broader GUI design this implements:** `remote-tensor-cache.md` §§7–8.

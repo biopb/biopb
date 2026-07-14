@@ -102,7 +102,7 @@ local checkout/unpacked installer it reads the sibling `biopb-engine.ps1`; when
 run via `irm | iex` (no file on disk, `$PSScriptRoot` empty) it downloads the
 engine from `https://biopb.org/biopb-engine.ps1`. CI publishes the engine as a
 release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring how
-`install.ps1`/`install.sh` are already hosted (see `release-model.md`).
+`install.ps1`/`install.sh` are already hosted (see `../../docs/release-model.md`).
 
 **ExecutionPolicy: the engine is dot-sourced in-memory, never from a temp file.**
 `Resolve-EngineSource` returns the engine's *text* (local `Get-Content` or the

@@ -400,7 +400,7 @@ by special-casing only the add-only first scan and keeping reconcile idempotent.
   fields; the Directory Monitoring section describes progressive/streamed startup.
 - Root `development.md` (the root `CLAUDE.md` symlink target): the `health`
   `do_action` bullet notes progressive startup + the freshness fields.
-- `docs/progressive-discovery.md` Status flipped to "Implemented (Option B)" with
+- `progressive-discovery.md` Status flipped to "Implemented (Option B)" with
   a pointer to this plan.
 
 ---

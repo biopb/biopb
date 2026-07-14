@@ -349,7 +349,7 @@ editing the code.
   immediately and runs/streams its data-folder scan in the background, so
   `SERVING` no longer implies a complete catalog — `health` carries
   `full_scan_in_progress` / `last_full_scan_finished_at` as the freshness signal
-  (see `biopb-tensor-server/ARCHITECTURE.md` and `docs/progressive-discovery.md`).
+  (see `biopb-tensor-server/ARCHITECTURE.md` and `biopb-tensor-server/docs/progressive-discovery.md`).
 
 - **A tensor is identified by its `array_id` alone** — the policy every server,
   SDK (Python/Java/TS), and the CLI must follow. The authoritative spec lives in

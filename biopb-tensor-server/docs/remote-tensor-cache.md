@@ -6,8 +6,8 @@ segment-cache keys for proxied sources may change without notice; `biopb/biopb#1
 **Related:** `biopb/biopb#178` (shared segment cache for remote),
 `biopb/biopb#34` (config validation), `biopb/biopb#212` (startup-scan progress),
 the claim-based discovery framework, `CacheManager` / `ArrowFileBackend`, the
-localhost `chunk_locate` mmap fast path (`#9`), `docs/progressive-discovery.md`,
-`docs/cloud-storage-support.md`.
+localhost `chunk_locate` mmap fast path (`#9`), `progressive-discovery.md`,
+`cloud-storage-support.md`.
 
 ---
 
@@ -275,7 +275,7 @@ a new branch (reached from Case 0 for a `grpc*` url):
 2. `list_sources()` (or `get_descriptor` for the single-`source_id` form). For a
    large upstream catalog, prefer a `query_sources` page or the upstream's
    `list_flights` so this does not block startup — and **background it** the same
-   way `docs/progressive-discovery.md` backgrounds the local walk (the upstream
+   way `progressive-discovery.md` backgrounds the local walk (the upstream
    list is the network equivalent of a slow directory walk).
 3. Yield one concrete `SourceConfig` per upstream source, each with
    `type="tensor-server"`, `url="grpc://host:port/<upstream_source_id>"`, the
@@ -656,7 +656,7 @@ The restart then triggers the **startup discovery scan**, which on a large/cloud
 root can run for minutes with no output — `#212` measured **142 s of silence** and
 it "looks hung." The GUI must not reproduce that blind wait: after restart it
 **polls the `health` action and shows progress** using the freshness fields from
-`docs/progressive-discovery.md` — `full_scan_in_progress`,
+`progressive-discovery.md` — `full_scan_in_progress`,
 `last_full_scan_finished_at`, and the climbing `source_count` — turning the
 restart into a visible "scanning… N sources" state. `#212` (server-side progress
 logging) and progressive-discovery's backgrounded scan + freshness `health` fields
@@ -680,7 +680,7 @@ frontend later. See [§10](#10-open-questions--follow-ups).
 > integration reduced to a single "open admin" browser action rather than a Qt
 > form. The detailed design — routes, the detached-`biopb server restart`
 > self-restart, `save_config`, the same-origin auth guard, and the post-restart
-> scan-progress UX — lives in **`docs/tensor-server-admin-endpoint.md`**.
+> scan-progress UX — lives in **`tensor-server-admin-endpoint.md`**.
 
 ---
 
@@ -781,4 +781,4 @@ upstream and local+proxy add no new dispatch layer — they fall out of the flat
   `_config.py` (`_atomic_write_json`, the `_Config` singleton).
 - **Restart lever + startup-scan freshness:** `biopb server restart` in
   `biopb/cli.py`; the `health` action freshness fields in
-  `docs/progressive-discovery.md` (and `#212`).
+  `progressive-discovery.md` (and `#212`).
