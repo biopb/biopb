@@ -99,6 +99,15 @@ biopb-tensor-server = { workspace = true }
 biopb-mcp = { workspace = true }
 biopb-control = { workspace = true }
 
+[tool.uv]
+# Drop the transitive `cryptography` dep from the workspace closure (biopb#355).
+# The MCP SDK requires `pyjwt[crypto]` unconditionally, for asymmetric-JWT / OAuth
+# signing that biopb-mcp never exercises (we run over localhost stdio). Overriding
+# it back to plain `pyjwt` un-requests the `crypto` extra, so cryptography and its
+# cffi / Rust / OpenSSL build surface fall out of the resolved set. Keeps this
+# checkout's `uv sync` closure aligned with what install.sh ships via --overrides.
+override-dependencies = ["pyjwt>=2.10.1"]
+
 # ---------------------------------------------------------------------------
 # Single source of truth for Python lint + format across the whole monorepo.
 # ruff resolves config hierarchically, so this root [tool.ruff] applies to all

@@ -1085,17 +1085,19 @@ install_biopb() {
         --with-executables-from biopb-control
     )
 
-    # cryptography >= 49 dropped its universal2/x86_64 macOS wheel and now ships
-    # arm64 only, so on an Intel Mac uv finds no wheel and compiles the Rust/OpenSSL
-    # sdist -- which fails on a stock machine without OpenSSL dev headers. It reaches
-    # us purely transitively (mcp -> pyjwt[crypto]), so cap it below 49 on Intel macOS
-    # where uv then picks 48.x's universal2 wheel. arm64 macOS, Linux, and Windows all
-    # have a 49 wheel and are unaffected. Remove once cryptography ships an Intel-mac
-    # wheel again (or biopb-mcp's MCP dep drops the pyjwt crypto extra).
-    if [ "$PLATFORM" = "macOS" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
-        install_args+=(--with "cryptography<49")
-        _info "  pinning cryptography<49 (Intel macOS: 49 dropped its x86_64 wheel)"
-    fi
+    # biopb-mcp reaches `cryptography` only transitively, via the MCP SDK's
+    # unconditional `pyjwt[crypto]` -- asymmetric-JWT / OAuth signing we never use,
+    # since we run over localhost stdio. Override that dep back to plain `pyjwt` and
+    # cryptography (plus its cffi / Rust / OpenSSL build surface) falls out of the
+    # resolved closure entirely. That also retires the Intel-macOS wheel problem the
+    # old `cryptography<49` pin worked around: cryptography>=49 ships arm64-only macOS
+    # wheels, so an Intel Mac found no wheel and compiled the sdist -- failing on a
+    # stock machine without OpenSSL dev headers. Supersedes the Intel-mac pin from
+    # 024ca79 (biopb#355). Safe because pyjwt imports cryptography lazily, only for
+    # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine.
+    printf 'pyjwt>=2.10.1\n' > "$WHEELS_DIR/overrides.txt"
+    install_args+=(--overrides "$WHEELS_DIR/overrides.txt")
+    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override)"
 
     # Retire any running old-code MCP daemon before the new wheels land, so the
     # next agent reconnect brings up the just-installed code (the daemon is

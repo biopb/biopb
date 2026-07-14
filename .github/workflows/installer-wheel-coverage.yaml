@@ -27,7 +27,7 @@ jobs:
       matrix:
         # The platforms install.sh supports (uv --python-platform targets).
         target:
-          - x86_64-apple-darwin       # Intel macOS -- the cryptography-49 gap
+          - x86_64-apple-darwin       # Intel macOS -- surfaced the cryptography-49 gap (#355)
           - aarch64-apple-darwin      # Apple Silicon
           - x86_64-unknown-linux-gnu
           - x86_64-pc-windows-msvc
