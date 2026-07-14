@@ -461,4 +461,4 @@ editing the code.
 - **Browser front end:** `biopb/web/` — one Vite + React SPA served by the
   control. `packages/app/src/` (`main.tsx` routes; `pages/{HomePage,AdminPage,
   DashboardPage,ObservePage}.tsx`) and `packages/tensor-flight-client/` (the TS
-  data-plane SDK). See `web/README.md`.
+  data-plane SDK). See `web/README.md` and `web/ARCHITECTURE.md`.

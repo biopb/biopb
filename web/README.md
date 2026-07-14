@@ -6,6 +6,10 @@ is the single web origin: it serves this bundle at its root and proxies the data
 plane and each MCP session. There is no build-time namespacing — the app is
 always built with base `/`.
 
+For the front-end internals — the `@biopb/tensor-flight-client` data-plane SDK,
+axis mapping / `computeScaleHint`, the token/store model, and the slice-render
+data flow — see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Layout
 
 ```
