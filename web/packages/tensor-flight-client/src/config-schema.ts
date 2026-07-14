@@ -30,6 +30,10 @@ export interface SchemaProp {
    * pure prose (biopb config schema emits both). */
   constraint?: string;
   deprecated?: boolean;
+  /** Written but never read back (JSON Schema `writeOnly`). The server sets this
+   * on credential secrets it redacts from `GET /api/config`; the editor renders
+   * such fields as masked password inputs. */
+  writeOnly?: boolean;
   /** The dataclass default for this field (omitted when the default is null). */
   default?: unknown;
   required?: string[];
@@ -52,9 +56,6 @@ export type ConfigError = AdminConfigError;
  * field would silently delete the stored secret.
  */
 export const REDACTED_SENTINEL = "***REDACTED***";
-
-/** Secret profile keys that arrive masked and must round-trip to be preserved. */
-export const SECRET_PROFILE_KEYS = ["key", "secret", "token"] as const;
 
 /** The object-typed config sections we render structured editors for, in order. */
 export const ADVANCED_SECTIONS = [
@@ -105,8 +106,15 @@ export function credentialProfileRequired(
   return schema?.properties?.credentials?.properties?.profiles?.items?.required ?? [];
 }
 
-export function isSecretProfileKey(key: string): boolean {
-  return (SECRET_PROFILE_KEYS as readonly string[]).includes(key);
+/**
+ * Whether a credential-profile field holds a write-only secret — masked in
+ * `GET /api/config` and rendered as a password input by the editor. Read off the
+ * schema property's `writeOnly` flag (the server marks its secret props), so a
+ * new masked field is picked up automatically with no hardcoded key list here
+ * (biopb/biopb#252).
+ */
+export function isSecretProfileKey(prop: SchemaProp | undefined): boolean {
+  return prop?.writeOnly === true;
 }
 
 export function isDeprecated(prop: SchemaProp | undefined): boolean {

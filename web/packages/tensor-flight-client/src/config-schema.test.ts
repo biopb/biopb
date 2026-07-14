@@ -86,9 +86,10 @@ const SCHEMA: ConfigSchema = {
             properties: {
               name: { type: "string" },
               storage_type: { type: "string" },
-              key: { type: "string" },
-              secret: { type: "string" },
-              token: { type: "string" },
+              key: { type: "string", writeOnly: true },
+              secret: { type: "string", writeOnly: true },
+              token: { type: "string", writeOnly: true },
+              region: { type: "string" },
             },
           },
         },
@@ -270,13 +271,17 @@ describe("normalizeConfigForSave", () => {
 
 describe("credential helpers", () => {
   it("exposes profile props / required / secret keys", () => {
-    expect(Object.keys(credentialProfileProperties(SCHEMA))).toContain("secret");
+    const profileProps = credentialProfileProperties(SCHEMA);
+    expect(Object.keys(profileProps)).toContain("secret");
     expect(credentialProfileRequired(SCHEMA)).toEqual(["name"]);
-    expect(isSecretProfileKey("secret")).toBe(true);
-    expect(isSecretProfileKey("key")).toBe(true);
-    expect(isSecretProfileKey("token")).toBe(true);
-    expect(isSecretProfileKey("region")).toBe(false);
-    expect(isSecretProfileKey("name")).toBe(false);
+    // Secret masking is driven by the schema's `writeOnly` flag, not a hardcoded
+    // client key list (biopb/biopb#252).
+    expect(isSecretProfileKey(profileProps.secret)).toBe(true);
+    expect(isSecretProfileKey(profileProps.key)).toBe(true);
+    expect(isSecretProfileKey(profileProps.token)).toBe(true);
+    expect(isSecretProfileKey(profileProps.region)).toBe(false);
+    expect(isSecretProfileKey(profileProps.name)).toBe(false);
+    expect(isSecretProfileKey(undefined)).toBe(false);
   });
 });
 

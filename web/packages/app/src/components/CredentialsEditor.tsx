@@ -212,7 +212,7 @@ export function CredentialsEditor({
                     {orderedKeys
                       .filter((k) => k !== "name")
                       .map((key) => {
-                        const secret = isSecretProfileKey(key);
+                        const secret = isSecretProfileKey(props[key]);
                         const masked = secret && str(p[key]) === REDACTED_SENTINEL;
                         return (
                           <SchemaField
