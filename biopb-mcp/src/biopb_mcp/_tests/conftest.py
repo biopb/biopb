@@ -17,7 +17,7 @@ def _isolate_config(monkeypatch, tmp_path):
     1. *State leakage* -- the cache persists across tests, so a value loaded (or
        written) in one test would bleed into the next.
     2. *Non-hermeticity* -- call sites now hit ``CONFIG.get(...)``, whose first
-       access reads the developer's real ``~/.config/biopb-mcp/config.json``.
+       access reads the developer's real ``~/.config/biopb/mcp-config.json``.
 
     This autouse fixture points ``Path.home()`` at a per-test ``tmp_path`` (so an
     untouched config resolves to defaults) and invalidates the cache before and

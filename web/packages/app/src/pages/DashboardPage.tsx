@@ -206,6 +206,12 @@ export default function DashboardPage() {
         />
         <h1>BioPB control - dashboard</h1>
         <span id="conn">{conn}</span>
+        {/* biopb-mcp's own global settings (transport/kernel/dask/algorithm
+            servers), served by the control at /api/mcp_config. A top-level nav
+            link — it is neither a data-plane nor a per-session concern. */}
+        <a className="hdr-link" href="/mcp/admin" target="_blank" rel="noopener">
+          MCP Settings
+        </a>
         <button
           className="lock-btn"
           disabled={!hasToken}
@@ -474,6 +480,8 @@ const DASH_CSS = `
   .ctrl-dash h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a8;
        margin: 0 0 10px; }
   .ctrl-dash #conn { font-size: 12px; color: #9aa; margin-left: auto; }
+  .ctrl-dash a.hdr-link { font-size: 12px; color: #8bf; text-decoration: none; }
+  .ctrl-dash a.hdr-link:hover { text-decoration: underline; }
   .ctrl-dash main { padding: 16px; max-width: 760px; }
   .ctrl-dash .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
           background: #161616; }

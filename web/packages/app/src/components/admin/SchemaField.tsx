@@ -138,6 +138,77 @@ export function SchemaField({
         onChange={(e) => onChange(e.target.value === "" ? undefined : Number(e.target.value))}
       />
     );
+  } else if (type === "array") {
+    // Two array shapes: a fixed numeric vector (grid tile sizes -> one number
+    // input per element) and a variable string list (server / origin lists ->
+    // editable rows with add/remove). The item type comes from the schema; the
+    // starting value falls back to the schema default so an omitted key still
+    // renders its effective vector/list.
+    const itemType = prop.items ? primaryType(prop.items) : "string";
+    const arr: unknown[] = Array.isArray(value)
+      ? value
+      : Array.isArray(prop.default)
+        ? (prop.default as unknown[])
+        : [];
+    if (itemType === "integer" || itemType === "number") {
+      control = (
+        <span className="setting-field-vector">
+          {arr.map((el, i) => (
+            <input
+              key={i}
+              type="number"
+              value={el == null ? "" : String(el)}
+              disabled={disabled}
+              step={itemType === "integer" ? 1 : "any"}
+              className={cls}
+              onChange={(e) => {
+                const next = arr.slice();
+                next[i] = e.target.value === "" ? 0 : Number(e.target.value);
+                onChange(next);
+              }}
+            />
+          ))}
+        </span>
+      );
+    } else {
+      const list = arr.map((v) => (v == null ? "" : String(v)));
+      control = (
+        <span className="setting-field-list">
+          {list.map((el, i) => (
+            <span key={i} className="setting-field-list-row">
+              <input
+                type="text"
+                value={el}
+                disabled={disabled}
+                placeholder={placeholder}
+                onChange={(e) => {
+                  const next = list.slice();
+                  next[i] = e.target.value;
+                  onChange(next);
+                }}
+              />
+              <button
+                type="button"
+                className="icon-btn"
+                disabled={disabled}
+                aria-label="Remove"
+                onClick={() => onChange(list.filter((_, j) => j !== i))}
+              >
+                ✕
+              </button>
+            </span>
+          ))}
+          <button
+            type="button"
+            className="icon-btn setting-field-list-add"
+            disabled={disabled}
+            onClick={() => onChange([...list, ""])}
+          >
+            + Add
+          </button>
+        </span>
+      );
+    }
   } else {
     control = (
       <input
