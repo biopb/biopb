@@ -1,25 +1,30 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   credentialProfileProperties,
-  enumValues,
   fieldErrors,
   isSecretProfileKey,
   REDACTED_SENTINEL,
   type ConfigError,
   type ConfigSchema,
 } from "@biopb/tensor-flight-client";
+import { SchemaField } from "./admin/SchemaField";
 
 /**
  * Structured editor for the `credentials` block (remote-storage profiles that
- * `credentials_profile` on a source points at). Kept separate from the flat
- * AdvancedSections because credentials are a nested *array of profiles* with
- * masked secrets.
+ * `credentials_profile` on a source points at). Its own settings panel — a
+ * nested *array of profiles* with masked secrets, rendered directly (the panel
+ * shell owns the heading), no collapse.
  *
  * Secret fields (`key`/`secret`/`token`) arrive from `GET /api/config` as the
  * REDACTED_SENTINEL and are rendered as password inputs seeded with that mask;
  * `PUT /api/config` restores the stored secret only when the sentinel round-trips
  * verbatim, so an untouched secret is preserved and typing over it replaces it.
- * The whole section is collapsible and starts collapsed (advanced surface).
+ *
+ * A profile's `name` is set once, in the add-bar (typed before "+ Add profile"),
+ * and then shown as the block's static title — there is no rename field. This
+ * mirrors the Sources editor's fixed titles and sidesteps the masked-secret
+ * rename hazard (the server keys stored secrets by profile name, so a rename
+ * would silently drop them).
  */
 
 type Config = Record<string, unknown>;
@@ -66,17 +71,13 @@ export function CredentialsEditor({
   disabled,
   onChange,
 }: CredentialsEditorProps) {
+  // Name for the next profile, typed in the add-bar; a profile's name is fixed at
+  // creation (the block title is a static display), so there is no rename path —
+  // which also sidesteps the masked-secret rename hazard.
+  const [newName, setNewName] = useState("");
   const props = credentialProfileProperties(schema);
   const profiles = profilesOf(config);
-  // Section carries an error → force open (mirrors AdvancedSections).
-  const hasError = errors.some((e) => e.path[0] === "credentials");
-  const [userOpen, setUserOpen] = useState(false);
-  // Latch open on error so fixing it doesn't collapse the section mid-edit.
-  useEffect(() => {
-    if (hasError) setUserOpen(true);
-  }, [hasError]);
   if (!schema) return null;
-  const open = userOpen || hasError;
 
   const orderedKeys = [
     ...FIELD_ORDER.filter((k) => k in props),
@@ -114,8 +115,10 @@ export function CredentialsEditor({
   }
 
   function addProfile() {
-    setUserOpen(true);
-    commit([...profiles, { name: "", storage_type: "s3" }]);
+    const name = newName.trim();
+    if (!name) return;
+    commit([...profiles, { name, storage_type: "s3" }]);
+    setNewName("");
   }
 
   function removeProfile(i: number) {
@@ -131,24 +134,8 @@ export function CredentialsEditor({
   const currentDefault = str(credentials(config).default_profile);
 
   return (
-    <div className={`adv-section${hasError ? " has-error" : ""}`}>
-      <button
-        type="button"
-        className="adv-section-header"
-        aria-expanded={open}
-        onClick={() => setUserOpen(!open)}
-      >
-        <span className="adv-caret">{open ? "▾" : "▸"}</span>
-        <span className="adv-section-title">Credentials</span>
-        <span className="adv-section-hint">
-          {profiles.length} profile{profiles.length === 1 ? "" : "s"} for remote
-          storage
-        </span>
-        {hasError && <span className="adv-section-errdot" title="Has errors" />}
-      </button>
-
-      {open && (
-        <div className="adv-section-body creds-body">
+    <div className="creds-panel">
+      <div className="creds-body">
           <div className="creds-default">
             <label className="adv-field-label">
               <span className="adv-field-name">
@@ -172,6 +159,31 @@ export function CredentialsEditor({
             </label>
           </div>
 
+          <div className="creds-add-bar">
+            <input
+              className="creds-add-name"
+              type="text"
+              value={newName}
+              placeholder="profile name"
+              disabled={disabled}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addProfile();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={disabled || !newName.trim()}
+              onClick={addProfile}
+            >
+              + Add profile
+            </button>
+          </div>
+
           {profiles.length === 0 ? (
             <p className="adv-field-help">
               No credential profiles. Add one to give a remote source (S3 / GCS /
@@ -180,120 +192,62 @@ export function CredentialsEditor({
           ) : (
             <ul className="creds-rows">
               {profiles.map((p, i) => {
-                // The server restores masked secrets by matching profile *name*
-                // (restore_redacted_secrets), so renaming a profile that still
-                // carries a masked secret would silently drop it. Lock the name
-                // until the secrets are re-entered (or the profile has none).
-                const hasMaskedSecret = orderedKeys.some(
-                  (k) => isSecretProfileKey(k) && str(p[k]) === REDACTED_SENTINEL,
-                );
                 return (
-                <li key={i} className="creds-row">
-                  <div className="creds-row-grid">
-                    {orderedKeys.map((key) => {
-                      const secret = isSecretProfileKey(key);
-                      const locked = key === "name" && hasMaskedSecret;
-                      const errs = fieldErrors(errors, [
-                        "credentials",
-                        "profiles",
-                        i,
-                        key,
-                      ]);
-                      const invalid = errs.length > 0;
-                      const hardEnum = enumValues(props[key]);
-                      const value = str(p[key]);
-                      return (
-                        <label key={key} className="adv-field-label">
-                          <span className="adv-field-name">
-                            <code>{key}</code>
-                            {secret && <span className="secret-tag">secret</span>}
-                          </span>
-                          {hardEnum ? (
-                            <select
-                              value={value}
-                              disabled={disabled}
-                              className={invalid ? "invalid" : undefined}
-                              onChange={(e) =>
-                                updateProfile(
-                                  i,
-                                  key,
-                                  e.target.value === "" ? undefined : e.target.value,
-                                )
-                              }
-                            >
-                              <option value="">(unset)</option>
-                              {hardEnum
-                                .filter((v): v is string => typeof v === "string")
-                                .map((v) => (
-                                  <option key={v} value={v}>
-                                    {v}
-                                  </option>
-                                ))}
-                            </select>
-                          ) : (
-                            <input
-                              type={secret ? "password" : "text"}
-                              value={value}
-                              disabled={disabled || locked}
-                              autoComplete={secret ? "new-password" : "off"}
-                              placeholder={
-                                secret ? "(stored — leave to keep)" : undefined
-                              }
-                              className={invalid ? "invalid" : undefined}
-                              onChange={(e) =>
-                                updateProfile(
-                                  i,
-                                  key,
-                                  e.target.value === "" ? undefined : e.target.value,
-                                )
-                              }
-                            />
-                          )}
-                          {locked && (
-                            <span className="adv-field-help">
-                              Rename disabled — stored secrets are keyed by name.
-                              Clear a secret field to rename.
-                            </span>
-                          )}
-                          {secret && value === REDACTED_SENTINEL && (
-                            <span className="adv-field-help">
-                              Stored secret hidden — leave as-is to keep it.
-                            </span>
-                          )}
-                          {errs.map((m, k) => (
-                            <span key={k} className="adv-field-error">
-                              {m}
-                            </span>
-                          ))}
-                        </label>
-                      );
-                    })}
+                <li key={i} className="entry-row">
+                  <div className="entry-head">
+                    <span className="entry-title">
+                      {str(p.name) || "Unnamed profile"}
+                    </span>
+                    <button
+                      type="button"
+                      className="entry-delete"
+                      disabled={disabled}
+                      onClick={() => removeProfile(i)}
+                    >
+                      Delete
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="source-row-remove"
-                    title="Remove profile"
-                    disabled={disabled}
-                    onClick={() => removeProfile(i)}
-                  >
-                    ✕
-                  </button>
+                  <div className="entry-fields">
+                  <div className="creds-row-grid">
+                    {orderedKeys
+                      .filter((k) => k !== "name")
+                      .map((key) => {
+                        const secret = isSecretProfileKey(key);
+                        const masked = secret && str(p[key]) === REDACTED_SENTINEL;
+                        return (
+                          <SchemaField
+                            key={key}
+                            fieldKey={key}
+                            prop={props[key] ?? { type: "string" }}
+                            value={p[key]}
+                            errs={fieldErrors(errors, [
+                              "credentials",
+                              "profiles",
+                              i,
+                              key,
+                            ])}
+                            disabled={disabled}
+                            secret={secret}
+                            placeholder={
+                              secret ? "(stored — leave to keep)" : undefined
+                            }
+                            note={
+                              masked
+                                ? "Stored secret hidden — leave as-is to keep it."
+                                : undefined
+                            }
+                            onChange={(v) => updateProfile(i, key, v)}
+                          />
+                        );
+                      })}
+                  </div>
+                  </div>
                 </li>
                 );
               })}
             </ul>
           )}
-
-          <button
-            type="button"
-            className="icon-btn"
-            disabled={disabled}
-            onClick={addProfile}
-          >
-            + Add credential profile
-          </button>
-        </div>
-      )}
+      </div>
     </div>
   );
 }

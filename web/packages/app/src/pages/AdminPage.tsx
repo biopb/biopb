@@ -14,10 +14,17 @@ import type {
 import { useAppStore } from "../store";
 import { authHeaders, redirectToUnlock } from "../auth";
 import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
-import { AdvancedSections } from "../components/AdvancedSections";
 import { CredentialsEditor } from "../components/CredentialsEditor";
 import { Modal } from "../components/Modal";
-import { AdvancedJsonModal } from "../components/AdvancedJsonModal";
+import { AdminNav } from "../components/admin/AdminNav";
+import { SectionFields } from "../components/admin/SectionFields";
+import { RawJsonPanel } from "../components/admin/RawJsonPanel";
+import { FileBrowser } from "../components/admin/FileBrowser";
+import {
+  DEFAULT_ADMIN_NAV_ID,
+  navItemById,
+  navIdForErrorPath,
+} from "../components/admin/adminSections";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 type Config = Record<string, unknown>;
@@ -63,13 +70,15 @@ export function AdminPage() {
   useDocumentTitle("BioPB tensor - admin");
   const client = useAppStore((s) => s.client);
   const connectionState = useAppStore((s) => s.connectionState);
-  const clearSession = useAppStore((s) => s.clearSession);
 
   const [config, setConfig] = useState<Config | null>(null);
   const [schema, setSchema] = useState<ConfigSchema | null>(null);
   const [path, setPath] = useState<string>("");
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Selected settings section (left-nav) and the source row whose "Browse…"
+  // opened the server-side file chooser (biopb/biopb#244), if any.
+  const [activeSection, setActiveSection] = useState<string>(DEFAULT_ADMIN_NAV_ID);
+  const [browseRow, setBrowseRow] = useState<number | null>(null);
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -136,6 +145,18 @@ export function AdminPage() {
   );
   const hasErrors = combinedErrors.length > 0;
 
+  // Which nav sections currently carry an error, so the nav can dot them (Save is
+  // disabled while any error exists, and an errored field may sit on an inactive
+  // panel — the dot is how the user finds it).
+  const erroredNavIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const e of combinedErrors) {
+      const id = navIdForErrorPath(e.path);
+      if (id) ids.add(id);
+    }
+    return ids;
+  }, [combinedErrors]);
+
   const refreshStatus = useCallback(async () => {
     if (!client) return;
     try {
@@ -144,6 +165,16 @@ export function AdminPage() {
       /* admin status is best-effort for the header read-out */
     }
   }, [client]);
+
+  // Stable binding for the file chooser: FileBrowser's load effect depends on
+  // this, so an inline `(p) => client.http.browse(p)` (a fresh identity every
+  // render) would re-run the effect and reset the browser to its initial path on
+  // any AdminPage re-render. `client!` is safe — the modal only mounts past the
+  // `if (!client)` guard below. Bound to #244.
+  const browse = useCallback(
+    (p?: string) => client!.http.browse(p),
+    [client],
+  );
 
   // Initial load.
   useEffect(() => {
@@ -344,6 +375,10 @@ export function AdminPage() {
             : { cls: "connecting", text: "Loading…" };
 
   const sources = getSources(config);
+  const activeItem = navItemById(activeSection);
+  // Local mode ⇒ the server's filesystem is this machine, so the "Browse…" file
+  // chooser is safe to offer (biopb/biopb#244). Absent/false ⇒ typed path only.
+  const localMode = status?.local === true;
 
   return (
     <div className="app-shell admin-shell">
@@ -357,6 +392,18 @@ export function AdminPage() {
         <h1>BioPB tensor - admin</h1>
         <span className={`status-pill ${pill.cls}`}>{pill.text}</span>
         <div className="topbar-spacer" />
+        {dirty && !saved && !hasErrors && (
+          <span className="admin-hint">Unsaved changes</span>
+        )}
+        <button
+          type="button"
+          className="submit-btn topbar-save"
+          disabled={!dirty || saving || restarting || hasErrors}
+          onClick={onSave}
+          title={hasErrors ? "Fix the highlighted settings to save" : undefined}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
         <button
           type="button"
           className="icon-btn"
@@ -366,115 +413,141 @@ export function AdminPage() {
           {restartVerb}
         </button>
         <Link className="icon-btn" to="/viewer">
-          ← Back
+          Viewer
         </Link>
-        <button className="icon-btn" onClick={clearSession} title="Lock session">
-          Lock
-        </button>
       </header>
 
       <main className="app-main admin-main">
-        {loadError && (
-          <div className="admin-banner error">Could not load config: {loadError}</div>
-        )}
+        <AdminNav
+          active={activeSection}
+          erroredIds={erroredNavIds}
+          onSelect={setActiveSection}
+        />
 
-        {daemonDown && (
-          <div className="admin-banner degraded">
-            <strong>Server not running.</strong> The Flight server isn't serving
-            (the config file is still editable — Save, then <em>{restartVerb}</em>).
-            <button
-              type="button"
-              className="icon-btn"
-              disabled={restarting}
-              onClick={() => setConfirmRestart(true)}
-            >
-              {restartVerb} now
-            </button>
-          </div>
-        )}
+        <div className="admin-content">
+          {loadError && (
+            <div className="admin-banner error">Could not load config: {loadError}</div>
+          )}
 
-        {path && (
-          <div className="admin-config-path">
-            Editing <code>{path}</code>
-          </div>
-        )}
-
-        {serverGeneral.length > 0 && (
-          <div className="admin-banner error">
-            <strong>Config not saved — fix these:</strong>
-            <ul>
-              {serverGeneral.map((m, i) => (
-                <li key={i}>{m}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {saved && (
-          <div className="admin-banner saved">
-            Saved — {restartVerb.toLowerCase()} required to apply.
-            <button
-              type="button"
-              className="icon-btn"
-              disabled={restarting}
-              onClick={() => setConfirmRestart(true)}
-            >
-              {restartVerb} now
-            </button>
-          </div>
-        )}
-
-        {config && (
-          <>
-            <SourcesEditor
-              sources={sources}
-              onChange={onSourcesChange}
-              errorsByIndex={sourceErrors}
-              disabled={restarting}
-            />
-
-            <AdvancedSections
-              config={config}
-              schema={schema}
-              errors={combinedErrors}
-              disabled={restarting}
-              onChange={applyConfig}
-              onEditRaw={() => setAdvancedOpen(true)}
-            />
-
-            <CredentialsEditor
-              config={config}
-              schema={schema}
-              errors={combinedErrors}
-              disabled={restarting}
-              onChange={applyConfig}
-            />
-
-            <div className="admin-actions">
+          {daemonDown && (
+            <div className="admin-banner degraded">
+              <strong>Server not running.</strong> The Flight server isn't serving
+              (the config file is still editable — Save, then <em>{restartVerb}</em>).
               <button
                 type="button"
-                className="submit-btn"
-                disabled={!dirty || saving || restarting || hasErrors}
-                onClick={onSave}
+                className="icon-btn"
+                disabled={restarting}
+                onClick={() => setConfirmRestart(true)}
               >
-                {saving ? "Saving…" : "Save"}
+                {restartVerb} now
               </button>
-              {hasErrors ? (
-                <span className="admin-hint error">
-                  Fix the highlighted fields to enable Save.
-                </span>
-              ) : (
-                dirty &&
-                !saved && (
-                  <span className="admin-hint">
-                    Unsaved changes — {restartVerb.toLowerCase()} required to apply.
-                  </span>
-                )
-              )}
             </div>
-          </>
-        )}
+          )}
+
+          {serverGeneral.length > 0 && (
+            <div className="admin-banner error">
+              <strong>Config not saved — fix these:</strong>
+              <ul>
+                {serverGeneral.map((m, i) => (
+                  <li key={i}>{m}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {hasErrors && serverGeneral.length === 0 && (
+            <div className="admin-banner error">
+              Some settings need fixing — see the marked sections in the sidebar.
+            </div>
+          )}
+
+          {saved && (
+            <div className="admin-banner saved">
+              Saved — {restartVerb.toLowerCase()} required to apply.
+              <button
+                type="button"
+                className="icon-btn"
+                disabled={restarting}
+                onClick={() => setConfirmRestart(true)}
+              >
+                {restartVerb} now
+              </button>
+            </div>
+          )}
+
+          {config && (
+            <section className="admin-panel">
+              <div className="admin-panel-head">
+                <h2>{activeItem.label}</h2>
+                <p className="admin-panel-desc">{activeItem.description}</p>
+              </div>
+
+              {activeItem.kind === "sources" && (
+                <SourcesEditor
+                  sources={sources}
+                  onChange={onSourcesChange}
+                  schema={schema}
+                  errorsByIndex={sourceErrors}
+                  disabled={restarting}
+                  onBrowse={localMode ? (i) => setBrowseRow(i) : undefined}
+                />
+              )}
+
+              {activeItem.kind === "credentials" && (
+                <CredentialsEditor
+                  config={config}
+                  schema={schema}
+                  errors={combinedErrors}
+                  disabled={restarting}
+                  onChange={applyConfig}
+                />
+              )}
+
+              {activeItem.kind === "fields" && activeItem.section && (
+                <SectionFields
+                  section={activeItem.section}
+                  commonFields={activeItem.commonFields ?? []}
+                  config={config}
+                  schema={schema}
+                  errors={combinedErrors}
+                  disabled={restarting}
+                  onChange={applyConfig}
+                />
+              )}
+
+              {activeItem.kind === "raw" && (
+                <RawJsonPanel
+                  config={config}
+                  disabled={restarting}
+                  onApply={applyConfig}
+                />
+              )}
+            </section>
+          )}
+
+          {path && (
+            <div className="admin-config-path">
+              Editing <code>{path}</code>
+            </div>
+          )}
+        </div>
       </main>
+
+      {browseRow !== null && config && (
+        <FileBrowser
+          browse={browse}
+          initialPath={String(sources[browseRow]?.url ?? "")}
+          onPick={(picked) => {
+            onSourcesChange(
+              sources.map((s, idx) =>
+                idx === browseRow ? { ...s, url: picked } : s,
+              ),
+            );
+            setBrowseRow(null);
+          }}
+          onClose={() => setBrowseRow(null)}
+        />
+      )}
 
       {confirmRestart && (
         <Modal
@@ -496,14 +569,6 @@ export function AdminPage() {
             </button>
           </div>
         </Modal>
-      )}
-
-      {advancedOpen && config && (
-        <AdvancedJsonModal
-          config={config}
-          onApply={applyConfig}
-          onClose={() => setAdvancedOpen(false)}
-        />
       )}
 
       {saveError && (

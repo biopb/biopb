@@ -500,6 +500,11 @@ def _normalize_array(arr: np.ndarray) -> np.ndarray:
 
 _router = APIRouter()
 
+# Cap on entries returned from one /api/admin/browse listing, so a directory with
+# tens of thousands of files can't produce a giant payload; the chooser shows a
+# "truncated" note and the user navigates in rather than paginating.
+_BROWSE_MAX_ENTRIES = 2000
+
 
 # -- Health endpoints (unauthenticated) -------------------------------------
 
@@ -1319,6 +1324,11 @@ async def admin_status(request: Request) -> JSONResponse:
             # Control-owned: the admin UI must route a restart through the
             # control, not the sidecar self-restart (biopb/biopb#418).
             "supervised": ctx.supervised,
+            # Local mode ⇔ no token enforced (every listener loopback-bound, one
+            # machine). It is the single two-mode signal (biopb/biopb#447): the
+            # admin UI keys the local-only server-side file chooser (#244) off it,
+            # since in local mode the server's filesystem *is* the user's own box.
+            "local": ctx.token is None,
             "config_path": str(ctx.config_path) if ctx.config_path else None,
             "health": _h("status"),
             "source_count": _h("source_count"),
@@ -1326,6 +1336,78 @@ async def admin_status(request: Request) -> JSONResponse:
             "uptime_seconds": _h("uptime_seconds"),
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+        }
+    )
+
+
+@_router.get("/api/admin/browse")
+async def admin_browse(request: Request) -> JSONResponse:
+    """List a directory on the server's filesystem for the Sources file chooser.
+
+    Local-mode only (biopb/biopb#244): a browsable FS listing is an
+    info-disclosure surface, so it is served **only** when no token is enforced
+    — the two-mode signal (biopb/biopb#447) for a loopback-bound, single-machine
+    deployment where the server's filesystem *is* the user's own box. In remote
+    mode it 404s (feature absent), matching how the admin UI hides the "Browse…"
+    button unless ``/api/admin/status`` reports ``local``.
+
+    Returns ``{path, parent, entries: [{name, is_dir}], truncated}``. No path (or
+    a blank one) starts at the server user's home directory; a path that is a file
+    resolves to its containing directory so the chooser can navigate from it. One
+    unreadable entry never fails the whole listing.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)  # no-op in local mode; guards a misconfigured caller
+    if ctx.token is not None:
+        # Remote mode: never expose the server's filesystem to a remote browser.
+        raise HTTPException(
+            status_code=404, detail="File browsing is available only in local mode"
+        )
+
+    from pathlib import Path
+
+    raw = request.query_params.get("path") or ""
+    try:
+        base = (Path(raw).expanduser() if raw else Path.home()).resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Bad path: {e}")
+
+    # A file selection resolves to its parent so the chooser keeps navigating.
+    try:
+        directory = base if base.is_dir() else base.parent
+        if not directory.is_dir():
+            raise HTTPException(status_code=404, detail="Not a directory")
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot access path: {e}")
+
+    entries: List[Dict[str, Any]] = []
+    truncated = False
+    try:
+        with os.scandir(directory) as it:
+            for de in it:
+                try:
+                    is_dir = de.is_dir(follow_symlinks=True)
+                except OSError:
+                    is_dir = False  # broken symlink / race: list it as a file
+                entries.append({"name": de.name, "is_dir": is_dir})
+                if len(entries) >= _BROWSE_MAX_ENTRIES:
+                    truncated = True
+                    break
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Permission denied")
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot list directory: {e}")
+
+    # Directories first, then files; each ordered case-insensitively by name.
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+
+    parent = str(directory.parent) if directory.parent != directory else None
+    return JSONResponse(
+        {
+            "path": str(directory),
+            "parent": parent,
+            "entries": entries,
+            "truncated": truncated,
         }
     )
 

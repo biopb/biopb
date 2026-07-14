@@ -116,9 +116,10 @@ def test_every_constraint_is_reflected(schema):
                     assert "maximum" not in prop
             elif isinstance(constraint, _Enum):
                 if constraint.case_insensitive:
-                    # Lenient: no hard enum, but the accepted set is documented.
+                    # Lenient: no hard enum, but the accepted set is documented in
+                    # the `constraint` hint (description is now pure prose).
                     assert "enum" not in prop
-                    assert prop.get("description")
+                    assert prop.get("constraint")
                 else:
                     assert set(prop["enum"]) == set(constraint._display)
 

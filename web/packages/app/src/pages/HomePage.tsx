@@ -10,7 +10,6 @@ export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
-  const clearSession = useAppStore((s) => s.clearSession);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
 
@@ -37,9 +36,6 @@ export function HomePage() {
         <Link className="icon-btn" to="/admin" title="Server admin">
           ⚙ Admin
         </Link>
-        <button className="icon-btn" onClick={clearSession} title="Lock session">
-          Lock
-        </button>
       </header>
 
       <aside className="app-sidebar">

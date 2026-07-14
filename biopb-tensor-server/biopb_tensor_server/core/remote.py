@@ -27,23 +27,36 @@ logger = logging.getLogger(__name__)
 class CredentialProfile:
     """Named credential profile for remote storage.
 
-    Attributes:
-        name: Profile name (e.g., "aws-prod", "gcs-shared")
-        storage_type: Storage type - "s3", "gs", "http", "azure"
-        key: Access key (AWS: access_key_id)
-        secret: Secret key (AWS: secret_access_key)
-        region: Region (S3: us-east-1)
-        token: Session token (for temporary credentials) or service account JSON path (GCS)
-        endpoint_url: Custom endpoint (for S3-compatible storage like MinIO)
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
     """
 
-    name: str
-    storage_type: str
-    key: Optional[str] = None
-    secret: Optional[str] = None
-    region: Optional[str] = None
-    token: Optional[str] = None
-    endpoint_url: Optional[str] = None
+    name: str = field(
+        metadata={"help": "Profile name a source references via credentials_profile."}
+    )
+    storage_type: str = field(
+        metadata={"help": "Remote storage backend (s3, gs, http, azure)."}
+    )
+    key: Optional[str] = field(
+        default=None, metadata={"help": "Access key (AWS: access_key_id)."}
+    )
+    secret: Optional[str] = field(
+        default=None, metadata={"help": "Secret key (AWS: secret_access_key)."}
+    )
+    region: Optional[str] = field(
+        default=None, metadata={"help": "Region (e.g. S3 us-east-1)."}
+    )
+    token: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Session token (temporary credentials) or GCS service-account "
+            "JSON path."
+        },
+    )
+    endpoint_url: Optional[str] = field(
+        default=None,
+        metadata={"help": "Custom endpoint for S3-compatible storage (e.g. MinIO)."},
+    )
 
     def to_storage_options(self) -> Dict[str, Any]:
         """Convert profile to fsspec storage_options dict.

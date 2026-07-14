@@ -120,9 +120,9 @@ def _empty_section() -> Dict[str, Any]:
     return {"type": "object", "additionalProperties": True, "properties": {}}
 
 
-def _scalar_property(class_name: str, field: str) -> Dict[str, Any]:
+def _scalar_property(class_name: str, f: dataclasses.Field) -> Dict[str, Any]:
     inst = _DEFAULT_INSTANCES[class_name]
-    value = getattr(inst, field)
+    value = getattr(inst, f.name)
     prop: Dict[str, Any] = {"type": _json_type(value)}
     # The dataclass default, so a config editor can render the effective value of
     # an omitted key (e.g. show a default-true boolean checked) and only write a
@@ -134,13 +134,20 @@ def _scalar_property(class_name: str, field: str) -> Dict[str, Any]:
         prop["default"] = (
             value if isinstance(value, (bool, int, float, str)) else str(value)
         )
-    constraint = _CONSTRAINTS.get(class_name, {}).get(field)
+    # `description` is prose, sourced from the field's metadata["help"] -- the
+    # single source of truth (the dataclass field), so there is no second doc
+    # table here to drift from config.py.
+    help_text = f.metadata.get("help")
+    if help_text:
+        prop["description"] = help_text
+    constraint = _CONSTRAINTS.get(class_name, {}).get(f.name)
     if constraint is not None:
         prop.update(constraint.to_json_schema())
-        # describe() carries the rule (and, for case-insensitive enums where
-        # to_json_schema() emits nothing, the accepted set) so the description
-        # is useful for autocomplete even when validation stays lenient.
-        prop["description"] = constraint.describe()
+        # The validation rule (bounds + accepted values -- incl. the
+        # case-insensitive enum sets the schema keeps out of `enum`) rides its
+        # own `constraint` key, so `description` stays pure prose. A config editor
+        # renders it as a secondary hint under the description.
+        prop["constraint"] = constraint.describe()
     return prop
 
 
@@ -159,60 +166,36 @@ def _source_type_enum() -> Optional[list]:
 
 
 def _sources_schema() -> Dict[str, Any]:
-    # Curated, but enumerates every public SourceConfig field (asserted by the
-    # drift-guard test) plus the deprecated `path` alias.
+    # Curated shape, but every field's prose comes from SourceConfig's
+    # metadata["help"] (the single source), so it can't drift from config.py.
+    # Enumerates every public SourceConfig field (asserted by the drift-guard
+    # test) plus the deprecated `path` alias.
+    help_by = {
+        f.name: f.metadata.get("help", "") for f in dataclasses.fields(SourceConfig)
+    }
+
+    def _prop(name: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+        p = dict(extra)
+        h = help_by.get(name)
+        if h:
+            p["description"] = h
+        return p
+
     item: Dict[str, Any] = {
         "type": "object",
         "required": ["url"],
         "additionalProperties": True,
         "properties": {
-            "url": {
-                "type": "string",
-                "description": (
-                    "Path or URL to the data source. Local paths are stable; "
-                    "remote URLs (s3://, http(s)://, grpc://) are experimental."
-                ),
-            },
-            "source_id": {
-                "type": "string",
-                "description": (
-                    "Deprecated and ignored: a source's id is derived from its "
-                    "resolved URL so the same data always maps to one catalog "
-                    "entry (biopb/biopb#308). Use `alias` for a display name."
-                ),
-                "deprecated": True,
-            },
-            "dataset": {"type": "string", "description": "HDF5 dataset path."},
-            "dim_labels": {"type": "array", "items": {"type": "string"}},
-            "monitor": {
-                "type": "boolean",
-                "description": "Watch this local directory for add/delete events.",
-            },
-            "cloud": {
-                "type": "boolean",
-                "description": (
-                    "(experimental) Treat as a cloud/synced root; admit offline "
-                    "placeholders resolved lazily on first access."
-                ),
-            },
-            "credentials_profile": {
-                "type": "string",
-                "description": (
-                    "(experimental) Credential profile for a remote-URL source "
-                    "(s3://, http(s)://, ...)."
-                ),
-            },
-            "alias": {
-                "type": "string",
-                "description": (
-                    "(experimental) The name this source shows up under. For a "
-                    "'tensor-server' upstream: a namespace prefix "
-                    "(<alias>__<upstream_source_id>). For a local file/directory "
-                    "source: its catalog tree root (each source under a configured "
-                    "folder is re-rooted beneath it), ignored with a warning on a "
-                    "monitored directory. Must be slash-free."
-                ),
-            },
+            "url": _prop("url", {"type": "string"}),
+            "source_id": _prop("source_id", {"type": "string", "deprecated": True}),
+            "dataset": _prop("dataset", {"type": "string"}),
+            "dim_labels": _prop(
+                "dim_labels", {"type": "array", "items": {"type": "string"}}
+            ),
+            "monitor": _prop("monitor", {"type": "boolean"}),
+            "cloud": _prop("cloud", {"type": "boolean"}),
+            "credentials_profile": _prop("credentials_profile", {"type": "string"}),
+            "alias": _prop("alias", {"type": "string"}),
             "path": {
                 "type": "string",
                 "description": "Deprecated alias for url.",
@@ -221,13 +204,7 @@ def _sources_schema() -> Dict[str, Any]:
         },
     }
     type_enum = _source_type_enum()
-    type_prop: Dict[str, Any] = {
-        "type": ["string", "null"],
-        "description": (
-            "Storage type; auto-detected for local files when omitted. "
-            "('tensor-server' is experimental.)"
-        ),
-    }
+    type_prop: Dict[str, Any] = _prop("type", {"type": ["string", "null"]})
     if type_enum:
         type_prop["enum"] = list(type_enum) + [None]
     item["properties"]["type"] = type_prop
@@ -235,10 +212,15 @@ def _sources_schema() -> Dict[str, Any]:
 
 
 def _credentials_schema() -> Dict[str, Any]:
-    # Profile keys come from the CredentialProfile dataclass (all string-valued).
-    profile_props = {
-        f.name: {"type": "string"} for f in dataclasses.fields(CredentialProfile)
-    }
+    # Profile keys + their prose come from the CredentialProfile dataclass (all
+    # string-valued; description from each field's metadata["help"]).
+    profile_props: Dict[str, Any] = {}
+    for f in dataclasses.fields(CredentialProfile):
+        p: Dict[str, Any] = {"type": "string"}
+        h = f.metadata.get("help")
+        if h:
+            p["description"] = h
+        profile_props[f.name] = p
     return {
         "type": "object",
         "additionalProperties": True,
@@ -281,7 +263,7 @@ def build_config_schema() -> Dict[str, Any]:
                 continue  # a nested section, handled on its own pass
             section, key = ondisk_location(cname, f.name)
             sect = sections.setdefault(section, _empty_section())
-            sect["properties"][key] = _scalar_property(cname, f.name)
+            sect["properties"][key] = _scalar_property(cname, f)
 
     # 2. Deprecated scalar aliases that aren't dataclass fields.
     for section, aliases in _DEPRECATED_ALIASES.items():

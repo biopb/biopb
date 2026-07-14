@@ -1122,6 +1122,9 @@ class TestAdminStatusRoute:
         assert body["config_path"] == str(config_path)
         assert isinstance(body["pid"], int)
         assert body["version"]
+        # No token enforced ⇒ local mode; the admin UI keys the file chooser off
+        # this (biopb/biopb#244).
+        assert body["local"] is True
 
     def test_status_reports_not_supervised_by_default(self, admin_client):
         # A directly-launched `biopb server start` is not control-owned, so its
@@ -1134,6 +1137,96 @@ class TestAdminStatusRoute:
     ):
         tc, _ = supervised_admin_client
         assert tc.get("/api/admin/status").json()["supervised"] is True
+
+    def test_status_reports_not_local_when_token_enforced(self, tmp_path):
+        # A token means remote mode; the admin UI then hides the file chooser.
+        config_path = tmp_path / "biopb.json"
+        config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
+        mock_fc = _build_mock_client()
+        mock_fc.health_check.return_value = {"status": "SERVING", "source_count": 1}
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN, config_path=str(config_path))
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                assert (
+                    tc.get("/api/admin/status", headers=_bearer(_TOKEN)).json()["local"]
+                    is False
+                )
+
+
+class TestAdminBrowseRoute:
+    def test_browse_lists_dirs_first_then_files(self, admin_client, tmp_path):
+        tc, _ = admin_client
+        base = tmp_path / "data"
+        (base / "sub_b").mkdir(parents=True)
+        (base / "sub_a").mkdir()
+        (base / "img.tif").write_text("x")
+        (base / "notes.txt").write_text("y")
+        r = tc.get("/api/admin/browse", params={"path": str(base)})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["path"] == str(base.resolve())
+        assert body["parent"] == str(base.resolve().parent)
+        assert body["truncated"] is False
+        names = [(e["name"], e["is_dir"]) for e in body["entries"]]
+        # Directories first (case-insensitive), then files.
+        assert names == [
+            ("sub_a", True),
+            ("sub_b", True),
+            ("img.tif", False),
+            ("notes.txt", False),
+        ]
+
+    def test_browse_file_path_resolves_to_parent_dir(self, admin_client, tmp_path):
+        tc, _ = admin_client
+        f = tmp_path / "experiment.zarr"
+        f.mkdir()
+        (tmp_path / "peer.txt").write_text("z")
+        # A typed *file* selection lists its containing directory so the chooser
+        # keeps navigating instead of erroring.
+        target = tmp_path / "peer.txt"
+        r = tc.get("/api/admin/browse", params={"path": str(target)})
+        assert r.status_code == 200
+        assert r.json()["path"] == str(tmp_path.resolve())
+        assert "experiment.zarr" in {e["name"] for e in r.json()["entries"]}
+
+    def test_browse_defaults_to_home_when_no_path(self, admin_client):
+        from pathlib import Path
+
+        tc, _ = admin_client
+        r = tc.get("/api/admin/browse")
+        assert r.status_code == 200
+        assert r.json()["path"] == str(Path.home().resolve())
+
+    def test_browse_missing_dir_404(self, admin_client, tmp_path):
+        tc, _ = admin_client
+        r = tc.get(
+            "/api/admin/browse",
+            params={"path": str(tmp_path / "does" / "not" / "exist")},
+        )
+        # A non-existent path resolves to a non-existent parent → not a directory.
+        assert r.status_code == 404
+
+    def test_browse_unavailable_in_remote_mode(self, tmp_path):
+        # Remote mode (token enforced): the FS-listing surface must not exist.
+        config_path = tmp_path / "biopb.json"
+        config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
+        mock_fc = _build_mock_client()
+        mock_fc.health_check.return_value = {"status": "SERVING"}
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN, config_path=str(config_path))
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.get(
+                    "/api/admin/browse",
+                    params={"path": str(tmp_path)},
+                    headers=_bearer(_TOKEN),
+                )
+                assert r.status_code == 404
 
 
 class TestAdminRestartRoute:

@@ -15,6 +15,7 @@ import type {
   AdminConfigResponse,
   AdminConfigSaveResult,
   AdminStatus,
+  BrowseResponse,
   DataSourceDescriptor,
   DiagnosticsSnapshot,
   QuerySourcesResult,
@@ -303,6 +304,23 @@ export class TensorHttpClient {
   async getAdminStatus(): Promise<AdminStatus> {
     return this.fetchJson<AdminStatus>(
       "/api/admin/status",
+      undefined,
+      this.metadataTimeoutMs,
+    );
+  }
+
+  /**
+   * List one directory of the server's filesystem (`GET /api/admin/browse`).
+   *
+   * Local-mode only (biopb/biopb#244): in remote mode the server returns 404 and
+   * `fetchJson` throws a {@link TensorApiError}. Callers gate the UI on
+   * {@link AdminStatus.local} so this is only invoked when available. A blank
+   * `path` starts at the server user's home directory.
+   */
+  async browse(path?: string): Promise<BrowseResponse> {
+    const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+    return this.fetchJson<BrowseResponse>(
+      `/api/admin/browse${qs}`,
       undefined,
       this.metadataTimeoutMs,
     );

@@ -114,15 +114,47 @@ html, body {
 .status-pill.restarting { background: #422006; color: #fcd34d; }
 .status-pill.scanning { background: #1e3a5f; color: #93c5fd; }
 
-/* --- Admin page ------------------------------------------------------------ */
+/* --- Admin page (fixed settings layout: left nav + content panel) ---------- */
 .admin-shell { grid-template-columns: 1fr; }
 .admin-main {
-  display: flex; flex-direction: column; gap: 1rem;
-  padding: 1.25rem; overflow-y: auto;
+  display: flex; flex-direction: row; overflow: hidden; min-height: 0;
 }
 .topbar-spacer { flex: 1; }
-.admin-config-path { font-size: 12px; color: #94a3b8; }
-.admin-config-path code { color: #cbd5e1; }
+.topbar-save { width: auto; padding: 5px 16px; }
+.admin-hint { font-size: 12px; color: #94a3b8; }
+.admin-hint.error { color: #fca5a5; }
+
+/* Left navigation */
+.admin-nav {
+  width: 220px; flex-shrink: 0; overflow-y: auto;
+  background: #141820; border-right: 1px solid #2d3748;
+  padding: 0.75rem 0.6rem; display: flex; flex-direction: column; gap: 2px;
+}
+.admin-nav-item {
+  display: flex; align-items: center; gap: 0.5rem;
+  background: none; border: none; border-radius: 6px; cursor: pointer;
+  color: #94a3b8; font-size: 13px; text-align: left;
+  padding: 0.5rem 0.7rem; width: 100%;
+}
+.admin-nav-item:hover { background: #1e2435; color: #e2e8f0; }
+.admin-nav-item.active { background: #2a3347; color: #60a5fa; font-weight: 500; }
+.admin-nav-label { flex: 1; }
+.admin-nav-errdot {
+  width: 8px; height: 8px; border-radius: 999px; background: #dc2626; flex-shrink: 0;
+}
+
+/* Content column */
+.admin-content {
+  flex: 1; overflow-y: auto; min-width: 0;
+  padding: 1.25rem 1.5rem; display: flex; flex-direction: column; gap: 1rem;
+}
+.admin-panel { display: flex; flex-direction: column; gap: 1rem; max-width: 900px; }
+.admin-panel-head { display: flex; flex-direction: column; gap: 0.35rem; }
+.admin-panel-head h2 { font-size: 1.15rem; font-weight: 600; margin: 0; }
+.admin-panel-desc { font-size: 13px; color: #94a3b8; line-height: 1.5; margin: 0; max-width: 640px; }
+
+.admin-config-path { font-size: 12px; color: #64748b; margin-top: auto; padding-top: 0.5rem; }
+.admin-config-path code { color: #94a3b8; }
 
 .admin-banner {
   border-radius: 8px; padding: 0.7rem 1rem; font-size: 13px;
@@ -132,13 +164,22 @@ html, body {
 .admin-banner.error { background: #450a0a; color: #fca5a5; border: 1px solid #dc2626; }
 .admin-banner ul { margin: 0.25rem 0 0; padding-left: 1.1rem; }
 
-.sources-editor-head {
-  display: flex; align-items: center; justify-content: space-between;
+/* Add-bar (+ Add …) sits at the top of the Sources / Credentials list, with a
+ * divider beneath separating it from the entries. */
+.sources-editor-head, .creds-add-bar {
+  display: flex; align-items: center; gap: 0.5rem;
+  border-bottom: 1px solid #2d3748; padding-bottom: 0.85rem; margin-bottom: 0.85rem;
 }
+/* Name for a new credential profile, typed before the + Add profile button. */
+.creds-add-name {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 240px; max-width: 60%;
+}
+.creds-add-name:focus { border-color: #3b82f6; outline: none; }
 .sources-editor-head h2 { font-size: 14px; margin: 0; }
 .add-menu { position: relative; }
 .add-menu-list {
-  position: absolute; right: 0; top: 110%; z-index: 20;
+  position: absolute; left: 0; top: 110%; z-index: 20;
   background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px;
   display: flex; flex-direction: column; min-width: 220px; overflow: hidden;
 }
@@ -154,26 +195,26 @@ html, body {
 }
 .sources-empty .submit-btn { width: auto; margin-top: 0.5rem; padding: 0.5rem 1rem; }
 
-.source-rows { list-style: none; margin: 0.5rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
-.source-row {
-  position: relative; background: #141820; border: 1px solid #2d3748;
-  border-radius: 8px; padding: 0.75rem 2.25rem 0.75rem 0.85rem;
+/* List-item entries (a source or a credential profile): no bounding box — a
+ * title + a text Delete button, with the entry's keys indented below. */
+.source-rows, .creds-rows {
+  list-style: none; margin: 0.25rem 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 1.25rem;
 }
-.source-row.has-error { border-color: #dc2626; }
-.source-row-grid {
-  display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 0.6rem 0.85rem; align-items: end;
+.entry-row { display: flex; flex-direction: column; gap: 0.6rem; }
+.entry-row + .entry-row { border-top: 1px solid #242b3b; padding-top: 1.25rem; }
+.entry-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.entry-title { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+.entry-row.has-error .entry-title { color: #fca5a5; }
+.entry-delete {
+  background: none; border: none; color: #94a3b8; cursor: pointer;
+  font-size: 12px; padding: 2px 6px; border-radius: 4px;
 }
-.source-row-grid label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 11px; color: #94a3b8; }
-.source-row-grid input[type="text"], .source-row-grid select {
-  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
-  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
-}
-.source-row-monitor { flex-direction: row !important; align-items: center; gap: 0.4rem !important; grid-column: 1 / -1; }
-.source-row-remove {
-  position: absolute; top: 0.5rem; right: 0.5rem;
-  background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px;
-}
-.source-row-remove:hover { color: #fca5a5; }
+.entry-delete:hover:not(:disabled) { color: #fca5a5; text-decoration: underline; }
+.entry-delete:disabled { color: #475569; cursor: default; }
+.entry-fields { padding-left: 0.9rem; border-left: 2px solid #2d3748; }
+/* Source entry fields are SchemaField (.setting-field); this only stacks them. */
+.source-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
 .source-row-errors { margin: 0.5rem 0 0; padding-left: 1.1rem; color: #fca5a5; font-size: 12px; }
 
 .admin-banner.degraded { background: #422006; color: #fcd34d; border: 1px solid #b45309; }
@@ -216,16 +257,6 @@ html, body {
   font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
   background: #422006; color: #fcd34d; border-radius: 4px; padding: 1px 5px;
 }
-.source-row-deprecated {
-  grid-column: 1 / -1; display: flex; flex-direction: column; gap: 0.25rem;
-  font-size: 11px; color: #94a3b8;
-}
-.source-row-deprecated input[type="text"] {
-  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
-  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
-}
-.source-row-deprecated .adv-field-help code { color: #cbd5e1; }
-
 /* Credentials editor (nested profiles array with masked secrets). */
 .creds-body { display: flex !important; flex-direction: column; gap: 0.85rem; }
 .creds-default { max-width: 260px; }
@@ -233,21 +264,8 @@ html, body {
   background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
   color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
 }
-.creds-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
-.creds-row {
-  position: relative; background: #0f1117; border: 1px solid #2d3748;
-  border-radius: 8px; padding: 0.75rem 2.25rem 0.75rem 0.85rem;
-}
-.creds-row-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.6rem 0.85rem;
-}
-.creds-row .adv-field-label input, .creds-row .adv-field-label select {
-  background: #141820; border: 1px solid #2d3748; border-radius: 6px;
-  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
-}
-.creds-row .adv-field-label input.invalid, .creds-row .adv-field-label select.invalid {
-  border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626;
-}
+/* Credential profile fields are SchemaField (.setting-field); this stacks them. */
+.creds-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
 .secret-tag {
   font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
   background: #1e3a5f; color: #93c5fd; border-radius: 4px; padding: 1px 5px;
@@ -261,10 +279,77 @@ html, body {
 }
 .admin-raw.invalid { border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626; }
 
-.admin-actions { display: flex; align-items: center; gap: 0.85rem; }
-.admin-actions .submit-btn { width: auto; padding: 0.5rem 1.4rem; }
-.admin-hint { font-size: 12px; color: #94a3b8; }
-.admin-hint.error { color: #fca5a5; }
+/* Section field editor (common/advanced split). Fields stack vertically, one per
+ * row, with the control at a readable width (settings-page style). */
+.section-fields { display: flex; flex-direction: column; gap: 1.1rem; }
+.section-field-grid { display: flex; flex-direction: column; gap: 1.1rem; }
+.setting-field { display: flex; flex-direction: column; gap: 0.3rem; max-width: 520px; }
+.setting-field-label { display: flex; flex-direction: column; gap: 0.35rem; }
+.setting-field-name { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+.setting-field-title { font-size: 13px; font-weight: 500; color: #e2e8f0; }
+.setting-field-name code { font-size: 11px; color: #64748b; }
+.setting-field-label input[type="text"], .setting-field-label input[type="number"],
+.setting-field-label select {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
+}
+.setting-field-label input.invalid, .setting-field-label select.invalid {
+  border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626;
+}
+/* Booleans read as a labelled checkbox row, not a stacked field. */
+.setting-field-bool .setting-field-label { flex-direction: row; align-items: center; gap: 0.6rem; }
+.setting-field-bool .setting-field-name { order: 2; }
+.setting-field-bool input[type="checkbox"] { order: 1; width: 15px; height: 15px; accent-color: #4f8ef7; }
+.setting-field-help { margin: 0; font-size: 11px; color: #64748b; line-height: 1.45; }
+/* Validation-rule hint (min/max, accepted values) under the prose description. */
+.setting-field-constraint { margin: 0; font-size: 11px; color: #52607a; font-style: italic; }
+.setting-field-error { margin: 0; font-size: 11px; color: #fca5a5; }
+/* A control paired with an inline affordance (e.g. a path input + Browse…). */
+.setting-field-control-row { display: flex; gap: 0.4rem; align-items: stretch; }
+.setting-field-control-row > input { flex: 1; min-width: 0; }
+.setting-field-control-row > .icon-btn { flex-shrink: 0; white-space: nowrap; }
+
+.section-advanced { border-top: 1px solid #2d3748; padding-top: 0.85rem; }
+.section-advanced-toggle {
+  display: flex; align-items: center; gap: 0.5rem; width: 100%;
+  background: none; border: none; cursor: pointer; color: #cbd5e1;
+  font-size: 13px; padding: 0.15rem 0; text-align: left;
+}
+.section-advanced-hint { color: #64748b; font-size: 11px; flex: 1; }
+.section-advanced-body { margin-top: 0.85rem; }
+
+/* Raw JSON panel */
+.raw-json-panel { display: flex; flex-direction: column; }
+.raw-json-panel .admin-raw { min-height: 380px; }
+.raw-json-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.raw-json-actions .submit-btn, .raw-json-actions .icon-btn { width: auto; padding: 0.45rem 1.1rem; }
+
+/* Credentials panel */
+.creds-panel { display: flex; flex-direction: column; }
+
+/* File browser modal (server-side chooser, local mode only) */
+.file-browser { display: flex; flex-direction: column; gap: 0.75rem; }
+.file-browser-bar { display: flex; align-items: center; gap: 0.6rem; }
+.file-browser-path {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #cbd5e1; font-size: 12px; padding: 0.4rem 0.55rem;
+}
+.file-browser-list {
+  list-style: none; margin: 0; padding: 0; overflow-y: auto;
+  height: 46vh; border: 1px solid #2d3748; border-radius: 8px; background: #0f1117;
+}
+.file-browser-entry {
+  display: flex; align-items: center; gap: 0.55rem; width: 100%;
+  background: none; border: none; cursor: pointer; color: #94a3b8;
+  font-size: 13px; padding: 0.4rem 0.7rem; text-align: left;
+}
+.file-browser-entry:hover { background: #1e2435; color: #e2e8f0; }
+.file-browser-entry.is-dir { color: #cbd5e1; }
+.file-browser-icon { flex-shrink: 0; }
+.file-browser-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-browser-empty { padding: 0.6rem 0.7rem; color: #64748b; font-size: 13px; }
+.file-browser-note { margin: 0; font-size: 11px; color: #64748b; }
 
 .admin-modal-backdrop {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);

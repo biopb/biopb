@@ -296,54 +296,29 @@ class SourceConfig:
     A source may contain multiple tensors (multifield support) - the adapter
     handles tensor enumeration via list_tensor_descriptors() at runtime.
 
-    Remote/cloud source features are EXPERIMENTAL (marked below): remote URLs,
-    ``cloud = true`` synced-folder roots, the ``tensor-server`` proxy type, its
-    ``alias``, and ``credentials_profile``. Local-file sources are stable.
+    Remote/cloud source features are EXPERIMENTAL: remote URLs, ``cloud = true``
+    synced-folder roots, the ``tensor-server`` proxy type, its ``alias``, and
+    ``credentials_profile``. Local-file sources are stable.
 
-    Attributes:
-        url: URL or path to the data source. Local paths are stable; remote URLs
-             (s3://, http(s)://, grpc://) are experimental.
-        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs",
-              "aics", or "tensor-server" (experimental; an upstream biopb tensor server, fronted as a caching proxy).
-              Optional - auto-detected if None (local files, or a grpc:// endpoint -> "tensor-server").
-        source_id: Derived identity for the data source -- computed from the
-             resolved URL (or set internally by the tensor-server proxy). NOT a
-             user-facing config key: an explicit ``source_id`` in config is
-             deprecated and ignored (biopb/biopb#308), because a user-chosen id
-             lets the same bytes map to two catalog rows. Use ``alias`` for a
-             friendly display name.
-        dim_labels: Dimension labels (optional, applies to all tensors in source)
-        dataset: HDF5 dataset path (required for HDF5 type)
-        monitor: Enable live filesystem monitoring for this source (local directories only)
-                 When True, the server will watch for file add/delete events and update
-                 the catalog automatically.
-        cloud: (experimental) Treat this root as cloud/synced-folder storage (OneDrive, Dropbox, ...).
-               When True, dehydrated (offline-placeholder) entries under this root are
-               admitted as *unresolved* sources instead of being skipped, and their
-               shape/dtype is resolved lazily on first access (cloud-storage phase 2).
-               Opt-in only -- it does not weaken the global placeholder guard elsewhere.
-        credentials_profile: (experimental) Name of credential profile for remote URLs (overrides global default)
-        alias: (experimental) Type-split meaning, unified as "the name this source
-               shows up under":
-               - tensor-server (proxy) upstream: namespace prefix. The proxy mirrors
-                 the upstream's sources under "<alias>__<upstream_source_id>" so
-                 multiple upstreams (and local sources) coexist in one flat,
-                 source_id-keyed catalog without id collisions.
-               - local file/directory source: catalog **tree root**. Each configured
-                 source (and every source discovered under a configured folder) is
-                 re-rooted under ``alias`` in the browser/web tree, the same way a
-                 drag-dropped folder gets its own root -- see ``_alias_catalog_url``
-                 and ``SourceManager._drop_catalog_url``. Display-only (never touches
-                 ``source_id``). Honored on the static / one-shot-expand path only; a
-                 ``monitor = true`` local *directory* re-merges into the shared path
-                 tree on rescan, so its alias tree-root is ignored with a warning
-                 (see ``cli._resolve_serve_sources``).
-               Must be slash-free (it becomes a source_id prefix for a proxy, and the
-               first ``/``-split tree-root component for a local source).
-        is_remote: Flag indicating if this is a remote source (set during discovery)
+    Per-field help lives in each field's ``metadata["help"]`` -- the single
+    source the config JSON Schema reads (see ``config_schema.py``); a few fields
+    carry extra maintainer rationale in inline comments below.
+
+    The ``alias`` help is deliberately terse; the full behavior: for a
+    tensor-server proxy it is the namespace prefix mirroring the upstream's
+    sources under ``<alias>__<upstream_source_id>`` (so multiple upstreams share
+    one flat source_id-keyed catalog); for a local source it is the catalog tree
+    root the source is re-rooted under (display-only, honored on the static /
+    one-shot-expand path -- a ``monitor = true`` directory re-merges into the
+    shared tree on rescan and the alias is ignored with a warning).
     """
 
-    url: str
+    url: str = field(
+        metadata={
+            "help": "URL or path to the data source. Local paths are stable; "
+            "remote URLs (s3://, http(s)://, grpc://) are experimental."
+        }
+    )
     type: Optional[
         Literal[
             "zarr",
@@ -355,19 +330,62 @@ class SourceConfig:
             "aics",
             "tensor-server",
         ]
-    ] = None
-    source_id: Optional[str] = None
-    dim_labels: Optional[List[str]] = None
-    dataset: Optional[str] = None  # For HDF5
-    monitor: bool = False  # Enable live filesystem monitoring
-    cloud: bool = False  # Treat as cloud/synced-folder root (admit unresolved sources)
-    credentials_profile: Optional[str] = None  # Override global credential profile
-    alias: Optional[str] = None  # Proxy namespace prefix / local-source tree root
-    # Display-only catalog tree-root override, derived from `alias` for a local
-    # source during expansion (resolve_all_sources). Threaded to the descriptor's
-    # source_url via _commit_add_claim(catalog_url=...); never affects source_id.
-    # Internal/derived (leading underscore): not a user-facing config key, so it
-    # is excluded from the config-schema drift guard, like `_is_remote`.
+    ] = field(
+        default=None,
+        metadata={
+            "help": "Storage type; auto-detected for local files when omitted. "
+            "('tensor-server' is experimental.)"
+        },
+    )
+    source_id: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Deprecated and ignored: a source's id is derived from its "
+            "resolved URL (biopb/biopb#308). Use `alias` for a display name."
+        },
+    )
+    dim_labels: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Dimension labels applied to all tensors in the source."},
+    )
+    dataset: Optional[str] = field(
+        default=None,
+        metadata={"help": "HDF5 dataset path (required for HDF5 sources)."},
+    )
+    monitor: bool = field(
+        default=False,
+        metadata={
+            "help": "Watch this local directory for add/delete events and update "
+            "the catalog automatically."
+        },
+    )
+    cloud: bool = field(
+        default=False,
+        metadata={
+            "help": "(experimental) Treat as a cloud/synced-folder root: admit "
+            "offline placeholders, resolved lazily on first access."
+        },
+    )
+    credentials_profile: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "(experimental) Credential profile for a remote-URL source "
+            "(overrides the default profile)."
+        },
+    )
+    alias: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "(experimental) Display name this source appears under: a "
+            "namespace prefix for a tensor-server upstream, or the catalog tree "
+            "root for a local source. Must be slash-free."
+        },
+    )
+    # Internal/derived (leading underscore): not user-facing config keys, so they
+    # are excluded from the config-schema drift guard.
+    # _catalog_url: display-only tree-root override, derived from `alias` for a
+    # local source during expansion; threaded to the descriptor's source_url,
+    # never affects source_id.
     _catalog_url: Optional[str] = None
     _is_remote: Optional[bool] = field(
         default=None, init=False
@@ -418,21 +436,40 @@ class SourceConfig:
 class CacheConfig:
     """Cache configuration for computed virtual chunks.
 
-    Attributes:
-        backend: Cache backend type - "memory" or "file"
-        memory_max_entries: Maximum number of cached entries (memory backend)
-        memory_max_bytes: Maximum total bytes to cache (memory backend, default 512 MB)
-        file_cache_dir: Directory for cache files (file backend, default: system temp dir/biopb-cache-<uid>, scoped per user)
-        file_max_segment_bytes: Maximum bytes per segment file (file backend, default 64 MB)
-        file_max_total_bytes: Maximum total bytes across all segments (file backend, default 4 GB)
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema). Note the on-disk key names differ for the size fields
+    (``memory_max_bytes`` -> ``max_bytes``, ``file_max_segment_bytes`` ->
+    ``file_max_segment_mb``, ``file_max_total_bytes`` -> ``file_max_total_gb``);
+    the help is phrased for the on-disk form the editor shows.
     """
 
-    backend: str = field(default_factory=_default_cache_backend)
-    memory_max_entries: int = 1024
-    memory_max_bytes: int = 512 * 1024 * 1024  # 512 MB
-    file_cache_dir: Path = DEFAULT_FILE_CACHE_DIR
-    file_max_segment_bytes: int = 64 * 1024 * 1024  # 64 MB per segment
-    file_max_total_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GB total
+    backend: str = field(
+        default_factory=_default_cache_backend,
+        metadata={
+            "help": "Chunk cache backend: 'memory' (in-process only) or 'file' "
+            "(adds an on-disk cache)."
+        },
+    )
+    memory_max_entries: int = field(
+        default=1024,
+        metadata={"help": "Maximum number of decoded chunks kept in memory."},
+    )
+    memory_max_bytes: int = field(
+        default=512 * 1024 * 1024,  # 512 MB
+        metadata={"help": "Maximum total bytes of decoded chunks kept in memory."},
+    )
+    file_cache_dir: Path = field(
+        default=DEFAULT_FILE_CACHE_DIR,
+        metadata={"help": "Directory for the on-disk chunk cache (file backend)."},
+    )
+    file_max_segment_bytes: int = field(
+        default=64 * 1024 * 1024,  # 64 MB per segment
+        metadata={"help": "Maximum size of one on-disk cache segment file (MB)."},
+    )
+    file_max_total_bytes: int = field(
+        default=4 * 1024 * 1024 * 1024,  # 4 GB total
+        metadata={"help": "Maximum total size of the on-disk chunk cache (GB)."},
+    )
 
     def __post_init__(self):
         if isinstance(self.file_cache_dir, str):
@@ -452,20 +489,32 @@ class PyramidConfig:
     and were mirrored here by hand). They still default to biopb-mcp's historical
     values so an un-upgraded client computing the pyramid itself stays aligned.
 
-    Attributes:
-        reduction_method: On-the-fly downsampling reduction for computed levels
-            ("area" = proper averaging). Native (on-disk) levels are served via
-            "precompute" regardless of this.
-        threshold: Max X/Y extent of the coarsest level.
-        downscale_factor: Per-level linear step (per spatial axis).
-        pixel_budget_cubic_root: Cube root of the coarsest level's voxel budget
-            (Lx*Ly*Lz <= this**3); bounds napari's 3-D whole-volume read.
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
     """
 
-    reduction_method: str = "area"
-    threshold: int = 4096
-    downscale_factor: int = 4
-    pixel_budget_cubic_root: int = 512
+    reduction_method: str = field(
+        default="area",
+        metadata={
+            "help": "Downsampling method for computed levels ('area' = averaging). "
+            "Native on-disk levels are served precomputed regardless."
+        },
+    )
+    threshold: int = field(
+        default=4096,
+        metadata={"help": "Maximum X/Y extent (pixels) of the coarsest level."},
+    )
+    downscale_factor: int = field(
+        default=4,
+        metadata={"help": "Per-level linear downsampling step, per spatial axis."},
+    )
+    pixel_budget_cubic_root: int = field(
+        default=512,
+        metadata={
+            "help": "Cube root of the coarsest level's voxel budget "
+            "(Lx*Ly*Lz <= this**3); bounds a whole-volume 3-D read."
+        },
+    )
 
     def __post_init__(self):
         _validate_config(self)
@@ -482,24 +531,46 @@ class PrecacheConfig:
     reduction) lives in :class:`PyramidConfig`; this holds only the worker's
     operational knobs.
 
-    Attributes:
-        enabled: Run the background precache worker (no-op on a memory backend).
-        idle_debounce_seconds: Quiet period required before the worker resumes
-            after live Flight traffic.
-        backlog_enabled: Also warm sources already present at startup (the
-            "backlog"), as a secondary pass behind live additions.
-        backlog_high_water: Stop backlog warming once the file cache fills past
-            this fraction of its max_bytes, so precache never evicts live data.
-        backlog_idle_recheck_seconds: When the cache is over the high-water mark,
-            how long the backlog naps before re-checking for freed room.
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
     """
 
-    enabled: bool = True
-    idle_debounce_seconds: float = 2.0
+    enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Run the background pre-cache worker to warm new sources "
+            "(no-op on the memory backend)."
+        },
+    )
+    idle_debounce_seconds: float = field(
+        default=2.0,
+        metadata={
+            "help": "Quiet period after live traffic before the worker resumes "
+            "(seconds)."
+        },
+    )
     # Startup-backlog (existing sources) knobs.
-    backlog_enabled: bool = True
-    backlog_high_water: float = 0.8
-    backlog_idle_recheck_seconds: float = 5.0
+    backlog_enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Also warm sources already present at startup, behind live "
+            "additions."
+        },
+    )
+    backlog_high_water: float = field(
+        default=0.8,
+        metadata={
+            "help": "Stop backlog warming once the file cache fills past this "
+            "fraction of its budget (0-1), so precache never evicts live data."
+        },
+    )
+    backlog_idle_recheck_seconds: float = field(
+        default=5.0,
+        metadata={
+            "help": "Over the high-water mark, seconds the backlog naps before "
+            "re-checking for freed room."
+        },
+    )
 
     def __post_init__(self):
         _validate_config(self)
@@ -517,15 +588,22 @@ class MetadataDbConfig:
     flag -- the DB is always constructed. A lingering ``metadata_db.enabled`` key
     in an old config is ignored with a warning (see ``parse_config``).
 
-    Attributes:
-        max_query_results: Safety cap on SQL query returned rows (truncation signaled via schema metadata)
-        max_list_flights_results: Safety cap on list_flights() returned sources (truncation signaled via schema metadata)
-        query_timeout_ms: Query execution timeout in milliseconds
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
     """
 
-    max_query_results: int = 100000
-    max_list_flights_results: int = 100000
-    query_timeout_ms: int = 30000
+    max_query_results: int = field(
+        default=100000,
+        metadata={"help": "Safety cap on rows returned by a catalog SQL query."},
+    )
+    max_list_flights_results: int = field(
+        default=100000,
+        metadata={"help": "Safety cap on sources returned by ListFlights."},
+    )
+    query_timeout_ms: int = field(
+        default=30000,
+        metadata={"help": "Catalog SQL query timeout (milliseconds)."},
+    )
 
     def __post_init__(self):
         _validate_config(self)
@@ -535,55 +613,99 @@ class MetadataDbConfig:
 class ServerConfig:
     """Server configuration.
 
-    Attributes:
-        host: Server host
-        port: Server port
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        log_scope_to_biopb: If True, logging level changes only affect biopb_tensor_server
-                            packages, not external packages like grpc, numpy, etc.
-        monitor_mode: Directory monitoring mode.
-            "periodic": Run periodic rescans for monitored local directories.
-            "off": Disable background rescans after initial discovery.
-        rescan_interval: Seconds between background rescan attempts.
-        full_rescan_interval: Seconds between forced full rescans that bypass
-            subtree pruning. Values <= 0 disable the periodic full-scan backstop.
-        stability_window: Minimum quiet period before a path/subtree is eligible
-            for discovery or removal checks.
-        stable_rescans_required: Additional unchanged rescans required before a
-            path is considered stable. The default 0 preserves current behavior.
-        probe_open_files: When True, perform a best-effort append-open probe
-            before considering candidate files stable. This is advisory only.
-        aggressive_dir_pruning: When True, allow unchanged monitored roots to be
-            pruned in addition to descendant subdirectories. This reduces scan
-            cost further but may defer root-level file updates until a later scan.
-        claim_generic_images: When True, recursive directory discovery also
-            claims generic raster/video files (.png/.jpg/.jpeg/.gif/.bmp and
-            .avi/.mov/.mp4/.mpeg/.mpg) as aics sources. Off by default: these
-            are almost never microscopy tensors and flood the catalog with
-            screenshots/icons/thumbnails (biopb/biopb#40). Explicitly configured
-            sources (type set, or a single-file url) are unaffected.
-        writable: Enable write mode for source creation and data upload
-        write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
-        cache: Cache configuration
-        credentials: Credentials configuration for remote storage
-        metadata_db: DuckDB metadata database configuration for source filtering
-        sources: List of data sources (each may contain multiple tensors)
+    Per-field help lives in each field's ``metadata["help"]`` -- the single
+    source the config JSON Schema reads (see ``config_schema.py``). The nested
+    section objects (``cache``/``pyramid``/``precache``/``credentials``/
+    ``metadata_db``) and ``sources`` document themselves.
     """
 
-    host: str = "0.0.0.0"
-    port: int = 8815
-    log_level: str = "INFO"
-    log_scope_to_biopb: bool = True
-    monitor_mode: str = "periodic"
-    rescan_interval: float = 30.0
-    full_rescan_interval: float = 3600.0
-    stability_window: float = 30.0
-    stable_rescans_required: int = 0
-    probe_open_files: bool = True
-    aggressive_dir_pruning: bool = False
-    claim_generic_images: bool = False  # Claim generic raster/video in discovery (#40)
-    writable: bool = False  # Enable write mode
-    write_dir: Optional[Path] = None  # Directory for zarr-backed sources
+    host: str = field(
+        default="0.0.0.0",
+        metadata={
+            "help": "Address the Flight gRPC server binds. Loopback (127.0.0.1) "
+            "is local mode; a public address requires a token (remote mode)."
+        },
+    )
+    port: int = field(
+        default=8815,
+        metadata={"help": "TCP port for the Flight gRPC data-plane server."},
+    )
+    log_level: str = field(
+        default="INFO",
+        metadata={"help": "Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL)."},
+    )
+    log_scope_to_biopb: bool = field(
+        default=True,
+        metadata={
+            "help": "Apply the log level only to biopb loggers, leaving "
+            "third-party libraries (grpc, numpy, ...) at their defaults."
+        },
+    )
+    monitor_mode: str = field(
+        default="periodic",
+        metadata={
+            "help": "How monitored folders are watched: 'periodic' rescans, or "
+            "'off' to stop background rescans after initial discovery."
+        },
+    )
+    rescan_interval: float = field(
+        default=30.0,
+        metadata={"help": "Seconds between background rescans of monitored folders."},
+    )
+    full_rescan_interval: float = field(
+        default=3600.0,
+        metadata={
+            "help": "Seconds between forced full rescans that bypass subtree "
+            "pruning (<= 0 disables this backstop)."
+        },
+    )
+    stability_window: float = field(
+        default=30.0,
+        metadata={
+            "help": "Minimum quiet period before a path is eligible for discovery "
+            "or removal (seconds)."
+        },
+    )
+    stable_rescans_required: int = field(
+        default=0,
+        metadata={
+            "help": "Extra unchanged rescans required before a path is considered "
+            "stable (0 relies on the stability window alone)."
+        },
+    )
+    probe_open_files: bool = field(
+        default=True,
+        metadata={
+            "help": "Best-effort append-open probe to skip files still being "
+            "written (advisory)."
+        },
+    )
+    aggressive_dir_pruning: bool = field(
+        default=False,
+        metadata={
+            "help": "Also prune unchanged monitored roots (faster scans; may "
+            "defer root-level file updates to a later scan)."
+        },
+    )
+    claim_generic_images: bool = field(
+        default=False,
+        metadata={
+            "help": "Also catalog generic raster/video files "
+            "(.png/.jpg/.gif/.bmp/.mp4/...) during discovery. Off by default -- "
+            "they are rarely microscopy tensors (biopb/biopb#40)."
+        },
+    )
+    writable: bool = field(
+        default=False,
+        metadata={"help": "Enable write mode: allow source creation and data upload."},
+    )
+    write_dir: Optional[Path] = field(
+        default=None,
+        metadata={
+            "help": "Directory for zarr-backed uploaded sources (unset = no zarr "
+            "uploads)."
+        },
+    )
     cache: CacheConfig = field(default_factory=CacheConfig)
     pyramid: PyramidConfig = field(default_factory=PyramidConfig)
     precache: PrecacheConfig = field(default_factory=PrecacheConfig)
