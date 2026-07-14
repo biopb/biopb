@@ -218,16 +218,22 @@ jobs:
           username: jiyuuchc
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
-      # Idempotent: skip if this version is already in the registry (re-run a tag
-      # -> noop).
+      # Idempotent: skip only if this version is already in BOTH registries (re-run
+      # a tag -> noop). Checking both (not just ghcr) means a partial prior publish
+      # (ghcr pushed, Docker Hub failed) re-publishes to fill the gap instead of
+      # skipping and leaving Docker Hub permanently missing the version.
       - name: Check if already published
         id: gate
         run: |
           set -euo pipefail
           owner="${{ github.repository_owner }}"
-          if docker manifest inspect "ghcr.io/$owner/biopb-image-base:${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+          ver="${{ steps.ver.outputs.version }}"
+          ghcr="ghcr.io/$owner/biopb-image-base:$ver"
+          hub="docker.io/jiyuuchc/biopb-image-base:$ver"
+          if docker manifest inspect "$ghcr" >/dev/null 2>&1 \
+             && docker manifest inspect "$hub" >/dev/null 2>&1; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "${{ steps.ver.outputs.version }} already published — skip"
+            echo "$ver already in both registries — skip"
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi

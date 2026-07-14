@@ -291,23 +291,22 @@ jobs:
             PRERELEASE=true
           fi
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          # A Docker reference forbids '+' (setuptools_scm's local segment); map any
-          # out-of-set char to '_'. A clean X.Y.Z is unchanged. The gate's
-          # manifest-inspect and the tags below both use this so they agree.
-          DOCKER=$(printf '%s' "$VER" | sed -E 's/[^A-Za-z0-9_.-]/_/g')
-          echo "docker=$DOCKER" >> "$GITHUB_OUTPUT"
+          # VER is the tag name suffix (this job only runs on refs/tags/server-v*),
+          # so it is a clean version with no setuptools_scm '+local' segment and is
+          # already a valid Docker reference -- no sanitization needed (matches
+          # image-runtime-ci, which uses its tag name directly too).
           owner="${{ github.repository_owner }}"
           {
             echo "tags<<TAGS_EOF"
-            echo "ghcr.io/$owner/biopb-tensor-server:$DOCKER"
-            echo "docker.io/jiyuuchc/biopb-tensor-server:$DOCKER"
+            echo "ghcr.io/$owner/biopb-tensor-server:$VER"
+            echo "docker.io/jiyuuchc/biopb-tensor-server:$VER"
             if [[ "$PRERELEASE" == "false" ]]; then
               echo "ghcr.io/$owner/biopb-tensor-server:latest"
               echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
             fi
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "tensor-server $VER (docker tag $DOCKER, prerelease=$PRERELEASE)"
+          echo "tensor-server $VER (prerelease=$PRERELEASE)"
 
       - name: Login to ghcr.io
         uses: docker/login-action@v3
@@ -322,17 +321,23 @@ jobs:
           username: jiyuuchc
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
-      # Idempotent: skip if this version is already in the registry (re-run a tag
-      # -> noop) — the same "publish only when the version changed" property the
-      # unified release.yaml had.
+      # Idempotent: skip only if this version is already in BOTH registries (re-run
+      # a tag -> noop) — the "publish only when the version changed" property the
+      # unified release.yaml had. Checking both (not just ghcr) means a partial
+      # prior publish (ghcr pushed, Docker Hub failed) re-publishes to fill the gap
+      # instead of skipping and leaving Docker Hub permanently missing the version.
       - name: Check if already published
         id: gate
         run: |
           set -euo pipefail
           owner="${{ github.repository_owner }}"
-          if docker manifest inspect "ghcr.io/$owner/biopb-tensor-server:${{ steps.ver.outputs.docker }}" >/dev/null 2>&1; then
+          ver="${{ steps.ver.outputs.version }}"
+          ghcr="ghcr.io/$owner/biopb-tensor-server:$ver"
+          hub="docker.io/jiyuuchc/biopb-tensor-server:$ver"
+          if docker manifest inspect "$ghcr" >/dev/null 2>&1 \
+             && docker manifest inspect "$hub" >/dev/null 2>&1; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "${{ steps.ver.outputs.docker }} already published — skip"
+            echo "$ver already in both registries — skip"
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi

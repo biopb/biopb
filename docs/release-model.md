@@ -112,20 +112,24 @@ tagged with the SDK version (and `:latest` for a clean `X.Y.Z`).
 ### Idempotent Docker publish (the "did the version change?" check)
 
 Each image `publish` job (tensor-server-ci, image-runtime-ci) is **idempotent**:
-it publishes only if that version tag is not already in the registry, so
-re-running a tag is a noop:
+it publishes only if that version tag is missing from **at least one** of the two
+registries (ghcr.io, Docker Hub), so re-running a tag with both already present is
+a noop, while a partial prior publish (one registry pushed, the other failed)
+re-runs to fill the gap:
 
 ```bash
-if docker manifest inspect ghcr.io/biopb/biopb-image-base:$VER >/dev/null 2>&1; then
-  echo "$VER already published — skip"
+if docker manifest inspect ghcr.io/biopb/biopb-image-base:$VER >/dev/null 2>&1 \
+   && docker manifest inspect docker.io/jiyuuchc/biopb-image-base:$VER >/dev/null 2>&1; then
+  echo "$VER already in both registries — skip"
 else
-  # build + push :$VER (+ move :latest for a clean X.Y.Z)
+  # build + push :$VER to both (+ move :latest for a clean X.Y.Z)
 fi
 ```
 
 The check needs a **clean** version with no `+gSHA` local segment (a Docker
-reference forbids `+`): the tag name is always clean, and the tensor-server job
-sanitizes any out-of-set char to a Docker-safe form for defensiveness.
+reference forbids `+`): both jobs derive `$VER` straight from the tag name
+(`${GITHUB_REF#refs/tags/…}`), which is always clean, so no sanitization is
+needed.
 
 ## Installer
 
