@@ -564,18 +564,6 @@ def get_setting(config: dict, path: str, default=_MISSING):
     return copy.deepcopy(node)
 
 
-def get_config_dir() -> Path:
-    """Config directory (``~/.config/biopb`` on all platforms).
-
-    Co-located with the tensor server's ``biopb.json`` and the installer's
-    client-definition ``mcp.json`` (see :mod:`biopb._config_location`); computed
-    from ``Path.home()`` at call time so tests can redirect it.
-    """
-    config_dir = Path.home() / ".config" / "biopb"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    return config_dir
-
-
 def get_config_path() -> Path:
     """Path to the config file (``~/.config/biopb/mcp-config.json``).
 
