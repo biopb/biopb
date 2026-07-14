@@ -308,6 +308,16 @@ html, body {
 .setting-field-control-row { display: flex; gap: 0.4rem; align-items: stretch; }
 .setting-field-control-row > input { flex: 1; min-width: 0; }
 .setting-field-control-row > .icon-btn { flex-shrink: 0; white-space: nowrap; }
+/* Array fields: a fixed numeric vector (grid tile sizes) as a row of small number
+   inputs, and a variable string list (server / origin lists) as stacked rows. */
+.setting-field-vector { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+/* label-scoped so it out-specifies the generic .setting-field-label input rule. */
+.setting-field-label .setting-field-vector input { width: 6rem; }
+.setting-field-list { display: flex; flex-direction: column; gap: 0.35rem; align-items: flex-start; width: 100%; }
+.setting-field-list-row { display: flex; gap: 0.4rem; width: 100%; align-items: stretch; }
+.setting-field-label .setting-field-list-row input { flex: 1; min-width: 0; }
+.setting-field-list-row > .icon-btn { flex-shrink: 0; }
+.setting-field-list-add { align-self: flex-start; }
 
 .section-advanced { border-top: 1px solid #2d3748; padding-top: 0.85rem; }
 .section-advanced-toggle {

@@ -12,6 +12,10 @@ import "./index.css";
 // pulls only its own chunk plus the shared runtime, not the Pixi/Arrow viewer.
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const ObservePage = lazy(() => import("./pages/ObservePage"));
+// The biopb-mcp settings page is control-owned (it edits the global mcp config
+// via the control's /api/mcp_config), not part of the tensor viewer, so it is a
+// standalone route like the dashboard — outside ViewerLayout (no tensor client).
+const McpAdminPage = lazy(() => import("./pages/McpAdminPage"));
 
 const root = document.getElementById("root")!;
 
@@ -26,6 +30,7 @@ createRoot(root).render(
       <Suspense fallback={null}>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
+          <Route path="/mcp/admin" element={<McpAdminPage />} />
           <Route
             path="/session/:sessionId/observe"
             element={<ObservePage />}

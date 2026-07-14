@@ -283,9 +283,10 @@ _setup_mcp() {
 
     # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
     # Preserved if it already exists so the user's tweaks survive a rerun.
-    local mcp_config_dir="$HOME/.config/biopb-mcp"
-    local mcp_config="$mcp_config_dir/config.json"
-    mkdir -p "$mcp_config_dir"
+    # Co-located with the tensor config in ~/.config/biopb (distinct from the
+    # client-definition mcp.json written below); the schema is flat sections.
+    local mcp_config="$CONFIG_DIR/mcp-config.json"
+    mkdir -p "$CONFIG_DIR"
     if [ -f "$mcp_config" ]; then
         _ok "biopb-mcp config exists at $mcp_config (preserved)"
     else
@@ -321,12 +322,10 @@ _setup_mcp() {
         # default, so no shm opt-out is seeded here anymore.
         cat > "$mcp_config" << EOF
 {
-  "mcp": {
-    "services": {
-      "process_image_servers": [
+  "services": {
+    "process_image_servers": [
 $process_image_servers
-      ]
-    }
+    ]
   }
 }
 EOF
@@ -1296,7 +1295,7 @@ install_biopb() {
     fi
 
     _info "biopb-mcp configuration file:"
-    _cmd "  $HOME/.config/biopb-mcp/config.json"
+    _cmd "  $HOME/.config/biopb/mcp-config.json"
     echo ""
 
     _info "Data server configuration file:"
