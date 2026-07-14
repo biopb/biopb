@@ -550,8 +550,12 @@ def build_app(
                 return JSONResponse(
                     {"error": f"config on disk is unreadable: {exc}"}, status_code=500
                 )
+        # no-store: a config editor must always see the live file, never a cached
+        # GET (a stale empty {} cached before the file was populated would render
+        # the wrong config and clobber it on save).
         return JSONResponse(
-            {"path": str(p), "config": raw, "schema": build_mcp_config_schema()}
+            {"path": str(p), "config": raw, "schema": build_mcp_config_schema()},
+            headers={"Cache-Control": "no-store"},
         )
 
     async def api_mcp_config_save(request: Request) -> JSONResponse:

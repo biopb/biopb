@@ -39,16 +39,45 @@ interface McpConfigResponse {
 }
 
 async function loadMcpConfig(): Promise<McpConfigResponse> {
-  const r = await fetch("/api/mcp_config", { headers: authHeaders() });
+  // `no-store`: an admin config editor must never render a cached GET — a stale
+  // response (e.g. an empty {} cached before the file was populated) would show
+  // the wrong config and clobber it on save. The server also sends
+  // Cache-Control: no-store, but this makes the client independent of that.
+  const r = await fetch("/api/mcp_config", {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
   if (r.status === 401) {
     redirectToUnlock();
     throw new Error("Session locked — re-enter the access token.");
   }
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) {
-    throw new Error(body?.error || `Could not load config (HTTP ${r.status}).`);
+    const errBody = await r.json().catch(() => ({}));
+    throw new Error(errBody?.error || `Could not load config (HTTP ${r.status}).`);
   }
-  return body as McpConfigResponse;
+  // A 200 with an empty/opaque or schema-less body is the fingerprint of an
+  // intercepting layer (a stale service worker or proxy) silently serving
+  // nothing. Surface that as a clear error rather than a confusing empty form
+  // (header renders, no fields, Raw JSON shows {}). See the no-store note above.
+  let body: unknown;
+  try {
+    body = await r.json();
+  } catch {
+    throw new Error(
+      "Config response was not valid JSON — a stale service worker or proxy may " +
+        "be intercepting /api/mcp_config. Clear the site's data (or unregister the " +
+        "service worker) and reload.",
+    );
+  }
+  const parsed = body as Partial<McpConfigResponse> | null;
+  if (!parsed || typeof parsed !== "object" || !parsed.schema) {
+    throw new Error(
+      "Config response was missing its schema — a stale service worker or cache " +
+        "may be intercepting /api/mcp_config. Clear the site's data (or unregister " +
+        "the service worker) and reload.",
+    );
+  }
+  return parsed as McpConfigResponse;
 }
 
 export default function McpAdminPage() {
