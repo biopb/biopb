@@ -92,6 +92,15 @@ class DataPlaneSupervisor:
         self._state = _State()
         self._lock = threading.RLock()
 
+    @property
+    def log_path(self) -> Optional[Path]:
+        """The file the data-plane subprocess's stdout/stderr is appended to, or
+        ``None`` when no ``server_log`` was configured (output then goes to the
+        control's own stderr). A public accessor so the control's log endpoint can
+        tail it without reaching into ``_spec``."""
+        p = self._spec.server_log
+        return Path(p) if p is not None else None
+
     # --- liveness / argv / env ------------------------------------------- #
 
     def _port_up(self, timeout: float = 0.5) -> bool:

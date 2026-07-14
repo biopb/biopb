@@ -364,6 +364,71 @@ def test_data_plane_restart_stops_then_ensures(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# /api/data_plane/logs — the dashboard log monitor's backing tail
+# --------------------------------------------------------------------------- #
+
+
+def test_data_plane_logs_tails_the_server_log(control, tmp_path):
+    # The endpoint returns the tail of the file the supervisor writes the data
+    # plane to (the same tmp_path/server.log the `control` fixture configures).
+    (tmp_path / "server.log").write_text("".join(f"line {i}\n" for i in range(1, 51)))
+    status, headers, body = _get(f"{control}/api/data_plane/logs?lines=10")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["exists"] is True
+    assert payload["lines"] == [f"line {i}" for i in range(41, 51)]  # last 10
+    assert payload["truncated"] is True  # 50 lines exist, 10 returned
+    assert payload["path"].endswith("server.log")
+    # A config editor / log tail must never be cached (each poll wants fresh output).
+    assert (headers.get("Cache-Control") or "").lower() == "no-store"
+
+
+def test_data_plane_logs_caps_lines(control, tmp_path):
+    # An absurd ?lines is clamped to _LOG_TAIL_MAX_LINES rather than honored.
+    from biopb_control._control import _LOG_TAIL_MAX_LINES
+
+    (tmp_path / "server.log").write_text(
+        "".join(f"l{i}\n" for i in range(_LOG_TAIL_MAX_LINES + 500))
+    )
+    _status, _h, body = _get(f"{control}/api/data_plane/logs?lines=999999")
+    payload = json.loads(body)
+    assert len(payload["lines"]) == _LOG_TAIL_MAX_LINES
+
+
+def test_data_plane_logs_missing_file(control):
+    # No log written yet -> a clean exists:false, empty lines, not a 500.
+    status, _h, body = _get(f"{control}/api/data_plane/logs")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["exists"] is False
+    assert payload["lines"] == []
+
+
+def test_data_plane_logs_bad_lines_param_falls_back(control, tmp_path):
+    # A non-integer ?lines degrades to the default rather than erroring.
+    (tmp_path / "server.log").write_text("only line\n")
+    status, _h, body = _get(f"{control}/api/data_plane/logs?lines=abc")
+    assert status == 200
+    assert json.loads(body)["lines"] == ["only line"]
+
+
+def test_tail_file_bounds_bytes_and_drops_fragment(tmp_path):
+    # The byte window bounds the read: with a small max_bytes we get only the tail,
+    # truncated is True, and the (probably-partial) leading line is dropped so no
+    # half-line is surfaced.
+    from biopb_control._control import _tail_file
+
+    p = tmp_path / "big.log"
+    p.write_text("".join(f"{i:04d}-payload\n" for i in range(1000)))
+    lines, truncated = _tail_file(p, max_lines=1000, max_bytes=200)
+    assert truncated is True
+    assert lines  # some tail lines survived
+    assert lines[-1] == "0999-payload"  # last full line intact
+    # Every returned line is a complete "NNNN-payload" record (no fragment).
+    assert all(len(line) == len("0000-payload") for line in lines)
+
+
+# --------------------------------------------------------------------------- #
 # /api/* auth gate (§6.1 — the control's own API on the single origin)
 # --------------------------------------------------------------------------- #
 _TOKEN = "test-control-token-123"

@@ -16,6 +16,9 @@ const ObservePage = lazy(() => import("./pages/ObservePage"));
 // via the control's /api/mcp_config), not part of the tensor viewer, so it is a
 // standalone route like the dashboard — outside ViewerLayout (no tensor client).
 const McpAdminPage = lazy(() => import("./pages/McpAdminPage"));
+// The data-plane log monitor: a standalone dashboard surface polling the
+// control's /api/data_plane/logs. No tensor client, so outside ViewerLayout.
+const LogsPage = lazy(() => import("./pages/LogsPage"));
 
 const root = document.getElementById("root")!;
 
@@ -31,6 +34,7 @@ createRoot(root).render(
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/mcp/admin" element={<McpAdminPage />} />
+          <Route path="/logs" element={<LogsPage />} />
           <Route
             path="/session/:sessionId/observe"
             element={<ObservePage />}
