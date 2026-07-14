@@ -1,6 +1,7 @@
 # Vetting report: mcp-proxy as the stdio→http bridge
 
-**Context:** docs/daemon-migration.md (Direction 1) plans to recommend
+**Context:** the http-only-transport plan (docs/mcp-dedaemonization-migration.md)
+considered recommending
 [sparfenyuk/mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) as the generic
 streamable-http↔stdio bridge for stdio-only clients once biopb-mcp goes
 http-only, likely wrapped in a connect-or-spawn shim. This is the pre-adoption

@@ -154,9 +154,8 @@ display fix), pumps stdio JSON-RPC to that child's `/mcp` until the client close
 stdin, then **reaps** the child (and its kernel grandchild) on the way out. There
 is **no probe-and-reuse, no shared daemon, and no fixed port**: each stdio client
 spawns and owns *its own* session, so N clients get N independent sessions (N
-viewers), by design — de-daemonization Layer 1
-(docs/mcp-dedaemonization-migration.md), which supersedes the shared,
-client-outliving daemon of Direction 1 (docs/daemon-migration.md). The shim
+viewers), by design (docs/mcp-dedaemonization-migration.md), which supersedes the
+earlier shared, client-outliving daemon. The shim
 process owns fd 1 as a protocol channel but imports only the mcp SDK — no
 Qt/dask/uvicorn — so the old fd-1 corruption class is structurally impossible; it
 replays the child's initialize result verbatim (including `instructions` — the

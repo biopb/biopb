@@ -11,7 +11,7 @@ heavy launcher process. Instead the launcher runs this module, which
 3. reaps the child (and its kernel grandchild) on the way out (``_reap_session``).
 
 This is de-daemonization Layer 1 (docs/mcp-dedaemonization-migration.md). It
-retains the shim/heavy *split* of docs/daemon-migration.md — the process that
+retains the shim/heavy *split* described there — the process that
 owns fd 1 as a protocol channel imports nothing that could write to stdout (no
 Qt, dask, uvicorn, or kernel — only the mcp SDK), so the fd-1 corruption class
 is structurally impossible here — but undoes the daemon's *detachment* and its

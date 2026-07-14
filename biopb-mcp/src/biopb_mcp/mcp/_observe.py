@@ -19,7 +19,7 @@ no dependence on the dask scheduler/dashboard.
 **Mounted on the http server.** :func:`register_http_routes` mounts the routes
 on the *existing* FastMCP Starlette app via ``mcp.custom_route``, so they share
 the MCP loop and port (``transport.port``) with ``/mcp``. The server is
-http-only (daemon migration, docs/daemon-migration.md), so the API is always
+http-only (docs/mcp-dedaemonization-migration.md), so the API is always
 available — stdio clients reach it too: they connect through the launcher's
 stdio→http bridge (``mcp/_shim.py``) and so hit ``/api/*`` on the shared daemon
 like any other http client. (It was once skipped under a stdio-*serving*
