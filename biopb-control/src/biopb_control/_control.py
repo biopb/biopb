@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import socket
 import sys
@@ -521,6 +522,113 @@ def build_app(
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
+    def api_mcp_config(_request: Request) -> JSONResponse:
+        # The biopb-mcp settings editor's backing read: the raw on-disk config +
+        # its path + the JSON Schema (labels/help/bounds), mirroring the tensor
+        # sidecar's GET /api/config so the same schema-driven admin UI renders it.
+        # The control OWNS this because the config is global (~/.config/biopb/
+        # mcp-config.json) while mcp sessions are ephemeral/dynamic-port -- none of
+        # them owns the file. biopb_mcp is soft-imported (only for the schema): the
+        # lean control does not hard-depend on it (invariant I2), but a real biopb
+        # deployment always co-installs it. mcp_config_path lives in core biopb.
+        from biopb._config_location import mcp_config_path
+
+        try:
+            from biopb_mcp._config_schema import build_mcp_config_schema
+        except Exception as exc:  # noqa: BLE001 - biopb-mcp not installed here
+            return JSONResponse(
+                {"error": f"biopb-mcp is not installed: {exc}"}, status_code=501
+            )
+        p = mcp_config_path()
+        raw: dict = {}
+        if p.exists():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw = loaded
+            except (OSError, ValueError) as exc:
+                return JSONResponse(
+                    {"error": f"config on disk is unreadable: {exc}"}, status_code=500
+                )
+        # no-store: a config editor must always see the live file, never a cached
+        # GET (a stale empty {} cached before the file was populated would render
+        # the wrong config and clobber it on save).
+        return JSONResponse(
+            {"path": str(p), "config": raw, "schema": build_mcp_config_schema()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def api_mcp_config_save(request: Request) -> JSONResponse:
+        # Validate + write the biopb-mcp config. Validation reuses biopb-mcp's own
+        # _CONSTRAINTS table (the exact rules it clamps to at load time), so "the
+        # form accepted it" == "biopb-mcp will accept it" with no jsonschema
+        # dependency in the lean control. Changes apply to the NEXT session (each
+        # session reads config fresh at bootstrap), so there is no server to
+        # restart -- unlike the data plane.
+        try:
+            from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, save_config
+        except Exception as exc:  # noqa: BLE001 - biopb-mcp not installed here
+            return JSONResponse(
+                {"error": f"biopb-mcp is not installed: {exc}"}, status_code=501
+            )
+        from biopb._config_location import mcp_config_path
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse(
+                {"detail": "Request body is not valid JSON"}, status_code=422
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"detail": "Config body must be a JSON object"}, status_code=422
+            )
+
+        errors: list[dict] = []
+        for section, cls in _SECTION_CLASSES.items():
+            sec = body.get(section)
+            if not isinstance(sec, dict):
+                continue
+            for field, constraint in _CONSTRAINTS.get(cls.__name__, {}).items():
+                if field in sec and not constraint.ok(sec[field]):
+                    errors.append(
+                        {
+                            "path": [section, field],
+                            "message": f"expected {constraint.describe()}",
+                        }
+                    )
+        # Cross-field: the health-poll backoff must not invert (min > max).
+        tensor = body.get("tensor")
+        if isinstance(tensor, dict):
+            lo, hi = (
+                tensor.get("health_poll_min_interval"),
+                tensor.get("health_poll_max_interval"),
+            )
+            if (
+                isinstance(lo, (int, float))
+                and isinstance(hi, (int, float))
+                and lo > hi
+            ):
+                errors.append(
+                    {
+                        "path": ["tensor", "health_poll_min_interval"],
+                        "message": "must be <= health_poll_max_interval",
+                    }
+                )
+        if errors:
+            errors.sort(key=lambda d: d["path"])
+            return JSONResponse(
+                {"detail": "Config failed validation", "errors": errors},
+                status_code=422,
+            )
+        try:
+            save_config(body)
+        except OSError as exc:
+            return JSONResponse(
+                {"error": f"could not write config: {exc}"}, status_code=500
+            )
+        return JSONResponse({"saved": True, "path": str(mcp_config_path())})
+
     def _serve_shell() -> Response:
         # The SPA shell (index.html) every non-API GET falls back to; the React
         # router then renders the right surface for the URL. web_root is checked
@@ -728,6 +836,8 @@ def build_app(
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
+        Route("/api/mcp_config", api_mcp_config, methods=["GET"]),
+        Route("/api/mcp_config", api_mcp_config_save, methods=["PUT"]),
         Mount("/data_plane", sidecar),
         # Per-session observe: /session/<id>/observe (SPA shell) + /session/<id>/
         # api/* (proxied). The {session_id} convertor is slash-free (session ids

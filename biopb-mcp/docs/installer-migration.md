@@ -46,7 +46,7 @@ The precondition was bundling all three wheels into one biopb-mcp release
 Installs the stack into **one `uv` tool environment** so the components can import
 and drive each other (`biopb server start`, the napari viewer, `ops`), unpacks
 the data-browser webapp, writes default config
-(`~/.config/biopb/biopb.toml`, `~/.config/biopb-mcp/config.json`,
+(`~/.config/biopb/biopb.toml`, `~/.config/biopb/mcp-config.json`,
 `~/.config/biopb/mcp.json`), wires biopb-mcp into any detected AI agent
 (Claude Code/Desktop, Cursor, opencode, Hermes) as a **stdio** MCP server, and
 starts the data server. Idempotent; rerun to upgrade. By default it tracks the

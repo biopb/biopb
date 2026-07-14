@@ -473,7 +473,7 @@ core.
 ### 7.1 Config: federate, don't merge *(decided)*
 
 The config surfaces (data-plane `~/.config/biopb/biopb.json`, MCP
-`~/.config/biopb-mcp/config.json`, and a future control config) stay **separate
+`~/.config/biopb/mcp-config.json`, and a future control config) stay **separate
 files, each owned by one process** — they do **not** collapse into one
 control-owned file. The governing rule:
 
@@ -510,7 +510,7 @@ Writer model:
 |---|---|
 | `~/.config/biopb/biopb.json` | **data plane** — installer seeds; `biopb server migrate-config`; the **admin API** at runtime; the container entrypoint (env→file). The control never writes or parses it (blind proxy). |
 | `control.json` *(new, optional)* | **control** — its own API is the sole writer; env/argv overrides and suffices. Holds the algorithm-server registry + session policy; empty/absent in the container. |
-| `~/.config/biopb-mcp/config.json` | **MCP** — per-session kernel/dask/viewer/timeout knobs. Absent in the container. |
+| `~/.config/biopb/mcp-config.json` | **MCP** — per-session kernel/dask/viewer/timeout knobs. Absent in the container. |
 
 What actually moves in Layer 4 is **only the algorithm-server registry**, MCP →
 control. It is the one piece with a real reason to move: today it is

@@ -951,3 +951,99 @@ def test_websocket_render_is_proxied(ws_upstream, tmp_path):
             assert ws.recv() == b"\x00\x01\x02"  # binary upstream -> client
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# GET/PUT /api/mcp_config — the biopb-mcp settings surface the control owns
+# (global config; sessions are ephemeral). Needs biopb-mcp co-installed (it is in
+# the workspace venv; the stdlib-only control CI skips these).
+# --------------------------------------------------------------------------- #
+
+pytest.importorskip("biopb_mcp")
+
+
+def _put(url, payload, headers=None):
+    body = json.dumps(payload).encode()
+    hdrs = {"Content-Type": "application/json", **(headers or {})}
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+@pytest.fixture
+def mcp_home(monkeypatch, tmp_path):
+    """Point Path.home() at a tmp dir so mcp_config_path() (resolved per-request
+    inside the in-process uvicorn thread) reads/writes an isolated location."""
+    import pathlib
+
+    home = tmp_path / "mcp_home"
+    home.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: home))
+    return home
+
+
+def test_mcp_config_get_returns_config_path_and_schema(control, mcp_home):
+    cfg_dir = mcp_home / ".config" / "biopb"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "mcp-config.json").write_text(json.dumps({"transport": {"port": 9000}}))
+    status, _headers, body = _get(f"{control}/api/mcp_config")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["path"].endswith("mcp-config.json")
+    assert payload["config"] == {"transport": {"port": 9000}}
+    # The schema carries the section that the editor renders (labels/help/bounds).
+    assert "transport" in payload["schema"]["properties"]
+
+
+def test_mcp_config_get_tolerates_missing_file(control, mcp_home):
+    status, _headers, body = _get(f"{control}/api/mcp_config")
+    assert status == 200
+    assert json.loads(body)["config"] == {}
+
+
+def test_mcp_config_put_writes_valid_config(control, mcp_home):
+    status, payload = _put(
+        f"{control}/api/mcp_config", {"transport": {"kind": "http", "port": 8080}}
+    )
+    assert status == 200, payload
+    assert payload["saved"] is True
+    on_disk = json.loads(
+        (mcp_home / ".config" / "biopb" / "mcp-config.json").read_text()
+    )
+    assert on_disk["transport"]["port"] == 8080
+
+
+def test_mcp_config_put_rejects_bad_enum_and_range(control, mcp_home):
+    status, payload = _put(
+        f"{control}/api/mcp_config",
+        {"transport": {"kind": "websocket", "port": 99999}},
+    )
+    assert status == 422, payload
+    paths = {tuple(e["path"]) for e in payload["errors"]}
+    assert ("transport", "kind") in paths
+    assert ("transport", "port") in paths
+    # Nothing is written on a rejected PUT.
+    assert not (mcp_home / ".config" / "biopb" / "mcp-config.json").exists()
+
+
+def test_mcp_config_put_rejects_unhashable_enum_value_as_422_not_500(control, mcp_home):
+    # A list/dict where an enum scalar is expected must be a clean 422, not a 500
+    # (Enum.ok is total, so the PUT validator never raises on unhashable input).
+    status, payload = _put(
+        f"{control}/api/mcp_config", {"transport": {"kind": ["http"]}}
+    )
+    assert status == 422, payload
+    assert ("transport", "kind") in {tuple(e["path"]) for e in payload["errors"]}
+
+
+def test_mcp_config_put_rejects_inverted_health_poll(control, mcp_home):
+    status, payload = _put(
+        f"{control}/api/mcp_config",
+        {"tensor": {"health_poll_min_interval": 90, "health_poll_max_interval": 10}},
+    )
+    assert status == 422, payload
+    paths = {tuple(e["path"]) for e in payload["errors"]}
+    assert ("tensor", "health_poll_min_interval") in paths

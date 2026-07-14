@@ -591,7 +591,7 @@ progress).
 Be precise about which config: the tool edits the **tensor server's canonical
 config**, `~/.config/biopb/biopb.json` (`biopb._config_location`,
 `CANONICAL_CONFIG_NAME = "biopb.json"`, JSON-canonical per `#34`). This is **not**
-the biopb-mcp client config (`~/.config/biopb-mcp/config.json`, which holds
+the biopb-mcp client config (`~/.config/biopb/mcp-config.json`, which holds
 `tensor_browser.server_url`, `mcp.*`, dask budget). The two stay separate; the GUI
 targets the server file, where `sources` live.
 

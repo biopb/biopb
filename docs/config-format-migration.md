@@ -18,7 +18,7 @@ advantages evaporate and its one wart dominates:
   workaround. JSON generation is stdlib on both ends (`json.dumps` /
   `ConvertTo-Json`), and that fragile block disappears.
 - **Ecosystem alignment.** `biopb-mcp` already writes
-  `~/.config/biopb-mcp/config.json`. Server-on-JSON unifies the format.
+  `~/.config/biopb/mcp-config.json`. Server-on-JSON unifies the format.
 - **Comments are moot** for a generated file, so JSON's lack of them costs nothing.
 - **Pairs with JSON Schema**, giving validation + generation one shared contract.
 

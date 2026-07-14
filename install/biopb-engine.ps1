@@ -443,10 +443,11 @@ function Set-McpClients {
     $mcpArgs = @("--transport", "stdio")
 
     # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved if
-    # it already exists so the user's tweaks survive a rerun.
-    $mcpConfigDir = Join-Path $BiopbHome ".config\biopb-mcp"
-    $mcpConfig = Join-Path $mcpConfigDir "config.json"
-    if (-not (Test-Path -LiteralPath $mcpConfigDir)) { New-Item -ItemType Directory -Force -Path $mcpConfigDir | Out-Null }
+    # it already exists so the user's tweaks survive a rerun. Co-located with the
+    # tensor config in ~/.config/biopb (distinct from the client-definition
+    # mcp.json below); the schema is flat sections.
+    $mcpConfig = Join-Path $ConfigDir "mcp-config.json"
+    if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
     if (Test-Path -LiteralPath $mcpConfig) {
         Report-Ok "biopb-mcp config exists at $mcpConfig (preserved)"
     } else {
@@ -462,12 +463,10 @@ function Set-McpClients {
         }
         $mcpConfigContent = @"
 {
-  "mcp": {
-    "services": {
-      "process_image_servers": [
+  "services": {
+    "process_image_servers": [
 $processImageServers
-      ]
-    }
+    ]
   }
 }
 "@

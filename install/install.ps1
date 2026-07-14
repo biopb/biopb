@@ -151,7 +151,7 @@ function Show-Summary {
     }
 
     Write-Inf "biopb-mcp configuration file:"
-    Write-Cmd "  $BiopbHome\.config\biopb-mcp\config.json"
+    Write-Cmd "  $BiopbHome\.config\biopb\mcp-config.json"
     Write-Host ""
 
     Write-Inf "Data server configuration file:"
@@ -255,7 +255,7 @@ try {
     # network dependency. Only fires when no biopb-mcp config exists yet, so a
     # prior choice survives a rerun. Default is Yes (Enter = enable).
     $noRemotePlugins = $false
-    $mcpConfig = Join-Path $BiopbHome ".config\biopb-mcp\config.json"
+    $mcpConfig = Join-Path $BiopbHome ".config\biopb\mcp-config.json"
     if (-not (Test-Path -LiteralPath $mcpConfig)) {
         if ($script:NonInteractive) {
             # Consent can't be asked unattended: enable only on explicit opt-in.
