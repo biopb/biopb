@@ -166,7 +166,7 @@ def check_for_update(
 
         from .._config import get_setting
 
-        if not get_setting(config, "mcp.update.enabled"):
+        if not get_setting(config, "update.enabled"):
             return None
 
         # Suppress on a dev/editable build of the running code — a developer
@@ -181,10 +181,10 @@ def check_for_update(
             logger.debug("update check: no installed-release marker; skipping")
             return None
 
-        repo = get_setting(config, "mcp.update.repo")
-        channel = get_setting(config, "mcp.update.channel")
-        timeout = get_setting(config, "mcp.update.timeout")
-        skipped = get_setting(config, "mcp.update.skipped_version") or ""
+        repo = get_setting(config, "update.repo")
+        channel = get_setting(config, "update.channel")
+        timeout = get_setting(config, "update.timeout")
+        skipped = get_setting(config, "update.skipped_version") or ""
         allow_prerelease = channel == "prerelease"
 
         releases = _http_json(

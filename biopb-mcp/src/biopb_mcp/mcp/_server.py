@@ -802,9 +802,7 @@ def server_status() -> str:
         lines.append(f"  url: {obs['url']}")
         lines.append(f"  mode: {obs['mode']}")
     else:
-        lines.append(
-            "  status: not running (mcp.observe.enabled off or failed to start)"
-        )
+        lines.append("  status: not running (observe.enabled off or failed to start)")
     lines.append("")
     lines.append("## Kernel")
 

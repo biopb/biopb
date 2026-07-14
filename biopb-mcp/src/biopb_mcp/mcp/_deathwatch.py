@@ -11,7 +11,7 @@ scheduler loss — the sole reaper on an *uncatchable* daemon death (the daemon'
 own ``_shutdown`` / ``atexit`` close covers the graceful exits), which is why the
 ``mcp`` extra floors ``distributed>=2023.9`` (post-``reconnect``, when a worker
 that loses its scheduler shuts down instead of retrying forever). Only under the
-``mcp.dask.owner="kernel"`` escape hatch does the kernel's group also contain
+``dask.owner="kernel"`` escape hatch does the kernel's group also contain
 dask children this reap takes down.
 
 Why a pipe and not ``PR_SET_PDEATHSIG``: the parent-death *signal* is tied to

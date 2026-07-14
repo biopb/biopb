@@ -29,7 +29,7 @@ def mock_home(monkeypatch, tmp_path):
 def skills_cfg(monkeypatch):
     """Control config without touching the real CONFIG singleton / disk, and
     reset the module-level TTL cache so tests don't leak into each other."""
-    cfg = {"enabled": True, "catalog_url": "", "cache_ttl": 3600}
+    cfg = {"skills_enabled": True, "skills_catalog_url": "", "skills_cache_ttl": 3600}
 
     def fake_setting(path, default=None):
         return cfg.get(path.rsplit(".", 1)[1], default)
@@ -112,7 +112,7 @@ def test_find_skills_query_filters(mock_home, skills_cfg, monkeypatch):
 
 def test_find_skills_disabled_returns_empty(mock_home, skills_cfg, monkeypatch):
     _offline(monkeypatch)
-    skills_cfg["enabled"] = False
+    skills_cfg["skills_enabled"] = False
     assert _skills.find_skills("") == []
 
 
@@ -120,7 +120,7 @@ def test_find_skills_disabled_returns_empty(mock_home, skills_cfg, monkeypatch):
 # Discovery — network success + disk cache
 # --------------------------------------------------------------------------- #
 def test_network_catalog_then_disk_cache(mock_home, skills_cfg, monkeypatch):
-    skills_cfg["catalog_url"] = CATALOG_URL
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
     payload = _catalog_bytes(
         [{"id": "net", "title": "Net", "description": "from network"}]
     )
@@ -132,14 +132,14 @@ def test_network_catalog_then_disk_cache(mock_home, skills_cfg, monkeypatch):
     # Now go offline and bust the TTL cache: the on-disk copy must be used
     # (a stale cache beats nothing), NOT the bundle.
     _offline(monkeypatch)
-    skills_cfg["cache_ttl"] = 0
+    skills_cfg["skills_cache_ttl"] = 0
     _skills._cache["skills"] = None
     got2 = _skills.find_skills("")
     assert [s["id"] for s in got2] == ["net"]
 
 
 def test_ttl_cache_avoids_refetch(mock_home, skills_cfg, monkeypatch):
-    skills_cfg["catalog_url"] = CATALOG_URL
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
     calls = {"n": 0}
 
     def counting_get(url, timeout):
@@ -184,7 +184,7 @@ def test_get_body_network_verifies_and_caches(mock_home, skills_cfg, monkeypatch
     catalog = _catalog_bytes(
         [{"id": "net", "description": "d", "url": body_url, "sha256": sha}]
     )
-    skills_cfg["catalog_url"] = CATALOG_URL
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
 
     def get(url, timeout):
         return catalog if url == CATALOG_URL else raw_body
@@ -229,7 +229,7 @@ def test_corrupt_cached_body_is_not_trusted_and_refetched(
     catalog = _catalog_bytes(
         [{"id": "net", "description": "d", "url": body_url, "sha256": sha}]
     )
-    skills_cfg["catalog_url"] = CATALOG_URL
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
 
     bodies = _skills._cache_dir() / "bodies"
     bodies.mkdir(parents=True, exist_ok=True)

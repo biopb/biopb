@@ -49,9 +49,9 @@ def _configure_dask(config: dict):
     Returns ``(client, cluster)``:
 
     * ``"distributed"`` + an address (``BIOPB_DASK_ADDRESS`` injected by the
-      daemon, or an external ``mcp.dask.address``) -> a ``Client`` attached to
+      daemon, or an external ``dask.address``) -> a ``Client`` attached to
       that scheduler; ``cluster`` is ``None``. This is the default: the daemon
-      owns the cluster (``mcp.dask.owner="daemon"``) and injects its address.
+      owns the cluster (``dask.owner="daemon"``) and injects its address.
     * ``"distributed"`` + no address + ``owner="daemon"`` -> the daemon has no
       cluster (disabled or a spin failure), so degrade to the in-process
       ``threads`` scheduler rather than spinning a competing kernel-local one.
@@ -68,13 +68,13 @@ def _configure_dask(config: dict):
 
     from .._config import get_setting
 
-    scheduler = get_setting(config, "mcp.dask.scheduler")
-    num_workers = get_setting(config, "mcp.dask.num_workers") or None
-    owner = get_setting(config, "mcp.dask.owner")
+    scheduler = get_setting(config, "dask.scheduler")
+    num_workers = get_setting(config, "dask.num_workers") or None
+    owner = get_setting(config, "dask.owner")
     # The daemon-injected address (its owned cluster) wins over the configured
     # external one; either takes the plain Client(address) attach path.
     address = os.environ.get("BIOPB_DASK_ADDRESS") or get_setting(
-        config, "mcp.dask.address"
+        config, "dask.address"
     )
 
     if scheduler == "distributed":
@@ -107,11 +107,9 @@ def _configure_dask(config: dict):
                 cluster = LocalCluster(
                     n_workers=num_workers,
                     processes=True,
-                    threads_per_worker=get_setting(
-                        config, "mcp.dask.threads_per_worker"
-                    ),
-                    memory_limit=get_setting(config, "mcp.dask.memory_limit"),
-                    dashboard_address=get_setting(config, "mcp.dask.dashboard_address"),
+                    threads_per_worker=get_setting(config, "dask.threads_per_worker"),
+                    memory_limit=get_setting(config, "dask.memory_limit"),
+                    dashboard_address=get_setting(config, "dask.dashboard_address"),
                     local_directory=local_directory,
                 )
                 client = Client(cluster)
@@ -174,7 +172,7 @@ def _make_cache_plugin(location, token, cache_bytes):
 def _register_cache_plugin(dask_client, url, token, config: dict, planned_workers=None):
     """Split the data-plane chunk-cache budget across dask workers.
 
-    Divides ``mcp.dask.cache_budget`` evenly across the workers and installs a
+    Divides ``dask.cache_budget`` evenly across the workers and installs a
     worker-init plugin so each worker (current and future) caps its per-process
     cache at ``budget // n_workers`` -- bounding the aggregate cache that would
     otherwise be replicated per worker.
@@ -202,7 +200,7 @@ def _register_cache_plugin(dask_client, url, token, config: dict, planned_worker
             planned_workers or len(dask_client.scheduler_info().get("workers", {})),
         )
 
-        budget_cfg = get_setting(config, "mcp.dask.cache_budget")
+        budget_cfg = get_setting(config, "dask.cache_budget")
         budget = (
             int(budget_cfg)
             if isinstance(budget_cfg, int | float)
@@ -433,7 +431,7 @@ def _bootstrap_impl():
     }
 
     def _register_cache_if_ready():
-        # Caller holds _dask_lock. Splits mcp.dask.cache_budget across the worker
+        # Caller holds _dask_lock. Splits dask.cache_budget across the worker
         # processes (localhost workers clamp it to 0 themselves). No-op until both
         # a Client and a connection exist.
         client = _dask_state["client"]
@@ -481,7 +479,7 @@ def _bootstrap_impl():
     #    single-process scheduler so they share the main-process chunk cache
     #    instead of scattering across the distributed cluster (issue #8).
     #    Headless: no viewer — `viewer` is a self-describing sentinel instead.
-    compute_scheduler = get_setting(config, "mcp.viewer.compute_scheduler")
+    compute_scheduler = get_setting(config, "viewer.compute_scheduler")
     if headless:
         viewer = _HeadlessViewer()
         logger.info("Headless mode: no napari viewer (no display).")
@@ -510,7 +508,7 @@ def _bootstrap_impl():
         # slice before capturing so the agent still sees the requested frame
         # (resync_view_for_capture).
         os.environ["NAPARI_ASYNC"] = (
-            "1" if get_setting(config, "mcp.viewer.async_slicing") else "0"
+            "1" if get_setting(config, "viewer.async_slicing") else "0"
         )
 
         try:
@@ -619,8 +617,8 @@ def _bootstrap_impl():
     #    runs even headless where there is no Qt loop.
     try:
         conn.start_source_watch(
-            min_interval=get_setting(config, "mcp.tensor.health_poll_min_interval"),
-            max_interval=get_setting(config, "mcp.tensor.health_poll_max_interval"),
+            min_interval=get_setting(config, "tensor.health_poll_min_interval"),
+            max_interval=get_setting(config, "tensor.health_poll_max_interval"),
         )
     except Exception:
         logger.exception("Failed to start source watcher")

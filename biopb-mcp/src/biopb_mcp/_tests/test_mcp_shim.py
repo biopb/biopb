@@ -34,7 +34,7 @@ def _free_port():
 
 
 def _cfg(**transport):
-    return {"mcp": {"transport": transport}}
+    return {"transport": transport}
 
 
 # A stand-in session child: reads its port-report file from the env, binds a

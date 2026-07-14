@@ -892,14 +892,14 @@ class TestSourceWatch:
 class TestPersistUrl:
     def test_preserves_unowned_keys(self):
         # persist_url() writes via CONFIG.set, which preserves keys the service
-        # does not own (here mcp.services.process_image_servers) -- both in the
+        # does not own (here services.process_image_servers) -- both in the
         # cache and on disk.
         import json
 
         from biopb_mcp._config import CONFIG, get_config_path
 
         CONFIG.set(
-            "mcp.services.process_image_servers",
+            "services.process_image_servers",
             ["grpc://ops:5"],
             persist=False,
         )
@@ -910,11 +910,11 @@ class TestPersistUrl:
         conn.persist_url()
 
         assert CONFIG.get("tensor_browser.server_url") == "grpc://new:2"
-        assert CONFIG.get("mcp.services.process_image_servers") == ["grpc://ops:5"]
+        assert CONFIG.get("services.process_image_servers") == ["grpc://ops:5"]
         with get_config_path().open() as f:
             saved = json.load(f)
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
-        assert saved["mcp"]["services"]["process_image_servers"] == ["grpc://ops:5"]
+        assert saved["services"]["process_image_servers"] == ["grpc://ops:5"]
 
 
 # ---------------------------------------------------------------------------
@@ -966,7 +966,7 @@ class TestServerStartTimeout:
     def test_server_start_timeout_from_config(self):
         from biopb_mcp._config import CONFIG
 
-        CONFIG.set("mcp.server_start_timeout", 12.5, persist=False)
+        CONFIG.set("transport.server_start_timeout", 12.5, persist=False)
         conn = TensorConnection(config={})
         assert conn.server_start_timeout() == 12.5
 

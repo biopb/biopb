@@ -326,7 +326,7 @@ class _WidgetBase(Container):
         """Save current widget settings via the config singleton.
 
         Targeted ``CONFIG.set`` writes touch only this widget's leaves; sibling
-        keys (e.g. mcp.services.process_image_servers) are preserved. Batched
+        keys (e.g. services.process_image_servers) are preserved. Batched
         with ``persist=False`` and flushed once via ``CONFIG.save()``.
         """
         settings = self._snapshot()

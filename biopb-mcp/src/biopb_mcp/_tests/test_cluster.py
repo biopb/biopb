@@ -38,7 +38,7 @@ class _FakeCluster:
 def _cfg(**over):
     dask = {"scheduler": "distributed", "address": "", "owner": "daemon"}
     dask.update(over)
-    return {"mcp": {"dask": dask}}
+    return {"dask": dask}
 
 
 @pytest.fixture

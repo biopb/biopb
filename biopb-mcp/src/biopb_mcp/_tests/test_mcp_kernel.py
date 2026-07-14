@@ -27,7 +27,7 @@ class TestConfigureDask:
         """threads/synchronous schedulers yield no client and no cluster."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask({"mcp": {"dask": {"scheduler": "threads"}}})
+        client, cluster = _configure_dask({"dask": {"scheduler": "threads"}})
         assert client is None
         assert cluster is None
 
@@ -49,11 +49,9 @@ class TestConfigureDask:
 
         client, cluster = _configure_dask(
             {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "tcp://1.2.3.4:8786",
-                    }
+                "dask": {
+                    "scheduler": "distributed",
+                    "address": "tcp://1.2.3.4:8786",
                 }
             }
         )
@@ -78,7 +76,7 @@ class TestConfigureDask:
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
         client, cluster = _configure_dask(
-            {"mcp": {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}}
+            {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}
         )
         assert created["address"] == "tcp://daemon:8786"
         assert cluster is None
@@ -100,12 +98,10 @@ class TestConfigureDask:
 
         client, cluster = _configure_dask(
             {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "",
-                        "owner": "daemon",
-                    }
+                "dask": {
+                    "scheduler": "distributed",
+                    "address": "",
+                    "owner": "daemon",
                 }
             }
         )
@@ -137,12 +133,10 @@ class TestConfigureDask:
 
         client, cluster = _configure_dask(
             {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "",
-                        "owner": "kernel",
-                    }
+                "dask": {
+                    "scheduler": "distributed",
+                    "address": "",
+                    "owner": "kernel",
                 }
             }
         )
@@ -169,12 +163,10 @@ class TestConfigureDask:
 
         client, cluster = _configure_dask(
             {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "",
-                        "owner": "kernel",
-                    }
+                "dask": {
+                    "scheduler": "distributed",
+                    "address": "",
+                    "owner": "kernel",
                 }
             }
         )

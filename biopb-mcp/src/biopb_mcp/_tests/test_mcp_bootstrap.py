@@ -30,7 +30,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 "tok",
-                {"mcp": {"dask": {"cache_budget": "1G"}}},
+                {"dask": {"cache_budget": "1G"}},
                 planned_workers=12,
             )
         # 1G // 12 planned workers, NOT // 5 live workers
@@ -47,7 +47,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 None,
-                {"mcp": {"dask": {"cache_budget": "1G"}}},
+                {"dask": {"cache_budget": "1G"}},
             )
         assert mk.call_args.args[2] == 1_000_000_000 // 4
 
@@ -59,7 +59,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 None,
-                {"mcp": {"dask": {"cache_budget": 800_000_000}}},
+                {"dask": {"cache_budget": 800_000_000}},
                 planned_workers=2,
             )
         assert mk.call_args.args[2] == 400_000_000
@@ -76,7 +76,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://localhost:8815",
                 None,
-                {"mcp": {"dask": {"cache_budget": "4G"}}},
+                {"dask": {"cache_budget": "4G"}},
                 planned_workers=8,
             )
         assert mk.call_args.args[2] == 4_000_000_000 // 8

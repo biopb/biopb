@@ -20,7 +20,7 @@ class ObjectDetectionWidget(_WidgetBase):
         super().__init__(viewer)
 
         self._threshold = create_widget(
-            value=CONFIG.get("widget.detection.min_score"),
+            value=CONFIG.get("detection.min_score"),
             label="Min Score",
             annotation=float,
             widget_type="FloatSlider",
@@ -35,7 +35,7 @@ class ObjectDetectionWidget(_WidgetBase):
         self._use_advanced.changed.connect(self._activte_advanced_inputs)
 
         self._size_hint = create_widget(
-            value=CONFIG.get("widget.detection.size_hint"),
+            value=CONFIG.get("detection.size_hint"),
             label="Size Hint",
             annotation=float,
             widget_type="FloatSlider",
@@ -43,14 +43,14 @@ class ObjectDetectionWidget(_WidgetBase):
         )
 
         self._nms = ComboBox(
-            value=CONFIG.get("widget.detection.nms"),
+            value=CONFIG.get("detection.nms"),
             choices=["Off", "Iou-0.2", "Iou-0.4", "Iou-0.6", "Iou-0.8"],
             label="NMS",
             visible=False,
         )
 
         self._aspect_ratio = create_widget(
-            value=CONFIG.get("widget.detection.z_aspect_ratio"),
+            value=CONFIG.get("detection.z_aspect_ratio"),
             label="Z Aspect Ratio",
             options={"visible": False},
         )
@@ -145,17 +145,17 @@ class ObjectDetectionWidget(_WidgetBase):
         """Save current widget settings via the config singleton.
 
         Targeted ``CONFIG.set`` writes touch only this widget's leaves; sibling
-        keys (e.g. mcp.services.process_image_servers) are preserved. Batched
+        keys (e.g. services.process_image_servers) are preserved. Batched
         with ``persist=False`` and flushed once via ``CONFIG.save()``.
         """
         settings = self._snapshot()
         CONFIG.set("widget.server_url", settings["Server"], persist=False)
         CONFIG.set("widget.is_3d", settings["3D"], persist=False)
-        CONFIG.set("widget.detection.min_score", settings["Min Score"], persist=False)
-        CONFIG.set("widget.detection.size_hint", settings["Size Hint"], persist=False)
-        CONFIG.set("widget.detection.nms", settings["NMS"], persist=False)
+        CONFIG.set("detection.min_score", settings["Min Score"], persist=False)
+        CONFIG.set("detection.size_hint", settings["Size Hint"], persist=False)
+        CONFIG.set("detection.nms", settings["NMS"], persist=False)
         CONFIG.set(
-            "widget.detection.z_aspect_ratio",
+            "detection.z_aspect_ratio",
             settings["Z Aspect Ratio"],
             persist=False,
         )
