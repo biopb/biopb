@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
+    _SECRET_PROFILE_KEYS,
     _SECTION_FOR,
     CacheConfig,
     MetadataDbConfig,
@@ -213,13 +214,20 @@ def _sources_schema() -> Dict[str, Any]:
 
 def _credentials_schema() -> Dict[str, Any]:
     # Profile keys + their prose come from the CredentialProfile dataclass (all
-    # string-valued; description from each field's metadata["help"]).
+    # string-valued; description from each field's metadata["help"]). The secret
+    # fields (config._SECRET_PROFILE_KEYS -- the same set redact_config_secrets
+    # masks) are marked `writeOnly: true`, the standard JSON Schema flag for a
+    # value that is written but never read back; the admin editor keys its
+    # password-input masking off this flag instead of a hardcoded client list
+    # (biopb/biopb#252), so a new secret field masks automatically.
     profile_props: Dict[str, Any] = {}
     for f in dataclasses.fields(CredentialProfile):
         p: Dict[str, Any] = {"type": "string"}
         h = f.metadata.get("help")
         if h:
             p["description"] = h
+        if f.name in _SECRET_PROFILE_KEYS:
+            p["writeOnly"] = True
         profile_props[f.name] = p
     return {
         "type": "object",
