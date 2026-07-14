@@ -877,7 +877,9 @@ class TestResolveAction:
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
             bodies = [bytes(r) for r in server.do_action(None, action)]
             msgs, kinds = self._parse(bodies)
-            results = [m.result for m, k in zip(msgs, kinds) if k == "result"]
+            results = [
+                m.result for m, k in zip(msgs, kinds, strict=True) if k == "result"
+            ]
             assert len(results) == 1  # exactly one terminal descriptor
             assert kinds[-1] == "result"
             desc = results[0]
@@ -935,7 +937,9 @@ class TestResolveAction:
         assert msgs[-1].result.source_id == "slow"
         # progress heartbeats carry a monotonically non-decreasing elapsed clock
         elapsed = [
-            m.progress.elapsed_seconds for m, k in zip(msgs, kinds) if k == "progress"
+            m.progress.elapsed_seconds
+            for m, k in zip(msgs, kinds, strict=True)
+            if k == "progress"
         ]
         assert elapsed == sorted(elapsed)
         assert elapsed[-1] >= 0.0
@@ -1050,7 +1054,9 @@ class TestWarmAction:
         assert done.bytes_done == total  # every byte recalled
         # progress arms report a monotonically non-decreasing files_done
         prog_files = [
-            m.progress.files_done for m, k in zip(msgs, kinds) if k == "progress"
+            m.progress.files_done
+            for m, k in zip(msgs, kinds, strict=True)
+            if k == "progress"
         ]
         assert prog_files == sorted(prog_files)
         # guard cleaned up
@@ -1073,7 +1079,7 @@ class TestWarmAction:
         # The current_name as each file finishes, in order (dedupe consecutive
         # repeats from per-block progress): smallest first.
         names = []
-        for m, k in zip(msgs, kinds):
+        for m, k in zip(msgs, kinds, strict=True):
             if k == "progress" and m.progress.current_name:
                 if not names or names[-1] != m.progress.current_name:
                     names.append(m.progress.current_name)

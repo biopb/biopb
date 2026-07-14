@@ -166,9 +166,8 @@ ignore = [
     # autofix), NOT a verdict that they're noise. F401 and F821 (the rule that
     # caught the http_server NameError) stay ENFORCED. Tracked follow-ups to fix
     # the findings and re-enable the rest:
-    #   #163 — flake8-bugbear:          B905, B007, B008, B017, B018, B028, B011
     #   #164 — style/simplify:          SIM*, C4*, A002, G201, PIE810, E712, E722
-    "B905", "B007", "B008", "B028", "B018", "B017", "B011",
+    # (#163 flake8-bugbear — B905/B007/B008/B017/B018/B028/B011 — is fixed & enforced.)
     "A002", "G201", "PIE810",
     "SIM102", "SIM108", "SIM113", "SIM115", "SIM118", "SIM210",
     "C401", "C408", "C416",
@@ -182,3 +181,6 @@ force-single-line = false
 [tool.ruff.lint.per-file-ignores]
 # Re-export aggregator hubs: imports exist to re-export, not for local use.
 "__init__.py" = ["F401"]
+# typer CLIs: function-call defaults (typer.Option/Argument) are the framework's
+# intended pattern, not the B008 mutable-default footgun. Ignore B008 there.
+"cli.py" = ["B008"]

@@ -125,7 +125,7 @@ _MIN_PATTERN_FILES = 3
 
 def _common_prefix_len(a: str, b: str) -> int:
     n = 0
-    for ca, cb in zip(a, b):
+    for ca, cb in zip(a, b, strict=False):
         if ca != cb:
             break
         n += 1
@@ -681,7 +681,10 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         # Slice math (no I/O) needs no lock; only the per-file read below is
         # synchronized, and per file -- so a slow read of one frame no longer
@@ -1097,7 +1100,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdap
         # Only remove from non-spatial dimensions (keep y, x)
         self.full_shape = []
         self._shape_axes = []
-        for i, (size, axis) in enumerate(zip(initial_shape, shape_axes)):
+        for i, (size, axis) in enumerate(zip(initial_shape, shape_axes, strict=False)):
             if i < len(shape_axes):  # Non-spatial axis
                 if size > 1:  # Keep non-singleton dimensions
                     self.full_shape.append(size)
@@ -1179,7 +1182,10 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdap
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         # Slice math (no I/O) needs no lock; all state read below is immutable
         # after __init__. Only the per-file read is synchronized, and per file --

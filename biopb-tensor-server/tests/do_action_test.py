@@ -35,7 +35,7 @@ def test_cache_stats_action_errors_without_cache():
     server = TensorFlightServer("grpc://localhost:0")
     try:
         list(server.do_action(None, flight.Action("cache_stats", b"")))
-        assert False, "expected FlightServerError"
+        raise AssertionError("expected FlightServerError")
     except flight.FlightServerError as exc:
         assert "Cache not initialized" in str(exc)
 

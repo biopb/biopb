@@ -58,7 +58,8 @@ def _pad_shape_to_scale_multiple(
     scale_hint: Tuple[int, ...],
 ) -> Tuple[int, ...]:
     return tuple(
-        ceil_div(extent, scale) * scale for extent, scale in zip(shape, scale_hint)
+        ceil_div(extent, scale) * scale
+        for extent, scale in zip(shape, scale_hint, strict=True)
     )
 
 
@@ -69,14 +70,17 @@ def _pad_array_edge(
     if tuple(int(dim) for dim in data.shape) == tuple(int(dim) for dim in target_shape):
         return data
 
-    if any(target < current for target, current in zip(target_shape, data.shape)):
+    if any(
+        target < current
+        for target, current in zip(target_shape, data.shape, strict=True)
+    ):
         raise ValueError(
             f"Target shape {target_shape} must be >= data shape {data.shape}"
         )
 
     pad_width = [
         (0, int(target) - int(current))
-        for current, target in zip(data.shape, target_shape)
+        for current, target in zip(data.shape, target_shape, strict=True)
     ]
     if data.size == 0 or any(dim == 0 for dim in data.shape):
         return np.pad(data, pad_width, mode="constant")

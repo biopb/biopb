@@ -27,7 +27,7 @@ def _zarr_available() -> bool:
     try:
         import zarr
 
-        zarr.open_array
+        _ = zarr.open_array
         return True
     except ImportError:
         return False

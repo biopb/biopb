@@ -179,7 +179,9 @@ def normalized_slice_bounds(
             f"got start={len(start)} stop={len(stop)}"
         )
 
-    for axis, (axis_start, axis_stop, axis_shape) in enumerate(zip(start, stop, shape)):
+    for axis, (axis_start, axis_stop, axis_shape) in enumerate(
+        zip(start, stop, shape, strict=True)
+    ):
         if axis_start < 0 or axis_stop < 0:
             raise ValueError(f"Slice bounds must be non-negative on axis {axis}")
         if axis_start > axis_stop:
@@ -535,7 +537,9 @@ def build_pyramid_plan(
     )
     levels: List[PyramidLevel] = []
     for scale in scales:
-        level_shape = [ceil_div(int(dim), s) for dim, s in zip(shape, scale)]
+        level_shape = [
+            ceil_div(int(dim), s) for dim, s in zip(shape, scale, strict=True)
+        ]
         levels.append(
             PyramidLevel(
                 scale_hint=scale,

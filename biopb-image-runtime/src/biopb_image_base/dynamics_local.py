@@ -229,7 +229,7 @@ def cluster_destinations(
     # Remove implausibly large masks (matches upstream max_size_fraction guard).
     uniq, counts = np.unique(labels, return_counts=True)
     big = np.prod(shape0) * max_size_fraction
-    for lab, cnt in zip(uniq, counts):
+    for lab, cnt in zip(uniq, counts, strict=True):
         if lab != 0 and cnt > big:
             labels[labels == lab] = 0
 

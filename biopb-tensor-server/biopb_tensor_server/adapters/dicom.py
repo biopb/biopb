@@ -277,7 +277,10 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         # Serialize IO for thread safety
         with self._io_lock:
@@ -664,12 +667,17 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         import pydicom
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])
 
         # Determine output shape
-        out_shape = tuple(int(e - s) for s, e in zip(bounds.start, bounds.stop))
+        out_shape = tuple(
+            int(e - s) for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         dtype = np.dtype(self._dtype)
 
         # Serialize IO for thread safety

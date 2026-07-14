@@ -648,7 +648,7 @@ def create_zarr_array(
     )
 
     # Populate with data where each chunk has unique value
-    n_chunks_per_dim = [s // c for s, c in zip(shape, chunks)]
+    n_chunks_per_dim = [s // c for s, c in zip(shape, chunks, strict=True)]
     for chunk_indices in np.ndindex(*n_chunks_per_dim):
         # Compute chunk value based on indices
         chunk_value = sum(
@@ -656,7 +656,7 @@ def create_zarr_array(
         )
         slices = tuple(
             slice(idx * c, min((idx + 1) * c, s))
-            for idx, c, s in zip(chunk_indices, chunks, shape)
+            for idx, c, s in zip(chunk_indices, chunks, shape, strict=True)
         )
         arr[slices] = chunk_value + 1  # Avoid zero for better test visibility
 

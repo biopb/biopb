@@ -97,7 +97,7 @@ def _same_partition(a, b):
         return False
     fa, fb = a[a > 0], b[a > 0]
     a2b, b2a = {}, {}
-    for la, lb in zip(fa.tolist(), fb.tolist()):
+    for la, lb in zip(fa.tolist(), fb.tolist(), strict=True):
         if a2b.setdefault(la, lb) != lb:
             return False
         if b2a.setdefault(lb, la) != la:

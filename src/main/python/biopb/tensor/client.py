@@ -453,7 +453,7 @@ class TensorFlightClient:
             {start: index for index, start in enumerate(starts)}
             for starts in axis_starts
         ]
-        for chunk_id, bounds in zip(chunks, chunk_bounds_list):
+        for chunk_id, bounds in zip(chunks, chunk_bounds_list, strict=True):
             chunk_idx = tuple(
                 axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
             )

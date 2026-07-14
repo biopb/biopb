@@ -180,7 +180,10 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         return self.zarr_array[slices]
 
     def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
@@ -201,7 +204,8 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         if data.shape != expected_shape:
             padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
             src_slices = tuple(
-                slice(0, min(d, es)) for d, es in zip(data.shape, expected_shape)
+                slice(0, min(d, es))
+                for d, es in zip(data.shape, expected_shape, strict=True)
             )
             padded[src_slices] = data[src_slices]
             data = padded
@@ -223,21 +227,29 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         chunk_shape = list(self.zarr_array.chunks)
 
         # start must align to the chunk grid
-        for d, (start, chunk_size) in enumerate(zip(bounds.start, chunk_shape)):
+        for d, (start, chunk_size) in enumerate(
+            zip(bounds.start, chunk_shape, strict=True)
+        ):
             if start % chunk_size != 0:
                 raise ValueError(
                     f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
                 )
 
         # size may only shrink at the edge, never exceed the nominal chunk
-        actual_size = [stop - start for start, stop in zip(bounds.start, bounds.stop)]
-        for d, (actual, expected) in enumerate(zip(actual_size, chunk_shape)):
+        actual_size = [
+            stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
+        ]
+        for d, (actual, expected) in enumerate(
+            zip(actual_size, chunk_shape, strict=True)
+        ):
             if actual > expected:
                 raise ValueError(
                     f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
                 )
 
-        chunk_idx = tuple(int(s // cs) for s, cs in zip(bounds.start, chunk_shape))
+        chunk_idx = tuple(
+            int(s // cs) for s, cs in zip(bounds.start, chunk_shape, strict=True)
+        )
         self.write_chunk(chunk_idx, arr)
 
     def get_tensor_descriptor(self) -> TensorDescriptor:

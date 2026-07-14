@@ -1024,8 +1024,12 @@ class OmeZarrAdapter(ZarrAdapter):
         if slice_hint is None:
             return None
 
-        level_start = [s // sc for s, sc in zip(slice_hint.start, level_scale)]
-        level_stop = [s // sc for s, sc in zip(slice_hint.stop, level_scale)]
+        level_start = [
+            s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)
+        ]
+        level_stop = [
+            s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)
+        ]
         return SliceHint(start=level_start, stop=level_stop)
 
     def _plan_from_precomputed(

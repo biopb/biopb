@@ -448,7 +448,7 @@ def _build_slice_hint(
             detail="slice_start and slice_stop must have the same length",
         )
     # slice_hint is applied BEFORE scaling, so coordinates are in original units
-    return tuple(slice(s, e) for s, e in zip(slice_start, slice_stop))
+    return tuple(slice(s, e) for s, e in zip(slice_start, slice_stop, strict=True))
 
 
 def _dim_labels_for(

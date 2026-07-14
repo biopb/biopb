@@ -287,7 +287,7 @@ def _close_clients(clients) -> None:
 def _create_prewarmed_arrays(clients, assignments: List[Dict]) -> List:
     """Pre-create dask arrays for each client (removes get_flight_info from benchmark)."""
     arrays = []
-    for client, spec in zip(clients, assignments):
+    for client, spec in zip(clients, assignments, strict=True):
         arr = client.get_tensor(
             spec["id"],
             slice_hint=READ_WINDOW,

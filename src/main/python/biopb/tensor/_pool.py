@@ -311,8 +311,8 @@ _POOL_LOCK = threading.Lock()
 def _cleanup_connection_pool():
     """Clean up all pooled FlightClient connections on process exit."""
     with _REGISTRY_LOCK:
-        for thread_id, clients in _CONNECTION_REGISTRY.items():
-            for key, client in clients.items():
+        for _thread_id, clients in _CONNECTION_REGISTRY.items():
+            for _key, client in clients.items():
                 try:
                     client.close()
                 except Exception:
@@ -330,7 +330,7 @@ def _evict_dead_threads():
         # Check if thread is alive using threading._active (tracks all live threads)
         if thread_id not in threading._active:
             # Thread died - close all its connections
-            for key, client in clients.items():
+            for _key, client in clients.items():
                 try:
                     client.close()
                 except Exception:
@@ -738,7 +738,7 @@ def _build_dask_array_from_chunk_map(
     blocks = np.empty(grid_shape, dtype=object)
     for chunk_idx, (chunk_id, bounds) in chunk_map.items():
         chunk_shape = tuple(
-            stop - start for start, stop in zip(bounds.start, bounds.stop)
+            stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
         blocks[chunk_idx] = da.from_delayed(
             delayed(_fetch_chunk_distributed)(

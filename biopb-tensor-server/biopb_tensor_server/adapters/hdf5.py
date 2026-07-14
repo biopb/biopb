@@ -123,7 +123,10 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         return self.h5_dataset[slices]
 
     def get_tensor_descriptor(self) -> TensorDescriptor:

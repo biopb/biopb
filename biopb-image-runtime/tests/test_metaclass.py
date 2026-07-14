@@ -20,12 +20,21 @@ from biopb_image_base.common import BiopbServicerBase, abort_invalid_argument
 from biopb_image_base.mock_servicer import MockServicer
 
 
+class _GrpcAbort(Exception):
+    """Sentinel the fake context raises from abort(), mirroring grpc.
+
+    grpc._server._Context.abort raises a bare Exception; using a dedicated
+    subclass lets the tests assert precisely on the abort path (it is still an
+    Exception, so the servicer's broad handlers treat it identically).
+    """
+
+
 class FakeContext:
     """Minimal stand-in for grpc._server._Context.
 
     Mirrors the two behaviors the servicer relies on: code() returns None until
-    a status is set, and abort() records the status then raises a *bare*
-    Exception (exactly as grpc._server._Context.abort does).
+    a status is set, and abort() records the status then raises (as
+    grpc._server._Context.abort does).
     """
 
     def __init__(self):
@@ -35,7 +44,7 @@ class FakeContext:
     def abort(self, code, details):
         self._code = code
         self._details = details
-        raise Exception()  # noqa: TRY002 - mimic grpc's bare-Exception abort
+        raise _GrpcAbort()
 
     def code(self):
         return self._code
@@ -86,7 +95,7 @@ def test_helpers_are_not_wrapped():
 def test_no_boilerplate_translates_value_error():
     servicer = _RaisesValueError(use_lock=False)
     ctx = FakeContext()
-    with pytest.raises(Exception):
+    with pytest.raises(_GrpcAbort):
         servicer.RunDetection(object(), ctx)
     assert ctx.code() == grpc.StatusCode.INVALID_ARGUMENT
 
@@ -95,7 +104,7 @@ def test_explicit_boilerplate_translates_once():
     # Outer (metaclass) + inner (explicit) wrap: reentrancy => single translation.
     servicer = _ExplicitBoilerplate(use_lock=False)
     ctx = FakeContext()
-    with pytest.raises(Exception):
+    with pytest.raises(_GrpcAbort):
         servicer.RunDetection(object(), ctx)
     assert ctx.code() == grpc.StatusCode.INVALID_ARGUMENT
 
@@ -104,7 +113,7 @@ def test_direct_abort_status_is_preserved():
     # A direct context.abort() must keep INVALID_ARGUMENT, not become INTERNAL.
     servicer = _DirectAbort(use_lock=False)
     ctx = FakeContext()
-    with pytest.raises(Exception):
+    with pytest.raises(_GrpcAbort):
         servicer.Run(object(), ctx)
     assert ctx.code() == grpc.StatusCode.INVALID_ARGUMENT
 
@@ -112,6 +121,6 @@ def test_direct_abort_status_is_preserved():
 def test_streaming_handler_translates_errors():
     servicer = _StreamRaises(use_lock=False)
     ctx = FakeContext()
-    with pytest.raises(Exception):
+    with pytest.raises(_GrpcAbort):
         list(servicer.RunStream(iter([]), ctx))
     assert ctx.code() == grpc.StatusCode.INVALID_ARGUMENT
