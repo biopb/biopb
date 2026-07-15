@@ -32,13 +32,21 @@ def create_synthetic_qptiff(
     n_channels: int = 3,
     base: int = 512,
     n_levels: int = 3,
-    markers=("DAPI", "CD8", "PanCK"),
+    baseline_marker: str = "DAPI",
     tile: int = 256,
 ):
     """Write a minimal pyramidal multichannel QPTIFF tifffile can read.
 
     Level 0 is (n_channels, base, base); each further level halves Y/X. Returns the
     full-resolution numpy array (c, y, x) for round-trip comparison.
+
+    Only the *baseline* page (channel 0) carries a vendor <Name>. A real QPTIFF
+    names every channel page, but tifffile's writer can't reproduce that here: the
+    moment its pages carry differing ImageDescriptions it splits them into separate
+    series, which would collapse the (c, y, x) tensor the read path needs -- and a
+    single multichannel write attaches the description to page 0 only. So this
+    fixture exercises "one named channel, the rest unnamed", which is exactly the
+    positional/gap case get_metadata must not truncate.
     """
     data = np.arange(n_channels * base * base, dtype=np.uint16).reshape(
         n_channels, base, base
@@ -49,11 +57,10 @@ def create_synthetic_qptiff(
             arr = data[:, ::step, ::step]
             opts = dict(photometric="minisblack", tile=(tile, tile))
             if lvl == 0:
-                # Marker name in the first channel page's vendor XML.
                 tw.write(
                     arr,
                     subifds=n_levels - 1,
-                    description=_QPI_DESC.format(name=markers[0]),
+                    description=_QPI_DESC.format(name=baseline_marker),
                     **opts,
                 )
             else:
@@ -246,11 +253,16 @@ class TestQptiffAdapter:
     def test_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
-            create_synthetic_qptiff(p, markers=("DAPI", "CD8", "PanCK"))
+            create_synthetic_qptiff(p, n_channels=3, baseline_marker="DAPI")
             meta = _adapter(p).get_metadata()
             assert meta["format"] == "qptiff"
-            # First channel page carries the marker name in the vendor XML.
-            assert "DAPI" in meta.get("channels", [])
+            # channels is positional (one entry per channel): the named baseline
+            # plus None gaps -- NOT collapsed to ["DAPI"], which would misalign.
+            assert meta["channels"] == ["DAPI", None, None]
+            # Vendor XML is returned whole, not sliced to a byte cap.
+            assert meta["image_description"].endswith(
+                "</PerkinElmer-QPI-ImageDescription>"
+            )
 
 
 class TestQptiffAdapterIntegration:

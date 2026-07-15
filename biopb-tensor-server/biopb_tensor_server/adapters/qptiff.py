@@ -503,16 +503,22 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
                 base = self.get_tensor_descriptor()
                 labels = list(base.dim_labels)
                 n_channels = int(base.shape[labels.index("c")]) if "c" in labels else 1
-                channels = []
-                for pg in self._tiff.pages[:n_channels]:
-                    nm = self._marker_name(pg.description or "")
-                    if nm:
-                        channels.append(nm)
-                if channels:
-                    meta["channels"] = channels
+                # One entry per channel, positionally (None where a page has no
+                # vendor name). Do NOT drop the gaps: collapsing them shortens the
+                # list and misaligns it with the channel axis, so a consumer would
+                # attribute names to the wrong channels.
+                names = [
+                    self._marker_name(pg.description or "")
+                    for pg in self._tiff.pages[:n_channels]
+                ]
+                if any(names):
+                    meta["channels"] = names
+                # Full page-0 vendor XML -- not truncated. It is fetched only on a
+                # metadata request (never in list_flights) and a hard byte cap
+                # could sever a multi-KB Akoya block mid-element.
                 d0 = self._tiff.pages[0].description or ""
                 if d0:
-                    meta["image_description"] = d0[:4000]
+                    meta["image_description"] = d0
                 aux = [
                     str(s.name)
                     for s in self._tiff.series[1:]
