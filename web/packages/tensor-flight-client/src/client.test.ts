@@ -470,8 +470,8 @@ describe("TensorHttpClient.browse", () => {
     expect(r.entries[0]!.is_dir).toBe(true);
   });
 
-  it("throws TensorApiError when browsing is unavailable (remote mode 404)", async () => {
-    mockFetch.mockResolvedValueOnce(errorResponse(404, "File browsing is available only in local mode"));
+  it("throws TensorApiError when browsing is unavailable (token-gated 404)", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(404, "File browsing is available only on a tokenless local server"));
     const c = new TensorHttpClient(BASE, TOKEN);
     await expect(c.browse("/data")).rejects.toThrow(TensorApiError);
   });

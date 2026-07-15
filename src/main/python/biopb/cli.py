@@ -2068,7 +2068,9 @@ def control_start(
         "--token",
         help="Access token (or set BIOPB_TENSOR_TOKEN). Enforced in either mode: "
         "required for --remote (auto-generated if omitted), optional in local "
-        "mode (defense-in-depth on a shared machine; loopback bind either way).",
+        "mode (loopback bind either way). A local token gates the browser too, "
+        "and biopb-mcp then needs BIOPB_TENSOR_TOKEN in its own environment to "
+        "reach the data plane (biopb/biopb#470).",
     ),
     data_plane: bool = typer.Option(
         True,
@@ -2320,7 +2322,9 @@ def control_run(
         "--token",
         help="Access token (or set BIOPB_TENSOR_TOKEN). Enforced in either mode: "
         "required for --remote (auto-generated if omitted), optional in local "
-        "mode (defense-in-depth on a shared machine; loopback bind either way).",
+        "mode (loopback bind either way). A local token gates the browser too, "
+        "and biopb-mcp then needs BIOPB_TENSOR_TOKEN in its own environment to "
+        "reach the data plane (biopb/biopb#470).",
     ),
     data_plane: bool = typer.Option(
         True,

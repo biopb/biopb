@@ -192,8 +192,18 @@ class TensorConnection:
         control (see :meth:`auto_connect`); this resolves only the fallback used
         when no control is reachable. Fallback order for the URL:
         ``BIOPB_TENSOR_URL`` env -> ``tensor_browser.server_url`` config ->
-        default. The token still comes from ``BIOPB_TENSOR_TOKEN`` (the control
-        does not mint one for localhost planes).
+        default.
+
+        The token comes from ``BIOPB_TENSOR_TOKEN`` **only** — and note this is
+        the sole way we can learn one, since the control's ensure reply carries
+        the plane's endpoint but no credential. That is fine for a tokenless
+        local plane and for a remote one (whose token the user supplies out of
+        band), but a *local plane behind an optional token* leaves us unable to
+        authenticate unless that token also reaches this process's environment —
+        which it does not when an agent spawns biopb-mcp over stdio. The user
+        recovers by entering the token in the Tensor Browser or exporting
+        ``BIOPB_TENSOR_TOKEN``; the real fix is a local credential handoff (see
+        biopb/biopb#470).
         """
         url = os.environ.get("BIOPB_TENSOR_URL") or get_setting(
             config, "tensor_browser.server_url"
