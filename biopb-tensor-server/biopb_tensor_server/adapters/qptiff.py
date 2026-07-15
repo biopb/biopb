@@ -246,10 +246,16 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
             slice(int(s), int(e))
             for s, e in zip(bounds.start, bounds.stop, strict=True)
         )
-        with self._io_lock:
-            za, _ = self._level_store(level)
-            # Copy out of the store so the returned array is independent of it.
-            return np.asarray(za[slices])
+        # _level_store takes the lock only for the lazy open + cache; the read
+        # itself runs WITHOUT our lock so parallel do_get chunk reads decode
+        # concurrently. tifffile already makes this safe: its aszarr store
+        # serializes the raw seek+read on one shared handle lock (fh.lock, the
+        # same RLock across all our per-level stores), and the tile decode
+        # (imagecodecs: LZW for Akoya component data, JPEG for RGB overviews, ...)
+        # is per-tile into a fresh buffer, so concurrent reads cannot race. Copy
+        # out so the result is independent of the store.
+        za, _ = self._level_store(level)
+        return np.asarray(za[slices])
 
     def close(self) -> None:
         with self._io_lock:
