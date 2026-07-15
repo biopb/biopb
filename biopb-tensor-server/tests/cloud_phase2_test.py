@@ -181,6 +181,52 @@ class TestContentFreeClaimsDoNotRead:
         assert claim is not None
         assert claim.source_type == NdTiffAdapter.SOURCE_TYPE
 
+    def test_qptiff_claims_by_extension_without_opening_file(
+        self, tmp_path, monkeypatch
+    ):
+        # Suffix-only claim (biopb/biopb#135): a .qptiff is claimed recall-free --
+        # even under a cloud root, where a byte read recalls the whole placeholder.
+        # The dropped .tif vendor-XML sniff opened the file with tifffile.TiffFile
+        # (not ctx.read_text, so _RaisingReadCtx alone wouldn't catch it), so make
+        # TiffFile explode to prove claim() never reaches it. Deferring a
+        # non-resident file is the manager's job (_claim_is_unresolved), not
+        # claim()'s, so the claim itself is definite here -- like CZI/NIfTI.
+        import tifffile
+        from biopb_tensor_server.adapters.qptiff import QptiffAdapter
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("claim() must not open the file (recall under cloud)")
+
+        monkeypatch.setattr(tifffile, "TiffFile", _boom)
+
+        f = tmp_path / "slide.qptiff"
+        f.write_bytes(b"II*\x00not-a-real-qptiff")
+        claim = QptiffAdapter.claim(
+            _RaisingReadCtx(f, cloud_root=True), DiscoveryState()
+        )
+        assert claim is not None
+        assert claim.source_type == "qptiff"
+        assert claim.unresolved is False
+
+    def test_qptiff_declines_tif_recall_free_under_cloud(self, tmp_path, monkeypatch):
+        # The other half of the suffix-only policy: a .tif QPTIFF is NOT sniffed,
+        # so QptiffAdapter declines it without opening the file (it falls through
+        # to the generic bioio adapter). Guards that no sniff creeps back in.
+        import tifffile
+        from biopb_tensor_server.adapters.qptiff import QptiffAdapter
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("declining a .tif must not open the file")
+
+        monkeypatch.setattr(tifffile, "TiffFile", _boom)
+
+        f = tmp_path / "slide.tif"
+        f.write_bytes(b"II*\x00not-a-real-qptiff")
+        claim = QptiffAdapter.claim(
+            _RaisingReadCtx(f, cloud_root=True), DiscoveryState()
+        )
+        assert claim is None
+
 
 # --------------------------------------------------------------------------- #
 # Reader adapters: residency-guarded defer branch

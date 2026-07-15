@@ -825,6 +825,10 @@ ndtiff = [
 nifti = [
     { name = "nibabel" },
 ]
+qptiff = [
+    { name = "imagecodecs", version = "2025.3.30", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "imagecodecs", version = "2026.1.14", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 test = [
     { name = "fastapi" },
     { name = "httpx" },
@@ -863,6 +867,7 @@ requires-dist = [
     { name = "fsspec" },
     { name = "h5py", marker = "extra == 'hdf5'", specifier = ">=3.0.0" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.25.0" },
+    { name = "imagecodecs", marker = "extra == 'qptiff'", specifier = ">=2023.1.23" },
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.18.0" },
     { name = "ndtiff", marker = "extra == 'ndtiff'", specifier = ">=3.0.0" },
     { name = "nibabel", marker = "extra == 'medical'", specifier = ">=5.0.0" },
@@ -883,7 +888,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = ">=0.30.0" },
     { name = "zarr", specifier = ">=2.0.0,<3" },
 ]
-provides-extras = ["web", "test", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical"]
+provides-extras = ["web", "test", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff"]
 
 [[package]]
 name = "black"

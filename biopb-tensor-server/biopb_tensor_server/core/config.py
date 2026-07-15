@@ -328,6 +328,7 @@ class SourceConfig:
             "ome-zarr",
             "ome-zarr-hcs",
             "aics",
+            "qptiff",
             "tensor-server",
         ]
     ] = field(

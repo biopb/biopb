@@ -28,6 +28,17 @@ try:
 except ImportError:
     NdTiffAdapter = None  # type: ignore
 
+# QPTIFF (Akoya PhenoImager) reads via tifffile (a core dep), but decoding its
+# compressed tiles (JPEG/LZW) needs imagecodecs -- gate on it so a slim install
+# without imagecodecs simply doesn't claim .qptiff rather than claim-then-error
+# at read (biopb/biopb#135).
+try:
+    import imagecodecs  # noqa: F401
+
+    from .qptiff import QptiffAdapter
+except ImportError:
+    QptiffAdapter = None  # type: ignore
+
 # Optional bioio adapters (format-specific subclasses)
 try:
     from .bioio import (
@@ -74,6 +85,7 @@ __all__ = [
     "RemoteTensorAdapter",
     "NdTiffAdapter",
     "OmeTiffAdapter",
+    "QptiffAdapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",
@@ -92,6 +104,8 @@ def get_default_registry() -> AdapterRegistry:
 
     Adapter registration order (by priority/specificity, highest first):
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
+    - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
+      native pyramid)
     - ZeissAdapter - Zeiss microscopy (CZI, LSM)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
@@ -119,6 +133,15 @@ def get_default_registry() -> AdapterRegistry:
     # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
     # declines falls through to the generic bioio adapter registered below.
     registry.register_with_type("ome-tiff", OmeTiffAdapter)
+
+    # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
+    # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not
+    # sniffed (that read is unsafe under cloud and wasteful without caching), so
+    # it falls through to bioio unless configured with an explicit type: qptiff.
+    # Registration order is claim probe order; callers take claims[0]. See
+    # biopb/biopb#135.
+    if QptiffAdapter is not None:
+        registry.register_with_type("qptiff", QptiffAdapter)
 
     # Register bioio-based adapters in priority order (most specific first)
     if ZeissAdapter is not None:
