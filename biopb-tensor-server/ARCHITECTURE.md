@@ -812,6 +812,8 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
+| `BIOPB_OMETIFF_PARALLEL_READ` | `OmeTiffAdapter.get_data` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**: reads decode under the lock, as before. |
+| `BIOPB_TIFF_STORE_TTL` | OME-TIFF store reaper | Seconds an idle OME-TIFF `aszarr` store handle is kept warm before the reaper closes it (default `300`). |
 
 ---
 
