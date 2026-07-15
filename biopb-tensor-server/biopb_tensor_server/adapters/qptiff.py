@@ -238,25 +238,46 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
 
     def close(self) -> None:
         with self._io_lock:
-            for _za, store in self._level_stores.values():
-                try:
-                    store.close()
-                except Exception:
-                    logger.debug("error closing qptiff level store", exc_info=True)
-            self._level_stores.clear()
-            self._level_adapters.clear()
-            if self._tiff is not None:
-                try:
-                    self._tiff.close()
-                except Exception:
-                    logger.debug("error closing qptiff handle", exc_info=True)
-            self._tiff = None
-            self._series = None
-            self._cached_descriptor = None
+            self._close_handles()
+
+    def _close_handles(self) -> None:
+        """Close the tifffile handle + per-level stores; allow a later reopen.
+
+        Caller holds ``self._io_lock`` (the explicit ``close()``) or is the GC
+        finalizer (no references left, so no read can be in flight -- no lock
+        needed). Nulls the instance refs *before* closing so a concurrent reopen,
+        were one possible, sees a clean slate; reads them via ``getattr`` so a
+        finalizer running after a half-finished ``__init__`` can't raise. Safe to
+        call repeatedly.
+        """
+        stores = getattr(self, "_level_stores", None) or {}
+        tiff = getattr(self, "_tiff", None)
+        self._level_stores = {}
+        self._level_adapters = {}
+        self._tiff = None
+        self._series = None
+        self._cached_descriptor = None
+        for _za, store in list(stores.values()):
+            try:
+                store.close()
+            except Exception:
+                logger.debug("error closing qptiff level store", exc_info=True)
+        if tiff is not None:
+            try:
+                tiff.close()
+            except Exception:
+                logger.debug("error closing qptiff handle", exc_info=True)
 
     def __del__(self):
+        # GC backstop: release the handle even without an explicit close(), but
+        # WITHOUT taking _io_lock -- acquiring a lock in a finalizer can deadlock
+        # against a thread that holds it, or touch torn-down globals at interpreter
+        # shutdown. By the time GC collects this adapter no references remain, so
+        # no read can be in flight and the lock is unnecessary (the OmeTiffAdapter
+        # pattern). The registry's unregister/shutdown path calls close() for the
+        # locked, in-flight-safe release.
         try:
-            self.close()
+            self._close_handles()
         except Exception:
             pass
 
