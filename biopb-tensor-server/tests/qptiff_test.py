@@ -65,6 +65,32 @@ def _adapter(path: Path) -> QptiffAdapter:
     return QptiffAdapter.create_from_config(SourceConfig(url=str(path)))
 
 
+def _wait_until_serving(port: int, timeout: float = 5.0) -> None:
+    """Block until the server reports SERVING, or raise past the deadline.
+
+    More reliable than a fixed sleep: the port binds the moment serve() runs, but
+    a read races if it lands before mark_ready(), and a fixed sleep is both slower
+    on a warm machine and flakier under CI load. Retry on FlightUnavailableError
+    (port not up yet) and STARTING until health flips to SERVING.
+    """
+    import json
+
+    from pyarrow import flight
+
+    deadline = time.monotonic() + timeout
+    with flight.FlightClient(f"grpc://localhost:{port}") as probe:
+        while True:
+            try:
+                (raw,) = list(probe.do_action(flight.Action("health", b"")))
+                if json.loads(raw.body.to_pybytes()).get("status") == "SERVING":
+                    return
+            except flight.FlightUnavailableError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"server on :{port} did not reach SERVING in time")
+            time.sleep(0.02)
+
+
 class TestQptiffAdapterClaim:
     def test_claim_qptiff_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -245,7 +271,7 @@ class TestQptiffAdapterIntegration:
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)
             t.start()
-            time.sleep(1)
+            _wait_until_serving(server.port)
             try:
                 client = TensorFlightClient(
                     f"grpc://localhost:{server.port}", cache_bytes=10_000_000
