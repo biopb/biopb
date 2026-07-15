@@ -146,7 +146,8 @@ function Show-Summary {
     Write-Host ""
 
     if ($Result.WebappInstalled) {
-        Write-Inf "Web interface available at http://localhost:8814"
+        Write-Inf "Web interface available at http://localhost:8813"
+        Write-Inf "  open it anytime with: biopb dashboard (or the Desktop shortcut)"
         Write-Host ""
     }
 
@@ -170,8 +171,8 @@ function Show-Summary {
     Write-Host ""
 
     if (-not $Result.WebappInstalled) {
-        Write-Warn2 "Web interface not installed (`$env:BIOPB_INSTALL_WEBAPP = `"0`")"
-        Write-Inf "  rerun without that env var to install it"
+        Write-Warn2 "Web interface not installed (download failed)"
+        Write-Inf "  the dashboard won't work until you rerun this script to fetch it"
         Write-Host ""
     }
 
@@ -203,14 +204,12 @@ try {
 
     # ----- Resolve component choices (no longer prompted -- biopb/biopb#237) -----
 
-    # Components are no longer offered interactively. The web interface now carries
-    # the server admin page (config / status / restart) on top of the image viewer,
-    # so it installs by default. Bio-Formats stays off by default: the Python
-    # adapters cover the formats most labs use, and it pulls a heavyweight Java
-    # toolchain. Both remain overridable for scripted installs via env vars:
-    #   $env:BIOPB_INSTALL_WEBAPP = "0"      skip the web interface (API-only server)
+    # Components are no longer offered interactively. The web interface is mandatory
+    # (the dashboard is the SPA; a legacy $env:BIOPB_INSTALL_WEBAPP=0 is ignored).
+    # Bio-Formats stays off by default: the Python adapters cover the formats most
+    # labs use, and it pulls a heavyweight Java toolchain. Overridable for scripted
+    # installs via env var:
     #   $env:BIOPB_INSTALL_BIOFORMATS = "1"  add Bio-Formats (Java fetched on first use)
-    $installWebapp     = ($env:BIOPB_INSTALL_WEBAPP -ne '0')
     $installBioformats = ($env:BIOPB_INSTALL_BIOFORMATS -eq '1')
 
     # Data directory / keep-config decision. No prompt: a fresh install lets the
@@ -279,7 +278,6 @@ try {
     # ----- Drive the engine in-process, rendering its progress in color (-Mode console) -----
     $result = Invoke-BiopbInstall `
         -DataDir $dataDir `
-        -Webapp:$installWebapp `
         -Bioformats:$installBioformats `
         -KeepConfig:$keepConfig `
         -NoRemotePlugins:$noRemotePlugins `

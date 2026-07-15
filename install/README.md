@@ -71,7 +71,8 @@ are produced.
 - **napari** — from PyPI, into the same environment.
 - **Web interface** — `webapp.tar.gz` from the same release, unpacked to
   `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin
-  page; installed by default (set `BIOPB_INSTALL_WEBAPP=0` to skip).
+  page, and is the dashboard `biopb dashboard` opens, so it is **always
+  installed** (not optional).
 - **A "biopb Dashboard" Desktop shortcut** that runs `biopb dashboard` — start
   the control plane (if it isn't already up) and open the dashboard in your
   default browser. Set `BIOPB_INSTALL_SHORTCUT=0` to skip creating it. You can
