@@ -763,15 +763,16 @@ _install_desktop_shortcut() {
     local biopb_bin
     biopb_bin=$(command -v biopb 2>/dev/null || echo "$HOME/.local/bin/biopb")
 
+    # Only place an icon where a desktop already exists -- creating ~/Desktop on a
+    # headless box (a compute node, a container) would leave a launcher nobody sees.
     local desktop_dir="$HOME/Desktop"
-    mkdir -p "$desktop_dir" 2>/dev/null || true
     [ -d "$desktop_dir" ] || { _note "No Desktop directory; skipping shortcut"; return 0; }
 
     case "$PLATFORM" in
         macOS)
             # A .command file is the standard double-clickable launcher on macOS.
             local shortcut="$desktop_dir/biopb Dashboard.command"
-            cat > "$shortcut" <<EOF
+            cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
 #!/bin/bash
 # biopb Dashboard — starts the control plane (if needed) and opens the browser.
 exec "$biopb_bin" dashboard
@@ -781,7 +782,7 @@ EOF
             ;;
         Linux|WSL)
             local shortcut="$desktop_dir/biopb-dashboard.desktop"
-            cat > "$shortcut" <<EOF
+            cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
 [Desktop Entry]
 Type=Application
 Name=biopb Dashboard
