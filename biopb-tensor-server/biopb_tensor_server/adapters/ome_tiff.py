@@ -320,6 +320,21 @@ _open_store_lock = threading.Lock()
 _reaper_started = False
 
 
+def _parallel_read_enabled() -> bool:
+    """Whether OME-TIFF chunk reads decode lock-free (biopb/biopb#473).
+
+    Default **off**: ``get_data`` holds ``_io_lock`` across the whole read+decode,
+    exactly as before this flag existed, so nothing changes unless opted in. Set
+    ``BIOPB_OMETIFF_PARALLEL_READ=1`` to serve reads lock-free -- tifffile
+    serializes the raw seek+read on the store's own shared handle lock and the tile
+    decode is per-tile into a fresh buffer, so concurrent decodes run in parallel
+    (the ``_active_reads`` counter then guards the reaper). Read at call time so a
+    process (or a test) can toggle it without reimport; the cost is one dict lookup
+    per chunk, negligible against a tile read.
+    """
+    return os.environ.get("BIOPB_OMETIFF_PARALLEL_READ", "0") == "1"
+
+
 def _register_store_adapter(adapter: "OmeTiffAdapter") -> None:
     """Track an OME-TIFF adapter holding an open persistent store; start the reaper."""
     global _reaper_started
@@ -462,13 +477,19 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's tifffile aszarr store.
 
-        Validates bounds, then acquires the persistent store and registers the read
-        as in-flight under ``_io_lock`` -- but serves the slice **without** holding
-        it. tifffile already serializes the raw seek+read on the store's own shared
-        handle lock, and the tile decode is per-tile into a fresh buffer, so
-        concurrent reads are thread-safe and their decodes run in parallel (holding
-        ``_io_lock`` across the whole read would needlessly serialize them). The
-        ``_active_reads`` guard stops the reaper from closing the store mid-read.
+        Two read modes, selected by ``BIOPB_OMETIFF_PARALLEL_READ``
+        (:func:`_parallel_read_enabled`, default **off**):
+
+        - **Default** -- acquire the store and serve the slice entirely under
+          ``_io_lock``, so concurrent chunk reads of one scene are serialized. This
+          is the long-standing behavior; a store held under the lock is never closed
+          mid-read, so the ``_active_reads`` guard is not needed.
+        - **Opt-in lock-free** -- hold ``_io_lock`` only to acquire the store and
+          register the read as in-flight, then decode **without** it. tifffile
+          serializes the raw seek+read on the store's own shared handle lock and the
+          tile decode is per-tile into a fresh buffer, so concurrent reads are
+          thread-safe and their decodes run in parallel; ``_active_reads`` stops the
+          reaper from closing the store mid-read (biopb/biopb#473).
 
         Raises:
             ValueError: bad bounds, source-level adapter, or store unavailable.
@@ -481,15 +502,18 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
             slice(int(s), int(e))
             for s, e in zip(bounds.start, bounds.stop, strict=True)
         )
+
+        if not _parallel_read_enabled():
+            # Default: read+decode under _io_lock (concurrent reads serialized).
+            with self._io_lock:
+                za, axes = self._acquire_store_or_raise()
+                result = self._read_region(za, axes, slices)
+                self._persistent_last_access = time.monotonic()
+                return result
+
+        # Opt-in lock-free: register the read as in-flight, decode without the lock.
         with self._io_lock:
-            opened = self._ensure_store()
-            if opened is None:
-                raise ValueError(
-                    f"OME-TIFF aszarr store unavailable for {self._source_url!r} "
-                    f"(scene {self.scene_index})"
-                )
-            za, axes = opened
-            self._persistent_last_access = time.monotonic()
+            za, axes = self._acquire_store_or_raise()
             self._active_reads += 1
         try:
             return self._read_region(za, axes, slices)
@@ -497,6 +521,23 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
             with self._io_lock:
                 self._active_reads -= 1
                 self._persistent_last_access = time.monotonic()
+
+    def _acquire_store_or_raise(self):
+        """Open (or reuse) the persistent aszarr store; stamp last-access.
+
+        Caller must hold ``_io_lock``. Returns ``(zarr_array, axes)``.
+
+        Raises:
+            ValueError: the store is unavailable for this scene.
+        """
+        opened = self._ensure_store()
+        if opened is None:
+            raise ValueError(
+                f"OME-TIFF aszarr store unavailable for {self._source_url!r} "
+                f"(scene {self.scene_index})"
+            )
+        self._persistent_last_access = time.monotonic()
+        return opened
 
     # ---- descriptors --------------------------------------------------------
 
