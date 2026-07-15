@@ -19,7 +19,7 @@ import biopb.image as proto
 from biopb_image_base import (
     run_server,            # Run server (optionally with embedded cache)
     decode_image_data,     # Decode ImageData to numpy/dask
-    encode_image,          # Encode numpy array to ImageData (eager)
+    return_lazy_or_eager,  # Return result inline (small) or as a lazy tensor ref (large)
     BiopbServicerBase,     # Base class for servicers
 )
 
@@ -58,17 +58,23 @@ docker run --rm -p 50051:50051 \
     python /opt/biopb/my_servicer.py
 ```
 
-### Update biopb-mcp config
+### Register the server with biopb-mcp
 
-Update the field `mcp.services.process_image_servers`
-to include your new server:
+Add your server's URL to the `services.process_image_servers` list in the
+biopb-mcp config (`~/.config/biopb/mcp-config.json`):
+
 ``` json
-"mcp": {
+{
     "services": {
         "process_image_servers": ["grpc://your_ip_address:50051"]
     }
 }
 ```
+
+Each URL is queried via `GetOpNames` and exposed as callables in the kernel's
+`ops` dict. You can also edit this without touching the file: the browser
+dashboard's **MCP Settings** page (served by the control) edits the same
+`mcp-config.json`.
 
 ## Architecture
 This subproject provides:
