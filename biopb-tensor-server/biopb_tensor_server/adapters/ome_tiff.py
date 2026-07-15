@@ -350,11 +350,17 @@ def _store_reaper_loop() -> None:
                 last = getattr(adapter, "_persistent_last_access", now)
                 if now - last <= _STORE_TTL_SECONDS:
                     continue
-                # Only close when no read is in flight; recheck under the lock.
+                # Only close when idle AND no read is in flight. Reads no longer
+                # hold _io_lock for their duration (only to bump _active_reads), so
+                # the counter -- not lock contention -- is what proves no lock-free
+                # read is mid-flight on this store.
                 if adapter._io_lock.acquire(blocking=False):
                     try:
                         idle = time.monotonic() - adapter._persistent_last_access
-                        if idle > _STORE_TTL_SECONDS:
+                        if (
+                            idle > _STORE_TTL_SECONDS
+                            and getattr(adapter, "_active_reads", 0) == 0
+                        ):
                             adapter._close_persistent_store()
                     finally:
                         adapter._io_lock.release()
@@ -431,6 +437,11 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
         self._persistent_tiff = None
         self._persistent_attempted = False
         self._persistent_last_access = 0.0
+        # In-flight lock-free reads on this scene's store. get_data holds _io_lock
+        # only to acquire the store + bookkeep, then reads without it (tifffile
+        # serializes the raw read on its own handle lock); this counter is what
+        # keeps the reaper from closing the store mid-read.
+        self._active_reads = 0
 
         # Cache of the embedded OME-XML string (biopb/biopb#168), shared by the
         # descriptor, metadata, and physical-scale paths so registration opens the
@@ -451,9 +462,13 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's tifffile aszarr store.
 
-        Validates bounds against the tensor descriptor, then serves the slice from
-        the persistent store under ``_io_lock`` (a single shared file handle, read
-        on this thread via the synchronous scheduler).
+        Validates bounds, then acquires the persistent store and registers the read
+        as in-flight under ``_io_lock`` -- but serves the slice **without** holding
+        it. tifffile already serializes the raw seek+read on the store's own shared
+        handle lock, and the tile decode is per-tile into a fresh buffer, so
+        concurrent reads are thread-safe and their decodes run in parallel (holding
+        ``_io_lock`` across the whole read would needlessly serialize them). The
+        ``_active_reads`` guard stops the reaper from closing the store mid-read.
 
         Raises:
             ValueError: bad bounds, source-level adapter, or store unavailable.
@@ -475,7 +490,13 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                 )
             za, axes = opened
             self._persistent_last_access = time.monotonic()
+            self._active_reads += 1
+        try:
             return self._read_region(za, axes, slices)
+        finally:
+            with self._io_lock:
+                self._active_reads -= 1
+                self._persistent_last_access = time.monotonic()
 
     # ---- descriptors --------------------------------------------------------
 
@@ -562,10 +583,17 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
         """Release the persistent file handle and cascade to scene adapters.
 
         Scene adapters share this adapter's ``_io_lock`` (non-reentrant), so the
-        cascade runs WITHOUT holding it.
+        cascade runs WITHOUT holding it. Reads no longer hold ``_io_lock`` for
+        their duration, so drain any in-flight lock-free read first (bounded, so
+        teardown never hangs) -- a read must never decode from a closed handle.
         """
-        with self._io_lock:
-            self._close_persistent_store()
+        deadline = time.monotonic() + 5.0
+        while True:
+            with self._io_lock:
+                if self._active_reads == 0 or time.monotonic() >= deadline:
+                    self._close_persistent_store()
+                    break
+            time.sleep(0.005)
         for adapter in list(getattr(self, "_tensor_adapters", {}).values()):
             if adapter is not self:
                 try:
