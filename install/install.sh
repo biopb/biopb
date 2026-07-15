@@ -749,6 +749,66 @@ _precompile_bytecode() {
     _ok "Bytecode precompiled (first viewer launch will be faster)"
 }
 
+# Drop a double-clickable "biopb Dashboard" shortcut on the user's Desktop that
+# runs `biopb dashboard` (start the control plane if needed, then open the
+# browser). Best-effort: a failure only means no icon, never aborts the install.
+# Skip with BIOPB_INSTALL_SHORTCUT=0. GUI launchers do NOT inherit the shell
+# PATH, so the shortcut invokes biopb by its absolute path. Requires PLATFORM set.
+_install_desktop_shortcut() {
+    if [ "${BIOPB_INSTALL_SHORTCUT:-1}" = "0" ]; then
+        _note "Desktop shortcut skipped (BIOPB_INSTALL_SHORTCUT=0)"
+        return 0
+    fi
+
+    local biopb_bin
+    biopb_bin=$(command -v biopb 2>/dev/null || echo "$HOME/.local/bin/biopb")
+
+    # Only place an icon where a desktop already exists -- creating ~/Desktop on a
+    # headless box (a compute node, a container) would leave a launcher nobody sees.
+    local desktop_dir="$HOME/Desktop"
+    [ -d "$desktop_dir" ] || { _note "No Desktop directory; skipping shortcut"; return 0; }
+
+    case "$PLATFORM" in
+        macOS)
+            # A .command file is the standard double-clickable launcher on macOS.
+            local shortcut="$desktop_dir/biopb Dashboard.command"
+            cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
+#!/bin/bash
+# biopb Dashboard — starts the control plane (if needed) and opens the browser.
+exec "$biopb_bin" dashboard
+EOF
+            chmod +x "$shortcut" 2>/dev/null || true
+            _ok "Desktop shortcut created: $shortcut"
+            ;;
+        Linux|WSL)
+            local shortcut="$desktop_dir/biopb-dashboard.desktop"
+            cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
+[Desktop Entry]
+Type=Application
+Name=biopb Dashboard
+Comment=Start the biopb control plane and open the dashboard
+Exec=$biopb_bin dashboard
+Terminal=false
+Categories=Science;Education;
+EOF
+            chmod +x "$shortcut" 2>/dev/null || true
+            # GNOME/Nautilus won't run a launcher on double-click until it is
+            # marked trusted; best-effort (an absent/older gio just no-ops).
+            gio set "$shortcut" metadata::trusted true 2>/dev/null || true
+            # Also register it in the app menu so it's findable without the icon.
+            local apps_dir="$HOME/.local/share/applications"
+            if mkdir -p "$apps_dir" 2>/dev/null; then
+                cp -f "$shortcut" "$apps_dir/biopb-dashboard.desktop" 2>/dev/null || true
+            fi
+            _ok "Desktop shortcut created: $shortcut"
+            ;;
+        *)
+            _note "Desktop shortcut not supported on this platform"
+            ;;
+    esac
+    return 0
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -1220,7 +1280,22 @@ install_biopb() {
     # or the untouched existing file when the user keeps it (shown in the summary).
     local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
-        _ok "Keeping current config: $EXISTING_CONFIG"
+        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
+        # convert it in place to the canonical JSON via `biopb server
+        # migrate-config` (settings preserved verbatim, old file backed up to
+        # biopb.toml.bak) so an upgraded install stops warning about the
+        # deprecated format. A JSON config is already canonical -- nothing to do.
+        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && command -v biopb >/dev/null 2>&1; then
+            _info "Migrating legacy TOML config to canonical JSON..."
+            if biopb server migrate-config >/dev/null 2>&1; then
+                ACTIVE_CONFIG="$CONFIG_FILE"
+                _ok "Migrated config: $LEGACY_CONFIG -> $CONFIG_FILE (old file backed up)"
+            else
+                _warn "Could not migrate legacy config; keeping $LEGACY_CONFIG"
+            fi
+        else
+            _ok "Keeping current config: $EXISTING_CONFIG"
+        fi
     else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
@@ -1278,6 +1353,9 @@ install_biopb() {
     _step "[7/7] Starting control plane..."
     _start_control_plane
 
+    # Drop a "biopb Dashboard" launcher on the Desktop (runs `biopb dashboard`).
+    _install_desktop_shortcut
+
     # ===== Summary =====
     # Two groups, in order: all informational blocks, then all warnings. Every
     # block is one headline line, optional indented detail lines, then one blank
@@ -1291,6 +1369,7 @@ install_biopb() {
     # --- informational blocks ---
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         _info "Web interface available at http://localhost:8813"
+        _info "  open it anytime with: ${CYAN}biopb dashboard${RESET} (or the Desktop shortcut)"
         echo ""
     fi
 

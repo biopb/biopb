@@ -72,6 +72,10 @@ are produced.
 - **Web interface** — `webapp.tar.gz` from the same release, unpacked to
   `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin
   page; installed by default (set `BIOPB_INSTALL_WEBAPP=0` to skip).
+- **A "biopb Dashboard" Desktop shortcut** that runs `biopb dashboard` — start
+  the control plane (if it isn't already up) and open the dashboard in your
+  default browser. Set `BIOPB_INSTALL_SHORTCUT=0` to skip creating it. You can
+  run `biopb dashboard` from a terminal at any time instead.
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Cursor, opencode, Hermes) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
@@ -81,8 +85,9 @@ are produced.
 ## Config & data locations
 
 - Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
-  legacy `biopb.toml` still loads and is migrated to JSON when you pick a new
-  data folder)
+  legacy `biopb.toml` still loads and is migrated to JSON on rerun — via
+  `biopb server migrate-config`, or automatically when you pick a new data
+  folder)
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Webapp: `~/.local/share/biopb/webapp`

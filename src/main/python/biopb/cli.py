@@ -2366,6 +2366,67 @@ def control_run(
 app.add_typer(control_app, name="control")
 
 
+@app.command("dashboard")
+def dashboard(
+    remote: bool = typer.Option(
+        False,
+        "--remote",
+        help="If the control plane isn't already running, start it in remote mode "
+        "(bind publicly behind a token). See 'biopb control start --remote'.",
+    ),
+    no_browser: bool = typer.Option(
+        False,
+        "--no-browser",
+        help="Ensure the control plane is up but only print the dashboard URL "
+        "instead of opening a browser.",
+    ),
+):
+    """Open the biopb dashboard, starting the control plane first if needed.
+
+    The one-command way in: it makes sure the control plane (which owns the data
+    plane and serves the web UI) is running, then points your default web browser
+    at the dashboard. Idempotent -- if the control plane is already up it just
+    opens the page. This is what the desktop shortcut the installer creates runs.
+    """
+    control_host, control_port = _control_endpoint()
+    url = f"http://{control_host}:{control_port}"
+
+    if _port_listening(control_host, control_port):
+        console.print(f"[green]biopb control plane already running[/green] ({url})")
+    else:
+        # Reuse `biopb control start`'s full start/port-guard/readiness logic (it
+        # returns only once the control API is listening). It signals its outcome
+        # by raising typer.Exit; a non-zero code means the plane never came up, so
+        # bail out rather than open a browser at a dead URL.
+        try:
+            control_start(
+                config=DEFAULT_CONFIG,
+                static_dir=DEFAULT_WEBAPP,
+                web_port=8814,
+                log_level="INFO",
+                remote=remote,
+                token=None,
+                data_plane=True,
+            )
+        except typer.Exit as started:
+            if started.exit_code:
+                raise
+
+    if no_browser:
+        console.print(f"Dashboard: {url}")
+        raise typer.Exit(0)
+
+    import webbrowser
+
+    console.print(f"[green]Opening the dashboard:[/green] {url}")
+    if not webbrowser.open(url):
+        console.print(
+            "[yellow]Could not open a browser automatically.[/yellow] "
+            f"Open this URL manually: {url}"
+        )
+    raise typer.Exit(0)
+
+
 # ---------------------------------------------------------------------------
 # biopb agents: register biopb-mcp with local AI agent clients
 # ---------------------------------------------------------------------------

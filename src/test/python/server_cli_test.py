@@ -1213,6 +1213,67 @@ class TestMigrateConfig:
         assert (tmp_path / "biopb.json").exists()
 
 
+class TestDashboardCommand:
+    """`biopb dashboard`: ensure the control plane is up, then open the browser.
+
+    The command is the desktop shortcut's target and the one-liner install
+    summary points users at. It reuses `control_start` for the actual startup,
+    so these tests mock both the port probe and the browser to stay hermetic.
+    """
+
+    def test_already_running_opens_browser_without_starting(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        start = MagicMock()
+        monkeypatch.setattr(cli, "control_start", start)
+        opened = []
+        with patch("webbrowser.open", lambda url: opened.append(url) or True):
+            res = CliRunner().invoke(cli.app, ["dashboard"])
+        assert res.exit_code == 0, res.output
+        start.assert_not_called()  # already up -> no start attempt
+        assert opened == ["http://127.0.0.1:8813"]
+
+    def test_starts_control_plane_when_not_listening(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        start = MagicMock(side_effect=typer.Exit(0))
+        monkeypatch.setattr(cli, "control_start", start)
+        opened = []
+        with patch("webbrowser.open", lambda url: opened.append(url) or True):
+            res = CliRunner().invoke(cli.app, ["dashboard"])
+        assert res.exit_code == 0, res.output
+        start.assert_called_once()
+        # remote defaults off; local mode carries no token.
+        assert start.call_args.kwargs["remote"] is False
+        assert opened == ["http://127.0.0.1:8813"]
+
+    def test_start_failure_aborts_without_opening_browser(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(cli, "control_start", MagicMock(side_effect=typer.Exit(1)))
+        opened = []
+        with patch("webbrowser.open", lambda url: opened.append(url) or True):
+            res = CliRunner().invoke(cli.app, ["dashboard"])
+        assert res.exit_code == 1
+        assert opened == []  # never point a browser at a dead URL
+
+    def test_no_browser_prints_url_only(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        monkeypatch.setattr(cli, "control_start", MagicMock())
+        opened = []
+        with patch("webbrowser.open", lambda url: opened.append(url) or True):
+            res = CliRunner().invoke(cli.app, ["dashboard", "--no-browser"])
+        assert res.exit_code == 0, res.output
+        assert opened == []
+        assert "http://127.0.0.1:8813" in res.output
+
+    def test_remote_flag_forwarded_to_control_start(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        start = MagicMock(side_effect=typer.Exit(0))
+        monkeypatch.setattr(cli, "control_start", start)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(cli.app, ["dashboard", "--remote"])
+        assert res.exit_code == 0, res.output
+        assert start.call_args.kwargs["remote"] is True
+
+
 class TestVersionCommand:
     """`biopb version` reports the release-v* deployment version (from the
     installer's marker file) plus each of the three bundled wheels, resolved
