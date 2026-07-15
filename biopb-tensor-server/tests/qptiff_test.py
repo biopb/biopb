@@ -136,50 +136,65 @@ class TestQptiffAdapter:
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p, n_channels=3, base=512, tile=256)
-            desc = _adapter(p).get_tensor_descriptor()
-            assert list(desc.shape) == [3, 512, 512]
-            assert list(desc.dim_labels) == ["c", "y", "x"]
-            assert desc.dtype == np.dtype("uint16").str
-            # Native tile grid as the advertised access chunk.
-            assert list(desc.chunk_shape) == [1, 256, 256]
+            adapter = _adapter(p)
+            try:
+                desc = adapter.get_tensor_descriptor()
+                assert list(desc.shape) == [3, 512, 512]
+                assert list(desc.dim_labels) == ["c", "y", "x"]
+                assert desc.dtype == np.dtype("uint16").str
+                # Native tile grid as the advertised access chunk.
+                assert list(desc.chunk_shape) == [1, 256, 256]
+            finally:
+                adapter.close()
 
     def test_get_data_subregion(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             data = create_synthetic_qptiff(p)
-            sub = _adapter(p).get_data(
-                ChunkBounds(start=[0, 10, 20], stop=[2, 100, 200])
-            )
-            np.testing.assert_array_equal(sub, data[0:2, 10:100, 20:200])
+            adapter = _adapter(p)
+            try:
+                sub = adapter.get_data(
+                    ChunkBounds(start=[0, 10, 20], stop=[2, 100, 200])
+                )
+                np.testing.assert_array_equal(sub, data[0:2, 10:100, 20:200])
+            finally:
+                adapter.close()
 
     def test_get_data_out_of_bounds(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p, base=512)
-            with pytest.raises(ValueError):
-                _adapter(p).get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 999, 512]))
+            adapter = _adapter(p)
+            try:
+                with pytest.raises(ValueError):
+                    adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 999, 512]))
+            finally:
+                adapter.close()
 
     def test_native_pyramid_levels(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p, n_channels=3, base=512, n_levels=3)
             adapter = _adapter(p)
-            assert adapter.has_native_pyramid()
-            levels = adapter.get_native_pyramid_levels()
-            assert [list(lv.shape) for lv in levels] == [
-                [3, 512, 512],
-                [3, 256, 256],
-                [3, 128, 128],
-            ]
-            # Level 0 = [1,1,1]; each further level doubles the Y/X factor.
-            assert [list(lv.scale_hint) for lv in levels] == [
-                [1, 1, 1],
-                [1, 2, 2],
-                [1, 4, 4],
-            ]
-            assert all(
-                lv.native and lv.reduction_method == "precompute" for lv in levels
-            )
+            try:
+                assert adapter.has_native_pyramid()
+                levels = adapter.get_native_pyramid_levels()
+                assert [list(lv.shape) for lv in levels] == [
+                    [3, 512, 512],
+                    [3, 256, 256],
+                    [3, 128, 128],
+                ]
+                # Level 0 = [1,1,1]; each further level doubles the Y/X factor.
+                assert [list(lv.scale_hint) for lv in levels] == [
+                    [1, 1, 1],
+                    [1, 2, 2],
+                    [1, 4, 4],
+                ]
+                assert all(
+                    lv.native and lv.reduction_method == "precompute" for lv in levels
+                )
+            finally:
+                adapter.close()
 
     def test_single_level_advertises_computed_not_native_pyramid(self):
         # A QPTIFF with no on-disk pyramid (1 level) must NOT advertise a native
@@ -193,49 +208,64 @@ class TestQptiffAdapter:
             p = Path(tmp) / "flat.qptiff"
             data = create_synthetic_qptiff(p, n_channels=2, base=256, n_levels=1)
             adapter = _adapter(p)
-            assert adapter._n_levels() == 1
-            assert adapter.has_native_pyramid() is False
-            assert adapter.get_native_pyramid_levels() is None
+            try:
+                assert adapter._n_levels() == 1
+                assert adapter.has_native_pyramid() is False
+                assert adapter.get_native_pyramid_levels() is None
 
-            desc = adapter.get_tensor_descriptor()
-            # Forced low threshold -> the computed plan has >=2 levels, all
-            # native=False / reduction=area (on-the-fly downsample from level 0).
-            cfg = PyramidConfig(
-                reduction_method="area",
-                threshold=64,
-                downscale_factor=4,
-                pixel_budget_cubic_root=512,
-            )
-            levels = adapter._advertised_pyramid(desc, cfg)
-            assert len(levels) >= 2
-            assert all(not lv.native for lv in levels)
-            assert [list(lv.scale_hint) for lv in levels] == [[1, 1, 1], [1, 4, 4]]
-            # Full read still round-trips through the base (non-precompute) path.
-            full = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=list(desc.shape)))
-            np.testing.assert_array_equal(full, data)
+                desc = adapter.get_tensor_descriptor()
+                # Forced low threshold -> the computed plan has >=2 levels, all
+                # native=False / reduction=area (on-the-fly downsample from level 0).
+                cfg = PyramidConfig(
+                    reduction_method="area",
+                    threshold=64,
+                    downscale_factor=4,
+                    pixel_budget_cubic_root=512,
+                )
+                levels = adapter._advertised_pyramid(desc, cfg)
+                assert len(levels) >= 2
+                assert all(not lv.native for lv in levels)
+                assert [list(lv.scale_hint) for lv in levels] == [
+                    [1, 1, 1],
+                    [1, 4, 4],
+                ]
+                # Full read still round-trips through the base (non-precompute) path.
+                full = adapter.get_data(
+                    ChunkBounds(start=[0, 0, 0], stop=list(desc.shape))
+                )
+                np.testing.assert_array_equal(full, data)
+            finally:
+                adapter.close()
 
     def test_read_plan_routes_to_native_level(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p, n_channels=3, base=512, n_levels=3)
             adapter = _adapter(p)
-            # Request the [1,2,2] level via precompute.
-            req = TensorDescriptor(
-                array_id=adapter.array_id,
-                dim_labels=["c", "y", "x"],
-                shape=[3, 512, 512],
-                dtype=np.dtype("uint16").str,
-                scale_hint=[1, 2, 2],
-                reduction_method="precompute",
-            )
-            plan = adapter.get_read_plan(req)
-            # Chunk_ids carry the level suffix so DoGet dispatches to the level.
-            assert plan.chunk_endpoints
-            level_adapter = adapter.get_level_adapter("1")
-            assert level_adapter.get_tensor_descriptor().array_id == (
-                f"{adapter.source_id}/1"
-            )
-            assert list(level_adapter.get_tensor_descriptor().shape) == [3, 256, 256]
+            try:
+                # Request the [1,2,2] level via precompute.
+                req = TensorDescriptor(
+                    array_id=adapter.array_id,
+                    dim_labels=["c", "y", "x"],
+                    shape=[3, 512, 512],
+                    dtype=np.dtype("uint16").str,
+                    scale_hint=[1, 2, 2],
+                    reduction_method="precompute",
+                )
+                plan = adapter.get_read_plan(req)
+                # Chunk_ids carry the level suffix so DoGet dispatches to the level.
+                assert plan.chunk_endpoints
+                level_adapter = adapter.get_level_adapter("1")
+                assert level_adapter.get_tensor_descriptor().array_id == (
+                    f"{adapter.source_id}/1"
+                )
+                assert list(level_adapter.get_tensor_descriptor().shape) == [
+                    3,
+                    256,
+                    256,
+                ]
+            finally:
+                adapter.close()
 
     def test_level_adapter_is_a_full_backend(self):
         # The level adapter must be a genuine source+tensor adapter (like
@@ -248,54 +278,67 @@ class TestQptiffAdapter:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p, n_channels=3, base=512, n_levels=3)
             adapter = _adapter(p)
-            lvl = adapter.get_level_adapter("1")
+            try:
+                lvl = adapter.get_level_adapter("1")
 
-            assert isinstance(lvl, SourceAdapter) and isinstance(lvl, TensorAdapter)
-            # Identity is built by the base array_id property from source_id +
-            # _tensor_name, not hardcoded into the descriptor.
-            assert lvl.source_id == adapter.source_id
-            assert lvl._tensor_name == "1"
-            assert lvl.array_id == f"{adapter.source_id}/1"
-            # Source-level surface resolves without AttributeError, and carries the
-            # real file url + this format (not ZarrAdapter's synthetic-store repr).
-            assert lvl.source_url == adapter._source_url
-            assert lvl.source_type == "qptiff"
-            src_desc = lvl.get_source_descriptor()
-            assert src_desc.source_id == adapter.source_id
-            assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
-                f"{adapter.source_id}/1"
-            ]
-            # Cached: repeated calls return the same instance.
-            assert adapter.get_level_adapter("1") is lvl
+                assert isinstance(lvl, SourceAdapter) and isinstance(lvl, TensorAdapter)
+                # Identity is built by the base array_id property from source_id +
+                # _tensor_name, not hardcoded into the descriptor.
+                assert lvl.source_id == adapter.source_id
+                assert lvl._tensor_name == "1"
+                assert lvl.array_id == f"{adapter.source_id}/1"
+                # Source-level surface resolves without AttributeError, and carries
+                # the real file url + this format (not ZarrAdapter's synthetic-store
+                # repr).
+                assert lvl.source_url == adapter._source_url
+                assert lvl.source_type == "qptiff"
+                src_desc = lvl.get_source_descriptor()
+                assert src_desc.source_id == adapter.source_id
+                assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
+                    f"{adapter.source_id}/1"
+                ]
+                # Cached: repeated calls return the same instance.
+                assert adapter.get_level_adapter("1") is lvl
+            finally:
+                adapter.close()
 
     def test_read_plan_unknown_scale_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p)
-            req = TensorDescriptor(
-                array_id="x",
-                shape=[3, 512, 512],
-                dim_labels=["c", "y", "x"],
-                dtype=np.dtype("uint16").str,
-                scale_hint=[1, 3, 3],  # no such level
-                reduction_method="precompute",
-            )
-            with pytest.raises(ValueError):
-                _adapter(p).get_read_plan(req)
+            adapter = _adapter(p)
+            try:
+                req = TensorDescriptor(
+                    array_id="x",
+                    shape=[3, 512, 512],
+                    dim_labels=["c", "y", "x"],
+                    dtype=np.dtype("uint16").str,
+                    scale_hint=[1, 3, 3],  # no such level
+                    reduction_method="precompute",
+                )
+                with pytest.raises(ValueError):
+                    adapter.get_read_plan(req)
+            finally:
+                adapter.close()
 
     def test_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
             create_synthetic_qptiff(p, n_channels=3, baseline_marker="DAPI")
-            meta = _adapter(p).get_metadata()
-            assert meta["format"] == "qptiff"
-            # channels is positional (one entry per channel): the named baseline
-            # plus None gaps -- NOT collapsed to ["DAPI"], which would misalign.
-            assert meta["channels"] == ["DAPI", None, None]
-            # Vendor XML is returned whole, not sliced to a byte cap.
-            assert meta["image_description"].endswith(
-                "</PerkinElmer-QPI-ImageDescription>"
-            )
+            adapter = _adapter(p)
+            try:
+                meta = adapter.get_metadata()
+                assert meta["format"] == "qptiff"
+                # channels is positional (one entry per channel): the named
+                # baseline plus None gaps -- NOT collapsed to ["DAPI"], which
+                # would misalign.
+                assert meta["channels"] == ["DAPI", None, None]
+                # Vendor XML is returned whole, not sliced to a byte cap.
+                assert meta["image_description"].endswith(
+                    "</PerkinElmer-QPI-ImageDescription>"
+                )
+            finally:
+                adapter.close()
 
 
 class TestQptiffAdapterIntegration:
