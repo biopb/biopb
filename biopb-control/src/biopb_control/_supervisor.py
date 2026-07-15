@@ -52,9 +52,10 @@ class DataPlaneSpec:
 
     ``grpc_host`` / ``grpc_port`` are the loopback-reachable endpoint the
     liveness probe connects to (a server bound to 0.0.0.0/:: is reached over
-    127.0.0.1). ``token`` is the data-plane access token the caller resolved for
-    the chosen mode: a value in remote mode, ``None`` in local mode (every
-    listener loopback-bound, so no token is enforced).
+    127.0.0.1). ``token`` is the data-plane access token the caller resolved:
+    always set in remote mode, and ``None`` in local mode *unless* a token was
+    supplied there too (local mode allows an optional token — enforcement is
+    independent of the loopback/public bind).
     """
 
     config: Path
@@ -134,9 +135,10 @@ class DataPlaneSupervisor:
         env = os.environ.copy()
         if self._spec.token:
             env["BIOPB_TENSOR_TOKEN"] = self._spec.token
-        # No token (local mode): the tensor `launch` runs tokenless on its own
-        # because the config binds the flight server to loopback — no bypass
-        # signal is needed or read anymore.
+        # No token resolved (tokenless local mode): the tensor `launch` runs
+        # tokenless on its own because the config binds the flight server to
+        # loopback — no bypass signal is needed or read anymore. (A local
+        # deployment *may* still carry a token; then the branch above sets it.)
         #
         # Mark the plane as control-owned so its HTTP sidecar refuses the admin
         # self-restart (`biopb server restart`), which would race this supervisor

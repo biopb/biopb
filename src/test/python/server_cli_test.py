@@ -882,29 +882,65 @@ class TestControlRunArgv:
 
 
 class TestResolveMode:
-    """`_resolve_mode` is the single fail-closed rule tying the token to the
-    deployment mode (the security-model simplification): local = tokenless +
-    loopback-only; remote = public + token required."""
+    """`_resolve_mode` decides the enforced token. Token enforcement is
+    independent of the network mode (a token is allowed in *either*); the single
+    fail-closed rule is that a public listener is never left unauthenticated:
+    remote always carries a token, and a local mode with a public flight bind is
+    refused unless a token is supplied."""
 
     @pytest.fixture(autouse=True)
     def _loopback_flight(self, monkeypatch):
-        # Default the flight bind to loopback; individual tests override.
+        # Default the flight bind to loopback; individual tests override. Clear any
+        # ambient BIOPB_TENSOR_TOKEN so "tokenless" cases resolve deterministically
+        # (the resolver now reads the env token in either mode).
         monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "127.0.0.1")
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
 
-    def test_local_loopback_is_tokenless(self, tmp_path):
+    def test_local_loopback_is_tokenless_by_default(self, tmp_path):
         assert cli._resolve_mode(tmp_path / "c.json", remote=False, token=None) is None
 
-    def test_local_rejects_explicit_token(self, tmp_path):
-        # A token only makes sense in remote mode; local + --token is a usage error.
-        with pytest.raises(typer.Exit):
-            cli._resolve_mode(tmp_path / "c.json", remote=False, token="abc123")
+    def test_local_accepts_explicit_token(self, tmp_path):
+        # A token is now allowed in local mode (defense-in-depth on a shared
+        # machine); it is enforced across the loopback-bound listeners.
+        assert (
+            cli._resolve_mode(
+                tmp_path / "c.json", remote=False, token="local-token-0123456"
+            )
+            == "local-token-0123456"
+        )
 
-    def test_local_refuses_public_flight_bind(self, tmp_path, monkeypatch):
+    def test_local_reads_env_token(self, tmp_path, monkeypatch):
+        # The token travels via BIOPB_TENSOR_TOKEN in either mode; local mode now
+        # honors it too (matching what the supervised child already enforces).
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token-0123456789")
+        assert (
+            cli._resolve_mode(tmp_path / "c.json", remote=False, token=None)
+            == "env-token-0123456789"
+        )
+
+    def test_local_rejects_malformed_token(self, tmp_path):
+        # A supplied-but-malformed token is refused in local mode too, so it is
+        # never silently ignored downstream (which would leave the listeners open).
+        with pytest.raises(typer.Exit):
+            cli._resolve_mode(tmp_path / "c.json", remote=False, token="too-short")
+
+    def test_public_flight_refused_when_tokenless(self, tmp_path, monkeypatch):
         # Fail-closed: a config that binds the flight server publicly must not run
         # tokenless. This is the guard that makes "public + open" unrepresentable.
         monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "0.0.0.0")
         with pytest.raises(typer.Exit):
             cli._resolve_mode(tmp_path / "c.json", remote=False, token=None)
+
+    def test_local_public_flight_bind_allowed_with_token(self, tmp_path, monkeypatch):
+        # A token satisfies the fail-closed guard: a public flight bind behind a
+        # token is authenticated, so it is representable without --remote.
+        monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "0.0.0.0")
+        assert (
+            cli._resolve_mode(
+                tmp_path / "c.json", remote=False, token="local-token-0123456"
+            )
+            == "local-token-0123456"
+        )
 
     def test_remote_uses_supplied_token(self, tmp_path):
         assert (
