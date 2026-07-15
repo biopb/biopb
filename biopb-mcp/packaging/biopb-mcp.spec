@@ -1,6 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec file for biopb-mcp bundled application."""
+"""PyInstaller spec file for the biopb-mcp bundled desktop application.
 
+This spec and its build inputs -- ``main.py`` (the bundle entry point), the
+``hooks/`` dir, and the ``logo.ico`` / ``logo.icns`` app icons -- live together
+under ``biopb-mcp/packaging/``. Every input path below is anchored to ``SPECPATH``
+(the directory holding this spec, injected by PyInstaller), so the build works no
+matter which directory ``pyinstaller`` is invoked from.
+"""
+
+import os
 import sys
 from PyInstaller.building.build_main import Analysis, PYZ, EXE, COLLECT, BUNDLE
 from PyInstaller.utils.hooks import copy_metadata
@@ -37,11 +45,11 @@ for pkg in [
 
 
 def get_icon():
-    """Return platform-appropriate icon file."""
+    """Return the platform-appropriate icon file (anchored to this spec's dir)."""
     if sys.platform.startswith("win"):
-        return "logo.ico"
+        return os.path.join(SPECPATH, "logo.ico")
     elif sys.platform == "darwin":
-        return "logo.icns"
+        return os.path.join(SPECPATH, "logo.icns")
     return None
 
 
@@ -83,8 +91,8 @@ def get_version():
 
 
 a = Analysis(
-    ["main.py"],
-    hookspath=["hooks"],
+    [os.path.join(SPECPATH, "main.py")],
+    hookspath=[os.path.join(SPECPATH, "hooks")],
     excludes=[
         "FixTk",
         "tcl",
