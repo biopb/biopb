@@ -43,6 +43,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter, TensorReadPlan
 from biopb_tensor_server.core.chunk import normalized_scale_hint
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
@@ -80,30 +81,6 @@ def _default_dim_labels(ndim: int) -> List[str]:
     if ndim == 4:
         return ["c", "z", "y", "x"]
     return [f"dim{i}" for i in range(ndim - 2)] + ["y", "x"]
-
-
-class _QptiffLevelAdapter(TensorAdapter):
-    """Tensor adapter bound to one native pyramid level of a QPTIFF source.
-
-    Holds only ``(parent, level, descriptor)`` and delegates reads to the parent's
-    shared ``tifffile`` handle, so all levels share one open file. ``DoGet`` reaches
-    this via ``QptiffAdapter.get_level_adapter`` when a chunk's ``array_id`` carries
-    a ``/{level}`` suffix.
-    """
-
-    def __init__(
-        self, parent: "QptiffAdapter", level: int, descriptor: TensorDescriptor
-    ):
-        self._parent = parent
-        self._level = level
-        self._descriptor = descriptor
-
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        return self._descriptor
-
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        super().get_data(bounds)  # validate bounds against this level's descriptor
-        return self._parent._read_level(self._level, bounds)
 
 
 class QptiffAdapter(SourceAdapter, TensorAdapter):
@@ -166,8 +143,9 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
         self._url = url or ""
         self._source_url = url or ""
         self._source_type = self.SOURCE_TYPE
-        # Reentrant: _read_level holds the lock and calls _level_store, which also
-        # acquires it. One lock serialises all access to the single tifffile handle.
+        # One lock serialises the open/cache and metadata paths over the single
+        # tifffile handle; reads run lock-free (see _read_level). RLock keeps it
+        # safe should any of those paths ever acquire it while already held.
         self._io_lock = io_lock if io_lock is not None else threading.RLock()
 
         self._dim_labels_override = list(dim_labels) if dim_labels else None
@@ -176,7 +154,7 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
         self._tiff = None
         self._series = None
         self._level_stores: dict = {}  # level -> (zarr_array, store)
-        self._level_adapters: dict = {}  # level -> _QptiffLevelAdapter
+        self._level_adapters: dict = {}  # level -> ZarrAdapter (native-level backend)
         self._cached_descriptor: Optional[TensorDescriptor] = None
 
     # ---- tifffile handle / level stores ------------------------------------
@@ -423,28 +401,40 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
         read_plan.descriptor.array_id = self.array_id
         return read_plan
 
-    def get_level_adapter(self, path: str) -> _QptiffLevelAdapter:
-        """Tensor adapter for a native level, keyed by its integer index.
+    def get_level_adapter(self, path: str) -> ZarrAdapter:
+        """Full backend adapter for a native level, keyed by its integer index.
 
         Reached by ``DoGet`` for ``precompute`` chunks (``array_id`` suffix
         ``/{level}``) via the server's duck-typed ``get_level_adapter`` dispatch.
+
+        Each level's ``aszarr`` store is already a real ``zarr`` array, so -- like
+        ``OmeZarrAdapter`` -- the level adapter is a bare ``ZarrAdapter`` over it
+        with ``source_id`` inherited and ``_tensor_name = str(level)``. The base
+        ``array_id`` property then yields ``source_id/{level}``; nothing hardcodes
+        the identifier. This keeps the level adapter a genuine ``BackendAdapter``
+        (not a partial ``TensorAdapter``), so any caller that treats it as a full
+        source -- metadata-DB sync, source-level ops -- finds the attributes it
+        expects. All levels share the parent's one open ``tifffile`` handle (the
+        ``aszarr`` stores reference it), and ``ZarrAdapter`` holds no handle of its
+        own, so the parent's ``close()`` remains the single owner of teardown.
         """
         level = int(path)
         cached = self._level_adapters.get(level)
         if cached is not None:
             return cached
         za, _ = self._level_store(level)
-        shape = self._level_shape(level)
-        desc = TensorDescriptor(
-            array_id=f"{self.source_id}/{level}",
-            dim_labels=self.get_tensor_descriptor().dim_labels,
-            shape=list(shape),
-            chunk_shape=list(za.chunks),
-            dtype=za.dtype.str,
+        level_adapter = ZarrAdapter(
+            za,
+            source_id=self.source_id,
+            dim_labels=list(self.get_tensor_descriptor().dim_labels),
         )
-        adapter = _QptiffLevelAdapter(self, level, desc)
-        self._level_adapters[level] = adapter
-        return adapter
+        level_adapter._tensor_name = str(level)
+        # Point provenance at the real file + this format, not ZarrAdapter's
+        # synthetic store repr / "zarr" default (the aszarr store has no path).
+        level_adapter._source_url = self._source_url
+        level_adapter._source_type = self.SOURCE_TYPE
+        self._level_adapters[level] = level_adapter
+        return level_adapter
 
     # ---- metadata / physical scale -----------------------------------------
 

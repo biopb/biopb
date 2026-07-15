@@ -171,6 +171,37 @@ class TestQptiffAdapter:
             )
             assert list(level_adapter.get_tensor_descriptor().shape) == [3, 256, 256]
 
+    def test_level_adapter_is_a_full_backend(self):
+        # The level adapter must be a genuine source+tensor adapter (like
+        # OME-Zarr's ZarrAdapter level), not a partial TensorAdapter that
+        # hardcodes array_id -- so code treating it as a full backend (metadata-DB
+        # sync, source-level ops) finds source_id/array_id/source_url.
+        from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "slide.qptiff"
+            create_synthetic_qptiff(p, n_channels=3, base=512, n_levels=3)
+            adapter = _adapter(p)
+            lvl = adapter.get_level_adapter("1")
+
+            assert isinstance(lvl, SourceAdapter) and isinstance(lvl, TensorAdapter)
+            # Identity is built by the base array_id property from source_id +
+            # _tensor_name, not hardcoded into the descriptor.
+            assert lvl.source_id == adapter.source_id
+            assert lvl._tensor_name == "1"
+            assert lvl.array_id == f"{adapter.source_id}/1"
+            # Source-level surface resolves without AttributeError, and carries the
+            # real file url + this format (not ZarrAdapter's synthetic-store repr).
+            assert lvl.source_url == adapter._source_url
+            assert lvl.source_type == "qptiff"
+            src_desc = lvl.get_source_descriptor()
+            assert src_desc.source_id == adapter.source_id
+            assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
+                f"{adapter.source_id}/1"
+            ]
+            # Cached: repeated calls return the same instance.
+            assert adapter.get_level_adapter("1") is lvl
+
     def test_read_plan_unknown_scale_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
