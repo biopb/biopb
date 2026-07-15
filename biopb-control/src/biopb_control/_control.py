@@ -130,11 +130,22 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # to bring the plane up, and it is idempotent (spawns the plane the control
 # already owns), so it stays open rather than forcing the mcp client to carry the
 # token (the accepted #417 posture). The dangerous verbs (stop/restart) and the
-# enumerating reads (status/sessions) are gated. Residual (biopb/biopb#424 item
-# 2): in remote mode this is an unauthenticated public state-change, but idempotent
-# and non-destructive, so it is accepted rather than gated — biopb-mcp (the only
-# caller) is local-only and a local control is tokenless, so gating it would buy
-# nothing in the supported modes.
+# enumerating reads (status/sessions) are gated.
+#
+# Residual (biopb/biopb#424 item 2): this is an unauthenticated state-change on
+# any token-gated deployment. It is idempotent and non-destructive, so it is
+# accepted rather than gated. The exemption is *load-bearing*, not merely
+# tolerated: _control_client has no way to obtain the token (the control hands
+# back the plane's endpoint but never a credential), so gating this route would
+# lock biopb-mcp out of a gated deployment entirely.
+#
+# NOTE: the old rationale for deferring #424's fix — "a local control is
+# tokenless, so gating it would buy nothing in the supported modes" — no longer
+# holds now that local mode accepts an optional token. On a shared host (the
+# scenario that motivates a local token) loopback is reachable by every uid, so
+# an untrusted local user can drive this route on a deployment the owner asked
+# to gate. Dropping the exemption is blocked on giving local clients a
+# credential path -- see biopb/biopb#470.
 _AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
 
 # Data-plane log tail (the dashboard /logs page polls it). Bound BOTH the returned
@@ -406,8 +417,9 @@ def build_app(
     def health(_request: Request) -> JSONResponse:
         # `auth_required` is the SPA's public probe: the browser bundle + this
         # endpoint stay unauthenticated always, and the app reads this to decide
-        # whether to gate itself behind the unlock page. True in remote mode (a
-        # token gates /api/* and the proxied data plane), False in local mode.
+        # whether to gate itself behind the unlock page. It tracks the *token*,
+        # not the network mode: always true in remote (which requires one), and
+        # true in local mode too when an optional token was supplied.
         return JSONResponse(
             {
                 "control": "ok",

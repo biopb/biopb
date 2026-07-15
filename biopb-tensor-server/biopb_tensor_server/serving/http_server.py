@@ -1324,10 +1324,17 @@ async def admin_status(request: Request) -> JSONResponse:
             # Control-owned: the admin UI must route a restart through the
             # control, not the sidecar self-restart (biopb/biopb#418).
             "supervised": ctx.supervised,
-            # Local mode ⇔ no token enforced (every listener loopback-bound, one
-            # machine). It is the single two-mode signal (biopb/biopb#447): the
-            # admin UI keys the local-only server-side file chooser (#244) off it,
-            # since in local mode the server's filesystem *is* the user's own box.
+            # No token enforced. The admin UI keys the local-only server-side file
+            # chooser (#244) off this, since a tokenless plane is loopback-bound
+            # and its filesystem *is* the user's own box.
+            #
+            # KNOWN LIMITATION: this is a proxy for topology, not topology itself.
+            # It was exact while the two-mode model tied the token to the bind
+            # (biopb/biopb#447), but local mode now accepts an optional token, so a
+            # loopback-bound plane behind one reports false here and loses the file
+            # chooser even though its filesystem really is the user's own box. It
+            # fails closed (a feature hides), so it is accepted for now; the fix is
+            # to derive this from the actual bind. See biopb/biopb#470.
             "local": ctx.token is None,
             "config_path": str(ctx.config_path) if ctx.config_path else None,
             "health": _h("status"),
@@ -1344,12 +1351,17 @@ async def admin_status(request: Request) -> JSONResponse:
 async def admin_browse(request: Request) -> JSONResponse:
     """List a directory on the server's filesystem for the Sources file chooser.
 
-    Local-mode only (biopb/biopb#244): a browsable FS listing is an
-    info-disclosure surface, so it is served **only** when no token is enforced
-    — the two-mode signal (biopb/biopb#447) for a loopback-bound, single-machine
-    deployment where the server's filesystem *is* the user's own box. In remote
-    mode it 404s (feature absent), matching how the admin UI hides the "Browse…"
-    button unless ``/api/admin/status`` reports ``local``.
+    Tokenless deployments only (biopb/biopb#244): a browsable FS listing is an
+    info-disclosure surface, so it is served **only** when no token is enforced —
+    a loopback-bound, single-machine deployment where the server's filesystem
+    *is* the user's own box. Otherwise it 404s (feature absent), matching how the
+    admin UI hides the "Browse…" button unless ``/api/admin/status`` reports
+    ``local``.
+
+    Same known limitation as the ``local`` flag this mirrors (see
+    ``admin_status``): a *local* plane behind an optional token 404s here even
+    though its filesystem is the user's own box. Fails closed; see
+    biopb/biopb#470.
 
     Returns ``{path, parent, entries: [{name, is_dir}], truncated}``. No path (or
     a blank one) starts at the server user's home directory; a path that is a file
@@ -1359,9 +1371,12 @@ async def admin_browse(request: Request) -> JSONResponse:
     ctx = _sidecar(request)
     ctx.check_token(request)  # no-op in local mode; guards a misconfigured caller
     if ctx.token is not None:
-        # Remote mode: never expose the server's filesystem to a remote browser.
+        # A token is enforced: never expose the server's filesystem to what may be
+        # a remote browser. (Conservative — a local plane behind an optional token
+        # is caught here too; see the limitation noted above.)
         raise HTTPException(
-            status_code=404, detail="File browsing is available only in local mode"
+            status_code=404,
+            detail="File browsing is available only on a tokenless local server",
         )
 
     from pathlib import Path

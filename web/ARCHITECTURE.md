@@ -109,8 +109,9 @@ notes that aren't there:
   it (`auth.ts`); absent → redirect to `/unlock`, which stores the pasted token and
   initializes the client. Every HTTP request then carries `Authorization: Bearer`;
   the Flight server (`BearerAuthMiddlewareFactory`) and the sidecar (`HTTPBearer`)
-  validate the *same* token. In local mode (loopback, no token) the unlock step is
-  skipped.
+  validate the *same* token. The unlock step is skipped only when no token is
+  enforced (driven by `/health` → `auth_required`) — which is the default locally,
+  though a local deployment may opt into a token and then gates like a remote one.
 - **Store (Zustand, `store.ts`).** Holds the `TensorHttpClient` + connection state,
   the source list (plus a `scanning` flag seeded from `/readyz` `backend_health` so
   the UI can distinguish "indexing" from "empty" during progressive discovery — see
