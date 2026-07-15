@@ -1034,7 +1034,10 @@ class TestAicsImageIoAdapterClaim:
         from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            for ext in [".tif", ".tiff", ".mrc", ".ims", ".fits", ".nrrd"]:
+            # NOTE: .mrc/.mrcs are intentionally absent -- no bioio plugin can read
+            # a plain cryo-EM MRC, so they are owned by MrcAdapter now, not this
+            # generic bioio adapter (biopb/biopb#94; see test_mrc_not_claimed).
+            for ext in [".tif", ".tiff", ".ims", ".fits", ".nrrd"]:
                 path = Path(tmpdir) / f"test{ext}"
                 path.write_bytes(b"\x00")  # Dummy content
 
@@ -1044,6 +1047,23 @@ class TestAicsImageIoAdapterClaim:
 
                 assert claim is not None, f"AicsImageIoAdapter should claim {ext} files"
                 assert claim.source_type == "aics"
+
+    def test_mrc_not_claimed(self):
+        """MRC is NOT claimed by the generic bioio adapter (biopb/biopb#94).
+
+        No installed bioio plugin can read a plain cryo-EM MRC, so claiming it
+        here produced a claim-then-error. MRC is owned by MrcAdapter, which is
+        registered ahead of the bioio adapters.
+        """
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for ext in [".mrc", ".mrcs"]:
+                path = Path(tmpdir) / f"test{ext}"
+                path.write_bytes(b"\x00")
+                claim = AicsImageIoAdapter.claim(ClaimContext(path), DiscoveryState())
+                assert claim is None, f"bioio must not claim {ext}"
 
     def test_generic_images_rejected_by_default(self):
         """Generic raster/video must NOT be claimed during discovery by default

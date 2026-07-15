@@ -79,9 +79,12 @@ MICROSCOPY_EXTENSIONS = frozenset(
         # TIFF (plain; OME-TIFF handled by OmeTiffAdapter)
         ".tif",
         ".tiff",
-        # Microscopy-specific formats (not handled by specific adapters)
-        ".mrc",
-        ".mrcs",  # MRC electron microscopy
+        # Microscopy-specific formats (not handled by specific adapters).
+        # NOTE: MRC (.mrc/.mrcs) is deliberately NOT here -- no installed bioio
+        # plugin can read a plain cryo-EM MRC (bioio-dv's `mrc` lib is
+        # DeltaVision-only), so claiming it produced a claim-then-error. MRC is
+        # owned by MrcAdapter (rosettasciio), registered ahead of this adapter.
+        # See biopb/biopb#94.
         ".klb",  # Keller Lab Blockfile
         ".ims",  # Imaris
         ".liff",

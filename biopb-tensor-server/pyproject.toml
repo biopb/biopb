@@ -118,6 +118,15 @@ dependencies = [
   qptiff = [
     "imagecodecs >= 2023.1.23",
   ]
+  # Electron-microscopy formats: MRC (.mrc/.mrcs/.rec/.st/.map) and EMD (.emd,
+  # both Berkeley/NCEM and Velox/ThermoFisher). One reader covers all of them:
+  # rosettasciio is HyperSpy's I/O backend, extracted to stand alone (no hyperspy
+  # dep). Its EMD lazy path forwards the native HDF5 chunk grid; MRC is parsed
+  # from rosettasciio's header and served from an own np.memmap. The [hdf5] extra
+  # pulls h5py for the EMD path.
+  em = [
+    "rosettasciio[hdf5]",
+  ]
 
 [project.scripts]
   biopb-tensor-server = "biopb_tensor_server.cli:app"

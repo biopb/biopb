@@ -38,6 +38,16 @@ try:
     from .qptiff import QptiffAdapter
 except ImportError:
     QptiffAdapter = None  # type: ignore
+# Optional electron-microscopy adapters (rosettasciio)
+try:
+    from .mrc import MrcAdapter
+except ImportError:
+    MrcAdapter = None  # type: ignore
+
+try:
+    from .emd import EmdAdapter
+except ImportError:
+    EmdAdapter = None  # type: ignore
 
 # Optional bioio adapters (format-specific subclasses)
 try:
@@ -86,6 +96,8 @@ __all__ = [
     "NdTiffAdapter",
     "OmeTiffAdapter",
     "QptiffAdapter",
+    "MrcAdapter",
+    "EmdAdapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",
@@ -106,6 +118,8 @@ def get_default_registry() -> AdapterRegistry:
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
     - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
       native pyramid)
+    - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
+    - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
     - ZeissAdapter - Zeiss microscopy (CZI, LSM)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
@@ -142,6 +156,14 @@ def get_default_registry() -> AdapterRegistry:
     # biopb/biopb#135.
     if QptiffAdapter is not None:
         registry.register_with_type("qptiff", QptiffAdapter)
+    # Electron-microscopy adapters (rosettasciio), before the bioio group so they
+    # own their extensions -- notably .mrc, which no bioio plugin can read
+    # (biopb/biopb#94). Registration order is claim probe order; callers take
+    # claims[0].
+    if MrcAdapter is not None:
+        registry.register_with_type("mrc", MrcAdapter)
+    if EmdAdapter is not None:
+        registry.register_with_type("emd", EmdAdapter)
 
     # Register bioio-based adapters in priority order (most specific first)
     if ZeissAdapter is not None:

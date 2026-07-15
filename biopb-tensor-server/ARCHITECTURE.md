@@ -192,6 +192,8 @@ Concrete adapters:
 | `QptiffAdapter` | Akoya PhenoImager QPTIFF (claimed by the `.qptiff` extension; a `.tif`-named QPTIFF needs an explicit `type: qptiff`) — pyramidal multiplex whole-slide via tifffile, serving the native on-disk pyramid as `precompute` levels (2nd native-pyramid adapter after OME-Zarr). Module: `adapters/qptiff.py` |
 | `TiffSequenceAdapter` | Plain TIFF stacks (directory of non-OME `.tif`) |
 | `Hdf5Adapter` | HDF5 chunked datasets |
+| `MrcAdapter` | MRC electron-microscopy volumes (`.mrc/.mrcs/.rec/.st/.map`) — header parsed by rosettasciio, reads served from an own `np.memmap`. Module: `adapters/mrc.py` |
+| `EmdAdapter` | EMD electron-microscopy datasets (`.emd`, NCEM + Velox) via rosettasciio; multi-signal → multi-tensor, native HDF5 chunk grid. Module: `adapters/emd.py` |
 | `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via bioio (successor to aicsimageio; per-format `bioio-*` plugins). Module: `adapters/bioio.py` |
 
 ### Chunk caching
