@@ -183,10 +183,17 @@ class MrcAdapter(SourceAdapter, TensorAdapter):
             slice(int(s), int(e))
             for s, e in zip(bounds.start, bounds.stop, strict=True)
         )
+        if self._mm is not None:
+            # No lock on the fast path: a read-only np.memmap has no shared cursor
+            # (unlike a seekable file handle), so indexing computes byte offsets
+            # directly and the copy lands in a fresh buffer -- concurrent reads are
+            # thread-safe. Skipping the lock lets parallel do_get chunk reads of one
+            # MRC source run at once. Copy out so the result is independent of the
+            # mapping.
+            return np.array(self._mm[slices])
+        # Fallback: rsciio's dask array reopens a memmap per block on compute; keep
+        # it under the lock (the slow, rarely-taken path).
         with self._io_lock:
-            if self._mm is not None:
-                # Copy out of the mapping so the returned array is independent.
-                return np.array(self._mm[slices])
             return self._lazy_data[slices].compute()
 
     def _physical_scale(self) -> Optional[tuple]:
