@@ -39,6 +39,13 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
+; Brand the setup wizard / setup.exe with the biopb icon. The .ico is the web
+; SPA's committed favicon (the canonical brand icon), resolved relative to this
+; script's dir at compile time -- a source file, so it needs no web build.
+SetupIconFile=..\..\web\packages\app\public\favicon.ico
+; Add/Remove Programs icon: the same brand icon, from the installed webapp bundle
+; (the engine unpacks it under %USERPROFILE%\.local\share\biopb\webapp).
+UninstallDisplayIcon={%USERPROFILE}\.local\share\biopb\webapp\favicon.ico
 ; Per-user, no admin: no UAC prompt, works on locked-down lab machines.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog

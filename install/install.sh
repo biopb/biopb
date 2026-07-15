@@ -782,12 +782,18 @@ EOF
             ;;
         Linux|WSL)
             local shortcut="$desktop_dir/biopb-dashboard.desktop"
+            # Brand the launcher with the webapp's logo (shipped in the webapp
+            # bundle at $WEBAPP_DIR); omit the line if the fetch failed so we never
+            # point Icon= at a missing file.
+            local icon_line=""
+            [ -f "$WEBAPP_DIR/biopb-logo.png" ] && icon_line="Icon=$WEBAPP_DIR/biopb-logo.png"
             cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
 [Desktop Entry]
 Type=Application
 Name=biopb Dashboard
 Comment=Start the biopb control plane and open the dashboard
 Exec=$biopb_bin dashboard
+${icon_line}
 Terminal=false
 Categories=Science;Education;
 EOF
@@ -905,15 +911,14 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    # No longer offered interactively (biopb/biopb#237). The web interface now
-    # carries the server admin page (config / status / restart) on top of the
-    # image viewer, so it is installed by default rather than being optional.
+    # The web interface is NOT optional (biopb/biopb#237, dashboard redesign):
+    # `biopb dashboard` -- the one-command entry point and the Desktop shortcut the
+    # installer drops -- boots the control plane and opens its web UI, so the SPA is
+    # always installed. (A legacy BIOPB_INSTALL_WEBAPP=0 is silently ignored now.)
     # Bio-Formats stays off by default: the Python adapters now cover the formats
-    # most labs use, and it pulls in a heavyweight Java toolchain. Both remain
-    # overridable for scripted installs via env vars:
-    #   BIOPB_INSTALL_WEBAPP=0      skip the web interface (API-only server)
+    # most labs use, and it pulls in a heavyweight Java toolchain. It remains
+    # overridable for scripted installs via env var:
     #   BIOPB_INSTALL_BIOFORMATS=1  add Bio-Formats (Java fetched on first use)
-    if [ "${BIOPB_INSTALL_WEBAPP:-1}" != "0" ]; then INSTALL_WEBAPP=1; else INSTALL_WEBAPP=0; fi
     if [ "${BIOPB_INSTALL_BIOFORMATS:-0}" = "1" ]; then INSTALL_BIOFORMATS=1; else INSTALL_BIOFORMATS=0; fi
 
     # ===== Non-interactive / unmanned mode =====
@@ -1188,41 +1193,44 @@ install_biopb() {
     fi
 
     # ===== 4. Webapp =====
+    # Mandatory (the dashboard is the SPA). WEBAPP_OK tracks whether it is actually
+    # on disk after this step, so the summary can flag a failed fetch -- the only
+    # way it can be missing now is a network/asset error, not a user opt-out.
     _step "[4/7] Installing web interface..."
 
-    if [ "$INSTALL_WEBAPP" = "1" ]; then
-        mkdir -p "$WEBAPP_DIR"
+    WEBAPP_OK=0
+    mkdir -p "$WEBAPP_DIR"
 
-        # Reuses the release metadata already fetched for the wheels (cached).
-        if _fetch_latest_release; then
-            INSTALLED_TAG=""
-            [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
-            if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
-                _ok "Web interface already up to date ($RELEASE_TAG)"
-            else
-                _info "Downloading $RELEASE_TAG..."
-                rm -rf "${WEBAPP_DIR:?}"
-                mkdir -p "$WEBAPP_DIR"
-                local webapp_url
-                webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
-                webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
-                local tmp
-                tmp=$(mktemp)
-                if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
-                    tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
-                    printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
-                    _ok "Web interface installed to: $WEBAPP_DIR"
-                else
-                    _warn "No webapp.tar.gz in release $RELEASE_TAG; server will run in API-only mode"
-                fi
-                rm -f "$tmp"
-            fi
+    # Reuses the release metadata already fetched for the wheels (cached).
+    if _fetch_latest_release; then
+        INSTALLED_TAG=""
+        [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
+        if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
+            _ok "Web interface already up to date ($RELEASE_TAG)"
+            WEBAPP_OK=1
         else
-            _warn "Could not fetch latest release, web interface not installed"
-            _info "Server will run in API-only mode"
+            _info "Downloading $RELEASE_TAG..."
+            rm -rf "${WEBAPP_DIR:?}"
+            mkdir -p "$WEBAPP_DIR"
+            local webapp_url
+            webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
+            webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
+            local tmp
+            tmp=$(mktemp)
+            if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
+                tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
+                printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
+                _ok "Web interface installed to: $WEBAPP_DIR"
+                WEBAPP_OK=1
+            else
+                _warn "Could not download the web interface (webapp.tar.gz) from $RELEASE_TAG"
+                _info "  the dashboard needs it -- rerun this script to retry"
+            fi
+            rm -f "$tmp"
         fi
     else
-        _info "Skipped"
+        _warn "Could not fetch the latest release; web interface not installed"
+        _info "  the dashboard needs it -- rerun this script to retry"
     fi
 
     # ===== 5. Config =====
@@ -1367,7 +1375,7 @@ install_biopb() {
 
     # Headlines via _info (indent 2, matching _ok/_warn), detail lines indent 4.
     # --- informational blocks ---
-    if [ "$INSTALL_WEBAPP" = "1" ]; then
+    if [ "$WEBAPP_OK" = "1" ]; then
         _info "Web interface available at http://localhost:8813"
         _info "  open it anytime with: ${CYAN}biopb dashboard${RESET} (or the Desktop shortcut)"
         echo ""
@@ -1391,9 +1399,9 @@ install_biopb() {
         echo ""
     fi
 
-    if [ "$INSTALL_WEBAPP" = "0" ]; then
-        _warn "Web interface not installed (BIOPB_INSTALL_WEBAPP=0)"
-        _info "  rerun without that env var to install it"
+    if [ "$WEBAPP_OK" = "0" ]; then
+        _warn "Web interface not installed (download failed)"
+        _info "  the dashboard won't work until you rerun this script to fetch it"
         echo ""
     fi
 

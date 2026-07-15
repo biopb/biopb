@@ -45,9 +45,9 @@ param(
     # else falls back to a dedicated data subfolder (never the profile root).
     [string]$DataDir = "",
 
-    # Install the web interface (webapp.tar.gz) -- the image viewer plus the
-    # server admin page (config / status / restart). Default ON when neither this
-    # switch nor $env:BIOPB_INSTALL_WEBAPP is given; set the env var to "0" to skip.
+    # DEPRECATED / accepted-but-ignored: the web interface is always installed now
+    # (the dashboard IS the SPA). Kept so existing front-ends / direct invocations
+    # that still pass -Webapp don't error; it has no effect.
     [switch]$Webapp,
 
     # Add the Bio-Formats extra (pulls a Java toolchain on first use). Default OFF;
@@ -770,6 +770,10 @@ function Install-DesktopShortcut {
         $sc.Arguments = 'dashboard'
         $sc.Description = 'Start the biopb control plane and open the dashboard'
         $sc.WorkingDirectory = Split-Path $biopbExe -Parent
+        # Brand the shortcut with the webapp's icon (shipped in the webapp bundle);
+        # only if present, else leave the default (biopb.exe's) icon.
+        $icon = Join-Path $BiopbHome ".local\share\biopb\webapp\favicon.ico"
+        if (Test-Path -LiteralPath $icon) { $sc.IconLocation = "$icon,0" }
         $sc.Save()
         Report-Ok "Desktop shortcut created: $lnkPath"
     } catch {
@@ -822,7 +826,6 @@ function Invoke-BiopbInstall {
         $BiopbHome  = $env:USERPROFILE
         $ConfigDir  = Join-Path $BiopbHome ".config\biopb"
         $configFile = Join-Path $ConfigDir "biopb.json"
-        $InstallWebapp = if ($PSBoundParameters.ContainsKey('Webapp')) { [bool]$Webapp } else { $env:BIOPB_INSTALL_WEBAPP -ne '0' }
         $stepMsgs = @(
             "Checking system...",
             "Ensuring build tools...",
@@ -841,7 +844,7 @@ function Invoke-BiopbInstall {
         Report-Note "DRY RUN - no changes were made to your system"
         $result = [pscustomobject]@{
             BiopbHome = $BiopbHome; ConfigFile = $configFile; ConfigDir = $ConfigDir
-            WebappInstalled = $InstallWebapp; McpNeedsManual = $false
+            WebappInstalled = $true; McpNeedsManual = $false
         }
         if ($Mode -eq 'gui') {
             if ($result.WebappInstalled) { Emit-Gui "::biopb::RESULT|webapp|1" }
@@ -892,11 +895,10 @@ function Invoke-BiopbInstall {
     }
     Report-Ok "System check passed"
 
-    # Component selection is no longer prompted (biopb/biopb#237). An explicit
-    # -Webapp/-Bioformats from a front-end wins; absent that, fall back to env vars
-    # with the web interface (now carrying the admin page) defaulting ON and
-    # Bio-Formats OFF -- so a direct engine invocation behaves the same way.
-    $InstallWebapp     = if ($PSBoundParameters.ContainsKey('Webapp'))     { [bool]$Webapp }     else { $env:BIOPB_INSTALL_WEBAPP -ne '0' }
+    # Component selection is no longer prompted (biopb/biopb#237). The web interface
+    # is mandatory (the dashboard is the SPA; -Webapp / BIOPB_INSTALL_WEBAPP are
+    # ignored). Bio-Formats stays opt-in: an explicit -Bioformats from a front-end
+    # wins, else the env var, default OFF (it pulls a Java toolchain on first use).
     $InstallBioformats = if ($PSBoundParameters.ContainsKey('Bioformats')) { [bool]$Bioformats } else { $env:BIOPB_INSTALL_BIOFORMATS -eq '1' }
 
     # ===== 1. Install uv (if needed) =====
@@ -1199,49 +1201,52 @@ function Invoke-BiopbInstall {
     }
 
     # ===== 4. Webapp =====
+    # Mandatory (the dashboard is the SPA). $WebappOk records whether it is actually
+    # on disk after this step, so the summary flags a failed fetch -- the only way
+    # it can be missing now is a network/asset error, not a user opt-out.
     Report-Step 4 "Installing web interface..."
 
-    if ($InstallWebapp) {
-        if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
+    $WebappOk = $false
+    if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
 
-        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
-        $latestTag = if ($release) { $release.tag_name } else { "" }
+    if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
+    $latestTag = if ($release) { $release.tag_name } else { "" }
 
-        if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
-            Report-Warn "Unexpected tag format, skipping web interface install"
-            $latestTag = ""
-        }
+    if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
+        Report-Warn "Unexpected tag format, skipping web interface install"
+        $latestTag = ""
+    }
 
-        if ($latestTag) {
-            $versionFile = Join-Path $WebappDir ".version"
-            $installedTag = if (Test-Path -LiteralPath $versionFile) { (Get-Content -Raw -LiteralPath $versionFile).Trim() } else { "" }
-            if ($installedTag -eq $latestTag) {
-                Report-Ok "Web interface already up to date ($latestTag)"
-            } else {
-                Report-Info "Downloading $latestTag..."
-                Remove-Item -LiteralPath $WebappDir -Recurse -Force -ErrorAction SilentlyContinue
-                New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null
-                $webAsset = $release.assets | Where-Object { $_.name -eq 'webapp.tar.gz' } | Select-Object -First 1
-                $webUrl = if ($webAsset) { $webAsset.browser_download_url } else { "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" }
-                $tarball = Join-Path $env:TEMP "biopb-webapp.tar.gz"
-                $webOk = $true
-                try { Invoke-WebRequest -Uri $webUrl -OutFile $tarball }
-                catch { $webOk = $false }
-                if ($webOk) {
-                    tar -xzf $tarball -C $WebappDir --strip-components=1
-                    Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
-                    Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
-                    Report-Ok "Web interface installed to: $WebappDir"
-                } else {
-                    Report-Warn "No webapp.tar.gz in release $latestTag; server will run in API-only mode"
-                }
-            }
+    if ($latestTag) {
+        $versionFile = Join-Path $WebappDir ".version"
+        $installedTag = if (Test-Path -LiteralPath $versionFile) { (Get-Content -Raw -LiteralPath $versionFile).Trim() } else { "" }
+        if ($installedTag -eq $latestTag) {
+            Report-Ok "Web interface already up to date ($latestTag)"
+            $WebappOk = $true
         } else {
-            Report-Warn "Could not fetch latest release, web interface not installed"
-            Report-Detail "Server will run in API-only mode"
+            Report-Info "Downloading $latestTag..."
+            Remove-Item -LiteralPath $WebappDir -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null
+            $webAsset = $release.assets | Where-Object { $_.name -eq 'webapp.tar.gz' } | Select-Object -First 1
+            $webUrl = if ($webAsset) { $webAsset.browser_download_url } else { "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" }
+            $tarball = Join-Path $env:TEMP "biopb-webapp.tar.gz"
+            $webOk = $true
+            try { Invoke-WebRequest -Uri $webUrl -OutFile $tarball }
+            catch { $webOk = $false }
+            if ($webOk) {
+                tar -xzf $tarball -C $WebappDir --strip-components=1
+                Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
+                Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
+                Report-Ok "Web interface installed to: $WebappDir"
+                $WebappOk = $true
+            } else {
+                Report-Warn "Could not download the web interface (webapp.tar.gz) from $latestTag"
+                Report-Detail "The dashboard needs it -- rerun to retry."
+            }
         }
     } else {
-        Report-Info "Skipped"
+        Report-Warn "Could not fetch the latest release; web interface not installed"
+        Report-Detail "The dashboard needs it -- rerun to retry."
     }
 
     # ===== 5. Config =====
@@ -1461,7 +1466,7 @@ function Invoke-BiopbInstall {
         BiopbHome      = $BiopbHome
         ConfigFile     = $activeConfig
         ConfigDir      = $ConfigDir
-        WebappInstalled = $InstallWebapp
+        WebappInstalled = $WebappOk
         McpNeedsManual = $script:McpNeedsManual
     }
 
