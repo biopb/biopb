@@ -34,6 +34,33 @@ def _h5py_available() -> bool:
     return importlib.util.find_spec("h5py") is not None
 
 
+# Directory of real vendor samples (CZI/ND2/LIF) for the fixture-gated read
+# tests. BIOPB_TEST_VENDOR_DIR overrides the checked-in default.
+_VENDOR_FIXTURE_DIR = Path(__file__).parent / "data" / "vendor"
+
+
+def _vendor_fixture(ext: str):
+    """First sample file with the given extension, or None if none provided.
+
+    Looks in $BIOPB_TEST_VENDOR_DIR (if set) then tests/data/vendor/. Returns a
+    path string so a test can read through the real reader plugin, or None so it
+    self-skips when no sample is present.
+    """
+    import os
+
+    roots = []
+    env = os.environ.get("BIOPB_TEST_VENDOR_DIR")
+    if env:
+        roots.append(Path(env))
+    roots.append(_VENDOR_FIXTURE_DIR)
+    for root in roots:
+        if root.is_dir():
+            hits = sorted(root.glob(f"*{ext}"))
+            if hits:
+                return str(hits[0])
+    return None
+
+
 class TestZarrIntegration:
     """Integration tests for ZarrAdapter with server/client."""
 
@@ -837,13 +864,22 @@ class TestBioioReadPath:
     that let that plugin get dropped from the ``[aics]`` extra once.
     """
 
-    def _read_full(self, path):
-        """Register a file as a bioio source and read its first tensor whole."""
+    def _read_full(self, path, adapter_cls=None):
+        """Register a file as a bioio source and read its first tensor whole.
+
+        ``adapter_cls`` selects the concrete adapter to read through -- the
+        generic ``AicsImageIoAdapter`` by default, or a vendor subclass
+        (``ZeissAdapter`` etc.) to exercise the exact class discovery would
+        route a real file to. The read itself lives on the shared base, so the
+        subclass only matters for provenance; the companion claim assertion
+        (``_assert_claims``) is what pins the routing.
+        """
         from bioio import BioImage
         from biopb.tensor.ticket_pb2 import ChunkBounds
         from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
-        src = AicsImageIoAdapter(
+        adapter_cls = adapter_cls or AicsImageIoAdapter
+        src = adapter_cls(
             BioImage(path), scene_index=None, source_id="s", source_url=path
         )
         descs = src.list_tensor_descriptors()
@@ -854,6 +890,15 @@ class TestBioioReadPath:
             ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
         )
         return desc, data
+
+    @staticmethod
+    def _assert_claims(path, adapter_cls, source_type):
+        """The vendor adapter claims the extension and tags the right type."""
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+
+        claim = adapter_cls.claim(ClaimContext(Path(path)), DiscoveryState())
+        assert claim is not None, f"{adapter_cls.__name__} did not claim {path}"
+        assert claim.source_type == source_type
 
     def test_plain_tiff_read_via_bioio(self, tmp_path):
         """Plain (non-OME) TIFF reads through bioio-tifffile (the generic
@@ -883,6 +928,84 @@ class TestBioioReadPath:
         desc, data = self._read_full(path)
         assert tuple(data.shape) == tuple(desc.shape)
         np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
+
+    def test_dv_read_via_bioio(self, tmp_path):
+        """DeltaVision .dv reads through bioio-dv (its ``mrc`` backend), the
+        path DvAdapter takes. Guards the bioio-dv dependency.
+
+        DV is the one true vendor format here that a Python lib can *write*
+        (``mrc.imwrite``, which bioio-dv also reads through), so it gets real,
+        self-contained read-path coverage in CI -- CZI/ND2/LIF have no open
+        writer and are fixture-gated below.
+        """
+        pytest.importorskip("bioio_dv")
+        mrc = pytest.importorskip("mrc")  # bioio-dv's reader backend
+        from biopb_tensor_server.adapters.bioio import DvAdapter
+
+        # A Z-stack keeps the mrc header at C=1 (a bare 3-D block is otherwise
+        # mis-read as 3 channels with mismatched coordinate metadata).
+        arr = np.arange(5 * 16 * 16, dtype=np.int16).reshape(5, 16, 16)
+        path = str(tmp_path / "sample.dv")
+        mrc.imwrite(path, arr)
+
+        self._assert_claims(path, DvAdapter, "dv")
+        desc, data = self._read_full(path, DvAdapter)
+        assert tuple(data.shape) == tuple(desc.shape)
+        assert desc.dtype == np.dtype(np.int16).str
+        np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
+
+    # ---- Fixture-gated true-vendor formats (no open writer) ----------------
+    #
+    # CZI, ND2 and LIF have no Python library that writes a file their bioio
+    # plugin will read back faithfully (a synthesized CZI, for instance, lacks
+    # the Scenes / Channel / Pixels metadata bioio-czi's OME transform demands
+    # and fails validation), so these can only be exercised against a real
+    # sample. Drop tiny samples in a directory and point BIOPB_TEST_VENDOR_DIR
+    # at it (or the default tests/data/vendor/) and the matching test reads one
+    # through its adapter; otherwise it self-skips. This is the hook the planned
+    # installer-wheel-coverage CI provisions fixtures for (issue #361).
+
+    @pytest.mark.parametrize(
+        "plugin, ext, source_type",
+        [
+            ("bioio_czi", ".czi", "zeiss"),
+            ("bioio_nd2", ".nd2", "nikon"),
+            ("bioio_lif", ".lif", "leica"),
+        ],
+    )
+    def test_vendor_fixture_read_via_bioio(self, plugin, ext, source_type):
+        """A real CZI/ND2/LIF sample claims + reads through its adapter.
+
+        Skips cleanly when the plugin is absent (slim install) or no sample is
+        provisioned, so it never fails spuriously -- but catches a dropped
+        plugin the moment a fixture is present.
+        """
+        pytest.importorskip(plugin)
+        from biopb_tensor_server.adapters.bioio import (
+            LeicaAdapter,
+            NikonAdapter,
+            ZeissAdapter,
+        )
+
+        adapter_cls = {
+            "zeiss": ZeissAdapter,
+            "nikon": NikonAdapter,
+            "leica": LeicaAdapter,
+        }[source_type]
+
+        path = _vendor_fixture(ext)
+        if path is None:
+            pytest.skip(
+                f"no *{ext} sample found (set BIOPB_TEST_VENDOR_DIR or add one "
+                f"to {_VENDOR_FIXTURE_DIR})"
+            )
+
+        self._assert_claims(path, adapter_cls, source_type)
+        desc, data = self._read_full(path, adapter_cls)
+        # Descriptor and read agree, the read is non-trivial, and dtype matches.
+        assert tuple(data.shape) == tuple(desc.shape)
+        assert data.size > 0
+        assert data.dtype.str == desc.dtype
 
 
 class TestAicsImageIoAdapterClaim:
