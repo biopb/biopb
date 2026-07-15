@@ -739,6 +739,44 @@ function Invoke-Precompile {
     }
 }
 
+# Drop a "biopb Dashboard" shortcut (.lnk) on the user's Desktop that runs
+# `biopb dashboard` -- start the control plane if needed, then open the browser.
+# Best-effort: a failure only means no icon, never aborts the install. Skip with
+# BIOPB_INSTALL_SHORTCUT=0. GUI launchers don't inherit the shell PATH, so the
+# shortcut targets biopb.exe by its absolute path.
+function Install-DesktopShortcut {
+    param([string]$BiopbHome)
+
+    if ($env:BIOPB_INSTALL_SHORTCUT -eq '0') {
+        Report-Info "Desktop shortcut skipped (BIOPB_INSTALL_SHORTCUT=0)"
+        return
+    }
+
+    $cmd = Get-Command biopb -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        Report-Info "biopb not on PATH; skipping Desktop shortcut"
+        return
+    }
+    $biopbExe = $cmd.Source
+
+    try {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if (-not $desktop) { $desktop = Join-Path $BiopbHome 'Desktop' }
+        if (-not (Test-Path -LiteralPath $desktop)) { New-Item -ItemType Directory -Force -Path $desktop | Out-Null }
+        $lnkPath = Join-Path $desktop 'biopb Dashboard.lnk'
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($lnkPath)
+        $sc.TargetPath = $biopbExe
+        $sc.Arguments = 'dashboard'
+        $sc.Description = 'Start the biopb control plane and open the dashboard'
+        $sc.WorkingDirectory = Split-Path $biopbExe -Parent
+        $sc.Save()
+        Report-Ok "Desktop shortcut created: $lnkPath"
+    } catch {
+        Report-Warn "Could not create Desktop shortcut: $_"
+    }
+}
+
 # ============================================================================
 # Invoke-BiopbInstall -- the headless install body (was Install-Biopb). Returns a
 # result object the front-end uses to render its summary. Throws on fatal errors
@@ -1248,7 +1286,26 @@ function Invoke-BiopbInstall {
     # or the untouched existing file when the user keeps it.
     $activeConfig = $existingConfig
     if ($effectiveKeep) {
-        Report-Ok "Keeping current config: $existingConfig"
+        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
+        # convert it in place to the canonical JSON via `biopb server
+        # migrate-config` (settings preserved verbatim, old file backed up to
+        # biopb.toml.bak) so an upgraded install stops warning about the
+        # deprecated format. A JSON config is already canonical -- nothing to do.
+        if ($existingConfig -eq $legacyConfig -and (Get-Command biopb -ErrorAction SilentlyContinue)) {
+            Report-Info "Migrating legacy TOML config to canonical JSON..."
+            $prevEAP2 = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { & biopb server migrate-config *> $null } catch { }
+            $ErrorActionPreference = $prevEAP2
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $configFile)) {
+                $activeConfig = $configFile
+                Report-Ok "Migrated config: $legacyConfig -> $configFile (old file backed up)"
+            } else {
+                Report-Warn "Could not migrate legacy config; keeping $existingConfig"
+            }
+        } else {
+            Report-Ok "Keeping current config: $existingConfig"
+        }
     } else {
         # Cloud/synced root? Auto-detect from the path so any front-end (GUI,
         # console menu, manual entry, BIOPB_DATA_DIR) gets it right; -Cloud forces
@@ -1394,6 +1451,9 @@ function Invoke-BiopbInstall {
     # ===== 7. Start the control plane (which owns the data plane) =====
     Report-Step 7 "Starting control plane..."
     Start-ControlPlane -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
+
+    # Drop a "biopb Dashboard" launcher on the Desktop (runs `biopb dashboard`).
+    Install-DesktopShortcut -BiopbHome $BiopbHome
 
     # Result object: the front-end renders the human-facing summary from this, so
     # the summary wording is a front-end concern, not the engine's.
