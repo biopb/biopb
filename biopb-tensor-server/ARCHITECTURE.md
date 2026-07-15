@@ -157,10 +157,13 @@ level 0 is full resolution. The client reads each advertised level via the norma
 `scale_hint` path. Two sources of levels (`TensorFlightServer._advertised_pyramid`):
 
 - **Native** — adapters that ship a real on-disk pyramid override
-  `TensorAdapter.get_native_pyramid_levels()` (only `OmeZarrAdapter` today) to
-  return one `native=True`, `reduction_method="precompute"` level per multiscales
-  dataset, so the client requests the precomputed level directly. Each level's
+  `TensorAdapter.get_native_pyramid_levels()` (`OmeZarrAdapter` and `QptiffAdapter`)
+  to return one `native=True`, `reduction_method="precompute"` level per on-disk
+  resolution, so the client requests the precomputed level directly. Each level's
   `scale_hint` is the value `_find_level_for_scale` matches on, so it round-trips.
+  `QptiffAdapter` encodes each level's chunks with `array_id = source_id/{level}`,
+  so `DoGet` dispatches back through `get_level_adapter` (the same seam OME-Zarr
+  uses).
 - **Computed** — everything else gets `chunk.build_pyramid_plan(...)`, a full
   pyramid (level 0 → coarsest) generated from the authoritative `[pyramid]` config
   knobs (`threshold` / `downscale_factor` / `pixel_budget_cubic_root`). The
@@ -186,6 +189,7 @@ Concrete adapters:
 | `ZarrAdapter` | Zarr v2 arrays |
 | `OmeZarrAdapter` | OME-Zarr with precomputed pyramid routing |
 | `OmeTiffAdapter` | OME-TIFF (single- and multi-file), pure-tifffile — no aicsimageio |
+| `QptiffAdapter` | Akoya PhenoImager QPTIFF (`.qptiff`, or `.tif`/`.tiff` with the PerkinElmer/Akoya vendor XML) — pyramidal multiplex whole-slide via tifffile, serving the native on-disk pyramid as `precompute` levels (2nd native-pyramid adapter after OME-Zarr). Module: `adapters/qptiff.py` |
 | `TiffSequenceAdapter` | Plain TIFF stacks (directory of non-OME `.tif`) |
 | `Hdf5Adapter` | HDF5 chunked datasets |
 | `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via bioio (successor to aicsimageio; per-format `bioio-*` plugins). Module: `adapters/bioio.py` |
@@ -416,6 +420,9 @@ Registration order (by priority/specificity, highest first — callers take
 `claims[0]`; see `adapters/__init__.py::get_default_registry`):
 1. `OmeTiffAdapter` — local OME-TIFF with embedded OME-XML (single- and
    multi-file); pure-tifffile, no aicsimageio dependency
+1b. `QptiffAdapter` — before the bioio group so it owns `.qptiff` and wins the
+   `.tif`/`.tiff` vendor-XML sniff (bioio drops the QPTIFF pyramid); OmeTiffAdapter
+   runs first but declines a QPTIFF (no OME-XML)
 2. `ZeissAdapter` / `LeicaAdapter` / `NikonAdapter` / `DvAdapter` /
    `OlympusAdapter` / `BioformatsAdapter` / `AicsImageIoAdapter` — vendor formats
    and the generic bioio fallback (which also picks up a remote or non-OME

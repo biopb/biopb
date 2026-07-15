@@ -111,6 +111,13 @@ dependencies = [
     "pydicom >= 2.4.0",
     "nibabel >= 5.0.0",
   ]
+  # Akoya PhenoImager QPTIFF (.qptiff): read via tifffile (a core dep), but its
+  # compressed tiles (JPEG/LZW) decode through imagecodecs. Registration is gated
+  # on imagecodecs (adapters/__init__.py), so this extra is what turns QPTIFF
+  # support on. See biopb/biopb#135.
+  qptiff = [
+    "imagecodecs >= 2023.1.23",
+  ]
 
 [project.scripts]
   biopb-tensor-server = "biopb_tensor_server.cli:app"
