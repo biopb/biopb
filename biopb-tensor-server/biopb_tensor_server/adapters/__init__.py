@@ -104,8 +104,8 @@ def get_default_registry() -> AdapterRegistry:
 
     Adapter registration order (by priority/specificity, highest first):
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
-    - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff, or .tif with vendor XML;
-      tifffile, native pyramid)
+    - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
+      native pyramid)
     - ZeissAdapter - Zeiss microscopy (CZI, LSM)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
@@ -134,11 +134,12 @@ def get_default_registry() -> AdapterRegistry:
     # declines falls through to the generic bioio adapter registered below.
     registry.register_with_type("ome-tiff", OmeTiffAdapter)
 
-    # QPTIFF before the bioio group so it owns .qptiff and wins the .tif/.tiff
-    # vendor-XML sniff (bioio would drop the QPTIFF pyramid). OmeTiffAdapter runs
-    # first but declines a QPTIFF (no OME-XML), so this is what claims a QPTIFF
-    # saved as .tif. Registration order is claim probe order; callers take
-    # claims[0]. See biopb/biopb#135.
+    # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
+    # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not
+    # sniffed (that read is unsafe under cloud and wasteful without caching), so
+    # it falls through to bioio unless configured with an explicit type: qptiff.
+    # Registration order is claim probe order; callers take claims[0]. See
+    # biopb/biopb#135.
     if QptiffAdapter is not None:
         registry.register_with_type("qptiff", QptiffAdapter)
 

@@ -75,13 +75,15 @@ class TestQptiffAdapterClaim:
             assert claim.source_type == "qptiff"
             assert claim.primary_path == str(p)
 
-    def test_claim_tif_with_vendor_xml(self):
+    def test_decline_tif_even_with_vendor_xml(self):
+        # Claim is suffix-only (biopb/biopb#135): a QPTIFF saved as .tif is NOT
+        # claimed -- sniffing the vendor XML on the claim path is disabled, so it
+        # falls through to the generic bioio adapter. Use type: qptiff to force
+        # the native-pyramid path on a .tif-named QPTIFF.
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.tif"  # QPTIFF saved as .tif
             create_synthetic_qptiff(p)
-            claim = QptiffAdapter.claim(ClaimContext(p), DiscoveryState())
-            assert claim is not None
-            assert claim.source_type == "qptiff"
+            assert QptiffAdapter.claim(ClaimContext(p), DiscoveryState()) is None
 
     def test_decline_plain_tif(self):
         with tempfile.TemporaryDirectory() as tmp:

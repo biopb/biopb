@@ -1,11 +1,19 @@
 """QPTIFF adapter for Akoya PhenoImager multiplex whole-slide images.
 
-QPTIFF (`.qptiff`, and sometimes `.tif`/`.tiff`) is the output of Akoya
-Biosciences' PhenoImager platform (formerly PerkinElmer Vectra/Polaris/Mantra) --
-a pyramidal, multi-channel BigTIFF used for multiplex-IF / whole-slide imaging.
-It is *almost* an OME-TIFF, except channel/marker metadata lives in a
-PerkinElmer/Akoya XML block in the ``ImageDescription`` tag rather than OME-XML,
-so ``OmeTiffAdapter`` declines it.
+QPTIFF is the output of Akoya Biosciences' PhenoImager platform (formerly
+PerkinElmer Vectra/Polaris/Mantra) -- a pyramidal, multi-channel BigTIFF used for
+multiplex-IF / whole-slide imaging. It is *almost* an OME-TIFF, except
+channel/marker metadata lives in a PerkinElmer/Akoya XML block in the
+``ImageDescription`` tag rather than OME-XML, so ``OmeTiffAdapter`` declines it.
+
+This adapter claims by the ``.qptiff`` extension only. A QPTIFF is sometimes
+saved with a plain ``.tif``/``.tiff`` extension, but recognizing that requires
+opening the file to sniff the vendor XML on the claim path -- a per-rescan read
+that is unsafe under cloud/synced folders and wasteful without a cached result
+(biopb/biopb#135). Until claim-time sniffs are cached, a ``.tif``-named QPTIFF
+falls through to the generic bioio adapter (which reads it, only without the
+native pyramid); rename it to ``.qptiff``, or set an explicit ``type: qptiff``
+source, to get the pyramid-preserving path.
 
 Reader: ``tifffile`` directly -- NOT Bio-Formats. Bio-Formats is known to expose
 only the base resolution of a QPTIFF and drop the prebuilt pyramid levels;
@@ -47,11 +55,11 @@ if TYPE_CHECKING:
     from biopb_tensor_server.core.discovery import DiscoveryState
 
 QPTIFF_EXTENSIONS = (".qptiff",)
-_TIFF_EXTENSIONS = (".tif", ".tiff")
 
 # The vendor XML block in a QPTIFF's ImageDescription is rooted at
-# <PerkinElmer-QPI-ImageDescription>; this substring disambiguates a QPTIFF saved
-# with a plain .tif/.tiff extension from a generic TIFF.
+# <PerkinElmer-QPI-ImageDescription>; this substring gates channel/marker-name
+# extraction in get_metadata() (the file is already open there, so this is a
+# read of in-hand bytes -- not a claim-time recall).
 _QPI_XML_MARKER = "PerkinElmer-QPI"
 
 # TIFF ResolutionUnit code -> micrometres per unit, for physical-scale conversion.
@@ -113,25 +121,22 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim a QPTIFF: any ``.qptiff``, or a ``.tif``/``.tiff`` carrying the
-        PerkinElmer/Akoya XML.
+        """Claim a QPTIFF by the ``.qptiff`` extension -- suffix only.
 
-        ``.qptiff`` is claimed by extension alone -- recall-free, so a
-        cloud/synced-folder placeholder is not recalled here. A plain
-        ``.tif``/``.tiff`` requires opening the file to sniff the vendor XML, so it
-        is gated to a **resident, non-cloud, local** file (mirroring
-        ``OmeTiffAdapter``'s embedded-XML sniff): under a cloud root, or for a
-        non-resident placeholder, we decline and the file falls through to the
-        generic bioio adapter. ``OmeTiffAdapter`` runs first and declines a QPTIFF
-        (no OME-XML), so this adapter -- registered ahead of the bioio group -- is
-        what claims the ``.tif`` QPTIFF that would otherwise lose its pyramid.
+        Recognizing a QPTIFF saved with a plain ``.tif``/``.tiff`` extension would
+        mean opening the file to sniff the PerkinElmer/Akoya vendor XML on every
+        rescan -- a read that is unsafe under cloud/synced folders and wasteful
+        without a cached result, so that path is deliberately disabled
+        (biopb/biopb#135). Extension matching is recall-free, so a
+        cloud/synced-folder placeholder is not recalled here. A ``.tif``-named
+        QPTIFF therefore falls through to the generic bioio adapter; use an
+        explicit ``type: qptiff`` source (or rename to ``.qptiff``) to force the
+        native-pyramid path.
         """
         if not ctx.is_file():
             return None
 
-        name = ctx.name.lower()
-
-        if name.endswith(QPTIFF_EXTENSIONS):
+        if ctx.name.lower().endswith(QPTIFF_EXTENSIONS):
             state.try_claim_path(ctx.path_str)
             return SourceClaim(
                 source_type=cls.SOURCE_TYPE,
@@ -139,33 +144,7 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
                 is_remote=ctx.is_remote,
             )
 
-        if (
-            not ctx.is_remote
-            and ctx._path is not None
-            and name.endswith(_TIFF_EXTENSIONS)
-            and not ctx.cloud_root
-            and ctx.is_resident()
-            and cls._sniff_qpi_xml(ctx._path)
-        ):
-            state.try_claim_path(ctx.path_str)
-            return SourceClaim(
-                source_type=cls.SOURCE_TYPE,
-                primary_path=ctx.path_str,
-            )
-
         return None
-
-    @staticmethod
-    def _sniff_qpi_xml(path) -> bool:
-        """Whether page 0's ImageDescription carries the PerkinElmer/Akoya XML."""
-        import tifffile
-
-        try:
-            with tifffile.TiffFile(str(path)) as tf:
-                desc = tf.pages[0].description or ""
-                return _QPI_XML_MARKER in desc
-        except Exception:
-            return False
 
     # ---- construction -------------------------------------------------------
 

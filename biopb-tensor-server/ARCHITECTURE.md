@@ -189,7 +189,7 @@ Concrete adapters:
 | `ZarrAdapter` | Zarr v2 arrays |
 | `OmeZarrAdapter` | OME-Zarr with precomputed pyramid routing |
 | `OmeTiffAdapter` | OME-TIFF (single- and multi-file), pure-tifffile — no aicsimageio |
-| `QptiffAdapter` | Akoya PhenoImager QPTIFF (`.qptiff`, or `.tif`/`.tiff` with the PerkinElmer/Akoya vendor XML) — pyramidal multiplex whole-slide via tifffile, serving the native on-disk pyramid as `precompute` levels (2nd native-pyramid adapter after OME-Zarr). Module: `adapters/qptiff.py` |
+| `QptiffAdapter` | Akoya PhenoImager QPTIFF (claimed by the `.qptiff` extension; a `.tif`-named QPTIFF needs an explicit `type: qptiff`) — pyramidal multiplex whole-slide via tifffile, serving the native on-disk pyramid as `precompute` levels (2nd native-pyramid adapter after OME-Zarr). Module: `adapters/qptiff.py` |
 | `TiffSequenceAdapter` | Plain TIFF stacks (directory of non-OME `.tif`) |
 | `Hdf5Adapter` | HDF5 chunked datasets |
 | `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via bioio (successor to aicsimageio; per-format `bioio-*` plugins). Module: `adapters/bioio.py` |
@@ -420,9 +420,10 @@ Registration order (by priority/specificity, highest first — callers take
 `claims[0]`; see `adapters/__init__.py::get_default_registry`):
 1. `OmeTiffAdapter` — local OME-TIFF with embedded OME-XML (single- and
    multi-file); pure-tifffile, no aicsimageio dependency
-1b. `QptiffAdapter` — before the bioio group so it owns `.qptiff` and wins the
-   `.tif`/`.tiff` vendor-XML sniff (bioio drops the QPTIFF pyramid); OmeTiffAdapter
-   runs first but declines a QPTIFF (no OME-XML)
+1b. `QptiffAdapter` — before the bioio group so it owns `.qptiff` (bioio drops the
+   QPTIFF pyramid). Claim is suffix-only; a QPTIFF saved as `.tif` is not sniffed
+   (that read is unsafe under cloud and wasteful without caching — biopb/biopb#135)
+   and falls through to bioio unless given an explicit `type: qptiff`
 2. `ZeissAdapter` / `LeicaAdapter` / `NikonAdapter` / `DvAdapter` /
    `OlympusAdapter` / `BioformatsAdapter` / `AicsImageIoAdapter` — vendor formats
    and the generic bioio fallback (which also picks up a remote or non-OME
