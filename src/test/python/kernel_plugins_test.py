@@ -17,7 +17,12 @@ from biopb import _kernel_plugins as kp
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """Isolate the kernel-plugin dir under a per-test home."""
+    """Isolate the kernel-plugin dir under a per-test home.
+
+    ``config_dir()`` honors ``XDG_CONFIG_HOME`` ahead of ``Path.home()``, and CI
+    runners set it — clear it so the default falls back to the patched home.
+    """
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     return tmp_path
 
