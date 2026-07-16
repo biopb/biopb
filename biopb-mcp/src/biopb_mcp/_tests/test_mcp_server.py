@@ -373,24 +373,9 @@ class TestJobTools:
         result = _server.poll_job("job-1")
         assert "viewer window is closed" not in result
 
-    def test_cancel_job_requests_cancellation(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-1", cancelled=True, status="running"
-        )
-        result = _server.cancel_job("job-1")
-        assert "Cancellation requested" in result
-        assert "restart_kernel" in result
-
-    def test_cancel_job_nothing_to_cancel(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-1", cancelled=False, status="ok"
-        )
-        assert "nothing to cancel" in _server.cancel_job("job-1")
-
     def test_job_tools_no_host(self):
         _server._kernel_host = None
         assert "not initialized" in _server.poll_job("job-1")
-        assert "not initialized" in _server.cancel_job("job-1")
 
 
 # -----------------------------------------------------------------------
