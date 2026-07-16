@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 
 import typer
 from biopb import _web_auth
+from biopb._lifecycle import deathwatch as _deathwatch
 from rich.console import Console
 from rich.table import Table
 
@@ -690,8 +691,12 @@ def serve(
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
 
-    # Treat SIGTERM (e.g. `biopb server stop`) like Ctrl+C so shutdown is clean.
+    # Treat SIGTERM (e.g. the control supervisor's graceful stop) like Ctrl+C so
+    # shutdown is clean.
     _install_sigterm_handler()
+    # If launched under the control supervisor, self-terminate when it dies
+    # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
+    _deathwatch.install()
 
     try:
         server.serve()
@@ -935,6 +940,13 @@ def launch(
     setup_logging(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
+
+    # If launched under the control supervisor, self-terminate when it dies
+    # uncatchably so a crashed/killed control never orphans this plane into a
+    # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
+    # uvicorn handles SIGTERM for the graceful stop path, so no SIGTERM handler
+    # here — only the uncatchable-death backstop.
+    _deathwatch.install()
 
     # --- Token management ---
     # The flight bind (server.host) is the mode switch; the sidecar's own bind
