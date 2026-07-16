@@ -19,5 +19,6 @@ server wants it.
 """
 
 from . import deathwatch, winjob
+from .owned_child import OwnedChild, open_child_log
 
-__all__ = ["deathwatch", "winjob"]
+__all__ = ["OwnedChild", "deathwatch", "open_child_log", "winjob"]
