@@ -66,8 +66,7 @@ are produced.
 
 - **biopb-mcp + biopb + biopb-tensor-server + biopb-control** — the matched wheel
   set from the one release, into a single `uv` tool environment so the components
-  can import and drive each other (`biopb control start`, `biopb server start`, the
-  napari viewer, etc.).
+  can import and drive each other (`biopb control start`, the napari viewer, etc.).
 - **napari** — from PyPI, into the same environment.
 - **Web interface** — `webapp.tar.gz` from the same release, unpacked to
   `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin

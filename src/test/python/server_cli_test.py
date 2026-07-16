@@ -151,120 +151,6 @@ class TestProbeDaemon:
         assert cli._probe_daemon("127.0.0.1", 8765).listening is False
 
 
-class TestStatusHealth:
-    """`server status` now queries the live Flight health (status + source_count)
-    and can emit JSON for scripting (used by the installer)."""
-
-    def _invoke(self, monkeypatch, *, pid, running, health, extra_args=()):
-        # token None -> _is_our_daemon falls back to the (mocked) liveness check.
-        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
-        monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
-        if isinstance(health, list):
-            seq = iter(health)
-            monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: next(seq))
-        else:
-            monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: health)
-        monkeypatch.setattr(
-            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
-        )
-        res = CliRunner().invoke(cli.app, ["server", "status", "--json", *extra_args])
-        assert res.exit_code == 0, res.output
-        return json.loads(res.stdout.strip().splitlines()[-1])
-
-    def test_running_serving_reports_sources(self, monkeypatch):
-        d = self._invoke(
-            monkeypatch,
-            pid=123,
-            running=True,
-            health={
-                "status": "SERVING",
-                "source_count": 7,
-                "writable": False,
-                "uptime_seconds": 42,
-            },
-        )
-        assert d["running"] is True and d["pid"] == 123
-        assert d["status"] == "running"
-        assert d["health"] == "SERVING" and d["source_count"] == 7
-
-    def test_not_running(self, monkeypatch):
-        d = self._invoke(monkeypatch, pid=None, running=False, health=None)
-        assert d["running"] is False and d["pid"] is None
-        assert d["status"] == "stopped"
-        assert d["health"] is None and d["source_count"] is None
-
-    def test_stale_pid(self, monkeypatch):
-        d = self._invoke(monkeypatch, pid=999, running=False, health=None)
-        assert d["running"] is False and d["status"] == "stale"
-
-    def test_running_but_no_sources(self, monkeypatch):
-        d = self._invoke(
-            monkeypatch,
-            pid=5,
-            running=True,
-            health={"status": "SERVING", "source_count": 0},
-        )
-        assert d["health"] == "SERVING" and d["source_count"] == 0
-
-    def test_unreachable_health(self, monkeypatch):
-        # Process up but Flight unreachable -> health None, still running.
-        d = self._invoke(monkeypatch, pid=5, running=True, health=None)
-        assert d["running"] is True and d["health"] is None
-
-    def test_wait_polls_until_serving(self, monkeypatch):
-        # First probe STARTING, second SERVING; --wait drives the poll loop
-        # (time.sleep is neutralized by the autouse fixture).
-        d = self._invoke(
-            monkeypatch,
-            pid=5,
-            running=True,
-            health=[
-                {"status": "STARTING", "source_count": 0},
-                {"status": "SERVING", "source_count": 3},
-            ],
-            extra_args=["--wait", "5"],
-        )
-        assert d["health"] == "SERVING" and d["source_count"] == 3
-
-    def test_wait_logs_progress(self, monkeypatch):
-        # --wait should log a human-facing progress report while STARTING; JSON
-        # stays the last line (parsed by _invoke).
-        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (5, None))
-        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
-        seq = iter(
-            [
-                {"status": "STARTING", "source_count": 2},
-                {"status": "SERVING", "source_count": 4},
-            ]
-        )
-        monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: next(seq))
-        monkeypatch.setattr(
-            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
-        )
-        res = CliRunner().invoke(cli.app, ["server", "status", "--json", "--wait", "5"])
-        assert res.exit_code == 0, res.output
-        assert "starting" in res.output and "2 source" in res.output
-        # JSON (final verdict) is still the last line.
-        last = json.loads(res.stdout.strip().splitlines()[-1])
-        assert last["health"] == "SERVING" and last["source_count"] == 4
-
-    def test_no_wait_is_silent(self, monkeypatch):
-        # Without --wait, a single probe and no progress chatter.
-        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (5, None))
-        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
-        monkeypatch.setattr(
-            cli,
-            "_query_health",
-            lambda *_a, **_k: {"status": "SERVING", "source_count": 1},
-        )
-        monkeypatch.setattr(
-            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
-        )
-        res = CliRunner().invoke(cli.app, ["server", "status", "--json"])
-        assert res.exit_code == 0
-        assert "starting" not in res.output and "waiting" not in res.output
-
-
 class TestLogLineHelpers:
     """Pure helpers behind `server logs --level`: parsing a line's level and
     filtering with carry-forward for off-format continuation lines."""
@@ -317,63 +203,6 @@ class TestLogLineHelpers:
         assert cli._filter_lines(lines, "ERROR") == lines
 
 
-class TestLogs:
-    """`server logs` reads ~/.local/share/biopb/logs/tensor-server.log."""
-
-    @pytest.fixture
-    def log_file(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "logs"
-        log_dir.mkdir()
-        monkeypatch.setattr(cli, "LOG_DIR", log_dir)
-        return log_dir / "tensor-server.log"
-
-    def _run(self, *args):
-        res = CliRunner().invoke(cli.app, ["server", "logs", *args])
-        return res
-
-    def test_path_prints_and_exits(self, log_file):
-        res = self._run("--path")
-        assert res.exit_code == 0
-        assert str(log_file) in res.output
-
-    def test_missing_file_is_not_an_error(self, log_file):
-        res = self._run()
-        assert res.exit_code == 0
-        assert "No log file" in res.output
-
-    def test_tail_last_n_lines(self, log_file):
-        log_file.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
-        res = self._run("-n", "5")
-        assert res.exit_code == 0
-        # Filter out the daemon-deprecation notice (stderr, mixed into CliRunner
-        # output); only the tailed log lines start with "line ".
-        out = [ln for ln in res.output.splitlines() if ln.startswith("line ")]
-        assert out == ["line 15", "line 16", "line 17", "line 18", "line 19"]
-
-    def test_level_filter_drops_below_threshold(self, log_file):
-        log_file.write_text(
-            "[t] INFO a: i\n[t] DEBUG a: d\n[t] WARNING a: w\n[t] ERROR a: e\n"
-        )
-        res = self._run("--level", "WARNING")
-        assert res.exit_code == 0
-        assert "WARNING a: w" in res.output and "ERROR a: e" in res.output
-        assert "INFO a: i" not in res.output and "DEBUG a: d" not in res.output
-
-    def test_level_filter_keeps_continuation(self, log_file):
-        log_file.write_text("[t] INFO a: i\n[t] WARNING a: boom\ncontinuation trace\n")
-        res = self._run("--level", "warning")  # case-insensitive
-        assert res.exit_code == 0
-        assert "WARNING a: boom" in res.output
-        assert "continuation trace" in res.output
-        assert "INFO a: i" not in res.output
-
-    def test_invalid_level_exits_1(self, log_file):
-        log_file.write_text("[t] INFO a: i\n")
-        res = self._run("--level", "FOO")
-        assert res.exit_code == 1
-        assert "Invalid --level" in res.output
-
-
 class TestCacheStats:
     """`server cache-stats` queries the running daemon's cache hit/miss stats
     and can emit JSON for scripting."""
@@ -393,37 +222,30 @@ class TestCacheStats:
         },
     }
 
-    def _run(self, monkeypatch, *, running, stats, args=()):
-        monkeypatch.setattr(
-            cli, "_read_pid_record", lambda *_a: (123 if running else None, None)
-        )
-        monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
+    def _run(self, monkeypatch, *, stats, args=()):
+        # Liveness is the Flight query itself (no PID-file gate): an unreachable
+        # server just yields no stats.
         monkeypatch.setattr(
             cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
         )
         monkeypatch.setattr(cli, "_query_cache_stats", lambda *_a, **_k: stats)
         return CliRunner().invoke(cli.app, ["server", "cache-stats", *args])
 
-    def test_not_running_exits_1(self, monkeypatch):
-        res = self._run(monkeypatch, running=False, stats=None)
-        assert res.exit_code == 1
-        assert "not running" in res.output
-
     def test_unreachable_exits_1(self, monkeypatch):
-        # Process up but the cache_stats action failed -> _query_cache_stats None.
-        res = self._run(monkeypatch, running=True, stats=None)
+        # Server unreachable / cache action failed -> _query_cache_stats None.
+        res = self._run(monkeypatch, stats=None)
         assert res.exit_code == 1
         assert "Could not retrieve cache stats" in res.output
 
     def test_json_emits_raw_dict(self, monkeypatch):
-        res = self._run(monkeypatch, running=True, stats=self._STATS, args=["--json"])
+        res = self._run(monkeypatch, stats=self._STATS, args=["--json"])
         assert res.exit_code == 0, res.output
         payload = json.loads(res.stdout.strip().splitlines()[-1])
         assert payload["hits"] == 80 and payload["misses"] == 20
         assert payload["pool_stats"]["unified-tiny"]["segments"] == 2
 
     def test_table_renders_hit_rate_and_pools(self, monkeypatch):
-        res = self._run(monkeypatch, running=True, stats=self._STATS)
+        res = self._run(monkeypatch, stats=self._STATS)
         assert res.exit_code == 0, res.output
         out = res.output
         assert "Cache Statistics" in out and "80.0%" in out  # 80/(80+20)
@@ -434,12 +256,8 @@ class TestCacheStats:
         assert cli._hit_rate(3, 1) == "75.0%"
 
     def test_explicit_token_is_passed_through(self, monkeypatch):
-        # Regression: --token must reach _query_cache_stats. The PID-record read
-        # binds an identity token; if it reused the name `token` it would clobber
-        # the access-token option (an int identity token would also win `or`).
+        # Regression: --token must reach _query_cache_stats verbatim.
         captured = {}
-        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (123, None))
-        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
         monkeypatch.setattr(
             cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
         )
@@ -511,11 +329,8 @@ class TestQueryServerHelper:
         monkeypatch.setitem(sys.modules, "biopb.tensor.client", None)
         assert cli._query_server("grpc://x", None, lambda c: c.health_check()) is None
 
-    def test_wrappers_route_to_the_right_client_method(self, monkeypatch):
+    def test_wrapper_routes_to_the_right_client_method(self, monkeypatch):
         class FakeClient:
-            def health_check(self):
-                return {"m": "health"}
-
             def cache_stats(self):
                 return {"m": "cache"}
 
@@ -526,7 +341,6 @@ class TestQueryServerHelper:
             return call(FakeClient())
 
         monkeypatch.setattr(cli, "_query_server", fake_query_server)
-        assert cli._query_health("grpc://x", "t") == {"m": "health"}
         assert cli._query_cache_stats("grpc://x", "t") == {"m": "cache"}
         assert captured["args"] == ("grpc://x", "t")
 
@@ -1069,29 +883,11 @@ class TestPidIdentity:
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: False)
         assert cli._is_our_daemon(100, 555) is False
 
-    def test_stop_skips_force_kill_on_reused_pid(self, monkeypatch):
-        """`stop` on a stale PID now owned by an unrelated process must clean the
-        PID file WITHOUT TerminateProcess-ing that innocent process."""
-        monkeypatch.setattr("sys.platform", "linux")
-        # The PID is alive, but its identity does not match the recorded token.
-        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (1234, 555))
-        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
-        monkeypatch.setattr(cli, "_process_create_time", lambda _p: 999)  # reused
-        remove = MagicMock()
-        monkeypatch.setattr(cli, "_remove_pid", remove)
-        with patch.object(cli.os, "kill") as kill:
-            res = CliRunner().invoke(cli.app, ["server", "stop"])
-        assert res.exit_code == 0
-        kill.assert_not_called()  # the innocent reused PID is never signaled
-        remove.assert_called_once()  # but the stale file is cleaned up
-
 
 class TestWinRequestShutdown:
-    def test_writes_fixed_sentinel_file(self, tmp_path, monkeypatch):
-        # Redirect the biopb data dir to a temp location.
-        monkeypatch.setattr(cli, "PID_FILE", tmp_path / "tensor-server.pid")
-        sentinel = cli._win_shutdown_sentinel()
-        assert sentinel == tmp_path / "tensor-server.stop"  # not pid-keyed
+    def test_writes_and_removes_sentinel(self, tmp_path):
+        # The generic Windows graceful-stop primitives: drop a "stop" file, tidy it.
+        sentinel = tmp_path / "some-daemon.stop"
         assert cli._win_request_shutdown(sentinel) is True
         assert sentinel.exists()
         assert sentinel.read_text() == "stop"

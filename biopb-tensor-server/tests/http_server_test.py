@@ -839,14 +839,14 @@ class TestQuerySourcesEndpoint:
 
 
 class TestWindowsShutdownListener:
-    """The graceful-stop listener used by `biopb server stop` on Windows."""
+    """The graceful-stop listener the control supervisor drives on Windows."""
 
     def test_sentinel_path_matches_stop_side_contract(self):
         from pathlib import Path
 
         from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
-        # Must match biopb.cli._win_shutdown_sentinel (PID_FILE.parent / name).
+        # Must match DataPlaneSupervisor._win_stop_sentinel (the control writes it).
         # Fixed name (not pid-keyed) so stop and the daemon always agree.
         expected = Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
         assert shutdown_sentinel_path() == expected
@@ -1227,77 +1227,6 @@ class TestAdminBrowseRoute:
                     headers=_bearer(_TOKEN),
                 )
                 assert r.status_code == 404
-
-
-class TestAdminRestartRoute:
-    def test_restart_spawns_detached_child_and_returns_202(self, admin_client):
-        tc, _ = admin_client
-        with patch("subprocess.Popen") as popen:
-            r = tc.post(
-                "/api/admin/restart",
-                headers={"Sec-Fetch-Site": "same-origin"},
-            )
-        assert r.status_code == 202
-        assert r.json() == {"restarting": True}
-        popen.assert_called_once()
-        cmd = popen.call_args.args[0]
-        assert cmd[1:5] == ["-m", "biopb.cli", "server", "restart"]
-        # The daemon echoes its own launch args so restart comes back identically.
-        assert cmd[cmd.index("--web-port") + 1] == "8814"
-        assert cmd[cmd.index("--web-host") + 1] == "127.0.0.1"
-        assert "--config" in cmd
-        # Local mode (no token): no bypass signal rides the child env (the flag is
-        # gone), and nothing BIOPB* leaks onto the world-readable command line.
-        assert "BIOPB_WEB_DEV_BYPASS" not in popen.call_args.kwargs["env"]
-        assert not any(str(arg).startswith("BIOPB") for arg in cmd)
-
-    def test_restart_blocks_cross_origin(self, admin_client):
-        tc, _ = admin_client
-        with patch("subprocess.Popen") as popen:
-            r = tc.post(
-                "/api/admin/restart",
-                headers={"Sec-Fetch-Site": "cross-site"},
-            )
-        assert r.status_code == 403
-        popen.assert_not_called()
-
-    def test_second_restart_while_one_in_progress_returns_409(self, admin_client):
-        tc, _ = admin_client
-        hdr = {"Sec-Fetch-Site": "same-origin"}
-        with patch("subprocess.Popen") as popen:
-            first = tc.post("/api/admin/restart", headers=hdr)
-            second = tc.post("/api/admin/restart", headers=hdr)
-        assert first.status_code == 202
-        assert second.status_code == 409
-        # The latch stops the second from spawning a competing restart child.
-        popen.assert_called_once()
-
-    def test_latch_resets_when_spawn_fails_so_retry_is_possible(self, admin_client):
-        tc, _ = admin_client
-        hdr = {"Sec-Fetch-Site": "same-origin"}
-        with patch("subprocess.Popen", side_effect=OSError("boom")):
-            failed = tc.post("/api/admin/restart", headers=hdr)
-        assert failed.status_code == 500
-        # Latch was cleared on failure, so a later successful spawn returns 202.
-        with patch("subprocess.Popen") as popen:
-            retry = tc.post("/api/admin/restart", headers=hdr)
-        assert retry.status_code == 202
-        popen.assert_called_once()
-
-    def test_supervised_restart_is_forbidden_and_spawns_nothing(
-        self, supervised_admin_client
-    ):
-        # Control-owned: the sidecar must refuse the self-restart (409) and spawn
-        # no `biopb server restart` child that would race the control for the
-        # gRPC port (biopb/biopb#418). The admin UI routes to the control instead.
-        tc, _ = supervised_admin_client
-        with patch("subprocess.Popen") as popen:
-            r = tc.post(
-                "/api/admin/restart",
-                headers={"Sec-Fetch-Site": "same-origin"},
-            )
-        assert r.status_code == 409
-        popen.assert_not_called()
 
 
 class TestCreateAppSupervisedFromEnv:

@@ -326,21 +326,6 @@ export class TensorHttpClient {
     );
   }
 
-  /**
-   * Spawn a detached `biopb server restart` (`POST /api/admin/restart`).
-   *
-   * Returns `202 {restarting: true}` immediately; the admin routes go dead
-   * while the daemon bounces, so the caller reconnects by polling
-   * {@link livez} then {@link getAdminStatus}.
-   */
-  async restartServer(): Promise<{ restarting: boolean }> {
-    return this.fetchJson<{ restarting: boolean }>(
-      "/api/admin/restart",
-      { method: "POST" },
-      this.metadataTimeoutMs,
-    );
-  }
-
   // -------------------------------------------------------------------------
   // Slice
   // -------------------------------------------------------------------------

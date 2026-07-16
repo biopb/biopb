@@ -2,16 +2,28 @@
 
 Exposes the TensorFlightClient over a browser-friendly HTTP/JSON + binary API.
 
-Endpoints:
-  GET  /livez                        — liveness probe (no auth)
-  GET  /readyz                       — readiness probe (no auth)
-  GET  /healthz                      — alias for /readyz (no auth)
-  GET  /api/diagnostics              — runtime diagnostics (token required)
-  GET  /api/sources                  — list DataSourceDescriptors (token required)
-  POST /api/sources/query            — SQL query against source metadata (token required)
-  GET  /api/sources/{source_id}      — single DataSourceDescriptor (token required)
-  GET  /api/sources/{source_id}/metadata — parsed metadata_json (token required)
-  POST /api/slice                    — fetch array slice as binary (token required)
+Endpoints (unauthenticated — probes):
+  GET  /livez                        — liveness probe
+  GET  /readyz                       — readiness probe
+  GET  /healthz                      — alias for /readyz
+
+Endpoints (token required):
+  GET  /api/diagnostics              — runtime diagnostics
+  GET  /api/sources                  — list DataSourceDescriptors
+  POST /api/sources/query            — SQL query against source metadata
+  GET  /api/sources/{source_id}/metadata          — parsed metadata_json
+  GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
+  GET  /api/sources/{source_id}      — single DataSourceDescriptor
+  POST /api/slice                    — fetch array slice as binary
+  POST /api/render                   — server-rendered RGB image of a slice
+  WS   /ws/render                    — streaming render channel
+  GET  /api/config                   — current config (secrets redacted)
+  PUT  /api/config                   — update config (same-origin guarded)
+  GET  /api/admin/status             — server/catalog status for the admin page
+  GET  /api/admin/browse             — server-side filesystem browse (data-folder picker)
+
+  The specific /api/sources/{id}/… routes are registered before the greedy
+  /{id:path} catch-all so Starlette does not shadow them (see route defs).
 
 Authentication:
   Pass the website token in the ``Authorization: Bearer <token>`` header or
@@ -212,12 +224,12 @@ class _DiagnosticsState:
 # ---------------------------------------------------------------------------
 
 
-def _now_rfc3339() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 _PATH_LIKE = re.compile(r"(/[^\s]{3,}|[A-Za-z]:\\[^\s]{3,})")
 _TOKEN_LIKE = re.compile(r"[A-Za-z0-9_\-]{16,}")
+
+
+def _now_rfc3339() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _redact(text: Optional[str]) -> Optional[str]:
@@ -309,11 +321,6 @@ class RenderRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Per-app context (was: closures captured inside create_app)
 # ---------------------------------------------------------------------------
 
@@ -342,26 +349,21 @@ class _SidecarContext:
         self.flight_location = flight_location
         self.token = token
         self.cache_bytes = cache_bytes
-        # Admin-route config: the config file this daemon was launched with and
-        # the bind args echoed into a self-restart so it comes back identically
-        # (biopb/biopb#237).
+        # The config file this daemon was launched with (read/written by the
+        # /api/config endpoints). web_host/web_port record this sidecar's own bind.
         self.config_path = config_path
         self.web_host = web_host
         self.web_port = web_port
         # True when the biopb control spawned + supervises this data plane (it
-        # sets BIOPB_DATA_PLANE_SUPERVISED in our env). The admin self-restart is
-        # then forbidden: the control is the sole owner, so a self-spawned
-        # `biopb server restart` would race the supervisor and silently hand the
-        # plane to a daemon the control did not start (biopb/biopb#418).
+        # sets BIOPB_DATA_PLANE_SUPERVISED in our env). Reported on
+        # /api/admin/status so the admin UI routes a restart to the control (which
+        # owns the process); a self-managed plane can't be restarted from the
+        # browser (biopb/biopb#418).
         self.supervised = supervised
         self.diag = _DiagnosticsState()
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
         self._client_holder: Dict[str, Optional[TensorFlightClient]] = {"client": None}
-        # Latches once POST /api/admin/restart spawns the detached restart child,
-        # so a rapid second request can't spawn a competing `biopb server restart`
-        # that would race on the PID file / port (biopb/biopb#237).
-        self._restart_state: Dict[str, bool] = {"in_progress": False}
 
     def get_client(self) -> TensorFlightClient:
         """Return the Flight client, connecting on first use."""
@@ -1321,8 +1323,9 @@ async def admin_status(request: Request) -> JSONResponse:
             "running": running,
             "pid": os.getpid(),
             "version": _VERSION,
-            # Control-owned: the admin UI must route a restart through the
-            # control, not the sidecar self-restart (biopb/biopb#418).
+            # Control-owned: the admin UI routes a restart through the control
+            # (which owns the process). A self-managed plane can't be restarted
+            # from the browser (biopb/biopb#418).
             "supervised": ctx.supervised,
             # No token enforced. The admin UI keys the local-only server-side file
             # chooser (#244) off this, since a tokenless plane is loopback-bound
@@ -1427,65 +1430,6 @@ async def admin_browse(request: Request) -> JSONResponse:
     )
 
 
-@_router.post("/api/admin/restart")
-async def admin_restart(request: Request) -> JSONResponse:
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    _require_same_origin(request)
-    # Control-owned plane: the sidecar must NOT self-restart. The control is the
-    # sole owner (it spawned + supervises this process); a self-spawned `biopb
-    # server restart` would SIGTERM the control's tracked child, the supervisor
-    # would respawn its own replacement, and both would race for the gRPC port —
-    # if the standalone daemon won, the control would see a port it didn't spawn,
-    # mark it a conflict, and stop managing the plane (biopb/biopb#418). Restart
-    # is instead a request to the control (POST /api/data_plane/restart), which
-    # the admin UI routes to when it sees supervised=True in /api/admin/status.
-    if ctx.supervised:
-        raise HTTPException(
-            status_code=409,
-            detail="This data plane is supervised by the biopb control; restart "
-            "it via the control (POST /api/data_plane/restart), not the sidecar "
-            "self-restart, which would conflict with supervision.",
-        )
-    # Refuse a second restart while one is already underway (e.g. a
-    # double-click): two `biopb server restart` children would race on the
-    # PID file and the freed port. This async handler has no await before the
-    # latch, so the check-and-set is atomic on the event loop.
-    if ctx._restart_state["in_progress"]:
-        raise HTTPException(status_code=409, detail="A restart is already in progress")
-    ctx._restart_state["in_progress"] = True
-    import subprocess
-
-    from biopb.cli import _detach_kwargs
-
-    # Echo this daemon's own launch args so the restart comes back identically
-    # (same config / port / host); a bare restart would fall back to defaults and
-    # return mismatched (biopb/biopb#237).
-    cmd = [sys.executable, "-m", "biopb.cli", "server", "restart"]
-    if ctx.config_path:
-        cmd += ["--config", str(ctx.config_path)]
-    if ctx.web_port is not None:
-        cmd += ["--web-port", str(ctx.web_port)]
-    if ctx.web_host:
-        cmd += ["--web-host", str(ctx.web_host)]
-
-    # The token rides the child's environment (never the visible command
-    # line), matching how `biopb server start` hands it to the daemon.
-    env = dict(os.environ)
-    if ctx.token:
-        env["BIOPB_TENSOR_TOKEN"] = ctx.token
-
-    # Detach so the child outlives this dying parent: `restart` SIGTERMs us,
-    # waits for the port to free, then relaunches a fresh daemon.
-    try:
-        subprocess.Popen(cmd, env=env, **_detach_kwargs())
-    except Exception as e:
-        # Spawn failed: nothing is bouncing, so clear the latch to allow retry.
-        ctx._restart_state["in_progress"] = False
-        raise HTTPException(status_code=500, detail=f"Could not spawn restart: {e}")
-    return JSONResponse(status_code=202, content={"restarting": True})
-
-
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -1516,16 +1460,16 @@ def create_app(
             every listener is loopback-bound).
         cache_bytes: Bytes for the in-process chunk cache.
         cors_origins: Allowed CORS origins. Defaults to localhost variants.
-        config_path: Path to the config file this daemon was launched with. The
-            admin routes read/write it and echo it into the restart command so a
-            self-restart comes back identically (biopb/biopb#237).
-        web_host: Host this HTTP sidecar was bound to (echoed into restart).
-        web_port: Port this HTTP sidecar was bound to (echoed into restart).
-        supervised: Whether the biopb control owns/supervises this data plane;
-            when it does, the admin self-restart is refused (biopb/biopb#418).
-            Defaults to reading ``BIOPB_DATA_PLANE_SUPERVISED`` from the env the
-            control set, so a directly-launched ``biopb server start`` is not
-            supervised and keeps its self-restart.
+        config_path: Path to the config file this daemon was launched with; the
+            /api/config routes read and write it.
+        web_host: Host this HTTP sidecar was bound to (recorded on the context).
+        web_port: Port this HTTP sidecar was bound to (recorded on the context).
+        supervised: Whether the biopb control owns/supervises this data plane.
+            Reported on /api/admin/status so the admin UI routes a restart to the
+            control (which owns the process); a self-managed plane can't be
+            restarted from the browser (biopb/biopb#418). Defaults to reading
+            ``BIOPB_DATA_PLANE_SUPERVISED`` from the env the control set, so a
+            directly-launched ``biopb-tensor-server launch`` is not supervised.
 
     Returns:
         Configured FastAPI application.
@@ -1605,14 +1549,15 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
 
 
 def shutdown_sentinel_path() -> os.PathLike:
-    """Path of the shutdown sentinel file `biopb server stop` writes.
+    """Path of the shutdown sentinel file the control supervisor writes (Windows).
 
-    Must stay in sync with the path biopb.cli computes (duplicated there to avoid
-    importing heavy server deps just to stop). A single fixed name in the user's
-    biopb data dir - NOT keyed by PID: on Windows the process `start` launches
-    can differ from the one running launch()/uvicorn (Store-Python/uv shims), so
-    the daemon's os.getpid() and the PID file may disagree. There is only ever
-    one daemon (the PID file is singular too), so a fixed name is unambiguous.
+    Must stay in sync with ``DataPlaneSupervisor._win_stop_sentinel`` (the control
+    writes it; the path is duplicated there to avoid importing heavy server deps).
+    A single fixed name in the user's biopb data dir - NOT keyed by PID: on Windows
+    the process the supervisor records can differ from the one running
+    launch()/uvicorn (Store-Python/uv shims), so a PID in the name would make
+    writer and watcher disagree. The control is the sole owner of the plane, so a
+    fixed name is unambiguous.
     """
     from pathlib import Path
 
@@ -1620,11 +1565,11 @@ def shutdown_sentinel_path() -> os.PathLike:
 
 
 def _install_windows_shutdown_listener(server) -> None:
-    """Windows-only: let `biopb server stop` shut the daemon down gracefully.
+    """Windows-only: let the control supervisor shut the daemon down gracefully.
 
     The daemon is a windowless background process (CREATE_NO_WINDOW) in its own
     process group, so it has no console to receive a CTRL_BREAK and Win32 named
-    objects are awkward across sessions/elevation. So `stop` instead drops a
+    objects are awkward across sessions/elevation. So the supervisor instead drops a
     small sentinel *file* that this watcher thread polls for; when it appears we
     ask uvicorn to exit (should_exit + force_exit, so an open browser connection
     can't stall shutdown). uvicorn then returns from run(), so launch()'s
