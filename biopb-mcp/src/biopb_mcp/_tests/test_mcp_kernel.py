@@ -60,7 +60,7 @@ class TestConfigureDask:
         assert cluster is None
 
     def test_injected_address_takes_precedence(self, monkeypatch):
-        """BIOPB_DASK_ADDRESS (daemon-injected) wins over the config address."""
+        """BIOPB_DASK_ADDRESS (session-child-injected) wins over the config address."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 

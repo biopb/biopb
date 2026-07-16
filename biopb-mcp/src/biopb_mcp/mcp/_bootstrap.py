@@ -371,12 +371,13 @@ def _bootstrap_impl():
     conn = TensorConnection(config)
 
     # 3. Attach dask on a background thread so the viewer opens immediately. The
-    #    cluster is daemon-owned and may still be registering workers, and even a
-    #    bare Client(address) connect costs a round-trip; the viewer never needs
-    #    the distributed cluster (its interactive reads pin to a single-process
-    #    scheduler, issue #8) — only the agent's explicit da.compute() uses the
-    #    distributed default, which is set once the Client attaches. Until then
-    #    `_dask_client` is None; cancel_job / server_status guard for that.
+    #    cluster is session-child-owned and may still be registering workers, and
+    #    even a bare Client(address) connect costs a round-trip; the viewer never
+    #    needs the distributed cluster (its interactive reads pin to a
+    #    single-process scheduler, issue #8) — only the agent's explicit
+    #    da.compute() uses the distributed default, which is set once the Client
+    #    attaches. Until then `_dask_client` is None; cancel_job / server_status
+    #    guard for that.
     import threading
 
     ip.user_ns["_dask_client"] = None

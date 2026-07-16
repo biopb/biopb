@@ -591,7 +591,7 @@ def _serve_http(config, port, view=False):
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
         Windows stop sentinel, the server loop returning: reap the kernel, close
-        the daemon-owned dask cluster, remove our files, exit.
+        the session-child-owned dask cluster, remove our files, exit.
 
         Skips Python finalization: this process still has a live asyncio/epoll
         event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -602,8 +602,9 @@ def _serve_http(config, port, view=False):
         logger.info("Shutting down (%s).", reason)
         host.shutdown()
         # After the kernel is reaped (no clients left attached): stop the
-        # daemon-owned cluster, then rmtree its now-idle spill dir. This is the
-        # only path that closes the cluster — kernel restart/reap leaves it warm.
+        # session-child-owned cluster, then rmtree its now-idle spill dir. This is
+        # the only path that closes the cluster — kernel restart/reap leaves it
+        # warm.
         cluster_host.close()
         _remove_pidfile(pidfile)
         _cleanup_dask_dir()

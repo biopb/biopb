@@ -232,10 +232,11 @@ class KernelHost:
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
 
-        # Daemon-owned dask cluster (or None). _launch calls ensure() and injects
-        # the scheduler address so the kernel attaches to it instead of spinning
-        # its own; the daemon owns its lifetime, so a kernel restart/reap here
-        # leaves the cluster (and its warm workers) untouched. See _cluster.py.
+        # Session-child-owned dask cluster (or None). _launch calls ensure() and
+        # injects the scheduler address so the kernel attaches to it instead of
+        # spinning its own; the session child owns its lifetime, so a kernel
+        # restart/reap here leaves the cluster (and its warm workers) untouched.
+        # See _cluster.py.
         self._cluster_host = cluster_host
 
     # -- lifecycle ------------------------------------------------------
@@ -317,11 +318,11 @@ class KernelHost:
             if self._tensor_url:
                 env[_TENSOR_URL_ENV] = self._tensor_url
 
-        # Attach this kernel to the daemon-owned dask cluster. ensure() spins it
-        # on the first launch (returning as soon as the scheduler is bound, so
-        # workers register while the kernel imports napari) and returns the cached
-        # address on later launches. None -> the daemon owns no cluster (owner
-        # "kernel", a non-distributed scheduler, an external address, or a spin
+        # Attach this kernel to the session-child-owned dask cluster. ensure()
+        # spins it on the first launch (returning as soon as the scheduler is
+        # bound, so workers register while the kernel imports napari) and returns
+        # the cached address on later launches. None -> the session child owns no
+        # cluster (a non-distributed scheduler, an external address, or a spin
         # failure); the kernel then resolves dask from its own config.
         if self._cluster_host is not None:
             from ._cluster import DASK_ADDRESS_ENV
