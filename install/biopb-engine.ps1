@@ -123,6 +123,18 @@ if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
     $env:UV_TOOL_DIR = Join-Path $env:LOCALAPPDATA "uv\tools"
 }
 
+# The `biopb` subdir of an XDG base dir, mirroring biopb._config_location: config
+# in the config tree, portable assets (webapp/samples) in the data tree, logs /
+# pid / sentinels in the STATE tree. Honors the XDG env var (as Python does on
+# every platform), defaulting to the conventional home-relative dir, so writer
+# (installer) and reader (code) resolve the same path.
+function Get-BiopbTree {
+    param([string]$EnvVar, [string]$DefaultRel)
+    $base = [Environment]::GetEnvironmentVariable($EnvVar)
+    if (-not $base) { $base = Join-Path $env:USERPROFILE $DefaultRel }
+    return Join-Path $base "biopb"
+}
+
 # ============================================================================
 # Reporter -- the integration seam between the engine and either front-end.
 # Both modes go through the SAME calls; only the rendering differs, so the
@@ -585,8 +597,9 @@ function Show-LogTail {
 function Start-ControlPlane {
     param([string]$BiopbHome, [string]$ConfigFile, [bool]$NoStart)
 
-    $controlLog  = Join-Path $BiopbHome ".local\share\biopb\logs\control.log"
-    $serverLog = Join-Path $BiopbHome ".local\share\biopb\logs\tensor-server.log"
+    $logsDir     = Join-Path (Get-BiopbTree "XDG_STATE_HOME" ".local\state") "logs"
+    $controlLog  = Join-Path $logsDir "control.log"
+    $serverLog   = Join-Path $logsDir "tensor-server.log"
 
     if ($NoStart) {
         Report-Info "Skipping control-plane start"
@@ -771,7 +784,7 @@ function Install-DesktopShortcut {
         $sc.WorkingDirectory = Split-Path $biopbExe -Parent
         # Brand the shortcut with the webapp's icon (shipped in the webapp bundle);
         # only if present, else leave the default (biopb.exe's) icon.
-        $icon = Join-Path $BiopbHome ".local\share\biopb\webapp\favicon.ico"
+        $icon = Join-Path (Get-BiopbTree "XDG_DATA_HOME" ".local\share") "webapp\favicon.ico"
         if (Test-Path -LiteralPath $icon) { $sc.IconLocation = "$icon,0" }
         $sc.Save()
         Report-Ok "Desktop shortcut created: $lnkPath"
@@ -823,7 +836,7 @@ function Invoke-BiopbInstall {
     # ----- Dry run: emit the full progress stream, change nothing. -----
     if ($DryRun) {
         $BiopbHome  = $env:USERPROFILE
-        $ConfigDir  = Join-Path $BiopbHome ".config\biopb"
+        $ConfigDir  = Get-BiopbTree "XDG_CONFIG_HOME" ".config"
         $configFile = Join-Path $ConfigDir "biopb.json"
         $stepMsgs = @(
             "Checking system...",
@@ -859,9 +872,10 @@ function Invoke-BiopbInstall {
     $ReleaseRepo  = "biopb/biopb"
     $ReleaseTagPrefix = "release-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
-    $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
-    $SamplesDir  = Join-Path $BiopbHome ".local\share\biopb\samples"
-    $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
+    $DataDir     = Get-BiopbTree "XDG_DATA_HOME" ".local\share"
+    $WebappDir   = Join-Path $DataDir "webapp"
+    $SamplesDir  = Join-Path $DataDir "samples"
+    $ConfigDir   = Get-BiopbTree "XDG_CONFIG_HOME" ".config"
     $LocalBin    = Join-Path $BiopbHome ".local\bin"
 
     # Release channel: -Rc (or BIOPB_INSTALL_RC env) admits the latest candidate.
@@ -1510,9 +1524,11 @@ function Invoke-BiopbUninstall {
     $BiopbHome = $env:USERPROFILE
     # config + cached data (NOT the user's microscopy images).
     $dataDirs = @(
-        (Join-Path $BiopbHome ".config\biopb"),
+        (Get-BiopbTree "XDG_CONFIG_HOME" ".config"),
         (Join-Path $BiopbHome ".config\biopb-mcp"),
-        (Join-Path $BiopbHome ".local\share\biopb")
+        (Get-BiopbTree "XDG_STATE_HOME" ".local\state"),
+        (Get-BiopbTree "XDG_DATA_HOME" ".local\share"),
+        (Join-Path $BiopbHome ".local\share\biopb-mcp")
     )
 
     if ($Mode -eq 'gui' -and $LogFile) {
@@ -1556,7 +1572,7 @@ function Invoke-BiopbUninstall {
             # default location, plus any custom cache.file_cache_dir read from the
             # config before it is deleted. The server was stopped in step 1.
             $cacheDirs = @((Join-Path $env:TEMP "biopb-cache-$env:USERNAME"))
-            $cfgFile = Join-Path $BiopbHome ".config\biopb\biopb.json"
+            $cfgFile = Join-Path (Get-BiopbTree "XDG_CONFIG_HOME" ".config") "biopb.json"
             if (Test-Path -LiteralPath $cfgFile) {
                 try {
                     $custom = (Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json).cache.file_cache_dir

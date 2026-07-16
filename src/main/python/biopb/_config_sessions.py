@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import _config_location
 from ._proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
@@ -56,26 +57,17 @@ logger = logging.getLogger(__name__)
 _SUFFIX = ".json"
 
 
-def _default_sessions_dir() -> Path:
-    """Live-session records live under the shared biopb *data* tree (persistent
-    runtime state, not user-editable config), mirroring the tensor server's
-    ``~/.local/share/biopb/log``. Deliberately the ``biopb`` tree, not
-    ``biopb-mcp`` — it is cross-component state the control (not biopb-mcp) also
-    reads. Resolved at call time (not a module constant) so a test that repoints
-    ``Path.home()`` gets an isolated dir for free."""
-    return Path.home() / ".local" / "share" / "biopb" / "sessions"
-
-
 def sessions_dir() -> Path:
     """The registry directory (``BIOPB_SESSIONS_DIR`` override, else the default).
 
-    Created on access so both the writing shim and the reading control can call
-    this without a separate mkdir step.
+    Live-session records live under the shared biopb **state** tree
+    (``~/.local/state/biopb/sessions``) — cross-component runtime state the
+    control (not just biopb-mcp) also reads, so deliberately the ``biopb`` tree.
+    Delegates to :func:`biopb._config_location.sessions_dir`, which owns the
+    override + location and creates the dir on access (so both the writing shim
+    and the reading control can call this without a separate mkdir).
     """
-    raw = os.environ.get("BIOPB_SESSIONS_DIR")
-    d = Path(raw) if raw else _default_sessions_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return _config_location.sessions_dir()
 
 
 # Characters that would let a session id escape the registry dir when spliced

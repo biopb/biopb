@@ -1551,17 +1551,17 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
 def shutdown_sentinel_path() -> os.PathLike:
     """Path of the shutdown sentinel file the control supervisor writes (Windows).
 
-    Must stay in sync with ``DataPlaneSupervisor._win_stop_sentinel`` (the control
-    writes it; the path is duplicated there to avoid importing heavy server deps).
-    A single fixed name in the user's biopb data dir - NOT keyed by PID: on Windows
-    the process the supervisor records can differ from the one running
-    launch()/uvicorn (Store-Python/uv shims), so a PID in the name would make
-    writer and watcher disagree. The control is the sole owner of the plane, so a
-    fixed name is unambiguous.
+    The one definition ``DataPlaneSupervisor._win_stop_sentinel`` also binds to
+    (both call ``biopb._config_location.tensor_stop_sentinel``), so the writer and
+    this watcher cannot drift. A single fixed name in the user's biopb state dir -
+    NOT keyed by PID: on Windows the process the supervisor records can differ from
+    the one running launch()/uvicorn (Store-Python/uv shims), so a PID in the name
+    would make writer and watcher disagree. The control is the sole owner of the
+    plane, so a fixed name is unambiguous.
     """
-    from pathlib import Path
+    from biopb import _config_location
 
-    return Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
+    return _config_location.tensor_stop_sentinel()
 
 
 def _install_windows_shutdown_listener(server) -> None:

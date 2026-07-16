@@ -29,8 +29,16 @@ from biopb import _algorithms
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """Isolate the biopb-mcp config location under a per-test home."""
+    """Isolate the biopb-mcp config location under a per-test home.
+
+    Also drops inherited ``XDG_*``: ``_config_location.config_dir`` honors
+    ``$XDG_CONFIG_HOME`` when it is set (GitHub's Linux runners set it), which
+    would otherwise bypass the monkeypatched ``Path.home`` and read the real
+    config -- so ``configured()`` would resolve outside this per-test home.
+    """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
+        monkeypatch.delenv(var, raising=False)
     return tmp_path
 
 

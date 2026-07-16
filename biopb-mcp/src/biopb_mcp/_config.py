@@ -11,8 +11,9 @@ literal lives.
 Config lives at ``~/.config/biopb/mcp-config.json`` -- co-located with the
 tensor server's ``biopb.json`` and the installer's client-definition ``mcp.json``
 (a *distinct* file: that one registers biopb-mcp with MCP clients; this one is
-biopb-mcp's own runtime settings). The XDG *data* tree
-(``~/.local/share/biopb-mcp``) still holds logs/pid -- runtime state, not config.
+biopb-mcp's own runtime settings). Logs -- runtime state, not config -- live in
+the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
+:mod:`biopb._config_location` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
@@ -40,6 +41,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 # Shared with the tensor server: the constraint primitives (so the pyramid knobs
 # are validated by the exact same rules in both packages -- the same bug, not an
 # analogous one; biopb/biopb#182, #34) and the config-file location.
+from biopb import _config_location
 from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
 from biopb._config_location import mcp_config_path
 
@@ -567,15 +569,14 @@ def get_config_path() -> Path:
 
 
 def get_log_dir() -> Path:
-    """Log directory (``~/.local/share/biopb-mcp/log`` on all platforms).
+    """Log directory (``~/.local/state/biopb/mcp`` on all platforms).
 
-    Logs are persistent runtime state, not user-editable config, so they live
-    under the XDG *data* tree rather than ~/.config -- matching the biopb tensor
-    server, which writes to ~/.local/share/biopb/log.
+    Logs are persistent runtime state, not user-editable config, so they live in
+    the shared biopb XDG *state* tree (``$XDG_STATE_HOME``), beside the tensor
+    server's ``logs/`` and the session registry. Delegates to
+    :func:`biopb._config_location.mcp_log_dir`, which creates it on access.
     """
-    log_dir = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir
+    return _config_location.mcp_log_dir()
 
 
 def get_session_log_dir() -> Path:
@@ -583,7 +584,8 @@ def get_session_log_dir() -> Path:
 
     Each shim-owned session writes its own logfile here rather than the shared
     ``mcp-server.log``, so concurrent sessions never interleave; retention
-    (``transport.session_log_keep``) prunes it to the newest N.
+    (``transport.session_log_keep``) prunes it to the newest N. Composed from the
+    local :func:`get_log_dir` so it tracks any override of that seam.
     """
     d = get_log_dir() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
@@ -595,8 +597,8 @@ def get_daemon_log_file(config: Optional[dict] = None) -> Path:
     ``--transport http`` server whose output is redirected to a file.
 
     A *single* canonical location so any such launcher and every reader agree on
-    one file. Honors ``transport.kernel_log`` if set, else
-    ``<log dir>/mcp-server.log``. ``config`` is loaded (cached singleton) when not
+    one file. Honors ``transport.kernel_log`` if set, else the shared
+    ``mcp-server.log``. ``config`` is loaded (cached singleton) when not
     supplied; the shim passes the dict it already holds.
     """
     if config is None:
@@ -604,7 +606,7 @@ def get_daemon_log_file(config: Optional[dict] = None) -> Path:
     override = get_setting(config, "transport.kernel_log")
     if override:
         return Path(override)
-    return get_log_dir() / "mcp-server.log"
+    return _config_location.mcp_server_log()
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

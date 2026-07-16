@@ -617,8 +617,9 @@ _tail_log() {
 # control plane so the freshly installed one can spawn and own a new plane -- it
 # refuses an in-use gRPC port.
 _start_control_plane() {
-    local control_log="$HOME/.local/share/biopb/logs/control.log"
-    local server_log="$HOME/.local/share/biopb/logs/tensor-server.log"
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local control_log="$state_dir/logs/control.log"
+    local server_log="$state_dir/logs/tensor-server.log"
 
     if [ "${BIOPB_NO_SERVER_START:-0}" = "1" ]; then
         _info "Skipping control-plane start (BIOPB_NO_SERVER_START=1)"
@@ -631,10 +632,11 @@ _start_control_plane() {
         return 0
     fi
 
-    # Retire a prior control plane (+ the data plane it owns) so the new control
-    # plane can bind a fresh plane it owns. Best-effort; a no-op on a clean machine.
-    # (The standalone `biopb server` daemon was retired; if a pre-retirement one is
-    # somehow still holding the gRPC port, control-start below names it and stops.)
+    # Belt-and-suspenders: the real upgrade stop already ran before uv tool
+    # install (above), so this is a no-op on a clean upgrade path. Kept for the
+    # first-install case where a pre-existing plane was started out-of-band and
+    # the pre-install stop missed it, and the "standalone biopb server" legacy
+    # case noted below. Best-effort.
     biopb control stop >/dev/null 2>&1 || true
 
     # Start the control plane; it brings up the data plane by default. Don't
@@ -807,9 +809,15 @@ install_biopb() {
     # wants is the `release-v*` one, so the release fetch filters by this prefix
     # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
-    WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
-    SAMPLES_DIR="$HOME/.local/share/biopb/samples"
-    CONFIG_DIR="$HOME/.config/biopb"
+    # On-disk trees follow XDG (matching biopb._config_location): config in the
+    # config tree, portable assets (webapp/samples) in the data tree, and logs /
+    # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
+    # conventional dirs, so writer (installer) and reader (code) never disagree.
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/biopb"
+    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local data_base="${XDG_DATA_HOME:-$HOME/.local/share}/biopb"
+    WEBAPP_DIR="$data_base/webapp"
+    SAMPLES_DIR="$data_base/samples"
 
     # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
     # BIOPB_INSTALL_RC=1 also admits the latest release candidate (a/b/rc
@@ -1143,6 +1151,16 @@ install_biopb() {
     # No MCP server to stop before the new wheels land: each AI client's stdio
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so
     # the next agent reconnect already brings up the just-installed code.
+    #
+    # Stop the control plane (and the data plane it owns) BEFORE swapping the
+    # binary. The old binary reads control.pid from the old path it was written
+    # to; stopping before uv tool install means reader+writer agree on the
+    # location, and the new binary's control start binds clean ports. Best-effort;
+    # a no-op on a first install (no biopb on PATH).
+    if command -v biopb >/dev/null 2>&1; then
+        _info "Stopping any running biopb control plane before upgrade..."
+        biopb control stop >/dev/null 2>&1 || true
+    fi
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -1515,7 +1533,7 @@ Options:
                 biopb from detected AI agents, and remove the package
                 environment. Keeps config and cached data unless --purge.
   --purge       With --uninstall, also delete config and cached/state data
-                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb, and
+                (~/.config/biopb, ~/.local/state/biopb, ~/.local/share/biopb, and
                 the file cache under the temp dir). Implies --uninstall. Never
                 touches your image data.
   -h, --help    Show this help.
@@ -1606,9 +1624,11 @@ PY
 
         local d
         for d in \
-            "$HOME/.config/biopb" \
+            "${XDG_CONFIG_HOME:-$HOME/.config}/biopb" \
             "$HOME/.config/biopb-mcp" \
-            "$HOME/.local/share/biopb"; do
+            "${XDG_STATE_HOME:-$HOME/.local/state}/biopb" \
+            "${XDG_DATA_HOME:-$HOME/.local/share}/biopb" \
+            "$HOME/.local/share/biopb-mcp"; do
             if [ -e "$d" ]; then
                 rm -rf "$d"
                 _ok "Removed $d"
@@ -1617,7 +1637,7 @@ PY
         _info "Your image data was not touched."
     else
         _info "Config and cached data were kept. Remove them with --purge, or:"
-        _cmd "  rm -rf ~/.config/biopb ~/.config/biopb-mcp ~/.local/share/biopb"
+        _cmd "  rm -rf ~/.config/biopb ~/.local/state/biopb ~/.local/share/biopb"
         _cmd "  rm -rf \"\${TMPDIR:-/tmp}/biopb-cache-\$(id -u)\"   # file cache"
     fi
 

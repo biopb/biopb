@@ -123,8 +123,9 @@ curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall
 curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
 ```
 
-`--purge` deletes `~/.config/biopb`, `~/.config/biopb-mcp`, and
-`~/.local/share/biopb`. `uv` and any AI agent (e.g. opencode) are left installed.
+`--purge` deletes `~/.config/biopb`, `~/.local/state/biopb` (logs, session
+registry, pids), and `~/.local/share/biopb` (webapp, samples). `uv` and any AI
+agent (e.g. opencode) are left installed.
 On Windows, uninstall through Add/Remove Programs instead.
 
 ## Notes
