@@ -59,8 +59,8 @@ def _configure_dask(config: dict):
       scheduler rather than spinning a competing kernel-local one.
     * ``"threads"`` / ``"synchronous"`` -> in-process scheduler.
 
-    ``cancel_job`` can stop an in-flight ``compute()`` in any distributed mode
-    (it holds a real ``Client``). A failure attaching degrades gracefully to
+    ``interrupt_kernel`` can stop an in-flight ``compute()`` in any distributed
+    mode (it holds a real ``Client``). A failure attaching degrades gracefully to
     ``threads`` rather than aborting the bootstrap.
     """
     import dask
@@ -562,8 +562,8 @@ def _bootstrap_impl():
     #    needs the distributed cluster (its interactive reads pin to a
     #    single-process scheduler, issue #8) — only the agent's explicit
     #    da.compute() uses the distributed default, which is set once the Client
-    #    attaches. Until then `_dask_client` is None; cancel_job / server_status
-    #    guard for that.
+    #    attaches. Until then `_dask_client` is None; interrupt_kernel /
+    #    server_status guard for that.
     import threading
 
     ip.user_ns["_dask_client"] = None

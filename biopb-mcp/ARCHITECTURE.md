@@ -186,7 +186,7 @@ per restart (the dominant restart cost on Windows). Worker/memory changes need a
 *session* restart, not just `restart_kernel`. On an uncatchable session-child
 death the workers **self-terminate on scheduler loss** (which is why the `mcp`
 extra floors `distributed>=2023.9`); on Windows they fall under the shim's Job
-Object by nesting. Any distributed mode lets `cancel_job` stop an in-flight
+Object by nesting. Any distributed mode lets `interrupt_kernel` stop an in-flight
 `.compute()`.
 
 ### The standalone `biopb mcp view`
@@ -322,8 +322,8 @@ starts on demand (above).
 - `_resources.py` — resource content strings. `_helpers.py` — `add_tensor()`
   viewer patch + `viewer_window_alive()` closed-window probe.
 
-**Tools (10):** `find_skills`, `start_kernel`, `take_screenshot`, `execute_code`,
-`poll_job`, `cancel_job`, `inspect_object`, `interrupt_kernel`, `restart_kernel`,
+**Tools (9):** `find_skills`, `start_kernel`, `take_screenshot`, `execute_code`,
+`poll_job`, `inspect_object`, `interrupt_kernel`, `restart_kernel`,
 `server_status`.
 
 **Resources (6):** `guide://kernel`, `guide://viewer`, `guide://tensor`,

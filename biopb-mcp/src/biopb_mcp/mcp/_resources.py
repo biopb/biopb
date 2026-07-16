@@ -35,12 +35,14 @@ inspect_object("<name>")                        # its signature + docstring
 
 ## Long-running jobs & cancellation
 A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
-watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `cancel_job`
-(graceful) or `restart_kernel` (guaranteed, kills the kernel). To stay stoppable:
-* **A blocking `.compute()` is interruptible** — `cancel_job` cancels the in-flight dask
-  tasks, so the `.compute()` raises and the job ends. No special pattern needed.
-* **Your own long loops** (per-chunk / per-file) have no dask futures to cancel, so poll
-  `cancelled()` and `break` yourself.
+watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
+(best-effort, raises KeyboardInterrupt into the job) or `restart_kernel` (guaranteed, kills
+the kernel). To stay stoppable:
+* **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
+  dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
+* **Your own long loops** (per-chunk / per-file) can poll `cancelled()` and `break` to stop
+  cleanly at the next iteration when the user cancels from the observe UI; otherwise
+  `interrupt_kernel` raises into the loop directly.
 * **Progress + responsive cancel on a big graph:** submit with the distributed client
   (`_dask_client`, present only under the distributed scheduler) and consume results as
   they land — this also gives a live processed count via `poll_job`:

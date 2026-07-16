@@ -540,8 +540,9 @@ def execute_code(python_code: str) -> str:
     Code runs in a background thread so it does not block the main thread.
     If it finishes quickly the result is returned inline; otherwise this returns
     a job handle (job-N) and the code keeps running. Poll it with poll_job,
-    watch it with take_screenshot / server_status, and stop it with cancel_job
-    (cooperative) or restart_kernel (guaranteed). Only one job runs at a time.
+    watch it with take_screenshot / server_status, and stop it with
+    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
+    runs at a time.
 
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
@@ -578,7 +579,7 @@ def execute_code(python_code: str) -> str:
         running = submitted.get("running_job_id")
         return (
             f"A job ({running}) is already running. Poll it with "
-            f"poll_job('{running}'), or stop it with cancel_job('{running}') / "
+            f"poll_job('{running}'), or stop it with interrupt_kernel / "
             "restart_kernel before starting another."
         )
 
@@ -599,7 +600,7 @@ def execute_code(python_code: str) -> str:
     return (
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
-        f"server_status; stop with cancel_job('{job_id}') or restart_kernel.\n"
+        f"server_status; stop with interrupt_kernel or restart_kernel.\n"
         "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
     )
 
@@ -626,33 +627,6 @@ def poll_job(job_id: str) -> str:
 
 
 @mcp.tool()
-def cancel_job(job_id: str) -> str:
-    """Request cancellation of a running job (cooperative; best-effort).
-
-    Sets a flag the job's code can poll via cancelled(), and—if a distributed
-    dask cluster is in use—cancels its in-flight futures. Pure-Python loops that
-    don't check cancelled(), in-process dask, and native gRPC calls won't stop
-    this way; use restart_kernel for a guaranteed stop.
-    """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
-
-    data, res, _window_alive = _run_job_call(host, "cancel(" + repr(job_id) + ")")
-    if data is None:
-        return _format_execute_result(res)
-    status = data.get("status")
-    if data.get("cancelled"):
-        return (
-            f"Cancellation requested for {job_id} (cooperative). If it does not "
-            "stop, use restart_kernel for a guaranteed stop."
-        )
-    if status == "unknown":
-        return f"No such job '{job_id}'."
-    return f"Job {job_id}: {status} (nothing to cancel)."
-
-
-@mcp.tool()
 def inspect_object(object_path: str) -> str:
     """Inspect a live object in the napari kernel namespace.
 
@@ -674,10 +648,11 @@ def inspect_object(object_path: str) -> str:
 def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
-    Stronger than cancel_job: it does not require the code to check cancelled().
-    The job runs in a background worker thread, so a SIGINT (which Python delivers
-    only to the kernel main thread) can't reach it — this raises the exception
-    directly into the worker. Best-effort: it lands at the next bytecode, so a
+    Works even when the job never checks cancelled(): it also runs the
+    cooperative cancel (flag + in-flight dask-future cancel). The job runs in a
+    background worker thread, so a SIGINT (which Python delivers only to the
+    kernel main thread) can't reach it — this raises the exception directly into
+    the worker. Best-effort: it lands at the next bytecode, so a
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
     it returns to Python; if the kernel stays stuck, use restart_kernel — the
     guaranteed stop.
