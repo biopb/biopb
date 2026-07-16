@@ -8,14 +8,22 @@ env-override rules, and the log rotator. See the module docstring for the policy
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from biopb import _config_location as L
 
 
 @pytest.fixture(autouse=True)
 def _clean_xdg(tmp_path, monkeypatch):
-    """Isolate HOME and drop inherited XDG_* so a test starts from the defaults."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    """Isolate the home dir and drop inherited XDG_* so a test starts from the defaults.
+
+    Isolate via ``Path.home`` rather than ``$HOME``: on Windows ``Path.home()``
+    reads ``USERPROFILE``/``HOMEDRIVE``+``HOMEPATH``, not ``HOME``, so a
+    ``setenv("HOME")`` would not redirect it and the machine's real home would
+    leak into the default-path assertions below.
+    """
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     for var in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv(L.SESSIONS_DIR_ENV, raising=False)
