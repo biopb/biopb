@@ -24,15 +24,13 @@ class TestConfigureDask:
     """Unit tests for _configure_dask (no kernel / no display needed)."""
 
     def test_in_process_scheduler_returns_no_client(self):
-        """threads/synchronous schedulers yield no client and no cluster."""
+        """threads/synchronous schedulers yield no client."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask({"dask": {"scheduler": "threads"}})
-        assert client is None
-        assert cluster is None
+        assert _configure_dask({"dask": {"scheduler": "threads"}}) is None
 
     def test_external_address_connects_without_cluster(self, monkeypatch):
-        """distributed + an explicit address attaches a Client, no cluster."""
+        """distributed + an explicit address attaches a Client."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
@@ -47,7 +45,7 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
+        client = _configure_dask(
             {
                 "dask": {
                     "scheduler": "distributed",
@@ -57,7 +55,6 @@ class TestConfigureDask:
         )
         assert isinstance(client, _FakeClient)
         assert created["address"] == "tcp://1.2.3.4:8786"
-        assert cluster is None
 
     def test_injected_address_takes_precedence(self, monkeypatch):
         """BIOPB_DASK_ADDRESS (session-child-injected) wins over the config address."""
@@ -75,11 +72,10 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
+        _configure_dask(
             {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}
         )
         assert created["address"] == "tcp://daemon:8786"
-        assert cluster is None
 
     def test_no_address_falls_back_to_threads(self, monkeypatch):
         """distributed + no injected address -> in-process threads. The kernel
@@ -96,11 +92,10 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
-            {"dask": {"scheduler": "distributed", "address": ""}}
+        assert (
+            _configure_dask({"dask": {"scheduler": "distributed", "address": ""}})
+            is None
         )
-        assert client is None
-        assert cluster is None
 
 
 class TestClusterAddressInjection:

@@ -48,8 +48,8 @@ def _configure_dask(config: dict):
 
     The kernel never owns a cluster: the session child (``biopb_mcp.mcp``) spins
     and owns the ``LocalCluster`` (see :class:`_cluster.DaskClusterHost`) and
-    injects its address. Returns ``(client, cluster)`` where ``cluster`` is
-    always ``None``:
+    injects its address. Returns a distributed ``Client`` (or ``None`` for the
+    in-process scheduler):
 
     * ``"distributed"`` + an address (``BIOPB_DASK_ADDRESS`` injected by the
       session child, or an external ``dask.address``) -> a ``Client`` attached
@@ -82,7 +82,7 @@ def _configure_dask(config: dict):
             if address:
                 client = Client(address)
                 logger.info("Dask attached to distributed scheduler at %s", address)
-                return client, None
+                return client
 
             # No address: the session child owns the cluster and would have
             # injected BIOPB_DASK_ADDRESS. None here means it has none (disabled
@@ -102,7 +102,7 @@ def _configure_dask(config: dict):
 
     dask.config.set(scheduler=scheduler, num_workers=num_workers)
     logger.info("Dask scheduler: %s, num_workers: %s", scheduler, num_workers)
-    return None, None
+    return None
 
 
 def _make_cache_plugin(location, token, cache_bytes):
@@ -381,7 +381,6 @@ def _bootstrap_impl():
     import threading
 
     ip.user_ns["_dask_client"] = None
-    ip.user_ns["_dask_cluster"] = None
     # False until the attach thread resolves (to a Client or, for threads mode /
     # a degrade, None). Lets server_status distinguish "still attaching" from
     # "no distributed cluster".
@@ -390,13 +389,12 @@ def _bootstrap_impl():
     # The connect hook and the attach thread race to register the chunk-cache
     # plugin; whichever runs second (both hold this lock) registers it, since it
     # needs both a ready Client and a live (url, token). register_plugin is named
-    # / idempotent so a double-register is harmless. planned_workers divides the
-    # budget by the cluster's *planned* worker_spec count (None for an attached
-    # address -> _register_cache_plugin falls back to the live scheduler count).
+    # / idempotent so a double-register is harmless. The kernel always attaches to
+    # the session child's cluster, so the budget splits across its live worker
+    # count (see _register_cache_plugin).
     _dask_lock = threading.Lock()
     _dask_state = {
         "client": None,
-        "cluster": None,
         "connected": False,
         "url": None,
         "token": None,
@@ -409,15 +407,7 @@ def _bootstrap_impl():
         client = _dask_state["client"]
         if client is None or not _dask_state["connected"]:
             return
-        cluster = _dask_state["cluster"]
-        planned = (
-            len(cluster.worker_spec)
-            if cluster is not None and hasattr(cluster, "worker_spec")
-            else None
-        )
-        _register_cache_plugin(
-            client, _dask_state["url"], _dask_state["token"], config, planned
-        )
+        _register_cache_plugin(client, _dask_state["url"], _dask_state["token"], config)
 
     # on_connect fires (in the kernel) after every successful connect with the
     # final (url, token): it bounds the dask chunk cache (token only known
@@ -436,11 +426,10 @@ def _bootstrap_impl():
     conn.on_connect = _on_connect
 
     def _attach_dask():
-        client, cluster = _configure_dask(config)
+        client = _configure_dask(config)
         with _dask_lock:
-            _dask_state.update(client=client, cluster=cluster)
+            _dask_state["client"] = client
             ip.user_ns["_dask_client"] = client
-            ip.user_ns["_dask_cluster"] = cluster
             ip.user_ns["_dask_attach_done"] = True
             _register_cache_if_ready()
 
@@ -557,9 +546,9 @@ def _bootstrap_impl():
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
-    #    _dask_client/_dask_cluster were seeded to None at step 3 and are filled
-    #    by the background attach thread; not set here so it stays the sole
-    #    writer (a threads-mode attach can finish before this runs).
+    #    _dask_client was seeded to None at step 3 and is filled by the background
+    #    attach thread; not set here so it stays the sole writer (a threads-mode
+    #    attach can finish before this runs).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
     from ._helpers import resync_view_for_capture, viewer_window_alive
