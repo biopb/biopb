@@ -207,105 +207,22 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 
 ## FastAPI HTTP Server
 
-**Module:** `biopb_tensor_server.serving.http_server`
-**Factory:** `create_app(flight_location, token, cache_bytes, cors_origins, config_path, web_host, web_port, supervised) → FastAPI`
-**Default port:** `8814`
+An **API-only** FastAPI sidecar (`biopb_tensor_server.serving.http_server`, factory
+`create_app(...)`, **port 8814**) co-located with the Flight server: it wraps the
+Python `TensorFlightClient` and re-exposes it as HTTP/JSON (+ binary slices) so
+browsers reach the data plane without a gRPC-Web proxy. It serves **no** static
+assets — the control plane owns the browser UI and reverse-proxies this sidecar
+under `/data_plane/*`.
 
-### Lifecycle
+Auth mirrors the Flight server: `Authorization: Bearer <token>` / `X-Biopb-Token`,
+timing-safe compared; a `None` token is **local mode** (loopback, no enforcement),
+a token is **remote mode** (public `server.host`). The `TensorFlightClient` opens
+lazily on the first authenticated request; a thread-safe `_DiagnosticsState` tracks
+latency / errors / cache hit-rate / per-session rate-limit, with every error string
+`_redact()`ed (filesystem paths and token-like strings -> `[REDACTED]`).
 
-The app holds two pieces of shared mutable state created at factory time:
-
-- **`_client_holder`** — lazily initialised `TensorFlightClient`; the first
-  authenticated request that reaches any protected endpoint triggers the gRPC
-  connection to `flight_location`.
-- **`_DiagnosticsState`** — thread-safe container for latency samples, error
-  events, cache counters, and per-session rate-limit state.
-
-### Authentication
-
-Two equivalent header schemes are accepted on every protected endpoint:
-
-```
-Authorization: Bearer <token>
-X-Biopb-Token: <token>
-```
-
-`secrets.compare_digest` is used for timing-safe comparison. The auth check
-compares against `expected = self.token`; a `None` token means no enforcement —
-this is **local mode**, where every listener binds loopback and no token exists.
-A token is present (and enforced) only in **remote mode**, when the config's
-`server.host` is a public address. There is no separate dev flag.
-
-### Endpoints
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET` | `/livez` | ✗ | Liveness probe — `{"status":"ok","timestamp":"…"}` |
-| `GET` | `/readyz` | ✗ | Readiness — adds `ready`, `dev_mode`, `service`, `version` |
-| `GET` | `/healthz` | ✗ | Alias for `/readyz` |
-| `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
-| `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
-| `GET` | `/api/sources/{id}` | ✓ | Single descriptor |
-| `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
-| `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
-| `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
-| `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
-| `POST` | `/api/render` | ✓ | Server-rendered RGB image of a slice |
-| `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
-| `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
-| `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
-| `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker |
-
-> **Route ordering:** `/api/sources/{id}/metadata` is registered *before* the
-> greedy `{id:path}` catch-all to avoid Starlette first-match shadowing.
-
-### Slice endpoint
-
-**Request body** (`SliceRequest` Pydantic model):
-
-```json
-{
-  "source_id":        "my-zarr",
-  "tensor_id":        "0",
-  "slice_start":      [0, 0, 0],
-  "slice_stop":       [1, 512, 512],
-  "scale_hint":       [1, 2, 2],
-  "reduction_method": "area",
-  "pixel_budget":     1000000
-}
-```
-
-**Response:**
-- `Content-Type: application/octet-stream` — C-contiguous `numpy.tobytes()`
-- `X-Shape: 1,512,512`
-- `X-Dtype: uint16`
-- `X-Dim-Labels: z,y,x`
-
-`scale_hint` and `reduction_method` are forwarded verbatim to
-`TensorFlightClient.get_tensor(...)`, which resolves the appropriate
-precomputed pyramid level (if available) or applies runtime downsampling.
-
-### Diagnostics
-
-`_DiagnosticsState` tracks:
-
-| Field | Implementation |
-|-------|---------------|
-| `latency_p50_ms` / `latency_p95_ms` | `_LatencyTracker` — rolling deque of 200 samples, thread-safe interpolated percentile |
-| `last_error_code` / `last_error_message` | Ring buffer of 20 `_ErrorEvent` objects |
-| `cache_hit_rate` | Pulled from `TensorFlightClient.cache_info()` on each diagnostics request |
-| `connection_state` | `"disconnected"` → `"connected"` or `"error"` |
-| Rate limiting | Per-session 1 req/s window, keyed by raw token header value |
-
-All error messages are passed through `_redact()` before storage:
-- Filesystem paths matching `/...` or `C:\...` → `[REDACTED]`
-- Strings of ≥ 16 URL-safe characters (potential tokens) → `[REDACTED]`
-
-### CORS
-
-Default allowed origins: `http://localhost:5173`, `http://127.0.0.1:5173`,
-`http://[::1]:5173` (Vite dev server port). Overridable via the `cors_origins`
-argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
+See **[docs/http-server.md](docs/http-server.md)** for the full endpoint table, the
+`/api/slice` request/response contract, the diagnostics fields, and CORS defaults.
 
 ---
 
@@ -398,358 +315,90 @@ bind only fires when the control is gone before it could.
 
 ## Discovery & Directory Monitoring
 
-### Discovery Protocol
+### Discovery protocol (`core.discovery`)
 
-**Module:** `biopb_tensor_server.core.discovery`
+Adapters **claim** filesystem paths they recognize (a `claim()` classmethod each).
+`AdapterRegistry.get_claims_for_path` returns claims in **registration order** and
+callers take `claims[0]`, so **order = priority**
+(`adapters/__init__.py::get_default_registry`), highest-specificity first:
 
-The discovery system uses a **claim-based protocol** where adapters "claim" filesystem paths they recognize. This enables:
-
-1. Extensible format detection — new adapters register and participate
-2. Cross-platform file identity tracking (symlink/hardlink safe via inode)
-3. Live filesystem monitoring support
-
-#### SourceClaim
-
-Lightweight claim object using `__slots__` for memory efficiency when scanning large directories:
-
-```python
-class SourceClaim:
-    __slots__ = ('source_type', 'primary_path',
-                 'source_id', 'dim_labels', 'extra_config', 'is_remote')
-
-    source_type: str      # "zarr", "ome-tiff", "hdf5", etc.
-    primary_path: str     # Main entry point (str for URL support)
-    source_id: str        # Auto-generated from URL hash
-    dim_labels: List[str] # Optional dimension labels
-    extra_config: dict    # Adapter-specific config (e.g., HDF5 dataset)
-    is_remote: bool       # Flag for remote sources
-```
-
-Multi-file claims: Paths are tracked in `DiscoveryState.consumed_paths` via `try_claim_path()` callback during claim().
-
-#### AdapterRegistry
-
-Adapters register with the registry and implement the `claim()` classmethod:
-
-```python
-class AdapterRegistry:
-    def register_with_type(source_type: str, adapter_cls: Type[BackendAdapter])
-    def get_claims_for_path(path: Path, visited: Set[str]) -> List[SourceClaim]
-    def get_adapter_for_type(source_type: str) -> Type[BackendAdapter]
-```
-
-Registration order (by priority/specificity, highest first — callers take
-`claims[0]`; see `adapters/__init__.py::get_default_registry`):
-1. `OmeTiffAdapter` — local OME-TIFF with embedded OME-XML (single- and
-   multi-file); pure-tifffile, no aicsimageio dependency
-1b. `QptiffAdapter` — before the bioio group so it owns `.qptiff` (bioio drops the
-   QPTIFF pyramid). Claim is suffix-only; a QPTIFF saved as `.tif` is not sniffed
-   (that read is unsafe under cloud and wasteful without caching — biopb/biopb#135)
-   and falls through to bioio unless given an explicit `type: qptiff`
+1. `OmeTiffAdapter` — local OME-TIFF w/ embedded OME-XML (single- + multi-file),
+   pure-tifffile · `QptiffAdapter` before the bioio group so it owns `.qptiff`
+   (suffix-only; a `.tif`-named QPTIFF needs an explicit `type: qptiff`, #135)
 2. `ZeissAdapter` / `LeicaAdapter` / `NikonAdapter` / `DvAdapter` /
-   `OlympusAdapter` / `BioformatsAdapter` / `AicsImageIoAdapter` — vendor formats
-   and the generic bioio fallback (which also picks up a remote or non-OME
-   `.tif` that OmeTiffAdapter declines)
-3. `OmeZarrAdapter` (+ HCS) — OME-Zarr multiscales
-4. `ZarrAdapter` — generic Zarr
-5. `NdTiffAdapter` / `MicroManagerLegacyAdapter` / `TiffSequenceAdapter` —
-   Micro-Manager NDTiff, legacy MM datasets, plain TIFF stacks
-6. `DicomSeriesAdapter` / `DicomAdapter` / `NiftiAdapter` — medical imaging
-7. `Hdf5Adapter` — HDF5 (explicit `hdf5` type only)
-8. `RemoteTensorAdapter` — caching passthrough proxy (explicit `tensor-server`
-   type only; never claims a filesystem path)
+   `OlympusAdapter` / `BioformatsAdapter` / `AicsImageIoAdapter` — vendor formats +
+   the generic bioio fallback (also picks up remote / non-OME `.tif`)
+3. `OmeZarrAdapter` (+ HCS)  ->  4. `ZarrAdapter`
+5. `NdTiffAdapter` / `MicroManagerLegacyAdapter` / `TiffSequenceAdapter`
+6. `DicomSeriesAdapter` / `DicomAdapter` / `NiftiAdapter`
+7. `Hdf5Adapter` (explicit `hdf5` only) · 8. `RemoteTensorAdapter` (explicit
+   `tensor-server`, never claims a path)
 
-The optional bioio/ndtiff/dicom/nifti adapters register only when their
-dependency is importable, so a slimmer install collapses the list without
-changing the relative order of what remains.
+Optional bioio/ndtiff/dicom/nifti adapters register only when their dependency is
+importable, so a slimmer install collapses the list without reordering the rest.
 
-**OME-TIFF before TIFF-sequence is load-bearing.** OmeTiffAdapter makes a
-*file*-level claim on a local `.tif`/`.tiff` that carries embedded OME-XML
-(consuming multi-file siblings via the master's OME-XML file list);
-TiffSequenceAdapter makes a *directory*-level claim on plain TIFF stacks and
-**excludes** OME-named files (`exclude_ome`, plus a `.companion.ome` guard).
-Registering OmeTiffAdapter first — together with that exclude — guarantees an
-`.ome.tif` becomes its own OME-TIFF source rather than being welded into a plain
-sequence. OmeTiffAdapter declines a non-OME `.tif` (and any remote/cloud path),
-so those fall through to the generic bioio adapter or the sequence adapter
-with no regression.
+**Two orderings are load-bearing:**
 
-**OME-Zarr before plain Zarr is load-bearing.** A `.zarr` dir can be claimed by
-both; `get_claims_for_path` returns claims in registration order and callers take
-`claims[0]`, so the specific adapter must win. The two stay disjoint once the store
-is resident: `OmeZarrAdapter` declines a non-multiscales store, and `ZarrAdapter`
-declines a real OME-Zarr — so the resident re-claim (e.g. at cloud resolve) lands
-`claims[0]` on the right type even though the provisional guess was made blind.
-`OmeZarrAdapter` also declines early when a top-level `.zarray`/`zarr.json` exists
-(a bare array is never an OME multiscales group), so `ZarrAdapter`'s read-free,
-definite claim wins for bare arrays — including deferred ones under cloud.
+- *OME-TIFF before TIFF-sequence* — OmeTiffAdapter *file*-claims an `.ome.tif`
+  (consuming multi-file siblings via the OME-XML file list) while
+  TiffSequenceAdapter *dir*-claims plain stacks and **excludes** OME-named files,
+  so an `.ome.tif` becomes its own source rather than being welded into a sequence.
+  OmeTiffAdapter declines a non-OME / remote `.tif`, which then falls through to
+  bioio or the sequence adapter.
+- *OME-Zarr before plain Zarr* — both can claim a `.zarr`, so the specific one must
+  win. They stay disjoint once resident (OmeZarr declines a non-multiscales store,
+  Zarr declines a real OME-Zarr, and OmeZarr declines early when a top-level
+  `.zarray`/`zarr.json` exists), so the resident re-claim lands `claims[0]` on the
+  right type even after a blind provisional guess (e.g. at cloud resolve).
 
-#### DiscoveryState
+A `SourceClaim` (`__slots__`) carries `source_type` / `primary_path` / `source_id`
+/ `dim_labels` / `extra_config` / `is_remote`; `DiscoveryState` holds the
+`source_id <-> path` maps and the `on_source_added` / `on_source_removed` callbacks
+the `SourceManager` wires.
 
-Bidirectional mappings for efficient source add/remove operations:
+### Directory monitoring (`sources.watcher`, `sources.source_manager`)
 
-```python
-class DiscoveryState:
-    claims: Dict[str, SourceClaim]           # source_id → claim
-    path_to_source: Dict[Path, str]          # primary_path → source_id
-    consumed_paths: Set[Path]                # all claimed paths
-    visited_identities: Set[str]             # inode-based dedup
+`PeriodicRescanWatcher` emits a `RESCAN` on a fixed interval; per rescan the
+`SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a pure
+producer that skips subtrees until they pass the stability window, returning an
+immutable `ScanSnapshot`), runs discovery on the snapshot's stable paths, and diffs
+the result against the confirmed catalog. Server mutations are lock-serialized on
+the main process; reconciliation is snapshot-diff, not per-file events. Only local
+directories can be monitored (`{ "url": ".../", "monitor": true }`).
 
-    on_source_added: Callable[[SourceClaim], None]   # Callback
-    on_source_removed: Callable[[str], None]         # Callback
-```
+**Startup is progressive (#212):** the launcher reaches `SERVING` immediately and
+the first full scan runs in the background, **streaming** each source into the
+catalog as it is claimed (so `health.source_count` grows during the scan);
+`full_scan_in_progress` / `last_full_scan_finished_at` carry catalog freshness, not
+`SERVING`. Full treatment in
+**[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
 
-### Directory Monitoring
+**Moves** within a monitored dir preserve `source_id`; a move out is a delete, a
+move in a create. **Shutdown:** `source_manager.stop()` then `watcher.stop()` (->
+`shutdown_event.set()` -> clean subprocess exit -> `join(5)` -> `terminate` ->
+`kill`).
 
-**Modules:** `biopb_tensor_server.sources.watcher`, `biopb_tensor_server.sources.source_manager`
+### Cloud / synced-folder sources (`cloud = true`)
 
-Periodic monitoring for configured directories. On each rescan interval, the catalog reconciles against a fresh stable snapshot of the monitored trees.
+On a synced folder (OneDrive/Dropbox/iCloud "Files-On-Demand") content is
+*dehydrated* until read, and reading one byte recalls the **whole** file — so
+discovery **skips offline placeholders** by default. `cloud = true` opts one root
+into the **phase-2** model:
 
-**Startup is progressive (biopb/biopb#212).** The bootstrap scan is **not** run
-synchronously before the server serves: the launcher reaches `SERVING`
-immediately, `PeriodicRescanWatcher` fires its first rescan at once
-(`initial_immediate=True`), and the scan runs on the SourceManager's event-loop
-thread. The **first** full scan also *streams* its additions — each source is
-registered the moment the walk claims it (`SourceManager._stream_first_scan_add`
-wired as the discovery state's `on_source_added`) rather than batching at
-end-of-walk — so the catalog (and `health.source_count`) grows during the scan.
-This is safe only for the first scan (empty + force-full ⇒ no removals to diff);
-steady-state rescans keep the snapshot-diff reconcile. `_handle_rescan` pushes
-`full_scan_in_progress` around a force-full pass and advances
-`last_full_scan_finished_at` on success; the first success also flips the
-internal `_initial_scan_done` gate (startup sources warm via the precache
-*backlog*; live additions thereafter prompt-enqueue).
+- **admit** placeholders (not skip), keeping every `claim()` **recall-free** —
+  single-source formats (Zarr/OME-Zarr, MicroManager, single DICOM) defer as a
+  provisional `unresolved=True` claim behind `UnresolvedSourceAdapter`, while
+  content-membership formats (multi-file OME-TIFF, DICOM **series**) cannot be
+  deferred and degrade to **N single-file sources**;
+- **resolve on first serve** — the first `GetFlightInfo` re-claims the now-resident
+  path and backfills the catalog (the recorded type was a recall-free guess);
+- cloud subtrees are walked only on a `force_full` rescan, with the stability window
+  + open-for-append probe **bypassed** (the probe would recall the file), and
+  precache never touches an unresolved source.
 
-#### Architecture
-
-```
-Main Process
-┌─────────────────────┐
-│ TensorFlightServer  │
-│ SourceManager       │
-│ PeriodicRescanWatcher
-│         │
-│         ▼
-│  get_events()
-│         │
-│         ▼
-│  _process_event()
-│         │
-│         ▼
-│  _handle_rescan()
-│         │           │─────────────►│   shutdown_event    │
-│         ▼           │ (shutdown)   │                     │
-│  register_source()  │              │                     │
-│  unregister_source()│              │                     │
-└─────────────────────┘              └─────────────────────┘
-```
-
-Key design decisions:
-- **Timer-driven monitoring**: The watcher emits periodic rescan requests only
-- **Separation of concerns**: The watcher handles cadence while `SourceManager` handles stability checks and diffs
-- **Thread-safe updates**: Server mutations are serialized via locks in the main process
-- **Stable snapshots**: Catalog reconciliation runs against a scan-local discovered snapshot, not per-file events
-
-#### Watcher Interface
-
-```python
-class DirectoryWatcher(ABC):
-    def start(self, directories: Set[Path]) -> None
-    def stop(self) -> None
-    def get_events(self, timeout: float) -> List[WatcherEvent]
-    def is_running(self) -> bool
-```
-
-Implementations:
-- `PeriodicRescanWatcher` — emits `RESCAN` events at a fixed cadence for monitored directories
-
-#### Event Types
-
-```python
-class WatcherEventType(Enum):
-  RESCAN = "rescan"     # Trigger one reconciliation pass
-```
-
-#### Rescan Cadence
-
-The watcher emits a `RESCAN` event on a fixed interval. `SourceManager` then:
-- delegates the filesystem signature walk to `TreeScanner` (`tree_scanner.py`), a pure
-  producer that refreshes cached directory/file signatures and skips unstable subtrees
-  until they satisfy the stability window, returning an immutable `ScanSnapshot`
-- performs discovery on the snapshot's stable paths only
-- diffs the discovered snapshot against the confirmed catalog state
-
-#### Move Handling
-
-| Scenario | Behavior |
-|----------|----------|
-| Move within monitored dir | Preserve `source_id`, update paths |
-| Move out of monitored dir | Treat as delete |
-| Move into monitored dir | Treat as create (new `source_id`) |
-
-#### SourceManager
-
-Coordinates watcher, discovery, and server catalog updates:
-
-```python
-class SourceManager:
-    def start() → None    # Start event processing thread
-    def stop() → None     # Stop thread and clean up
-
-    # Callbacks (set on DiscoveryState)
-    def _on_source_added(claim)   # Create adapter, register with server
-    def _on_source_removed(source_id)  # Unregister from server
-```
-
-#### Configuration
-
-Enable monitoring per source:
-
-```json
-{
-  "sources": [
-    { "url": "/data/acquisition/", "monitor": true }
-  ]
-}
-```
-
-Only local directories can be monitored (remote URLs not supported).
-
-#### Cloud / synced-folder sources (`cloud = true`, cloud-storage phase 2)
-
-```json
-{
-  "sources": [
-    { "url": "/home/u/OneDrive/microscopy/", "cloud": true }
-  ]
-}
-```
-
-(`cloud = true` admits dehydrated (offline-placeholder) data as *unresolved* sources.)
-
-On a synced folder (OneDrive/Dropbox/iCloud "Files-On-Demand"), data appears as
-local paths but content is *dehydrated* until accessed — and reading any byte
-recalls the **whole** file (slow, refills the disk, blocks offline). The default
-discovery guard therefore **skips** every offline placeholder
-(`_is_offline_placeholder`, `discovery.py`), so cloud data is normally never
-catalogued. `cloud = true` opts one configured root into the phase-2 model:
-
-- **Admit, don't skip.** Under a cloud root the walk passes `admit_nonresident`
-  to `should_skip_walk_entry`, so dehydrated entries reach `claim()` instead of
-  being pruned. The hidden/system-dir prunes still apply.
-- **Recall-free claim.** Every `claim()` recognizes a source from name + `stat` +
-  `exists` + directory layout only. Two mechanisms keep it read-free under cloud,
-  by *why* a format would otherwise read content:
-  - *Single-source format recognition* (OME-Zarr/plain-Zarr `.zattrs`,
-    MicroManager `metadata.txt`, single DICOM header): the read is guarded by
-    `ClaimContext.is_resident()` and, when non-resident, the adapter emits a
-    **provisional, `unresolved=True`** claim that defers it. (`is_resident()` is
-    recall-free — the same stat signal — and treats directories as resident.)
-    Resolution refines the *same* source in place, so there is nothing to
-    reconcile.
-  - *Content-derived membership* (multi-file OME-TIFF via the OME-XML file list,
-    DICOM **series** via per-slice `SeriesInstanceUID`): these cannot be deferred
-    safely — a directory can hold several such datasets, so the dir is not the
-    boundary and the deferred member set could diverge at resolve. They are gated
-    on the new **`ClaimContext.cloud_root`** flag (at scan the rescan walk records
-    each entry's cloud-ness once — `TreeScanner._scan_tree_state` already knows it per
-    monitored root — into a per-path map the claim phase reads via
-    `discover_sources_from_entries(cloud_by_path=…)`; at resolve it comes from
-    `UnresolvedSourceAdapter`, so it holds at *both* scan and resolve — residency
-    cannot gate resolve, where the file is resident): under cloud
-    `OmeTiffAdapter`/`DicomSeriesAdapter` **return `None`**, so each `.tif`/`.dcm`
-    falls back to its own single-file source.
-  - The content-free extension-only adapters need no change; a `cloud_phase2_test`
-    guard pins that they (and the deferring readers) stay read-free.
-- **Dir-claiming policy.** The five genuine one-dir-one-dataset formats (zarr,
-  ome-zarr, ndtiff, micromanager, tiff-sequence) record **the directory** as the
-  sole claim member, not an enumerated per-file glob. A claimed dir already prunes
-  its whole subtree, so interior files are never independently walked; recording
-  `member_paths = {dir}` makes the bookkeeping match that prune and removes the
-  glob-vs-content membership divergence (so resolution never needs to reconcile a
-  member set). Change-detection then keys on the dir signature (add/remove of an
-  interior file bumps dir mtime).
-- **Register unresolved.** `SourceManager._claim_is_unresolved` registers such a
-  source behind an `UnresolvedSourceAdapter` (`adapters/unresolved.py`) — a
-  catalog row with empty `tensors` / `data_resident = false`. This is also how a
-  content-free *file* source (NIfTI, CZI, …) under a cloud root is deferred: its
-  `claim()` never reads, but a non-resident content file (member-path placeholder
-  stat, `is_file`-guarded so a directory's `st_blocks == 0` is never a false hit)
-  flags it. The check is cloud-gated, so a normal local source is never marked
-  unresolved.
-- **Monitoring is governed by `monitor`, identically to non-cloud roots.** `cloud`
-  only controls *gating* (admit placeholders, defer unresolved, set
-  `ClaimContext.cloud_root`); it no longer forces a root onto the monitored
-  pipeline — `cli.py` routes on `monitor` alone. A `monitor = true` cloud root is
-  live-monitored; a `monitor = false` cloud root is scanned **once at startup**
-  through the static-expand path, which is cloud-gated too: `config.discover_sources`
-  threads `admit_nonresident` **and** `cloud_root` from `source.cloud`, so the
-  one-shot scan admits placeholders and applies the multi-file OME-TIFF / DICOM
-  ban exactly like the monitored path (the expanded configs also keep `cloud`, so
-  they defer as unresolved).
-- **Cloud subtrees are walked only on a `force_full` rescan (the monitored path).**
-  `TreeScanner._scan_tree_state` **skips a cloud subtree entirely** on an incremental
-  (non-`force_full`) rescan — carrying its cached claims forward untouched — and
-  re-walks it only on the periodic `force_full` pass (`full_rescan_interval`,
-  default 1h). The first rescan is `force_full` (last-full = −∞), so a cloud root
-  is still catalogued at startup, and a brand-new cloud dataset surfaces on the
-  next `force_full`. When a cloud subtree *is* walked (a `force_full` rescan, or
-  the one-shot static scan), it is fully walked with no stability gate:
-  `_should_scan_resolved` **bypasses the stability window and the open-for-append
-  probe** for cloud entries. The probe (`_can_open_for_append`) opens the file — a
-  whole-file recall on a placeholder — so skipping it is load-bearing, not an
-  optimization; the mtime/age gate is skipped because archived dehydrated data is
-  inherently stable and cloud mtime is untrustworthy (§1.2).
-- **Pre-cache stays out of cloud (natural protection).** The background pre-cache
-  worker loops `list_tensor_descriptors()` and consults `has_native_pyramid()` —
-  both empty/False on the unresolved proxy — so `_process_source` returns before
-  it ever reaches the resolving `get_tensor_adapter`. An unresolved source is thus
-  never warmed/hydrated in the background. (The explicit `is_resident()` skip gate
-  for the *post-resolution* re-warm backfire is phase 4; it cannot manifest in
-  phase 2, whose resolution is in-memory and consented.)
-- **Resolve on serve.** The proxy splits into a *catalog* surface
-  (`list_tensor_descriptors`/`get_source_descriptor`/`has_native_pyramid`) that
-  never resolves — keeping ListFlights, the metadata-DB sync, and the precache
-  worker cheap (precache loops the empty tensor list and skips before any serving
-  call) — and a *serve* surface (`get_tensor_adapter`) that **is** the consented
-  resolution hook. The first `GetFlightInfo` hydrates: it re-runs the real claim
-  + `create_from_config` on the now-resident path (the recorded `source_type` was
-  a recall-free guess; the authoritative one comes from the hydrated content),
-  caches the real adapter, fires `on_resolved` (the metadata-DB backfill —
-  `sync_source_added` is an upsert, so the NULL-shape row is overwritten in
-  place), and delegates thereafter. Resolution runs once under a lock; failure is
-  classified: a transient recall/IO failure raises `SourceResolveRetriableError`
-  (→ `FlightUnavailableError`/UNAVAILABLE, "retry"), a permanent one raises bare
-  `SourceUnresolvedError` (→ `FlightInternalError` from the resolve action, so the
-  client does not retry forever). The re-claim `except` is narrowed to **not**
-  swallow an `OSError` into the claim-time guess — a recall blip can no longer be
-  laundered into a wrong type.
-
-**Known limitation (accepted).** Multi-file content-membership formats — multi-file
-OME-TIFF (member set lives in the OME-XML) and DICOM **series** (grouped by the
-per-slice `SeriesInstanceUID`) — are **not reconstructed on cloud**. Their
-membership is intrinsically a content read and a directory can hold several such
-datasets, so the dir is not the dataset boundary; deferring the grouping would
-force a catalog reconciliation at resolve (forbidden — a claim is immutable once
-made). Under a cloud root they therefore degrade to **N independent single-file
-sources** (each `.tif`/`.dcm` its own source), permanently — there is no later
-reconstruction. This matches §9 of `docs/cloud-storage-support.md` (pyramidal/
-chunked OME-Zarr is the supported cloud path; **transcode monoliths to OME-Zarr
-at archive time**). Phase-2 resolution is in-memory only; surviving a restart
-(file-backed metadata DB) is phase 3.
-
-#### Shutdown Sequence
-
-```python
-# CLI stop sequence:
-source_manager.stop()   # First: stop event processing thread
-watcher.stop()          # Then: signal subprocess shutdown
-    # → shutdown_event.set()
-    # → subprocess exits cleanly
-    # → process.join(5)
-    # → process.terminate() if needed
-    # → process.kill() as last resort
-```
+Full model — the residency/recall rules, the resolve state machine, and the
+"transcode monoliths to OME-Zarr at archive time" guidance — in
+**[docs/cloud-storage-support.md](docs/cloud-storage-support.md)**.
 
 ---
 
