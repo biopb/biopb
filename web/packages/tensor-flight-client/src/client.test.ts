@@ -429,18 +429,6 @@ describe("TensorHttpClient.getAdminStatus", () => {
   });
 });
 
-describe("TensorHttpClient.restartServer", () => {
-  it("POSTs /api/admin/restart and returns the 202 body", async () => {
-    mockFetch.mockResolvedValueOnce(jsonResponse({ restarting: true }, 202));
-    const c = new TensorHttpClient(BASE, TOKEN);
-    const r = await c.restartServer();
-    const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${BASE}/api/admin/restart`);
-    expect(opts.method).toBe("POST");
-    expect(r.restarting).toBe(true);
-  });
-});
-
 describe("TensorHttpClient.browse", () => {
   it("GETs /api/admin/browse with no query when path omitted", async () => {
     mockFetch.mockResolvedValueOnce(

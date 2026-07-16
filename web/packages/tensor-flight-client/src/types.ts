@@ -103,7 +103,7 @@ export interface QuerySourcesResult {
 }
 
 // ---------------------------------------------------------------------------
-// Admin endpoint (GET/PUT /api/config, /api/admin/status, /api/admin/restart)
+// Admin endpoint (GET/PUT /api/config, /api/admin/status)
 // ---------------------------------------------------------------------------
 
 /** Response of `GET /api/config`: the on-disk config plus its path and schema. */

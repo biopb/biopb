@@ -253,17 +253,22 @@ export function AdminPage() {
       if (status?.supervised) {
         // The biopb control owns this data plane, so restarting it is a request
         // to the control — its own token-gated verb at this single origin —
-        // rather than the sidecar self-restart, which the supervisor would race
-        // for ownership (biopb/biopb#418). The control bounces + waits for the
-        // plane to come back, then the poll loop below confirms it's serving.
+        // rather than the sidecar, which the supervisor would race for ownership
+        // (biopb/biopb#418). The control bounces + waits for the plane to come
+        // back, then the poll loop below confirms it's serving.
         await restartViaControl();
       } else {
-        // Not control-owned: either a standalone `biopb server start` (no
-        // control), a plane the control merely *adopts* (`--no-data-plane`, so
-        // the control must NOT ensure/spawn its own competing child), or an
-        // older sidecar without the `supervised` field. In all three the daemon
-        // owns its own lifecycle, so the sidecar self-restart is correct here.
-        await client.http.restartServer();
+        // Not control-owned (a directly-launched `biopb-tensor-server launch`, or
+        // a `--no-data-plane` adopted plane): the control does not own this
+        // process and the sidecar has no self-restart, so restart is not available
+        // from the browser. The operator restarts it where they launched it.
+        setRestartError(
+          "This data plane is self-managed — restart it where you launched it, " +
+            "or run it under `biopb control` for managed restart.",
+        );
+        setRestarting(false);
+        setRestartMsg(null);
+        return;
       }
     } catch (err) {
       if (mounted.current) {

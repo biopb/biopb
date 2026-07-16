@@ -605,11 +605,10 @@ function Start-ControlPlane {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
 
-    # Retire a prior control plane (+ the data plane it owns) and any legacy
-    # standalone data server, so the new control plane can bind a fresh plane it
-    # owns -- it refuses an in-use gRPC port. Best-effort; no-ops on a clean machine.
+    # Retire a prior control plane (+ the data plane it owns) so the new control
+    # plane can bind a fresh plane it owns -- it refuses an in-use gRPC port.
+    # Best-effort; a no-op on a clean machine.
     try { & biopb control stop  *> $null } catch { }
-    try { & biopb server stop *> $null } catch { }
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
@@ -984,7 +983,6 @@ function Invoke-BiopbInstall {
     # clean machine. Done before the downloads so the OS releases the handles.
     if (Get-Command biopb -ErrorAction SilentlyContinue) {
         try { & biopb control stop  *> $null } catch { }
-        try { & biopb server stop *> $null } catch { }
         try { & biopb mcp stop    *> $null } catch { }
         Report-Detail "stopped any running biopb daemons (control + data + mcp) so their files can be replaced"
     }
@@ -1533,7 +1531,6 @@ function Invoke-BiopbUninstall {
         # stopping it is a complete teardown of that pair and stops it respawning.
         if (Get-Command biopb -ErrorAction SilentlyContinue) {
             try { & biopb control stop  *> $null } catch { }
-            try { & biopb server stop *> $null } catch { }
             try { & biopb mcp stop    *> $null } catch { }
         }
         # Force-stop any leftover process holding the tool dir open, else the

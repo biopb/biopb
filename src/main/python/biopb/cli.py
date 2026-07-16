@@ -74,14 +74,13 @@ _add_optional_typer("image", "biopb.image.cli", "ProcessImage client operations"
 # Tensor server daemon management
 server_app = typer.Typer(
     name="server",
-    help="Biopb tensor-server diagnostics. The standalone-daemon commands "
-    "(start/stop/restart/status/logs) are deprecated -- the control plane "
-    "(`biopb control`) now owns the data plane; cache-stats/migrate-config remain.",
+    help="Biopb tensor-server diagnostics (cache-stats, migrate-config). The "
+    "control plane (`biopb control`) owns the data-plane process lifecycle; the "
+    "former standalone-daemon commands (start/stop/restart/status/logs) are gone.",
 )
 app.add_typer(server_app, name="server")
 
 # Daemon management constants
-PID_FILE = Path.home() / ".local" / "share" / "biopb" / "tensor-server.pid"
 LOG_DIR = Path.home() / ".local" / "share" / "biopb" / "logs"
 DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
 
@@ -116,8 +115,8 @@ MCP_DEFAULT_PORT = 8765  # biopb_mcp default transport.port (loopback /mcp)
 # the lifecycle plumbing (pidfile / detach / stop-sentinel) lives here, reused
 # from the tensor-server / mcp daemons, so the package itself stays a pure
 # supervisor. It supervises the tensor server, which keeps writing the canonical
-# tensor-server.log (LOG_DIR), so `biopb server logs` still shows the data plane;
-# the control plane's own supervision/control-API log is control.log.
+# tensor-server.log (LOG_DIR) that the control's log endpoint tails; the control
+# plane's own supervision/control-API log is control.log.
 CONTROL_PID_FILE = Path.home() / ".local" / "share" / "biopb" / "control.pid"
 
 
@@ -186,7 +185,7 @@ def version():
 
 def _ensure_dirs():
     """Ensure required directories exist."""
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -250,17 +249,6 @@ def _remove_pid_file(pid_file: Path):
         pid_file.unlink()
 
 
-def _write_pid(pid: int):
-    """Write the tensor-server daemon PID (+ its create-time identity token)."""
-    _ensure_dirs()
-    _write_pid_file(PID_FILE, pid, _process_create_time(pid))
-
-
-def _remove_pid():
-    """Remove the tensor-server daemon PID file."""
-    _remove_pid_file(PID_FILE)
-
-
 def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
     """Whether `pid` is alive AND is the daemon we recorded -- not a reused PID.
 
@@ -284,18 +272,6 @@ def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
 # Diagnostic from the most recent _win_request_shutdown() failure, surfaced by
 # _stop_daemon() so a Windows user can see why graceful stop fell back to force-kill.
 _LAST_WIN_SHUTDOWN_DIAG: Optional[str] = None
-
-
-def _win_shutdown_sentinel() -> Path:
-    """Path of the shutdown sentinel file (Windows graceful stop).
-
-    Must match shutdown_sentinel_path() in biopb_tensor_server.serving.http_server (kept
-    as a literal here to avoid importing heavy server deps just to stop). A single
-    fixed name - NOT keyed by PID: on Windows the daemon's os.getpid() can differ
-    from the PID `start` recorded (Store-Python/uv launcher shims), so a pid in
-    the name would make stop and the daemon disagree. One daemon, one sentinel.
-    """
-    return PID_FILE.parent / "tensor-server.stop"
 
 
 def _win_request_shutdown(sentinel: Path) -> bool:
@@ -595,295 +571,6 @@ def _detach_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def _warn_server_daemon_deprecated() -> None:
-    """Print the standalone-tensor-server deprecation notice (to stderr).
-
-    Since Layer 2 of the de-daemonization migration
-    (biopb-mcp/docs/mcp-dedaemonization-migration.md), the data plane is owned
-    and supervised by the control plane: ``biopb control start`` brings it up and
-    owns its lifecycle (restart-on-crash, complete teardown on stop), so the
-    standalone ``biopb server`` daemon is superseded. ``start``/``stop``/
-    ``restart``/``status``/``logs`` still work but will be removed in a future
-    release. Goes to stderr so it never corrupts ``status --json`` stdout.
-    (``cache-stats`` and ``migrate-config`` are diagnostics/utilities, not daemon
-    management, and are not deprecated.)
-    """
-    err_console.print(
-        "[yellow]Deprecated:[/yellow] the standalone biopb tensor-server daemon "
-        "is superseded by the control plane. Use [bold]biopb control start[/bold] "
-        "(it owns and supervises the data plane) and [bold]biopb control "
-        "status[/bold]. These commands still work but will be removed in a future "
-        "release."
-    )
-
-
-@server_app.command("start")
-def start(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG,
-        "--config",
-        "-c",
-        help="Path to config file (JSON or TOML)",
-    ),
-    web_port: int = typer.Option(
-        8814,
-        "--web-port",
-        help="HTTP server port",
-    ),
-    web_host: str = typer.Option(
-        "127.0.0.1",
-        "--web-host",
-        help="HTTP server bind address",
-    ),
-    log_level: str = typer.Option(
-        "INFO",
-        "--log-level",
-        "-l",
-        help="Log level: DEBUG, INFO, WARNING, ERROR",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        help="Access token (auto-generated if not provided)",
-    ),
-):
-    """(Deprecated) Start TensorFlight server as a background daemon."""
-    _warn_server_daemon_deprecated()
-    _ensure_dirs()
-
-    # Check if already running (identity-checked, so a reused stale PID does not
-    # masquerade as a live server and silently block a real start).
-    existing_pid, existing_token = _read_pid_record(PID_FILE)
-    if _is_our_daemon(existing_pid, existing_token):
-        console.print(
-            f"[yellow]TensorFlight server already running (PID {existing_pid})[/yellow]"
-        )
-        raise typer.Exit(0)
-
-    # Clean up stale PID file
-    if existing_pid:
-        console.print(
-            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
-        )
-        _remove_pid()
-
-    # Refuse to start on top of an already-bound gRPC port. The stale-but-dead
-    # PID was handled above; this catches the orphan case the PID file cannot
-    # see -- a data server still serving after its manager exited, its PID file
-    # deleted, or a second login session -- which would otherwise double-bind,
-    # fail silently in the log, and leave a dead process behind the PID file we
-    # are about to write.
-    probe_host, probe_port = _resolve_grpc_hostport(config)
-    if _port_listening(probe_host, probe_port):
-        console.print(
-            f"[red]gRPC port {probe_host}:{probe_port} is already in use.[/red]"
-        )
-        console.print(
-            "It is held by a process biopb is not tracking (no matching PID "
-            "file -- an orphaned daemon, or another login session), so "
-            "[bold]biopb server stop[/bold] cannot reach it. Identify and stop "
-            f"the owner (`netstat -ano | findstr {probe_port}` on Windows, "
-            f"`lsof -i :{probe_port}` on macOS/Linux), then retry."
-        )
-        raise typer.Exit(1)
-
-    # Token: skip only when both web and gRPC are bound to localhost
-    _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
-    if not token:
-        token = os.environ.get("BIOPB_TENSOR_TOKEN")
-
-    grpc_host = "0.0.0.0"  # safe default: assume public if config unreadable
-    if config.exists():
-        try:
-            from biopb_tensor_server.core.config import (
-                load_config as _load_server_config,
-            )
-
-            grpc_host = _load_server_config(config).host
-        except Exception:
-            pass
-
-    local_only = (
-        not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
-    )
-    if not token and not local_only:
-        import secrets as _secrets
-
-        token = _secrets.token_urlsafe(32)
-        console.print(f"[bold green]Generated access token:[/bold green] {token}")
-
-    log_file = _get_log_file()
-    _rotate_log(log_file)
-
-    # Build subprocess environment. With no token (local_only), the tensor
-    # `launch` runs tokenless on its own because the config binds the flight
-    # server to loopback — no bypass signal needed.
-    env = os.environ.copy()
-    if token:
-        env["BIOPB_TENSOR_TOKEN"] = token
-
-    # Build command
-    cmd = [
-        sys.executable,
-        "-m",
-        "biopb_tensor_server.cli",
-        "launch",
-        "--config",
-        str(config),
-        "--web-port",
-        str(web_port),
-        "--web-host",
-        str(web_host),
-        "--log-level",
-        str(log_level),
-    ]
-
-    # Start subprocess
-    console.print("[green]Starting TensorFlight server...[/green]")
-    console.print(f"  Config: {config}")
-
-    # Detach the daemon from the launching console/process group so it survives
-    # this command returning. On Windows it then has no console for graceful
-    # `stop` to signal, so stop uses a named shutdown sentinel instead (see
-    # _win_request_shutdown / http_server._install_windows_shutdown_listener).
-    detach_kwargs = _detach_kwargs()
-
-    with open(log_file, "a") as log:
-        log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        process = subprocess.Popen(
-            cmd,
-            stdout=log,
-            stderr=log,
-            env=env,
-            **detach_kwargs,
-        )
-
-    _write_pid(process.pid)
-
-    # Wait for the daemon to actually bind its gRPC port -- a readiness check,
-    # not just "is the child alive". A bind collision or early crash surfaces as
-    # the port never coming up (or the process exiting), which we report here
-    # instead of a false "started".
-    if not _await_listening(process.pid, probe_host, probe_port, 15.0):
-        if _is_process_running(process.pid):
-            console.print(
-                f"[red]TensorFlight server started but is not listening on "
-                f"{probe_host}:{probe_port} after 15s.[/red]"
-            )
-            console.print(
-                "It may still be coming up; check [bold]biopb server status -w 30[/bold], "
-                "or [bold]biopb server stop[/bold] if it is wedged."
-            )
-        else:
-            console.print("[red]Failed to start TensorFlight server[/red]")
-            _remove_pid()
-        console.print(f"Check logs: {log_file}")
-        raise typer.Exit(1)
-
-    console.print(f"[green]TensorFlight server started (PID {process.pid})[/green]")
-    url = f"http://{web_host}:{web_port}/" + (f"?token={token}" if token else "")
-    console.print(f"  HTTP: {url}")
-    console.print("  gRPC: grpc://127.0.0.1:8815")
-    console.print(f"  Logs: {log_file}")
-
-
-@server_app.command("stop")
-def stop(
-    timeout: int = typer.Option(
-        10,
-        "--timeout",
-        "-t",
-        help="Seconds to wait for graceful shutdown",
-    ),
-):
-    """(Deprecated) Stop TensorFlight server daemon."""
-    _warn_server_daemon_deprecated()
-    pid, token = _read_pid_record(PID_FILE)
-
-    if not pid:
-        console.print("[yellow]No TensorFlight server running[/yellow]")
-        raise typer.Exit(0)
-
-    if not _is_our_daemon(pid, token):
-        console.print(
-            f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
-        )
-        _remove_pid()
-        raise typer.Exit(0)
-
-    console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-
-    if _stop_daemon(
-        pid, timeout, token, sentinel=_win_shutdown_sentinel(), remove_pid=_remove_pid
-    ):
-        console.print("[green]TensorFlight server stopped[/green]")
-    else:
-        console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
-    raise typer.Exit(0)
-
-
-@server_app.command("restart")
-def restart(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG,
-        "--config",
-        "-c",
-        help="Path to config file (JSON or TOML)",
-    ),
-    web_port: int = typer.Option(
-        8814,
-        "--web-port",
-        help="HTTP server port",
-    ),
-    web_host: str = typer.Option(
-        "127.0.0.1",
-        "--web-host",
-        help="HTTP server bind address",
-    ),
-    log_level: str = typer.Option(
-        "INFO",
-        "--log-level",
-        "-l",
-        help="Log level: DEBUG, INFO, WARNING, ERROR",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        help="Access token (auto-generated if not provided)",
-    ),
-    timeout: int = typer.Option(
-        10,
-        "--timeout",
-        "-t",
-        help="Seconds to wait for graceful shutdown",
-    ),
-):
-    """(Deprecated) Restart TensorFlight server daemon."""
-    _warn_server_daemon_deprecated()
-    # Stop first. Use id_token (the PID-record identity token) so we don't clobber
-    # the `token` access-token parameter, which must be passed through to start().
-    pid, id_token = _read_pid_record(PID_FILE)
-    if _is_our_daemon(pid, id_token):
-        console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-        _stop_daemon(
-            pid,
-            timeout,
-            id_token,
-            sentinel=_win_shutdown_sentinel(),
-            remove_pid=_remove_pid,
-        )
-        time.sleep(1)
-
-    # Start with same options
-    start(
-        config=config,
-        web_port=web_port,
-        web_host=web_host,
-        log_level=log_level,
-        token=token,
-    )
-
-
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
     """Loopback-reachable gRPC host/port from the config (default
     127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
@@ -942,11 +629,6 @@ def _query_server(
                 close()
             except Exception:
                 pass
-
-
-def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
-    """Return the server's Flight health dict, or None if unreachable."""
-    return _query_server(location, token, lambda c: c.health_check())
 
 
 def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
@@ -1041,116 +723,6 @@ def _emit_daemon_status(
     console.print(table)
 
 
-@server_app.command("status")
-def status(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
-    ),
-    json_output: bool = typer.Option(
-        False, "--json", help="Emit machine-readable JSON instead of a table"
-    ),
-    wait: float = typer.Option(
-        0.0,
-        "--wait",
-        "-w",
-        help="Seconds to poll for the server to reach SERVING (0 = check once)",
-    ),
-):
-    """(Deprecated) Check TensorFlight server daemon status and live health."""
-    _warn_server_daemon_deprecated()
-    pid, id_token = _read_pid_record(PID_FILE)
-    running = _is_our_daemon(pid, id_token)
-    stale = bool(pid and not running)
-
-    # When running, ask the daemon for its Flight health (status + source_count),
-    # polling up to --wait for it to finish its initial scan and report SERVING.
-    health: Optional[dict] = None
-    if running:
-        location, token = _resolve_grpc_endpoint(config)
-        host, port = _resolve_grpc_hostport(config)
-        deadline = time.monotonic() + max(0.0, wait)
-        last_report = None
-        while True:
-            health = _probe_daemon(
-                host, port, lambda: _query_health(location, token)
-            ).health
-            st = health.get("status") if health else None
-            n = health.get("source_count") if health else None
-            # While waiting, log human-facing progress to stderr so stdout stays
-            # clean for --json. The terminal SERVING line is left to the table /
-            # JSON (or the caller) so we don't duplicate the final verdict.
-            if wait > 0 and st != "SERVING":
-                report = (
-                    "waiting for the data server to come up..."
-                    if st is None
-                    else f"data server starting - {n} source(s) found so far..."
-                )
-                if report != last_report:
-                    print(report, file=sys.stderr, flush=True)
-                    last_report = report
-            if (health and st == "SERVING") or time.monotonic() >= deadline:
-                break
-            time.sleep(0.5)
-
-    health_status = health.get("status") if health else None
-    source_count = health.get("source_count") if health else None
-
-    table_rows: List[Tuple[str, str]] = []
-    if running:
-        if health:
-            table_rows.append(("Health", str(health_status)))
-            if source_count is not None:
-                table_rows.append(("Sources", str(source_count)))
-            if health.get("uptime_seconds") is not None:
-                table_rows.append(("Uptime", f"{health.get('uptime_seconds')}s"))
-            if health.get("writable") is not None:
-                table_rows.append(("Writable", str(health.get("writable"))))
-        else:
-            table_rows.append(("Health", "unreachable"))
-        table_rows.append(("Config", str(config)))
-
-    _emit_daemon_status(
-        title="TensorFlight Server Status",
-        pid=pid,
-        running=running,
-        stale=stale,
-        pid_file=PID_FILE,
-        log_file=_get_log_file(),
-        json_output=json_output,
-        json_fields={
-            "health": health_status,
-            "source_count": source_count,
-            "writable": health.get("writable") if health else None,
-            "uptime_seconds": health.get("uptime_seconds") if health else None,
-        },
-        table_rows=table_rows,
-    )
-
-
-@server_app.command("logs")
-def logs(
-    follow: bool = typer.Option(
-        False, "--follow", "-f", help="Stream new log lines as they are written"
-    ),
-    lines: int = typer.Option(
-        200, "--lines", "-n", help="Number of lines from the end to show (0 = all)"
-    ),
-    level: Optional[str] = typer.Option(
-        None,
-        "--level",
-        help="Minimum level to show: DEBUG, INFO, WARNING, ERROR, CRITICAL",
-    ),
-    path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
-):
-    """(Deprecated) Show the TensorFlight server daemon log."""
-    _warn_server_daemon_deprecated()
-    log_file = _get_log_file()
-    if path:
-        print(log_file)
-        raise typer.Exit(0)
-    _tail_and_follow(log_file, follow, lines, _validate_level(level), _line_level)
-
-
 def _fmt_mb(n_bytes: int) -> str:
     """Format a byte count as MB."""
     return f"{n_bytes / (1024 * 1024):.1f} MB"
@@ -1218,12 +790,12 @@ def cache_stats(
         False, "--json", help="Emit machine-readable JSON instead of a table"
     ),
 ):
-    """Show cache hit/miss diagnostics from the running server."""
-    pid, id_token = _read_pid_record(PID_FILE)
-    if not _is_our_daemon(pid, id_token):
-        console.print("[yellow]TensorFlight server is not running.[/yellow]")
-        raise typer.Exit(1)
+    """Show cache hit/miss diagnostics from the running server.
 
+    Liveness is the Flight query itself: an unreachable server yields no stats
+    (handled below), so there is no separate PID-file gate -- the control plane
+    now owns the data-plane process and writes no ``tensor-server.pid``.
+    """
     location, env_token = _resolve_grpc_endpoint(config)
     stats = _query_cache_stats(location, token or env_token)
 
@@ -1518,7 +1090,7 @@ def _mcp_shutdown_sentinel() -> Path:
     Must match _shutdown_sentinel_path() in biopb_mcp.mcp.__main__ (kept as a
     literal here, like MCP_PID_FILE itself, to avoid importing biopb_mcp just
     to stop). A single fixed name, not pid-keyed, for the same shim-PID-mismatch
-    reason as _win_shutdown_sentinel().
+    reason as _control_shutdown_sentinel().
     """
     return MCP_PID_FILE.parent / "mcp-server.stop"
 
@@ -2136,8 +1708,8 @@ def control_start(
 
             # The control plane owns the data plane exclusively, so refuse to start into a gRPC
             # port a stray server already holds -- otherwise the supervised child would
-            # crash-loop on EADDRINUSE. Mirrors `biopb server start`'s port guard. Skipped
-            # for --no-data-plane (the plane comes up on demand, guarded there too).
+            # crash-loop on EADDRINUSE. Skipped for --no-data-plane (the plane comes
+            # up on demand, guarded there too).
             if data_plane:
                 grpc_host, grpc_port = _resolve_grpc_hostport(config)
                 if _port_listening(grpc_host, grpc_port):
@@ -2227,8 +1799,8 @@ def control_stop(
     The control plane owns the data plane exclusively, so stopping it is a complete
     teardown: the supervised tensor server is shut down too. This is the single
     command an installer/upgrade uses to free the control-managed processes before
-    replacing files. (Legacy standalone daemons started with `biopb server start`
-    / `biopb mcp start` are stopped by their own `stop` commands.)
+    replacing files. (A standalone `biopb mcp start` daemon, if used, is stopped by
+    its own `biopb mcp stop`.)
     """
     _require_biopb_control()
     pid, token = _read_pid_record(CONTROL_PID_FILE)

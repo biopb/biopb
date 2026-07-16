@@ -614,8 +614,8 @@ _tail_log() {
 # plane. Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
 # Starting now lets the pre-cache warm overviews before the user opens anything.
 # The control plane owns the data plane exclusively, so we first retire any prior
-# control plane AND any legacy standalone data server (`biopb server start`) so the
-# freshly installed one can spawn and own a new plane -- it refuses an in-use gRPC port.
+# control plane so the freshly installed one can spawn and own a new plane -- it
+# refuses an in-use gRPC port.
 _start_control_plane() {
     local control_log="$HOME/.local/share/biopb/logs/control.log"
     local server_log="$HOME/.local/share/biopb/logs/tensor-server.log"
@@ -631,11 +631,11 @@ _start_control_plane() {
         return 0
     fi
 
-    # Retire a prior control plane (+ the data plane it owns) and any legacy
-    # standalone data server, so the new control plane can bind a fresh plane it
-    # owns. Best-effort; both are no-ops on a clean machine.
+    # Retire a prior control plane (+ the data plane it owns) so the new control
+    # plane can bind a fresh plane it owns. Best-effort; a no-op on a clean machine.
+    # (The standalone `biopb server` daemon was retired; if a pre-retirement one is
+    # somehow still holding the gRPC port, control-start below names it and stops.)
     biopb control stop >/dev/null 2>&1 || true
-    biopb server stop >/dev/null 2>&1 || true
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
@@ -1568,7 +1568,6 @@ uninstall_biopb() {
     _step "[1/3] Stopping biopb services..."
     if command -v biopb &>/dev/null; then
         biopb control stop &>/dev/null || true
-        biopb server stop &>/dev/null || true
         biopb mcp stop &>/dev/null || true
         _ok "biopb services stopped (if they were running)"
     else

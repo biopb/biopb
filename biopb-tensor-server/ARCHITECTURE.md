@@ -255,7 +255,6 @@ A token is present (and enforced) only in **remote mode**, when the config's
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
 | `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker |
-| `POST` | `/api/admin/restart` | ✓ | Restart the server (same-origin guarded) |
 
 > **Route ordering:** `/api/sources/{id}/metadata` is registered *before* the
 > greedy `{id:path}` catch-all to avoid Starlette first-match shadowing.
@@ -340,39 +339,37 @@ Startup sequence:
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
-### Windows daemon shutdown (`biopb server stop`)
+### Windows graceful shutdown of the supervised data plane
 
-When run as a background daemon (`biopb server start`), `launch` is spawned on
-Windows with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`. It therefore has no
-console that `biopb server stop` (running in a different console) can deliver a
-console control event to — and Win32 named events proved brittle across
-sessions/elevation. So graceful shutdown is coordinated through a **sentinel
-file** instead: `run_http_server` calls `_install_windows_shutdown_listener(server)`,
-which starts a daemon thread that polls for `~/.local/share/biopb/tensor-server.stop`
-every 0.2s. When `stop` writes that file, the thread sets `server.should_exit =
-True` *and* `server.force_exit = True` (so an open browser/keep-alive connection
-can't stall shutdown). uvicorn returns from `run()`, so `launch`'s `finally →
-_graceful_shutdown` runs and the file-cache process lock is released.
+The control plane owns the data-plane process: it spawns `launch` and stops it on
+teardown (`DataPlaneSupervisor._terminate`). On Windows that child runs with
+`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` and `os.kill` is an uncatchable
+`TerminateProcess`, so there is no way to deliver a catchable stop for a graceful
+exit — and Win32 named events proved brittle across sessions/elevation. So
+graceful shutdown is coordinated through a **sentinel file**: `run_http_server`
+calls `_install_windows_shutdown_listener(server)`, which starts a daemon thread
+that polls for `~/.local/share/biopb/tensor-server.stop`. When the supervisor
+writes that file, the thread sets `server.should_exit = True` *and*
+`server.force_exit = True` (so an open browser/keep-alive connection can't stall
+shutdown). uvicorn returns from `run()`, so `launch`'s `finally →
+_graceful_shutdown` runs and the file-cache process lock is released. The
+supervisor then hard-kills (`TerminateProcess`) as a backstop if the child hasn't
+exited within its timeout; on POSIX it sends `SIGTERM` instead. See `biopb/biopb#22`.
 
-The sentinel name is **fixed, not PID-keyed**: on Windows the process `start`
-launches (and records in the PID file) can differ from the one actually running
-`launch()`/uvicorn (Store-Python/uv launcher shims), so a PID in the name would
-make `stop` and the daemon disagree. A leftover sentinel from a prior run is
-ignored via an mtime guard. `stop` falls back to `TerminateProcess` (via
-`os.kill`) if the sentinel can't be written or the daemon doesn't exit within
-`--timeout`. On POSIX, `stop` sends `SIGTERM` as before. See `biopb/biopb#22`.
+The sentinel name is **fixed, not PID-keyed**: on Windows the process the
+supervisor records can differ from the one actually running `launch()`/uvicorn
+(Store-Python/uv launcher shims), so a PID in the name would make writer and
+watcher disagree. A leftover sentinel from a prior run is cleared once at
+listener startup. Because the control is the **sole owner** of the plane, the
+supervisor is the only writer of this sentinel — the former standalone `biopb
+server` daemon that also wrote it has been retired.
 
-This assumes the **single-server model**: the fixed sentinel name (and the
-singular PID file) are unambiguous because the `biopb` CLI runs at most one
-managed daemon. That single-instance guarantee comes from `biopb server start`
-(the PID-file check) — **not** from `launch` itself. Running
-`biopb-tensor-server launch`/`serve` directly bypasses it: such a process is
-**self-managed** — `biopb server stop` does not track it (no PID file, so it
-reports "no server running"), and you stop it with Ctrl+C / your own process
-control. Note that a directly-launched `launch` still installs the watcher on
-the same fixed sentinel, so running a managed daemon and a direct `launch` side
-by side on Windows is unsupported (a `biopb server stop` would also stop the
-direct one). On POSIX there is no such coupling — `stop` signals one PID.
+A directly-launched `biopb-tensor-server launch`/`serve` (not under the control)
+is **self-managed** — you stop it with Ctrl+C / your own process control. It still
+installs the same watcher on the same fixed sentinel, so running a
+control-supervised plane and a direct `launch` side by side on Windows is
+unsupported (they would share the one sentinel). On POSIX there is no such
+coupling — the supervisor signals one PID.
 
 ---
 

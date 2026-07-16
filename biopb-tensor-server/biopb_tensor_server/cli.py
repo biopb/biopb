@@ -120,8 +120,8 @@ def _resolve_launch_token(
 def _install_sigterm_handler() -> None:
     """Make SIGTERM behave like Ctrl+C (KeyboardInterrupt).
 
-    `biopb server stop`, `docker/singularity stop`, and SLURM all terminate the
-    server with SIGTERM, which Python ignores (default disposition) for a
+    The control supervisor (POSIX), `docker/singularity stop`, and SLURM all
+    terminate the server with SIGTERM, which Python ignores (default disposition) for a
     blocking call like the Flight server's serve(). Translating it into a
     KeyboardInterrupt lets the same graceful-shutdown path run, so the file
     cache process lock is released instead of being left behind as a stale lock.
