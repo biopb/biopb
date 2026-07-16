@@ -467,11 +467,9 @@ def _serve_http(config, port, view=False):
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
     # (which leaves workers no chance to clean up) doesn't leak spill dirs
-    # (issue #13, secondary disk-leak note). Consumed by the daemon-owned
-    # cluster (below) via DaskClusterHost.local_dir, or by a kernel-local cluster
-    # via BIOPB_DASK_LOCAL_DIR under the `owner="kernel"` escape hatch.
+    # (issue #13, secondary disk-leak note). Consumed by the session-child-owned
+    # cluster (below) via DaskClusterHost.local_dir.
     dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
-    kernel_env["BIOPB_DASK_LOCAL_DIR"] = dask_local_dir
 
     def _cleanup_dask_dir():
         shutil.rmtree(dask_local_dir, ignore_errors=True)
@@ -593,7 +591,7 @@ def _serve_http(config, port, view=False):
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
         Windows stop sentinel, the server loop returning: reap the kernel, close
-        the daemon-owned dask cluster, remove our files, exit.
+        the session-child-owned dask cluster, remove our files, exit.
 
         Skips Python finalization: this process still has a live asyncio/epoll
         event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -604,8 +602,9 @@ def _serve_http(config, port, view=False):
         logger.info("Shutting down (%s).", reason)
         host.shutdown()
         # After the kernel is reaped (no clients left attached): stop the
-        # daemon-owned cluster, then rmtree its now-idle spill dir. This is the
-        # only path that closes the cluster — kernel restart/reap leaves it warm.
+        # session-child-owned cluster, then rmtree its now-idle spill dir. This is
+        # the only path that closes the cluster — kernel restart/reap leaves it
+        # warm.
         cluster_host.close()
         _remove_pidfile(pidfile)
         _cleanup_dask_dir()

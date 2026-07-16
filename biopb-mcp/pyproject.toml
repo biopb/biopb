@@ -69,13 +69,14 @@ tables = [
 # can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
 # version as a `versions.json` release attribute that install.sh reads to pin
 # `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
-# distributed floor: the daemon owns the LocalCluster (DaskClusterHost), so its
-# worker processes live in the *daemon's* process group, not the kernel's. On an
-# abnormal daemon death (SIGKILL/OOM) neither _shutdown nor the atexit close runs
-# to reap them — the sole remaining cleanup is dask's own "worker shuts down when
-# it loses the scheduler" behavior, which only holds since the `reconnect` era
-# ended (>=2023.9). Pin a floor so orphan-hardening (issue #13) can't silently
-# regress on an older distributed. See mcp/_deathwatch and mcp/_cluster.
+# distributed floor: the session child owns the LocalCluster (DaskClusterHost),
+# so its worker processes live in the *session child's* process group, not the
+# kernel's. On an abnormal session-child death (SIGKILL/OOM) neither _shutdown nor
+# the atexit close runs to reap them — the sole remaining cleanup is dask's own
+# "worker shuts down when it loses the scheduler" behavior, which only holds since
+# the `reconnect` era ended (>=2023.9). Pin a floor so orphan-hardening (issue #13)
+# can't silently regress on an older distributed. See biopb._lifecycle.deathwatch
+# and mcp/_cluster.
 mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6"]
 3d = ["vedo"] # 3d rendering from mesh
 

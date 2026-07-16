@@ -24,15 +24,13 @@ class TestConfigureDask:
     """Unit tests for _configure_dask (no kernel / no display needed)."""
 
     def test_in_process_scheduler_returns_no_client(self):
-        """threads/synchronous schedulers yield no client and no cluster."""
+        """threads/synchronous schedulers yield no client."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask({"dask": {"scheduler": "threads"}})
-        assert client is None
-        assert cluster is None
+        assert _configure_dask({"dask": {"scheduler": "threads"}}) is None
 
     def test_external_address_connects_without_cluster(self, monkeypatch):
-        """distributed + an explicit address attaches a Client, no cluster."""
+        """distributed + an explicit address attaches a Client."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
@@ -47,7 +45,7 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
+        client = _configure_dask(
             {
                 "dask": {
                     "scheduler": "distributed",
@@ -57,10 +55,9 @@ class TestConfigureDask:
         )
         assert isinstance(client, _FakeClient)
         assert created["address"] == "tcp://1.2.3.4:8786"
-        assert cluster is None
 
     def test_injected_address_takes_precedence(self, monkeypatch):
-        """BIOPB_DASK_ADDRESS (daemon-injected) wins over the config address."""
+        """BIOPB_DASK_ADDRESS (session-child-injected) wins over the config address."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
@@ -75,103 +72,30 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
+        _configure_dask(
             {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}
         )
         assert created["address"] == "tcp://daemon:8786"
-        assert cluster is None
 
-    def test_daemon_owner_no_address_falls_back_to_threads(self, monkeypatch):
-        """owner='daemon' with no injected address -> threads, not a competing
-        kernel-local cluster (LocalCluster must never be constructed)."""
+    def test_no_address_falls_back_to_threads(self, monkeypatch):
+        """distributed + no injected address -> in-process threads. The kernel
+        never owns a cluster, so LocalCluster must never be constructed here."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
         monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
 
         def _must_not_spin(*args, **kwargs):
-            raise AssertionError("owner=daemon must not spin a kernel-local cluster")
+            raise AssertionError("the kernel must never spin a LocalCluster")
 
         monkeypatch.setattr(dd, "LocalCluster", _must_not_spin)
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
-            {
-                "dask": {
-                    "scheduler": "distributed",
-                    "address": "",
-                    "owner": "daemon",
-                }
-            }
+        assert (
+            _configure_dask({"dask": {"scheduler": "distributed", "address": ""}})
+            is None
         )
-        assert client is None
-        assert cluster is None
-
-    def test_kernel_owner_spins_local_cluster(self, monkeypatch):
-        """owner='kernel' (escape hatch) spins a kernel-local LocalCluster."""
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-        spun = {}
-
-        class _FakeCluster:
-            def __init__(self, **kwargs):
-                spun["kwargs"] = kwargs
-                self.scheduler_address = "tcp://local:1"
-                self.workers = {"w0": object()}
-
-        class _FakeClient:
-            def __init__(self, target):
-                spun["client_target"] = target
-
-        monkeypatch.setattr(dd, "LocalCluster", _FakeCluster)
-        monkeypatch.setattr(dd, "Client", _FakeClient)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        client, cluster = _configure_dask(
-            {
-                "dask": {
-                    "scheduler": "distributed",
-                    "address": "",
-                    "owner": "kernel",
-                }
-            }
-        )
-        assert isinstance(cluster, _FakeCluster)
-        assert isinstance(client, _FakeClient)
-        assert spun["client_target"] is cluster
-
-    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
-        """A LocalCluster spawn failure degrades to in-process, not a crash.
-
-        Uses owner='kernel' so the LocalCluster branch is actually reached.
-        """
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("no cluster for you")
-
-        monkeypatch.setattr(dd, "LocalCluster", _boom)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        client, cluster = _configure_dask(
-            {
-                "dask": {
-                    "scheduler": "distributed",
-                    "address": "",
-                    "owner": "kernel",
-                }
-            }
-        )
-        assert client is None
-        assert cluster is None
 
 
 class TestClusterAddressInjection:
@@ -722,7 +646,7 @@ class TestParentDeathPipe:
     """Fix 1: kernel self-terminates when the launcher process dies."""
 
     def test_deathwatch_install_noop_without_fd(self, monkeypatch):
-        from biopb_mcp.mcp import _deathwatch
+        from biopb._lifecycle import deathwatch as _deathwatch
 
         monkeypatch.delenv(_deathwatch.ENV_FD, raising=False)
         assert _deathwatch.install() is False
@@ -733,7 +657,7 @@ class TestParentDeathPipe:
         # close the write end (the launcher "dying"); the watcher thread should
         # hit EOF and call the group-kill. killpg is stubbed so we record the
         # call instead of killing the test process.
-        from biopb_mcp.mcp import _deathwatch
+        from biopb._lifecycle import deathwatch as _deathwatch
 
         r, w = os.pipe()
         monkeypatch.setenv(_deathwatch.ENV_FD, str(r))
@@ -1178,7 +1102,7 @@ class TestWinJobReal:
         return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 
     def test_close_job_kills_member(self):
-        from biopb_mcp.mcp import _winjob
+        from biopb._lifecycle import winjob as _winjob
 
         job = _winjob.create_kill_on_close_job()
         assert job is not None
@@ -1197,7 +1121,7 @@ class TestWinJobReal:
                 proc.kill()
 
     def test_terminate_job_kills_member_and_keeps_job_usable(self):
-        from biopb_mcp.mcp import _winjob
+        from biopb._lifecycle import winjob as _winjob
 
         job = _winjob.create_kill_on_close_job()
         assert job is not None
@@ -1222,7 +1146,7 @@ class TestWinJobReal:
         # with True exactly when the watched process exits (immune to pid reuse).
         import threading
 
-        from biopb_mcp.mcp import _winjob
+        from biopb._lifecycle import winjob as _winjob
 
         proc = self._sleeper()
         handle = _winjob.open_for_wait(proc.pid)

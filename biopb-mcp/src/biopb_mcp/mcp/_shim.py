@@ -50,15 +50,15 @@ import logging
 import os
 import signal
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
 
 import anyio
 from biopb import _config_sessions
+from biopb._lifecycle import winjob as _winjob
+from biopb._lifecycle.owned_child import OwnedChild, open_child_log
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -67,7 +67,6 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 
 from .. import _control_client
-from . import _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -158,23 +157,6 @@ def _prune_session_logs(keep):
             pass
 
 
-def _open_session_log(path):
-    """Open ``path`` for the session child's stdout/stderr (binary, append,
-    unbuffered — native Qt/GL/dask/gRPC writers emit arbitrary bytes, and the
-    child's fds are inherited by its kernel). On failure, falls back to the shim's
-    stderr buffer so the child still starts (its output then interleaves with the
-    shim's logging — harmless, stderr is not a protocol channel).
-    """
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        return open(path, "ab", buffering=0)
-    except OSError:
-        logger.warning(
-            "Could not open session log %s; routing child output to stderr", path
-        )
-        return getattr(sys.stderr, "buffer", sys.stderr)
-
-
 def _read_port_file(path):
     """The port the child published, or None if not yet written / unparseable.
 
@@ -242,13 +224,14 @@ def _await_listening(proc, port, timeout):
 
 
 def spawn_session(config, timeout=SESSION_START_TIMEOUT):
-    """Spawn a private http child this shim owns; return (proc, url, job, session_id).
+    """Spawn a private http child this shim owns; return (child, url, session_id).
 
-    See the module docstring for the ownership model. Inherits this shim's live
-    environment (the #98 fix), binds a dynamic port the child reports back, and
-    ties the child's lifetime to this shim (POSIX process group; Windows Job
-    Object). On any startup failure the child is reaped before the error
-    propagates, so a failed bring-up never leaks a process.
+    ``child`` is an :class:`OwnedChild`. See the module docstring for the
+    ownership model. Inherits this shim's live environment (the #98 fix), binds a
+    dynamic port the child reports back, and ties the child's lifetime to this
+    shim (POSIX process group; Windows Job Object). On any startup failure the
+    child is reaped before the error propagates, so a failed bring-up never leaks
+    a process.
 
     Raises TimeoutError / RuntimeError if the child never becomes reachable.
     """
@@ -259,8 +242,7 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     # new one (it is newest, so it survives).
     session_id = _new_session_id()
     log_path = _session_log_path(config, session_id)
-    log = _open_session_log(log_path)
-    logged_to_file = log is not getattr(sys.stderr, "buffer", sys.stderr)
+    log, logged_to_file = open_child_log(log_path)
     if logged_to_file and not get_setting(config, "transport.kernel_log"):
         _prune_session_logs(get_setting(config, "transport.session_log_keep", 5))
 
@@ -277,49 +259,23 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     if logged_to_file:
         env[ENV_SESSION_LOG] = log_path
 
-    popen_kwargs = {}
-    if os.name == "nt":
-        # CREATE_NO_WINDOW, NOT DETACHED_PROCESS / CREATE_NEW_PROCESS_GROUP:
-        # keep this shim from pinning a console while giving the child a hidden
-        # console the kernel inherits silently (DETACHED_PROCESS would force a
-        # fresh *visible* console when the child later spawns the console-
-        # subsystem Jupyter kernel — an empty window popping on the desktop). The
-        # child is reaped via the Job Object below, not group signals, so it
-        # needs no new process group.
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    # POSIX: intentionally NO start_new_session — the child shares this shim's
-    # process group, so the MCP client's process-group teardown takes it (and
-    # its kernel, via the kernel's parent-death pipe) down with the shim.
-
+    # OwnedChild applies the owned-child spawn conventions and the Windows Job
+    # Object bind (CREATE_NO_WINDOW, no new process group; POSIX shares this
+    # shim's group so the client's teardown reaps it — and its kernel, via the
+    # kernel's parent-death pipe). See biopb._lifecycle.owned_child.
     logger.info("Spawning owned biopb-mcp session: %s", cmd)
+    child = OwnedChild(cmd, log=log, env=env)
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            close_fds=True,
-            env=env,
-            **popen_kwargs,
-        )
+        child.spawn()
     finally:
-        if log is not getattr(sys.stderr, "buffer", sys.stderr):
+        if logged_to_file:
             log.close()  # the child holds its own duplicate of the fd
 
-    # Windows: hold a kill-on-close Job Object containing the child, so a
-    # force-killed shim reaps the child (and, via the child's own nested kernel
-    # job, the kernel) — the #403 fix, now shim-owned. POSIX ties via the
-    # process group above.
-    job = None
-    if os.name == "nt":
-        job = _winjob.create_kill_on_close_job()
-        _winjob.assign_process(job, proc.pid)
-
     try:
-        port = _await_port(proc, port_file, timeout)
-        _await_listening(proc, port, timeout)
+        port = _await_port(child.proc, port_file, timeout)
+        _await_listening(child.proc, port, timeout)
     except BaseException:
-        _reap_session(proc, job)
+        child.stop()
         raise
     finally:
         try:
@@ -337,23 +293,22 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     # register()'s own unsafe-id ValueError, must not escape and break the session
     # either (biopb/biopb#422).
     try:
-        _config_sessions.register(session_id, port=port, pid=proc.pid, mcp_url=url)
+        _config_sessions.register(session_id, port=port, pid=child.pid, mcp_url=url)
     except Exception as e:
         logger.warning("Could not register session %s: %s", session_id, e)
 
-    return proc, url, job, session_id
+    return child, url, session_id
 
 
-def _reap_session(proc, job, session_id=None):
+def _reap_session(child, session_id=None):
     """Tear down the owned child (and its kernel grandchild).
 
     The bridge-close / signal counterpart to the OS-level ties set at spawn.
-    POSIX: SIGTERM the child so its own handler reaps the kernel *gracefully*
-    (dask/spill cleanup), then escalate to SIGKILL; the kernel is in its own
-    session watching the child's parent-death pipe, so even an abrupt child
-    death still reaps it. Windows: TerminateJobObject force-reaps the whole tree
-    (no catchable signal there), then the handle is released. Idempotent and
-    best-effort — safe to call more than once and on an already-dead child.
+    Delegates the platform reap escalation to :meth:`OwnedChild.stop` (POSIX:
+    SIGTERM so the child's handler reaps the kernel gracefully, then SIGKILL;
+    Windows: TerminateJobObject force-reaps the whole tree, then releases the
+    handle). Idempotent and best-effort — safe to call more than once and on an
+    already-dead child.
 
     ``session_id`` (when this reaps a registered session) is dropped from the
     filesystem registry here so teardown and de-registration are one path — a
@@ -363,50 +318,10 @@ def _reap_session(proc, job, session_id=None):
     """
     if session_id is not None:
         _config_sessions.unregister(session_id)
-
-    if proc.poll() is not None:
-        if job is not None:
-            _winjob.close_job(job)  # release the handle for an already-gone child
-        return
-
-    if os.name == "nt":
-        # terminate_job force-reaps the whole tree when the child was assigned;
-        # proc.kill() (TerminateProcess) is the backstop for when the Job Object
-        # is unavailable (winjob is best-effort — a ctypes/OS hiccup returns
-        # None) or the assign failed, so the child is still reaped directly, and
-        # its own kill-on-close kernel job then reaps the kernel.
-        _winjob.terminate_job(job)
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=REAP_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            pass
-        _winjob.close_job(job)
-        return
-
-    try:
-        proc.terminate()  # SIGTERM -> the child's handler reaps its kernel
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=REAP_TIMEOUT)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        proc.kill()  # SIGKILL -> kernel self-reaps off its parent-death pipe
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=REAP_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        pass
+    child.stop(timeout=REAP_TIMEOUT)
 
 
-def _install_shim_reaper(proc, job, session_id=None):
+def _install_shim_reaper(child, session_id=None):
     """POSIX: reap the child if this shim is signalled to exit.
 
     A SIGTERM/SIGHUP delivered to the shim *alone* (not its whole group) would
@@ -425,7 +340,7 @@ def _install_shim_reaper(proc, job, session_id=None):
         return
 
     def _on_signal(signum, frame):
-        _reap_session(proc, job, session_id)
+        _reap_session(child, session_id)
         os._exit(0)
 
     for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
@@ -488,7 +403,7 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _install_client_death_watchdog(proc, job, session_id=None):
+def _install_client_death_watchdog(child, session_id=None):
     """Windows: reap the owned child if the stdio *client* dies unseen by stdin.
 
     Normal teardown runs when ``run_bridge`` returns on stdin EOF (client hung
@@ -525,7 +440,7 @@ def _install_client_death_watchdog(proc, job, session_id=None):
         return None
     thread = threading.Thread(
         target=_client_deathwatch,
-        args=(handle, client.pid, proc, job, session_id),
+        args=(handle, client.pid, child, session_id),
         name="biopb-client-deathwatch",
         daemon=True,
     )
@@ -534,7 +449,7 @@ def _install_client_death_watchdog(proc, job, session_id=None):
     return thread
 
 
-def _client_deathwatch(handle, client_pid, proc, job, session_id):
+def _client_deathwatch(handle, client_pid, child, session_id):
     """Block on the client's ``handle``; on its exit, reap the tree and exit.
 
     A wait error is treated as *undecided* — we do not reap, since a spurious
@@ -546,7 +461,7 @@ def _client_deathwatch(handle, client_pid, proc, job, session_id):
     logger.info(
         "stdio client (pid %s) exited; reaping owned session %s", client_pid, session_id
     )
-    _reap_session(proc, job, session_id)
+    _reap_session(child, session_id)
     os._exit(0)
 
 
@@ -721,11 +636,11 @@ def serve(config, port=None):
         _control_client.start_control_detached()
     except Exception:  # noqa: BLE001 - best-effort; the child surfaces real errors
         logger.info("control auto-start attempt failed", exc_info=True)
-    proc, url, job, session_id = spawn_session(config)
-    _install_shim_reaper(proc, job, session_id)
-    _install_client_death_watchdog(proc, job, session_id)
-    logger.info("Bridging stdio to %s (owned session pid %s)", url, proc.pid)
+    child, url, session_id = spawn_session(config)
+    _install_shim_reaper(child, session_id)
+    _install_client_death_watchdog(child, session_id)
+    logger.info("Bridging stdio to %s (owned session pid %s)", url, child.pid)
     try:
         run_bridge(url)
     finally:
-        _reap_session(proc, job, session_id)
+        _reap_session(child, session_id)

@@ -22,6 +22,7 @@ import time
 import anyio
 import pytest
 from biopb import _config_sessions
+from biopb._lifecycle.owned_child import OwnedChild
 from mcp import types
 
 from biopb_mcp.mcp import _shim
@@ -115,25 +116,6 @@ class TestReadPortFile:
         assert _shim._read_port_file(str(p)) is None
 
 
-class TestOpenSessionLog:
-    def test_writes_to_path_creating_parent(self, tmp_path):
-        path = tmp_path / "sub" / "sess.log"  # parent does not exist yet
-        f = _shim._open_session_log(str(path))
-        try:
-            f.write(b"hello\n")
-        finally:
-            f.close()
-        assert path.read_bytes() == b"hello\n"
-
-    def test_falls_back_to_stderr_when_unopenable(self, tmp_path):
-        # Parent path is a FILE, so mkdir(parents=True) fails regardless of
-        # privilege (works even when tests run as root).
-        blocker = tmp_path / "afile"
-        blocker.write_text("x")
-        f = _shim._open_session_log(str(blocker / "sub" / "x.log"))
-        assert f is getattr(sys.stderr, "buffer", sys.stderr)
-
-
 class TestSessionLogPath:
     def test_default_is_per_session_under_sessions_dir(self, tmp_path, monkeypatch):
         import biopb_mcp._config as cfg
@@ -179,25 +161,25 @@ class TestSpawnSession:
             _shim, "_session_command", lambda: [sys.executable, "-c", _FAKE_CHILD]
         )
         cfg = _cfg(kernel_log=str(tmp_path / "d.log"))
-        proc, url, job, session_id = _shim.spawn_session(cfg, timeout=15)
+        child, url, session_id = _shim.spawn_session(cfg, timeout=15)
         try:
             m = re.match(r"http://127\.0\.0\.1:(\d+)/mcp$", url)
             assert m, url
             port = int(m.group(1))
             assert _shim._port_listening(port) is True
-            assert proc.poll() is None  # still running while we bridge
+            assert child.poll() is None  # still running while we bridge
             if os.name == "nt":
-                assert job is not None  # Windows: a kill-on-close Job Object
+                assert child.job is not None  # Windows: a kill-on-close Job Object
             else:
-                assert job is None  # POSIX: reaped via the process group, not a job
+                assert child.job is None  # POSIX: reaped via the group, not a job
             # Self-registered so the control can discover + proxy to it.
             rec = _config_sessions.read_session(session_id)
             assert rec is not None
-            assert rec["port"] == port and rec["pid"] == proc.pid
+            assert rec["port"] == port and rec["pid"] == child.pid
             assert rec["mcp_url"] == url
         finally:
-            _shim._reap_session(proc, job, session_id)
-        assert proc.poll() is not None  # reaped on the way out
+            _shim._reap_session(child, session_id)
+        assert child.poll() is not None  # reaped on the way out
         # Reap de-registers, so the record is gone.
         assert _config_sessions.read_session(session_id) is None
 
@@ -222,10 +204,12 @@ class TestSpawnSession:
                 f.write("54321")
             return _FakeProc()
 
-        monkeypatch.setattr(_shim.subprocess, "Popen", _fake_popen)
+        from biopb._lifecycle import owned_child
+
+        monkeypatch.setattr(owned_child.subprocess, "Popen", _fake_popen)
         monkeypatch.setattr(_shim, "_await_listening", lambda *a, **k: None)
 
-        proc, url, job, session_id = _shim.spawn_session(
+        child, url, session_id = _shim.spawn_session(
             _cfg(kernel_log=str(tmp_path / "d.log")), timeout=5
         )
         assert url == "http://127.0.0.1:54321/mcp"
@@ -250,15 +234,16 @@ class TestReapSession:
     def test_reaps_running_child(self):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         assert proc.poll() is None
-        _shim._reap_session(proc, None)
+        _shim._reap_session(OwnedChild.adopt(proc))
         assert proc.poll() is not None
 
     def test_idempotent_on_dead_child(self):
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
         # Both calls must be no-op-safe on an already-dead child.
-        _shim._reap_session(proc, None)
-        _shim._reap_session(proc, None)
+        child = OwnedChild.adopt(proc)
+        _shim._reap_session(child)
+        _shim._reap_session(child)
         assert proc.poll() is not None
 
 
@@ -339,12 +324,12 @@ class TestClientDeathWatchdog:
     def test_installer_is_noop_off_windows(self):
         if os.name == "nt":
             pytest.skip("Windows arms a real watchdog thread")
-        assert _shim._install_client_death_watchdog(object(), None, "sid") is None
+        assert _shim._install_client_death_watchdog(object(), "sid") is None
 
     def test_not_armed_when_client_unidentifiable(self, monkeypatch):
         monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: None)
-        assert _shim._install_client_death_watchdog(object(), None, "sid") is None
+        assert _shim._install_client_death_watchdog(object(), "sid") is None
 
     def test_not_armed_when_client_handle_unopenable(self, monkeypatch):
         # A client we found but cannot open (returns None) must not arm --
@@ -352,7 +337,7 @@ class TestClientDeathWatchdog:
         monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
         monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: None)
-        assert _shim._install_client_death_watchdog(object(), None, "sid") is None
+        assert _shim._install_client_death_watchdog(object(), "sid") is None
 
     def test_arms_thread_when_client_found_and_openable(self, monkeypatch):
         import threading
@@ -361,7 +346,7 @@ class TestClientDeathWatchdog:
         monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
         monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: "HANDLE")
         monkeypatch.setattr(_shim, "_client_deathwatch", lambda *a, **k: None)
-        t = _shim._install_client_death_watchdog(object(), None, "sid")
+        t = _shim._install_client_death_watchdog(object(), "sid")
         assert isinstance(t, threading.Thread)
         t.join(timeout=5)
 
@@ -369,12 +354,12 @@ class TestClientDeathWatchdog:
         events = []
         monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: True)
         monkeypatch.setattr(
-            _shim, "_reap_session", lambda p, j, s=None: events.append(("reap", s))
+            _shim, "_reap_session", lambda c, s=None: events.append(("reap", s))
         )
         monkeypatch.setattr(
             _shim.os, "_exit", lambda code: events.append(("exit", code))
         )
-        _shim._client_deathwatch("HANDLE", 4242, object(), None, "sid")
+        _shim._client_deathwatch("HANDLE", 4242, object(), "sid")
         # The client's exit must both reap (de-registering the session) and exit.
         assert events == [("reap", "sid"), ("exit", 0)]
 
@@ -387,7 +372,7 @@ class TestClientDeathWatchdog:
             _shim, "_reap_session", lambda *a, **k: events.append("reap")
         )
         monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append("exit"))
-        _shim._client_deathwatch("HANDLE", 4242, object(), None, "sid")
+        _shim._client_deathwatch("HANDLE", 4242, object(), "sid")
         assert events == []
 
 
@@ -647,7 +632,7 @@ class TestServe:
 
         def _fake_spawn(config, *a, **k):
             calls.append("spawn")
-            return _FakeProc(), "http://127.0.0.1:1/mcp", None, "sid"
+            return _FakeProc(), "http://127.0.0.1:1/mcp", "sid"
 
         monkeypatch.setattr(_shim, "spawn_session", _fake_spawn)
         monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
@@ -674,7 +659,7 @@ class TestServe:
         monkeypatch.setattr(
             _shim,
             "spawn_session",
-            lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", None, "sid"),
+            lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", "sid"),
         )
         monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
         monkeypatch.setattr(

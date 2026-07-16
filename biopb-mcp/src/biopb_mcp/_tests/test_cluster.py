@@ -1,4 +1,4 @@
-"""Unit tests for DaskClusterHost (the daemon-owned dask cluster).
+"""Unit tests for DaskClusterHost (the session-child-owned dask cluster).
 
 No real cluster is spun: dask.distributed.LocalCluster is monkeypatched with a
 fake so these run fast and headless.
@@ -36,7 +36,7 @@ class _FakeCluster:
 
 
 def _cfg(**over):
-    dask = {"scheduler": "distributed", "address": "", "owner": "daemon"}
+    dask = {"scheduler": "distributed", "address": ""}
     dask.update(over)
     return {"dask": dask}
 
@@ -58,11 +58,6 @@ def fake_local_cluster(monkeypatch):
 
 
 class TestShouldOwn:
-    def test_none_when_owner_kernel(self, fake_local_cluster):
-        host = DaskClusterHost(_cfg(owner="kernel"))
-        assert host.ensure() is None
-        assert fake_local_cluster == []  # never spun
-
     def test_none_when_not_distributed(self, fake_local_cluster):
         host = DaskClusterHost(_cfg(scheduler="threads"))
         assert host.ensure() is None
@@ -70,7 +65,7 @@ class TestShouldOwn:
 
     def test_none_when_external_address(self, fake_local_cluster):
         # An external scheduler is configured -> the kernel attaches to it
-        # directly; the daemon owns nothing.
+        # directly; the session child owns nothing.
         host = DaskClusterHost(_cfg(address="tcp://1.2.3.4:8786"))
         assert host.ensure() is None
         assert fake_local_cluster == []

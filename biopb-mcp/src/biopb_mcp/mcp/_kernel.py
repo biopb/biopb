@@ -18,7 +18,7 @@ import threading
 import time
 from typing import List, Optional
 
-from . import _deathwatch, _winjob
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -62,24 +62,19 @@ _TENSOR_URL_ENV = "BIOPB_TENSOR_URL"
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines=import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
 # Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no
-# standalone caller).  ``_dask_client`` / ``_dask_cluster`` are set by the
-# bootstrap (both None for the in-process scheduler; for an auto-spun
-# LocalCluster the cluster is closed after the client so workers don't orphan).
+# standalone caller).  ``_dask_client`` is set by the bootstrap (None for the
+# in-process scheduler; a real Client when attached to the session child's
+# distributed cluster). The kernel never owns the cluster, so closing the
+# client is all there is to release here.
 _DASK_RELEASE_SNIPPET = (
     "try:\n"
     "    _dc = globals().get('_dask_client')\n"
     "    if _dc is not None:\n"
     "        _dc.close()\n"
-    "except Exception:\n"
-    "    pass\n"
-    "try:\n"
-    "    _dk = globals().get('_dask_cluster')\n"
-    "    if _dk is not None:\n"
-    "        _dk.close()\n"
     "except Exception:\n"
     "    pass\n"
 )
@@ -237,10 +232,11 @@ class KernelHost:
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
 
-        # Daemon-owned dask cluster (or None). _launch calls ensure() and injects
-        # the scheduler address so the kernel attaches to it instead of spinning
-        # its own; the daemon owns its lifetime, so a kernel restart/reap here
-        # leaves the cluster (and its warm workers) untouched. See _cluster.py.
+        # Session-child-owned dask cluster (or None). _launch calls ensure() and
+        # injects the scheduler address so the kernel attaches to it instead of
+        # spinning its own; the session child owns its lifetime, so a kernel
+        # restart/reap here leaves the cluster (and its warm workers) untouched.
+        # See _cluster.py.
         self._cluster_host = cluster_host
 
     # -- lifecycle ------------------------------------------------------
@@ -322,11 +318,11 @@ class KernelHost:
             if self._tensor_url:
                 env[_TENSOR_URL_ENV] = self._tensor_url
 
-        # Attach this kernel to the daemon-owned dask cluster. ensure() spins it
-        # on the first launch (returning as soon as the scheduler is bound, so
-        # workers register while the kernel imports napari) and returns the cached
-        # address on later launches. None -> the daemon owns no cluster (owner
-        # "kernel", a non-distributed scheduler, an external address, or a spin
+        # Attach this kernel to the session-child-owned dask cluster. ensure()
+        # spins it on the first launch (returning as soon as the scheduler is
+        # bound, so workers register while the kernel imports napari) and returns
+        # the cached address on later launches. None -> the session child owns no
+        # cluster (a non-distributed scheduler, an external address, or a spin
         # failure); the kernel then resolves dask from its own config.
         if self._cluster_host is not None:
             from ._cluster import DASK_ADDRESS_ENV
@@ -390,10 +386,9 @@ class KernelHost:
                     cwd=self._cwd,
                     # Own session/process group so a hard restart — or the
                     # kernel's own parent-death watcher — can group-kill the
-                    # kernel and any subprocess it spawned (arbitrary agent code;
-                    # and, under the `owner="kernel"` escape hatch, a kernel-local
-                    # dask cluster). The daemon-owned cluster lives in the
-                    # *daemon's* group, so this group-kill never touches it.
+                    # kernel and any subprocess it spawned (arbitrary agent
+                    # code). The session child owns the dask cluster in *its*
+                    # group, so this group-kill never touches it.
                     start_new_session=True,
                     **popen_kwargs,
                 )

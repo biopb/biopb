@@ -25,14 +25,14 @@ DASK_ADDRESS_ENV = "BIOPB_DASK_ADDRESS"
 
 
 class DaskClusterHost:
-    """Own a distributed ``LocalCluster`` on behalf of the MCP daemon.
+    """Own a distributed ``LocalCluster`` on behalf of the session child.
 
     Lazily spins the cluster on the first :meth:`ensure` (i.e. the first kernel
     launch) and keeps it warm across kernel restarts.  :meth:`ensure` returns the
-    scheduler address to inject into the kernel, or ``None`` when the daemon
-    should not own a cluster (``owner != "daemon"``, a non-distributed scheduler,
-    an external ``dask.address``, or a spin failure) — the kernel then falls
-    back per its own config (see ``_bootstrap._configure_dask``).
+    scheduler address to inject into the kernel, or ``None`` when the session
+    child should not own a cluster (a non-distributed scheduler, an external
+    ``dask.address``, or a spin failure) — the kernel then falls back per its
+    own config (see ``_bootstrap._configure_dask``).
     """
 
     def __init__(self, config, local_dir=None):
@@ -50,20 +50,17 @@ class DaskClusterHost:
         self._lock = threading.Lock()
 
     def _should_own(self):
-        """Whether the daemon should spin/own a cluster, per config.
+        """Whether the session child should spin/own a cluster, per config.
 
-        Only when it is explicitly the daemon's job, the scheduler is
-        distributed, and no external scheduler was configured (the kernel
-        attaches to an external ``dask.address`` directly, daemon owns
-        nothing).
+        Only when the scheduler is distributed and no external scheduler was
+        configured (with an external ``dask.address`` the kernel attaches to it
+        directly and the session child owns nothing).
         """
         from .._config import get_setting
 
-        return (
-            get_setting(self._config, "dask.owner") == "daemon"
-            and get_setting(self._config, "dask.scheduler") == "distributed"
-            and not get_setting(self._config, "dask.address")
-        )
+        return get_setting(
+            self._config, "dask.scheduler"
+        ) == "distributed" and not get_setting(self._config, "dask.address")
 
     def ensure(self):
         """Return the scheduler address, spinning the cluster on first use.
@@ -92,8 +89,8 @@ class DaskClusterHost:
         try:
             from dask.distributed import LocalCluster
         except Exception:
-            # No distributed install: the kernel degrades to threads (owner
-            # "daemon" + no injected address -> threads, per _configure_dask).
+            # No distributed install: the kernel degrades to threads (no
+            # injected address -> threads, per _configure_dask).
             logger.exception("distributed unavailable; kernel will degrade to threads")
             return None
         try:
