@@ -632,10 +632,11 @@ _start_control_plane() {
         return 0
     fi
 
-    # Retire a prior control plane (+ the data plane it owns) so the new control
-    # plane can bind a fresh plane it owns. Best-effort; a no-op on a clean machine.
-    # (The standalone `biopb server` daemon was retired; if a pre-retirement one is
-    # somehow still holding the gRPC port, control-start below names it and stops.)
+    # Belt-and-suspenders: the real upgrade stop already ran before uv tool
+    # install (above), so this is a no-op on a clean upgrade path. Kept for the
+    # first-install case where a pre-existing plane was started out-of-band and
+    # the pre-install stop missed it, and the "standalone biopb server" legacy
+    # case noted below. Best-effort.
     biopb control stop >/dev/null 2>&1 || true
 
     # Start the control plane; it brings up the data plane by default. Don't
@@ -1150,6 +1151,16 @@ install_biopb() {
     # No MCP server to stop before the new wheels land: each AI client's stdio
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so
     # the next agent reconnect already brings up the just-installed code.
+    #
+    # Stop the control plane (and the data plane it owns) BEFORE swapping the
+    # binary. The old binary reads control.pid from the old path it was written
+    # to; stopping before uv tool install means reader+writer agree on the
+    # location, and the new binary's control start binds clean ports. Best-effort;
+    # a no-op on a first install (no biopb on PATH).
+    if command -v biopb >/dev/null 2>&1; then
+        _info "Stopping any running biopb control plane before upgrade..."
+        biopb control stop >/dev/null 2>&1 || true
+    fi
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
