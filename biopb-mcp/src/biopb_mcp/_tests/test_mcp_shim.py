@@ -6,7 +6,7 @@ faithful initialize replay (the `instructions` field above all — losing it is
 the defect that disqualified delegating to mcp-proxy), and the request
 forwarding of the vendored proxy. One end-to-end test runs the real thing:
 ``biopb-mcp --transport stdio`` as a subprocess, which must spawn its own http
-session child, bridge a full JSON-RPC session, and — de-daemonization Layer 1 —
+session child, bridge a full JSON-RPC session, and — the shim-owned session model —
 **reap** that child when the client hangs up (the shared daemon used to survive).
 """
 

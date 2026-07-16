@@ -3,7 +3,7 @@
 The registry (:mod:`biopb._config_sessions`) is the seam between the biopb-mcp
 shim (writer) and the control plane (reader) — neither imports the other, so its
 on-disk contract is pinned here in the core ``biopb`` package. See
-``biopb-mcp/docs/mcp-dedaemonization-migration.md`` §6.1.
+``biopb-mcp/ARCHITECTURE.md``
 """
 
 import json

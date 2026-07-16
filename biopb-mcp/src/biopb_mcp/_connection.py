@@ -647,10 +647,10 @@ class TensorConnection:
         answers do we fall back to the config/env URL and a direct connect — the
         standalone / pre-control case.
 
-        ``_connection`` is a **pure client** since Layer 2 of the
-        de-daemonization migration (docs/mcp-dedaemonization-migration.md §5): it
+        ``_connection`` is a **pure client** since the de-daemonization
+        (ARCHITECTURE.md, Lifecycle): it
         never spawns a server itself, so the dependent no longer starts its
-        dependency (the §1.1 bootstrap loop). The control is the durable root that
+        dependency (the bootstrap loop). The control is the durable root that
         owns the data plane; here we only *ask* it to ensure the plane. If no
         control is running, we record an actionable "start the control" status and
         return — best-effort, no exception out.
@@ -700,7 +700,7 @@ class TensorConnection:
 
         # No control answered -> standalone / pre-control fallback: connect to the
         # config/env URL (or the last endpoint we used) directly. We never spawn a
-        # server ourselves (the §1.1 bootstrap loop this migration removes), and
+        # server ourselves (the bootstrap loop the control-plane model removes), and
         # there is no control to defer to, so an unreachable URL is a terminal,
         # actionable error rather than something to wait on.
         url = self.url

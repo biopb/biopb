@@ -3,7 +3,7 @@
 :mod:`biopb._web_auth` is the single source of the token / same-origin / loopback
 decisions used by the control, the tensor sidecar, and observe (none can import
 another). The predicates take a case-insensitive header getter; these tests drive
-them with a plain dict getter. See ``mcp-dedaemonization-migration.md`` §6.1.
+them with a plain dict getter. See ``biopb-mcp/ARCHITECTURE.md``
 """
 
 from biopb import _web_auth as wa

@@ -1,7 +1,7 @@
 """Client for the biopb control (control plane) control API — stdlib only.
 
-Since Layer 2 of the de-daemonization migration
-(docs/mcp-dedaemonization-migration.md), ``_connection`` is a *pure client*: it
+Since the de-daemonization (ARCHITECTURE.md, Lifecycle), ``_connection`` is a
+*pure client*: it
 never shells out ``biopb server start`` to bring the data plane up. When the
 plane is down it asks the control to ensure it, via this thin urllib client. The
 control is the durable root that owns the data plane; ``_connection`` only uses it.

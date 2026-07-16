@@ -1,7 +1,7 @@
 """The control plane's single web origin — a Starlette/uvicorn ASGI app on 8813.
 
-This is the Layer-3 front of the de-daemonization migration
-(``biopb-mcp/docs/mcp-dedaemonization-migration.md``, §6.1). It replaces the
+This is the single-origin web front of the control plane
+(``biopb-mcp/ARCHITECTURE.md``). It replaces the
 earlier stdlib ``ThreadingHTTPServer`` control API with a real ASGI app **on the
 same port**, and routes by namespace so no two upstreams share a path prefix:
 
@@ -57,12 +57,12 @@ never imports — the proxy reaches it over loopback like any other client.
   to the loopback target (satisfying the child's own loopback Host guard) and the
   absent ``Origin`` passes its Origin guard — so the trusted control→child hop is
   accepted regardless of which external hostname the browser used to reach the
-  control. (Rebinding/token protection for the origin as a whole is a §6.1
+  control. (Rebinding/token protection for the origin as a whole is a
   follow-up, same as the data-plane proxy's.)
 
 This module lands the namespaced origin, the data-plane API proxy, per-session
-observe routing, and the control-served SPA bundle — the full Layer-3
-single-origin front.
+observe routing, and the control-served SPA bundle — the full single-origin
+front.
 """
 
 from __future__ import annotations
@@ -206,7 +206,7 @@ def _is_session_api_path(path: str) -> bool:
 
 
 class _ControlAuthMiddleware:
-    """Gate the control's web API at the single origin (§6.1) — both the
+    """Gate the control's web API at the single origin — both the
     control's **own** ``/api/*`` and each session's proxied ``/session/<id>/api/*``.
 
     A pure-ASGI middleware (not ``BaseHTTPMiddleware``) so it touches only the
@@ -620,7 +620,8 @@ def build_app(
     def api_algorithms(_request: Request) -> JSONResponse:
         # The configured algorithm-plane servers (biopb.image ProcessImage
         # servicers listed in the biopb-mcp config) with a live health + ops
-        # probe. Read-only inspection — no lifecycle control (that is Layer 4).
+        # probe. Read-only inspection — no lifecycle control (the pending
+        # algorithm plane).
         # Sync: statuses() reads a config file and makes blocking gRPC calls (run
         # concurrently, bounded by one probe timeout), so Starlette runs it in the
         # threadpool. Polled on demand (a dashboard button), not on the interval,
@@ -833,7 +834,7 @@ def build_app(
         # 404 (and the dead record is pruned by resolve()).
         session_id = request.path_params["session_id"]
         sub_path = request.path_params["path"]
-        # Allowlist the session data API only (§6.1) — the observe page itself is
+        # Allowlist the session data API only — the observe page itself is
         # the control-served SPA shell (session_observe below), so only /api/*
         # proxies here. The child's /mcp agent transport is deliberately off this
         # origin — agents reach it directly on the child's own loopback port
@@ -1050,8 +1051,8 @@ def serve_control_api(
     if data_web_url is None:
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
-    # The data-plane token gates the control's own /api/* too (single origin,
-    # §6.1). None in local mode -> the gate falls back to a loopback Host check
+    # The data-plane token gates the control's own /api/* too (single
+    # origin). None in local mode -> the gate falls back to a loopback Host check
     # instead.
     app = build_app(
         supervisor,

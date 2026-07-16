@@ -974,7 +974,7 @@ class TestServerStartTimeout:
 class TestAutoConnect:
     """The shared connect policy used by both the kernel and the widget.
 
-    Since Layer 2 of the de-daemonization migration, ``_connection`` is a pure
+    Since the de-daemonization, ``_connection`` is a pure
     client: it asks the control plane **first** to ensure the data plane (single
     source of truth, #413) and never spawns a server itself; only when no control
     answers does it fall back to the config/env URL. Both callers drive this off

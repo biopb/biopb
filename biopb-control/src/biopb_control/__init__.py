@@ -1,7 +1,7 @@
 """biopb-control: the biopb control plane (supervision + single-origin front).
 
 Lean by construction — supervises the durable planes as subprocesses and never
-imports them (invariant I2, mcp-dedaemonization-migration.md). Public surface:
+imports them (invariant I2, biopb-mcp/ARCHITECTURE.md). Public surface:
 :func:`run_control` (the blocking entry) and :class:`DataPlaneSupervisor`.
 """
 

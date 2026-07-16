@@ -14,8 +14,8 @@ share — the endpoint — lives here in the dependency-light core ``biopb`` SDK
 next to ``_config_location`` / ``_config_constraints``. Kept stdlib-only so
 importing it never drags in the heavy server/mcp stacks.
 
-This is the anchor of the Layer-3 single-origin web front (see
-``biopb-mcp/docs/mcp-dedaemonization-migration.md`` §6.1): the control serves a
+This is the anchor of the single-origin web front (see
+``biopb-mcp/ARCHITECTURE.md``): the control serves a
 Starlette/uvicorn app on this port that serves the built ``web/`` SPA bundle at
 its root (dashboard ``/``, dataviewer ``/viewer``, per-session observe
 ``/session/<id>/observe`` — all React routes of one SPA), answers its own control

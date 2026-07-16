@@ -3,7 +3,7 @@
 Both harden ``biopb control start`` for the world where several processes (the
 launcher, the installer, and -- once the shim starts the control on demand --
 racing agent sessions) can invoke it at once. See
-``biopb-mcp/docs/mcp-dedaemonization-migration.md`` and ``biopb._filelock``.
+``biopb-mcp/ARCHITECTURE.md`` and ``biopb._filelock``.
 """
 
 import time
