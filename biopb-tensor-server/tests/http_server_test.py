@@ -842,14 +842,14 @@ class TestWindowsShutdownListener:
     """The graceful-stop listener the control supervisor drives on Windows."""
 
     def test_sentinel_path_matches_stop_side_contract(self):
-        from pathlib import Path
-
+        from biopb import _config_location
         from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
-        # Must match DataPlaneSupervisor._win_stop_sentinel (the control writes it).
-        # Fixed name (not pid-keyed) so stop and the daemon always agree.
-        expected = Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
-        assert shutdown_sentinel_path() == expected
+        # Both this watcher and DataPlaneSupervisor._win_stop_sentinel (the control
+        # writes it) bind to the one shared definition, so they cannot drift. Fixed
+        # name (not pid-keyed) under the biopb state dir so stop and the daemon agree.
+        assert shutdown_sentinel_path() == _config_location.tensor_stop_sentinel()
+        assert shutdown_sentinel_path().name == "tensor-server.stop"
 
     def test_noop_off_windows(self):
         from biopb_tensor_server.serving.http_server import (

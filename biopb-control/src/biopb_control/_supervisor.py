@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from biopb import _config_location
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,12 @@ class DataPlaneSupervisor:
         child and its native libraries (gRPC, Arrow) emit arbitrary bytes. Falls
         back to the control's own stderr if the file can't be opened, so a bad log
         path never blocks the plane from starting.
+
+        Rotated once here, before the first open of this supervisor's lifetime, so
+        the plane's stdout log (which has no in-process RotatingFileHandler) does
+        not grow unbounded across control restarts — mirroring what ``control
+        start`` does for ``control.log``. Rotating here (not per child respawn)
+        keeps the appended fd stable while the control lives.
         """
         if self._log_fh is not None:
             return self._log_fh
@@ -185,6 +192,7 @@ class DataPlaneSupervisor:
             return self._log_fh
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+            _config_location.rotate_log(Path(path))
             self._log_fh = open(path, "ab", buffering=0)
         except OSError:
             logger.warning("Cannot open data-plane log %s; using stderr", path)
@@ -510,10 +518,11 @@ class DataPlaneSupervisor:
 
     @staticmethod
     def _win_stop_sentinel() -> Path:
-        # Must match _win_shutdown_sentinel() in biopb.cli /
-        # http_server.shutdown_sentinel_path(): a single fixed name under the
-        # biopb data dir, not keyed by PID.
-        return Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
+        # The one definition the tensor server's shutdown listener also binds to
+        # (biopb._config_location.tensor_stop_sentinel), so writer and watcher
+        # cannot disagree — a single fixed name under the biopb state dir, not
+        # keyed by PID.
+        return _config_location.tensor_stop_sentinel()
 
     def _close_log(self) -> None:
         fh = self._log_fh

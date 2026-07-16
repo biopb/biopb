@@ -61,10 +61,13 @@ def marker_path() -> Path:
 
     The biopb *umbrella* config dir (``~/.config/biopb``), NOT
     ``~/.config/biopb-mcp`` — the marker is a whole-deployment fact written by
-    ``install/install.sh`` / ``install/biopb-engine.ps1``. Keep this in sync with
-    them.
+    ``install/install.sh`` / ``install/biopb-engine.ps1``. Resolved via the shared
+    ``biopb._config_location.config_dir`` so it honors ``$XDG_CONFIG_HOME`` exactly
+    like the installer (keep the installer in sync).
     """
-    return Path.home() / ".config" / "biopb" / "release.version"
+    from biopb import _config_location
+
+    return _config_location.config_dir() / "release.version"
 
 
 def read_installed_version(path: Path | None = None) -> str | None:

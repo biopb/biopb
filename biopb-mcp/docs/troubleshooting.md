@@ -21,7 +21,8 @@ install the full [biopb](https://github.com/biopb/biopb) system, or point
 ### Startup failures
 
 When auto-start fails, the browser shows the underlying cause inline; the full
-server output is written to `~/.local/share/biopb/log/`. Common causes:
+server output is written to `~/.local/state/biopb/logs/` (the MCP session's own
+log is under `~/.local/state/biopb/mcp/`). Common causes:
 
 - **Port already in use** — most likely on a shared machine or HPC node where
   another user already holds the default port (gRPC `8815`). Either point at the

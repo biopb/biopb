@@ -148,7 +148,7 @@ viewers), by design. The child:
 Native http (`claude mcp add --transport http biopb http://127.0.0.1:8765/mcp`)
 skips the shim entirely and is preferred where the client supports it. The child's
 output goes to a **per-session** log (`transport.kernel_log` empty by default →
-`~/.local/share/biopb-mcp/log/sessions/<id>.log`; set it to force one shared file).
+`~/.local/state/biopb/mcp/sessions/<id>.log`; set it to force one shared file).
 
 ### On-demand kernel
 
@@ -410,7 +410,7 @@ and verbs never mix. Observe uses **SSE**, so the proxy is a streaming ASGI
 passthrough; explicit prefix `Mount`s (no root catch-all) keep the static
 `/`-fallback from swallowing `/session/<id>/*` or `/data_plane/*`.
 
-**Session registry.** Each session writes `~/.local/share/biopb/sessions/<id>.json`
+**Session registry.** Each session writes `~/.local/state/biopb/sessions/<id>.json`
 (host + port + pid + `/mcp` url) once reachable and removes it on reap; the control
 reads that dir. The contract is stdlib-only `biopb._config_sessions` (shim writes,
 control reads). `resolve()`/`list_sessions()` **self-heal** by pruning records

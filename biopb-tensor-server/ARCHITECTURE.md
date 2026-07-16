@@ -265,7 +265,7 @@ teardown (`DataPlaneSupervisor._terminate`). On Windows that child runs with
 exit — and Win32 named events proved brittle across sessions/elevation. So
 graceful shutdown is coordinated through a **sentinel file**: `run_http_server`
 calls `_install_windows_shutdown_listener(server)`, which starts a daemon thread
-that polls for `~/.local/share/biopb/tensor-server.stop`. When the supervisor
+that polls for `~/.local/state/biopb/tensor-server.stop`. When the supervisor
 writes that file, the thread sets `server.should_exit = True` *and*
 `server.force_exit = True` (so an open browser/keep-alive connection can't stall
 shutdown). uvicorn returns from `run()`, so `launch`'s `finally →

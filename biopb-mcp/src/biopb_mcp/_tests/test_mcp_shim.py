@@ -479,6 +479,10 @@ def _home_env(tmp_path):
         env["HOMEDRIVE"], env["HOMEPATH"] = drive, tail
     else:
         env["HOME"] = home
+    # The XDG base dirs override HOME in _config_location; drop any inherited
+    # values so the HOME-based defaults (state/config/data under tmp_path) apply.
+    for var in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        env.pop(var, None)
     return env
 
 
@@ -573,7 +577,7 @@ class TestEndToEnd:
             # [pid]") and its dynamic listen URL (_server.run) to its own
             # per-session logfile under log/sessions/ (NOT the shared
             # mcp-server.log — that separation is the session-log feature).
-            sessions_dir = tmp_path / ".local/share/biopb-mcp/log/sessions"
+            sessions_dir = tmp_path / ".local/state/biopb/mcp/sessions"
             session_logs = list(sessions_dir.glob("*.log"))
             assert len(session_logs) == 1, session_logs
             log = session_logs[0].read_bytes().decode(errors="replace")
@@ -586,7 +590,7 @@ class TestEndToEnd:
 
             # Self-registered for control discovery while up (the shared biopb
             # data tree, isolated here via HOME).
-            reg_dir = tmp_path / ".local/share/biopb/sessions"
+            reg_dir = tmp_path / ".local/state/biopb/sessions"
             records = list(reg_dir.glob("*.json"))
             assert len(records) == 1, records
             rec = json.loads(records[0].read_text())

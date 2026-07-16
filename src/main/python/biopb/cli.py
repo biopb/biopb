@@ -15,7 +15,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _web_auth
+from . import _agents, _config_location, _web_auth
 from ._config_location import DEFAULT_CONFIG_DIR, find_config
 from ._filelock import LockTimeout, file_lock
 from ._proc import (
@@ -78,9 +78,10 @@ server_app = typer.Typer(
 )
 app.add_typer(server_app, name="server")
 
-# Daemon management constants
-LOG_DIR = Path.home() / ".local" / "share" / "biopb" / "logs"
-DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
+# Daemon management constants. On-disk locations come from the shared
+# `_config_location` module (XDG-aware): the installed webapp bundle is a portable
+# asset (data tree); logs / pid / sentinels are per-machine state (state tree).
+DEFAULT_WEBAPP = _config_location.webapp_dir()
 
 # Default config path, preferring JSON over legacy TOML and warning when both
 # exist. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
@@ -93,9 +94,9 @@ DEFAULT_CONFIG = find_config()
 # the lifecycle plumbing (pidfile / detach / stop-sentinel) lives here, reused
 # from the tensor-server / mcp daemons, so the package itself stays a pure
 # supervisor. It supervises the tensor server, which keeps writing the canonical
-# tensor-server.log (LOG_DIR) that the control's log endpoint tails; the control
-# plane's own supervision/control-API log is control.log.
-CONTROL_PID_FILE = Path.home() / ".local" / "share" / "biopb" / "control.pid"
+# tensor-server.log (the state-tree logs dir) that the control's log endpoint
+# tails; the control plane's own supervision/control-API log is control.log.
+CONTROL_PID_FILE = _config_location.control_pid_file()
 
 
 # The installer records the release-v* deployment version it pulled the wheels
@@ -164,7 +165,7 @@ def version():
 def _ensure_dirs():
     """Ensure required directories exist."""
     CONTROL_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _config_location.log_dir()  # creates the state-tree logs dir on access
 
 
 def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
@@ -361,21 +362,12 @@ def _stop_daemon(
 
 def _get_log_file() -> Path:
     """Get log file path."""
-    return LOG_DIR / "tensor-server.log"
+    return _config_location.tensor_server_log()
 
 
-def _rotate_log(
-    log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5
-):
-    """Rotate log file if it exceeds max_bytes, keeping up to backup_count backups."""
-    if not log_file.exists() or log_file.stat().st_size < max_bytes:
-        return
-    for i in range(backup_count - 1, 0, -1):
-        src = log_file.parent / f"{log_file.name}.{i}"
-        dst = log_file.parent / f"{log_file.name}.{i + 1}"
-        if src.exists():
-            src.rename(dst)
-    log_file.rename(log_file.parent / f"{log_file.name}.1")
+# The rotation helper lives in `_config_location` so the supervisor shares one
+# rotator; re-exported here under the old name for the existing call sites.
+_rotate_log = _config_location.rotate_log
 
 
 def _detach_kwargs() -> dict:
@@ -912,7 +904,7 @@ def _control_endpoint() -> Tuple[str, int]:
 def _control_log_file() -> Path:
     """The control plane's own supervision / control-API log (distinct from the data
     plane's tensor-server.log, which the supervised server keeps writing)."""
-    return LOG_DIR / "control.log"
+    return _config_location.control_log()
 
 
 def _write_control_pid(pid: int) -> None:
@@ -926,8 +918,8 @@ def _remove_control_pid() -> None:
 
 def _control_shutdown_sentinel() -> Path:
     """The control plane's Windows stop-sentinel path (watched by biopb_control._run).
-    A single fixed name under the biopb data dir, like the other daemons'."""
-    return CONTROL_PID_FILE.parent / "control.stop"
+    A single fixed name under the biopb state dir, like the other daemons'."""
+    return _config_location.control_stop_sentinel()
 
 
 def _control_start_lock() -> Path:
