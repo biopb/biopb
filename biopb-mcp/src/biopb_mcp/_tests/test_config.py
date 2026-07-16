@@ -240,11 +240,11 @@ class TestDefaultConfig:
         assert "skills" not in services
 
     def test_dask_defaults(self):
-        """MCP dask defaults to a daemon-owned distributed cluster."""
+        """MCP dask defaults to a session-child-owned distributed cluster."""
         dask = DEFAULT_CONFIG["dask"]
         assert dask["scheduler"] == "distributed"
         assert dask["address"] == ""
-        assert dask["owner"] == "daemon"
+        assert "owner" not in dask  # the escape hatch was removed
         for key in (
             "num_workers",
             "threads_per_worker",

@@ -15,9 +15,8 @@ process). On that parent's death its workers self-terminate on scheduler loss --
 the sole reaper on an *uncatchable* parent death (the parent's own ``_shutdown``
 / ``atexit`` close covers the graceful exits), which is why the ``mcp`` extra
 floors ``distributed>=2023.9`` (post-``reconnect``, when a worker that loses its
-scheduler shuts down instead of retrying forever). Only under the
-``dask.owner="kernel"`` escape hatch does the kernel's group also contain dask
-children this reap takes down.
+scheduler shuts down instead of retrying forever). The kernel never owns the
+cluster, so this reap only takes down agent-spawned subprocesses.
 
 Why a pipe and not ``PR_SET_PDEATHSIG``: the parent-death *signal* is tied to
 the **thread** that forked the child, so it fires early when a transient
@@ -72,8 +71,8 @@ def install() -> bool:
 
 
 def _self_terminate():
-    """Hard group-kill: reap this child and any subprocess it spawned (agent
-    code; and, under owner="kernel", a kernel-local dask cluster)."""
+    """Hard group-kill: reap this child and any subprocess it spawned (e.g.
+    agent code run in the kernel)."""
     try:
         os.killpg(os.getpgid(0), signal.SIGKILL)
     except Exception:

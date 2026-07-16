@@ -66,20 +66,15 @@ _DEATHWATCH_ARG = (
 )
 
 # Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no
-# standalone caller).  ``_dask_client`` / ``_dask_cluster`` are set by the
-# bootstrap (both None for the in-process scheduler; for an auto-spun
-# LocalCluster the cluster is closed after the client so workers don't orphan).
+# standalone caller).  ``_dask_client`` is set by the bootstrap (None for the
+# in-process scheduler; a real Client when attached to the session child's
+# distributed cluster). The kernel never owns the cluster, so closing the
+# client is all there is to release here.
 _DASK_RELEASE_SNIPPET = (
     "try:\n"
     "    _dc = globals().get('_dask_client')\n"
     "    if _dc is not None:\n"
     "        _dc.close()\n"
-    "except Exception:\n"
-    "    pass\n"
-    "try:\n"
-    "    _dk = globals().get('_dask_cluster')\n"
-    "    if _dk is not None:\n"
-    "        _dk.close()\n"
     "except Exception:\n"
     "    pass\n"
 )
@@ -390,10 +385,9 @@ class KernelHost:
                     cwd=self._cwd,
                     # Own session/process group so a hard restart — or the
                     # kernel's own parent-death watcher — can group-kill the
-                    # kernel and any subprocess it spawned (arbitrary agent code;
-                    # and, under the `owner="kernel"` escape hatch, a kernel-local
-                    # dask cluster). The daemon-owned cluster lives in the
-                    # *daemon's* group, so this group-kill never touches it.
+                    # kernel and any subprocess it spawned (arbitrary agent
+                    # code). The session child owns the dask cluster in *its*
+                    # group, so this group-kill never touches it.
                     start_new_session=True,
                     **popen_kwargs,
                 )

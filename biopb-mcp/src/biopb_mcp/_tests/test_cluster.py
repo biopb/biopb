@@ -36,7 +36,7 @@ class _FakeCluster:
 
 
 def _cfg(**over):
-    dask = {"scheduler": "distributed", "address": "", "owner": "daemon"}
+    dask = {"scheduler": "distributed", "address": ""}
     dask.update(over)
     return {"dask": dask}
 
@@ -58,11 +58,6 @@ def fake_local_cluster(monkeypatch):
 
 
 class TestShouldOwn:
-    def test_none_when_owner_kernel(self, fake_local_cluster):
-        host = DaskClusterHost(_cfg(owner="kernel"))
-        assert host.ensure() is None
-        assert fake_local_cluster == []  # never spun
-
     def test_none_when_not_distributed(self, fake_local_cluster):
         host = DaskClusterHost(_cfg(scheduler="threads"))
         assert host.ensure() is None

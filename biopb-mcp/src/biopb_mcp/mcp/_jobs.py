@@ -23,9 +23,9 @@ Design notes
   from the main-thread ``<<JOB_JSON>>`` reply line.
 * **Cancellation is cooperative.** :func:`cancel` sets a per-job event that job
   code may poll via ``cancelled()``; when a distributed dask client is active
-  (the default kernel-local ``LocalCluster``) it *also* cancels the client's
-  in-flight futures — the only mid-``compute()`` stop short of
-  ``restart_kernel``.  The in-process ``threads`` / ``synchronous`` schedulers
+  (the kernel's ``Client`` attached to the session child's ``LocalCluster``) it
+  *also* cancels the client's in-flight futures — the only mid-``compute()`` stop
+  short of ``restart_kernel``.  The in-process ``threads`` / ``synchronous`` schedulers
   have no futures to cancel, so a running ``compute()`` under them can only be
   stopped by ``restart_kernel``.
 """

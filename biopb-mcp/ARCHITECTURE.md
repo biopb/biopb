@@ -320,15 +320,14 @@ top-level sections `transport` / `kernel` / `dask` / `tensor` / `viewer` /
   `address` auto-spins a multi-process `LocalCluster`; any distributed mode lets
   `cancel_job` stop an in-flight `.compute()`. Set a non-empty `address` to
   attach to an external scheduler, or `threads`/`synchronous` for a low-overhead
-  in-process scheduler with no mid-compute cancel. `owner` (default `daemon`)
-  decides who owns the auto-spun cluster: `daemon` — the MCP daemon owns it and
-  it survives kernel restart/respawn/window-close (the kernel attaches via an
-  injected scheduler address; no cold worker re-spawn per restart, which is the
-  dominant restart cost on Windows), so worker/memory changes need a *daemon*
-  restart, not just `restart_kernel`; `kernel` — the legacy per-kernel cluster.
-  `num_workers`/`threads_per_worker`/`memory_limit`/`dashboard_address` size the
-  auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
-  cluster-wide chunk cache (split across workers).
+  in-process scheduler with no mid-compute cancel. The **session child** (not the
+  kernel) owns the auto-spun cluster, so it survives kernel
+  restart/respawn/window-close — the kernel attaches via an injected scheduler
+  address, with no cold worker re-spawn per restart (the dominant restart cost on
+  Windows) — and worker/memory changes need a *session* restart, not just
+  `restart_kernel`. `num_workers`/`threads_per_worker`/`memory_limit`/
+  `dashboard_address` size the auto-spun cluster (dashboard binds loopback only);
+  `cache_budget` bounds the cluster-wide chunk cache (split across workers).
 - **`tensor`** — `health_poll_min_interval`/`health_poll_max_interval` (the
   background source watcher's backoff bounds; the kernel re-lists when
   `source_count` changes so a catalog cached mid-index self-heals — issue #44;

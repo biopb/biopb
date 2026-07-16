@@ -296,12 +296,6 @@ class DaskConfig:
         'cancel and real CPU parallelism), "threads"/"synchronous" (low-overhead '
         "in-process, no mid-compute cancel).",
     )
-    owner: str = _h(
-        "daemon",
-        'Who owns the auto-spun LocalCluster. "daemon": the MCP daemon owns it, so '
-        'it outlives kernel restart. "kernel": each kernel spins/tears down its own. '
-        "Ignored unless scheduler is distributed with no external address.",
-    )
     num_workers: int = _h(
         _DEFAULT_DASK_NUM_WORKERS,
         "n_workers for the auto-spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
@@ -309,8 +303,8 @@ class DaskConfig:
     )
     address: str = _h(
         "",
-        "Non-empty -> connect to this external scheduler address; empty -> spin a "
-        "kernel-local LocalCluster.",
+        "Non-empty -> connect to this external scheduler address; empty -> the "
+        "session child spins/owns a LocalCluster.",
     )
     threads_per_worker: int = _h(
         1, "LocalCluster threads per worker (local cluster only)."
@@ -507,7 +501,6 @@ _CONSTRAINTS = {
     },
     "DaskConfig": {
         "scheduler": Enum({"distributed", "threads", "synchronous"}),
-        "owner": Enum({"daemon", "kernel"}),
         "num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
     },
     "TensorRuntimeConfig": {

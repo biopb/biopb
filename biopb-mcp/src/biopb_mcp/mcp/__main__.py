@@ -467,11 +467,9 @@ def _serve_http(config, port, view=False):
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
     # (which leaves workers no chance to clean up) doesn't leak spill dirs
-    # (issue #13, secondary disk-leak note). Consumed by the daemon-owned
-    # cluster (below) via DaskClusterHost.local_dir, or by a kernel-local cluster
-    # via BIOPB_DASK_LOCAL_DIR under the `owner="kernel"` escape hatch.
+    # (issue #13, secondary disk-leak note). Consumed by the session-child-owned
+    # cluster (below) via DaskClusterHost.local_dir.
     dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
-    kernel_env["BIOPB_DASK_LOCAL_DIR"] = dask_local_dir
 
     def _cleanup_dask_dir():
         shutil.rmtree(dask_local_dir, ignore_errors=True)

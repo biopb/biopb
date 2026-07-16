@@ -46,23 +46,22 @@ class _HeadlessViewer:
 def _configure_dask(config: dict):
     """Set up dask in the kernel process.
 
-    Returns ``(client, cluster)``:
+    The kernel never owns a cluster: the session child (``biopb_mcp.mcp``) spins
+    and owns the ``LocalCluster`` (see :class:`_cluster.DaskClusterHost`) and
+    injects its address. Returns ``(client, cluster)`` where ``cluster`` is
+    always ``None``:
 
     * ``"distributed"`` + an address (``BIOPB_DASK_ADDRESS`` injected by the
-      daemon, or an external ``dask.address``) -> a ``Client`` attached to
-      that scheduler; ``cluster`` is ``None``. This is the default: the daemon
-      owns the cluster (``dask.owner="daemon"``) and injects its address.
-    * ``"distributed"`` + no address + ``owner="daemon"`` -> the daemon has no
-      cluster (disabled or a spin failure), so degrade to the in-process
-      ``threads`` scheduler rather than spinning a competing kernel-local one.
-    * ``"distributed"`` + no address + ``owner="kernel"`` (escape hatch) -> a
-      kernel-local multi-process ``LocalCluster`` and a ``Client`` bound to it.
-    * ``"threads"`` / ``"synchronous"`` -> in-process scheduler; both ``None``.
+      session child, or an external ``dask.address``) -> a ``Client`` attached
+      to that scheduler.
+    * ``"distributed"`` + no address -> the session child has no cluster
+      (disabled or a spin failure), so degrade to the in-process ``threads``
+      scheduler rather than spinning a competing kernel-local one.
+    * ``"threads"`` / ``"synchronous"`` -> in-process scheduler.
 
     ``cancel_job`` can stop an in-flight ``compute()`` in any distributed mode
-    (it holds a real ``Client``), not just the kernel-local one. A failure
-    spinning/attaching degrades gracefully to ``threads`` rather than aborting
-    the bootstrap.
+    (it holds a real ``Client``). A failure attaching degrades gracefully to
+    ``threads`` rather than aborting the bootstrap.
     """
     import dask
 
@@ -70,9 +69,8 @@ def _configure_dask(config: dict):
 
     scheduler = get_setting(config, "dask.scheduler")
     num_workers = get_setting(config, "dask.num_workers") or None
-    owner = get_setting(config, "dask.owner")
-    # The daemon-injected address (its owned cluster) wins over the configured
-    # external one; either takes the plain Client(address) attach path.
+    # The session-child-injected address (its owned cluster) wins over the
+    # configured external one; either takes the plain Client(address) attach path.
     address = os.environ.get("BIOPB_DASK_ADDRESS") or get_setting(
         config, "dask.address"
     )
@@ -86,43 +84,16 @@ def _configure_dask(config: dict):
                 logger.info("Dask attached to distributed scheduler at %s", address)
                 return client, None
 
-            if owner != "kernel":
-                # owner == "daemon" (default): the daemon owns the cluster and
-                # would have injected BIOPB_DASK_ADDRESS. No address here means it
-                # has none (disabled or spin failure) -> threads, not a competing
-                # kernel-local cluster.
-                logger.info(
-                    "No daemon dask address; using in-process threads scheduler"
-                )
-                scheduler = "threads"
-            else:
-                from dask.distributed import LocalCluster
-
-                # Put worker spill dirs under a launcher-owned temp dir (when set)
-                # so the launcher can rmtree them on shutdown — a group-SIGKILL of
-                # the kernel leaves workers no chance to clean up after themselves
-                # (issue #13, secondary disk-leak note).
-                local_directory = os.environ.get("BIOPB_DASK_LOCAL_DIR") or None
-
-                cluster = LocalCluster(
-                    n_workers=num_workers,
-                    processes=True,
-                    threads_per_worker=get_setting(config, "dask.threads_per_worker"),
-                    memory_limit=get_setting(config, "dask.memory_limit"),
-                    dashboard_address=get_setting(config, "dask.dashboard_address"),
-                    local_directory=local_directory,
-                )
-                client = Client(cluster)
-                logger.info(
-                    "Dask using kernel-local cluster: %d worker(s) at %s",
-                    len(cluster.workers),
-                    cluster.scheduler_address,
-                )
-                return client, cluster
+            # No address: the session child owns the cluster and would have
+            # injected BIOPB_DASK_ADDRESS. None here means it has none (disabled
+            # or a spin failure) -> in-process threads, not a competing
+            # kernel-local cluster.
+            logger.info("No injected dask address; using in-process threads scheduler")
+            scheduler = "threads"
         except Exception:
-            # Covers a missing `distributed` install, an unreachable address, or
-            # a LocalCluster spawn failure -- degrade to the in-process scheduler
-            # so the bootstrap (and the viewer) survives.
+            # A missing `distributed` install or an unreachable address --
+            # degrade to the in-process scheduler so the bootstrap (and the
+            # viewer) survives.
             logger.exception(
                 "Distributed dask unavailable; "
                 "falling back to in-process threads scheduler"
