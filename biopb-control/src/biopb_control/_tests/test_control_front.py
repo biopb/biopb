@@ -1,4 +1,4 @@
-"""Tests for the Layer-3 single-origin front (``_control`` ASGI app).
+"""Tests for the single-origin web front (``_control`` ASGI app).
 
 Concerns beyond the health/ensure control API (covered in ``test_supervisor``):
 (1) the control's own routes win, (2) the ``/data_plane`` namespace faithfully
@@ -429,7 +429,7 @@ def test_tail_file_bounds_bytes_and_drops_fragment(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# /api/* auth gate (§6.1 — the control's own API on the single origin)
+# /api/* auth gate (the control's own API on the single origin)
 # --------------------------------------------------------------------------- #
 _TOKEN = "test-control-token-123"
 

@@ -3,13 +3,13 @@
 The "algorithm plane" is the set of gRPC ``ProcessImage`` servicers an agent's
 kernel exposes as callable ``ops``. Their URLs live in the biopb-mcp config today
 (``services.process_image_servers``); each is queried via ``GetOpNames`` so its
-ops surface in the kernel. Moving that config under the control is migration
-Layer 4 (``biopb-mcp/docs/mcp-dedaemonization-migration.md`` §7), deliberately
-*later*.
+ops surface in the kernel. Moving that config under the control is the pending
+algorithm-plane supervision (``biopb-mcp/ARCHITECTURE.md``, Lifecycle),
+deliberately *later*.
 
 This module is a **read-only inspector** for the control dashboard: it lists the
 configured servers and probes each for liveness + advertised ops. It does **not**
-control their lifecycle (start/stop is Layer 4, out of scope) and it never writes
+control their lifecycle (start/stop is the pending algorithm plane, out of scope) and it never writes
 the config. Mirrors ``biopb._agents`` in spirit — a small importable API the lean
 control plane can call.
 

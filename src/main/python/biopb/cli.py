@@ -875,8 +875,8 @@ app.add_typer(mcp_app, name="mcp")
 # biopb control: the control plane (supervises the durable planes)
 # ---------------------------------------------------------------------------
 # `biopb control` manages the lean control-plane process (the `biopb-control`
-# package). Layer 2 of the de-daemonization migration
-# (biopb-mcp/docs/mcp-dedaemonization-migration.md): the control plane becomes the
+# package). Since the de-daemonization
+# (biopb-mcp/ARCHITECTURE.md): the control plane becomes the
 # durable root that supervises the tensor server, so `_connection` no longer
 # shells out `biopb server start` -- it asks the control plane to ensure the data plane.
 control_app = typer.Typer(

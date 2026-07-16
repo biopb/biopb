@@ -1,238 +1,326 @@
 # biopb-mcp
 
-## Architecture Overview
+## Overview
 
 `biopb-mcp` connects [napari](https://napari.org) and AI agents to
 [biopb](https://github.com/biopb/biopb) servers. It has two faces:
 
-1. **napari plugin** — a `Tensor Browser` widget that browses/loads images from
-   a biopb tensor server (Arrow Flight), plus two **experimental demo widgets**,
-   `Object Detection` and `Image Processing`, that call the `biopb.image`
+1. **napari plugin** — a `Tensor Browser` widget that browses/loads images from a
+   biopb tensor server (Arrow Flight), plus two **experimental demo widgets**
+   (`Object Detection`, `Image Processing`) that call the `biopb.image`
    ProcessImage gRPC protocol. The demo widgets exist to test algorithm servers;
-   they are not the primary interface.
-2. **MCP server** — a standalone process that exposes a live napari viewer to an
-   AI agent over MCP. The project thesis is *"agent first;
-   provide tools only if they help."* The agent drives napari through a real
-   Python kernel; image results go to the viewer, other results to the agent's
-   chat.
+   they are **not** the primary interface.
+2. **MCP server** — a process that exposes a live napari viewer to an AI agent
+   over MCP. Thesis: *"agent first; provide tools only if they help."* The agent
+   drives napari through a real Python kernel; image results go to the viewer,
+   other results to the agent's chat.
 
-Read [napari.md](docs/napari.md) for a summary of napari's architecture and plugin system.
+Read [docs/napari.md](docs/napari.md) for napari's plugin architecture.
+
+### Runtime shape
+
+A biopb deployment is a **tree rooted at a durable control plane** — no cycles:
+
+```
+   control plane   (durable ROOT — lean: supervise + route + serve the web UI)
+        ├── supervises ─► data plane      (tensor Flight server + HTTP sidecar)
+        ├── supervises ─► algorithm plane (algorithm servers)          [pending]
+        └── observes   ◄─ MCP sessions    (ephemeral, SHIM-owned; self-register)
+                            env inherited from the shim  (the #98 fix)
+                            USE the planes; never START them
+```
+
+| Component | Lifetime | Owned by | Role |
+|---|---|---|---|
+| Control plane | durable (root) | OS service / `biopb` launcher | supervise, route, single-origin web front, session registry, auth |
+| Data plane | durable | control (subprocess) | pixels, cache, remote-data proxy |
+| Algorithm plane | durable | control (subprocess) | compute ops *(pending)* |
+| MCP session | ephemeral | the **shim** | kernel + dask + viewer; env-inherited; registers with control |
+| Shim | per client connection | the MCP client | stdio↔http bridge; spawns & reaps its session child |
+
+This shape resolves three problems the older shared-daemon model had:
+
+1. **fd-1 corruption → the shim/heavy split.** Under stdio MCP, **fd 1 *is* the
+   JSON-RPC channel**; any stray stdout from a heavy process (uvicorn/Qt/dask/
+   kernel) corrupts it. So the client spawns a **featherweight shim** that owns
+   fd 1 and imports only the mcp SDK, and all heavy work runs in a separate child
+   it bridges to over http — making fd-1 corruption structurally impossible.
+2. **A bootstrap cycle.** The session depends on the data plane, yet its data
+   layer used to *start* it — a cycle with no clean owner. The control owns the
+   plane; `_connection` becomes a pure client.
+3. **N ephemeral web surfaces.** Each session's `observe` UI lives on a dynamic
+   port; a single web origin needs an owner that discovers sessions dynamically.
+
+Plus the daemon model's env/orphan bugs: **#98** (a login-time daemon freezes
+`DISPLAY`, so the viewer lands on the wrong display) and **#403** (Windows kernel
+orphans).
+
+---
+
+## Lifecycle
+
+Two invariants keep the tree correct:
+
+- **I1 — the control *observes* sessions, never *spawns* them.** A control-spawned
+  session would inherit the control's frozen env, re-breaking #98. Sessions stay
+  shim-owned and env-inherited; they only **register** so the control can route to
+  and list them.
+- **I2 — the control stays lean and subprocess-based.** It supervises components
+  as subprocesses (`python -m biopb_tensor_server …`, `python -m biopb_mcp.mcp …`),
+  never by importing them — no Qt/napari/dask/kernel enters it. Shared facts (the
+  control endpoint, the session-file contract, auth predicates, the process/
+  lifecycle helpers) live in **stdlib-only core-SDK modules** (`biopb._config_control`,
+  `biopb._config_sessions`, `biopb._web_auth`, `biopb._proc`, `biopb._lifecycle`)
+  that neither side imports from the other.
+
+### Control plane (durable root)
+
+A small always-on Starlette/uvicorn app (`biopb-control` package; `biopb control
+start/stop/status/run`) on `127.0.0.1:8813` that **supervises the data plane**,
+**is the single web origin**, and **holds the session registry**.
+
+`DataPlaneSupervisor` spawns the tensor server, polls liveness (a stdlib TCP
+connect — no pyarrow/grpc imported, I2), and restarts it on crash with capped
+backoff. It is the **sole owner**: it always spawns its own child and **refuses a
+port already held by a foreign process** (a *conflict*, surfaced not adopted) — so
+`self._proc` is the whole state and `control stop` is a complete teardown, with no
+"adopted, left running" case. `biopb control start` brings the plane up by default
+(`--no-data-plane` runs the control alone).
+
+**The plane is bound to the control's lifetime (Pattern O).** An orphaned plane
+keeps holding the gRPC port, which the next control start reads as a conflict it
+refuses — so a crashed/killed/logged-out control would wedge every restart (and
+the installer's stop→start) behind a plane nobody owns. The supervisor closes that
+by tying the plane's life to its own, using the shared `biopb._lifecycle`
+primitives:
+
+- **POSIX** — the child inherits a **parent-death pipe** (`deathwatch`) and runs
+  in its own session; the tensor server's `launch`/`serve` call
+  `deathwatch.install()`, which self-terminates the plane (a contained group-kill)
+  when the control dies **uncatchably** (SIGKILL/OOM/crash/logout).
+- **Windows** — the child is assigned to a **kill-on-close Job Object** (`winjob`)
+  the control holds; the OS reaps the plane (and its descendants) when the
+  control's last handle closes.
+
+This is **orthogonal to the graceful stop** path — SIGTERM (POSIX) / a sentinel
+file (Windows) still run the plane's orderly shutdown (releasing the file-cache
+process lock) whenever the control is alive to ask; the bind is only the backstop
+for when it is not. The cost is a brief data-serving gap across a control restart
+(the plane comes back with it); keeping the control lean and crash-only-restartable
+bounds that gap.
+
+> The Windows **sentinel file** is the tensor server's alone. A process needs it
+> only when all three hold: its stop is a raw signal (uncatchable on Windows), it
+> has no in-band shutdown channel, and it holds costly durable state (the cache
+> lock/WAL). The kernel has an in-band channel (jupyter ZMQ), the session child is
+> ephemeral, and the dask workers self-terminate on scheduler loss — so none of
+> them use it. See `biopb-tensor-server/ARCHITECTURE.md`.
+
+### Shim-owned MCP sessions
+
+The MCP server process **is http-only** (loopback streamable-http on
+`transport.port`). `--transport stdio` (still the default, so installer-seeded
+client configs keep working) no longer serves MCP from the launcher: it runs the
+**shim** (`mcp/_shim.py`), which
+
+1. **spawns its own ephemeral session child** — FastMCP/uvicorn + the kernel host
+   — on a **dynamic OS-assigned port** (`--port 0`), reported back over an
+   inherited pipe fd (`BIOPB_PORT_REPORT_FD`);
+2. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin,
+   replaying the child's initialize result **verbatim** (including `instructions`,
+   the field the generic `mcp-proxy` drops — which is why the bridge is vendored);
+   any bridge failure exits the shim so the client sees EOF, never a hung server;
+3. **reaps** the child (and its kernel grandchild) on the way out.
+
+There is **no probe-and-reuse, no shared daemon, no fixed port**: each stdio
+client spawns and owns its own session, so N clients get N independent sessions (N
+viewers), by design. The child:
+
+- **inherits the shim's live environment** (`DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY`
+  are the user's current session — the **#98 fix**), so the agent's viewer lands
+  on the human's real display;
+- **registers with the control** on startup and deregisters on reap;
+- is **reaped as a tree** — POSIX via the shared process group + a parent-death
+  pipe; Windows via a **Job Object** the shim creates and assigns (**#403**), so a
+  force-killed shim takes the whole subtree down. A client-death watchdog covers a
+  multi-process client that keeps the shim's stdin open past its own exit.
+
+Native http (`claude mcp add --transport http biopb http://127.0.0.1:8765/mcp`)
+skips the shim entirely and is preferred where the client supports it. The child's
+output goes to a **per-session** log (`transport.kernel_log` empty by default →
+`~/.local/share/biopb-mcp/log/sessions/<id>.log`; set it to force one shared file).
+
+### On-demand kernel
+
+The process owns a **single child Jupyter kernel** (real IPython kernel via
+`jupyter_client`) that hosts the napari viewer, dask, and the tensor client. Agent
+code runs *in that kernel*, not on the MCP thread or napari's Qt loop — so a
+runaway execution can be interrupted (`SIGINT`) or hard-restarted (process-group
+`SIGKILL` + respawn) without killing the MCP server. A single `RLock` serializes
+access to the kernel.
+
+The kernel is **launched lazily, not at boot**, so a long-running server binds
+cheaply and never pops a viewer with nobody connected. The `start_kernel` tool
+drives `KernelHost.ensure_started()` — **synchronous** (blocks until ready or
+failure; FastMCP runs sync tool handlers on the event loop) and idempotent, and is
+also the recovery path after a dead kernel. Until then kernel-dependent tools
+return a structured not-ready status: `not_started` / `error` / `dead` (→ call
+`start_kernel`) or `starting` (a watchdog respawn in flight).
+
+**Closing the napari window tears the kernel back down to idle.** POSIX: the
+kernel holds the write end of a `BIOPB_WINDOW_CLOSE_FD` pipe fired from the
+window's `destroyed` signal, and a server reader thread calls `shutdown()` on the
+byte. Windows (no `pass_fds`): the launcher **polls** the in-kernel
+`_viewer_window_alive()` probe (default 2 s) and shuts down on a confirmed close —
+acting only on a clean reading from a ready, idle kernel, so it never aborts a
+running job (a close during a long job is caught on the next idle tick). Either
+way a user-attributed `_teardown_reason` reaches the agent via `execute()` /
+`server_status`. Rebuild with `start_kernel`.
+
+### dask cluster
+
+The **session child** (not the kernel) owns the dask `LocalCluster`
+(`DaskClusterHost`), so it survives kernel restart/respawn/window-close — the
+kernel attaches via an injected scheduler address, with no cold worker re-spawn
+per restart (the dominant restart cost on Windows). Worker/memory changes need a
+*session* restart, not just `restart_kernel`. On an uncatchable session-child
+death the workers **self-terminate on scheduler loss** (which is why the `mcp`
+extra floors `distributed>=2023.9`); on Windows they fall under the shim's Job
+Object by nesting. Any distributed mode lets `cancel_job` stop an in-flight
+`.compute()`.
+
+### The standalone `biopb mcp view`
+
+The no-agent path: a **foreground, blocking, Ctrl-C** viewer that opens napari
+immediately, binds a dynamic port, prints its `/mcp` URL for optional agent
+attach, and writes no PID file. It stays fully standalone — it does *not* register
+with the control and works whether or not the control is running.
+
+---
+
+## Security model
+
+**The kernel is a real IPython kernel with imports allowed — `execute_code` is
+arbitrary code execution by design.** Do not describe it as sandboxed. The whole
+system assumes a **localhost / trusted-intranet** deployment; untrusted-network
+exposure is expected to be fronted by a separately-documented reverse proxy.
+
+- **Loopback bind + DNS-rebinding allowlist.** Every server binds loopback only
+  and enforces an `Origin`/`Host` allowlist (`build_transport_security()` in
+  `_server.py`), so a malicious page in the user's browser is rejected (`403`/
+  `421`) before it reaches the kernel. There is **no loopback token** — the
+  `Origin` check already blocks the browser-attacker threat. Extend the allowlist
+  via `config['transport']['allowed_origins']`/`allowed_hosts` for a reverse-proxy
+  front (http only).
+- **Web-origin auth** (`biopb._web_auth`, shared by control + sidecar + observe):
+  when a data-plane token is configured it is required (`Bearer` / `X-Biopb-Token`);
+  in local mode (all-loopback) a **loopback-Host** check is the DNS-rebinding
+  backstop; and every state-changing verb refuses a forgeable cross-site request
+  (CSRF). Because the `/session/<id>/*` proxy hop strips the child's own
+  Host/Origin guard, this control-side check is the child's **only** auth.
+- **The `/session/<id>` proxy is an allowlist, not a denylist** (its `/mcp` is an
+  RCE sharing the child port). httpx normalizes dot-segments, so a denylist would
+  let `api/../mcp` collapse onto `/mcp`; only a first path segment of `observe` or
+  `api` is proxied, parent-traversal rejected.
+- **Supervised restart is control-routed, not blind-proxied** (**#418**). The
+  sidecar's `/api/admin/restart` self-restarts by spawning a detached process —
+  correct standalone, but under supervision it would SIGTERM the control's tracked
+  child and race the supervisor for the port. So the control marks its child
+  (`BIOPB_DATA_PLANE_SUPERVISED`), the sidecar surfaces `supervised` and **refuses**
+  self-restart (409), and the admin UI routes restart to `/api/data_plane/restart`.
+  Config *edits* stay a blind proxy (the tensor process is the sole validator of
+  `biopb.json`); only *restart* — an ownership action — is control-routed.
+
+---
+
+## Components
 
 ### Data connection (`_connection.py`)
 
-`TensorConnection` is a **GUI-independent** data-access service (imports neither
-Qt nor napari). It owns the `biopb.tensor.TensorFlightClient`, the source
-catalog, and URL/token resolution + persistence. Both the `TensorBrowserWidget`
-and the MCP kernel *consume* this service rather than owning a client.
+`TensorConnection` is a **GUI-independent** data-access service (imports neither Qt
+nor napari), so the `TensorBrowserWidget` and the headless MCP kernel share one
+implementation. It owns the `biopb.tensor.TensorFlightClient`, the source catalog,
+and URL/token resolution + persistence.
 
-URL/token resolution fallback chain (`resolve_from_config`):
+- **Connect policy** (`auto_connect`, shared by both faces) is **control-first**:
+  it asks the **control** to ensure the data plane (one `ensure_data_plane()` POST
+  — the single source of truth since #413 — which brings the plane up if down and
+  returns the *authoritative* gRPC endpoint), and **only when no control answers**
+  falls back to a direct connect on a locally-resolved `(url, token)`, waiting the
+  server through a `STARTING` scan. `_connection` is a **pure client**: it never
+  starts a server itself — that is the control's job. It is best-effort (failures
+  recorded in `last_status`/`last_message`, never raised) and must be driven **off
+  the caller's main thread** because `connect()` blocks on I/O (the kernel runs it
+  on a daemon thread; the widget on a connect worker that signals the tree render
+  back to the Qt main thread).
+- **Fallback resolution** (`resolve_from_config`, used only on that no-control
+  path — the control's endpoint wins whenever it answers): env
+  (`BIOPB_TENSOR_URL`/`BIOPB_TENSOR_TOKEN`) → config (`tensor_browser.server_url`)
+  → default `grpc://localhost:8815`. Only the URL is persisted; the token is read
+  from the environment.
+- **Self-healing catalog** (`start_source_watch`, **#44**): a catalog cached at
+  connect can be *partial* (the server reports `SERVING` before it finishes
+  enumerating scenes). A daemon thread `health_check()`s and re-lists on any
+  `source_count` change, backing off exponentially between
+  `tensor.health_poll_min/max_interval` while stable. It only ever *rebinds*
+  `self.sources` to a fresh dict, so agent and widget see no torn reads (no lock).
+  Both faces start it; idempotent. Known limit: a source gaining scenes (1→18
+  tensors) doesn't bump `source_count`, so that specific partial isn't caught.
 
-1. **Environment variables**: `BIOPB_TENSOR_URL`, `BIOPB_TENSOR_TOKEN`
-2. **Config file**: `tensor_browser.server_url` in the config
-3. **Default**: `grpc://localhost:8815`
+### MCP server module (`mcp/`)
 
-**Connect policy (`auto_connect`).** `auto_connect()` is the single connect
-policy shared by **both** faces: it asks the **control plane** first to ensure
-the data plane (one `ensure_data_plane()` POST — the control is the single source
-of truth for the data plane since #413 — which brings it up if down, idempotently,
-and returns the authoritative gRPC endpoint), and only when no control answers
-falls back to the resolved `(url, token)` and a direct connect, waiting the server
-through a `STARTING` data-folder scan. `_connection` is a **pure client** (Layer 2
-of the de-daemonization migration): it never shells out `biopb server start`
-itself — bringing the plane up is the control's job (`biopb control start`). It is
-best-effort (failures are recorded
-in `last_status`/`last_message`, never raised) and **must be driven off the
-caller's main thread** because `connect()` blocks on network I/O: the MCP kernel
-runs it on a daemon thread (`_bootstrap`'s headless branch), the
-`TensorBrowserWidget` on a connect worker that signals the tree render back to
-the Qt main thread (`_start_connect` → `_connect_done`). This replaced the
-widget's old QTimer poll chain **and** its modal autostart dialog — a modal on
-the kernel's Qt loop could wedge the synchronous `start_kernel` (which blocks on
-a kernel-main-thread readiness probe) until the user clicked. Only the URL is
-persisted; the token is read from the environment, not saved.
+Launch with the console script `biopb-mcp` or `python -m biopb_mcp.mcp` (`pip
+install biopb-mcp[mcp]`). The launcher comes up **idle** — the heavy kernel/viewer
+starts on demand (above).
 
-**Self-healing catalog (`start_source_watch`, issue #44).** The catalog cached
-at connect time can be *partial* — the server reports `SERVING` (port bound)
-before it finishes enumerating scenes, so a mid-index `list_sources()` looks
-complete but isn't. `start_source_watch()` spawns a **daemon thread** (not a
-`QTimer` — it must run headless with no Qt loop) that periodically
-`health_check()`s and re-lists (`refresh()`) whenever the server's
-`source_count` changes, reconciling against the count cached at connect on its
-first poll. The poll interval backs off exponentially from
-`tensor.health_poll_min_interval` to `health_poll_max_interval` while stable
-and snaps back to the min on a change. The watcher only ever *rebinds*
-`self.sources` to a fresh dict, so the agent (which reads `_conn.sources` live)
-and the widget (which wires `on_sources_changed` to a queued Qt signal to
-rebuild its tree) see no torn reads — no lock. Both the kernel bootstrap and the
-widget start it; the call is idempotent. Known limit: `source_count` doesn't
-grow when an existing source gains scenes (1→18 tensors), so that specific
-partial isn't caught by count alone — the common "sources still being
-discovered" case is.
-
-### MCP Server Module (`mcp/`)
-
-The MCP server **is its own process** — it does *not* auto-start on plugin
-import. Launch it with the console script `biopb-mcp` or `python -m
-biopb_mcp.mcp`. Install the optional deps with `pip install biopb-mcp[mcp]`.
-The launcher comes up **idle**: the heavy kernel (and, with a display, the
-napari viewer window) is **not** spawned at boot — it starts on demand when an
-agent calls the `start_kernel` tool (see the kernel-lifecycle note below).
-
-**Transport.** The MCP server process is **http-only** (loopback streamable-http
-on `transport.port`). `--transport` / `config['transport']['kind']` still accepts
-`stdio` (still the default so installer-seeded client configs keep working
-unchanged), but stdio no longer serves MCP from the launcher process: it runs the
-**shim** (`mcp/_shim.py`) — a featherweight bridge that spawns its **own**
-ephemeral http session child (FastMCP/uvicorn + the kernel host) on a **dynamic
-OS-assigned port** (`--port 0`), inheriting the client's live environment (the #98
-display fix), pumps stdio JSON-RPC to that child's `/mcp` until the client closes
-stdin, then **reaps** the child (and its kernel grandchild) on the way out. There
-is **no probe-and-reuse, no shared daemon, and no fixed port**: each stdio client
-spawns and owns *its own* session, so N clients get N independent sessions (N
-viewers), by design (docs/mcp-dedaemonization-migration.md), which supersedes the
-earlier shared, client-outliving daemon. The shim
-process owns fd 1 as a protocol channel but imports only the mcp SDK — no
-Qt/dask/uvicorn — so the old fd-1 corruption class is structurally impossible; it
-replays the child's initialize result verbatim (including `instructions` — the
-field the generic `mcp-proxy` bridge drops — which is why the bridge is
-vendored), and any bridge failure exits the shim so the client sees EOF,
-never a hung server. The child's output goes to a **per-session** log
-(`transport.kernel_log` default empty → `~/.local/share/biopb-mcp/log/sessions/<id>.log`;
-set `kernel_log` to force one shared file). The Host/Origin allowlist and the
-observe UI apply to stdio-bridged sessions too, since each session child is a real
-http server. Native http
-(`claude mcp add --transport http biopb http://127.0.0.1:8765/mcp`) skips the
-shim entirely and is preferred where the client supports it.
-
-The process owns a **single child Jupyter kernel** (real IPython kernel via
-`jupyter_client`) that hosts the napari viewer, dask, and the tensor client.
-Agent code runs *in that kernel*, not on the MCP server's thread or napari's Qt
-loop — so a runaway execution can be interrupted (`SIGINT`) or hard-restarted
-(process-group `SIGKILL` + respawn) without killing the MCP server.
-
-**On-demand kernel lifecycle.** The kernel is launched lazily, not at boot, so a
-long-running server binds cheaply and never pops a viewer (or Qt-aborts on a
-display-less host) with nobody connected. The `start_kernel` tool drives
-`KernelHost.ensure_started()` — **synchronous** (it blocks until the kernel is
-ready or the bring-up fails, like `restart_kernel`/`restart()`; FastMCP runs sync
-tool handlers on the event loop, so both lifecycle tools block) and idempotent;
-it is also the recovery path after a failed/dead kernel. Until then the host is
-idle and the kernel-dependent tools funnel through `KernelHost.execute()`, which
-returns a structured not-ready status — `not_started` (idle → call
-`start_kernel`), `error`/`dead` (call `start_kernel` to retry), or `starting` (a
-watchdog respawn in flight, derived from `is_alive() && !ready`). Conversely,
-**closing the napari window tears the kernel back down to idle**: on POSIX a
-reverse of the parent-death pipe (the kernel holds the write end of a
-`BIOPB_WINDOW_CLOSE_FD` pipe and the bootstrap fires it from the window's
-`destroyed` signal; a server reader thread calls `shutdown()` on the byte). On
-**Windows** the inherited fd isn't available (no `subprocess` `pass_fds`), so the
-launcher instead **polls** the in-kernel `_viewer_window_alive()` probe on a
-thread (`_poll_window_close`, default every 2 s) and calls the same `shutdown()`
-on a confirmed close. The poll only acts on a clean "window gone" reading from a
-ready, idle kernel — a busy kernel (a job holds the lock), a not-ready kernel, or
-an in-flight stop are skipped — so it never aborts a running job; the trade-off
-vs. the POSIX byte is that a close during a long job is detected on the next idle
-tick rather than immediately. Either way a user-attributed `_teardown_reason` is
-surfaced via `execute()` / `server_status` so the agent learns *why* a running
-job vanished. Rebuild with `start_kernel`.
-
-**Async job model (`_jobs.py`):** `execute_code` runs agent code in a
-**background daemon thread inside the kernel**, so the kernel main thread (and
-its `%gui qt` Qt loop) stays free to service `take_screenshot` / `server_status`
-/ `poll_job` mid-job — the agent is not blind during long work. `execute_code`
-waits up to `promote_after` seconds; if the code finishes it returns the result
-inline, otherwise it returns a job handle (`job-N`) and keeps running. One job
-at a time. Because the viewer has Qt main-thread affinity, GUI mutations from
-the worker thread are marshaled to the main thread: `_bootstrap` wraps
-`add_tensor` + the `add_*` family, and `run_on_main(fn)` is exposed for the
-rest; `cancelled()` supports cooperative `cancel_job`. Rich IPython `display()`
-output is not captured (code is exec'd, not run via `run_cell`).
-
-**Files:**
-- `__main__.py` / `__init__.py` — launcher; builds the `KernelHost` **idle**
-  (does not eager-start it), injects the bootstrap via `IPKernelApp.exec_lines`,
-  then runs the FastMCP server. The kernel is brought up later by the
-  `start_kernel` tool.
+- `__main__.py` / `__init__.py` — launcher; builds the `KernelHost` **idle**,
+  injects the bootstrap via `IPKernelApp.exec_lines`, then runs FastMCP.
 - `_server.py` — FastMCP server (`mcp = FastMCP("biopb-mcp")`); defines the
   tools/resources and dispatches them to the `KernelHost`. `run()` serves
-  streamable-http on `127.0.0.1:<port>/mcp` — the only serving path in this
-  process.
-- `_shim.py` — the stdio bridge (`--transport stdio`): spawns its **own**
-  ephemeral http session child on a dynamic port (inheriting the client's live
-  env), pumps stdio JSON-RPC to its `/mcp`, and reaps the child on disconnect;
-  replays the child's initialize result verbatim.
-- `_kernel.py` — `KernelHost`: manages the one child kernel. A single
-  `threading.RLock` serializes access to the kernel shell channel; with the job
-  model it is held only for the *quick* snippets (submit/poll/screenshot/status)
-  — never during the long compute, which runs in a detached kernel thread.
-  `execute()` has an `execute_timeout` (now bounds only those quick snippets,
-  SIGINT on timeout) and a `busy_lock_timeout` (returns `"busy"` if another
-  quick call holds the lock). `ensure_started()` is the synchronous, idempotent
-  on-demand start (no eager boot); `restart()` releases dask then group-kills and
-  respawns (re-running bootstrap, which clears job state). `_watch_window_close`
-  (POSIX: a reader thread on the inherited window-close pipe) / `_poll_window_close`
-  (Windows: a thread polling the `_viewer_window_alive()` probe) tears the kernel
-  down to idle when the user closes the viewer, recording a `_teardown_reason`.
-- `_bootstrap.py` — runs *inside* the kernel via `exec_lines`. Enables `%gui qt`,
-  configures dask, constructs the `TensorConnection`, opens the napari viewer +
-  Tensor Browser, builds `ops`, installs the job runner (`_jobs.install`) and
-  the agent-facing viewer proxy (`_viewer_proxy.make_viewer_proxy`, see below),
-  wires the window-close hook (the viewer's
-  `destroyed` signal → a byte on `BIOPB_WINDOW_CLOSE_FD`), starts the background
-  source watcher (`conn.start_source_watch`, issue #44 — covers headless, where
-  there is no widget to start it), and populates the `execute_code` namespace.
-  On failure it prints a `BOOTSTRAP_ERROR` sentinel; the host's health probe
-  detects success via `'viewer' in dir()`.
-- `_jobs.py` — runs *inside* the kernel. The async job runner: a `_jobs`
-  registry, `submit`/`poll`/`cancel`/`cancel_current`/`interrupt_current`/
-  `jobs_summary`, a thread-aware stdout dispatcher, `run_on_main` (Qt main-thread
-  marshaling with proper exception propagation), and `cancelled()`. The stop
-  ladder: `cancel`/`cancel_current` is
-  cooperative (sets a flag the code polls via `cancelled()`) and also cancels
-  in-flight distributed-dask futures; `interrupt_current` does that *plus* raises
-  a `KeyboardInterrupt` directly into the job's worker thread via
-  `PyThreadState_SetAsyncExc` (a `SIGINT` only reaches the kernel main thread, not
-  the worker, so it can't stop a background job), forcing an uncooperative
-  pure-Python loop to stop short of `restart_kernel`. A `reason=...` on either
-  threads a human-readable `cancel_reason` into the job record (prefixed onto the
-  finalized `error_text`), so a stop triggered by a *user* in the observe UI
-  surfaces to the agent via `poll_job` instead of an unexplained cancellation.
-- `_viewer_proxy.py` — runs *inside* the kernel. The agent-facing `viewer` in the
-  `execute_code` namespace is a **transparent main-thread marshaling proxy** over
-  the real `napari.Viewer`. Because job code runs on a background thread but
-  napari/Qt are main-thread-only, any off-main viewer mutation can segfault the
-  whole kernel (biopb/biopb#100). The proxy marshals mutations (`__setattr__`)
-  and method calls to the Qt main thread via `_jobs.run_on_main`, **re-wraps**
-  every napari handle it returns (so `viewer.layers`, `viewer.dims`,
-  `viewer.layers[0]`, … never leak unwrapped — the gap the old `add_*`-only wrap
-  left), passes inert values (arrays/scalars) through, and **fail-loud**-guards
-  raw-Qt objects (`viewer.window`) so off-main access raises `ViewerThreadError`
-  instead of crashing. Handle-set completeness is enforced by a graph-walk test
-  (`_tests/test_viewer_proxy.py`); see `docs/viewer-thread-safety.md`.
-- `_observe.py` — runs *in the MCP server process* (not the kernel). The web
-  "observe" UI (`observe.enabled`, **on by default / opt-out**): job history
-  (the submitted code + truncated output) + global cancel/interrupt/restart
-  knobs. **http transport only** — the routes mount on the existing FastMCP app
-  via `mcp.custom_route`
-  (same loop and port as `/mcp`). It is deliberately *not* supported under stdio:
-  a second uvicorn server in the stdio launcher process would risk the fd-1
-  JSON-RPC channel (uvicorn attaches a stdout log handler) and a second
-  event-loop thread driving the one `KernelHost` races the MCP thread and can
-  wedge the kernel — so under stdio the launcher logs a hint and skips it. Custom
-  routes are *not* covered by FastMCP's transport-security, so each route carries
-  its **own** Host/Origin guard reusing the SDK's `TransportSecurityMiddleware`
-  validators with the same loopback allowlist. Reads reuse `_server._run_job_call`;
-  controls are direct `KernelHost` calls — no new IPC, no dask-dashboard
-  dependence. Wired by `__main__._setup_observe` (fully guarded; a failure never
-  blocks the server).
+  streamable-http on `127.0.0.1:<port>/mcp` — the only serving path here.
+- `_shim.py` — the stdio↔http bridge: `spawn_session` (dynamic-port child, env
+  inheritance, port pipe, tree reap) + the vendored bridge (see Lifecycle).
+- `_kernel.py` — `KernelHost`: the one child kernel. The `RLock` is held only for
+  *quick* snippets (submit/poll/screenshot/status), never during long compute (it
+  runs in a detached kernel thread). `execute()` has an `execute_timeout` (bounds
+  quick snippets, SIGINT on timeout) and a `busy_lock_timeout` (`"busy"` if another
+  quick call holds the lock). `ensure_started()` is the synchronous idempotent
+  on-demand start; `restart()` releases dask then group-kills and respawns. Wires
+  the window-close teardown (POSIX pipe reader / Windows probe poll).
+- `_bootstrap.py` — runs **inside the kernel** via `exec_lines`. Enables `%gui qt`,
+  configures dask, builds the `TensorConnection`, opens the viewer + Tensor
+  Browser, builds `ops`, installs the job runner and the viewer proxy, wires the
+  window-close hook, starts the source watcher (#44, also for headless), populates
+  the namespace. On failure prints a `BOOTSTRAP_ERROR` sentinel; the host detects
+  success via `'viewer' in dir()`.
+- `_jobs.py` — runs **inside the kernel**. The async job runner: `execute_code`
+  runs agent code in a **background daemon thread**, so the kernel main thread (and
+  its `%gui qt` loop) stays free to service `take_screenshot`/`server_status`/
+  `poll_job` mid-job. It waits up to `promote_after` seconds, then returns a job
+  handle (`job-N`) and keeps running. One job at a time. The stop ladder:
+  `cancel`/`cancel_current` is cooperative (a flag polled via `cancelled()`) and
+  cancels in-flight distributed futures; `interrupt_current` additionally raises
+  `KeyboardInterrupt` into the worker thread via `PyThreadState_SetAsyncExc` (a
+  `SIGINT` reaches only the main thread). A `reason=…` threads a human-readable
+  `cancel_reason` into the record so a user-triggered stop surfaces to the agent.
+- `_viewer_proxy.py` — runs **inside the kernel**. The agent-facing `viewer` is a
+  transparent **main-thread marshaling proxy** over the real `napari.Viewer`:
+  because job code runs off-main but napari/Qt are main-thread-only, any off-main
+  mutation can segfault the kernel (**#100**). It marshals mutations/calls to the
+  Qt main thread, **re-wraps** every napari handle it returns (so
+  `viewer.layers[0]`, `viewer.dims`, … never leak unwrapped), passes inert values
+  through, and fail-loud-guards raw-Qt objects. Completeness is enforced by a
+  graph-walk test; see `docs/viewer-thread-safety.md`.
+- `_observe.py` — runs **in the MCP server process** (not the kernel). The web
+  "observe" UI (`observe.enabled`, on by default): job history + global
+  cancel/interrupt/restart. **http transport only** — the routes mount on the
+  FastMCP app via `mcp.custom_route` (same loop/port as `/mcp`); under stdio a
+  second uvicorn server would risk the fd-1 channel and race the kernel, so it is
+  skipped. Custom routes carry their own Host/Origin guard.
 - `_process_ops.py` — `build_ops()`: a thin `Run()` callable per configured
-  `ProcessImage` servicer URL (discovered via `GetOpNames`), exposed as `ops`.
-- `_resources.py` — string constants served as MCP resources.
-- `_helpers.py` — monkey-patches `viewer.add_tensor()` for agent use; also
-  `viewer_window_alive()`, the closed-window liveness probe (bound into the
-  kernel namespace as `_viewer_window_alive`) that lets `server_status` /
-  `take_screenshot` / `execute_code` detect a user-closed window instead of
-  silently mutating a destroyed viewer.
+  ProcessImage server (discovered via `GetOpNames`), exposed as `ops`.
+- `_resources.py` — resource content strings. `_helpers.py` — `add_tensor()`
+  viewer patch + `viewer_window_alive()` closed-window probe.
 
 **Tools (10):** `find_skills`, `start_kernel`, `take_screenshot`, `execute_code`,
 `poll_job`, `cancel_job`, `inspect_object`, `interrupt_kernel`, `restart_kernel`,
@@ -241,148 +329,113 @@ output is not captured (code is exec'd, not run via `run_cell`).
 **Resources (6):** `guide://kernel`, `guide://viewer`, `guide://tensor`,
 `guide://annotations`, `guide://ops`, and the `skill://{skill_id}` template.
 
-**`execute_code` namespace** (populated by `_bootstrap.py`):
-- `viewer` — the live `napari.Viewer`
-- `np` — numpy, `da` — dask.array
-- `client` — `TensorFlightClient` (or `None` if not connected); refreshed
-  per-call from the connection service
-- `ops` — `dict[str, callable]` of `biopb.image` ProcessImage ops from the
-  configured servers (may be empty)
-
-**Security model (important):** the kernel is a real IPython kernel with imports
-allowed — `execute_code` is arbitrary code execution by design. The server binds
-**loopback only** and assumes a localhost / trusted-intranet deployment;
-untrusted-network exposure is expected to be fronted by a separately-documented
-reverse proxy. The server **enforces a DNS-rebinding / `Origin` / `Host`
-allowlist** (loopback only, set explicitly in `_server.py` via
-`build_transport_security()`), so a malicious page in the user's browser is
-rejected (`403`/`421`) before it can reach the kernel. The allowlist is
-extensible via `config['transport']['allowed_origins']` /
-`config['transport']['allowed_hosts']` for a reverse-proxy front; there
-is no loopback token (the `Origin` check already
-blocks the browser-attacker threat). Do not describe this as sandboxed.
-
-**Error-propagation model (general — applies beyond startup).** Letting an
-exception propagate *upward* — including out of a Qt callback (timer/signal slot,
-e.g. the connect/autostart ticks in `tensor_browser/_widget.py`) — is **generally
-safe in both hosts and will not qFatal-abort the process**, so prefer surfacing
-real failures over silently swallowing them. The reason: PyQt6 only calls
-`qFatal()`/`abort()` on an unhandled slot exception when `sys.excepthook` is the
-*default* `sys.__excepthook__`, and a **non-default hook is always installed** in
-both contexts — napari's `notification_manager` in the standalone plugin (set by
-`napari.run()` via `with notification_manager:`), and ipykernel's
-`ZMQInteractiveShell.excepthook` in the **MCP kernel** (where `napari.run()` is
-never called — the kernel's `%gui qt` inputhook drives the loop and `run()`
-early-returns under an IPython loop — so napari's hooks are absent but the kernel's
-own hook covers it). The only difference is *where the error surfaces*: a GUI
-notification in the plugin vs. a printed traceback in the kernel output (the
-per-session kernel log under stdio) for MCP. Verified empirically: a slot exception aborts with SIGABRT
-only under the default hook and exits cleanly under any override, and the ipykernel
-hook stays non-default through `enable_gui("qt")` and `napari.Viewer()`. Caveat:
-this only covers crash-safety — a propagated error in the MCP kernel produces a log
-traceback, not an agent- or user-facing message, so still catch where you want a
-clean, reported failure.
+**`execute_code` namespace** (populated by `_bootstrap.py`): `viewer` (live
+`napari.Viewer`), `np`/`da` (numpy / dask.array), `client` (`TensorFlightClient`
+or `None`, refreshed per-call), `ops` (`dict[str, callable]` of ProcessImage ops,
+possibly empty).
 
 ### Configuration (`_config.py`)
 
-The config file lives at `~/.config/biopb/mcp-config.json` — co-located with the
-tensor server's `biopb.json` (via `biopb._config_location.mcp_config_path`), not
-in a separate `~/.config/biopb-mcp` directory. It is **deep-merged** with
-`DEFAULT_CONFIG` on load — a partial nested user section overrides only its own
-leaves and leaves sibling defaults intact. Read values with
-`get_setting(config, "dotted.path")`, which falls back to `DEFAULT_CONFIG` so
-call sites never restate a default literal.
+The config lives at `~/.config/biopb/mcp-config.json` — co-located with the tensor
+server's `biopb.json` (via `biopb._config_location.mcp_config_path`). It is
+**deep-merged** with `DEFAULT_CONFIG` on load, so a partial nested section
+overrides only its own leaves. Read values with `get_setting(config,
+"dotted.path")`, which falls back to `DEFAULT_CONFIG` so call sites never restate a
+default. Sections are **flat / top-level** (each maps 1:1 to a section dataclass).
 
-Sections are **flat / top-level** — there is no `mcp.` or `widget.` wrapper (each
-maps 1:1 to a section dataclass in `McpConfig`). The demo-widget knobs are
-`widget` (`server_url`, `is_3d`), `detection`, and `grid` (tiling; consumer is
-`image_processing/`); `tensor_browser.server_url` (data-plane URL, deliberately
-top-level because the GUI-independent `TensorConnection` reads it from the
-headless kernel too), `pyramid`, `timeout`, `grpc.max_message_size_mb`, and
-`memory` are shared by the widgets and `ops`. The MCP-server knobs are the
-top-level sections `transport` / `kernel` / `dask` / `tensor` / `viewer` /
-`services` / `observe` / `update`:
+- **Demo-widget / shared knobs:** `widget` (`server_url`, `is_3d`), `detection`,
+  `grid`; `tensor_browser.server_url` (data-plane URL, top-level so the headless
+  `TensorConnection` reads it too), `pyramid`, `timeout`, `grpc.max_message_size_mb`,
+  `memory`.
+- **`transport`** — `kind` (`stdio`/`http`, default `stdio`), `port` (8765),
+  `display_mode`, `kernel_log` (stdio-only, empty by default → per-session log),
+  `session_log_keep`, `allowed_origins`/`allowed_hosts` (http only),
+  `server_start_timeout`.
+- **`kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; quick
+  snippets only), `busy_lock_timeout` (5s), `promote_after` (10s),
+  `parent_death_pipe`, `watchdog_*` (orphan-hardening, #13).
+- **`dask`** — `scheduler` (`distributed` default → auto-spun multi-process
+  `LocalCluster`; `threads`/`synchronous` for in-process, no mid-compute cancel),
+  `address` (attach to an external scheduler), `num_workers`/`threads_per_worker`/
+  `memory_limit`/`dashboard_address` (dashboard loopback only), `cache_budget`
+  (cluster-wide chunk cache, split across workers). The session child owns the
+  cluster (see Lifecycle).
+- **`tensor`** — `health_poll_min/max_interval` (the #44 source watcher's backoff;
+  min ≤ 0 disables). (The localhost client-cache decision lives in the tensor
+  client — `_resolve_cache_bytes`, off by default, `BIOPB_CACHE_LOCAL=1` to opt in.)
+- **`viewer`** — `compute_scheduler` (default `threads`; pins the viewer's *serial*
+  slice reads to a single-process scheduler so they share one main-process chunk
+  cache instead of scattering across per-worker caches — **#8**; `_viewer_compute.
+  wrap_levels`). `async_slicing` (default `True`; fetches slices off the Qt main
+  thread via `NAPARI_ASYNC`, so a zoom into a cold pyramid level keeps the current
+  texture instead of freezing; `take_screenshot` force-syncs first).
+- **`services.process_image_servers`** — the ProcessImage URLs exposed as `ops`.
+- **`observe`** — `enabled` (on by default, http only), `max_output_chars`,
+  `poll_interval_ms`.
 
-- **`transport`** — `kind` (`stdio`/`http`, default `stdio`; chosen at
-  startup, also via `--transport`), `port` (8765), `display_mode`, `kernel_log`
-  (stdio-only; **empty by default** → each shim session logs to its own
-  `~/.local/share/biopb-mcp/log/sessions/<id>.log`; set it to force ONE shared
-  file), `session_log_keep`, `allowed_origins`/`allowed_hosts` (extra Host/Origin
-  values appended to the loopback DNS-rebinding allowlist for a reverse-proxy
-  front; http only), and `server_start_timeout` (the down-plane control-ensure /
-  boot-wait budget, applied twice so the worst-case wall wait is ~2x it).
-- **`kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; now
-  bounds only the quick in-band snippets), `busy_lock_timeout` (5s),
-  `promote_after` (10s; how long `execute_code` waits inline before returning a
-  job handle), `parent_death_pipe`, and the `watchdog_*` orphan-hardening knobs
-  (issue #13).
-- **`dask`** — `scheduler` defaults to `distributed`, which with an empty
-  `address` auto-spins a multi-process `LocalCluster`; any distributed mode lets
-  `cancel_job` stop an in-flight `.compute()`. Set a non-empty `address` to
-  attach to an external scheduler, or `threads`/`synchronous` for a low-overhead
-  in-process scheduler with no mid-compute cancel. The **session child** (not the
-  kernel) owns the auto-spun cluster, so it survives kernel
-  restart/respawn/window-close — the kernel attaches via an injected scheduler
-  address, with no cold worker re-spawn per restart (the dominant restart cost on
-  Windows) — and worker/memory changes need a *session* restart, not just
-  `restart_kernel`. `num_workers`/`threads_per_worker`/`memory_limit`/
-  `dashboard_address` size the auto-spun cluster (dashboard binds loopback only);
-  `cache_budget` bounds the cluster-wide chunk cache (split across workers).
-- **`tensor`** — `health_poll_min_interval`/`health_poll_max_interval` (the
-  background source watcher's backoff bounds; the kernel re-lists when
-  `source_count` changes so a catalog cached mid-index self-heals — issue #44;
-  min `<= 0` disables it). (The localhost client-cache decision lives in the
-  tensor client itself — `_resolve_cache_bytes`, off by default with
-  `BIOPB_CACHE_LOCAL=1` as the opt-out — the MCP kernel no longer overrides it.)
-- **`viewer`** — `compute_scheduler` (default `threads`; pins the napari
-  viewer's *serial* slice reads to a single-process scheduler via
-  `_viewer_compute.wrap_levels` so they share the one main-process `conn.client`
-  chunk cache instead of scattering across the distributed cluster's per-worker
-  caches — issue #8. The viewer being serial makes this free; the agent's
-  explicit `da` computes keep the distributed default. `synchronous` for fully
-  serial reads, `""` to disable wrapping). `async_slicing` (default `True`)
-  fetches viewer slices *off* the Qt main thread (napari experimental async
-  slicing, enabled via the `NAPARI_ASYNC` env var set in `_bootstrap.py` before
-  `import napari` — the `_LayerSlicer` captures the flag once at construction),
-  so a zoom into a not-yet-cached pyramid level keeps the current coarse texture
-  on screen instead of freezing for the cold read; the read still uses the
-  wrapped serial scheduler, just off-thread. `take_screenshot` force-syncs the
-  current view first (`_helpers.resync_view_for_capture`) so the agent's capture
-  reflects the state it set, not a pre-load frame. Set `False` to restore fully
-  synchronous slicing.
-- **`services.process_image_servers`** — the `grpc://`/`grpcs://`
-  ProcessImage URLs exposed as `ops`.
-- **`observe`** — the web observe UI (`_observe.py`): `enabled` (**on by
-  default / opt-out**; **http transport only** — it mounts on the MCP app so it
-  adds no surface beyond `/mcp`; under stdio it is silently skipped, since a
-  second HTTP server in the stdio process risks the fd-1 JSON-RPC channel and
-  races the kernel), `max_output_chars` (detail-view stdout cap, tail kept),
-  `poll_interval_ms` (page poll cadence).
+### Plugin entry points
 
-### Plugin Entry Points
-
-Defined in `napari.yaml` (manifest registered via the
-`napari.manifest` entry point in `pyproject.toml`):
+Defined in `napari.yaml` (registered via the `napari.manifest` entry point):
 - `Tensor Browser` → `biopb_mcp.tensor_browser:TensorBrowserWidget`
 - `Object Detection` → `biopb_mcp.image_processing:ObjectDetectionWidget`
 - `Image Processing` → `biopb_mcp.image_processing:ImageProcessingWidget`
 
-The console script `biopb-mcp` (`pyproject.toml [project.scripts]`) launches the
-MCP server.
+The console script `biopb-mcp` (`[project.scripts]`) launches the MCP server. The
+`image_processing` demo widgets use napari's `@thread_worker` (yield progress/
+results; connect `.yielded`/`.finished`/`.errored`; cancel via `.quit()`).
 
-### napari Thread Worker Pattern
+---
 
-The `image_processing` demo widgets use the `@thread_worker` decorator from
-`napari.qt.threading`. Workers:
-- Yield progress updates (`yield None`) or results (`yield value`)
-- Connect `.yielded`, `.finished`, `.errored` signals to callbacks
-- Support cancellation via `.quit()` and `.await_workers()`
+## Misc
 
-## macOS CI Testing
+### Single-origin web front
 
-macOS headless CI environments cannot initialize OpenGL contexts, causing
-segfaults when napari creates a viewer. Tests that use `make_napari_viewer` must
-be skipped on macOS CI:
+The control serves **one base-`/` SPA** and gives every plane its own path prefix,
+so the three `/api/*` namespaces that used to collide at the root never meet:
+
+| Path | Target | Hop |
+|---|---|---|
+| `/`, `/viewer`, `/admin`, `/assets/*` | control-served `web/` SPA | in-process |
+| `/api/*` | control's own API (`status`, `sessions`, `data_plane/{ensure,stop,restart}`) | in-process |
+| `/health` | bare liveness (installer / `_control_client`) | in-process |
+| `/data_plane/api/*`, `/data_plane/ws/render` | tensor sidecar (API-only) | loopback proxy |
+| `/session/<id>/observe` | control-served SPA observe shell | in-process |
+| `/session/<id>/api/*` | that session's observe API | loopback proxy |
+| `/mcp` | agent JSON-RPC — **not routed here**; shim → child, direct | — |
+
+The SPA is built with **base `/`** so `/assets/*` resolve from the root under any
+shell prefix. `/data_plane/*` is a pure prefix-stripping proxy into the (API-only)
+sidecar; control *verbs about* the plane live under `/api/data_plane/*`, so proxy
+and verbs never mix. Observe uses **SSE**, so the proxy is a streaming ASGI
+passthrough; explicit prefix `Mount`s (no root catch-all) keep the static
+`/`-fallback from swallowing `/session/<id>/*` or `/data_plane/*`.
+
+**Session registry.** Each session writes `~/.local/share/biopb/sessions/<id>.json`
+(host + port + pid + `/mcp` url) once reachable and removes it on reap; the control
+reads that dir. The contract is stdlib-only `biopb._config_sessions` (shim writes,
+control reads). `resolve()`/`list_sessions()` **self-heal** by pruning records
+whose owning pid is dead — or alive on a recycled pid (create-time token mismatch,
+the #138 PID-reuse guard, via `biopb._proc`) — so a dead session expires to a clean
+"session ended" rather than a hang.
+
+### Error-propagation model
+
+Letting an exception propagate *upward* — including out of a Qt callback — is
+**safe in both hosts and will not qFatal-abort the process**, so prefer surfacing
+real failures over swallowing them. PyQt6 only calls `qFatal()`/`abort()` on an
+unhandled slot exception when `sys.excepthook` is the *default* one, and a
+non-default hook is always installed: napari's `notification_manager` in the plugin
+(via `napari.run()`), ipykernel's `ZMQInteractiveShell.excepthook` in the MCP
+kernel (where `napari.run()` is never called — the `%gui qt` inputhook drives the
+loop). The only difference is *where* the error surfaces — a GUI notification vs. a
+printed traceback in the per-session kernel log. Caveat: this is crash-safety only;
+a propagated error in the kernel produces a log traceback, not an agent-facing
+message, so still catch where you want a clean, reported failure.
+
+### macOS CI testing
+
+macOS headless CI cannot initialize OpenGL, so napari-viewer creation segfaults.
+Skip such tests on macOS CI (apply at class level for viewer-using classes):
 
 ```python
 @pytest.mark.skipif(
@@ -391,58 +444,37 @@ be skipped on macOS CI:
 )
 ```
 
-Apply at the class level for test classes that require napari viewers. See
-`test_widget.py` and `test_progress_timer.py` for examples.
+See `test_widget.py` and `test_progress_timer.py`. Headless testing elsewhere uses
+`QT_QPA_PLATFORM=offscreen`; the QT API is pinned to pyqt6 in the pytest config.
 
-## Project Structure
+### Project structure
 
-- `src/biopb_mcp/` — main source
-  - `_connection.py` — GUI-independent `TensorConnection` data-access service
-    (incl. `start_source_watch`, the background self-healing-catalog watcher —
-    issue #44)
-  - `_config.py` — configuration management
-  - `_tensor_utils.py` — pyramid-level building and dimension utilities
-  - `_viewer_compute.py` — `wrap_levels` / `_ViewerArray`: pin viewer slice
-    reads to a single-process scheduler (issue #8)
-  - `_typing.py`, `_utils.py`, `_version.py`
-  - `napari.yaml` — plugin manifest
+- `src/biopb_mcp/`
+  - `_connection.py` — GUI-independent `TensorConnection` (incl. `start_source_watch`, #44)
+  - `_config.py` — configuration; `_tensor_utils.py` — pyramid/dimension utils
+  - `_viewer_compute.py` — `wrap_levels`/`_ViewerArray` (single-process viewer reads, #8)
+  - `_typing.py`, `_utils.py`, `_version.py`, `napari.yaml`
   - `tensor_browser/` — `_widget.py` (`TensorBrowserWidget`)
-  - `image_processing/` — experimental demo widgets and `biopb.image` gRPC:
-    - `_object_det_widget.py`, `_image_processing_widget.py`, `_widget_base.py`
-    - `_grpc.py`, `_chunking.py`, `_render.py`
-  - `mcp/` — MCP server module (optional; `pip install biopb-mcp[mcp]`)
-    - `__main__.py` / `__init__.py` — launcher + public API
-    - `_server.py` — FastMCP server, tools, resources
-    - `_kernel.py` — `KernelHost` (child Jupyter kernel lifecycle)
-    - `_jobs.py` — in-kernel async job runner (submit/poll/cancel, main-thread
-      marshaling, thread-aware stdout, user-action attribution)
-    - `_observe.py` — loopback web "observe" UI (job history + global
-      cancel/interrupt/restart), in the MCP server process
-    - `_bootstrap.py` — in-kernel bootstrap (namespace, viewer, dask, ops, jobs)
-    - `_process_ops.py` — `build_ops()` ProcessImage callables
-    - `_resources.py` — resource content strings
-    - `_helpers.py` — `add_tensor()` viewer patch + `viewer_window_alive()`
-      closed-window probe
-  - `_tests/` — test files
+  - `image_processing/` — demo widgets + `biopb.image` gRPC (`_grpc.py`, `_chunking.py`, `_render.py`, …)
+  - `mcp/` — MCP server module (optional `[mcp]` extra); see the file list above
+  - `_tests/`
 
-## Dependencies
+### Dependencies
 
-Main (from `pyproject.toml`):
-- numpy, pandas, magicgui, qtpy, scikit-image
-- `biopb[tensor] >= 0.5.4` (Arrow Flight tensor client)
-- opencv-python-headless
-- grpcio-tools, grpcio-health-checking
-- vedo (3D visualization)
+Main: numpy, pandas, magicgui, qtpy, scikit-image, `biopb[tensor] >= 0.5.4`
+(Arrow Flight client), opencv-python-headless, grpcio-tools,
+grpcio-health-checking, vedo (3D).
+MCP extra (`[mcp]`): `mcp >= 1.20`, `uvicorn >= 0.29`, `jupyter_client`,
+`ipykernel`, `psutil`, `distributed >= 2023.9`, `napari[all]`, `pyqt6`.
+Testing: pytest(-cov/-qt/-env), napari, pyqt6, jupyter_client, ipykernel,
+napari-skimage-regionprops. Versioning via setuptools_scm.
 
-Optional MCP extra (`pip install biopb-mcp[mcp]`):
-- `mcp >= 1.20`, `uvicorn >= 0.29`, `jupyter_client`, `ipykernel`, `psutil`
+### Code anchors
 
-Testing group includes: pytest, pytest-cov, pytest-qt, pytest-env, napari,
-pyqt6, jupyter_client, ipykernel, napari-skimage-regionprops.
-
-## Development Notes
-
-- setuptools_scm for versioning
-- magicgui for automatic GUI generation in the demo widgets
-- QT API set to pyqt6 in pytest configuration
-- Headless testing uses `QT_QPA_PLATFORM=offscreen`
+- `mcp/_shim.py` — session spawn/bridge/reap. `mcp/{_server,_kernel}.py` — FastMCP
+  app + `KernelHost`. `mcp/_observe.py` — per-session observe UI.
+- `_connection.py` — the pure client (asks the control to ensure the plane).
+- `biopb-control/src/biopb_control/` — `_control.py` (ASGI origin: SPA + plane
+  proxies), `_supervisor.py` (`DataPlaneSupervisor`).
+- `biopb/{_config_control,_config_sessions,_web_auth,_proc,_lifecycle}` — the
+  stdlib-only cross-process seams.

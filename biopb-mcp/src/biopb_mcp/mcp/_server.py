@@ -881,8 +881,8 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
 
     ``sock`` is an already-bound listening socket. When given we serve over it
     with an explicit ``uvicorn.Server`` instead of letting FastMCP bind ``port``
-    itself: the de-daemonized shim-owned child (docs/mcp-dedaemonization-migration.md,
-    Layer 1) binds port 0 up front so it can report the OS-assigned port back to
+    itself: the de-daemonized shim-owned child (ARCHITECTURE.md, Lifecycle)
+    binds port 0 up front so it can report the OS-assigned port back to
     its shim *before* serving, then hands the socket here. The Starlette app
     FastMCP builds carries the ``session_manager.run()`` lifespan on its own
     (``streamable_http_app``), so a plain uvicorn run drives it — identical to
@@ -912,6 +912,6 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
     asyncio.run(server.serve(sockets=[sock]))
 
 
-# run_stdio() is gone: this process serves http only (daemon migration,
-# Direction 1). stdio clients are served by the launcher's bridge mode
+# run_stdio() is gone: this process serves http only (the shim-owned session
+# model). stdio clients are served by the launcher's bridge mode
 # instead — see `_shim`, which fronts this server's /mcp endpoint.

@@ -331,7 +331,7 @@ Key properties of the coupling:
   (`/session/<id>/api/*`), so N dynamic-port sessions need no N bookmarks. The
   agentless `biopb mcp view` is the exception: a self-contained foreground viewer
   that stays off the control entirely. See
-  `biopb-mcp/docs/mcp-dedaemonization-migration.md`.
+  `biopb-mcp/ARCHITECTURE.md`.
 
 This coupling — *arbitrary agent code against a live, shared session* — is
 exactly why the kernel-isolation choices in §3 exist: the session must survive

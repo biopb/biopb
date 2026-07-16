@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 # Env var carrying the path of the file a shim-owned child publishes its
-# OS-assigned port to (de-daemonization Layer 1). Presence of this var is also
+# OS-assigned port to (the shim-owned session model). Presence of this var is also
 # how _serve_http tells a shim-owned child (dynamic port, reported back) from a
 # direct `--transport http` launch (fixed port). Kept in sync with _shim.
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
@@ -42,7 +42,7 @@ ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
 def _report_port(path, port):
     """Publish the OS-assigned ``port`` to the shim's report file.
 
-    The stdio shim (docs/mcp-dedaemonization-migration.md, Layer 1) spawns this
+    The stdio shim (ARCHITECTURE.md, Lifecycle) spawns this
     child with ``--port 0`` and a unique ``BIOPB_PORT_REPORT_FILE``, then polls
     that file for the real port to build its bridge URL. Written atomically
     (temp + ``os.replace``) so the shim never reads a half-written value.
@@ -398,7 +398,7 @@ def _serve_http(config, port, view=False):
 
     # Two foreground modes bind a *dynamic* port and report it back rather than
     # binding the configured fixed port:
-    #   * the de-daemonized shim-owned child (Layer 1) — the shim set
+    #   * the de-daemonized shim-owned child — the shim set
     #     BIOPB_PORT_REPORT_FILE and passed --port 0; it reaps us directly (own
     #     process group / Job Object) and we report the OS-assigned port back;
     #   * the agentless `biopb mcp view` viewer — a user-owned Ctrl-C session; it

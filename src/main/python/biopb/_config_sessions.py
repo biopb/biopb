@@ -16,10 +16,10 @@ here in the dependency-light core ``biopb`` SDK, beside ``_config_control`` /
 ``_config_location``. Kept **stdlib-only** so importing it never drags in the
 heavy server/mcp stacks and stays cheap on the featherweight shim.
 
-Why a filesystem registry (see ``mcp-dedaemonization-migration.md`` §6.1): it
+Why a filesystem registry (see ``biopb-mcp/ARCHITECTURE.md``): it
 matches the existing sentinel/PID-file idioms, needs no always-listening
 endpoint, and self-heals — a reader prunes any record whose owning process is
-gone, so a shim killed hard enough to skip its reap (§6.1 gotcha 3) leaves no
+gone, so a shim killed hard enough to skip its reap leaves no
 routing ghost. (HTTP self-registration would be the alternative only if the
 front and the sessions could later cross a machine boundary.)
 
@@ -219,7 +219,7 @@ def list_sessions(prune: bool = True) -> list[dict]:
     With ``prune`` (the default) a record whose owning process is gone — the pid
     is dead, or alive but a different process on a recycled pid — is dropped *and
     its file unlinked*. This is the registry's self-heal: a shim that died without
-    running its reap (§6.1 gotcha 3) leaves a ghost record that the first reader
+    running its reap leaves a ghost record that the first reader
     cleans up, so the control never proxies to a dead (or reused) port. A record
     with no usable pid, or one we cannot decide on, is kept (fail-open, so a
     transient probe error never hides a live session).
