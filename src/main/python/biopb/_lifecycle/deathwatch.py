@@ -9,14 +9,15 @@ mode 1). Shared by both owned-child owners: the biopb-mcp kernel (installed via
 ``IPKernelApp.exec_lines``, watching its session-child parent) and -- once the
 control supervisor passes the fd -- the tensor server (watching the control).
 
-For the kernel specifically: the daemon-owned dask cluster is *not* in the
-kernel's group (it lives in the daemon's); on daemon death its workers
-self-terminate on scheduler loss -- the sole reaper on an *uncatchable* daemon
-death (the daemon's own ``_shutdown`` / ``atexit`` close covers the graceful
-exits), which is why the ``mcp`` extra floors ``distributed>=2023.9``
-(post-``reconnect``, when a worker that loses its scheduler shuts down instead of
-retrying forever). Only under the ``dask.owner="kernel"`` escape hatch does the
-kernel's group also contain dask children this reap takes down.
+For the kernel specifically: the dask cluster is *not* in the kernel's group --
+it lives in the kernel's parent, the shim-owned session child (the MCP server
+process). On that parent's death its workers self-terminate on scheduler loss --
+the sole reaper on an *uncatchable* parent death (the parent's own ``_shutdown``
+/ ``atexit`` close covers the graceful exits), which is why the ``mcp`` extra
+floors ``distributed>=2023.9`` (post-``reconnect``, when a worker that loses its
+scheduler shuts down instead of retrying forever). Only under the
+``dask.owner="kernel"`` escape hatch does the kernel's group also contain dask
+children this reap takes down.
 
 Why a pipe and not ``PR_SET_PDEATHSIG``: the parent-death *signal* is tied to
 the **thread** that forked the child, so it fires early when a transient
