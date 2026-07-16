@@ -27,15 +27,6 @@ import tempfile
 logger = logging.getLogger(__name__)
 
 
-def _port_listening(port, timeout=0.5):
-    """Whether something already accepts TCP connections on 127.0.0.1:<port>."""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
 # Env var carrying the path of the file a shim-owned child publishes its
 # OS-assigned port to (de-daemonization Layer 1). Presence of this var is also
 # how _serve_http tells a shim-owned child (dynamic port, reported back) from a
