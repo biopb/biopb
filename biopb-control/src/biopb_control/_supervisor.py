@@ -1,9 +1,9 @@
 """Supervise the data (tensor) plane as a subprocess — never import it.
 
-:class:`DataPlaneSupervisor` owns the tensor-server process the way the existing
-``biopb server start`` command does (same ``python -m biopb_tensor_server.cli
-launch`` argv, same detach/log idiom), but *persistently*: it starts the plane,
-polls its liveness, and restarts it on crash with capped backoff. The control is
+:class:`DataPlaneSupervisor` owns the tensor-server process — it spawns ``python
+-m biopb_tensor_server.cli launch`` with the same detach/log idiom, but
+*persistently*: it starts the plane, polls its liveness, and restarts it on
+crash with capped backoff. The control is
 the **sole owner** of the data plane — it always spawns and manages its own
 child and never adopts a server it did not start; a gRPC port already held by
 another process is a *conflict* it refuses (surface, don't manage), not
@@ -140,10 +140,10 @@ class DataPlaneSupervisor:
         # loopback — no bypass signal is needed or read anymore. (A local
         # deployment *may* still carry a token; then the branch above sets it.)
         #
-        # Mark the plane as control-owned so its HTTP sidecar refuses the admin
-        # self-restart (`biopb server restart`), which would race this supervisor
-        # for ownership; the admin UI routes restarts through the control instead
-        # (biopb/biopb#418).
+        # Mark the plane as control-owned so its HTTP sidecar reports
+        # `supervised` on /api/admin/status; the admin UI then routes restarts
+        # through the control (POST /api/data_plane/restart) rather than telling
+        # the user the plane is self-managed (biopb/biopb#418).
         env["BIOPB_DATA_PLANE_SUPERVISED"] = "1"
         return env
 
