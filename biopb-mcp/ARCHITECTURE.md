@@ -344,12 +344,28 @@ a protocol:
   `startup/` semantics): a file's top-level defs land beside `viewer`/`client`/
   `ops`, and its functions resolve those live handles as globals **at call time**,
   so a `client` refreshed per-job is seen — exactly like agent code. The lowest-
-  friction path: drop a file, no packaging.
+  friction path: drop a file, no packaging. **biopb-mcp ships its built-in example
+  here**: the source lives in the wheel (`biopb_mcp/plugins/`, importable +
+  unit-tested), and the installer *seeds a copy* into this dir via the
+  `biopb-mcp-seed-plugins` console script (`plugins/_seed.py`) — idempotent,
+  never clobbering a user edit. Delivering it as a *file the user can see and
+  edit* (not a buried module) is the point of goal (1) "as an example," and the
+  startup-file load is robust to the kernel interpreter's metadata view (the
+  `python3` kernelspec need not be the tool env, so an entry point could be
+  invisible). The example, `rolling_ball.py`, exports `subtract_background` /
+  `rolling_ball_background` — a fast (shrink-then-roll, ~75× over
+  `skimage.restoration.rolling_ball` at radius 50) port of ImageJ's rolling-ball
+  background subtraction — filling a real algorithm gap (a segmentation-grade
+  background estimator the agent can't reproduce accurately in ad-hoc numpy). Its
+  imports/helpers are privately aliased so the startup exec contributes only the
+  two public callables; the seeded `__init__.py` (skipped by the loader — leading
+  `_`) documents the dir.
 - **`biopb_mcp.namespace` entry points** — the distribution path (a lab publishes a
-  plugin package, or the project ships its own reference tool). An entry point
-  resolves to a `register(namespace)` hook (reads the live handles, adds names) or
-  a module/mapping whose public names (honoring `__all__`, dropping imported
-  modules) are merged.
+  plugin package). An entry point resolves to a `register(namespace)` hook (reads
+  the live handles, adds names) or a module/mapping whose public names (honoring
+  `__all__`, dropping imported modules) are merged. biopb-mcp registers none of its
+  own (its built-in ships via the kernel-dir seed above); this path is for
+  third-party packages.
 
 Both are **fail-open per unit** (one bad plugin logs and is skipped, never aborts
 the bootstrap — the `build_ops`/skills precedent) and pass a **reserved-name
@@ -487,14 +503,16 @@ See `test_widget.py` and `test_progress_timer.py`. Headless testing elsewhere us
   - `_typing.py`, `_utils.py`, `_version.py`, `napari.yaml`
   - `tensor_browser/` — `_widget.py` (`TensorBrowserWidget`)
   - `image_processing/` — demo widgets + `biopb.image` gRPC (`_grpc.py`, `_chunking.py`, `_render.py`, …)
+  - `plugins/` — built-in example kernel plugin (`rolling_ball.py`) + `_seed.py`
+    (installer seeds it into `~/.config/biopb/kernel/`) + `__init__.py` namespace doc (#92)
   - `mcp/` — MCP server module (optional `[mcp]` extra); see the file list above
   - `_tests/`
 
 ### Dependencies
 
-Main: numpy, pandas, magicgui, qtpy, scikit-image, `biopb[tensor] >= 0.5.4`
-(Arrow Flight client), opencv-python-headless, grpcio-tools,
-grpcio-health-checking, vedo (3D).
+Main: numpy, pandas, magicgui, qtpy, scikit-image, scipy (rolling-ball plugin),
+`biopb[tensor] >= 0.5.4` (Arrow Flight client), opencv-python-headless,
+grpcio-tools, grpcio-health-checking, vedo (3D).
 MCP extra (`[mcp]`): `mcp >= 1.20`, `uvicorn >= 0.29`, `jupyter_client`,
 `ipykernel`, `psutil`, `distributed >= 2023.9`, `napari[all]`, `pyqt6`.
 Testing: pytest(-cov/-qt/-env), napari, pyqt6, jupyter_client, ipykernel,

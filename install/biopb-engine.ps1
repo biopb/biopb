@@ -486,6 +486,22 @@ $processImageServers
         Report-Ok "Created biopb-mcp config: $mcpConfig"
     }
 
+    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
+    # they load into the agent kernel namespace at startup and are visible as a
+    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
+    # there (not only an installed module) so it is user-visible/editable and
+    # loads via the robust startup-file path. Idempotent (never clobbers a
+    # user-edited file); best-effort so a failure never aborts the install.
+    $seedCmd = (Get-Command biopb-mcp-seed-plugins -ErrorAction SilentlyContinue).Source
+    if ($seedCmd) {
+        try {
+            & $seedCmd | Out-Null
+            Report-Ok "Seeded example kernel plugins: $ConfigDir\kernel"
+        } catch {
+            Report-Info "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
+        }
+    }
+
     # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
     $canonical = [pscustomobject]@{
         mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ command = $mcpCmd; args = $mcpArgs } }

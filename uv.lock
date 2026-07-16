@@ -693,6 +693,9 @@ dependencies = [
     { name = "qtpy" },
     { name = "scikit-image", version = "0.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-image", version = "0.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.optional-dependencies]
@@ -748,6 +751,7 @@ requires-dist = [
     { name = "pyqt6", marker = "extra == 'mcp'" },
     { name = "qtpy" },
     { name = "scikit-image" },
+    { name = "scipy" },
     { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.29" },
     { name = "vedo", marker = "extra == '3d'" },
 ]

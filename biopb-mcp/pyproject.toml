@@ -33,6 +33,10 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
+    # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
+    # requirement explicit.
+    "scipy",
     # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
     # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
     # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
@@ -120,6 +124,11 @@ testing = [
 
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
+# Light console entry (stdlib + biopb._config_location only, no kernel/napari
+# import) the installer calls to seed the built-in example kernel plugins
+# (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
+# tool" example, delivered as a visible file rather than a buried entry point.
+biopb-mcp-seed-plugins = "biopb_mcp.plugins._seed:_cli"
 
 [project.entry-points."napari.manifest"]
 biopb-mcp = "biopb_mcp:napari.yaml"

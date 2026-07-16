@@ -90,6 +90,9 @@ are produced.
   folder)
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
+- Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools
+  to the agent's namespace; the installer seeds a `rolling_ball.py` example there,
+  never clobbering your edits)
 - Webapp: `~/.local/share/biopb/webapp`
 
 ### Unattended / unmanned upgrades
