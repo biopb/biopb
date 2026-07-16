@@ -23,6 +23,16 @@ GUIDE = """\
 * Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
 * `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
+**User plugins may add more names** beyond this table (biopb-mcp#92): top-level
+definitions from `*.py` files in `~/.config/biopb/kernel/`, and installed
+`biopb_mcp.namespace` packages, are loaded into this namespace at kernel start.
+They're lab-specific helpers, not built-ins — so if you see an unfamiliar name,
+it's likely one of these. Discover and read them by introspection:
+```python
+[n for n in dir() if not n.startswith("_")]   # everything actually in scope
+inspect_object("<name>")                        # its signature + docstring
+```
+
 ## Long-running jobs & cancellation
 A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
 watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `cancel_job`

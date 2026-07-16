@@ -237,7 +237,11 @@ interface.
 
 The intended extension story is that different labs add their own
 domain-specific algorithm servers (compute plane) and tools (agent side) for
-their own problems.
+their own problems. On the agent side the low-friction path is a **user plugin**
+(`biopb/biopb-mcp#92`): drop a `*.py` file in `~/.config/biopb/kernel/` (or ship a
+`biopb_mcp.namespace` entry-point package) and its callables load straight into
+the kernel namespace, visible to the agent — capability is added by *putting
+objects in scope*, not by extending a protocol. See `biopb-mcp/ARCHITECTURE.md`.
 
 ### Polyglot by construction
 
