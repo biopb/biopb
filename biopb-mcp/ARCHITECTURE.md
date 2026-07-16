@@ -291,8 +291,8 @@ starts on demand (above).
   configures dask, builds the `TensorConnection`, opens the viewer + Tensor
   Browser, builds `ops`, installs the job runner and the viewer proxy, wires the
   window-close hook, starts the source watcher (#44, also for headless), populates
-  the namespace. On failure prints a `BOOTSTRAP_ERROR` sentinel; the host detects
-  success via `'viewer' in dir()`.
+  the namespace, then loads **user plugins** into it (below). On failure prints a
+  `BOOTSTRAP_ERROR` sentinel; the host detects success via `'viewer' in dir()`.
 - `_jobs.py` — runs **inside the kernel**. The async job runner: `execute_code`
   runs agent code in a **background daemon thread**, so the kernel main thread (and
   its `%gui qt` loop) stays free to service `take_screenshot`/`server_status`/
@@ -334,6 +334,35 @@ starts on demand (above).
 or `None`, refreshed per-call), `ops` (`dict[str, callable]` of ProcessImage ops,
 possibly empty).
 
+**User plugins — the low-friction "bring your own tool" path (#92).** Beyond the
+built-in handles, `_bootstrap._load_namespace_plugins` (gated by
+`services.namespace_enabled`, on by default) loads two extra sources into the same
+namespace, so a lab adds capability by *putting objects in scope*, not by extending
+a protocol:
+
+- **`~/.config/biopb/kernel/*.py`** — `exec`'d directly in the namespace (IPython
+  `startup/` semantics): a file's top-level defs land beside `viewer`/`client`/
+  `ops`, and its functions resolve those live handles as globals **at call time**,
+  so a `client` refreshed per-job is seen — exactly like agent code. The lowest-
+  friction path: drop a file, no packaging.
+- **`biopb_mcp.namespace` entry points** — the distribution path (a lab publishes a
+  plugin package, or the project ships its own reference tool). An entry point
+  resolves to a `register(namespace)` hook (reads the live handles, adds names) or
+  a module/mapping whose public names (honoring `__all__`, dropping imported
+  modules) are merged.
+
+Both are **fail-open per unit** (one bad plugin logs and is skipped, never aborts
+the bootstrap — the `build_ops`/skills precedent) and pass a **reserved-name
+guard**: a plugin overwriting a load-bearing handle (`viewer`/`client`/`np`/`da`/
+`ops`/…) is restored-or-skipped with a warning (the two attach-thread-owned names,
+`_dask_client`/`_dask_attach_done`, are left untouched to avoid racing that
+thread). There is **no generated enumeration** — the `guide://kernel` resource
+tells the agent plugins may exist and where they came from, and the agent
+discovers them with `dir()` / `inspect_object` (the docstring *is* the doc, so code
+and doc can't drift). The control dashboard's algorithm-plane panel shows a
+**static** listing of the files + installed packages (read never executed,
+invariant I2; via `biopb._kernel_plugins`), not the live namespace.
+
 ### Configuration (`_config.py`)
 
 The config lives at `~/.config/biopb/mcp-config.json` — co-located with the tensor
@@ -369,7 +398,9 @@ default. Sections are **flat / top-level** (each maps 1:1 to a section dataclass
   wrap_levels`). `async_slicing` (default `True`; fetches slices off the Qt main
   thread via `NAPARI_ASYNC`, so a zoom into a cold pyramid level keeps the current
   texture instead of freezing; `take_screenshot` force-syncs first).
-- **`services.process_image_servers`** — the ProcessImage URLs exposed as `ops`.
+- **`services.process_image_servers`** — the ProcessImage URLs exposed as `ops`;
+  `services.skills_*` (the skills catalog); `services.namespace_enabled` (load user
+  kernel plugins, #92 — see the `execute_code` namespace above).
 - **`observe`** — `enabled` (on by default, http only), `max_output_chars`,
   `poll_interval_ms`.
 

@@ -386,6 +386,13 @@ class ServicesConfig:
         "Seconds a fetched skills catalog is reused before re-fetching. A stale "
         "on-disk cache is still used past this if the network is down.",
     )
+    namespace_enabled: bool = _h(
+        True,
+        "Load user 'bring your own tool' plugins into the agent kernel namespace at "
+        "start: *.py files in ~/.config/biopb/kernel/ and installed "
+        "biopb_mcp.namespace packages (biopb/biopb-mcp#92). Off -> a clean "
+        "built-in-only namespace.",
+    )
 
 
 @dataclass

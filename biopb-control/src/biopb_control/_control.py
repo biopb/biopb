@@ -78,7 +78,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from biopb import _agents, _algorithms, _config_sessions, _web_auth
+from biopb import _agents, _algorithms, _config_sessions, _kernel_plugins, _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -626,11 +626,24 @@ def build_app(
         # concurrently, bounded by one probe timeout), so Starlette runs it in the
         # threadpool. Polled on demand (a dashboard button), not on the interval,
         # because it dials external servers.
+        #
+        # `plugins` folds in the kernel-namespace "bring your own tool" surface
+        # (biopb/biopb-mcp#92) -- a static, stdlib-only listing of the ~/.config/
+        # biopb/kernel/ files and biopb_mcp.namespace packages, read (never
+        # executed, invariant I2) via _kernel_plugins. It renders in the same
+        # algorithm-plane card; a summary read failure degrades to empty rather
+        # than 500-ing the servers view alongside it.
         try:
-            return JSONResponse({"servers": _algorithms.statuses()})
+            servers = _algorithms.statuses()
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
+        try:
+            plugins = _kernel_plugins.summary()
+        except Exception:  # noqa: BLE001 - inspector is never-raise; belt-and-braces
+            logger.exception("api/algorithms plugin summary failed")
+            plugins = {"dir": "", "files": [], "entry_points": []}
+        return JSONResponse({"servers": servers, "plugins": plugins})
 
     def api_mcp_config(_request: Request) -> JSONResponse:
         # The biopb-mcp settings editor's backing read: the raw on-disk config +

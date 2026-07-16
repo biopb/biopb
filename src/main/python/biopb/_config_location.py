@@ -115,6 +115,20 @@ def mcp_config_path() -> Path:
     return config_dir() / MCP_CONFIG_NAME
 
 
+def mcp_plugin_dir() -> Path:
+    """User kernel-plugin dir (``~/.config/biopb/kernel``).
+
+    ``*.py`` files here are loaded into the biopb-mcp agent kernel's namespace at
+    bootstrap -- the low-friction "bring your own tool" path (biopb/biopb-mcp#92),
+    beside the installed ``biopb_mcp.namespace`` entry-point packages. Config-tree
+    (user-authored), co-located with ``mcp-config.json``. Resolved at call time for
+    test isolation and **not created on access**: absence is the normal no-plugins
+    case and the loader / the dashboard inspector simply find nothing, so a bare
+    read must not materialize an empty dir.
+    """
+    return config_dir() / "kernel"
+
+
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     """Resolve the config file in *config_dir*, preferring JSON over TOML.
 
