@@ -1,11 +1,12 @@
 """Tests for biopb._lifecycle.owned_child (the Pattern O primitive).
 
-POSIX-exercisable: spawn a real Python child, assert liveness/identity, and the
-graceful-then-hard stop escalation. The Windows Job Object bind is covered
-separately (biopb._lifecycle.winjob is a no-op off Windows); here spawn/stop run
-the POSIX path.
+Spawn a real Python child, assert liveness/identity, and the graceful-then-hard
+stop escalation. Runs on every OS: the stop escalation differs by platform
+(SIGTERM->SIGKILL on POSIX; TerminateJobObject on Windows), and spawn binds a
+Job Object on Windows (a no-op off it), so the identity check gates on os.name.
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -46,8 +47,10 @@ class TestSpawn:
             assert child.alive() is True
             assert child.poll() is None
             assert child.returncode is None
-            # POSIX takes no Job Object; the process group is the bind.
-            assert child.job is None
+            if os.name == "nt":
+                assert child.job is not None  # Windows: a kill-on-close Job Object
+            else:
+                assert child.job is None  # POSIX: reaped via the group, not a job
         finally:
             child.stop()
 
