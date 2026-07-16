@@ -33,6 +33,10 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
+    # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
+    # requirement explicit.
+    "scipy",
     # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
     # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
     # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
@@ -123,6 +127,14 @@ biopb-mcp = "biopb_mcp.mcp.__main__:main"
 
 [project.entry-points."napari.manifest"]
 biopb-mcp = "biopb_mcp:napari.yaml"
+
+# Built-in kernel-namespace plugins (#92): loaded into the agent kernel's
+# namespace at bootstrap by mcp/_bootstrap._load_entry_point_plugins, the same
+# path a lab's own biopb_mcp.namespace package takes. Each value is a module whose
+# public (__all__) names are merged in. rolling-ball ships the fast ImageJ port of
+# rolling-ball background subtraction as both a useful op and a reference example.
+[project.entry-points."biopb_mcp.namespace"]
+rolling-ball = "biopb_mcp.plugins.rolling_ball"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/biopb/biopb/issues"

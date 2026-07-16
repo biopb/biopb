@@ -241,7 +241,9 @@ their own problems. On the agent side the low-friction path is a **user plugin**
 (`biopb/biopb-mcp#92`): drop a `*.py` file in `~/.config/biopb/kernel/` (or ship a
 `biopb_mcp.namespace` entry-point package) and its callables load straight into
 the kernel namespace, visible to the agent — capability is added by *putting
-objects in scope*, not by extending a protocol. See `biopb-mcp/ARCHITECTURE.md`.
+objects in scope*, not by extending a protocol. biopb-mcp ships one such built-in
+as the reference example (`biopb_mcp/plugins/rolling_ball.py`, a fast ImageJ port
+of rolling-ball background subtraction). See `biopb-mcp/ARCHITECTURE.md`.
 
 ### Polyglot by construction
 

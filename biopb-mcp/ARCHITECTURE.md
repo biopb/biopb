@@ -349,7 +349,14 @@ a protocol:
   plugin package, or the project ships its own reference tool). An entry point
   resolves to a `register(namespace)` hook (reads the live handles, adds names) or
   a module/mapping whose public names (honoring `__all__`, dropping imported
-  modules) are merged.
+  modules) are merged. **biopb-mcp ships one built-in here** (`biopb_mcp/plugins/`):
+  `rolling-ball` → a module exporting `subtract_background` /
+  `rolling_ball_background`, a fast (shrink-then-roll, ~75× over
+  `skimage.restoration.rolling_ball` at radius 50) port of ImageJ's rolling-ball
+  background subtraction. It fills a real algorithm gap (a segmentation-grade
+  background estimator the agent can't reproduce accurately in ad-hoc numpy) and
+  doubles as the reference example of the entry-point path — a plain module, no
+  biopb-internal imports.
 
 Both are **fail-open per unit** (one bad plugin logs and is skipped, never aborts
 the bootstrap — the `build_ops`/skills precedent) and pass a **reserved-name
@@ -487,14 +494,15 @@ See `test_widget.py` and `test_progress_timer.py`. Headless testing elsewhere us
   - `_typing.py`, `_utils.py`, `_version.py`, `napari.yaml`
   - `tensor_browser/` — `_widget.py` (`TensorBrowserWidget`)
   - `image_processing/` — demo widgets + `biopb.image` gRPC (`_grpc.py`, `_chunking.py`, `_render.py`, …)
+  - `plugins/` — built-in `biopb_mcp.namespace` kernel plugins (`rolling_ball.py`, #92)
   - `mcp/` — MCP server module (optional `[mcp]` extra); see the file list above
   - `_tests/`
 
 ### Dependencies
 
-Main: numpy, pandas, magicgui, qtpy, scikit-image, `biopb[tensor] >= 0.5.4`
-(Arrow Flight client), opencv-python-headless, grpcio-tools,
-grpcio-health-checking, vedo (3D).
+Main: numpy, pandas, magicgui, qtpy, scikit-image, scipy (rolling-ball plugin),
+`biopb[tensor] >= 0.5.4` (Arrow Flight client), opencv-python-headless,
+grpcio-tools, grpcio-health-checking, vedo (3D).
 MCP extra (`[mcp]`): `mcp >= 1.20`, `uvicorn >= 0.29`, `jupyter_client`,
 `ipykernel`, `psutil`, `distributed >= 2023.9`, `napari[all]`, `pyqt6`.
 Testing: pytest(-cov/-qt/-env), napari, pyqt6, jupyter_client, ipykernel,
