@@ -303,6 +303,192 @@ def _start_update_check(viewer, config):
     threading.Thread(target=_worker, name="biopb-update-check", daemon=True).start()
 
 
+# Load-bearing namespace names a user plugin (#92) must not shadow. The merge
+# guard skips any of these; the startup-file save/restore protects all except the
+# two owned by the background dask-attach thread (below), which it must not race.
+_RESERVED_NAMES = frozenset(
+    {
+        "viewer",
+        "client",
+        "np",
+        "da",
+        "ops",
+        "run_on_main",
+        "cancelled",
+        "_conn",
+        "_jobs",
+        "_dask_client",
+        "_dask_attach_done",
+        "_viewer_window_alive",
+        "_resync_view",
+    }
+)
+# Written only by the daemon attach thread (its sole-writer invariant, step 3), so
+# a plugin exec must NOT snapshot+restore them — that would race the attach and
+# could revert a just-attached Client.
+_ATTACH_OWNED = frozenset({"_dask_client", "_dask_attach_done"})
+
+
+def _public_names(mapping: dict) -> dict:
+    """The names a module/mapping plugin contributes: ``__all__`` if declared, else
+    every public (non-``_``) name that is not itself an imported module (so a
+    plugin's ``import numpy as np`` doesn't leak ``np`` into the namespace)."""
+    import types
+
+    declared = mapping.get("__all__")
+    if isinstance(declared, list | tuple):
+        return {k: mapping[k] for k in declared if k in mapping}
+    return {
+        k: v
+        for k, v in mapping.items()
+        if not k.startswith("_") and not isinstance(v, types.ModuleType)
+    }
+
+
+def _merge_names(ip, names: dict, *, source: str) -> None:
+    """Merge plugin-contributed *names* into the kernel namespace, skipping any
+    reserved load-bearing name (warned, never silently)."""
+    ns = ip.user_ns
+    for key, value in names.items():
+        if key in _RESERVED_NAMES:
+            logger.warning(
+                "kernel plugin %s would shadow reserved name %r; skipped",
+                source,
+                key,
+            )
+            continue
+        ns[key] = value
+
+
+def _load_startup_files(ip, plugin_dir) -> None:
+    """Exec each ``*.py`` in *plugin_dir* directly in the kernel namespace.
+
+    IPython ``startup/`` semantics: a file's top-level defs land beside ``viewer``/
+    ``client``/``ops``, and its functions resolve those live handles as globals at
+    call time -- exactly like agent ``execute_code`` (which also runs in this
+    namespace), so ``client`` refreshed per-job is seen. Fail-open per file. Any
+    load-bearing name the file overwrites is restored (warned); the two
+    attach-thread-owned names are left untouched to avoid racing that thread.
+    """
+    try:
+        paths = sorted(plugin_dir.glob("*.py"))
+    except OSError:
+        return
+    ns = ip.user_ns
+    protect = _RESERVED_NAMES - _ATTACH_OWNED
+    for path in paths:
+        if path.name.startswith("_"):
+            continue
+        saved = {k: ns[k] for k in protect if k in ns}
+        try:
+            code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            exec(code, ns)  # noqa: S102 - user plugin; this kernel is RCE by design
+            logger.info("Loaded kernel plugin file: %s", path.name)
+        except Exception:
+            logger.exception("kernel plugin file %s failed to load", path.name)
+        finally:
+            for key, value in saved.items():
+                if ns.get(key) is not value:
+                    logger.warning(
+                        "kernel plugin %s overwrote reserved name %r; restored",
+                        path.name,
+                        key,
+                    )
+                    ns[key] = value
+
+
+def _load_entry_point_plugins(ip) -> None:
+    """Load ``biopb_mcp.namespace`` entry-point packages into the namespace.
+
+    An entry point resolving to a ``register(namespace)`` callable is called with a
+    read-through snapshot of the live namespace (it can inspect the handles and add
+    names); one resolving to a module or mapping has its public names merged. All
+    merges pass the reserved-name guard; fail-open per entry point.
+    """
+    from biopb._kernel_plugins import NAMESPACE_ENTRY_POINT_GROUP
+
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:  # pragma: no cover - stdlib since 3.8
+        return
+    try:
+        eps = list(entry_points(group=NAMESPACE_ENTRY_POINT_GROUP))
+    except Exception:
+        logger.debug("kernel plugin: entry-point discovery failed", exc_info=True)
+        return
+
+    import types
+    from collections.abc import Mapping
+
+    for ep in eps:
+        try:
+            obj = ep.load()
+        except Exception:
+            logger.exception("kernel plugin entry point %r failed to import", ep.name)
+            continue
+        try:
+            if isinstance(obj, types.ModuleType):
+                _merge_names(ip, _public_names(vars(obj)), source=ep.name)
+            elif isinstance(obj, Mapping):
+                # A returned mapping is a namespace-like source (like a module), so
+                # filter it the same way: public names / honor __all__, drop the
+                # odd dunder. (A register() hook, by contrast, writes literally.)
+                _merge_names(ip, _public_names(dict(obj)), source=ep.name)
+            elif callable(obj):
+                # A read-through snapshot: register() sees the live handles, and we
+                # merge only what it newly bound (guarded) rather than let it write
+                # straight into user_ns and clobber a built-in.
+                snapshot = dict(ip.user_ns)
+                obj(snapshot)
+                writes = {
+                    k: v
+                    for k, v in snapshot.items()
+                    if ip.user_ns.get(k, _MISSING) is not v
+                }
+                _merge_names(ip, writes, source=ep.name)
+            else:
+                logger.warning(
+                    "kernel plugin entry point %r is not a register()/module/mapping;"
+                    " ignored",
+                    ep.name,
+                )
+                continue
+            logger.info("Loaded kernel plugin entry point: %s", ep.name)
+        except Exception:
+            logger.exception("kernel plugin entry point %r failed to load", ep.name)
+
+
+def _load_namespace_plugins(ip, config) -> None:
+    """Load user "bring your own tool" plugins into the kernel namespace (#92).
+
+    Two sources, both fail-open per unit so one bad plugin never breaks the
+    bootstrap (the ``build_ops`` / skills precedent): ``*.py`` files under
+    ``~/.config/biopb/kernel/`` and installed ``biopb_mcp.namespace`` entry points.
+    Called after the built-in handles exist (step 7) so plugins can reference them.
+    Gated by ``services.namespace_enabled``.
+    """
+    from .._config import get_setting
+
+    if not get_setting(config, "services.namespace_enabled", True):
+        logger.info("kernel plugins disabled (services.namespace_enabled=false)")
+        return
+    from biopb._config_location import mcp_plugin_dir
+
+    try:
+        _load_startup_files(ip, mcp_plugin_dir())
+    except Exception:
+        logger.exception("kernel plugin: startup-file load failed")
+    try:
+        _load_entry_point_plugins(ip)
+    except Exception:
+        logger.exception("kernel plugin: entry-point load failed")
+
+
+# Sentinel for "key absent" in the entry-point snapshot diff (a plugin may bind a
+# value that equals None, so `.get(k)` alone can't distinguish absent from None).
+_MISSING = object()
+
+
 def bootstrap():
     """Entry point called from the kernel's exec_lines."""
     try:
@@ -568,6 +754,13 @@ def _bootstrap_impl():
             "_resync_view": lambda: resync_view_for_capture(viewer),
         }
     )
+
+    # 7b. User "bring your own tool" plugins (#92): load *.py files from
+    #     ~/.config/biopb/kernel/ and biopb_mcp.namespace entry points into the
+    #     namespace now that the built-in handles (viewer/client/np/da/ops) exist,
+    #     so a plugin's code can reference them. Fail-open per plugin; the reserved
+    #     handles are guarded against a shadowing plugin.
+    _load_namespace_plugins(ip, config)
 
     # 8. Background source-catalog watcher (issue #44): a daemon thread that
     #    health-checks the server and re-lists sources when its source_count

@@ -799,6 +799,35 @@ def test_api_algorithms_lists_probed_servers(control, monkeypatch):
     assert json.loads(body)["servers"] == fake
 
 
+def test_api_algorithms_folds_in_kernel_plugins(control, monkeypatch):
+    # The kernel-plugin "bring your own tool" listing (biopb-mcp#92) rides in the
+    # same payload under `plugins`, from the stubbed core inspector.
+    monkeypatch.setattr("biopb._algorithms.statuses", list)
+    fake_plugins = {
+        "dir": "/home/u/.config/biopb/kernel",
+        "files": [{"name": "tool.py", "summary": "My tool."}],
+        "entry_points": [{"name": "lab", "dist": "lab-tools 1.2"}],
+    }
+    monkeypatch.setattr("biopb._kernel_plugins.summary", lambda: fake_plugins)
+    status, _h, body = _get(f"{control}/api/algorithms")
+    assert status == 200
+    assert json.loads(body)["plugins"] == fake_plugins
+
+
+def test_api_algorithms_plugin_error_degrades_not_500(control, monkeypatch):
+    # A servers sweep succeeds but the plugin inspector blows up: the panel still
+    # returns 200 with an empty plugin listing rather than 500-ing the whole card.
+    monkeypatch.setattr("biopb._algorithms.statuses", list)
+
+    def boom():
+        raise RuntimeError("plugin dir unreadable")
+
+    monkeypatch.setattr("biopb._kernel_plugins.summary", boom)
+    status, _h, body = _get(f"{control}/api/algorithms")
+    assert status == 200
+    assert json.loads(body)["plugins"] == {"dir": "", "files": [], "entry_points": []}
+
+
 def test_api_algorithms_core_error_is_500(control, monkeypatch):
     def boom():
         raise RuntimeError("config unreadable")
