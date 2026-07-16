@@ -621,9 +621,9 @@ def serve(config, port=None):
     logger.warning(
         "stdio is served by bridging to a private biopb-mcp http session this "
         "shim spawns and owns (torn down when this client disconnects). Native "
-        "http is recommended where the client supports it: "
-        "`claude mcp add --transport http biopb http://127.0.0.1:<port>/mcp` "
-        "against a `biopb mcp start` session."
+        "http is recommended where the client supports it: run a persistent "
+        "`biopb-mcp --transport http` server and attach with "
+        "`claude mcp add --transport http biopb http://127.0.0.1:<port>/mcp`."
     )
     # Best-effort, non-blocking: get the durable control plane (which owns the data
     # plane the kernel will talk to) coming up -- WITHOUT waiting for or verifying

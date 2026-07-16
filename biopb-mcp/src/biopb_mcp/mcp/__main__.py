@@ -4,9 +4,9 @@ Under the http transport this process *is* the MCP server: it owns a child
 Jupyter kernel that hosts a visible napari viewer when a display is available,
 or a compute-only headless kernel when none is (see
 ``transport.display_mode``).  Under the (deprecated) stdio transport it is
-instead a thin bridge: it ensures the http daemon is running on the configured
-loopback port — spawning it detached if needed — and pumps stdio JSON-RPC to
-it (see ``_shim``).  Run it with::
+instead a thin bridge: it spawns its own http session child on a dynamic port
+and pumps stdio JSON-RPC to it, reaping it on disconnect (see ``_shim``).  Run
+it with::
 
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
@@ -23,8 +23,6 @@ import signal
 import socket
 import sys
 import tempfile
-import threading
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -38,87 +36,10 @@ def _port_listening(port, timeout=0.5):
         return False
 
 
-def _self_create_time():
-    """This process's creation-time token, or None if it can't be determined.
-
-    Delegates to biopb._proc.process_create_time (the single source of truth
-    shared with biopb.cli, so the token this daemon writes is computed exactly
-    the way the CLI reads it) for os.getpid(): a per-process identity that lets
-    `biopb mcp stop`/`status` tell our daemon apart from an unrelated process
-    that later inherits a reused PID (Windows never cleans the PID file at logout
-    and recycles PIDs aggressively). None -> the CLI falls back to a liveness-only
-    check, the pre-fix behavior. Best-effort: any failure degrades to None.
-    """
-    try:
-        from biopb._proc import process_create_time
-
-        return process_create_time(os.getpid())
-    except Exception:
-        return None
-
-
-def _pidfile_contents():
-    """The text to write into the PID file: `pid` plus, when known, a `pid\\ntoken`
-    create-time identity. Read back by biopb.cli._read_pid_record (two whitespace-
-    separated ints, tolerant of the legacy bare-pid form)."""
-    pid = os.getpid()
-    token = _self_create_time()
-    return f"{pid}\n{token}" if token is not None else str(pid)
-
-
-def _write_pidfile(port):
-    """Best-effort: record this daemon's PID so `biopb mcp status` finds it.
-
-    The PID file is the one signal `status` trusts, and the stdio shim spawns
-    the daemon detached without writing it — so the daemon registers itself
-    here, covering every launch path uniformly. Best-effort: a write failure
-    only costs `status` visibility, never the server.
-
-    Records a create-time identity token alongside the PID (see
-    :func:`_self_create_time`) so the CLI can distinguish this daemon from an
-    unrelated process that later inherits a reused PID.
-
-    Concurrent first-run shims can each spawn a daemon; only the one that binds
-    the port survives (the rest die on EADDRINUSE). Re-checking the port
-    immediately before writing keeps a soon-to-die loser from clobbering the
-    winner's PID; pid-safe removal (see :func:`_remove_pidfile`) keeps a loser's
-    exit from deleting the winner's file.
-    """
-    from .._config import get_pid_file
-
-    pidfile = get_pid_file()
-    try:
-        if _port_listening(port):
-            # Someone already owns the port; we are about to lose the bind.
-            return None
-        pidfile.parent.mkdir(parents=True, exist_ok=True)
-        pidfile.write_text(_pidfile_contents())
-        return pidfile
-    except OSError:
-        logger.warning("Could not write PID file %s", pidfile, exc_info=True)
-        return None
-
-
-def _remove_pidfile(pidfile):
-    """Remove our PID file, but only if it still names this process.
-
-    Pid-safe so a losing daemon's exit never deletes the winner's file. Compares
-    only the first whitespace-separated field (the PID), ignoring any trailing
-    create-time token, so the match holds regardless of token presence.
-    """
-    if pidfile is None:
-        return
-    try:
-        if pidfile.read_text().split()[0] == str(os.getpid()):
-            pidfile.unlink()
-    except (OSError, ValueError, IndexError):
-        pass
-
-
 # Env var carrying the path of the file a shim-owned child publishes its
 # OS-assigned port to (de-daemonization Layer 1). Presence of this var is also
-# how _serve_http tells a shim-owned child (dynamic port, no PID file / sentinel)
-# from the standalone `biopb mcp start` daemon. Kept in sync with _shim.
+# how _serve_http tells a shim-owned child (dynamic port, reported back) from a
+# direct `--transport http` launch (fixed port). Kept in sync with _shim.
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
 # Env var the stdio shim sets to the child's own session logfile path, so the
@@ -151,72 +72,6 @@ def _report_port(path, port):
         logger.warning("Could not write port report file %s", path, exc_info=True)
 
 
-def _shutdown_sentinel_path():
-    """Path of the stop-sentinel file `biopb mcp stop` writes on Windows.
-
-    A sibling of the PID file with a single fixed name — NOT keyed by PID: on
-    Windows the PID the CLI recorded can differ from this daemon's os.getpid()
-    (Store-Python/uv launcher shims), so a pid-keyed name would make stop and
-    the daemon disagree. There is only ever one daemon (the PID file is
-    singular too), so a fixed name is unambiguous. The biopb CLI hardcodes the
-    same name next to its hardcoded MCP_PID_FILE (biopb.cli._mcp_shutdown_sentinel);
-    keep the two in sync.
-    """
-    from .._config import get_pid_file
-
-    return get_pid_file().with_name("mcp-server.stop")
-
-
-def _install_shutdown_sentinel_watcher(sentinel, shutdown, poll=0.2):
-    """Let `biopb mcp stop` shut this daemon down gracefully on Windows.
-
-    There, ``os.kill(pid, SIGTERM)`` is an unconditional TerminateProcess —
-    immediate and uncatchable, so the SIGTERM handler installed in _serve_http
-    never runs and the kernel is left to ipykernel's in-kernel parent poller,
-    which reaps abruptly (``os._exit(1)``: no dask/Qt close, no spill-dir
-    cleanup) and not at all when the kernel is GIL-wedged (issue #323). So on
-    Windows `stop` instead drops a sentinel *file*; this watcher thread polls
-    for it and runs the same shared shutdown as the POSIX signal handler,
-    reaping the kernel from *outside* regardless of the kernel's internal
-    state. Same mechanism as the tensor server's `biopb server stop`
-    (http_server._install_windows_shutdown_listener), minus the uvicorn nudge:
-    ``shutdown`` here ``os._exit``\\ s and never returns, so the sentinel is
-    consumed *before* calling it.
-
-    A leftover sentinel from a previous run is cleared once, up front, so the
-    watch loop can treat *any* existing sentinel as a live stop request with no
-    clock comparison. (The former mtime guard compared the filesystem's
-    ``st_mtime`` against a process-clock ``time.time()``; on a filesystem whose
-    mtime granularity is coarser than ``time.time()`` a freshly written sentinel
-    could round to just below install time and be misread as stale, dropping a
-    real stop -- biopb/biopb#345.) The *caller* gates installation on Windows
-    (POSIX uses real signals and needs no watcher); the function itself is
-    platform-agnostic so tests exercise it on every OS.
-    """
-    # Clear a stale leftover exactly once at install, so "fresh vs. leftover"
-    # needs no mtime/clock comparison: after this, any sentinel that appears was
-    # written by a stop request racing or following this watcher.
-    try:
-        sentinel.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    def _watch():
-        while True:
-            try:
-                if sentinel.exists():
-                    logger.info("Stop sentinel found; shutting down.")
-                    sentinel.unlink(missing_ok=True)
-                    shutdown("stop sentinel")
-                    return
-            except OSError:
-                pass
-            time.sleep(poll)
-
-    threading.Thread(target=_watch, name="mcp-stop-sentinel", daemon=True).start()
-    logger.info("Stop-sentinel watcher installed (%s).", sentinel)
-
-
 def _parse_args(argv, default_transport, default_port):
     """Parse launcher CLI args (separated out so it is unit-testable)."""
     parser = argparse.ArgumentParser(
@@ -228,8 +83,9 @@ def _parse_args(argv, default_transport, default_port):
         choices=["http", "stdio"],
         default=default_transport,
         help="Front-end transport (default from config; falls back to stdio). "
-        "stdio is deprecated: it is now served by bridging to the local http "
-        "daemon (spawned on demand); prefer connecting over http directly.",
+        "stdio is deprecated: it is now served by bridging to a private http "
+        "session child the shim spawns on demand; prefer connecting over http "
+        "directly.",
     )
     parser.add_argument(
         "--port",
@@ -243,9 +99,8 @@ def _parse_args(argv, default_transport, default_port):
         help="Agentless viewer: open the napari viewer directly in the "
         "foreground and block until Ctrl-C. Forces a visible display and an "
         "eager kernel start (the window opens now, not on a start_kernel call); "
-        "still serves /mcp on a dynamic port for optional agent attach. Writes "
-        "no PID file — it is a user-owned foreground session, not the managed "
-        "`biopb mcp start` daemon. Fronted by `biopb mcp view`.",
+        "still serves /mcp on a dynamic port for optional agent attach. A "
+        "user-owned foreground session. Fronted by `biopb mcp view`.",
     )
     return parser.parse_args(argv)
 
@@ -372,8 +227,8 @@ def main(argv=None):
 
     if opts.transport == "stdio":
         # Bridge mode: keep this process featherweight — the heavy stack
-        # (FastMCP/uvicorn/kernel plumbing) is only imported by the daemon it
-        # spawns. Any bridge failure exits nonzero so the client sees EOF
+        # (FastMCP/uvicorn/kernel plumbing) is only imported by the owned session
+        # child it spawns. Any bridge failure exits nonzero so the client sees EOF
         # rather than a hung server entry.
         from . import _shim
 
@@ -393,8 +248,7 @@ def _serve_http(config, port, view=False):
     ``view`` selects the agentless-viewer mode (`biopb mcp view`): force a
     visible display, bind a dynamic port and print its URL, and start the
     kernel/viewer eagerly so the window opens immediately instead of on the
-    first ``start_kernel`` tool call. Like a shim-owned child (and unlike the
-    managed ``biopb mcp start`` daemon) it writes no PID file / stop sentinel.
+    first ``start_kernel`` tool call.
     """
     from .._config import get_setting
     from . import _server
@@ -461,8 +315,8 @@ def _serve_http(config, port, view=False):
 
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
-    # the launcher's stdout/stderr — which, when the daemon was spawned by the
-    # stdio shim, is the daemon log file (see _shim._open_daemon_log).
+    # the launcher's stdout/stderr — which, for a shim-spawned session child, is
+    # that session's log file (biopb._lifecycle.owned_child.open_child_log).
 
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
@@ -479,10 +333,10 @@ def _serve_http(config, port, view=False):
     # the explicit calls on the os._exit paths harmless if they both run.
     atexit.register(_cleanup_dask_dir)
 
-    # Daemon-owned dask cluster: spun lazily on the first kernel launch (from
-    # KernelHost._launch, which injects its address), kept warm across kernel
-    # restarts, and closed only on real daemon exit (the _shutdown chokepoint +
-    # atexit backstop). Detaching the cluster from the kernel is what avoids
+    # Session-child-owned dask cluster: spun lazily on the first kernel launch
+    # (from KernelHost._launch, which injects its address), kept warm across
+    # kernel restarts, and closed only on real process exit (the _shutdown
+    # chokepoint + atexit backstop). Detaching the cluster from the kernel avoids
     # re-spinning N cold workers on every restart_kernel — the dominant restart
     # cost on Windows (no fork). Construction is cheap (no dask import until
     # ensure()); atexit is a backstop for exits that skip _shutdown.
@@ -503,8 +357,8 @@ def _serve_http(config, port, view=False):
         # The window-close pipe only matters with a viewer; a headless kernel
         # has no window to close, so don't wire it up.
         window_close_pipe=not headless,
-        # Daemon-owned dask cluster; _launch calls ensure() and injects its
-        # scheduler address so the kernel attaches instead of spinning its own.
+        # Session-child-owned dask cluster; _launch calls ensure() and injects
+        # its scheduler address so the kernel attaches instead of spinning its own.
         cluster_host=cluster_host,
     )
     _server.set_kernel_host(host)
@@ -516,7 +370,8 @@ def _serve_http(config, port, view=False):
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
     #     shim); also visible to execute_code via os.environ.
-    #   * file-redirected launch (`biopb mcp start`) -> the canonical daemon log.
+    #   * a non-tty direct `--transport http` launch (output redirected to a
+    #     file) -> the canonical mcp-server.log.
     #   * a terminal (foreground `--transport http` / `biopb mcp view`) -> None,
     #     reported as stdout.
     from .._config import get_daemon_log_file
@@ -530,7 +385,7 @@ def _serve_http(config, port, view=False):
     _server.set_session_log_path(session_log)
 
     # On-demand start: the kernel is NOT launched here. The server stays cheap
-    # and idle (no viewer window pops, no Qt abort on a display-less daemon)
+    # and idle (no viewer window pops, no Qt abort on a display-less server)
     # until an agent calls the `start_kernel` tool, which drives
     # host.ensure_started() — a synchronous bring-up that blocks that one tool
     # call until the kernel is ready. Other tool calls landing before then get a
@@ -550,17 +405,15 @@ def _serve_http(config, port, view=False):
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
-    # Two foreground modes bind a *dynamic* port and are NOT the managed
-    # `biopb mcp start` daemon, so they skip the PID file and stop sentinel
-    # (singular paths a concurrent session would collide on, and neither is owned
-    # by `biopb mcp stop`):
+    # Two foreground modes bind a *dynamic* port and report it back rather than
+    # binding the configured fixed port:
     #   * the de-daemonized shim-owned child (Layer 1) — the shim set
     #     BIOPB_PORT_REPORT_FILE and passed --port 0; it reaps us directly (own
     #     process group / Job Object) and we report the OS-assigned port back;
     #   * the agentless `biopb mcp view` viewer — a user-owned Ctrl-C session; it
     #     prints its URL instead.
-    # The POSIX signal handlers below stay in every mode (a group-directed
-    # SIGTERM / Ctrl-C still reaps our kernel gracefully).
+    # A direct `--transport http` binds the configured port. The POSIX signal
+    # handlers below reap our kernel gracefully in every mode.
     report_file = os.environ.get(ENV_PORT_REPORT_FILE)
     shim_owned = bool(report_file)
     dynamic_port = shim_owned or view
@@ -579,19 +432,10 @@ def _serve_http(config, port, view=False):
                 flush=True,
             )
 
-    # Register the daemon's PID so `biopb mcp status` can detect it no matter
-    # how it was launched (CLI or manual). Written just before the bind below;
-    # removed pid-safely on every exit path. Only the managed standalone daemon
-    # writes it — a shim-owned child and the foreground viewer do not.
-    pidfile = None
-    if not dynamic_port:
-        pidfile = _write_pidfile(port)
-        atexit.register(_remove_pidfile, pidfile)
-
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
-        Windows stop sentinel, the server loop returning: reap the kernel, close
-        the session-child-owned dask cluster, remove our files, exit.
+        server loop returning: reap the kernel, close the session-child-owned
+        dask cluster, remove our scratch, exit.
 
         Skips Python finalization: this process still has a live asyncio/epoll
         event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -602,11 +446,10 @@ def _serve_http(config, port, view=False):
         logger.info("Shutting down (%s).", reason)
         host.shutdown()
         # After the kernel is reaped (no clients left attached): stop the
-        # session-child-owned cluster, then rmtree its now-idle spill dir. This is
-        # the only path that closes the cluster — kernel restart/reap leaves it
-        # warm.
+        # session-child-owned cluster, then rmtree its now-idle spill dir. This
+        # is the only path that closes the cluster — kernel restart/reap leaves
+        # it warm.
         cluster_host.close()
-        _remove_pidfile(pidfile)
         _cleanup_dask_dir()
         os._exit(0)
 
@@ -615,15 +458,6 @@ def _serve_http(config, port, view=False):
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
-
-    # On Windows those handlers are unreachable from `biopb mcp stop` —
-    # os.kill(SIGTERM) is TerminateProcess, uncatchable — so stop drops a
-    # sentinel file instead and a watcher thread runs the same _shutdown. Only
-    # the managed standalone daemon has a `biopb mcp stop` owner; a shim-owned
-    # child (reaped by its shim) and the foreground viewer (Ctrl-C) do not, so
-    # they install no sentinel watcher.
-    if os.name == "nt" and not dynamic_port:
-        _install_shutdown_sentinel_watcher(_shutdown_sentinel_path(), _shutdown)
 
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built.

@@ -699,33 +699,10 @@ _start_control_plane() {
     _info "  recheck with: ${CYAN}biopb control status${RESET}"
 }
 
-# Stop a running biopb-mcp daemon (best-effort) so the just-installed code takes
-# effect. UNLIKE the data server we deliberately do NOT restart it: the MCP
-# daemon owns a *visible* napari viewer and is brought up on demand by each AI
-# client's stdio bridge, so a plain stop is enough — the next agent reconnect
-# spawns a fresh (new-code) daemon via ensure_daemon, without the installer
-# popping a viewer window the user never asked for. Stopping does close any open
-# viewer and drops live agent sessions, so we announce it, and only act when a
-# daemon is actually running (a first install / not-running case stays silent).
-_stop_mcp_server() {
-    command -v biopb >/dev/null 2>&1 || return 0
-
-    # `biopb mcp status --json` -> {"running": true|false, ...}. Only proceed on
-    # a live daemon so nothing is printed (or torn down) when none is up.
-    if ! biopb mcp status --json 2>/dev/null \
-        | grep -q '"running"[[:space:]]*:[[:space:]]*true'; then
-        return 0
-    fi
-
-    _info "Stopping the biopb MCP server so the update takes effect"
-    _info "  (this closes any open napari viewer; it restarts on demand)"
-    biopb mcp stop >/dev/null 2>&1 || true
-}
-
-# Precompile the tool env's Python bytecode (.py -> .pyc) so the first
-# `biopb mcp start` and first `start_kernel` don't pay the one-time compile cost
+# Precompile the tool env's Python bytecode (.py -> .pyc) so the first MCP
+# session and first `start_kernel` don't pay the one-time compile cost
 # (biopb/biopb#384). This covers BOTH trees regardless of which process imports
-# them — the (smaller) server stack the `biopb mcp` daemon loads, and the heavy
+# them — the (smaller) server stack an MCP session child loads, and the heavy
 # napari/Qt tree the child kernel loads on first `start_kernel`, which is where
 # the user waits longest. Admin-free, so it runs on every install; idempotent —
 # a rerun after an upgrade just compiles the newly added files. Best-effort: a
@@ -1163,10 +1140,9 @@ install_biopb() {
     install_args+=(--overrides "$WHEELS_DIR/overrides.txt")
     _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override)"
 
-    # Retire any running old-code MCP daemon before the new wheels land, so the
-    # next agent reconnect brings up the just-installed code (the daemon is
-    # spawned on demand, so there is nothing to restart here).
-    _stop_mcp_server
+    # No MCP server to stop before the new wheels land: each AI client's stdio
+    # shim spawns and owns its own ephemeral session, reaped on disconnect, so
+    # the next agent reconnect already brings up the just-installed code.
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -1568,7 +1544,6 @@ uninstall_biopb() {
     _step "[1/3] Stopping biopb services..."
     if command -v biopb &>/dev/null; then
         biopb control stop &>/dev/null || true
-        biopb mcp stop &>/dev/null || true
         _ok "biopb services stopped (if they were running)"
     else
         _info "biopb command not on PATH; nothing to stop"

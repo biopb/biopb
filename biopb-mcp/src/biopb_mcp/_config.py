@@ -207,8 +207,8 @@ class TransportConfig:
     port: int = _h(
         8765,
         "Fixed loopback port for the http server. Applies only to a directly-"
-        "launched `--transport http` and the deprecated `biopb mcp start` daemon "
-        "(the stdio shim and `biopb mcp view` use dynamic ports).",
+        "launched `--transport http` server (the stdio shim and `biopb mcp view` "
+        "use dynamic ports).",
     )
     display_mode: str = _h(
         "auto",
@@ -591,12 +591,13 @@ def get_session_log_dir() -> Path:
 
 
 def get_daemon_log_file(config: Optional[dict] = None) -> Path:
-    """Path of the http daemon's combined stdout/stderr log.
+    """Path of the canonical combined stdout/stderr log for a direct
+    ``--transport http`` server whose output is redirected to a file.
 
-    A *single* canonical location so every launcher and every reader agree on one
-    file regardless of who started the daemon. Honors ``transport.kernel_log`` if
-    set, else ``<log dir>/mcp-server.log``. ``config`` is loaded (cached
-    singleton) when not supplied; the shim passes the dict it already holds.
+    A *single* canonical location so any such launcher and every reader agree on
+    one file. Honors ``transport.kernel_log`` if set, else
+    ``<log dir>/mcp-server.log``. ``config`` is loaded (cached singleton) when not
+    supplied; the shim passes the dict it already holds.
     """
     if config is None:
         config = load_config()
@@ -604,16 +605,6 @@ def get_daemon_log_file(config: Optional[dict] = None) -> Path:
     if override:
         return Path(override)
     return get_log_dir() / "mcp-server.log"
-
-
-def get_pid_file() -> Path:
-    """Path to the http daemon's PID file (``~/.local/share/biopb-mcp/mcp-server.pid``).
-
-    The running http daemon writes its own PID here once it is up, regardless of
-    who launched it, so ``biopb mcp status`` can detect it uniformly. The biopb
-    CLI hardcodes the same path (``biopb.cli.MCP_PID_FILE``); keep the two in sync.
-    """
-    return Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

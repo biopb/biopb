@@ -126,8 +126,8 @@ immediately, binds a dynamic port, prints its `/mcp` URL for optional agent atta
 and writes no PID file. It stays **fully standalone** — it does *not* register with
 the control (an agentless foreground session has nothing to observe and no remote
 lifecycle to control), and works whether or not the control is running. The old
-shared `biopb mcp start/stop/status` daemon is **deprecated** (still works, emits a
-notice).
+shared `biopb mcp start/stop/restart/status/logs` daemon has been **removed** — the
+shim-owned session (for agents) and `biopb mcp view` (agentless) cover every case.
 
 ## Single-origin web front
 
