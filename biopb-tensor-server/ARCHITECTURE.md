@@ -343,7 +343,7 @@ Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
 The control plane owns the data-plane process: it spawns `launch` and stops it on
 teardown (`DataPlaneSupervisor._terminate`). On Windows that child runs with
-`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` and `os.kill` is an uncatchable
+`CREATE_NO_WINDOW` and `os.kill` is an uncatchable
 `TerminateProcess`, so there is no way to deliver a catchable stop for a graceful
 exit — and Win32 named events proved brittle across sessions/elevation. So
 graceful shutdown is coordinated through a **sentinel file**: `run_http_server`
@@ -370,6 +370,29 @@ installs the same watcher on the same fixed sentinel, so running a
 control-supervised plane and a direct `launch` side by side on Windows is
 unsupported (they would share the one sentinel). On POSIX there is no such
 coupling — the supervisor signals one PID.
+
+### Dying with the control (the uncatchable-death backstop)
+
+The sentinel (Windows) and `SIGTERM` (POSIX) above are the *graceful* stop — they
+run while the control is alive to ask for it. A separate bind covers the control
+dying **uncatchably** (SIGKILL, OOM, crash, a session logout), where no graceful
+signal is ever sent: the plane must still die, or it orphans onto the gRPC port
+and the next control start refuses it as a *conflict* (a wedged restart / install).
+So the supervisor ties the plane's lifetime to its own (Pattern O, shared with
+biopb-mcp; the primitives live in `biopb._lifecycle`):
+
+- **POSIX** — the child inherits a **parent-death pipe** and runs in its own
+  session (`start_new_session`). `launch`/`serve` call `deathwatch.install()`,
+  which blocks a thread on that pipe; when the control process dies the pipe EOFs
+  and the plane group-kills itself (only its own session, so the reap is
+  contained). A standalone launch inherits no pipe, so `install()` is a no-op.
+- **Windows** — the child is assigned to a **kill-on-close Job Object** the
+  control holds the only handle to (`_assign_to_job`); when the control exits for
+  any reason the OS empties the job, reaping the plane and everything it spawned.
+
+The bind is orthogonal to the sentinel/SIGTERM path: a graceful `control stop`
+still runs the plane's orderly `_graceful_shutdown` (releasing the cache lock); the
+bind only fires when the control is gone before it could.
 
 ---
 

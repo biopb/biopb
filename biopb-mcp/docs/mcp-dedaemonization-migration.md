@@ -87,10 +87,18 @@ start/stop/status/run`) — a Starlette/uvicorn app on `127.0.0.1:8813` that:
 - **holds the session registry** and terminates auth/TLS.
 
 **Failure semantics:** the control is a single point of failure for *supervision
-and routing only* — already-spawned planes keep serving through a control blip and
-re-register when it returns. Keeping it lean and crash-only-restartable bounds the
-blast radius (contrast a process-merge, where a fault would take down data serving
-itself).
+and routing only*, and the plane is **bound to its lifetime** (Pattern O): the
+supervisor spawns the tensor server with a parent-death pipe (POSIX,
+`biopb._lifecycle.deathwatch`) and in a kill-on-close Job Object (Windows,
+`biopb._lifecycle.winjob`), so a control crash/kill/logout takes the plane down
+with it rather than leaving an orphan. That is deliberate: an orphaned plane keeps
+holding the gRPC port, which the next control start reads as a *conflict* it
+refuses — so every restart (and the installer's stop→start) would wedge behind a
+plane nobody owns. Dying-with-the-control keeps `self._proc` the whole truth and
+`control stop` a complete teardown, at the cost of a brief data-serving gap across
+a control restart (the plane comes back with it). Keeping the control lean and
+crash-only-restartable bounds that gap; contrast a process-merge, where a fault
+takes down data serving in the same address space.
 
 ## Shim-owned sessions
 

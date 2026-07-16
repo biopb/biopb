@@ -5,12 +5,14 @@ trivial child that just binds the gRPC port (liveness is a TCP connect), and the
 restart/backoff logic is exercised against a fake process so timing is exact.
 """
 
+import os
 import socket
 import sys
 import time
 from unittest.mock import MagicMock
 
 import pytest
+from biopb._lifecycle import deathwatch as _deathwatch
 
 from biopb_control._control import serve_control_api
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -248,6 +250,115 @@ def test_backoff_grows_then_resets_on_recovery(spec, monkeypatch):
     sup._state.up_since = time.monotonic() - 120  # long healthy
     sup.tick()
     assert sup._state.failures == 0
+
+
+# --------------------------------------------------------------------------- #
+# death-binding: the plane dies with the control (Pattern O)
+# --------------------------------------------------------------------------- #
+class _LiveFake:
+    pid = 12345
+
+    def poll(self):
+        return None  # alive
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent-death pipe wiring")
+def test_pipe_failure_counts_toward_backoff(spec, monkeypatch):
+    # os.pipe() failing (fd exhaustion) must be counted like a Popen failure, not
+    # propagate out of ensure/tick uncounted -- it is armed inside the same try.
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: False)
+
+    def boom():
+        raise OSError("EMFILE: too many open files")
+
+    monkeypatch.setattr("biopb_control._supervisor.os.pipe", boom)
+    sup.ensure()  # must not raise
+    assert sup._proc is None
+    assert sup._death_w is None  # nothing half-armed left behind
+    assert sup._state.failures == 1
+    assert sup._state.next_attempt_at > 0  # backoff armed
+    assert "failed to spawn" in (sup._state.last_error or "")
+    assert sup.snapshot()["state"] == "down"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent-death pipe wiring")
+def test_spawn_arms_parent_death_pipe_posix(spec, monkeypatch):
+    # On POSIX the child is tied to the control via a parent-death pipe: it
+    # inherits the read end (fd in BIOPB_PARENT_DEATH_FD, passed via pass_fds) and
+    # runs in its own session so its self-kill reaps only the plane subtree.
+    sup = DataPlaneSupervisor(spec)
+    captured = {}
+
+    def _fake_popen(argv, **kwargs):
+        captured["kwargs"] = kwargs
+        return _LiveFake()
+
+    monkeypatch.setattr("biopb_control._supervisor.subprocess.Popen", _fake_popen)
+    assert sup._spawn_locked() is True
+    kw = captured["kwargs"]
+    fd_str = kw["env"][_deathwatch.ENV_FD]
+    assert kw["pass_fds"] == (int(fd_str),)  # the child inherits exactly that fd
+    assert kw["start_new_session"] is True  # own session -> contained killpg
+    assert sup._death_w is not None  # control keeps the write end live
+    # The parent's copy of the read end is closed right after spawn (finally).
+    with pytest.raises(OSError):
+        os.fstat(int(fd_str))
+    # stop() releases the write end.
+    monkeypatch.setattr(sup, "_terminate", lambda proc, timeout=10.0: None)
+    sup.stop()
+    assert sup._death_w is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent-death pipe wiring")
+def test_reap_dead_child_releases_death_pipe(spec):
+    # A crashed child held the read end; reaping it must release the control's
+    # write end so the next spawn re-arms a fresh pipe rather than leaking the fd.
+    sup = DataPlaneSupervisor(spec)
+    r, sup._death_w = os.pipe()
+    os.close(r)  # emulate the (dead) child that owned the read end
+    sup._proc = _DeadProc()
+    assert sup._reap_dead_child() == 1
+    assert sup._proc is None
+    assert sup._death_w is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX has no Job Object")
+def test_no_job_object_on_posix(spec, monkeypatch):
+    # POSIX binds via the pipe, never a Job Object; _assign_to_job is a no-op and
+    # the stop-time bindings teardown must tolerate no job.
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: False)
+    monkeypatch.setattr(
+        sup, "_spawn_locked", lambda: setattr(sup, "_proc", _LiveFake())
+    )
+    sup.ensure()
+    assert sup._winjob is None
+    monkeypatch.setattr(sup, "_terminate", lambda proc, timeout=10.0: None)
+    sup.stop()  # must not raise with no job to close
+    assert sup._winjob is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object binding")
+def test_spawn_binds_job_on_windows(spec, monkeypatch):
+    # On Windows the child is assigned to a kill-on-close Job Object the control
+    # holds, so an uncatchable control death reaps the plane. No POSIX pipe.
+    sup = DataPlaneSupervisor(spec)
+    assigned = {}
+    monkeypatch.setattr(
+        "biopb_control._supervisor._winjob.create_kill_on_close_job", lambda: "JOB"
+    )
+    monkeypatch.setattr(
+        "biopb_control._supervisor._winjob.assign_process",
+        lambda job, pid: assigned.setdefault("call", (job, pid)),
+    )
+    monkeypatch.setattr(
+        "biopb_control._supervisor.subprocess.Popen", lambda argv, **k: _LiveFake()
+    )
+    assert sup._spawn_locked() is True
+    assert sup._winjob == "JOB"
+    assert assigned["call"] == ("JOB", _LiveFake.pid)
+    assert sup._death_w is None  # no parent-death pipe on Windows
 
 
 # --------------------------------------------------------------------------- #

@@ -1,9 +1,9 @@
 """Supervise the data (tensor) plane as a subprocess — never import it.
 
 :class:`DataPlaneSupervisor` owns the tensor-server process — it spawns ``python
--m biopb_tensor_server.cli launch`` with the same detach/log idiom, but
-*persistently*: it starts the plane, polls its liveness, and restarts it on
-crash with capped backoff. The control is
+-m biopb_tensor_server.cli launch`` with the shared log idiom, but *persistently*:
+it starts the plane, polls its liveness, and restarts it on crash with capped
+backoff. The control is
 the **sole owner** of the data plane — it always spawns and manages its own
 child and never adopts a server it did not start; a gRPC port already held by
 another process is a *conflict* it refuses (surface, don't manage), not
@@ -12,6 +12,20 @@ something to attach to. This single-owner rule is what makes the state simple
 teardown. It never imports ``biopb_tensor_server`` — liveness is a cheap stdlib
 TCP connect to the gRPC port, so no pyarrow/grpc is pulled into the lean control
 (invariant I2).
+
+**The plane is bound to the control's lifetime (Pattern O).** A crashed, killed,
+or logged-out control must not orphan the tensor server: an orphan keeps holding
+the gRPC port, which the next control start then reads as a *conflict* it refuses
+— so the installer's stop→start (and every restart) would wedge behind a plane
+nobody owns. The bind closes that: on POSIX the child inherits a parent-death
+pipe (:mod:`biopb._lifecycle.deathwatch`) and runs in its own session, so an
+*uncatchable* control death (SIGKILL/OOM/crash) EOFs the pipe and the plane
+group-kills itself; on Windows it is assigned to a kill-on-close Job Object
+(:mod:`biopb._lifecycle.winjob`) the control holds, so the OS reaps it when the
+control's last handle closes. This is orthogonal to the *graceful* stop path
+below (SIGTERM / the Windows sentinel), which still runs the plane's orderly
+shutdown when the control is alive to ask for it; the bind is only the backstop
+for when it is not.
 
 Readiness beyond "port bound" (the progressive-discovery ``SERVING`` scan) is
 left to the *client*: ``biopb-mcp``'s ``_connection`` connects and waits the
@@ -31,6 +45,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +106,12 @@ class DataPlaneSupervisor:
         self._spec = spec
         self._proc: Optional[subprocess.Popen] = None
         self._log_fh = None
+        # Death-binding handles (see the module docstring). POSIX: the write end
+        # of the child's parent-death pipe, re-armed per spawn and closed once the
+        # child is gone. Windows: a kill-on-close Job Object created once and
+        # reused across restarts, closed only on final stop.
+        self._death_w: Optional[int] = None
+        self._winjob = None
         self._state = _State()
         self._lock = threading.RLock()
 
@@ -175,12 +197,13 @@ class DataPlaneSupervisor:
         """(Re)spawn the data plane. Returns True on success, False on a spawn
         failure that has been counted toward the backoff.
 
-        A ``Popen`` that raises (OSError: a bad executable, ENOMEM, EAGAIN/too
-        many processes) is treated like a failed attempt -- ``failures`` is
-        bumped, the backoff window is armed, and ``last_error`` records it --
-        rather than propagating. That keeps a failing spawn from escaping
-        ``ensure`` / ``tick`` (and the ``/data_plane/ensure`` handler) uncounted
-        and hammering with no backoff.
+        Any ``OSError`` from bring-up -- the parent-death pipe's ``os.pipe`` under
+        fd exhaustion (EMFILE/ENFILE), or ``Popen`` (a bad executable, ENOMEM,
+        EAGAIN/too many processes) -- is treated like a failed attempt: ``failures``
+        is bumped, the backoff window is armed, and ``last_error`` records it,
+        rather than propagating. That keeps a failing spawn from escaping ``ensure``
+        / ``tick`` (and the ``/data_plane/ensure`` handler) uncounted and hammering
+        with no backoff. So the pipe arm runs *inside* the try, alongside ``Popen``.
         """
         argv = self._build_argv()
         log = self._open_log()
@@ -192,28 +215,99 @@ class DataPlaneSupervisor:
         except (OSError, ValueError):
             pass
         logger.info("Spawning data plane: %s", " ".join(argv))
-        # No detachment: the plane is a *tracked* child of the control -- if the
-        # control dies the plane stays serving (already-spawned planes survive a
-        # control blip, migration doc S3), but while the control lives it owns and
-        # can reap this child directly.
+        # The plane is a tracked child bound to the control's lifetime (module
+        # docstring): while the control lives it owns and reaps this child
+        # directly; if the control dies uncatchably the child reaps *itself* off
+        # the parent-death pipe (POSIX) or the OS reaps it off the closed Job
+        # Object (Windows), so a dead control never orphans the plane into a
+        # port-holding conflict.
+        env = self._child_env()
+        popen_kwargs: dict = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        # Arm the pipe inside the try so an os.pipe() failure (fd exhaustion) is
+        # counted toward the backoff exactly like a Popen failure, not raised out
+        # of ensure/tick uncounted. death_r is pre-set so `finally` can reference
+        # it whether or not the arm completed.
+        death_r = None
         try:
+            death_r = self._arm_parent_death(env, popen_kwargs)
             self._proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
-                env=self._child_env(),
+                env=env,
                 close_fds=True,
+                **popen_kwargs,
             )
         except OSError as exc:
+            self._close_death_pipe()  # drop the half-armed write end
             st = self._state
             st.failures += 1
             st.last_error = f"failed to spawn data plane: {exc}"
             st.next_attempt_at = time.monotonic() + self._backoff()
             logger.error(st.last_error)
             return False
+        finally:
+            # The child inherited its own copy of the read end; close the
+            # control's copy so only the child's death (or ours) shuts the pipe.
+            if death_r is not None:
+                try:
+                    os.close(death_r)
+                except OSError:
+                    pass
+        self._assign_to_job()
         self._state.up_since = None
         return True
+
+    def _arm_parent_death(self, env: dict, popen_kwargs: dict) -> Optional[int]:
+        """POSIX: arm the child's parent-death pipe; return the read fd to close
+        after ``Popen`` (``None`` off POSIX, where the Job Object binds instead).
+
+        Creates a pipe, passes the read end to the child (fd inherited via
+        ``pass_fds``, its number in ``BIOPB_PARENT_DEATH_FD``), and keeps the
+        write end on ``self._death_w``. The child's :func:`biopb._lifecycle.
+        deathwatch.install` blocks on the read end and self-terminates on EOF, so
+        an uncatchable control death takes the plane down. The child is put in its
+        **own session** so the deathwatch's group-kill reaps only the plane and
+        its descendants, never anything else in the control's group.
+        """
+        if os.name == "nt":
+            return None
+        self._close_death_pipe()  # drop any stale write end before re-arming
+        death_r, self._death_w = os.pipe()
+        env[_deathwatch.ENV_FD] = str(death_r)
+        popen_kwargs["pass_fds"] = (death_r,)
+        popen_kwargs["start_new_session"] = True
+        return death_r
+
+    def _assign_to_job(self) -> None:
+        """Windows: put the freshly-spawned plane in a kill-on-close Job Object so
+        it (and everything it spawns) dies with the control even on an uncatchable
+        ``TerminateProcess`` (biopb/biopb#403). No-op on POSIX (the parent-death
+        pipe covers it) and best-effort — a failure just leaves the child
+        unbound. The job is created once and reused across restarts."""
+        if os.name != "nt":
+            return
+        if self._winjob is None:
+            self._winjob = _winjob.create_kill_on_close_job()
+        if self._winjob is not None and self._proc is not None:
+            _winjob.assign_process(self._winjob, self._proc.pid)
+
+    def _close_death_pipe(self) -> None:
+        """Close the control's write end of the parent-death pipe, if held.
+
+        Only ever called once the child is gone (reaped / stopped), so it never
+        races the child into a spurious self-kill; re-arming a fresh pipe on the
+        next spawn drops any leftover here first."""
+        w = self._death_w
+        self._death_w = None
+        if w is not None:
+            try:
+                os.close(w)
+            except OSError:
+                pass
 
     def _child_alive(self) -> bool:
         """Whether we hold a spawned child that is still running.
@@ -237,6 +331,9 @@ class DataPlaneSupervisor:
             return None
         rc = self._proc.returncode
         self._proc = None
+        # The crashed child held the read end; free our write end so the next
+        # spawn re-arms a fresh pipe (the reused Windows job is left intact).
+        self._close_death_pipe()
         return rc
 
     def _note_healthy(self) -> None:
@@ -365,7 +462,21 @@ class DataPlaneSupervisor:
             self._proc = None
         if proc is not None:
             self._terminate(proc)
+        self._close_child_bindings()
         self._close_log()
+
+    def _close_child_bindings(self) -> None:
+        """Release the death-binding handles after the child is stopped.
+
+        Closes the POSIX parent-death pipe and, on Windows, force-reaps any
+        surviving job member and closes the Job Object (the graceful ``_terminate``
+        has usually already emptied it). Called only on a full stop — a crash
+        respawn keeps the reused job and re-arms the pipe."""
+        self._close_death_pipe()
+        if self._winjob is not None:
+            _winjob.terminate_job(self._winjob)
+            _winjob.close_job(self._winjob)
+            self._winjob = None
 
     def _terminate(self, proc: subprocess.Popen, timeout: float = 10.0) -> None:
         if proc.poll() is not None:
