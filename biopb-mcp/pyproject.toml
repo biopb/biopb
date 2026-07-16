@@ -124,17 +124,14 @@ testing = [
 
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
+# Light console entry (stdlib + biopb._config_location only, no kernel/napari
+# import) the installer calls to seed the built-in example kernel plugins
+# (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
+# tool" example, delivered as a visible file rather than a buried entry point.
+biopb-mcp-seed-plugins = "biopb_mcp.plugins._seed:_cli"
 
 [project.entry-points."napari.manifest"]
 biopb-mcp = "biopb_mcp:napari.yaml"
-
-# Built-in kernel-namespace plugins (#92): loaded into the agent kernel's
-# namespace at bootstrap by mcp/_bootstrap._load_entry_point_plugins, the same
-# path a lab's own biopb_mcp.namespace package takes. Each value is a module whose
-# public (__all__) names are merged in. rolling-ball ships the fast ImageJ port of
-# rolling-ball background subtraction as both a useful op and a reference example.
-[project.entry-points."biopb_mcp.namespace"]
-rolling-ball = "biopb_mcp.plugins.rolling_ball"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/biopb/biopb/issues"

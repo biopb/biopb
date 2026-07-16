@@ -8,7 +8,10 @@ proportionally small ball on it, and **bilinearly enlarge** the background back,
 cutting the work by the shrink factor to the fourth power (``~256×`` at radius 50).
 That is the whole reason ImageJ is dramatically faster, and this reproduces it.
 
-Exposed in the agent kernel namespace (loaded as a ``biopb_mcp.namespace`` plugin):
+biopb-mcp ships this as a built-in example kernel plugin (#92): the installer
+seeds a copy into ``~/.config/biopb/kernel/`` so it loads into the agent kernel
+namespace at startup and is visible/editable as a worked "bring your own tool"
+example. Two callables land in the namespace:
 
 - ``subtract_background(image, radius=50, ...)`` — the background-subtracted image.
 - ``rolling_ball_background(image, radius=50, ...)`` — just the estimated background.
@@ -27,13 +30,20 @@ is scipy's edge-replicate, a minor rim approximation vs ImageJ's roll-past-edge 
 immaterial to the interior background estimate.
 """
 
-from __future__ import annotations
+# No ``from __future__ import annotations``: as a startup file this exec's into
+# the agent namespace, and that import would leak the name ``annotations`` there.
+# The 3.10+ signatures below don't need it (no ``X | Y`` unions).
 
-import math
+# Imported under private aliases so that when this file is loaded as a kernel
+# startup plugin (exec'd directly into the agent namespace, IPython startup/
+# semantics) it contributes only its public API — subtract_background,
+# rolling_ball_background, DEFAULT_RADIUS — and not scipy/skimage handles. np is
+# left public but the loader's reserved-name guard restores the kernel's own.
+import math as _math
 
 import numpy as np
-from scipy.ndimage import grey_dilation, grey_erosion, uniform_filter
-from skimage.measure import block_reduce
+import scipy.ndimage as _ndi
+from skimage.measure import block_reduce as _block_reduce
 
 __all__ = ["subtract_background", "rolling_ball_background"]
 
@@ -68,7 +78,7 @@ def _build_ball(radius: float) -> tuple[np.ndarray, int]:
     # (int)(arcTrimPer*smallballradius)/100 — Java truncation then integer divide.
     xtrim = int(arc_trim * small_r) // 100
     # Java Math.round = floor(x + 0.5), NOT numpy's banker's rounding.
-    half = int(math.floor(small_r - xtrim + 0.5))
+    half = int(_math.floor(small_r - xtrim + 0.5))
     yy, xx = np.mgrid[-half : half + 1, -half : half + 1].astype(np.float64)
     temp = rsquare - xx * xx - yy * yy
     ball = np.where(temp > 0.0, np.sqrt(np.maximum(temp, 0.0)), 0.0)
@@ -84,8 +94,8 @@ def _roll_ball(image: np.ndarray, ball: np.ndarray) -> np.ndarray:
     dilation with the non-flat ``ball`` structuring element. ``mode='nearest'``
     replicates the edge (a small rim approximation vs ImageJ's roll-past-border).
     """
-    eroded = grey_erosion(image, structure=ball, mode="nearest")
-    return grey_dilation(eroded, structure=ball, mode="nearest")
+    eroded = _ndi.grey_erosion(image, structure=ball, mode="nearest")
+    return _ndi.grey_dilation(eroded, structure=ball, mode="nearest")
 
 
 def _shrink(image: np.ndarray, shrink: int) -> np.ndarray:
@@ -94,7 +104,7 @@ def _shrink(image: np.ndarray, shrink: int) -> np.ndarray:
     Output dims are ``ceil(dim/shrink)``; a padded partial block is filled with
     ``+inf`` so ``min`` ignores it (matching ImageJ's "min over available pixels").
     """
-    small = block_reduce(image, (shrink, shrink), func=np.min, cval=np.float32(np.inf))
+    small = _block_reduce(image, (shrink, shrink), func=np.min, cval=np.float32(np.inf))
     return small.astype(np.float32)
 
 
@@ -140,7 +150,7 @@ def _background_2d(
         fp = -fp
     if do_presmooth:
         # Separable 3x3 mean, edge-replicated — matches ImageJ filter3x3(MEAN).
-        fp = uniform_filter(fp, size=3, mode="nearest")
+        fp = _ndi.uniform_filter(fp, size=3, mode="nearest")
     ball, shrink = _build_ball(radius)
     if shrink > 1:
         rolled = _roll_ball(_shrink(fp, shrink), ball)

@@ -332,6 +332,20 @@ EOF
         _ok "Created biopb-mcp config: $mcp_config"
     fi
 
+    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
+    # they load into the agent kernel namespace at startup and are visible as a
+    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
+    # there (not only an installed module) so it is user-visible/editable and
+    # loads via the robust startup-file path. Idempotent (never clobbers a
+    # user-edited file); best-effort so a failure never aborts the install.
+    local seed_cmd
+    seed_cmd=$(command -v biopb-mcp-seed-plugins 2>/dev/null || true)
+    if [ -n "$seed_cmd" ] && "$seed_cmd" >/dev/null 2>&1; then
+        _ok "Seeded example kernel plugins: $CONFIG_DIR/kernel/"
+    else
+        _note "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
+    fi
+
     # Canonical standalone definition (standard mcpServers JSON; most clients
     # accept it) -- a manual fallback the summary points at if nothing auto-wired.
     # A fixed-shape standalone file, so a plain heredoc suffices (no merge).

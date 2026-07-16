@@ -243,7 +243,9 @@ their own problems. On the agent side the low-friction path is a **user plugin**
 the kernel namespace, visible to the agent — capability is added by *putting
 objects in scope*, not by extending a protocol. biopb-mcp ships one such built-in
 as the reference example (`biopb_mcp/plugins/rolling_ball.py`, a fast ImageJ port
-of rolling-ball background subtraction). See `biopb-mcp/ARCHITECTURE.md`.
+of rolling-ball background subtraction); the installer seeds a copy into
+`~/.config/biopb/kernel/` so it is visible and editable there. See
+`biopb-mcp/ARCHITECTURE.md`.
 
 ### Polyglot by construction
 

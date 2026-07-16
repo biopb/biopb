@@ -4,12 +4,11 @@ Pins the ImageJ-faithful behavior that matters to a user: a smooth background is
 recovered under bright features (dark features on a bright field with
 ``light_background``), features survive subtraction, the input dtype is preserved
 with ImageJ's integer offset/clip, N-D arrays are processed plane-by-plane, and
-the radius→(shrink, ball) buckets match ImageJ. Also checks the plugin is
-registered as a ``biopb_mcp.namespace`` entry point so the kernel bootstrap loads
-it, and that the static inspector sees it. No kernel/display needed.
+the radius→(shrink, ball) buckets match ImageJ. Also checks the delivery path:
+the installer's seeding copies the example into the kernel plugin dir, it loads
+via the startup-file path contributing only its public API, and the static
+dashboard inspector sees it. No kernel/display needed.
 """
-
-from importlib.metadata import entry_points
 
 import numpy as np
 import pytest
@@ -117,19 +116,67 @@ class TestDtypeAndShape:
             rb.subtract_background(np.arange(10.0), radius=RADIUS)
 
 
-class TestPluginRegistration:
-    def test_registered_as_namespace_entry_point(self):
-        eps = entry_points(group="biopb_mcp.namespace")
-        by_name = {e.name: e for e in eps}
-        assert "rolling-ball" in by_name
-        assert by_name["rolling-ball"].value == "biopb_mcp.plugins.rolling_ball"
-        # Loading the entry point yields the module; its __all__ is the surface
-        # the bootstrap merges into the kernel namespace.
-        mod = by_name["rolling-ball"].load()
-        assert set(mod.__all__) == {"subtract_background", "rolling_ball_background"}
+class TestSeeding:
+    """The delivery path: installer seeds the example into ~/.config/biopb/kernel/."""
 
-    def test_static_inspector_lists_it(self):
+    def test_seed_copies_example_and_doc(self, tmp_path):
+        from biopb_mcp.plugins._seed import SEED_FILES, seed_kernel_plugins
+
+        dest = tmp_path / "kernel"
+        actions = dict(seed_kernel_plugins(dest))
+        assert actions == dict.fromkeys(SEED_FILES, "created")
+        assert (dest / "rolling_ball.py").exists()
+        assert (dest / "__init__.py").exists()  # the namespace doc
+
+    def test_seed_idempotent_and_never_clobbers(self, tmp_path):
+        from biopb_mcp.plugins._seed import seed_kernel_plugins
+
+        dest = tmp_path / "kernel"
+        seed_kernel_plugins(dest)
+        (dest / "rolling_ball.py").write_text("# my edit\n", encoding="utf-8")
+        actions = dict(seed_kernel_plugins(dest))
+        assert all(a == "exists" for a in actions.values())
+        assert (dest / "rolling_ball.py").read_text(encoding="utf-8") == "# my edit\n"
+
+    def test_seeded_file_loads_as_startup_plugin_clean_surface(self, tmp_path):
+        # The production path: the kernel startup-file loader exec's the seeded
+        # file into the namespace. It must contribute the two public callables and
+        # nothing else — scipy/skimage handles stay private, __init__.py (leading
+        # underscore) is skipped, and the reserved np handle is left intact.
+        from biopb_mcp.mcp import _bootstrap
+        from biopb_mcp.plugins._seed import seed_kernel_plugins
+
+        dest = tmp_path / "kernel"
+        seed_kernel_plugins(dest)
+
+        class IP:
+            def __init__(self):
+                self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
+
+        ip = IP()
+        _bootstrap._load_startup_files(ip, dest)
+        assert callable(ip.user_ns.get("subtract_background"))
+        assert callable(ip.user_ns.get("rolling_ball_background"))
+        builtins_ = {"viewer", "client", "np", "da", "ops"}
+        contributed = {
+            n for n in ip.user_ns if not n.startswith("_") and n not in builtins_
+        }
+        assert contributed == {
+            "subtract_background",
+            "rolling_ball_background",
+            "DEFAULT_RADIUS",
+        }
+
+    def test_static_inspector_lists_seeded_file(self, tmp_path):
+        # The dashboard reads the kernel dir statically (parse, no exec).
         from biopb import _kernel_plugins
 
-        names = [row["name"] for row in _kernel_plugins.entry_point_plugins()]
-        assert "rolling-ball" in names
+        from biopb_mcp.plugins._seed import seed_kernel_plugins
+
+        dest = tmp_path / "kernel"
+        seed_kernel_plugins(dest)
+        files = {r["name"]: r["summary"] for r in _kernel_plugins.startup_files(dest)}
+        assert "__init__.py" not in files  # underscore-skipped
+        assert files["rolling_ball.py"].startswith(
+            "Rolling-ball background subtraction"
+        )
