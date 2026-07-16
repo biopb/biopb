@@ -292,9 +292,9 @@ function Assert-LastExit {
 
 # Force-terminate any process running from a biopb uv tool environment so its
 # locked binaries under <tooldir>\biopb\Scripts can be deleted. The graceful
-# `biopb server stop` / `biopb mcp stop` only reach daemons THIS install's pidfiles
-# track; a data server launched ad-hoc from a shell, a detached napari kernel, or
-# an agent-spawned stdio biopb-mcp keep the *_pb2/python.exe binaries open and make
+# `biopb control stop` only reaches the control-owned data plane; a data server
+# launched ad-hoc from a shell, a detached napari kernel, or an agent-spawned
+# stdio biopb-mcp keep the *_pb2/python.exe binaries open and make
 # `uv tool install --force` (and `uv tool uninstall`) fail with "Access is denied
 # (os error 5)". We match by executable path, covering the current UV_TOOL_DIR AND
 # the legacy %APPDATA% (Roaming) default, so an upgrade from an older Roaming
@@ -674,13 +674,13 @@ function Start-ControlPlane {
     }
 }
 
-# Precompile the tool env's Python bytecode (.py -> .pyc) so the first
-# `biopb mcp start` and first start_kernel don't pay the one-time compile cost
+# Precompile the tool env's Python bytecode (.py -> .pyc) so the first MCP
+# session and first start_kernel don't pay the one-time compile cost
 # (biopb/biopb#384). This is the biggest EASY win on Windows: Defender scans each
 # freshly written .pyc and .pyd on first import, so paying the compile once at
 # install time (admin-free) removes a large slice of the first-launch wait. It
 # covers both trees regardless of which process imports them -- the server stack
-# the `biopb mcp` daemon loads, and the heavy napari/Qt tree the child kernel
+# an MCP session child loads, and the heavy napari/Qt tree the child kernel
 # loads on first start_kernel (where the user waits longest). Idempotent (a
 # rerun after an upgrade compiles only new files) and best-effort: any failure
 # just means the first run recompiles as before. (The privileged half of #384 --
@@ -983,8 +983,7 @@ function Invoke-BiopbInstall {
     # clean machine. Done before the downloads so the OS releases the handles.
     if (Get-Command biopb -ErrorAction SilentlyContinue) {
         try { & biopb control stop  *> $null } catch { }
-        try { & biopb mcp stop    *> $null } catch { }
-        Report-Detail "stopped any running biopb daemons (control + data + mcp) so their files can be replaced"
+        Report-Detail "stopped the running biopb control + data plane so their files can be replaced"
     }
     # Belt-and-suspenders: the graceful stops above miss servers launched ad-hoc
     # from a shell, detached napari kernels, and agent-spawned stdio biopb-mcp --
@@ -1531,7 +1530,6 @@ function Invoke-BiopbUninstall {
         # stopping it is a complete teardown of that pair and stops it respawning.
         if (Get-Command biopb -ErrorAction SilentlyContinue) {
             try { & biopb control stop  *> $null } catch { }
-            try { & biopb mcp stop    *> $null } catch { }
         }
         # Force-stop any leftover process holding the tool dir open, else the
         # `uv tool uninstall` below fails to delete it with os error 5 (same as

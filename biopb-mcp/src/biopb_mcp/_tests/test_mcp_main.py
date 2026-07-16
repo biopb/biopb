@@ -1,14 +1,11 @@
 """Tests for the launcher's transport selection and dispatch.
 
 These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing
-and the stdio-vs-http dispatch) without starting a real kernel, viewer, or
-daemon.
+and the stdio-vs-http dispatch) without starting a real kernel or viewer.
 """
 
 import logging
-import os
 import sys
-import threading
 
 import pytest
 
@@ -16,14 +13,10 @@ from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
-    _install_shutdown_sentinel_watcher,
     _parse_args,
-    _remove_pidfile,
     _resolve_headless,
     _resolve_headless_logged,
     _setup_observe,
-    _shutdown_sentinel_path,
-    _write_pidfile,
     main,
 )
 
@@ -245,120 +238,3 @@ class TestSetupObserve:
         cfg = {"observe": {"enabled": True}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
-
-
-class TestPidfile:
-    """The daemon registers its own PID so `biopb mcp status` finds it
-    regardless of launch path (CLI, stdio shim, or manual)."""
-
-    @pytest.fixture
-    def pidfile(self, tmp_path, monkeypatch):
-        path = tmp_path / "mcp-server.pid"
-        # _write_pidfile resolves the path lazily via _config.get_pid_file.
-        monkeypatch.setattr("biopb_mcp._config.get_pid_file", lambda: path)
-        return path
-
-    def test_writes_pid_and_create_time_token(self, pidfile, monkeypatch):
-        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
-        monkeypatch.setattr(launcher, "_self_create_time", lambda: 4242)
-        returned = _write_pidfile(8765)
-        assert returned == pidfile
-        # pid + create-time token, whitespace-separated (read back by the CLI's
-        # _read_pid_record); the token lets stop/status reject a reused PID.
-        assert pidfile.read_text() == f"{os.getpid()}\n4242"
-
-    def test_writes_bare_pid_when_create_time_unknown(self, pidfile, monkeypatch):
-        # No create-time available (e.g. macOS) -> legacy bare-PID form, which
-        # the CLI still reads (token None -> liveness-only check).
-        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
-        monkeypatch.setattr(launcher, "_self_create_time", lambda: None)
-        _write_pidfile(8765)
-        assert pidfile.read_text() == str(os.getpid())
-
-    def test_skips_write_when_port_taken(self, pidfile, monkeypatch):
-        # A racing loser sees the winner already on the port: don't clobber it.
-        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: True)
-        assert _write_pidfile(8765) is None
-        assert not pidfile.exists()
-
-    def test_write_failure_is_swallowed(self, pidfile, monkeypatch):
-        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
-
-        def _boom(*_a, **_k):
-            raise OSError("read-only fs")
-
-        monkeypatch.setattr(type(pidfile), "write_text", _boom)
-        # A write failure costs `status` visibility, never the server.
-        assert _write_pidfile(8765) is None
-
-    def test_remove_is_pid_safe(self, pidfile):
-        pidfile.write_text(str(os.getpid()))
-        _remove_pidfile(pidfile)
-        assert not pidfile.exists()
-
-    def test_remove_matches_pid_with_token_present(self, pidfile):
-        # The token-bearing form still self-deletes: match is on the PID field.
-        pidfile.write_text(f"{os.getpid()}\n4242")
-        _remove_pidfile(pidfile)
-        assert not pidfile.exists()
-
-    def test_remove_leaves_other_pids(self, pidfile):
-        # A losing daemon's exit must not delete the winner's PID file.
-        pidfile.write_text("999999999")
-        _remove_pidfile(pidfile)
-        assert pidfile.exists()
-
-    def test_remove_none_is_noop(self):
-        _remove_pidfile(None)  # write was skipped/failed; nothing to undo
-
-
-class TestShutdownSentinelWatcher:
-    """The Windows stop path (issue #323): `biopb mcp stop` cannot deliver a
-    catchable signal there (os.kill is TerminateProcess), so it drops a
-    sentinel file and this daemon-side watcher runs the shared shutdown. The
-    watcher itself is platform-agnostic — only its installation in _serve_http
-    is Windows-gated — so these tests run on every OS."""
-
-    def test_sentinel_triggers_shutdown_and_is_consumed(self, tmp_path):
-        sentinel = tmp_path / "mcp-server.stop"
-        fired = threading.Event()
-        reasons = []
-
-        def _shutdown(reason):
-            reasons.append(reason)
-            fired.set()
-
-        _install_shutdown_sentinel_watcher(sentinel, _shutdown, poll=0.01)
-        sentinel.write_text("stop")
-        assert fired.wait(5), "watcher never fired on a fresh sentinel"
-        assert reasons == ["stop sentinel"]
-        # Consumed before shutdown, so a daemon started later can't trip on it
-        # (belt and braces on top of the delete-at-install clear).
-        assert not sentinel.exists()
-
-    def test_stale_sentinel_is_ignored(self, tmp_path):
-        # A leftover from a previous run must not stop a freshly started daemon.
-        # The watcher clears any pre-existing sentinel once at install (#345), so
-        # it is neither acted on nor left behind to trip a later check -- no mtime
-        # comparison, regardless of the leftover's timestamp.
-        sentinel = tmp_path / "mcp-server.stop"
-        sentinel.write_text("stop")
-        fired = threading.Event()
-        _install_shutdown_sentinel_watcher(sentinel, lambda _r: fired.set(), poll=0.01)
-        assert not fired.wait(0.3)
-        assert not sentinel.exists()  # cleared at install, not acted on
-
-    def test_missing_sentinel_never_fires(self, tmp_path):
-        fired = threading.Event()
-        _install_shutdown_sentinel_watcher(
-            tmp_path / "mcp-server.stop", lambda _r: fired.set(), poll=0.01
-        )
-        assert not fired.wait(0.2)
-
-    def test_sentinel_path_is_fixed_pidfile_sibling(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "biopb_mcp._config.get_pid_file", lambda: tmp_path / "mcp-server.pid"
-        )
-        # Fixed name (not pid-keyed: uv/Store-Python shims make PIDs ambiguous
-        # on Windows) in the PID file's dir; biopb.cli hardcodes the same.
-        assert _shutdown_sentinel_path() == tmp_path / "mcp-server.stop"
