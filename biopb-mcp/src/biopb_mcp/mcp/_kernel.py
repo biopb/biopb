@@ -18,7 +18,7 @@ import threading
 import time
 from typing import List, Optional
 
-from . import _deathwatch, _winjob
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ _TENSOR_URL_ENV = "BIOPB_TENSOR_URL"
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines=import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
 # Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no

@@ -722,7 +722,7 @@ class TestParentDeathPipe:
     """Fix 1: kernel self-terminates when the launcher process dies."""
 
     def test_deathwatch_install_noop_without_fd(self, monkeypatch):
-        from biopb_mcp.mcp import _deathwatch
+        from biopb._lifecycle import deathwatch as _deathwatch
 
         monkeypatch.delenv(_deathwatch.ENV_FD, raising=False)
         assert _deathwatch.install() is False
@@ -733,7 +733,7 @@ class TestParentDeathPipe:
         # close the write end (the launcher "dying"); the watcher thread should
         # hit EOF and call the group-kill. killpg is stubbed so we record the
         # call instead of killing the test process.
-        from biopb_mcp.mcp import _deathwatch
+        from biopb._lifecycle import deathwatch as _deathwatch
 
         r, w = os.pipe()
         monkeypatch.setenv(_deathwatch.ENV_FD, str(r))
@@ -1178,7 +1178,7 @@ class TestWinJobReal:
         return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 
     def test_close_job_kills_member(self):
-        from biopb_mcp.mcp import _winjob
+        from biopb._lifecycle import winjob as _winjob
 
         job = _winjob.create_kill_on_close_job()
         assert job is not None
@@ -1197,7 +1197,7 @@ class TestWinJobReal:
                 proc.kill()
 
     def test_terminate_job_kills_member_and_keeps_job_usable(self):
-        from biopb_mcp.mcp import _winjob
+        from biopb._lifecycle import winjob as _winjob
 
         job = _winjob.create_kill_on_close_job()
         assert job is not None
@@ -1222,7 +1222,7 @@ class TestWinJobReal:
         # with True exactly when the watched process exits (immune to pid reuse).
         import threading
 
-        from biopb_mcp.mcp import _winjob
+        from biopb._lifecycle import winjob as _winjob
 
         proc = self._sleeper()
         handle = _winjob.open_for_wait(proc.pid)

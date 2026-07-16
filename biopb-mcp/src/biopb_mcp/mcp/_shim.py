@@ -59,6 +59,7 @@ from pathlib import Path
 
 import anyio
 from biopb import _config_sessions
+from biopb._lifecycle import winjob as _winjob
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -67,7 +68,6 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 
 from .. import _control_client
-from . import _winjob
 
 logger = logging.getLogger(__name__)
 

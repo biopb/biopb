@@ -1,30 +1,32 @@
-"""Windows Job Object: tie the child kernel's lifetime to the daemon's.
+"""Windows Job Object: tie an owned child's lifetime to its live parent's.
 
-POSIX ties the kernel to the daemon two ways -- a process group the launcher
-group-kills (``KernelHost._shutdown_current``) and a parent-death pipe that
-self-terminates the kernel if the launcher dies uncatchably (``_deathwatch``).
-Both go through ``os.killpg``, which does not exist on Windows, so on Windows a
-force-killed or crashed daemon can orphan the kernel (biopb/biopb#403).
+Shared SDK primitive for the "owned child" lifecycle pattern -- a child a live
+parent spawns, holds, and must reap. Two owners use it: the control supervisor
+(the tensor-server child) and the biopb-mcp stdio shim (its session child, which
+in turn holds the kernel). POSIX ties an owned child to its parent two ways -- a
+process group the parent group-kills and a parent-death pipe that self-terminates
+the child if the parent dies uncatchably (``_deathwatch``). Both go through
+``os.killpg``, which does not exist on Windows, so on Windows a force-killed or
+crashed parent can orphan the child (biopb/biopb#403).
 
 A Job Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` closes that gap: the
-daemon creates the job, assigns the kernel (and thus every process the kernel
-spawns) to it, and holds the only handle. When the daemon exits for *any* reason
--- including a ``TerminateProcess`` from ``biopb mcp stop`` that runs no daemon
-code, and regardless of whether the kernel's GIL is wedged -- the OS closes that
-handle and kills the whole job. ``TerminateJobObject`` additionally gives a
-from-outside tree-kill on the graceful teardown path, the Windows counterpart to
+parent creates the job, assigns the child (and thus every process the child
+spawns) to it, and holds the only handle. When the parent exits for *any* reason
+-- including a ``TerminateProcess`` that runs no parent code, and regardless of
+whether the child's GIL is wedged -- the OS closes that handle and kills the
+whole job. ``TerminateJobObject`` additionally gives a from-outside tree-kill on
+the graceful teardown path, the Windows counterpart to
 ``os.killpg(pgid, SIGKILL)``.
 
 The module also exposes the *inverse* Windows primitive -- ``open_for_wait`` /
-``wait_for_process``, a blocking wait on some *other* process's exit -- so the
-shim can watch its stdio **client** die and reap the session it owns (the
-counterpart, in the other direction, to the kernel's parent-death pipe). A
-process handle names the process object, not its (reusable) pid, so the wait is
-immune to pid reuse.
+``wait_for_process``, a blocking wait on some *other* process's exit -- so a
+parent can watch a process it does not own (e.g. the shim watching its stdio
+**client**) and reap the session it does own. A process handle names the process
+object, not its (reusable) pid, so the wait is immune to pid reuse.
 
 Every function is Windows-only and best-effort: it returns ``None`` / ``False``
 and logs at debug on any failure, so a ctypes/OS hiccup degrades to the
-pre-#403 behavior instead of breaking kernel bring-up.
+pre-#403 behavior instead of breaking child bring-up.
 """
 
 import ctypes
@@ -113,9 +115,9 @@ _kernel32 = _kernel32() if os.name == "nt" else None
 def create_kill_on_close_job():
     """Create a kill-on-close Job Object; return an opaque handle or ``None``.
 
-    While the daemon holds the returned handle, the job's member processes stay
-    alive; when the last handle to the job closes (the daemon exits, however
-    abruptly) the OS terminates every member. Kept open for the daemon's whole
+    While the parent holds the returned handle, the job's member processes stay
+    alive; when the last handle to the job closes (the parent exits, however
+    abruptly) the OS terminates every member. Kept open for the parent's whole
     life and closed only on terminal shutdown.
     """
     if os.name != "nt":
@@ -137,7 +139,7 @@ def create_kill_on_close_job():
             raise ctypes.WinError(err)
         return handle
     except Exception:
-        logger.debug("CreateJobObject failed; kernel not job-tied", exc_info=True)
+        logger.debug("CreateJobObject failed; child not job-tied", exc_info=True)
         return None
 
 
@@ -145,9 +147,9 @@ def assign_process(job, pid):
     """Add process ``pid`` (and its future descendants) to ``job``.
 
     Best-effort: a failure (e.g. the process already died, or is in a
-    non-nestable job) just leaves the kernel outside the job, i.e. the pre-#403
+    non-nestable job) just leaves the child outside the job, i.e. the pre-#403
     reap behavior. On Windows 8+ a process already in a job is nested, so a
-    daemon that is itself jobbed still works.
+    parent that is itself jobbed still works.
     """
     if os.name != "nt" or not job or not pid:
         return False
@@ -171,7 +173,7 @@ def assign_process(job, pid):
 def terminate_job(job, exit_code=1):
     """Kill every process in ``job`` now (the from-outside tree-kill).
 
-    Leaves the job object usable, so a restart can reassign a fresh kernel to
+    Leaves the job object usable, so a restart can reassign a fresh child to
     the same handle.
     """
     if os.name != "nt" or not job:
