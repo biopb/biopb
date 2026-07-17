@@ -314,7 +314,6 @@ _RESERVED_NAMES = frozenset(
         "da",
         "ops",
         "run_on_main",
-        "cancelled",
         "_conn",
         "_jobs",
         "_dask_client",
@@ -749,7 +748,6 @@ def _bootstrap_impl():
             "_conn": conn,
             "_jobs": _jobs,
             "run_on_main": _jobs.run_on_main,
-            "cancelled": _jobs.cancelled,
             "_viewer_window_alive": lambda: viewer_window_alive(viewer),
             "_resync_view": lambda: resync_view_for_capture(viewer),
         }

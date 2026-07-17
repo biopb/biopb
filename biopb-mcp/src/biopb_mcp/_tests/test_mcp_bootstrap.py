@@ -203,7 +203,6 @@ def _seeded_ns():
         "da": "DA",
         "ops": {},
         "run_on_main": lambda f: f(),
-        "cancelled": lambda: False,
         "_conn": object(),
         "_jobs": object(),
         "_dask_client": None,
