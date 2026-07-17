@@ -193,7 +193,7 @@ class DataPlaneSupervisor:
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             _locations.rotate_log(Path(path))
-            self._log_fh = open(path, "ab", buffering=0)
+            self._log_fh = open(path, "ab", buffering=0)  # noqa: SIM115 - long-lived handle stored on self._log_fh for the spawned subprocess's lifetime
         except OSError:
             logger.warning("Cannot open data-plane log %s; using stderr", path)
             self._log_fh = getattr(sys.stderr, "buffer", sys.stderr)

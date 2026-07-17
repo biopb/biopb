@@ -34,7 +34,7 @@ def get_log_level_from_env() -> LogLevel | None:
 
 def setup_logging(
     level: LogLevel | str = "INFO",
-    format: str = DEFAULT_LOG_FORMAT,
+    log_format: str = DEFAULT_LOG_FORMAT,
     datefmt: str = DEFAULT_DATE_FORMAT,
     scope_to_biopb: bool = True,
     log_file: Optional[str] = None,
@@ -48,7 +48,7 @@ def setup_logging(
 
     Args:
         level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        format: Log message format string
+        log_format: Log message format string
         datefmt: Datetime format string for timestamps
         scope_to_biopb: If True, only configure biopb_tensor_server logger hierarchy.
                         If False, configure the root logger (affects all packages).
@@ -74,7 +74,7 @@ def setup_logging(
     # Normalize level string
     level_str = str(level).upper()
     numeric_level = level_map.get(level_str, logging.INFO)
-    formatter = logging.Formatter(format, datefmt)
+    formatter = logging.Formatter(log_format, datefmt)
 
     if scope_to_biopb:
         # Configure only the biopb_tensor_server logger hierarchy

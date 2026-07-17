@@ -1005,10 +1005,9 @@ class TensorFlightServer(flight.FlightServerBase):
                     total_bytes=-1,
                 )
             except Exception as e:
-                logger.error(
+                logger.exception(
                     f"list_flights: skipping source {source_id} due to "
                     f"descriptor build failure: {e}",
-                    exc_info=True,
                 )
                 skipped += 1
                 continue

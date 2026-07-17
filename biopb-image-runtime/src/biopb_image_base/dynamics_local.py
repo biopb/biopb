@@ -179,9 +179,7 @@ def cluster_destinations(
         seed_coords.append(pc)
         seed_inherit.append(gid)
 
-    inj_arr = (
-        np.array([c for c in seed_coords], dtype=np.float64) if seed_coords else None
-    )
+    inj_arr = np.array(list(seed_coords), dtype=np.float64) if seed_coords else None
     for k in range(own_seeds.shape[1]):
         c = own_seeds[:, k]
         if inj_arr is not None and len(inj_arr):
@@ -234,7 +232,7 @@ def cluster_destinations(
             labels[labels == lab] = 0
 
     # Record surviving labels and their seed (in the shape0 frame).
-    present = set(int(v) for v in np.unique(labels) if v != 0)
+    present = {int(v) for v in np.unique(labels) if v != 0}
     for k in range(n_seeds):
         temp_label = k + 1
         if temp_label not in present:

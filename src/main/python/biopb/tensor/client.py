@@ -240,12 +240,12 @@ class TensorFlightClient:
         """List available data sources. See :meth:`CatalogClient.list_sources`."""
         return self._catalog.list_sources()
 
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:
+    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Query the server catalog (DuckDB). See :meth:`CatalogClient.query_sources`."""
         return self._catalog.query_sources(sql, format=format)
 
     @staticmethod
-    def _format_query_result(table, format):
+    def _format_query_result(table, format):  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Coerce a query result to the requested format. See :meth:`CatalogClient._format_query_result`."""
         return CatalogClient._format_query_result(table, format)
 

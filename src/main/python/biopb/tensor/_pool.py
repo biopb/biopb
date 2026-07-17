@@ -157,12 +157,13 @@ def _is_localhost_location(location: str) -> bool:
         addrinfo = socket.getaddrinfo(hostname, None)
         for family, _, _, _, sockaddr in addrinfo:
             # Check if address is loopback
-            if family == socket.AF_INET:
-                if sockaddr[0] == "127.0.0.1":
-                    return True
-            elif family == socket.AF_INET6:
-                if sockaddr[0] == "::1":
-                    return True
+            if (
+                family == socket.AF_INET
+                and sockaddr[0] == "127.0.0.1"
+                or family == socket.AF_INET6
+                and sockaddr[0] == "::1"
+            ):
+                return True
     except socket.gaierror:
         # Hostname resolution failed, not localhost
         pass

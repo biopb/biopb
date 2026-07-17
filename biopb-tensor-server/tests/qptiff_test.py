@@ -55,7 +55,7 @@ def create_synthetic_qptiff(
         for lvl in range(n_levels):
             step = 2**lvl
             arr = data[:, ::step, ::step]
-            opts = dict(photometric="minisblack", tile=(tile, tile))
+            opts = {"photometric": "minisblack", "tile": (tile, tile)}
             if lvl == 0:
                 tw.write(
                     arr,

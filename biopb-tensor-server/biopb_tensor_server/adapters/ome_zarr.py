@@ -1055,7 +1055,7 @@ class OmeZarrAdapter(ZarrAdapter):
         """Extract scale for a specific level path."""
         multiscales = self.ome_metadata.get("multiscales", [])
         if not multiscales:
-            return tuple()
+            return ()
 
         for ds in multiscales[0].get("datasets", []):
             if ds.get("path") == level_path:
@@ -1063,7 +1063,7 @@ class OmeZarrAdapter(ZarrAdapter):
                     if t.get("type") == "scale":
                         return tuple(int(s) for s in t.get("scale", []))
 
-        return tuple()
+        return ()
 
     def _convert_slice_to_level(
         self,

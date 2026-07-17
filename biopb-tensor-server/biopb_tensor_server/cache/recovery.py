@@ -153,7 +153,7 @@ class WriteAheadLog:
 
     def get_pending_keys(self) -> List[bytes]:
         """Get all keys with pending writes."""
-        return [bytes.fromhex(k) for k in self._pending.keys()]
+        return [bytes.fromhex(k) for k in self._pending]
 
     def clear(self) -> None:
         """Clear WAL after clean shutdown."""

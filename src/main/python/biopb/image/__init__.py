@@ -2,7 +2,7 @@ try:
     import importlib.metadata
 
     __version__ = importlib.metadata.version("biopb")
-except:
+except Exception:
     pass
 
 from biopb.image.bindata_pb2 import BinData

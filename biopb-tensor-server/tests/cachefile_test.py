@@ -121,7 +121,10 @@ class TestLocateEntry:
     def test_locate_survives_restart(self):
         """Offsets are recoverable after a restart (rebuild from segments)."""
         d = tempfile.mkdtemp()
-        cfg = dict(max_segment_bytes=8 * 1024 * 1024, max_total_bytes=256 * 1024 * 1024)
+        cfg = {
+            "max_segment_bytes": 8 * 1024 * 1024,
+            "max_total_bytes": 256 * 1024 * 1024,
+        }
         be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
         a = (np.arange(2000, dtype=np.uint16) % 500).astype(np.uint16)
         be.get_or_acquire(b"k0", (lambda: (_make_typed_batch(a), a.nbytes)))
@@ -155,9 +158,10 @@ class TestLocateEntry:
         appending a truncated copy of a real message to the segment file.
         """
         d = tempfile.mkdtemp()
-        cfg = dict(
-            max_segment_bytes=64 * 1024 * 1024, max_total_bytes=256 * 1024 * 1024
-        )
+        cfg = {
+            "max_segment_bytes": 64 * 1024 * 1024,
+            "max_total_bytes": 256 * 1024 * 1024,
+        }
         be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
         try:
             arrs = {}

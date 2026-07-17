@@ -567,7 +567,7 @@ class ZeissAdapter(_BioioAdapterBase):
             return None
 
         name = ctx.name.lower()
-        if name.endswith(".czi") or name.endswith(".lsm"):
+        if name.endswith((".czi", ".lsm")):
             state.try_claim_path(ctx.path_str)
             return SourceClaim(
                 source_type=cls.SOURCE_TYPE,
@@ -655,7 +655,7 @@ class OlympusAdapter(_BioioAdapterBase):
             return None
 
         name = ctx.name.lower()
-        if name.endswith(".oif") or name.endswith(".oib"):
+        if name.endswith((".oif", ".oib")):
             state.try_claim_path(ctx.path_str)
             return SourceClaim(
                 source_type=cls.SOURCE_TYPE,

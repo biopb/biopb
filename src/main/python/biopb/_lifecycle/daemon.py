@@ -215,16 +215,16 @@ def stop_daemon(
             break
         time.sleep(1)
 
-    if not graceful:
+    if not graceful and is_our_daemon(pid, token):
         # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to
-        # SIGTERM, which os.kill maps to an unconditional TerminateProcess. Re-verify
-        # identity first: a reused PID must never take this unconditional kill.
-        if is_our_daemon(pid, token):
-            try:
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-            except OSError:
-                pass
-            time.sleep(0.5)
+        # SIGTERM, which os.kill maps to an unconditional TerminateProcess.
+        # Re-verify identity first: a reused PID must never take this
+        # unconditional kill (and short-circuited out above when graceful).
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError:
+            pass
+        time.sleep(0.5)
 
     remove_pid()
     if sys.platform == "win32":

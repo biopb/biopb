@@ -135,9 +135,7 @@ def _is_skippable_system_dir(name: str) -> bool:
     low = name.lower()
     if low in _SKIP_DIR_NAMES:
         return True
-    return (
-        low == "onedrive" or low.startswith("onedrive -") or low.startswith("onedrive-")
-    )
+    return low == "onedrive" or low.startswith(("onedrive -", "onedrive-"))
 
 
 def _is_offline_placeholder(
@@ -870,16 +868,13 @@ def generate_source_id(url: str, source_type: str) -> str:
     if url is None or url == "":
         raise ValueError("Cannot generate source_id from empty URL")
 
-    if is_remote_url(url):
-        # Remote URLs must NOT go through Path().resolve(): it treats the URL as
-        # a relative POSIX path, collapsing the scheme's "//" and prepending the
-        # server's cwd, which makes the id non-deterministic across deployments.
-        # Hash the raw URL (trailing slashes stripped so "x.zarr" == "x.zarr/").
-        key = url.rstrip("/")
-    else:
-        # For local paths, resolve to the canonical absolute path so the same
-        # location hashes identically however it was spelled (resolve_local_path).
-        key = resolve_local_path(url)
+    # Remote URLs must NOT go through Path().resolve(): it treats the URL as a
+    # relative POSIX path, collapsing the scheme's "//" and prepending the server's
+    # cwd, which makes the id non-deterministic across deployments. Hash the raw URL
+    # (trailing slashes stripped so "x.zarr" == "x.zarr/"). Local paths resolve to
+    # the canonical absolute path so the same location hashes identically however it
+    # was spelled (resolve_local_path).
+    key = url.rstrip("/") if is_remote_url(url) else resolve_local_path(url)
 
     hash_hex = hashlib.sha256(key.encode()).hexdigest()[:12]
     return f"{source_type}_{hash_hex}"

@@ -967,7 +967,7 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
         if (
             not ctx.is_remote
             and ctx._path is not None
-            and (name.endswith(".tif") or name.endswith(".tiff"))
+            and name.endswith((".tif", ".tiff"))
             # Cloud-storage phase 2: the embedded-OME-XML sniff opens the whole
             # TIFF (a recall on a non-resident placeholder). Skip it when the file
             # is not resident: the generic extension-only AicsImageIoAdapter then

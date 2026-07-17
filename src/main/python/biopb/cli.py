@@ -303,7 +303,7 @@ def _tail_and_follow(
     # truncated out from under us (a restart rotates it mid-follow). Track the
     # inode + size so a replaced or shrunk file restarts from the top.
     try:
-        f = open(log_file, errors="replace")
+        f = open(log_file, errors="replace")  # noqa: SIM115 - handle kept open across the follow loop, reopened on rotation
     except OSError:
         raise typer.Exit(0)
     try:
@@ -325,7 +325,7 @@ def _tail_and_follow(
                 st = None
             if st is not None and (st.st_ino != last_ino or st.st_size < f.tell()):
                 f.close()
-                f = open(log_file, errors="replace")
+                f = open(log_file, errors="replace")  # noqa: SIM115 - reopened handle lives across the follow loop
                 last_ino = os.fstat(f.fileno()).st_ino
                 carry = ""
                 continue

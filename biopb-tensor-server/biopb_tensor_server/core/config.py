@@ -1644,12 +1644,11 @@ def _claim_to_source_config(
 
     # Handle HDF5 special case - needs dataset path
     dataset = None
-    if claim.source_type == "hdf5":
-        # HDF5 claims have needs_dataset flag in extra_config
-        if claim.extra_config.get("needs_dataset"):
-            # This will fail at adapter creation unless dataset is provided
-            # For backward compatibility, we pass through any original dataset
-            dataset = original_source.dataset
+    if claim.source_type == "hdf5" and claim.extra_config.get("needs_dataset"):
+        # HDF5 claims have needs_dataset flag in extra_config. This will fail at
+        # adapter creation unless dataset is provided; for backward compatibility,
+        # pass through any original dataset.
+        dataset = original_source.dataset
 
     return SourceConfig(
         type=claim.source_type,

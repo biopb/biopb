@@ -648,10 +648,7 @@ class ArrowFileBackend(CacheBackend):
         pool_rates = []
         for pool_key, pool in self._pool_queues.items():
             total = pool.hits + pool.misses
-            if total > 0:
-                hit_rate = pool.hits / total
-            else:
-                hit_rate = 0.0
+            hit_rate = pool.hits / total if total > 0 else 0.0
             pool_rates.append((pool_key, hit_rate, pool.queue))
 
         # Select lowest hit rate pool with segments
@@ -1028,9 +1025,10 @@ class ArrowFileBackend(CacheBackend):
                 raise
 
         # If pending (either waiting on another thread or we just completed), wait
-        if entry.state == EntryState.PENDING:
-            if not entry.wait_ready(self._config.pending_timeout):
-                raise TimeoutError("Cache computation timed out for key")
+        if entry.state == EntryState.PENDING and not entry.wait_ready(
+            self._config.pending_timeout
+        ):
+            raise TimeoutError("Cache computation timed out for key")
 
         # Now acquire and return
         with self._lock:

@@ -46,7 +46,7 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
             return None
 
         name = ctx.name.lower()
-        if not (name.endswith(".h5") or name.endswith(".hdf5")):
+        if not name.endswith((".h5", ".hdf5")):
             return None
 
         state.try_claim_path(ctx.path_str)
