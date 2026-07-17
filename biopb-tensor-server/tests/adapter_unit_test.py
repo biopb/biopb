@@ -622,13 +622,25 @@ class TestGetPhysicalScale:
         assert unit == ["mm", "mm", "mm"]
 
     def test_nifti_physical_scale_time_axis_zeroed(self):
-        """Only the first three storage axes are spatial; the 4th (time) is 0.0."""
+        """Spatial axes carry a size; the time axis is 0.0 whatever its label."""
         a = self._make_nifti(
             ["x", "y", "z", "t"], [1.0, 0.5, 0.5, 2.0, 3.0], xyzt_units=3
         )
         scale, unit = a._physical_scale()
         assert scale == [0.5, 0.5, 2.0, 0.0]
         assert unit == ["µm", "µm", "µm", ""]
+
+    def test_nifti_physical_scale_time_first_labels_stay_aligned(self):
+        """Scale follows the label, not the position: a leading ``t`` axis (the
+        order ``_derive_dim_labels`` emits for 4D) gets 0.0, and x/y/z keep the
+        pixdim of their own storage axis -- so scale stays aligned with labels.
+        """
+        a = self._make_nifti(
+            ["t", "x", "y", "z"], [1.0, 3.0, 0.5, 0.5, 2.0], xyzt_units=2
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.5, 0.5, 2.0]
+        assert unit == ["", "mm", "mm", "mm"]
 
     def test_nifti_physical_scale_unknown_unit_keeps_size(self):
         """An uncalibrated pixdim still reports a size, with an empty unit."""

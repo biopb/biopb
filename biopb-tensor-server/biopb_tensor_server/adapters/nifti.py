@@ -272,14 +272,17 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim voxel size + unit from the header's ``pixdim`` / ``xyzt_units``.
 
-        NIfTI fixes the storage axis order: ``dim``/``pixdim`` index ``1 + i`` is
-        the extent of axis ``i``, and the first three axes are always the spatial
-        X/Y/Z (index 4 is time, 5-7 are extra) -- independent of the semantic
-        ``dim_labels`` this adapter guesses, which are positional over the very
-        same axes. So the spatial calibration is read positionally
-        (``pixdim[1:4]``) onto axes 0-2 with the ``xyzt_units`` spatial unit; the
-        time axis and beyond carry no spatial size and get ``0.0`` / ``""``.
-        Returns ``None`` when no spatial axis carries a positive size.
+        NIfTI carries one spacing per axis: ``pixdim[1 + i]`` is the extent of
+        storage axis ``i`` -- the very axis ``dim_labels[i]`` names -- so the
+        calibration is read positionally, ``pixdim[1 + i]`` onto axis ``i``, and
+        stays aligned 1:1 with ``dim_labels`` whatever order this adapter
+        assigned (it may place the non-spatial axis first, e.g.
+        ``["t", "x", "y", "z"]``). Only an axis this adapter labels spatial
+        (``x`` / ``y`` / ``z``) carries a spatial voxel size with the
+        ``xyzt_units`` spatial unit; on a time / channel / vector axis ``pixdim``
+        is a temporal step (or meaningless), not a spatial scale, so those axes
+        get ``0.0`` / ``""``. Returns ``None`` when no spatial axis carries a
+        positive size.
         """
         try:
             pixdim = self.header.get("pixdim", None)
@@ -294,10 +297,11 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
             scale: List[float] = []
             unit: List[str] = []
-            for i in range(len(self.dim_labels)):
+            for i, label in enumerate(self.dim_labels):
                 v = 0.0
-                # Only the first three storage axes are spatial (X/Y/Z).
-                if i < 3 and i + 1 < len(pixdim):
+                # Spatial-ness follows the label, not the position: only x/y/z
+                # carry a spatial voxel size (pixdim on t/c/v is not one).
+                if str(label).lower() in ("x", "y", "z") and i + 1 < len(pixdim):
                     try:
                         v = float(pixdim[i + 1])
                     except (TypeError, ValueError):
