@@ -5,6 +5,7 @@ OME-TIFF files are handled by OmeTiffAdapter (pure-tifffile).
 """
 
 import json
+import logging
 import math
 import re
 import threading
@@ -15,6 +16,12 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import (
+    MICRON,
+    mm_summary_scale,
+    scale_by_label,
+    unit_to_um,
+)
 from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
@@ -25,6 +32,49 @@ from biopb_tensor_server.core.discovery import (
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+logger = logging.getLogger(__name__)
+
+# TIFF ResolutionUnit code -> micrometres per unit (2 = inch, 3 = centimetre).
+# Code 1 ("no absolute unit") carries only an aspect ratio and is excluded.
+_RESUNIT_TO_UM = {2: 25400.0, 3: 10000.0}
+
+
+def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
+    """One axis' pixel size in µm from a TIFF ``X``/``YResolution`` tag.
+
+    A resolution tag is a *density* (pixels per unit), so the pixel size is its
+    reciprocal times the unit's µm length. The unit is the ImageJ calibration
+    unit when the file carries one (``imagej_unit_um`` = its µm factor), else the
+    standard ``ResolutionUnit`` tag (inch / centimetre). Returns ``None`` when
+    the tag is absent, zero, or the unit is unusable (e.g. ResolutionUnit 1).
+    """
+    tag = page.tags.get(tag_name)
+    if tag is None:
+        return None
+    val = tag.value
+    if isinstance(val, tuple) and len(val) == 2:
+        num, den = val
+        if not num or not den:
+            return None
+        density = num / den  # pixels per unit
+    else:
+        try:
+            density = float(val)
+        except (TypeError, ValueError):
+            return None
+    if not density:
+        return None
+    per_pixel = 1.0 / density  # units per pixel, in the resolution's own unit
+
+    if imagej_unit_um is not None:
+        return per_pixel * imagej_unit_um
+    ru_tag = page.tags.get("ResolutionUnit")
+    ru = int(ru_tag.value) if ru_tag is not None else 2
+    factor = _RESUNIT_TO_UM.get(ru)
+    if factor is None:
+        return None
+    return per_pixel * factor
 
 
 # OME-TIFF naming patterns owned by the file-level OmeTiffAdapter. Excluded only
@@ -775,6 +825,47 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
 
         return result
 
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (µm) from the first member's TIFF resolution tags.
+
+        X/Y come from ``X``/``YResolution`` (+ ``ResolutionUnit``, or the ImageJ
+        calibration unit when present); Z, only for a multi-page stack, from the
+        ImageJ ``spacing`` field. The opaque file axis (``i``) and any axis
+        without a tag get ``0.0`` / ``""``. Cheap: one page-header read of
+        ``members[0]`` under its per-file lock, matching the ``_physical_scale``
+        hot-path contract. Returns ``None`` when no usable resolution is present.
+        """
+        if not self._tiff_files:
+            return None
+        try:
+            import tifffile
+
+            path = self._tiff_files[0]
+            with self._lock_for(path):
+                with tifffile.TiffFile(str(path)) as tf:
+                    page = tf.pages[0]
+                    ij = tf.imagej_metadata or {}
+                    ij_unit_um = unit_to_um(ij.get("unit"))
+                    x_um = _tiff_pixel_size_um(page, "XResolution", ij_unit_um)
+                    y_um = _tiff_pixel_size_um(page, "YResolution", ij_unit_um)
+                    z_um = None
+                    spacing = ij.get("spacing")
+                    if spacing is not None and ij_unit_um is not None:
+                        try:
+                            z_um = float(spacing) * ij_unit_um
+                        except (TypeError, ValueError):
+                            z_um = None
+            return scale_by_label(
+                self.dim_labels, {"x": x_um, "y": y_um, "z": z_um}, MICRON
+            )
+        except Exception:
+            logger.debug(
+                "tiff-sequence: physical scale unavailable for %s",
+                self._source_url,
+                exc_info=True,
+            )
+            return None
+
     def get_metadata(self) -> dict:
         """Expose per-file provenance so the agent can interpret the file axis.
 
@@ -1363,6 +1454,15 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdap
             result = result.reshape(n_pos, n_time, n_chan, n_z, h, w)
 
         return result
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (µm) from the MicroManager ``Summary`` metadata.
+
+        ``PixelSize_um`` (isotropic X/Y) and the z-step onto the ``x`` / ``y`` /
+        ``z`` axes; position / time / channel axes get ``0.0`` / ``""``.
+        """
+        summary = self._raw_metadata.get("Summary", {})
+        return mm_summary_scale(summary, self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Return parsed MicroManager metadata."""

@@ -26,6 +26,81 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _physical_scale_from_multiscales(
+    multiscales: list, fallback_axes: list
+) -> Optional[Tuple[List[float], List[str]]]:
+    """Per-dim physical pixel size + unit from an OME-Zarr ``multiscales`` block.
+
+    Physical size of an axis = (optional multiscales-level scale transform) x
+    (level-0 dataset scale), in that axis' ``unit``, aligned to the axes order.
+    Only axes that declare a ``unit`` carry a physical size -- an NGFF scale is
+    otherwise a dimensionless (relative) downsample factor, so unit-less axes
+    (channel / index) get ``0.0`` / ``""``. Returns ``None`` when there is no
+    ``multiscales``, no axes/datasets, or no unit-bearing axis. Shared by the
+    single-image :meth:`OmeZarrAdapter._physical_scale` and the per-field HCS
+    adapter (:class:`_HcsFieldAdapter`), which read the identical block off their
+    own ``.zattrs``.
+    """
+    if not multiscales:
+        return None
+    ms = multiscales[0]
+    axes = ms.get("axes", []) or fallback_axes
+    datasets = ms.get("datasets", [])
+    if not axes or not datasets:
+        return None
+    ndim = len(axes)
+
+    def _scale_vec(transforms):
+        for t in transforms or []:
+            if t.get("type") == "scale":
+                vec = t.get("scale", [])
+                if len(vec) == ndim:
+                    return [float(v) for v in vec]
+        return [1.0] * ndim
+
+    # Transforms compose: dataset (level-0) scale, then multiscales-level.
+    global_scale = _scale_vec(ms.get("coordinateTransformations"))
+    level0_scale = _scale_vec(datasets[0].get("coordinateTransformations"))
+
+    scale, unit = [], []
+    for i, ax in enumerate(axes):
+        u = ax.get("unit", "") if isinstance(ax, dict) else ""
+        if u:
+            try:
+                v = global_scale[i] * level0_scale[i]
+            except (TypeError, ValueError, IndexError):
+                v = 0.0
+            if v > 0:
+                scale.append(v)
+                unit.append(str(u))
+                continue
+        scale.append(0.0)
+        unit.append("")
+    if not any(scale):
+        return None
+    return scale, unit
+
+
+class _HcsFieldAdapter(ZarrAdapter):
+    """A single HCS-plate field, served as a plain Zarr array + its own scale.
+
+    :meth:`OmeZarrAdapter._create_field_adapter` opens a field's level-0 array
+    directly (no group navigation), so a plain :class:`ZarrAdapter` handles the
+    pixels. This thin subclass additionally carries the ``(scale, unit)`` read
+    from the field's ``.zattrs`` multiscales, so a per-field ``GetFlightInfo``
+    advertises the field's physical calibration (biopb/biopb#272) -- the plate
+    adapter itself returns ``None`` (there is no plate-level scale), and the
+    field is where the calibration actually lives.
+    """
+
+    def __init__(self, *args, physical_scale=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._field_physical_scale = physical_scale
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        return self._field_physical_scale
+
+
 class OmeZarrAdapter(ZarrAdapter):
     """Adapter for OME-Zarr (OME-NGFF) datasets.
 
@@ -666,55 +741,15 @@ class OmeZarrAdapter(ZarrAdapter):
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the multiscales transforms.
 
-        Physical size of an axis = (optional multiscales-level scale transform)
-        x (level-0 dataset scale), in that axis' ``unit``. Aligned to the axes
-        order (which is also this adapter's ``dim_labels``). Only axes that
-        declare a ``unit`` carry a physical size -- the OME-Zarr scale is
-        otherwise a dimensionless (relative) downsample factor, so unit-less
-        axes (and channel/index axes) get ``0.0`` / ``""``. Returns ``None``
-        when no axis declares a unit (no physical information). See
-        ``TensorAdapter._physical_scale``.
+        Reads this image's top-level ``multiscales`` (aligned to ``dim_labels``);
+        an HCS plate has none at the source level and so returns ``None`` here --
+        its per-field scale is carried by :class:`_HcsFieldAdapter`. See
+        :func:`_physical_scale_from_multiscales` and ``TensorAdapter._physical_scale``.
         """
         try:
-            multiscales = self.ome_metadata.get("multiscales", [])
-            if not multiscales:
-                return None  # HCS plate or non-image: no top-level multiscales
-            ms = multiscales[0]
-            axes = ms.get("axes", []) or self.axes
-            datasets = ms.get("datasets", [])
-            if not axes or not datasets:
-                return None
-            ndim = len(axes)
-
-            def _scale_vec(transforms):
-                for t in transforms or []:
-                    if t.get("type") == "scale":
-                        vec = t.get("scale", [])
-                        if len(vec) == ndim:
-                            return [float(v) for v in vec]
-                return [1.0] * ndim
-
-            # Transforms compose: dataset (level-0) scale, then multiscales-level.
-            global_scale = _scale_vec(ms.get("coordinateTransformations"))
-            level0_scale = _scale_vec(datasets[0].get("coordinateTransformations"))
-
-            scale, unit = [], []
-            for i, ax in enumerate(axes):
-                u = ax.get("unit", "") if isinstance(ax, dict) else ""
-                if u:
-                    try:
-                        v = global_scale[i] * level0_scale[i]
-                    except (TypeError, ValueError, IndexError):
-                        v = 0.0
-                    if v > 0:
-                        scale.append(v)
-                        unit.append(str(u))
-                        continue
-                scale.append(0.0)
-                unit.append("")
-            if not any(scale):
-                return None
-            return scale, unit
+            return _physical_scale_from_multiscales(
+                self.ome_metadata.get("multiscales", []), self.axes
+            )
         except Exception:
             return None
 
@@ -890,23 +925,41 @@ class OmeZarrAdapter(ZarrAdapter):
         # Use plate root path for navigation
         store_path = self._plate_root_path
 
-        # Read field .zattrs to get resolution path
+        # Read the field's .zattrs once: the resolution path, dim labels, and
+        # the physical scale (biopb/biopb#272) all come from its multiscales
+        # block. A corrupt/absent .zattrs degrades to defaults (no scale).
         field_zattrs_path = os.path.join(
             store_path, well_path.rstrip("/"), field_path.rstrip("/"), ".zattrs"
         )
 
         resolution_path = "0"
+        dim_labels = None
+        physical_scale = None
         if os.path.exists(field_zattrs_path):
             try:
                 with open(field_zattrs_path) as f:
                     field_zattrs = json.load(f)
-                    multiscales = field_zattrs.get("multiscales", [])
-                    if multiscales:
-                        datasets = multiscales[0].get("datasets", [])
-                        if datasets:
-                            resolution_path = datasets[0].get("path", "0")
-            except (OSError, json.JSONDecodeError):
-                pass
+                multiscales = field_zattrs.get("multiscales", [])
+                if multiscales:
+                    ms0 = multiscales[0]
+                    datasets = ms0.get("datasets", [])
+                    if datasets:
+                        resolution_path = datasets[0].get("path", "0")
+                    axes = ms0.get("axes", [])
+                    if axes:
+                        dim_labels = [
+                            ax.get("name", f"dim{i}")
+                            if isinstance(ax, dict)
+                            else str(ax)
+                            for i, ax in enumerate(axes)
+                        ]
+                    physical_scale = _physical_scale_from_multiscales(multiscales, axes)
+            except Exception:
+                logger.debug(
+                    "ome-zarr HCS: field .zattrs unreadable at %s",
+                    field_zattrs_path,
+                    exc_info=True,
+                )
 
         # Open the field's resolution array
         arr_path = os.path.join(
@@ -915,30 +968,13 @@ class OmeZarrAdapter(ZarrAdapter):
 
         arr = zarr.open_array(arr_path, mode="r")
 
-        # Get dim_labels from field multiscales
-        dim_labels = None
-        if os.path.exists(field_zattrs_path):
-            try:
-                with open(field_zattrs_path) as f:
-                    field_zattrs = json.load(f)
-                    multiscales = field_zattrs.get("multiscales", [])
-                    if multiscales:
-                        axes = multiscales[0].get("axes", [])
-                        if axes:
-                            dim_labels = [
-                                ax.get("name", f"dim{i}")
-                                if isinstance(ax, dict)
-                                else str(ax)
-                                for i, ax in enumerate(axes)
-                            ]
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        # Create adapter for this field
-        field_adapter = ZarrAdapter(
+        # Create adapter for this field, carrying the field's own physical scale
+        # (the plate level has none -- biopb/biopb#272).
+        field_adapter = _HcsFieldAdapter(
             arr,
             source_id=self.source_id,
             dim_labels=dim_labels or self.dim_labels,
+            physical_scale=physical_scale,
         )
 
         # Set tensor name for array_id computation

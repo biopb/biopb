@@ -702,6 +702,45 @@ class TestHdf5Integration:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
+    def test_hdf5_element_size_um_reaches_client(self, temp_dir):
+        """An ilastik/Imaris element_size_um attribute rides the descriptor to
+        the client as physical_scale (issue #272)."""
+        import os
+
+        import h5py
+        import numpy as np
+        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+        h5_path = os.path.join(temp_dir, "calibrated.h5")
+        with h5py.File(h5_path, "w") as f:
+            dset = f.create_dataset(
+                "data", data=np.zeros((4, 16, 16), dtype="uint8"), chunks=(1, 16, 16)
+            )
+            dset.attrs["element_size_um"] = np.array([2.0, 0.25, 0.25])
+
+        with h5py.File(h5_path, "r") as f:
+            adapter = Hdf5Adapter(f["data"], "cal", ["z", "y", "x"])
+
+            server = TensorFlightServer("grpc://localhost:0")
+            server.register_source("cal", adapter)
+            server.mark_ready()
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                client = TensorFlightClient(
+                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+                )
+                client.get_tensor("cal")
+                scale, unit = client.get_physical_scale("cal")
+                assert list(scale) == [2.0, 0.25, 0.25]
+                assert list(unit) == ["µm", "µm", "µm"]
+                client.close()
+            finally:
+                server.shutdown()
+
 
 class TestCacheIntegration:
     """Integration tests for cache behavior across adapters."""

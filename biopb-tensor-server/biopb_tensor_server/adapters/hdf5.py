@@ -3,7 +3,7 @@
 Relies on OS page cache for raw data caching.
 """
 
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -140,6 +140,38 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
 
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim voxel size (µm) from the ``element_size_um`` attribute.
+
+        ``element_size_um`` (the ilastik / Imaris convention) is a per-axis
+        voxel-size vector in micrometres, aligned 1:1 with the dataset's own
+        axes -- i.e. with ``dim_labels``. Projected positionally, with a
+        non-positive entry left as ``0.0`` / ``""``. Best-effort: the attribute
+        is optional, and a length that does not match the dataset's rank cannot
+        be aligned, so both yield ``None`` rather than a guess.
+        """
+        try:
+            attrs = getattr(self.h5_dataset, "attrs", None)
+            if attrs is None or "element_size_um" not in attrs:
+                return None
+            vals = [float(v) for v in np.atleast_1d(attrs["element_size_um"]).tolist()]
+            if len(vals) != len(self.dim_labels):
+                return None
+            scale: List[float] = []
+            unit: List[str] = []
+            for v in vals:
+                if v > 0:
+                    scale.append(v)
+                    unit.append("µm")
+                else:
+                    scale.append(0.0)
+                    unit.append("")
+            if not any(scale):
+                return None
+            return scale, unit
+        except Exception:
+            return None
 
     def get_metadata(self) -> dict:
         """Return HDF5 metadata as dict.
