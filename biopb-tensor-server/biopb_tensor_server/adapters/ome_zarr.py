@@ -40,6 +40,12 @@ def _physical_scale_from_multiscales(
     single-image :meth:`OmeZarrAdapter._physical_scale` and the per-field HCS
     adapter (:class:`_HcsFieldAdapter`), which read the identical block off their
     own ``.zattrs``.
+
+    ``fallback_axes`` supplies the source-level axes to use when *this* block
+    omits its own ``axes`` array (permitted by older NGFF while it still carries
+    dataset scale transforms). Callers pass the adapter's ``self.axes`` so a
+    field/level missing its axes still resolves units from the source; both
+    lists describe the same dimensionality, so the fallback is safe.
     """
     if not multiscales:
         return None
@@ -953,7 +959,15 @@ class OmeZarrAdapter(ZarrAdapter):
                             else str(ax)
                             for i, ax in enumerate(axes)
                         ]
-                    physical_scale = _physical_scale_from_multiscales(multiscales, axes)
+                    # Fall back to the plate source's axes (populated from the
+                    # first field, see _parse_hcs_plate_structure) when THIS
+                    # field's multiscales omits its own -- fields in a plate share
+                    # axis structure, so the source axes carry the right units.
+                    # Passing the field's own (possibly empty) axes here instead
+                    # would make the fallback a no-op.
+                    physical_scale = _physical_scale_from_multiscales(
+                        multiscales, self.axes
+                    )
             except Exception:
                 logger.debug(
                     "ome-zarr HCS: field .zattrs unreadable at %s",

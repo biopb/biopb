@@ -980,6 +980,103 @@ class TestGetPhysicalScale:
         )
         return plate
 
+    @staticmethod
+    def _make_hcs_plate_second_field_missing_axes(tmpdir):
+        """A two-well plate whose second field's multiscales omits ``axes``.
+
+        Well ``A/1`` field 0 declares full c/y/x axes (micrometre-calibrated), so
+        the plate source picks up those axes; well ``A/2`` field 0 carries a
+        level-0 scale transform but NO ``axes`` array, exercising the fallback to
+        the source axes in :func:`_physical_scale_from_multiscales`.
+        """
+        import json
+
+        import zarr
+
+        plate = os.path.join(tmpdir, "plate.zarr")
+        for sub in ("", "A", "A/1", "A/1/0", "A/2", "A/2/0"):
+            d = os.path.join(plate, sub)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, ".zgroup"), "w") as f:
+                json.dump({"zarr_format": 2}, f)
+        with open(os.path.join(plate, ".zattrs"), "w") as f:
+            json.dump({"plate": {"wells": [{"path": "A/1"}, {"path": "A/2"}]}}, f)
+        for well in ("A/1", "A/2"):
+            with open(os.path.join(plate, well, ".zattrs"), "w") as f:
+                json.dump({"well": {"images": [{"path": "0"}]}}, f)
+        # Well A/1 field 0: full axes -> populates the plate source's self.axes.
+        with open(os.path.join(plate, "A", "1", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "axes": [
+                                {"name": "c", "type": "channel"},
+                                {"name": "y", "type": "space", "unit": "micrometer"},
+                                {"name": "x", "type": "space", "unit": "micrometer"},
+                            ],
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.5, 0.5]}
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                f,
+            )
+        # Well A/2 field 0: a scale transform but NO axes -> must fall back.
+        with open(os.path.join(plate, "A", "2", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.3, 0.3]}
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                },
+                f,
+            )
+        for well in ("A/1", "A/2"):
+            zarr.open_array(
+                os.path.join(plate, well, "0", "0"),
+                mode="w",
+                shape=(2, 16, 16),
+                chunks=(1, 16, 16),
+                dtype="uint8",
+            )
+        return plate
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_field_missing_axes_falls_back_to_source_axes(self):
+        """A field whose multiscales omits ``axes`` still resolves units, by
+        falling back to the plate source's axes (from the first field)."""
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = self._make_hcs_plate_second_field_missing_axes(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            # The plate source picked up axes from the first field (well A/1).
+            assert plate.axes  # non-empty
+            # Bind the second well's field, whose own multiscales has no axes.
+            field = plate.get_tensor_adapter("plate/2/0")
+            scale, unit = field._physical_scale()
+            assert scale == [0.0, 0.3, 0.3]
+            assert unit == ["", "micrometer", "micrometer"]
+
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_hcs_plate_level_scale_is_none_but_field_carries_it(self):
         """The plate advertises no scale; the per-field adapter (bound by full
