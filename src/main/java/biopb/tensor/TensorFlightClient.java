@@ -893,7 +893,8 @@ public class TensorFlightClient implements AutoCloseable {
         // Build TensorReadOption from descriptor's fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
                 .setTensorId(descriptor.getArrayId())
-                .setWithMetadata(false);
+                .setWithMetadata(false)
+                .setCompactGridOk(true);
 
         if (descriptor.hasSliceHint()) {
             readBuilder.setSliceHint(descriptor.getSliceHint());
@@ -922,8 +923,11 @@ public class TensorFlightClient implements AutoCloseable {
         try (FlightClient client = FlightClient.builder(allocator, location).build()) {
             FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
 
+            // resolveFlightEndpoints regenerates the endpoints if the server
+            // answered compact (biopb/biopb#346); an explicit response passes
+            // through unchanged.
             List<SerializedEndpoint> endpoints = new ArrayList<>();
-            for (FlightEndpoint endpoint : info.getEndpoints()) {
+            for (FlightEndpoint endpoint : CompactGrid.resolveFlightEndpoints(info)) {
                 TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
                 ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
                 SerializedEndpoint serializedEp = SerializedEndpoint.newBuilder()
@@ -1319,7 +1323,8 @@ public class TensorFlightClient implements AutoCloseable {
         // Build TensorReadOption with flattened fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
                 .setTensorId(tensorId)
-                .setWithMetadata(false);
+                .setWithMetadata(false)
+                .setCompactGridOk(true);
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);
@@ -1344,7 +1349,8 @@ public class TensorFlightClient implements AutoCloseable {
         // Cache the response descriptor
         descriptors.put(responseDescriptor.getArrayId(), responseDescriptor);
 
-        return new RequestContext(responseDescriptor, info.getEndpoints());
+        return new RequestContext(
+                responseDescriptor, CompactGrid.resolveFlightEndpoints(info, responseDescriptor));
     }
 
     private static String normalizeReductionMethod(String reductionMethod) {

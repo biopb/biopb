@@ -1,5 +1,7 @@
 package biopb.tensor;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -127,6 +129,51 @@ final class TensorChunkCodec {
             default:
                 return new FloatType();
         }
+    }
+
+    /**
+     * Encode a {@code chunk_id} from an array_id and bounds, byte-for-byte
+     * identical to the server's Python codec (biopb/biopb#346). The client needs
+     * this only on the compact-grid read path, where it regenerates chunk_ids
+     * arithmetically instead of reading them off explicit endpoints.
+     *
+     * <p>Format (all integers big-endian, which is {@link ByteBuffer}'s default):
+     * {@code [uint32 array_id_len][array_id utf-8][uint16 ndim][int64*ndim
+     * start][int64*ndim stop]}.
+     */
+    static byte[] encodeChunkId(String arrayId, ChunkBounds bounds) {
+        byte[] idBytes = arrayId.getBytes(StandardCharsets.UTF_8);
+        int ndim = bounds.getStartCount();
+        ByteBuffer buffer = ByteBuffer.allocate(4 + idBytes.length + 2 + 16 * ndim);
+        buffer.putInt(idBytes.length);
+        buffer.put(idBytes);
+        buffer.putShort((short) ndim);
+        for (int axis = 0; axis < ndim; axis++) {
+            buffer.putLong(bounds.getStart(axis));
+        }
+        for (int axis = 0; axis < ndim; axis++) {
+            buffer.putLong(bounds.getStop(axis));
+        }
+        return buffer.array();
+    }
+
+    /**
+     * Encode a scaled {@code chunk_id}: the standard bounds encoding followed by
+     * {@code [int64*ndim scale][uint16 method_len][method utf-8]}. Matches the
+     * server's {@code encode_chunk_id_with_scale}.
+     */
+    static byte[] encodeChunkIdWithScale(
+            String arrayId, ChunkBounds bounds, long[] scale, String method) {
+        byte[] base = encodeChunkId(arrayId, bounds);
+        byte[] methodBytes = method.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(base.length + 8 * scale.length + 2 + methodBytes.length);
+        buffer.put(base);
+        for (long factor : scale) {
+            buffer.putLong(factor);
+        }
+        buffer.putShort((short) methodBytes.length);
+        buffer.put(methodBytes);
+        return buffer.array();
     }
 
     /** Parse a {@link TensorTicket} from an endpoint ticket's bytes. */
