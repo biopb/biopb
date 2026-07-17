@@ -630,17 +630,31 @@ class TestGetPhysicalScale:
         assert scale == [0.5, 0.5, 2.0, 0.0]
         assert unit == ["µm", "µm", "µm", ""]
 
-    def test_nifti_physical_scale_time_first_labels_stay_aligned(self):
-        """Scale follows the label, not the position: a leading ``t`` axis (the
-        order ``_derive_dim_labels`` emits for 4D) gets 0.0, and x/y/z keep the
-        pixdim of their own storage axis -- so scale stays aligned with labels.
+    def test_nifti_physical_scale_time_first_labels_read_fixed_pixdim(self):
+        """pixdim is storage-fixed: for a real 4D fMRI (X/Y/Z in pixdim[1:4],
+        TR in pixdim[4]) with the auto-derived ``["t","x","y","z"]`` order, the
+        leading ``t`` gets 0.0 and x/y/z read pixdim[1:4] -- so TR (pixdim[4]=3.0)
+        is never misreported as the Z length.
         """
         a = self._make_nifti(
-            ["t", "x", "y", "z"], [1.0, 3.0, 0.5, 0.5, 2.0], xyzt_units=2
+            ["t", "x", "y", "z"], [1.0, 0.5, 0.5, 2.0, 3.0], xyzt_units=2
         )
         scale, unit = a._physical_scale()
         assert scale == [0.0, 0.5, 0.5, 2.0]
         assert unit == ["", "mm", "mm", "mm"]
+
+    def test_nifti_physical_scale_5d_leading_nonspatial(self):
+        """5D ``["v","t","x","y","z"]``: v/t are non-spatial (0.0), and x/y/z read
+        the storage-fixed pixdim[1:4] -- not pixdim[3:6] (Z / TR / 5th axis).
+        """
+        a = self._make_nifti(
+            ["v", "t", "x", "y", "z"],
+            [1.0, 0.5, 0.5, 2.0, 3.0, 7.0],
+            xyzt_units=3,
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.5, 0.5, 2.0]
+        assert unit == ["", "", "µm", "µm", "µm"]
 
     def test_nifti_physical_scale_unknown_unit_keeps_size(self):
         """An uncalibrated pixdim still reports a size, with an empty unit."""

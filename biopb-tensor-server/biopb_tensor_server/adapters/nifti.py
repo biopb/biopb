@@ -272,15 +272,17 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim voxel size + unit from the header's ``pixdim`` / ``xyzt_units``.
 
-        NIfTI carries one spacing per axis: ``pixdim[1 + i]`` is the extent of
-        storage axis ``i`` -- the very axis ``dim_labels[i]`` names -- so the
-        calibration is read positionally, ``pixdim[1 + i]`` onto axis ``i``, and
-        stays aligned 1:1 with ``dim_labels`` whatever order this adapter
-        assigned (it may place the non-spatial axis first, e.g.
-        ``["t", "x", "y", "z"]``). Only an axis this adapter labels spatial
-        (``x`` / ``y`` / ``z``) carries a spatial voxel size with the
-        ``xyzt_units`` spatial unit; on a time / channel / vector axis ``pixdim``
-        is a temporal step (or meaningless), not a spatial scale, so those axes
+        NIfTI fixes ``pixdim`` by storage axis, independent of ``dim_labels``:
+        ``pixdim[1:4]`` are always the spatial X / Y / Z voxel sizes, ``pixdim[4]``
+        the time step (TR), ``pixdim[5:]`` further non-spatial axes. This adapter's
+        ``dim_labels`` are NOT guaranteed to be in storage order -- auto-derivation
+        puts the non-spatial axis first for 4D/5D (e.g. ``["t", "x", "y", "z"]``)
+        -- so the spatial sizes are consumed *in order* as the spatial labels
+        appear (``pixdim[1]`` -> the first ``x``, ``pixdim[2]`` -> ``y``,
+        ``pixdim[3]`` -> ``z``), not by ``dim_labels`` position. Indexing
+        ``pixdim`` by position would shift by the number of leading non-spatial
+        axes and misread the TR (or a 5th axis) as a spatial length on any file
+        whose spatial labels are not at the front. Non-spatial axes (t / c / v)
         get ``0.0`` / ``""``. Returns ``None`` when no spatial axis carries a
         positive size.
         """
@@ -295,17 +297,21 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
                 units = units.item()
             unit_str = _NIFTI_SPATIAL_UNIT.get(int(units) & 0x07, "")
 
+            # pixdim[1:4] are the storage-fixed X/Y/Z spacings; walk them in order
+            # as the spatial labels appear, so a leading non-spatial axis doesn't
+            # shift the spatial sizes onto the wrong pixdim entry (or read the TR
+            # at pixdim[4] as a length). spatial_idx advances only on x/y/z.
+            spatial_idx = 1
             scale: List[float] = []
             unit: List[str] = []
-            for i, label in enumerate(self.dim_labels):
+            for label in self.dim_labels:
                 v = 0.0
-                # Spatial-ness follows the label, not the position: only x/y/z
-                # carry a spatial voxel size (pixdim on t/c/v is not one).
-                if str(label).lower() in ("x", "y", "z") and i + 1 < len(pixdim):
+                if str(label).lower() in ("x", "y", "z") and spatial_idx < len(pixdim):
                     try:
-                        v = float(pixdim[i + 1])
+                        v = float(pixdim[spatial_idx])
                     except (TypeError, ValueError):
                         v = 0.0
+                    spatial_idx += 1
                 if v > 0:
                     scale.append(v)
                     unit.append(unit_str)
