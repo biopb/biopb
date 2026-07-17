@@ -55,6 +55,7 @@ from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     decode_chunk_id,
     encode_chunk_id,
+    expand_compact_grid,
     is_scaled_chunk,
     rewrite_chunk_id_array_id,
 )
@@ -672,6 +673,33 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         # protocol mismatch or a proxy bug.
         try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
+            if not info.endpoints and up_desc.chunk_array_id:
+                # Compact upstream response (biopb/biopb#346): no per-chunk
+                # endpoints, just the grid + the chunk_array_id they encode.
+                # Regenerate the exact explicit (chunk_id, logical_bounds) list
+                # the upstream would otherwise have enumerated -- byte-identical,
+                # so the localization below and any later do_get are unchanged.
+                # The whole grid shares one chunk_array_id (compact is emitted
+                # only for a regular single-array_id grid), so the upstream->local
+                # map resolves once instead of per chunk.
+                local_aid = self._to_local_array_id(up_desc.chunk_array_id)
+                endpoints = [
+                    ChunkEndpoint(
+                        chunk_id=rewrite_chunk_id_array_id(cid, local_aid),
+                        bounds=bounds,
+                    )
+                    for cid, bounds in expand_compact_grid(up_desc)
+                ]
+                local_desc = self._localize_forwarded_descriptor(up_desc)
+                # This proxy re-emits explicit endpoints downstream (its plan
+                # leaves regular_grid False), so strip the compact-only
+                # descriptor fields -- the forwarded plan is then byte-for-byte
+                # what the explicit path produces and is never mis-detected as
+                # compact by the client.
+                local_desc.ClearField("chunk_array_id")
+                local_desc.ClearField("slice_hint")
+                return TensorReadPlan(descriptor=local_desc, chunk_endpoints=endpoints)
+
             endpoints = []
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
@@ -713,7 +741,16 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         only the descriptor + endpoints.
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
-        up_read_opt = TensorReadOption(tensor_id=upstream_array_id, with_metadata=False)
+        up_read_opt = TensorReadOption(
+            tensor_id=upstream_array_id,
+            with_metadata=False,
+            # Accept a compact grid from the upstream (biopb/biopb#346): for a
+            # regular grid the upstream omits the per-chunk endpoint list, so
+            # only the small grid descriptor crosses the network on this hop.
+            # forward_flight_info regenerates the endpoints locally. An older
+            # upstream ignores the flag and answers explicit -- the fallback path.
+            compact_grid_ok=True,
+        )
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
         if read_opt.scale_hint:

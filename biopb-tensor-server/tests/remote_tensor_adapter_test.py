@@ -370,6 +370,121 @@ class TestRemoteTensorProxy:
                 upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_forward_flight_info_compact_upstream_matches_explicit(self):
+        """A compact upstream response (biopb/biopb#346) localizes to the exact
+        same endpoints as an explicit one -- byte-for-byte chunk_ids and bounds.
+
+        The proxy sets ``compact_grid_ok`` on the upstream hop, so a regular-grid
+        upstream omits the per-chunk endpoint list; forward_flight_info then
+        regenerates it. This pins that the regenerated + localized endpoints are
+        identical to what the explicit path produces, which is what keeps the
+        downstream cache keys (derived from the local chunk_id bytes) stable
+        across the two upstream response forms.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.core.chunk import (
+            decode_chunk_id,
+            rewrite_chunk_id_array_id,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.zeros((3, 40, 50), dtype="<i2")
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source(
+                "aics",
+                ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
+            )
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__aics",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="aics",
+                )
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "aics",
+                            "dim_labels": ["z", "y", "x"],
+                            "shape": [3, 40, 50],
+                            "chunk_shape": [],
+                            "dtype": "<i2",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+
+                def _upstream_info(compact):
+                    read_opt = TensorReadOption(
+                        tensor_id="aics",
+                        with_metadata=False,
+                        compact_grid_ok=compact,
+                    )
+                    cmd = FlightCmd(source_id="aics", tensor_read=read_opt)
+                    fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+                    return adapter.client._client.get_flight_info(
+                        fd, options=adapter.client._call_options
+                    )
+
+                # The upstream genuinely answers compact for this regular grid,
+                # so forward_flight_info exercises the expand branch (not the
+                # explicit fallback).
+                info_compact = _upstream_info(True)
+                assert len(list(info_compact.endpoints)) == 0
+                assert TensorDescriptor.FromString(
+                    info_compact.descriptor.command
+                ).chunk_array_id
+
+                # The explicit reference: localize the upstream's own endpoints
+                # exactly as the explicit branch of forward_flight_info does.
+                info_explicit = _upstream_info(False)
+                assert len(list(info_explicit.endpoints)) == 3
+                expected = []
+                for ep in info_explicit.endpoints:
+                    ticket = TensorTicket.FromString(ep.ticket.ticket)
+                    bounds = ChunkBounds.FromString(ep.app_metadata)
+                    up_aid, _ = decode_chunk_id(ticket.chunk_id)
+                    local_cid = rewrite_chunk_id_array_id(
+                        ticket.chunk_id, adapter._to_local_array_id(up_aid)
+                    )
+                    expected.append(
+                        (local_cid, tuple(bounds.start), tuple(bounds.stop))
+                    )
+
+                # The real proxy path (compact upstream, since the flag is on).
+                plan = adapter.forward_flight_info(
+                    TensorReadOption(tensor_id="hpc__aics")
+                )
+                got = [
+                    (ce.chunk_id, tuple(ce.bounds.start), tuple(ce.bounds.stop))
+                    for ce in plan.chunk_endpoints
+                ]
+                assert got == expected
+                # The forwarded plan is indistinguishable from an explicit one:
+                # the compact-only descriptor fields are stripped.
+                assert not plan.descriptor.chunk_array_id
+                assert not plan.descriptor.HasField("slice_hint")
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_forward_flight_info_surfaces_upstream_native_pyramid(self):
         """A pyramidal OME-Zarr upstream's NATIVE precompute levels are surfaced
         through the proxy -- the whole-call forward carries them (the proxy itself
