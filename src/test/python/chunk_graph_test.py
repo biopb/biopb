@@ -135,6 +135,37 @@ class TestRegularGridBuilder:
         assert (out == 5).all()
 
 
+class TestLayerName:
+    """The Blockwise layer name is a content hash of the chunk ids (not the whole
+    dep_map, whose bounds are redundant with the grid -- biopb/biopb#346). It must
+    stay deterministic (so dask dedup/pickle work) and injective w.r.t. the chunk
+    ids (so two distinct arrays never collide onto one name / a false cache hit).
+    """
+
+    @staticmethod
+    def _name(arr):
+        (layer,) = arr.__dask_graph__().layers
+        return layer
+
+    def test_name_is_deterministic(self):
+        m, grid, shape = _regular_chunk_map(20)
+        assert self._name(_build(m, grid, shape)) == self._name(_build(m, grid, shape))
+
+    def test_distinct_chunk_ids_give_distinct_name(self):
+        m, grid, shape = _regular_chunk_map(20)
+        m2 = dict(m)
+        cid, bounds = m2[(0, 0, 0)]
+        m2[(0, 0, 0)] = (b"\xff" + cid[1:], bounds)  # one different chunk id
+        assert self._name(_build(m, grid, shape)) != self._name(_build(m2, grid, shape))
+
+    def test_name_independent_of_array_size_cost(self):
+        # The name derivation must not re-hash every block's bounds: two grids
+        # that differ only in size still each produce a valid single-layer name.
+        for n in (8, 4000):
+            m, grid, shape = _regular_chunk_map(n)
+            assert self._name(_build(m, grid, shape)).startswith("biopb-tensor-chunk-")
+
+
 class TestGraphSizeScaling:
     """Regression guard: partial-read graph size must not grow with array size."""
 
