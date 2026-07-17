@@ -6,8 +6,10 @@ them off explicit endpoints -- biopb/biopb#346).
 
 ``biopb-tensor-server`` depends on ``biopb``, so this lives in the core package
 and there is exactly one definition of the format; the two sides can never
-disagree (same pattern as ``biopb.tensor._wire_version``). Pure ``struct`` +
+disagree (same pattern as ``biopb.tensor._wire_version``). ``struct`` +
 ``ChunkBounds`` -- no server-only dependencies, cheap to import on every path.
+``compact_grid_arrays`` additionally uses ``numpy`` (already a hard dependency of
+both sides) to build the whole grid without a per-chunk Python loop.
 
 A ``chunk_id`` identifies a chunk by ``(array_id, bounds)`` and is a *pure
 function* of them, so a regular grid's chunk_ids are fully derivable from the
@@ -23,7 +25,9 @@ grid without the server enumerating them. Format:
 
 import itertools
 import struct
-from typing import List, Tuple
+from typing import List, NamedTuple, Tuple
+
+import numpy as np
 
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
@@ -295,6 +299,113 @@ def expand_compact_grid(descriptor) -> List[Tuple[bytes, ChunkBounds]]:
             lstop = [vstop[d] - rstart[d] for d in range(ndim)]
         out.append((cid, ChunkBounds(start=lstart, stop=lstop)))
     return out
+
+
+class CompactGridArrays(NamedTuple):
+    """Vectorized form of a compact-grid read plan (see :func:`compact_grid_arrays`).
+
+    Everything is materialized with numpy in a handful of array operations rather
+    than an ``n_chunks``-iteration Python loop, and the columnar arrays are what a
+    numpy-backed ``BlockwiseDep`` indexes directly -- no intermediate ``ChunkBounds``
+    objects, no ``chunk_map`` dict.
+    """
+
+    grid_chunks: Tuple[Tuple[int, ...], ...]  # dask ``chunks=`` (per-axis sizes)
+    chunk_ids: np.ndarray  # object array of chunk_id bytes, C-order
+    lstarts: np.ndarray  # (n_chunks, ndim) int64, logical (output) bounds start
+    lstops: np.ndarray  # (n_chunks, ndim) int64, logical (output) bounds stop
+    fingerprint: Tuple  # O(1) injective identity of the whole grid
+
+
+def compact_grid_arrays(descriptor) -> CompactGridArrays:
+    """Vectorized twin of :func:`expand_compact_grid`.
+
+    Produces the *same* chunk_ids (byte-for-byte) and logical bounds, in the same
+    C-order, but as columnar numpy arrays built without a per-chunk Python loop.
+    The chunk_id encoding is separable: every id shares one ``prefix`` (array_id +
+    ndim) and, for a scaled read, one constant ``suffix`` (scale + method); only
+    the middle 16*ndim bytes -- the virtual start/stop coordinates -- vary per
+    chunk, so all of them are packed at once with a single ``astype('>i8').tobytes``
+    and sliced out. The logical bounds are separable per axis, so they are computed
+    per axis and gathered by the meshgrid index. Mirrors the server's
+    ``_get_read_plan`` exactly, same as ``expand_compact_grid``.
+
+    ``fingerprint`` is an O(1) injective identity of the grid: the chunk_ids and the
+    data mapping are a pure function of ``(chunk_array_id, shape, chunk_shape,
+    scale_hint, realized bounds, reduction_method)``, so two arrays with equal
+    fingerprints have identical chunk_ids -- suitable for the dask layer name
+    without hashing the ``n_chunks`` ids.
+    """
+    ndim = len(descriptor.shape)
+    aid = descriptor.chunk_array_id
+    logical_chunk = [int(c) for c in descriptor.chunk_shape]
+    scaled = len(descriptor.scale_hint) > 0
+    scale = [int(s) for s in descriptor.scale_hint] if scaled else [1] * ndim
+    method = descriptor.reduction_method
+    rstart = [int(s) for s in descriptor.slice_hint.start]
+    rstop = [int(s) for s in descriptor.slice_hint.stop]
+    vcs = [logical_chunk[d] * scale[d] for d in range(ndim)]
+    n = [_ceil_div(rstop[d] - rstart[d], vcs[d]) for d in range(ndim)]
+
+    # Per-axis virtual and logical edges (separable). vstart/vstop are the virtual
+    # (base-coordinate) chunk bounds encoded in the chunk_id; lstart/lstop are the
+    # logical (output-array) bounds delivered to dask.
+    axis_vstart, axis_vstop, axis_lstart, axis_lstop = [], [], [], []
+    for d in range(ndim):
+        vs = rstart[d] + np.arange(n[d], dtype=np.int64) * vcs[d]
+        ve = np.minimum(vs + vcs[d], rstop[d])
+        axis_vstart.append(vs)
+        axis_vstop.append(ve)
+        if scaled:
+            axis_lstart.append((vs - rstart[d]) // scale[d])
+            axis_lstop.append(-(-(ve - rstart[d]) // scale[d]))  # ceil_div
+        else:
+            axis_lstart.append(vs - rstart[d])
+            axis_lstop.append(ve - rstart[d])
+
+    grid_chunks = tuple(
+        tuple((axis_lstop[d] - axis_lstart[d]).tolist()) for d in range(ndim)
+    )
+
+    # C-order meshgrid of block indices, then gather per-axis edges into
+    # (n_chunks, ndim) columns.
+    mesh = np.meshgrid(*[np.arange(k) for k in n], indexing="ij")
+    idx = np.stack([m.ravel() for m in mesh], axis=1)  # (n_chunks, ndim)
+    vstart = np.stack([axis_vstart[d][idx[:, d]] for d in range(ndim)], axis=1)
+    vstop = np.stack([axis_vstop[d][idx[:, d]] for d in range(ndim)], axis=1)
+    lstarts = np.stack([axis_lstart[d][idx[:, d]] for d in range(ndim)], axis=1)
+    lstops = np.stack([axis_lstop[d][idx[:, d]] for d in range(ndim)], axis=1)
+
+    # Vectorized chunk_id bytes: constant prefix (+ constant scale/method suffix),
+    # variable 16*ndim-byte virtual-bounds core packed in one shot.
+    aid_b = aid.encode("utf-8")
+    prefix = struct.pack(">I", len(aid_b)) + aid_b + struct.pack(">H", ndim)
+    suffix = b""
+    if scaled:
+        method_b = method.encode("utf-8")
+        suffix = (
+            b"".join(struct.pack(">q", s) for s in scale)
+            + struct.pack(">H", len(method_b))
+            + method_b
+        )
+    core = np.concatenate([vstart, vstop], axis=1).astype(">i8").tobytes()
+    w = 16 * ndim
+    n_chunks = idx.shape[0]
+    chunk_ids = np.empty(n_chunks, dtype=object)
+    chunk_ids[:] = [
+        prefix + core[i * w : (i + 1) * w] + suffix for i in range(n_chunks)
+    ]
+
+    fingerprint = (
+        aid,
+        tuple(int(s) for s in descriptor.shape),
+        tuple(logical_chunk),
+        tuple(scale) if scaled else None,
+        tuple(rstart),
+        tuple(rstop),
+        method if scaled else None,
+    )
+    return CompactGridArrays(grid_chunks, chunk_ids, lstarts, lstops, fingerprint)
 
 
 def _ceil_div(a: int, b: int) -> int:
