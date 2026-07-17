@@ -3,8 +3,8 @@
 Three layers:
 
 * ``TestJobRunnerUnit`` — the in-kernel job runner driven directly with a fake
-  InteractiveShell (no kernel, fast): submit/poll/cancel, output capture,
-  cooperative + distributed cancel.
+  InteractiveShell (no kernel, fast): submit/poll/interrupt, output capture,
+  distributed future-cancel.
 * ``TestJobConcurrency`` — a real *bare* kernel (no napari/display): proves the
   kernel main thread stays free while a background job runs (the agent is no
   longer blind).
@@ -47,7 +47,6 @@ class TestJobRunnerUnit:
         }
         fake_ip = types.SimpleNamespace(user_ns=ns)
         _jobs.install(fake_ip)
-        ns["cancelled"] = _jobs.cancelled
         yield ns
         _jobs.reset()
 
@@ -82,30 +81,14 @@ class TestJobRunnerUnit:
         assert "ValueError" in snap["error_text"]
 
     def test_one_job_at_a_time(self, runner):
-        jid = _jobs.submit("import time\nwhile not cancelled():\n    time.sleep(0.02)")[
-            "job_id"
-        ]
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         try:
             busy = _jobs.submit("1 + 1")
             assert busy.get("error") == "busy"
             assert busy["running_job_id"] == jid
         finally:
-            _jobs.cancel(jid)
+            _jobs.interrupt_current()
         self._wait(jid)
-
-    def test_cooperative_cancel(self, runner):
-        jid = _jobs.submit(
-            "import time\n"
-            "while not cancelled():\n    time.sleep(0.02)\n"
-            "print('stopped')"
-        )["job_id"]
-        time.sleep(0.1)
-        assert _jobs.poll(jid)["status"] == "running"
-        res = _jobs.cancel(jid)
-        assert res["cancelled"] is True
-        snap = self._wait(jid)
-        assert snap["status"] == "cancelled"
-        assert "stopped" in snap["stdout"]
 
     def test_distributed_cancel_rebuilds_futures(self, runner):
         # cancel() must rebuild real Future objects from dc.futures' string
@@ -137,15 +120,14 @@ class TestJobRunnerUnit:
                 calls["force"] = force
 
         runner["_dask_client"] = _StubClient()
-        jid = _jobs.submit("import time\nwhile not cancelled():\n    time.sleep(0.02)")[
-            "job_id"
-        ]
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         time.sleep(0.05)
         _jobs.cancel(jid)
         passed = calls["futures"]
         assert passed and all(isinstance(f, Future) for f in passed)
         assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
         assert calls["force"] is True
+        _jobs.interrupt_current()  # actually stop the uncooperative loop
         self._wait(jid)
 
     def test_poll_unknown_job(self, runner):
@@ -160,32 +142,18 @@ class TestJobRunnerUnit:
 
     # -- user-action attribution --------------------------------------------
 
-    def test_cancel_attributes_reason(self, runner):
-        jid = _jobs.submit("import time\nwhile not cancelled():\n    time.sleep(0.02)")[
-            "job_id"
-        ]
-        while _jobs.poll(jid)["status"] != "running":
-            time.sleep(0.02)
-        out = _jobs.cancel(jid, reason="stopped by Alice")
-        assert out["cancelled"] is True
-        assert out["job_id"] == jid
-        snap = self._wait(jid)
-        assert snap["status"] == "cancelled"
-        assert snap["cancel_reason"] == "stopped by Alice"
-        # The reason is surfaced in error_text so poll_job/execute_code render it.
-        assert "stopped by Alice" in snap["error_text"]
-
     def test_interrupt_current_stops_uncooperative_job(self, runner):
-        # A loop that NEVER checks cancelled() -> only a KeyboardInterrupt raised
-        # into the worker thread can stop it (short of restart).
+        # A pure-Python loop is stoppable only by a KeyboardInterrupt raised into
+        # the worker thread (short of restart); interrupt_current also threads a
+        # user-supplied reason into the finalized record.
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
         out = _jobs.interrupt_current(reason="forced by Bob")
         assert out["job_id"] == jid and out["interrupted"] is True
         snap = self._wait(jid)
-        # Distinct terminal status from a plain cooperative cancel.
         assert snap["status"] == "interrupted"
+        assert snap["cancel_reason"] == "forced by Bob"
         assert "forced by Bob" in snap["error_text"]
         assert "KeyboardInterrupt" in snap["error_text"]
 
@@ -232,7 +200,6 @@ _ip = get_ipython()
 _ip.user_ns['_conn'] = SimpleNamespace(client=None)
 _ip.user_ns['_dask_client'] = None
 _jobs.install(_ip)
-_ip.user_ns['cancelled'] = _jobs.cancelled
 print('JOBS_READY')
 """
 

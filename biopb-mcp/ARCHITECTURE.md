@@ -297,11 +297,11 @@ starts on demand (above).
   runs agent code in a **background daemon thread**, so the kernel main thread (and
   its `%gui qt` loop) stays free to service `take_screenshot`/`server_status`/
   `poll_job` mid-job. It waits up to `promote_after` seconds, then returns a job
-  handle (`job-N`) and keeps running. One job at a time. The stop ladder:
-  `cancel`/`cancel_current` is cooperative (a flag polled via `cancelled()`) and
-  cancels in-flight distributed futures; `interrupt_current` additionally raises
-  `KeyboardInterrupt` into the worker thread via `PyThreadState_SetAsyncExc` (a
-  `SIGINT` reaches only the main thread). A `reason=…` threads a human-readable
+  handle (`job-N`) and keeps running. One job at a time. Stopping a job:
+  `interrupt_current` raises `KeyboardInterrupt` into the worker thread via
+  `PyThreadState_SetAsyncExc` (a `SIGINT` reaches only the main thread) and, via
+  `cancel`, also cancels in-flight distributed futures — the only mid-`compute()`
+  stop short of `restart_kernel`. A `reason=…` threads a human-readable
   `cancel_reason` into the record so a user-triggered stop surfaces to the agent.
 - `_viewer_proxy.py` — runs **inside the kernel**. The agent-facing `viewer` is a
   transparent **main-thread marshaling proxy** over the real `napari.Viewer`:

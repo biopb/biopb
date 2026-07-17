@@ -609,7 +609,7 @@ def execute_code(python_code: str) -> str:
 def poll_job(job_id: str) -> str:
     """Get the status and output of a job started by execute_code.
 
-    Returns the job's status (running/ok/error/cancelled), elapsed time, and
+    Returns the job's status (running/ok/error/interrupted), elapsed time, and
     output so far (full output once terminal). Job records persist until the
     kernel is restarted (older terminal jobs are eventually evicted).
     """
@@ -648,11 +648,10 @@ def inspect_object(object_path: str) -> str:
 def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
-    Works even when the job never checks cancelled(): it also runs the
-    cooperative cancel (flag + in-flight dask-future cancel). The job runs in a
-    background worker thread, so a SIGINT (which Python delivers only to the
-    kernel main thread) can't reach it — this raises the exception directly into
-    the worker. Best-effort: it lands at the next bytecode, so a
+    Also cancels the job's in-flight dask futures. The job runs in a background
+    worker thread, so a SIGINT (which Python delivers only to the kernel main
+    thread) can't reach it — this raises the exception directly into the worker.
+    Best-effort: it lands at the next bytecode, so a
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
     it returns to Python; if the kernel stays stuck, use restart_kernel — the
     guaranteed stop.

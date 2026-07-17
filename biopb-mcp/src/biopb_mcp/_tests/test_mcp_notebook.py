@@ -49,14 +49,14 @@ def test_one_job_cell_structure():
     assert kinds == {"stream", "execute_result"}
 
 
-def test_cancelled_job_kept_as_code_with_reason_in_output():
-    reason = "Cancelled by user via the observe web UI."
+def test_interrupted_job_kept_as_code_with_reason_in_output():
+    reason = "Interrupted by user via the observe web UI."
     nb = _notebook.build_notebook(
-        [_snap(status="cancelled", error_text=reason, cancel_reason=reason)]
+        [_snap(status="interrupted", error_text=reason, cancel_reason=reason)]
     )
     job = [c for c in nb["cells"] if c["cell_type"] == "code"][-1]
     assert job["cell_type"] == "code"  # not demoted to markdown
-    assert "cancelled" in "".join(job["source"])
+    assert "interrupted" in "".join(job["source"])
     stderr = [o for o in job["outputs"] if o.get("name") == "stderr"]
     assert stderr and reason in "".join(stderr[0]["text"])
 

@@ -15,7 +15,7 @@ import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 interface JobSummary {
   job_id: string;
-  status: string; // running | ok | error | cancelled | interrupted
+  status: string; // running | ok | error | interrupted
   elapsed: number;
   code_preview?: string;
 }
@@ -373,7 +373,6 @@ const OBS_CSS = `
   .obs-page .running { background: #243; color: #7e7; }
   .obs-page .ok { background: #234; color: #8bf; }
   .obs-page .error { background: #422; color: #f99; }
-  .obs-page .cancelled { background: #432; color: #fc9; }
   .obs-page .interrupted { background: #324; color: #c9f; }
   .obs-page .preview { color: #8a8; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
