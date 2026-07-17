@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 # Code 1 ("no absolute unit") carries only an aspect ratio and is excluded.
 _RESUNIT_TO_UM = {2: 25400.0, 3: 10000.0}
 
+# Sentinel for "physical scale not computed yet" -- distinct from a computed
+# ``None`` (no usable calibration), so the memoized result is never recomputed.
+_SCALE_UNSET = object()
+
 
 def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
     """One axis' pixel size in µm from a TIFF ``X``/``YResolution`` tag.
@@ -46,8 +50,13 @@ def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
     A resolution tag is a *density* (pixels per unit), so the pixel size is its
     reciprocal times the unit's µm length. The unit is the ImageJ calibration
     unit when the file carries one (``imagej_unit_um`` = its µm factor), else the
-    standard ``ResolutionUnit`` tag (inch / centimetre). Returns ``None`` when
-    the tag is absent, zero, or the unit is unusable (e.g. ResolutionUnit 1).
+    ``ResolutionUnit`` tag (inch / centimetre) -- but only when that tag is
+    actually present. Returns ``None`` when the resolution tag is absent or zero,
+    when the unit is unusable (e.g. ResolutionUnit 1, aspect-ratio only), and --
+    deliberately -- when ``ResolutionUnit`` is *missing*: the TIFF spec defaults
+    it to inch, but an omitted unit in practice means the density is an
+    uncalibrated aspect ratio as often as it means inches, so assuming inch just
+    fabricates a bogus micron size. Better no scale than a wrong one.
     """
     tag = page.tags.get(tag_name)
     if tag is None:
@@ -70,8 +79,9 @@ def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
     if imagej_unit_um is not None:
         return per_pixel * imagej_unit_um
     ru_tag = page.tags.get("ResolutionUnit")
-    ru = int(ru_tag.value) if ru_tag is not None else 2
-    factor = _RESUNIT_TO_UM.get(ru)
+    if ru_tag is None:
+        return None  # no explicit unit -- don't assume inch (see docstring)
+    factor = _RESUNIT_TO_UM.get(int(ru_tag.value))
     if factor is None:
         return None
     return per_pixel * factor
@@ -521,6 +531,9 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
         # serialize while reads of different files run in parallel, so one slow
         # read can't freeze every other frame.
         self._init_file_locks()
+        # Memoized physical scale: computing it reopens members[0], so cache the
+        # result (incl. a None) after the first call -- see _physical_scale.
+        self._physical_scale_cache: Any = _SCALE_UNSET
 
         # Gather every TIFF in the claimed directory. Unlike claim(), read does
         # NOT exclude OME names: the OME exclusion is a claim-time ownership
@@ -828,12 +841,24 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (µm) from the first member's TIFF resolution tags.
 
+        Memoized: computing it reopens ``members[0]`` to read its page header, so
+        the result (a value *or* a ``None``) is cached after the first call and
+        every later open reuses it instead of reopening the TIFF. See
+        :meth:`_compute_physical_scale` for the projection itself.
+        """
+        if self._physical_scale_cache is _SCALE_UNSET:
+            self._physical_scale_cache = self._compute_physical_scale()
+        return self._physical_scale_cache
+
+    def _compute_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Read the physical scale off ``members[0]`` (see :meth:`_physical_scale`).
+
         X/Y come from ``X``/``YResolution`` (+ ``ResolutionUnit``, or the ImageJ
         calibration unit when present); Z, only for a multi-page stack, from the
         ImageJ ``spacing`` field. The opaque file axis (``i``) and any axis
-        without a tag get ``0.0`` / ``""``. Cheap: one page-header read of
-        ``members[0]`` under its per-file lock, matching the ``_physical_scale``
-        hot-path contract. Returns ``None`` when no usable resolution is present.
+        without a tag get ``0.0`` / ``""``. One page-header read of ``members[0]``
+        under its per-file lock. Returns ``None`` when no usable resolution is
+        present.
         """
         if not self._tiff_files:
             return None
