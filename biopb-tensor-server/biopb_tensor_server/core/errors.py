@@ -23,6 +23,11 @@ class SourceUnresolvedError(ValueError):
     succeed.
     """
 
+    # Canonical gRPC code for the Flight boundary's ``extra_info`` (the class it
+    # maps to, FlightUnavailableError, cannot express the distinction): a bare
+    # unresolved source is a precondition failure -- resolvable, but not as-is.
+    grpc_code = "FAILED_PRECONDITION"
+
 
 class SourceResolveRetriableError(SourceUnresolvedError):
     """Resolution failed *transiently* -- a retry may succeed.
@@ -35,6 +40,60 @@ class SourceResolveRetriableError(SourceUnresolvedError):
     for this subclass *first* and maps it to a retriable status (UNAVAILABLE),
     while a bare ``SourceUnresolvedError`` maps to a permanent status.
     """
+
+    grpc_code = "UNAVAILABLE"
+
+
+class TensorResolutionError(ValueError):
+    """A field/tensor within a source could not be resolved to an adapter.
+
+    The base for the *terminal client-error* taxonomy on the read path
+    (``get_tensor_adapter``): a bad ``array_id`` is the caller's mistake, not a
+    server bug. Subclasses ``ValueError`` on purpose -- like
+    ``SourceUnresolvedError`` -- so the read paths' existing ``except ValueError``
+    guards still catch it and every adapter that has not yet adopted the typed
+    taxonomy degrades gracefully.
+
+    Carries a canonical gRPC status-code name (``grpc_code``) and a
+    machine-readable ``reason`` slug. pyarrow's Flight-in-Python exposes no
+    ``NOT_FOUND``/``INVALID_ARGUMENT`` exception class, so the Flight boundary
+    maps this to the best *coarse-retryability* class (a terminal
+    ``FlightServerError``, never the "server bug, don't retry"
+    ``FlightInternalError``) and serializes ``{"code", "reason"}`` into the
+    error's ``extra_info`` -- the class carries retryability, ``extra_info``
+    carries the precise code the class hierarchy cannot express.
+    """
+
+    grpc_code = "INTERNAL"
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class TensorNotFound(TensorResolutionError):
+    """The requested tensor field does not exist in the source.
+
+    Canonical gRPC ``NOT_FOUND``. Raised by every ``get_tensor_adapter`` (the
+    single-tensor base included) for an unknown *nonempty* field, so a typo'd
+    ``array_id`` is representable before it is mapped instead of silently
+    returning the wrong tensor. The ``#44`` no-field defaults (empty / bare
+    ``source_id`` / the source's own id) still resolve to the default tensor.
+    """
+
+    grpc_code = "NOT_FOUND"
+
+
+class InvalidTensorId(TensorResolutionError):
+    """The tensor id is structurally malformed for this source.
+
+    Canonical gRPC ``INVALID_ARGUMENT``. Distinct from :class:`TensorNotFound`
+    (a well-formed id that names no existing tensor): the id itself cannot be
+    parsed -- e.g. an HCS field that is not ``well/field`` or whose field index
+    is not an integer.
+    """
+
+    grpc_code = "INVALID_ARGUMENT"
 
 
 class WriteNotSupportedError(Exception):

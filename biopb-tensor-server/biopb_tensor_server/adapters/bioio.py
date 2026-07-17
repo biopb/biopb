@@ -35,6 +35,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.errors import TensorNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -419,12 +420,14 @@ class _BioioAdapterBase(SourceAdapter, TensorAdapter):
             for i, d in enumerate(self._cached_descriptors):
                 if self._within_source_field(d.array_id) == field:
                     return i
-            raise ValueError(f"Unknown scene: {field}")
+            raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
         scene_ids = list(self._bio_image.scenes)
         try:
             return scene_ids.index(field)
-        except ValueError:
-            raise ValueError(f"Unknown scene: {field}")
+        except ValueError as e:
+            raise TensorNotFound(
+                f"Unknown scene: {field}", reason="unknown_field"
+            ) from e
 
     def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
         """Get BackendAdapter for a specific scene within this source.

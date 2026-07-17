@@ -56,6 +56,7 @@ from biopb_tensor_server.core.downsample import (
 )
 from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
+    TensorNotFound,
     WriteNotSupportedError,
 )
 
@@ -461,11 +462,31 @@ class SourceAdapter(ABC):
         Single-tensor adapters return self with tensor context set.
         Multi-tensor adapters override this to return a new adapter for the tensor.
 
+        Total by contract: a single-tensor source has exactly one tensor, so any
+        *unknown nonempty* field is rejected with a typed ``TensorNotFound`` (gRPC
+        NOT_FOUND) -- the miss is representable rather than silently returning the
+        base tensor under the wrong ``array_id``. Three inputs still resolve to
+        that sole tensor (reduced to a within-source field by
+        ``_within_source_field``): an empty/``None`` id, the source's own id (a
+        bare ``source_id`` or the full ``source_id`` array_id -> falsy or
+        ``== source_id``), and -- for a source whose one tensor carries a name --
+        that ``_tensor_name`` (a single-scene aicsimageio file names its lone
+        tensor, e.g. ``"Image:0"``, so ``source_id/Image:0`` is a valid read).
+
         Args:
             tensor_id: Identifier for the specific tensor within this source
         Returns:
             TensorAdapter for the specified tensor, with tensor context set
+        Raises:
+            TensorNotFound: ``tensor_id`` names a field this source does not have.
         """
+        field = self._within_source_field(tensor_id)
+        if field and field != self.source_id and field != self._tensor_name:
+            raise TensorNotFound(
+                f"tensor {tensor_id!r} not found in source {self.source_id!r} "
+                f"(single-tensor source has no field {field!r})",
+                reason="unknown_field",
+            )
         return self
 
     def put_chunk(

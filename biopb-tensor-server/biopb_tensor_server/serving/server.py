@@ -50,12 +50,50 @@ from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
+    TensorNotFound,
+    TensorResolutionError,
 )
 from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
+
+
+def to_flight_error(exc: Exception) -> flight.FlightError:
+    """Map a tensor-server domain error to a typed Flight error at the boundary.
+
+    The single field/tensor-resolution boundary handler shared by the read verbs
+    (``get_flight_info``/``do_get``). pyarrow's Flight-in-Python exposes only a
+    *subset* of gRPC's canonical status codes as typed exceptions -- there is no
+    ``FlightNotFoundError`` and no ``FlightInvalidArgumentError`` -- so this maps
+    the domain taxonomy two ways at once:
+
+    - to the best-available typed class for **coarse retryability**: a terminal
+      ``FlightServerError`` for a client error (NOT_FOUND / INVALID_ARGUMENT),
+      never the "server bug, don't retry" ``FlightInternalError``; a retriable
+      ``FlightUnavailableError`` for a transient/unresolved source, and
+    - to the **precise** canonical code + machine reason in ``extra_info``
+      (e.g. ``{"code": "NOT_FOUND", "reason": "unknown_field"}``), which a client
+      can switch on despite the missing typed classes.
+
+    The class carries retry behavior; ``extra_info`` carries the semantics the
+    class hierarchy cannot express.
+    """
+    code = getattr(exc, "grpc_code", "INTERNAL")
+    reason = getattr(exc, "reason", None)
+    payload = {"code": code, "reason": reason} if reason else {"code": code}
+    extra_info = json.dumps(payload).encode()
+
+    # Retriable subclass first (it IS a SourceUnresolvedError): a transient recall
+    # keeps the source resolvable, so UNAVAILABLE invites a retry.
+    if isinstance(exc, SourceUnresolvedError):
+        return flight.FlightUnavailableError(str(exc), extra_info)
+    # TensorNotFound / InvalidTensorId (and any other terminal domain error):
+    # the caller's mistake, terminal -- do not retry -- but NOT an INTERNAL
+    # "server bug". FlightServerError is the coarsest terminal class Flight offers.
+    return flight.FlightServerError(str(exc), extra_info)
+
 
 # How often the ``resolve`` action emits an (empty-body) heartbeat Result while a
 # resolution is in flight. Kept well under common proxy idle read timeouts
@@ -1101,11 +1139,43 @@ class TensorFlightServer(flight.FlightServerBase):
             f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}, field={field}"
         )
 
-        # Get tensor adapter for the specified source and tensor
-        tensor_adapter = self._get_adapter_for_tensor(source_id, field)
+        # Get tensor adapter for the specified source and tensor. Field resolution
+        # is total: an unknown field raises a typed TensorResolutionError, which
+        # the boundary handler maps to a terminal Flight error carrying the
+        # canonical code in extra_info (NOT a "server bug" FlightInternalError).
+        # A bare ValueError/KeyError from an adapter that predates the taxonomy is
+        # still a field-resolution miss, not a server bug, so it is coerced the
+        # same way rather than leaking as INTERNAL (issue #378).
+        try:
+            tensor_adapter = self._get_adapter_for_tensor(source_id, field)
+        except SourceUnresolvedError as e:
+            # An unresolved (cloud / synced-folder) source refuses the serve
+            # surface until an explicit resolve -> UNAVAILABLE "open to resolve",
+            # not NOT_FOUND. Must precede the ValueError clause (it subclasses
+            # ValueError), and it mirrors the same mapping the plan_flight_info
+            # try applies below.
+            raise flight.FlightUnavailableError(
+                f"Source unresolved (open to resolve): {e}"
+            ) from e
+        except TensorResolutionError as e:
+            logger.warning(f"Tensor not found: {source_id}/{tensor_id} ({e})")
+            raise to_flight_error(e) from e
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Tensor not found: {source_id}/{tensor_id} ({e})")
+            raise to_flight_error(
+                TensorNotFound(
+                    f"Tensor not found: {source_id}/{tensor_id}: {e}",
+                    reason="unknown_field",
+                )
+            ) from e
         if tensor_adapter is None:
             logger.warning(f"Tensor not found: {source_id}/{tensor_id}")
-            raise flight.FlightServerError(f"Tensor not found: {source_id}/{tensor_id}")
+            raise to_flight_error(
+                TensorNotFound(
+                    f"Tensor not found: {source_id}/{tensor_id}",
+                    reason="unknown_source",
+                )
+            )
 
         # Build the read plan and advertise the pyramid + physical scale. Each
         # adapter owns this seam (plan_flight_info): a remote proxy forwards the
@@ -1272,7 +1342,12 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id = decode_chunk_id(tensor_ticket.chunk_id)[0].split("/")[0]
             self._authorize_source(context, source_id)
 
-            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
+            try:
+                adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
+            except TensorResolutionError as e:
+                # A ticket names a field the source no longer has -> terminal
+                # NOT_FOUND with a code, not a bare ValueError -> INTERNAL.
+                raise to_flight_error(e) from e
             if adapter is None:
                 raise flight.FlightServerError(
                     f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}..."
@@ -1316,7 +1391,10 @@ class TensorFlightServer(flight.FlightServerBase):
         if cache_manager is None:
             return json.dumps({"available": False})
 
-        adapter = self._get_adapter_for_chunk(chunk_id)
+        try:
+            adapter = self._get_adapter_for_chunk(chunk_id)
+        except TensorResolutionError as e:
+            raise to_flight_error(e) from e
         if adapter is None:
             raise flight.FlightServerError(
                 f"Adapter not found for chunk_id: {chunk_id[:16]}..."

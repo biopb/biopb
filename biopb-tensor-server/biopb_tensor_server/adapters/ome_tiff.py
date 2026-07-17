@@ -36,6 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.errors import TensorNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -595,7 +596,7 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
         for i, d in enumerate(self.list_tensor_descriptors()):
             if self._within_source_field(d.array_id) == field:
                 return i
-        raise ValueError(f"Unknown scene: {field}")
+        raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
 
     # ---- metadata / physical scale -----------------------------------------
 
