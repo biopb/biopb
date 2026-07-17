@@ -32,7 +32,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 from cachey import Cache
+from dask.base import tokenize
+from dask.blockwise import BlockwiseDepDict, blockwise as _blockwise
 from dask.delayed import delayed
+from dask.highlevelgraph import HighLevelGraph
 
 from biopb.tensor.ticket_pb2 import TensorTicket
 
@@ -609,34 +612,30 @@ def _fetch_chunk_distributed(
 
 
 def _fetch_chunk_block(
-    id_map: Dict[Tuple[int, ...], bytes],
+    dep: Tuple[bytes, Tuple[int, ...], Tuple[int, ...]],
     location: str,
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]] = None,
-    block_info=None,
 ) -> np.ndarray:
-    """``da.map_blocks`` callback that fetches one block by its grid location.
+    """Single-``Blockwise``-layer callback that fetches one block.
 
-    The single-Blockwise-layer construction (see
-    ``_build_dask_array_from_chunk_map``) routes here. ``id_map`` maps a block's
-    grid index -> ``chunk_id``; the block's bounds are taken from dask's own
-    ``block_info`` ``array-location`` (which equals the chunk bounds, since the
-    array's chunk grid is built from exactly those bounds), so only the opaque
-    ``chunk_id`` needs to ride in the graph literal. Pickle-safe for the same
+    The regular-grid construction (see ``_build_dask_array_from_chunk_map``)
+    routes here. ``dep`` is the block's *own* ``(chunk_id, bounds_start,
+    bounds_stop)`` triple, delivered per block by a ``BlockwiseDepDict`` so that
+    only this block's chunk id/bounds ride in its task -- not the whole array's
+    chunk table. That keeps a partial read's graph size O(blocks read) instead of
+    O(blocks total): slicing one plane out of an N-chunk tensor no longer drags
+    all N chunk ids through the graph (biopb/biopb#278). Pickle-safe for the same
     reason as :func:`_fetch_chunk_distributed`: no closure over a FlightClient.
     """
-    info = block_info[None]
-    chunk_id = id_map[tuple(info["chunk-location"])]
-    array_location = info["array-location"]  # [(start, stop), ...] per axis
-    bounds_start = tuple(int(start) for start, _ in array_location)
-    bounds_stop = tuple(int(stop) for _, stop in array_location)
+    chunk_id, bounds_start, bounds_stop = dep
     return _fetch_chunk_distributed(
         location,
         token,
         chunk_id,
-        bounds_start,
-        bounds_stop,
+        tuple(bounds_start),
+        tuple(bounds_stop),
         cache_bytes,
         schema_metadata,
     )
@@ -707,32 +706,60 @@ def _build_dask_array_from_chunk_map(
     """Build the lazy chunk-fetching dask array from a chunk-index map.
 
     Shared by ``tensor_from_pb`` and ``_build_dask_array``. For a regular chunk
-    grid (the common case) this emits a *single* ``Blockwise`` (map_blocks)
-    layer, so slicing one chunk culls to O(1) tasks and graph optimization is
-    O(1) rather than O(n_chunks). This makes serial single-plane reads (napari
-    scrubbing a large T axis) and partial computes dramatically cheaper without
-    changing per-chunk fetch behavior or leaf-task parallelism. Ragged/sparse
-    grids fall back to the ``da.block``-of-``from_delayed`` construction.
+    grid (the common case) this emits a *single* ``Blockwise`` layer, so slicing
+    one chunk culls to O(1) tasks and graph optimization is O(1) rather than
+    O(n_chunks). Each block's ``chunk_id`` and bounds are delivered per block via
+    a ``BlockwiseDepDict`` -- not broadcast as one whole-array literal -- so a
+    partial read's graph *size* is O(blocks read), not O(blocks total): a
+    single-plane slice of an N-chunk tensor carries one chunk id, not N. This
+    makes serial single-plane reads (napari scrubbing a large T axis) and partial
+    computes dramatically cheaper without changing per-chunk fetch behavior or
+    leaf-task parallelism. Ragged/sparse grids fall back to the
+    ``da.block``-of-``from_delayed`` construction.
     """
     if not chunk_map:
         raise ValueError("No chunks found")
 
     chunks = _regular_grid_chunks(chunk_map, grid_shape, shape)
     if chunks is not None:
-        id_map = {
-            chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()
+        # Per-block dependency: block-index -> (chunk_id, bounds_start,
+        # bounds_stop). A BlockwiseDepDict hands each output block *only* its own
+        # entry, so culling a slice drops the rest and the graph stays small.
+        dep_map = {
+            chunk_idx: (
+                chunk_id,
+                tuple(int(s) for s in bounds.start),
+                tuple(int(s) for s in bounds.stop),
+            )
+            for chunk_idx, (chunk_id, bounds) in chunk_map.items()
         }
-        return da.map_blocks(
-            _fetch_chunk_block,
-            id_map,
-            location,
-            token,
-            cache_bytes,
-            schema_metadata,
-            dtype=dtype,
-            chunks=chunks,
-            meta=np.empty((0,) * len(shape), dtype=dtype),
+        numblocks = tuple(len(c) for c in chunks)
+        name = "biopb-tensor-chunk-" + tokenize(
+            dep_map, location, token, cache_bytes, schema_metadata, dtype, chunks
         )
+        out_ind = tuple(range(len(shape)))
+        dep = BlockwiseDepDict(mapping=dep_map, numblocks=numblocks)
+        # Build the single Blockwise layer directly: map_blocks would broadcast a
+        # non-array arg to every block, but the DepDict must be indexed like the
+        # output so each task gets its own entry (biopb/biopb#278).
+        layer = _blockwise(
+            _fetch_chunk_block,
+            name,
+            out_ind,
+            dep,
+            out_ind,
+            location,
+            None,
+            token,
+            None,
+            cache_bytes,
+            None,
+            schema_metadata,
+            None,
+            numblocks={},
+        )
+        graph = HighLevelGraph.from_collections(name, layer, dependencies=[])
+        return da.Array(graph, name, chunks, dtype=dtype)
 
     # Fallback: ragged/sparse grid -> one delayed task per chunk.
     blocks = np.empty(grid_shape, dtype=object)
