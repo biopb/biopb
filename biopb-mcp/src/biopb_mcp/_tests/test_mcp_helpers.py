@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_mcp.mcp._helpers import (
     _get_url_stem,
@@ -76,9 +77,10 @@ class TestPatchViewerAddTensor:
         with pytest.raises(RuntimeError, match="No tensor server connected"):
             viewer.add_tensor("some_source")
 
-    def test_raises_when_source_not_found_without_get_source(self, viewer, connection):
+    def test_raises_when_source_not_found(self, viewer, connection):
         client = MagicMock()
-        del client.get_source  # simulate biopb without the direct-fetch method
+        # The uncached-source fetch fails -> add_tensor surfaces "not found".
+        client.get_descriptor.side_effect = RuntimeError("no such source")
         connection.client = client
         connection.sources = {"a": MagicMock()}
         patch_viewer_add_tensor(viewer, connection)
@@ -86,14 +88,17 @@ class TestPatchViewerAddTensor:
         with pytest.raises(ValueError, match="not found"):
             viewer.add_tensor("nonexistent")
 
-    def test_fallback_to_get_source_when_uncached(self, viewer, connection):
-        tensor = _make_tensor("t1", [256, 256])
-        src = _make_source("http://server/data/remote_img", [tensor])
+    def test_fallback_to_get_descriptor_when_uncached(self, viewer, connection):
+        # Source absent from the (possibly truncated) cached catalog -> fetch the
+        # tensor descriptor directly by a bare source_id (resolves the default
+        # tensor) and wrap it as a single-tensor source.
         client = MagicMock()
-        client.get_source.return_value = src
+        client.get_descriptor.return_value = TensorDescriptor(
+            array_id="remote_src", shape=[256, 256], dtype="float32"
+        )
         client.get_physical_scale.return_value = None
         connection.client = client
-        connection.sources = {}  # source absent from the cached catalog
+        connection.sources = {}
 
         mock_arr = MagicMock()
         with patch(
@@ -103,15 +108,18 @@ class TestPatchViewerAddTensor:
             patch_viewer_add_tensor(viewer, connection)
             name = viewer.add_tensor("remote_src")
 
-        client.get_source.assert_called_once_with("remote_src", None)
-        assert name == "remote_img"
-        viewer.add_image.assert_called_once_with(mock_arr, name="remote_img")
+        client.get_descriptor.assert_called_once_with("remote_src")
+        # No source_url on a descriptor-only fetch, so the layer name is the id.
+        assert name == "remote_src"
+        viewer.add_image.assert_called_once_with(mock_arr, name="remote_src")
 
     def test_fallback_forwards_tensor_id(self, viewer, connection):
-        t2 = _make_tensor("t2", [128, 128])
-        src = _make_source("", [t2])  # synthesized descriptor: no source_url
+        # A within-source field is fetched by its qualified array_id.
         client = MagicMock()
-        client.get_source.return_value = src
+        client.get_descriptor.return_value = TensorDescriptor(
+            array_id="remote_src/t2", shape=[128, 128], dtype="float32"
+        )
+        client.get_physical_scale.return_value = None
         connection.client = client
         connection.sources = {}
 
@@ -120,9 +128,9 @@ class TestPatchViewerAddTensor:
             return_value=[MagicMock()],
         ):
             patch_viewer_add_tensor(viewer, connection)
-            viewer.add_tensor("remote_src", tensor_id="t2", name="x")
+            viewer.add_tensor("remote_src", tensor_id="remote_src/t2", name="x")
 
-        client.get_source.assert_called_once_with("remote_src", "t2")
+        client.get_descriptor.assert_called_once_with("remote_src/t2")
 
     def test_auto_selects_single_tensor(self, viewer, connection):
         tensor = _make_tensor("t1", [256, 256])

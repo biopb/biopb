@@ -16,7 +16,6 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -295,26 +294,17 @@ def _descriptor_key(source_id: str, array_id: str) -> Tuple[str, str]:
     return (source_id, array_id)
 
 
-def _resolve_array_id(
-    array_id: Optional[str],
-    tensor_id: Optional[str],
-    _method: str,
-    source_id: Optional[str] = None,
-) -> Tuple[str, Optional[str]]:
-    """Resolve the ``(source_id, request tensor_id)`` pair for an array_id-first
-    read call, per the tensor identity policy.
+def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
+    """Split a tensor's globally-unique ``array_id`` into the
+    ``(routing source_id, request tensor_id)`` pair the Flight RPCs use.
 
-    A tensor is identified by its globally-unique ``array_id`` ALONE (see the
-    policy at the top of ``proto/biopb/tensor/descriptor.proto``). The public
-    read methods take that single ``array_id``; the legacy two-argument
-    addressing -- a positional ``tensor_id`` or the ``source_id=`` keyword --
-    is still accepted but DEPRECATED.
+    A tensor is identified by its ``array_id`` ALONE (see the policy at the top
+    of ``proto/biopb/tensor/descriptor.proto``); ``source_id`` is just the
+    slash-free prefix carried on the wire as a routing convenience.
 
-    - legacy form (``tensor_id`` given, or the ``source_id=`` keyword used) ->
-      warns; the routing source_id and request tensor_id are used verbatim.
-    - else, ``array_id`` contains '/' -> source-qualified id: the routing
-      ``source_id`` is the slash-free prefix and the full ``array_id`` is the
-      request tensor_id.
+    - ``array_id`` contains '/' -> source-qualified: the routing ``source_id``
+      is the slash-free prefix and the full ``array_id`` is the request
+      tensor_id.
     - else -> a bare ``source_id``: return ``tensor_id=None``. The downstream
       resolution is then CALLER-dependent. A single-tensor source always
       resolves to its sole tensor. For a multi-tensor source it differs:
@@ -323,37 +313,7 @@ def _resolve_array_id(
       whereas ``get_physical_scale`` rides ``_fetch_tensor_descriptor``'s
       empty-tensor_id path and anchors on the source's default (first) tensor
       (server-side, #44). So a bare multi-tensor id is not a uniform error.
-
-    Passing BOTH the positional ``array_id`` and the legacy ``source_id=``
-    keyword is contradictory addressing and raises ``ValueError``.
     """
-    # Reject contradictory addressing: the new positional ``array_id`` and the
-    # legacy ``source_id=`` keyword name the routing source two different ways.
-    # Check before the back-compat mapping below, which makes them equal.
-    if array_id is not None and source_id is not None:
-        raise ValueError(
-            f"{_method}() received both the array_id (first argument) and the "
-            "deprecated 'source_id=' keyword. A tensor is identified by its "
-            "array_id alone -- pass only the array_id as the first argument."
-        )
-    # Back-compat for the legacy ``source_id=`` keyword: the first positional
-    # parameter is now ``array_id``, so map a keyword-only source_id onto it.
-    if source_id is not None and array_id is None:
-        array_id = source_id
-    if array_id is None:
-        raise TypeError(f"{_method}() missing required argument: 'array_id'")
-    if tensor_id is not None or source_id is not None:
-        warnings.warn(
-            f"The (source_id, tensor_id) addressing of {_method}() is "
-            "deprecated and will be removed in a future release: a tensor is "
-            "identified by its globally-unique array_id alone (see the identity "
-            "policy in proto/biopb/tensor/descriptor.proto). Pass the array_id "
-            f"as the single first argument instead -- {_method}('source_id/field'), "
-            f"or {_method}('source_id') for a single-tensor source.",
-            DeprecationWarning,
-            stacklevel=4,
-        )
-        return array_id, tensor_id
     if "/" in array_id:
         return array_id.split("/", 1)[0], array_id
     return array_id, None
@@ -601,11 +561,7 @@ class CatalogClient:
         return {}
 
     def get_physical_scale(
-        self,
-        array_id: Optional[str] = None,
-        tensor_id: Optional[str] = None,
-        *,
-        source_id: Optional[str] = None,
+        self, array_id: str
     ) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dimension physical pixel size + unit for a tensor.
 
@@ -628,15 +584,11 @@ class CatalogClient:
                 source id anchors on the source's default (first) tensor --
                 unlike ``get_tensor``, which requires the field be named; pass the
                 qualified ``source_id/field`` to target a specific scene.
-            tensor_id: DEPRECATED. The legacy ``(source_id, tensor_id)`` form;
-                pass the array_id as the single first argument instead.
 
         Returns:
             ``(scale, unit)`` lists, or ``None`` if no physical scale is known.
         """
-        source_id, tensor_id = _resolve_array_id(
-            array_id, tensor_id, "get_physical_scale", source_id=source_id
-        )
+        source_id, tensor_id = _split_array_id(array_id)
         desc = (
             self._state.descriptors.get(_descriptor_key(source_id, tensor_id))
             if tensor_id
@@ -656,8 +608,7 @@ class CatalogClient:
             # tensor_id None -> the source's default (first) tensor. A real fetch
             # error (server unreachable, source not found) propagates to the
             # caller -- it must stay distinguishable from "no physical scale
-            # recorded", which is the only case that yields None. This matches
-            # the pre-#75 contract, where the get_source() fetch was unguarded.
+            # recorded", which is the only case that yields None.
             desc = self._fetch_tensor_descriptor(source_id, tensor_id)
         if not desc.physical_scale:
             return None
@@ -670,9 +621,9 @@ class CatalogClient:
     ) -> "TensorDescriptor":
         """Fetch one tensor's descriptor directly from the server (internal).
 
-        Backs the public ``get_descriptor`` (the array_id-keyed primitive) and
-        the deprecated ``get_source``. Uses the per-tensor ``GetFlightInfo`` RPC,
-        which works even when the source is beyond the (truncatable)
+        Backs the public ``get_descriptor`` (the array_id-keyed primitive). Uses
+        the per-tensor ``GetFlightInfo`` RPC, which works even when the source is
+        beyond the (truncatable)
         ``list_sources()`` cap. ``tensor_id`` unset/empty -> the source's default
         (first) tensor (#44). This is a CHEAP probe: it does NOT resolve. An
         unresolved (cloud / synced-folder) source raises the directive
@@ -704,8 +655,8 @@ class CatalogClient:
             # synced-folder) source now refuses with FlightUnavailableError
             # ("Source unresolved ...") instead of silently downloading. Make this
             # a cheap steering probe -- restate it as the shared directive so
-            # get_descriptor / get_source point the caller at the explicit,
-            # consented resolve(), consistent with get_tensor / get_physical_scale.
+            # get_descriptor points the caller at the explicit, consented
+            # resolve(), consistent with get_tensor / get_physical_scale.
             if "unresolved" in str(exc).lower():
                 raise _unresolved_source_error(source_id) from exc
             raise
@@ -1058,50 +1009,6 @@ class CatalogClient:
             ) from exc
         return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
 
-    def get_source(
-        self,
-        source_id: str,
-        tensor_id: Optional[str] = None,
-    ) -> "DataSourceDescriptor":
-        """DEPRECATED -- use :meth:`get_descriptor` (one tensor) or
-        :meth:`list_sources` (all tensors of a source) instead.
-
-        This method is inconsistent with the tensor identity policy
-        (``proto/biopb/tensor/descriptor.proto``): it splits a tensor's identity
-        into a ``(source_id, tensor_id)`` pair, whereas a tensor is identified by
-        its globally-unique ``array_id`` alone. It is also misnamed -- despite
-        returning a ``DataSourceDescriptor``, it is a single-tensor probe: the
-        returned ``.tensors`` holds ONLY the resolved tensor (or the source's
-        default/first tensor when ``tensor_id`` is None), never the full scene
-        list. For a multi-scene source, ``get_source(id).tensors`` is length-1
-        and scenes 2..N are NOT enumerated here. Use
-        ``list_sources()[id].tensors`` for the complete enumeration.
-
-        Args:
-            source_id: Data source identifier.
-            tensor_id: Optional tensor to anchor the lookup; None -> the source's
-                default (first) tensor.
-
-        Returns:
-            DataSourceDescriptor wrapping the single resolved TensorDescriptor.
-        """
-        warnings.warn(
-            "TensorFlightClient.get_source() is deprecated and will be removed in "
-            "a future release: it is inconsistent with the array_id identity "
-            "policy and returns only a single tensor, not a source's full scene "
-            "list. Use get_descriptor(array_id) for one tensor, or list_sources() "
-            "to enumerate all tensors of a source.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        tensor_desc = self._fetch_tensor_descriptor(source_id, tensor_id)
-        source_desc = DataSourceDescriptor(source_id=source_id, tensors=[tensor_desc])
-        # Do NOT clobber a full enumeration previously cached by list_sources();
-        # only seed _sources when this source is otherwise unknown (issue #75).
-        if source_id not in self._state.sources:
-            self._state.sources[source_id] = source_desc
-        return source_desc
-
 
 class ChunkFetcher:
     """Tensor reads: GetFlightInfo planning + lazy dask chunk fetching.
@@ -1268,13 +1175,10 @@ class ChunkFetcher:
 
     def get_tensor(
         self,
-        array_id: Optional[str] = None,
-        tensor_id: Optional[str] = None,
+        array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-        *,
-        source_id: Optional[str] = None,
     ) -> da.Array:
         """Get a lazy dask array for a tensor, addressed by its array_id.
 
@@ -1282,8 +1186,6 @@ class ChunkFetcher:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
                 ``"zarr_a3f2"`` for a single-tensor source or
                 ``"aics_7f3/Image:0"`` for a multi-tensor source.
-            tensor_id: DEPRECATED. The legacy ``(source_id, tensor_id)`` form;
-                pass the array_id as the single first argument instead.
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
@@ -1295,9 +1197,7 @@ class ChunkFetcher:
             ValueError: If source not found, tensor not found, or a bare
                 multi-tensor source id is given without a within-source field
         """
-        source_id, tensor_id = _resolve_array_id(
-            array_id, tensor_id, "get_tensor", source_id=source_id
-        )
+        source_id, tensor_id = _split_array_id(array_id)
         logger.debug(f"get_tensor: source_id={source_id}, tensor_id={tensor_id}")
 
         # Get flight info context
@@ -1339,13 +1239,10 @@ class ChunkFetcher:
 
     def get_tensor_pb(
         self,
-        array_id: Optional[str] = None,
-        tensor_id: Optional[str] = None,
+        array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-        *,
-        source_id: Optional[str] = None,
     ) -> SerializedTensor:
         """Get a SerializedTensor protobuf for cross-process transfer.
 
@@ -1357,8 +1254,6 @@ class ChunkFetcher:
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
                 ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``.
-            tensor_id: DEPRECATED. The legacy ``(source_id, tensor_id)`` form;
-                pass the array_id as the single first argument instead.
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
@@ -1366,9 +1261,7 @@ class ChunkFetcher:
         Returns:
             SerializedTensor protobuf object
         """
-        source_id, tensor_id = _resolve_array_id(
-            array_id, tensor_id, "get_tensor_pb", source_id=source_id
-        )
+        source_id, tensor_id = _split_array_id(array_id)
         logger.debug(f"get_tensor_pb: source_id={source_id}, tensor_id={tensor_id}")
 
         # Get flight info context

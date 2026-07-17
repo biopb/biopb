@@ -67,7 +67,7 @@ from biopb.tensor._session import (
     _fetch_endpoints_via_get_flight_info,
     _parse_version as _parse_version,
     _request_crop_slices,
-    _resolve_array_id as _resolve_array_id,
+    _split_array_id as _split_array_id,
     _TensorContext,
     _unresolved_source_error as _unresolved_source_error,
 )
@@ -254,16 +254,10 @@ class TensorFlightClient:
         return self._catalog.get_source_metadata(source_id)
 
     def get_physical_scale(
-        self,
-        array_id: Optional[str] = None,
-        tensor_id: Optional[str] = None,
-        *,
-        source_id: Optional[str] = None,
+        self, array_id: str
     ) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dimension physical size + unit. See :meth:`CatalogClient.get_physical_scale`."""
-        return self._catalog.get_physical_scale(
-            array_id, tensor_id, source_id=source_id
-        )
+        return self._catalog.get_physical_scale(array_id)
 
     def _fetch_tensor_descriptor(
         self, source_id: str, tensor_id: Optional[str] = None
@@ -321,12 +315,6 @@ class TensorFlightClient:
         """Deregister a drag-dropped source branch. See :meth:`CatalogClient.remove_source`."""
         return self._catalog.remove_source(root_url)
 
-    def get_source(
-        self, source_id: str, tensor_id: Optional[str] = None
-    ) -> DataSourceDescriptor:
-        """DEPRECATED single-tensor probe. See :meth:`CatalogClient.get_source`."""
-        return self._catalog.get_source(source_id, tensor_id)
-
     # ---- Reads (delegated to ChunkFetcher) ----
 
     def _get_tensor_context(
@@ -344,42 +332,26 @@ class TensorFlightClient:
 
     def get_tensor(
         self,
-        array_id: Optional[str] = None,
-        tensor_id: Optional[str] = None,
+        array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-        *,
-        source_id: Optional[str] = None,
     ) -> da.Array:
         """Lazy dask array for a tensor. See :meth:`ChunkFetcher.get_tensor`."""
         return self._fetcher.get_tensor(
-            array_id,
-            tensor_id,
-            slice_hint,
-            scale_hint,
-            reduction_method,
-            source_id=source_id,
+            array_id, slice_hint, scale_hint, reduction_method
         )
 
     def get_tensor_pb(
         self,
-        array_id: Optional[str] = None,
-        tensor_id: Optional[str] = None,
+        array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-        *,
-        source_id: Optional[str] = None,
     ) -> SerializedTensor:
         """SerializedTensor handle for cross-process reads. See :meth:`ChunkFetcher.get_tensor_pb`."""
         return self._fetcher.get_tensor_pb(
-            array_id,
-            tensor_id,
-            slice_hint,
-            scale_hint,
-            reduction_method,
-            source_id=source_id,
+            array_id, slice_hint, scale_hint, reduction_method
         )
 
     def _build_dask_array(

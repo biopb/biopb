@@ -259,8 +259,9 @@ client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT data_r
 layer_name = viewer.add_tensor("source_id")                   # single-tensor source
 layer_name = viewer.add_tensor("source_id", tensor_id="t1")   # multi-tensor source
 
-# Or get a lazy dask array directly, without adding a layer:
-arr = client.get_tensor("source_id", tensor_id="t1")           # tensor_id optional if single
+# Or get a lazy dask array directly, without adding a layer (address it by its
+# array_id: "source_id/t1" for a multi-tensor source, "source_id" for a single one):
+arr = client.get_tensor("source_id/t1")
 ```
 
 ## Upload to Server

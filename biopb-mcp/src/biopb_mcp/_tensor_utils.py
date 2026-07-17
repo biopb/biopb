@@ -120,19 +120,14 @@ def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
     The lean catalog descriptor from ``list_sources`` carries no pyramid -- it
     is filled only at open time (``get_flight_info``) -- so when the passed
     *tensor_desc* lacks one, fetch the open-time descriptor once via
-    ``get_source``.
+    ``get_descriptor``.
     """
     levels = list(getattr(tensor_desc, "pyramid", None) or [])
     if levels:
         return levels
     try:
-        full = client.get_source(source_id, tensor_id)
-        tensors = list(getattr(full, "tensors", None) or [])
-        cand = next((t for t in tensors if t.array_id == tensor_id), None)
-        if cand is None and len(tensors) == 1:
-            cand = tensors[0]
-        if cand is not None:
-            return list(getattr(cand, "pyramid", None) or [])
+        full = client.get_descriptor(tensor_id)
+        return list(getattr(full, "pyramid", None) or [])
     except Exception:  # noqa: BLE001 - advisory; fall back to a client plan
         logger.debug(
             "advertised-pyramid lookup failed for %s/%s",
@@ -231,7 +226,6 @@ def build_pyramid_levels(
     if advertised:
         levels = [
             client.get_tensor(
-                source_id,
                 tensor_id,
                 scale_hint=list(lv.scale_hint),
                 reduction_method=lv.reduction_method or None,
@@ -250,7 +244,7 @@ def build_pyramid_levels(
             if z_idx is not None:
                 scale_hint[z_idx] = sz
 
-            arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
+            arr = client.get_tensor(tensor_id, scale_hint=scale_hint)
             levels.append(arr)
 
             # Real downsampled extents from the returned array, not
@@ -330,7 +324,7 @@ def build_layer_scale(
         return value if value > 0 else None
 
     try:
-        phys = client.get_physical_scale(source_id, tensor_id)
+        phys = client.get_physical_scale(tensor_id)
         if phys is None:
             return None, None
         scale_vec, unit_vec = phys

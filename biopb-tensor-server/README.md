@@ -203,8 +203,9 @@ client = TensorFlightClient("grpc://localhost:8815", token="your-token")
 # List available sources
 sources = client.list_sources()
 
-# Get a lazy array for a specific tensor
-arr = client.get_tensor("my-zarr", tensor_id="0", scale_hint=[1, 2, 2])
+# Get a lazy array for a specific tensor (by its globally-unique array_id:
+# "source_id/field" for a multi-tensor source, or "source_id" for a single one)
+arr = client.get_tensor("my-zarr/0", scale_hint=[1, 2, 2])
 
 # Obtain a slice (lazy, chunks fetched on demand)
 data = arr[5, :, :]

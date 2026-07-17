@@ -2,7 +2,6 @@
 
 import threading
 import time
-import warnings
 
 import numpy as np
 import pytest
@@ -263,13 +262,13 @@ class TestMultifieldServerClient:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             # Access first tensor
-            arr0 = client.get_tensor("multifield-access", "pos_0")
+            arr0 = client.get_tensor("multifield-access/pos_0")
             assert arr0.shape == (32, 32)
             data0 = arr0.compute()
             assert data0.mean() == 0  # Value based on tensor_id
 
             # Access second tensor (different shape)
-            arr1 = client.get_tensor("multifield-access", "pos_1")
+            arr1 = client.get_tensor("multifield-access/pos_1")
             assert arr1.shape == (64, 64)
             data1 = arr1.compute()
             assert data1.mean() == 1  # Value based on tensor_id
@@ -324,8 +323,8 @@ class TestMultifieldServerClient:
 
     def test_get_descriptor_enumeration_vs_probe(self):
         """Issue #75: enumeration is list_sources(); get_descriptor() is a single
-        tensor probe; the deprecated get_source() warns and never clobbers the
-        full enumeration."""
+        tensor probe that reaches any scene and never clobbers the full
+        enumeration."""
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
             ("pos_1", (64, 64), "uint8"),
@@ -354,27 +353,21 @@ class TestMultifieldServerClient:
 
             # Probe: get_descriptor(array_id) fetches exactly the addressed scene
             # -- including a non-default one (the #75 symptom: pos_1/pos_2 were
-            # unreachable through the old get_source path).
+            # unreachable through the old get_source path). It caches only the
+            # descriptor, so it must NOT clobber the full enumeration cached above.
             assert client.get_descriptor("multi/pos_1").shape == [64, 64]
             assert client.get_descriptor("multi/pos_2").shape == [16, 16]
-
-            # Deprecated get_source(): warns, returns a single-tensor wrapper, and
-            # must NOT clobber the full enumeration cached above.
-            with pytest.warns(DeprecationWarning):
-                legacy = client.get_source("multi")
-            assert len(legacy.tensors) == 1
-            # The full enumeration cached by list_sources() is untouched (read the
-            # cache directly -- re-calling list_sources() would just refetch).
+            # Read the _sources cache directly -- re-calling list_sources() would
+            # just refetch.
             assert len(client._sources["multi"].tensors) == 3
 
             client.close()
         finally:
             server.shutdown()
 
-    def test_get_tensor_accepts_qualified_and_bare_id(self):
-        """Identity policy: the wire array_id is the globally-unique
-        source_id/field, and a read resolves whether addressed by that qualified
-        array_id or (back-compat) the bare within-source field.
+    def test_get_tensor_accepts_qualified_id(self):
+        """Identity policy: a tensor is read by its globally-unique
+        source_id/field array_id.
         """
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
@@ -392,13 +385,10 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # Addressed by the full source-qualified array_id...
-            qualified = client.get_tensor("mf-liberal", "mf-liberal/pos_1")
+            # Addressed by the full source-qualified array_id.
+            qualified = client.get_tensor("mf-liberal/pos_1")
             assert qualified.shape == (64, 64)
-            # ...and by the bare within-source field (back-compat).
-            bare = client.get_tensor("mf-liberal", "pos_1")
-            assert bare.shape == (64, 64)
-            np.testing.assert_array_equal(qualified.compute(), bare.compute())
+            assert qualified.compute().mean() == 1  # value based on field index
 
             # The wire descriptor reports the qualified array_id.
             desc = client.get_descriptor("mf-liberal/pos_1")
@@ -408,9 +398,9 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
-    def test_get_tensor_array_id_first_form_and_deprecation(self):
-        """get_tensor/get_tensor_pb take a single array_id (identity policy);
-        the legacy (source_id, tensor_id) form still works but warns."""
+    def test_get_tensor_array_id_addressing(self):
+        """get_tensor/get_tensor_pb take a single array_id (identity policy); a
+        bare multi-tensor source id is ambiguous and must be qualified."""
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
             ("pos_1", (64, 64), "uint8"),
@@ -432,25 +422,9 @@ class TestMultifieldServerClient:
             assert client.get_tensor_pb("mf/pos_1") is not None
 
             # A bare multi-tensor source id is ambiguous -> must specify (never a
-            # silent default; the #75 lesson). No deprecation warning either.
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", DeprecationWarning)
-                with pytest.raises(ValueError, match="multiple tensors"):
-                    client.get_tensor("mf")
-
-            # Legacy two-arg form still works, but warns.
-            with pytest.warns(DeprecationWarning):
-                legacy = client.get_tensor("mf", "pos_1")
-            assert legacy.shape == (64, 64)
-
-            # Contradictory addressing: the positional array_id AND the deprecated
-            # source_id= keyword name the routing source two different ways ->
-            # ValueError, before any RPC (issue #75).
-            for read in (client.get_tensor, client.get_tensor_pb):
-                with pytest.raises(ValueError, match="both the array_id"):
-                    read("mf/pos_1", source_id="mf")
-            with pytest.raises(ValueError, match="both the array_id"):
-                client.get_physical_scale("mf/pos_1", source_id="mf")
+            # silent default; the #75 lesson).
+            with pytest.raises(ValueError, match="multiple tensors"):
+                client.get_tensor("mf")
 
             client.close()
         finally:
@@ -519,8 +493,8 @@ class TestMultifieldServerClient:
             sources = client.list_sources()
             assert len(sources["single-source"].tensors) == 1
 
-            # Access the single tensor
-            arr = client.get_tensor("single-source", "single-tensor")
+            # Access the single tensor -- a bare source id resolves the sole tensor.
+            arr = client.get_tensor("single-source")
             assert arr.shape == (50, 50)
 
             client.close()
@@ -705,11 +679,11 @@ class TestDescriptorCacheCollision:
             # bare tensor id "Image:0" -- the exact collision in #45. Each must
             # return its OWN scale. With a bare-only key the second source reads
             # the first's cached entry and returns the wrong scale.
-            scale_a, unit_a = client.get_physical_scale("aics_aaa", "Image:0")
+            scale_a, unit_a = client.get_physical_scale("aics_aaa/Image:0")
             assert scale_a == [2.0, 0.5, 0.5]
             assert unit_a == ["um", "um", "um"]
 
-            scale_b, unit_b = client.get_physical_scale("aics_bbb", "Image:0")
+            scale_b, unit_b = client.get_physical_scale("aics_bbb/Image:0")
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 

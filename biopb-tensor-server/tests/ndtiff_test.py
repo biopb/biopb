@@ -276,7 +276,7 @@ class TestNdTiffServerClient:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             # Get tensor - for single-tensor source, tensor_id = source_id
-            arr = client.get_tensor("ndtiff-test", "ndtiff-test")
+            arr = client.get_tensor("ndtiff-test")
 
             # Verify shape
             assert arr.shape == (3, 32, 32)

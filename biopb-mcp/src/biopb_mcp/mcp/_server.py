@@ -563,8 +563,8 @@ def execute_code(python_code: str) -> str:
       predicate hides them; use `data_resident` to filter on residency on
       purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
-      (auto-handles the multiscale pyramid). client.get_tensor(source_id,
-      tensor_id=None) returns a lazy dask array without adding a layer.
+      (auto-handles the multiscale pyramid). client.get_tensor(array_id)
+      returns a lazy dask array without adding a layer.
     """
     host = _kernel_host
     if host is None:

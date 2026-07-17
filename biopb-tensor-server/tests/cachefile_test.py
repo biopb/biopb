@@ -372,7 +372,7 @@ class TestCachefileIntegration:
         try:
             cmod._cachefile_support.clear()
             client = TensorFlightClient(loc, cache_bytes=0)
-            got = client.get_tensor("z", "z").compute(scheduler="threads")
+            got = client.get_tensor("z").compute(scheduler="threads")
             assert np.array_equal(got, src)
             if os.name == "posix":
                 # The fast path was actually used (chunk_locate succeeded).
@@ -399,7 +399,7 @@ class TestCachefileIntegration:
             cmod._cachefile_support.clear()
             with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
                 client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z", "z").compute(scheduler="threads")
+                got = client.get_tensor("z").compute(scheduler="threads")
                 assert np.array_equal(got, src)
                 # Never probed the fast path.
                 assert cmod._cachefile_support.get(loc) is None
@@ -419,7 +419,7 @@ class TestCachefileIntegration:
         try:
             cmod._cachefile_support.clear()
             client = TensorFlightClient(loc, cache_bytes=0)
-            got = client.get_tensor("z", "z").compute(scheduler="threads")
+            got = client.get_tensor("z").compute(scheduler="threads")
             assert np.array_equal(got, src)
             client.close()
         finally:
@@ -445,7 +445,7 @@ class TestCachefileIntegration:
             # (issue #278 item C), so patch it there, not on the client re-export.
             with patch("biopb.tensor._pool._CACHEFILE_SUPPORTED_FORMAT", 0):
                 client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z", "z").compute(scheduler="threads")
+                got = client.get_tensor("z").compute(scheduler="threads")
                 assert np.array_equal(got, src)  # correct via do_get fallback
                 assert cmod._cachefile_support.get(loc) is False  # declined + memoized
                 client.close()
