@@ -6,7 +6,7 @@ never shells out ``biopb server start`` to bring the data plane up. When the
 plane is down it asks the control to ensure it, via this thin urllib client. The
 control is the durable root that owns the data plane; ``_connection`` only uses it.
 
-The endpoint is resolved from ``biopb._config_control`` (the shared, stdlib-only
+The endpoint is resolved from ``biopb._endpoints`` (the shared, stdlib-only
 core-SDK module), the same location the control itself binds — biopb-mcp cannot
 import ``biopb-control`` any more than it can import ``biopb-tensor-server``, so the
 one shared fact (where the control listens) lives in core ``biopb``.
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def _base_url() -> str:
-    from biopb._config_control import control_base_url
+    from biopb._endpoints import control_base_url
 
     return control_base_url()
 
@@ -139,7 +139,7 @@ def start_control_detached() -> bool:
     The launched process is detached from the caller's process group / console, so
     it (and the durable control it spawns) survives a client that disconnects during
     the first seconds. Idempotent: ``biopb control start`` no-ops when a control is
-    already running and serializes concurrent starts (``biopb._filelock``), so racing
+    already running and serializes concurrent starts (``biopb._lifecycle.file_lock``), so racing
     shims are safe. ``--no-data-plane`` keeps the footprint minimal -- the data plane
     comes up on demand when a session actually asks for it.
     """

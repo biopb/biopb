@@ -51,7 +51,7 @@ never imports — the proxy reaches it over loopback like any other client.
 - ``/session/<id>/observe`` serves the control's own SPA shell (the React
   ObservePage), while ``/session/<id>/api/*`` is reverse-proxied to the shim-owned
   MCP session child on its dynamic loopback port, resolved per-request from the
-  filesystem registry (``biopb._config_sessions``); an unknown or dead session
+  filesystem registry (``biopb._sessions``); an unknown or dead session
   yields a clean 404 (and the dead record is pruned). Unlike the data-plane proxy,
   the ``/api/*`` hop drops both ``Host`` and ``Origin``: httpx then sets ``Host``
   to the loopback target (satisfying the child's own loopback Host guard) and the
@@ -78,7 +78,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from biopb import _agents, _algorithms, _config_sessions, _kernel_plugins, _web_auth
+from biopb import _agents, _algorithms, _kernel_plugins, _sessions, _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -556,7 +556,7 @@ def build_app(
             {
                 "control": "ok",
                 "data_plane": supervisor.snapshot(),
-                "sessions": len(_config_sessions.list_sessions()),
+                "sessions": len(_sessions.list_sessions()),
             }
         )
 
@@ -568,9 +568,7 @@ def build_app(
         # _probe_kernel). list_sessions() self-heals (prunes dead/reused records)
         # on read, so a stale session never lingers on the page. Async so the
         # per-session probes fan out concurrently rather than serializing.
-        records = [
-            rec for rec in _config_sessions.list_sessions() if rec.get("session_id")
-        ]
+        records = [rec for rec in _sessions.list_sessions() if rec.get("session_id")]
         kernels = await asyncio.gather(
             *(_probe_kernel(session_client, rec) for rec in records)
         )
@@ -654,7 +652,7 @@ def build_app(
         # them owns the file. biopb_mcp is soft-imported (only for the schema): the
         # lean control does not hard-depend on it (invariant I2), but a real biopb
         # deployment always co-installs it. mcp_config_path lives in core biopb.
-        from biopb._config_location import mcp_config_path
+        from biopb._locations import mcp_config_path
 
         try:
             from biopb_mcp._config_schema import build_mcp_config_schema
@@ -694,7 +692,7 @@ def build_app(
             return JSONResponse(
                 {"error": f"biopb-mcp is not installed: {exc}"}, status_code=501
             )
-        from biopb._config_location import mcp_config_path
+        from biopb._locations import mcp_config_path
 
         try:
             body = await request.json()
@@ -859,7 +857,7 @@ def build_app(
         segments = sub_path.split("/")
         if segments[0] not in _SESSION_ALLOWED_ROOTS or ".." in segments:
             return JSONResponse({"error": "not found"}, status_code=404)
-        rec = _config_sessions.resolve(session_id)
+        rec = _sessions.resolve(session_id)
         if rec is None:
             return JSONResponse(
                 {"error": f"session {session_id!r} not found or ended"},
@@ -911,7 +909,7 @@ def build_app(
         if web_root is None:
             return JSONResponse({"error": "web bundle not installed"}, status_code=404)
         session_id = request.path_params["session_id"]
-        if _config_sessions.resolve(session_id) is None:
+        if _sessions.resolve(session_id) is None:
             return JSONResponse(
                 {"error": f"session {session_id!r} not found or ended"},
                 status_code=404,

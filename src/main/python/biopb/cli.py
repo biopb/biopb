@@ -2,7 +2,6 @@
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -15,13 +14,21 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _config_location, _web_auth
-from ._config_location import DEFAULT_CONFIG_DIR, find_config
-from ._filelock import LockTimeout, file_lock
-from ._proc import (
+from . import _agents, _locations, _web_auth
+from ._lifecycle.daemon import (
+    detach_kwargs as _detach_kwargs,
+    is_our_daemon as _is_our_daemon,
+    read_pid_record as _read_pid_record,
+    remove_pid_file as _remove_pid_file,
+    stop_daemon as _stop_daemon,
+    write_pid_file as _write_pid_file,
+)
+from ._lifecycle.file_lock import LockTimeout, file_lock
+from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
+from ._locations import DEFAULT_CONFIG_DIR, find_config
 
 console = Console()
 
@@ -79,9 +86,9 @@ server_app = typer.Typer(
 app.add_typer(server_app, name="server")
 
 # Daemon management constants. On-disk locations come from the shared
-# `_config_location` module (XDG-aware): the installed webapp bundle is a portable
+# `_locations` module (XDG-aware): the installed webapp bundle is a portable
 # asset (data tree); logs / pid / sentinels are per-machine state (state tree).
-DEFAULT_WEBAPP = _config_location.webapp_dir()
+DEFAULT_WEBAPP = _locations.webapp_dir()
 
 # Default config path, preferring JSON over legacy TOML and warning when both
 # exist. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
@@ -96,7 +103,7 @@ DEFAULT_CONFIG = find_config()
 # supervisor. It supervises the tensor server, which keeps writing the canonical
 # tensor-server.log (the state-tree logs dir) that the control's log endpoint
 # tails; the control plane's own supervision/control-API log is control.log.
-CONTROL_PID_FILE = _config_location.control_pid_file()
+CONTROL_PID_FILE = _locations.control_pid_file()
 
 
 # The installer records the release-v* deployment version it pulled the wheels
@@ -165,236 +172,17 @@ def version():
 def _ensure_dirs():
     """Ensure required directories exist."""
     CONTROL_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _config_location.log_dir()  # creates the state-tree logs dir on access
-
-
-def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
-    """Read (pid, identity_token) from `pid_file`.
-
-    The file holds one or two whitespace-separated integers: the PID and, since
-    the PID-identity fix, a process create-time token (see _process_create_time)
-    that distinguishes our daemon from an unrelated process that later inherited
-    a reused PID. Tolerates the legacy bare-PID format (token None -> identity
-    unverifiable, callers fall back to a liveness-only check) so a pre-upgrade
-    file still reads. Returns (None, None) if missing or unparseable.
-    """
-    if not pid_file.exists():
-        return None, None
-    try:
-        parts = pid_file.read_text().split()
-        pid = int(parts[0])
-    except (OSError, ValueError, IndexError):
-        return None, None
-    token: Optional[int] = None
-    if len(parts) > 1:
-        try:
-            token = int(parts[1])
-        except ValueError:
-            token = None
-    return pid, token
-
-
-def _write_pid_file(pid_file: Path, pid: int, token: Optional[int] = None):
-    """Write `pid` (and, when known, its create-time `token`) to `pid_file`.
-
-    Written atomically (sibling temp file + os.replace on the same filesystem) so a
-    concurrent reader -- or a racing writer, now that several processes can start
-    the control plane on demand at once -- never observes a half-written or
-    interleaved file. A torn read parses as "no daemon" (_read_pid_record) and
-    would trigger a spurious extra spawn. The two-line `pid\\ntoken` form is read
-    back by _read_pid_record; a None token falls back to the legacy bare-PID form
-    (callers then verify by liveness only).
-    """
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    content = f"{pid}\n{token}" if token is not None else str(pid)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{pid_file.name}-", suffix=".tmp", dir=str(pid_file.parent)
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-        os.replace(tmp, pid_file)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _remove_pid_file(pid_file: Path):
-    """Remove `pid_file` if present."""
-    if pid_file.exists():
-        pid_file.unlink()
-
-
-def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
-    """Whether `pid` is alive AND is the daemon we recorded -- not a reused PID.
-
-    Returns False only when the PID can be PROVEN to be someone else (alive but a
-    different creation time), so `stop`/`restart` never force-kill, and `status`
-    never trusts, an unrelated process. When identity can't be established -- a
-    legacy bare-PID file, or a platform/moment with no create-time -- it falls
-    back to liveness, matching the pre-fix behavior rather than risk a false
-    "stopped" (which would strand a running daemon).
-    """
-    if not pid or not _is_process_running(pid):
-        return False
-    if token is None:
-        return True
-    current = _process_create_time(pid)
-    if current is None:
-        return True
-    return current == token
-
-
-# Diagnostic from the most recent _win_request_shutdown() failure, surfaced by
-# _stop_daemon() so a Windows user can see why graceful stop fell back to force-kill.
-_LAST_WIN_SHUTDOWN_DIAG: Optional[str] = None
-
-
-def _win_request_shutdown(sentinel: Path) -> bool:
-    """Windows: ask a daemon to shut down gracefully by dropping its stop
-    sentinel. Returns True if the request was delivered (not whether the
-    process has exited yet).
-
-    The daemon is a windowless background process in its own process group, so
-    it has no console to receive a CTRL_BREAK, and Win32 named events are brittle
-    across sessions/elevation. We instead drop a sentinel *file* the daemon polls
-    for (the control watches via biopb_control._run; its supervised tensor server
-    via _install_windows_shutdown_listener in
-    biopb_tensor_server.serving.http_server); a file under the user's biopb dir is
-    unambiguous regardless of how the process was launched.
-    """
-    global _LAST_WIN_SHUTDOWN_DIAG
-    try:
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text("stop")
-        return True
-    except OSError as e:
-        _LAST_WIN_SHUTDOWN_DIAG = f"could not write shutdown sentinel: {e}"
-        return False
-
-
-def _win_remove_sentinel(sentinel: Path) -> None:
-    """Remove a shutdown sentinel (best effort), so it doesn't linger after a
-    force-kill where the daemon never consumed it."""
-    try:
-        sentinel.unlink()
-    except OSError:
-        pass
-
-
-def _request_graceful_stop(pid: int, sentinel: Path) -> bool:
-    """Ask a daemon to shut down gracefully. Returns whether the request was
-    delivered (not whether the process has exited yet). `sentinel` is that
-    daemon's Windows stop-sentinel path (unused on POSIX, which signals)."""
-    if sys.platform == "win32":
-        return _win_request_shutdown(sentinel)
-    try:
-        os.kill(pid, signal.SIGTERM)
-        return True
-    except OSError:
-        return False
-
-
-def _stop_daemon(
-    pid: int,
-    timeout: int,
-    token: Optional[int] = None,
-    *,
-    sentinel: Path,
-    remove_pid: Callable[[], None],
-) -> bool:
-    """Stop a running daemon: request graceful shutdown, wait up to `timeout`
-    seconds, then force-kill. Clears the PID file via `remove_pid`. Returns True
-    if it exited gracefully, False if it had to be force-killed. Assumes `pid` is
-    running.
-
-    The single stop path for both SDK daemons (tensor server and biopb-mcp); the
-    two differ only in `sentinel` (their Windows stop-sentinel path) and
-    `remove_pid` (which PID file to clear).
-
-    On POSIX, graceful shutdown is a SIGTERM the daemon's handler catches. On
-    Windows os.kill is TerminateProcess -- immediate and uncatchable, so a
-    handler never runs; the control-managed daemons therefore watch for a
-    sentinel *file* instead (the control via biopb_control._run; its supervised
-    tensor server via http_server._install_windows_shutdown_listener). See
-    _request_graceful_stop.
-
-    `token` is the recorded create-time identity (see _process_create_time):
-    delivery, the wait loop, and the force-kill are all gated on it so that if
-    the daemon exits and its PID is reused mid-stop, we neither signal, keep
-    waiting on, nor TerminateProcess the innocent new owner.
-    """
-    if _is_our_daemon(pid, token):
-        delivered = _request_graceful_stop(pid, sentinel)
-        if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
-            console.print(
-                f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
-                f"force killing.[/yellow]"
-            )
-
-    graceful = False
-    for _ in range(timeout):
-        if not _is_our_daemon(pid, token):
-            graceful = True
-            break
-        time.sleep(1)
-
-    if not graceful:
-        # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to
-        # SIGTERM, which os.kill maps to an unconditional TerminateProcess. Re-verify
-        # identity first: a reused PID must never take this unconditional kill.
-        if _is_our_daemon(pid, token):
-            try:
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-            except OSError:
-                pass
-            time.sleep(0.5)
-
-    remove_pid()
-    if sys.platform == "win32":
-        # tidy up if the daemon never consumed it
-        _win_remove_sentinel(sentinel)
-    return graceful
+    _locations.log_dir()  # creates the state-tree logs dir on access
 
 
 def _get_log_file() -> Path:
     """Get log file path."""
-    return _config_location.tensor_server_log()
+    return _locations.tensor_server_log()
 
 
-# The rotation helper lives in `_config_location` so the supervisor shares one
+# The rotation helper lives in `_locations` so the supervisor shares one
 # rotator; re-exported here under the old name for the existing call sites.
-_rotate_log = _config_location.rotate_log
-
-
-def _detach_kwargs() -> dict:
-    """Popen kwargs that detach a spawned daemon from the launching console and
-    process group, so it survives this command returning and isn't killed by
-    the terminal's Ctrl+C or close (SIGHUP).
-
-    POSIX: start_new_session (setsid) gives the daemon its own session/process
-    group. Windows: CREATE_NO_WINDOW runs it without a console *window* (so none
-    pops); CREATE_NEW_PROCESS_GROUP makes it a group leader the terminal's
-    Ctrl+C does not reach (start_new_session is a silent no-op on Windows).
-
-    Note this detaches the daemon *within* the login session; it does NOT make
-    it persistent across logout, and is not meant to. Windows hard-kills session
-    processes on logout, and modern systemd-logind kills the user scope on
-    logout regardless of setsid (unless `loginctl enable-linger` is set). A
-    daemon that must outlive the session — e.g. a shared/remote tensor server —
-    must be made persistent at the container/service/wrapper level (a systemd
-    unit, `enable-linger`, or a long-lived container), not here.
-    """
-    if sys.platform == "win32":
-        return {
-            "creationflags": (
-                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
-        }
-    return {"start_new_session": True}
+_rotate_log = _locations.rotate_log
 
 
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
@@ -660,7 +448,7 @@ def migrate_config(
     up to ``biopb.toml.bak``. Settings are preserved verbatim, so a running
     server need not be restarted.
     """
-    from ._config_location import (
+    from ._locations import (
         CANONICAL_CONFIG_NAME,
         DEFAULT_CONFIG_DIR,
         LEGACY_CONFIG_NAME,
@@ -896,7 +684,7 @@ def _require_biopb_control() -> None:
 
 def _control_endpoint() -> Tuple[str, int]:
     """The control-API (host, port) from the shared core-SDK location."""
-    from ._config_control import control_host, control_port
+    from ._endpoints import control_host, control_port
 
     return control_host(), control_port()
 
@@ -904,7 +692,7 @@ def _control_endpoint() -> Tuple[str, int]:
 def _control_log_file() -> Path:
     """The control plane's own supervision / control-API log (distinct from the data
     plane's tensor-server.log, which the supervised server keeps writing)."""
-    return _config_location.control_log()
+    return _locations.control_log()
 
 
 def _write_control_pid(pid: int) -> None:
@@ -919,7 +707,7 @@ def _remove_control_pid() -> None:
 def _control_shutdown_sentinel() -> Path:
     """The control plane's Windows stop-sentinel path (watched by biopb_control._run).
     A single fixed name under the biopb state dir, like the other daemons'."""
-    return _config_location.control_stop_sentinel()
+    return _locations.control_stop_sentinel()
 
 
 def _control_start_lock() -> Path:
@@ -930,7 +718,7 @@ def _control_start_lock() -> Path:
     lock across the check-then-spawn below makes it atomic between processes:
     without it two starters can both see "no pidfile", both spawn a control, and
     the bind-loser's parent overwrite/remove the live winner's pidfile, orphaning a
-    control that `control stop` can no longer reach. See biopb._filelock.
+    control that `control stop` can no longer reach. See biopb._lifecycle.file_lock.
     """
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
@@ -1162,7 +950,7 @@ def control_start(
     _ensure_dirs()
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
-    # processes (see _control_start_lock / biopb._filelock). Held through the
+    # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
     # readiness wait too, so a second starter that was blocked wakes to a fully
     # started control (pidfile written, port listening) and reports the idempotent
     # "already running" rather than racing a half-up one. The lock auto-releases if
@@ -1307,6 +1095,9 @@ def control_stop(
         token,
         sentinel=_control_shutdown_sentinel(),
         remove_pid=_remove_control_pid,
+        notify=lambda diag: console.print(
+            f"[yellow]Graceful stop unavailable ({diag}); force killing.[/yellow]"
+        ),
     ):
         console.print("[green]biopb control plane stopped[/green]")
     else:
@@ -1707,7 +1498,6 @@ def _run_elevated_ps(inner: str) -> int:
     most commonly the user declining the UAC prompt (Start-Process then throws,
     so the outer shell exits nonzero).
     """
-    import tempfile
 
     # utf-8-sig, not plain utf-8: Windows PowerShell 5.1 reads a BOM-less script
     # as the ANSI code page, so a non-ASCII install path (e.g. an accented

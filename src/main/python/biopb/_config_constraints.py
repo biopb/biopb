@@ -16,7 +16,7 @@ out-of-range value there silently breaks pyramid construction on either side
 -> an infinite loop). Declaring the bounds here once means the two packages
 cannot drift (biopb/biopb#34, #182).
 
-Deliberately stdlib-only, like the sibling :mod:`biopb._config_location`, so
+Deliberately stdlib-only, like the sibling :mod:`biopb._locations`, so
 importing it stays cheap and pulls in none of the heavy adapter/discovery
 machinery.
 """

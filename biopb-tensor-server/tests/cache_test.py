@@ -859,7 +859,7 @@ class TestArrowFileBackendRecovery:
         our own alive PID and refused to reclaim; the identity check compares
         the recorded create-time token and treats a mismatch as stale.
         """
-        from biopb._proc import process_create_time
+        from biopb._lifecycle.proc import process_create_time
 
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"
@@ -888,7 +888,7 @@ class TestArrowFileBackendRecovery:
 
     def test_live_lock_matching_identity_is_held(self):
         """A lock with our alive PID and matching create time is NOT stale."""
-        from biopb._proc import process_create_time
+        from biopb._lifecycle.proc import process_create_time
 
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"

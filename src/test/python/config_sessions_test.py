@@ -1,6 +1,6 @@
 """Unit tests for the shared MCP-session filesystem registry.
 
-The registry (:mod:`biopb._config_sessions`) is the seam between the biopb-mcp
+The registry (:mod:`biopb._sessions`) is the seam between the biopb-mcp
 shim (writer) and the control plane (reader) — neither imports the other, so its
 on-disk contract is pinned here in the core ``biopb`` package. See
 ``biopb-mcp/ARCHITECTURE.md``
@@ -10,7 +10,7 @@ import json
 import os
 
 import pytest
-from biopb import _config_sessions as reg
+from biopb import _sessions as reg
 
 
 @pytest.fixture(autouse=True)

@@ -26,7 +26,7 @@ classifiers = [
 # planes as subprocesses and never imports them (invariant I2 in
 # biopb-mcp/docs/mcp-dedaemonization-migration.md). Its deps are the
 # dependency-light core SDK (for the shared control-endpoint location,
-# biopb._config_control) plus a light ASGI stack for the Layer-3 single-origin
+# biopb._endpoints) plus a light ASGI stack for the Layer-3 single-origin
 # web front (biopb_control._control): Starlette + uvicorn serve the origin,
 # httpx + websockets reverse-proxy the supervised tensor server's HTTP sidecar.
 # None of these drag in napari / dask / Qt / pyarrow / tensor-server / mcp, so

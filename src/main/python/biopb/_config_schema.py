@@ -16,7 +16,7 @@ keeps its own *composer* that calls :func:`dataclass_section` for its scalar
 sections and adds whatever bespoke array/alias parts it has.
 
 Deliberately stdlib-only, like the sibling :mod:`biopb._config_constraints` and
-:mod:`biopb._config_location`: it duck-types the constraint objects
+:mod:`biopb._locations`: it duck-types the constraint objects
 (``to_json_schema`` / ``describe``) and never imports the constraint classes, so
 it pulls in none of the heavy adapter/discovery machinery.
 """

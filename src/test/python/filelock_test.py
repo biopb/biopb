@@ -3,13 +3,13 @@
 Both harden ``biopb control start`` for the world where several processes (the
 launcher, the installer, and -- once the shim starts the control on demand --
 racing agent sessions) can invoke it at once. See
-``biopb-mcp/ARCHITECTURE.md`` and ``biopb._filelock``.
+``biopb-mcp/ARCHITECTURE.md`` and ``biopb._lifecycle.file_lock``.
 """
 
 import time
 
 import pytest
-from biopb._filelock import LockTimeout, file_lock
+from biopb._lifecycle.file_lock import LockTimeout, file_lock
 
 
 class TestFileLock:

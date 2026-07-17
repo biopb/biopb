@@ -471,7 +471,7 @@ def _load_namespace_plugins(ip, config) -> None:
     if not get_setting(config, "services.namespace_enabled", True):
         logger.info("kernel plugins disabled (services.namespace_enabled=false)")
         return
-    from biopb._config_location import mcp_plugin_dir
+    from biopb._locations import mcp_plugin_dir
 
     try:
         _load_startup_files(ip, mcp_plugin_dir())

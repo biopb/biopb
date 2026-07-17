@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 import pytest
 import websockets.sync.server
-from biopb import _config_sessions
+from biopb import _sessions
 from websockets.sync.client import connect as ws_connect
 
 from biopb_control._control import (
@@ -228,10 +228,10 @@ def test_api_sessions_omits_dead_records(control, upstream):
     # A session whose pid is gone is pruned by list_sessions() on read.
     dead = subprocess_dead_pid()
     u = urlparse(upstream)
-    _config_sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
+    _sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
     _status, _headers, body = _get(f"{control}/api/sessions")
     assert json.loads(body)["sessions"] == []
-    assert _config_sessions.read_session("ghost") is None  # pruned
+    assert _sessions.read_session("ghost") is None  # pruned
 
 
 @pytest.mark.parametrize(
@@ -268,9 +268,7 @@ def test_api_sessions_kernel_unknown_when_child_unreachable(control):
     # A live-pid record whose port has no server: the probe fails fast and the
     # session still lists (kernel state is decorative, never drops the session).
     closed = _free_port()  # nothing listening
-    _config_sessions.register(
-        "s-unreach", host="127.0.0.1", port=closed, pid=os.getpid()
-    )
+    _sessions.register("s-unreach", host="127.0.0.1", port=closed, pid=os.getpid())
     _status, _headers, body = _get(f"{control}/api/sessions")
     sessions = json.loads(body)["sessions"]
     assert len(sessions) == 1
@@ -882,7 +880,7 @@ def ws_upstream():
 def _register_session(session_id, upstream_url):
     """Register a live session whose loopback target is the echo ``upstream``."""
     u = urlparse(upstream_url)
-    _config_sessions.register(session_id, host=u.hostname, port=u.port, pid=os.getpid())
+    _sessions.register(session_id, host=u.hostname, port=u.port, pid=os.getpid())
 
 
 def test_session_observe_serves_the_spa_shell(control, upstream):
@@ -1008,11 +1006,11 @@ def test_dead_session_returns_404_and_is_pruned(control, upstream):
     # A record whose pid is gone must not be proxied; resolve() prunes it.
     dead = subprocess_dead_pid()
     u = urlparse(upstream)
-    _config_sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
+    _sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{control}/session/ghost/observe")
     assert exc.value.code == 404
-    assert _config_sessions.read_session("ghost") is None  # pruned
+    assert _sessions.read_session("ghost") is None  # pruned
 
 
 def subprocess_dead_pid():

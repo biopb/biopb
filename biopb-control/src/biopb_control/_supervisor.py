@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from biopb import _config_location
+from biopb import _locations
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,7 @@ class DataPlaneSupervisor:
             return self._log_fh
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            _config_location.rotate_log(Path(path))
+            _locations.rotate_log(Path(path))
             self._log_fh = open(path, "ab", buffering=0)
         except OSError:
             logger.warning("Cannot open data-plane log %s; using stderr", path)
@@ -519,10 +519,10 @@ class DataPlaneSupervisor:
     @staticmethod
     def _win_stop_sentinel() -> Path:
         # The one definition the tensor server's shutdown listener also binds to
-        # (biopb._config_location.tensor_stop_sentinel), so writer and watcher
+        # (biopb._locations.tensor_stop_sentinel), so writer and watcher
         # cannot disagree — a single fixed name under the biopb state dir, not
         # keyed by PID.
-        return _config_location.tensor_stop_sentinel()
+        return _locations.tensor_stop_sentinel()
 
     def _close_log(self) -> None:
         fh = self._log_fh

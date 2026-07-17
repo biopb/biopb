@@ -56,7 +56,7 @@ import threading
 import time
 
 import anyio
-from biopb import _config_sessions
+from biopb import _sessions
 from biopb._lifecycle import winjob as _winjob
 from biopb._lifecycle.owned_child import OwnedChild, open_child_log
 from mcp import types
@@ -293,7 +293,7 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     # register()'s own unsafe-id ValueError, must not escape and break the session
     # either (biopb/biopb#422).
     try:
-        _config_sessions.register(session_id, port=port, pid=child.pid, mcp_url=url)
+        _sessions.register(session_id, port=port, pid=child.pid, mcp_url=url)
     except Exception as e:
         logger.warning("Could not register session %s: %s", session_id, e)
 
@@ -313,11 +313,11 @@ def _reap_session(child, session_id=None):
     ``session_id`` (when this reaps a registered session) is dropped from the
     filesystem registry here so teardown and de-registration are one path — a
     force-killed child leaves no routing ghost; the registry's own pid-liveness
-    prune (:func:`biopb._config_sessions.list_sessions`) is the backstop for the
+    prune (:func:`biopb._sessions.list_sessions`) is the backstop for the
     case where even this reap is skipped.
     """
     if session_id is not None:
-        _config_sessions.unregister(session_id)
+        _sessions.unregister(session_id)
     child.stop(timeout=REAP_TIMEOUT)
 
 

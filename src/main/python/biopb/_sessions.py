@@ -12,8 +12,8 @@ Two independent processes need to agree on where the ephemeral MCP sessions are:
 Neither can import the other (``biopb-mcp`` cannot import ``biopb-control`` any
 more than ``biopb-tensor-server`` — see the "shared config lives in core biopb
 SDK" rationale), so the one thing they must share — the on-disk layout — lives
-here in the dependency-light core ``biopb`` SDK, beside ``_config_control`` /
-``_config_location``. Kept **stdlib-only** so importing it never drags in the
+here in the dependency-light core ``biopb`` SDK, beside ``_endpoints`` /
+``_locations``. Kept **stdlib-only** so importing it never drags in the
 heavy server/mcp stacks and stays cheap on the featherweight shim.
 
 Why a filesystem registry (see ``biopb-mcp/ARCHITECTURE.md``): it
@@ -24,12 +24,12 @@ routing ghost. (HTTP self-registration would be the alternative only if the
 front and the sessions could later cross a machine boundary.)
 
 Liveness is an **identity** check, not a bare PID probe: a record stores the
-child's per-process create-time token (``biopb._proc.process_create_time``), and a
+child's per-process create-time token (``biopb._lifecycle.proc.process_create_time``), and a
 reader treats the session as gone if the PID is dead *or* the PID is alive but now
 names a different process (create-time mismatch → the OS recycled the PID). This
 is the same PID-reuse guard as the daemon PID files (biopb#138); without it a
 recycled PID would keep a ghost "alive" and, worse, could route ``/session/<id>``
-traffic to an unrelated process. Delegated to ``biopb._proc`` (itself
+traffic to an unrelated process. Delegated to ``biopb._lifecycle.proc`` (itself
 dependency-free) so the liveness/identity computation matches the CLI's exactly.
 
 Concurrency: writes are atomic (temp file + ``os.replace`` in the same dir), so a
@@ -48,8 +48,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import _config_location
-from ._proc import is_process_running, process_create_time
+from . import _locations
+from ._lifecycle.proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,11 @@ def sessions_dir() -> Path:
     Live-session records live under the shared biopb **state** tree
     (``~/.local/state/biopb/sessions``) — cross-component runtime state the
     control (not just biopb-mcp) also reads, so deliberately the ``biopb`` tree.
-    Delegates to :func:`biopb._config_location.sessions_dir`, which owns the
+    Delegates to :func:`biopb._locations.sessions_dir`, which owns the
     override + location and creates the dir on access (so both the writing shim
     and the reading control can call this without a separate mkdir).
     """
-    return _config_location.sessions_dir()
+    return _locations.sessions_dir()
 
 
 # Characters that would let a session id escape the registry dir when spliced
@@ -252,7 +252,7 @@ def list_sessions(prune: bool = True) -> list[dict]:
 def _record_is_live(rec: dict) -> bool:
     """Whether ``rec``'s owning process is still the session child we registered.
 
-    Liveness *and* identity (biopb#138), delegated to :mod:`biopb._proc` so the
+    Liveness *and* identity (biopb#138), delegated to :mod:`biopb._lifecycle.proc` so the
     computation matches the daemon PID files exactly:
 
     - No usable pid -> ``True`` (fail-open: can't disprove, so never drop it).

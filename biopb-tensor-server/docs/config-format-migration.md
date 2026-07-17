@@ -45,7 +45,7 @@ deprecation warning naming `biopb.json` as canonical; an invalid file raises
 **JSON-preferred default-path resolution — one shared impl.** `find_config(dir)`
 returns the first of `biopb.json` → `biopb.toml` that exists, else the canonical
 `biopb.json`. When both exist the legacy TOML is silently shadowed, so it warns
-naming the ignored file. It lives once in **`biopb._config_location`** (stdlib-only
+naming the ignored file. It lives once in **`biopb._locations`** (stdlib-only
 module in the core `biopb` package — no heavy adapter/discovery imports, cheap to
 import per CLI invocation) and all three consumers call it: `core.config`
 re-exports it (`find_config` + name constants), `biopb.cli` sets

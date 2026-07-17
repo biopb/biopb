@@ -823,7 +823,7 @@ install_biopb() {
     # wants is the `release-v*` one, so the release fetch filters by this prefix
     # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
-    # On-disk trees follow XDG (matching biopb._config_location): config in the
+    # On-disk trees follow XDG (matching biopb._locations): config in the
     # config tree, portable assets (webapp/samples) in the data tree, and logs /
     # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
     # conventional dirs, so writer (installer) and reader (code) never disagree.

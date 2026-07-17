@@ -33,7 +33,7 @@ def seed_kernel_plugins(dest: Path | str | None = None) -> list[tuple[str, str]]
     ``"exists"`` (left as the user has it). Creates the directory if needed.
     """
     if dest is None:
-        from biopb._config_location import mcp_plugin_dir
+        from biopb._locations import mcp_plugin_dir
 
         dest = mcp_plugin_dir()
     dest = Path(dest)
