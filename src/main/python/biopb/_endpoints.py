@@ -11,7 +11,7 @@ Neither can import the other (``biopb-mcp`` cannot import ``biopb-control`` any
 more than it can import ``biopb-tensor-server`` — see the
 "shared config lives in core biopb SDK" rationale), so the one thing they must
 share — the endpoint — lives here in the dependency-light core ``biopb`` SDK,
-next to ``_config_location`` / ``_config_constraints``. Kept stdlib-only so
+next to ``_locations`` / ``_config_constraints``. Kept stdlib-only so
 importing it never drags in the heavy server/mcp stacks.
 
 This is the anchor of the single-origin web front (see

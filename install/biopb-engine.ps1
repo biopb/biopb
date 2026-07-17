@@ -123,7 +123,7 @@ if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
     $env:UV_TOOL_DIR = Join-Path $env:LOCALAPPDATA "uv\tools"
 }
 
-# The `biopb` subdir of an XDG base dir, mirroring biopb._config_location: config
+# The `biopb` subdir of an XDG base dir, mirroring biopb._locations: config
 # in the config tree, portable assets (webapp/samples) in the data tree, logs /
 # pid / sentinels in the STATE tree. Honors the XDG env var (as Python does on
 # every platform), defaulting to the conventional home-relative dir, so writer

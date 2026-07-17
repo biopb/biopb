@@ -58,7 +58,7 @@ def startup_files(plugin_dir: Optional[Path] = None) -> list[dict]:
     ``_``-prefixed files (dunder / private helpers) are skipped. Never raises.
     """
     if plugin_dir is None:
-        from biopb._config_location import mcp_plugin_dir
+        from biopb._locations import mcp_plugin_dir
 
         plugin_dir = mcp_plugin_dir()
     try:
@@ -112,7 +112,7 @@ def summary(plugin_dir: Optional[Path] = None) -> dict:
     ``entry_points`` are the two lists above. Read-only, never raises.
     """
     if plugin_dir is None:
-        from biopb._config_location import mcp_plugin_dir
+        from biopb._locations import mcp_plugin_dir
 
         plugin_dir = mcp_plugin_dir()
     return {

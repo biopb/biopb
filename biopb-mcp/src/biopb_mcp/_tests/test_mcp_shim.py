@@ -21,7 +21,7 @@ import time
 
 import anyio
 import pytest
-from biopb import _config_sessions
+from biopb import _sessions
 from biopb._lifecycle.owned_child import OwnedChild
 from mcp import types
 
@@ -173,7 +173,7 @@ class TestSpawnSession:
             else:
                 assert child.job is None  # POSIX: reaped via the group, not a job
             # Self-registered so the control can discover + proxy to it.
-            rec = _config_sessions.read_session(session_id)
+            rec = _sessions.read_session(session_id)
             assert rec is not None
             assert rec["port"] == port and rec["pid"] == child.pid
             assert rec["mcp_url"] == url
@@ -181,7 +181,7 @@ class TestSpawnSession:
             _shim._reap_session(child, session_id)
         assert child.poll() is not None  # reaped on the way out
         # Reap de-registers, so the record is gone.
-        assert _config_sessions.read_session(session_id) is None
+        assert _sessions.read_session(session_id) is None
 
     def test_inherits_live_env_and_wires_dynamic_port(self, tmp_path, monkeypatch):
         # The #98 fix: the child inherits THIS shim's current environment, so a
@@ -479,7 +479,7 @@ def _home_env(tmp_path):
         env["HOMEDRIVE"], env["HOMEPATH"] = drive, tail
     else:
         env["HOME"] = home
-    # The XDG base dirs override HOME in _config_location; drop any inherited
+    # The XDG base dirs override HOME in _locations; drop any inherited
     # values so the HOME-based defaults (state/config/data under tmp_path) apply.
     for var in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
         env.pop(var, None)

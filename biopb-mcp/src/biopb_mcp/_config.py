@@ -13,7 +13,7 @@ tensor server's ``biopb.json`` and the installer's client-definition ``mcp.json`
 (a *distinct* file: that one registers biopb-mcp with MCP clients; this one is
 biopb-mcp's own runtime settings). Logs -- runtime state, not config -- live in
 the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
-:mod:`biopb._config_location` (no more separate top-level ``biopb-mcp`` dir).
+:mod:`biopb._locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
@@ -41,9 +41,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 # Shared with the tensor server: the constraint primitives (so the pyramid knobs
 # are validated by the exact same rules in both packages -- the same bug, not an
 # analogous one; biopb/biopb#182, #34) and the config-file location.
-from biopb import _config_location
+from biopb import _locations
 from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
-from biopb._config_location import mcp_config_path
+from biopb._locations import mcp_config_path
 
 if TYPE_CHECKING:
     import numpy as np
@@ -569,7 +569,7 @@ def get_setting(config: dict, path: str, default=_MISSING):
 def get_config_path() -> Path:
     """Path to the config file (``~/.config/biopb/mcp-config.json``).
 
-    Delegates to :func:`biopb._config_location.mcp_config_path` so biopb-mcp and
+    Delegates to :func:`biopb._locations.mcp_config_path` so biopb-mcp and
     the core-``biopb`` readers (control plane / ``_algorithms``) share one location.
     """
     return mcp_config_path()
@@ -581,9 +581,9 @@ def get_log_dir() -> Path:
     Logs are persistent runtime state, not user-editable config, so they live in
     the shared biopb XDG *state* tree (``$XDG_STATE_HOME``), beside the tensor
     server's ``logs/`` and the session registry. Delegates to
-    :func:`biopb._config_location.mcp_log_dir`, which creates it on access.
+    :func:`biopb._locations.mcp_log_dir`, which creates it on access.
     """
-    return _config_location.mcp_log_dir()
+    return _locations.mcp_log_dir()
 
 
 def get_session_log_dir() -> Path:
@@ -613,7 +613,7 @@ def get_daemon_log_file(config: Optional[dict] = None) -> Path:
     override = get_setting(config, "transport.kernel_log")
     if override:
         return Path(override)
-    return _config_location.mcp_server_log()
+    return _locations.mcp_server_log()
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

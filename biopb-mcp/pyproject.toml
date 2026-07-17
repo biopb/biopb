@@ -124,7 +124,7 @@ testing = [
 
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
-# Light console entry (stdlib + biopb._config_location only, no kernel/napari
+# Light console entry (stdlib + biopb._locations only, no kernel/napari
 # import) the installer calls to seed the built-in example kernel plugins
 # (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
 # tool" example, delivered as a visible file rather than a buried entry point.

@@ -18,9 +18,10 @@ POSIX uses ``fcntl.flock``; Windows uses ``msvcrt.locking``. Both are polled in
 non-blocking mode so the wait honours a timeout — ``flock``'s blocking mode has
 no portable timeout, and this keeps one code path for both platforms.
 
-Kept dependency-free and in the core ``biopb`` SDK (next to ``_proc`` /
-``_config_sessions``) so both the CLI and biopb-mcp's shim can import it without
-dragging in a heavy stack or importing each other.
+Kept dependency-free and in the core ``biopb`` SDK — alongside the other
+owned-child lifecycle primitives in :mod:`biopb._lifecycle` — so both the CLI
+and biopb-mcp's shim can import it without dragging in a heavy stack or importing
+each other.
 """
 
 from __future__ import annotations

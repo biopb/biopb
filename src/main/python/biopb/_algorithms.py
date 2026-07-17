@@ -49,13 +49,13 @@ _DEFAULT_TIMEOUT = 4.0
 def _config_file() -> Path:
     """The biopb-mcp config file location (``~/.config/biopb/mcp-config.json``).
 
-    Uses the shared ``biopb._config_location.mcp_config_path`` -- the same location
+    Uses the shared ``biopb._locations.mcp_config_path`` -- the same location
     ``biopb_mcp._config.get_config_path()`` returns -- rather than importing
     ``biopb_mcp``: the control plane must not import the mcp package (invariant I2),
     and the read is plain JSON. The helper resolves ``Path.home()`` at call time
     (not cached) so a test that repoints it gets an isolated location.
     """
-    from biopb._config_location import mcp_config_path
+    from biopb._locations import mcp_config_path
 
     return mcp_config_path()
 

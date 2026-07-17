@@ -12,8 +12,8 @@ Two independent processes need to agree on where the ephemeral MCP sessions are:
 Neither can import the other (``biopb-mcp`` cannot import ``biopb-control`` any
 more than ``biopb-tensor-server`` — see the "shared config lives in core biopb
 SDK" rationale), so the one thing they must share — the on-disk layout — lives
-here in the dependency-light core ``biopb`` SDK, beside ``_config_control`` /
-``_config_location``. Kept **stdlib-only** so importing it never drags in the
+here in the dependency-light core ``biopb`` SDK, beside ``_endpoints`` /
+``_locations``. Kept **stdlib-only** so importing it never drags in the
 heavy server/mcp stacks and stays cheap on the featherweight shim.
 
 Why a filesystem registry (see ``biopb-mcp/ARCHITECTURE.md``): it
@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import _config_location
+from . import _locations
 from ._proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
@@ -63,11 +63,11 @@ def sessions_dir() -> Path:
     Live-session records live under the shared biopb **state** tree
     (``~/.local/state/biopb/sessions``) — cross-component runtime state the
     control (not just biopb-mcp) also reads, so deliberately the ``biopb`` tree.
-    Delegates to :func:`biopb._config_location.sessions_dir`, which owns the
+    Delegates to :func:`biopb._locations.sessions_dir`, which owns the
     override + location and creates the dir on access (so both the writing shim
     and the reading control can call this without a separate mkdir).
     """
-    return _config_location.sessions_dir()
+    return _locations.sessions_dir()
 
 
 # Characters that would let a session id escape the registry dir when spliced

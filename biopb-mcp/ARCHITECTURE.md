@@ -69,8 +69,8 @@ Two invariants keep the tree correct:
   as subprocesses (`python -m biopb_tensor_server …`, `python -m biopb_mcp.mcp …`),
   never by importing them — no Qt/napari/dask/kernel enters it. Shared facts (the
   control endpoint, the session-file contract, auth predicates, the process/
-  lifecycle helpers) live in **stdlib-only core-SDK modules** (`biopb._config_control`,
-  `biopb._config_sessions`, `biopb._web_auth`, `biopb._proc`, `biopb._lifecycle`)
+  lifecycle helpers) live in **stdlib-only core-SDK modules** (`biopb._endpoints`,
+  `biopb._sessions`, `biopb._web_auth`, `biopb._proc`, `biopb._lifecycle`)
   that neither side imports from the other.
 
 ### Control plane (durable root)
@@ -382,7 +382,7 @@ invariant I2; via `biopb._kernel_plugins`), not the live namespace.
 ### Configuration (`_config.py`)
 
 The config lives at `~/.config/biopb/mcp-config.json` — co-located with the tensor
-server's `biopb.json` (via `biopb._config_location.mcp_config_path`). It is
+server's `biopb.json` (via `biopb._locations.mcp_config_path`). It is
 **deep-merged** with `DEFAULT_CONFIG` on load, so a partial nested section
 overrides only its own leaves. Read values with `get_setting(config,
 "dotted.path")`, which falls back to `DEFAULT_CONFIG` so call sites never restate a
@@ -459,7 +459,7 @@ passthrough; explicit prefix `Mount`s (no root catch-all) keep the static
 
 **Session registry.** Each session writes `~/.local/state/biopb/sessions/<id>.json`
 (host + port + pid + `/mcp` url) once reachable and removes it on reap; the control
-reads that dir. The contract is stdlib-only `biopb._config_sessions` (shim writes,
+reads that dir. The contract is stdlib-only `biopb._sessions` (shim writes,
 control reads). `resolve()`/`list_sessions()` **self-heal** by pruning records
 whose owning pid is dead — or alive on a recycled pid (create-time token mismatch,
 the #138 PID-reuse guard, via `biopb._proc`) — so a dead session expires to a clean
@@ -525,5 +525,5 @@ napari-skimage-regionprops. Versioning via setuptools_scm.
 - `_connection.py` — the pure client (asks the control to ensure the plane).
 - `biopb-control/src/biopb_control/` — `_control.py` (ASGI origin: SPA + plane
   proxies), `_supervisor.py` (`DataPlaneSupervisor`).
-- `biopb/{_config_control,_config_sessions,_web_auth,_proc,_lifecycle}` — the
+- `biopb/{_endpoints,_sessions,_web_auth,_proc,_lifecycle}` — the
   stdlib-only cross-process seams.

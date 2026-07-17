@@ -10,7 +10,7 @@ say, Claude Code later and registers it from the dashboard with one click.
 
 It is the single source of truth for the catalog going forward: the two installer
 scripts are meant to delegate here (their hand-kept-in-sync copies collapse into
-one). Kept **stdlib-only** — like ``_config_control`` / ``_config_sessions`` — so
+one). Kept **stdlib-only** — like ``_endpoints`` / ``_sessions`` — so
 importing it never drags in a heavy stack, and so both the lean control plane and
 the core CLI can call it.
 
@@ -309,7 +309,7 @@ def _mcp_entry(spec: AgentSpec) -> dict:
 def _write_json_atomic(path: Path, data: dict) -> None:
     """Write ``data`` to ``path`` atomically (temp file + ``os.replace`` in the
     same dir), so a client reading concurrently never sees a half-written config.
-    Same idiom as ``_config_sessions``/``cli._write_pid_file``."""
+    Same idiom as ``_sessions``/``cli._write_pid_file``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)

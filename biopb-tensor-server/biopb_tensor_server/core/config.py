@@ -89,9 +89,9 @@ from biopb._config_constraints import (
 # Config file location & format preference live in the core `biopb` package so
 # the umbrella CLI and biopb-mcp share one definition (all three depend on
 # `biopb`). Re-exported for back-compat (`biopb_tensor_server.core.config.find_config`
-# and the name constants). See biopb._config_location for the JSON-canonical
+# and the name constants). See biopb._locations for the JSON-canonical
 # rationale (biopb/biopb#34).
-from biopb._config_location import (
+from biopb._locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
     LEGACY_CONFIG_NAME as LEGACY_CONFIG_NAME,

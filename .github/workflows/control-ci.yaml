@@ -16,7 +16,7 @@ on:
     paths:
       - 'biopb-control/**'
       - 'src/main/python/biopb/cli.py'          # the `control` CLI verbs
-      - 'src/main/python/biopb/_config_control.py' # shared control endpoint
+      - 'src/main/python/biopb/_endpoints.py' # shared control endpoint
       - 'proto/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
