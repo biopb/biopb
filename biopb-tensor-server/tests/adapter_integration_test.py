@@ -95,7 +95,7 @@ class TestZarrIntegration:
             assert "zarr-integration" in sources
 
             # Get tensor (source_id matches tensor_id for single-tensor sources)
-            darr = client.get_tensor("zarr-integration", "zarr-integration")
+            darr = client.get_tensor("zarr-integration")
             assert darr.shape == shape
             assert darr.dtype == np.uint8
 
@@ -178,7 +178,6 @@ class TestZarrIntegration:
             # Test stride downsampling
             darr = client.get_tensor(
                 "zarr-scaled",
-                "zarr-scaled",
                 scale_hint=[2, 2],
                 reduction_method="stride",
             )
@@ -223,7 +222,6 @@ class TestOmeZarrIntegration:
 
             # Test precompute method for scale 2
             darr = client.get_tensor(
-                "ome-zarr-integration",
                 "ome-zarr-integration",
                 scale_hint=[2, 2],
                 reduction_method="precompute",
@@ -271,7 +269,6 @@ class TestOmeZarrIntegration:
 
             # Request scale 3 - no matching level, should use virtual scaling
             darr = client.get_tensor(
-                "ome-zarr-virtual",
                 "ome-zarr-virtual",
                 scale_hint=[3, 3],
                 reduction_method="nearest",
@@ -351,8 +348,8 @@ class TestOmeZarrIntegration:
             # A normal get_tensor (with_metadata=False) populates the cached
             # descriptor's summary; get_physical_scale reads it with no extra
             # full-OME fetch.
-            client.get_tensor("phys", "phys")
-            scale, unit = client.get_physical_scale("phys", "phys")
+            client.get_tensor("phys")
+            scale, unit = client.get_physical_scale("phys")
             assert list(scale) == [0.5, 0.25]
             assert list(unit) == ["micrometer", "micrometer"]
 
@@ -381,8 +378,8 @@ class TestOmeZarrIntegration:
             client = TensorFlightClient(
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
-            client.get_tensor("plain", "plain")
-            assert client.get_physical_scale("plain", "plain") is None
+            client.get_tensor("plain")
+            assert client.get_physical_scale("plain") is None
             client.close()
         finally:
             server.shutdown()
@@ -415,8 +412,8 @@ class TestOmeTiffIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor("ome-tiff-integration", scene_id)
+            # scene_id is the source-qualified array_id (e.g. 'ome-tiff-integration/Image:0')
+            darr = client.get_tensor(scene_id)
 
             # OME-TIFF uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
             # Original fixture creates (C, Y, X) = (3, 128, 128) with CYX axes
@@ -460,8 +457,8 @@ class TestOmeTiffIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor("ome-tiff-channels", scene_id)
+            # scene_id is the source-qualified array_id (e.g. 'ome-tiff-channels/Image:0')
+            darr = client.get_tensor(scene_id)
 
             # Read channel 0 (value = 1) - C axis is index 1 in TCZYX
             data0 = darr[0:1, 0:1].compute()
@@ -609,8 +606,8 @@ class TestMultiSeriesOmeTiffIntegration:
             descriptors = adapter.list_tensor_descriptors()
             first_scene_id = descriptors[0].array_id
 
-            # Get first series tensor - tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor("multi-series-server", first_scene_id)
+            # first_scene_id is the source-qualified array_id (e.g. 'multi-series-server/Image:0')
+            darr = client.get_tensor(first_scene_id)
 
             # Read data
             data = darr.compute()
@@ -695,7 +692,7 @@ class TestHdf5Integration:
                     f"grpc://localhost:{server.port}", cache_bytes=10_000_000
                 )
 
-                darr = client.get_tensor("hdf5-integration", "hdf5-integration")
+                darr = client.get_tensor("hdf5-integration")
                 assert darr.shape == shape
 
                 data = darr.compute()
@@ -739,7 +736,7 @@ class TestCacheIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            darr = client.get_tensor("cache-test", "cache-test")
+            darr = client.get_tensor("cache-test")
 
             # First read
             data1 = darr[: chunks[0], : chunks[1]].compute()
@@ -785,7 +782,7 @@ class TestCacheIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            darr = client.get_tensor("cache-regions", "cache-regions")
+            darr = client.get_tensor("cache-regions")
 
             # Read first chunk
             darr[: chunks[0], : chunks[1]].compute()
@@ -832,7 +829,7 @@ class TestConcurrentAccess:
             client = TensorFlightClient(
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
-            darr = client.get_tensor("concurrent-test", "concurrent-test")
+            darr = client.get_tensor("concurrent-test")
             data = darr[: chunks[0], : chunks[1]].compute()
             results.append((client_id, data.mean()))
             client.close()

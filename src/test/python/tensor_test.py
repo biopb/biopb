@@ -97,14 +97,14 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_shape(self, server_client):
         """Test tensor shape retrieval."""
-        darr = server_client.get_tensor("test-tensor", "test-tensor")
+        darr = server_client.get_tensor("test-tensor")
         assert darr.shape == (128, 128)
         assert darr.dtype == np.uint8
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_read_chunks(self, server_client):
         """Test reading different chunks."""
-        darr = server_client.get_tensor("test-tensor", "test-tensor")
+        darr = server_client.get_tensor("test-tensor")
 
         # Top-left chunk
         data = darr[:64, :64].compute()
@@ -125,7 +125,7 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_cache_reuse(self, server_client):
         """Test that cache is reused."""
-        darr = server_client.get_tensor("test-tensor", "test-tensor")
+        darr = server_client.get_tensor("test-tensor")
 
         # First read
         data1 = darr[:64, :64].compute()
@@ -148,7 +148,6 @@ class TestTensorFlightClient:
         """Test explicit per-call scaled reads using stride downsampling."""
         darr = server_client.get_tensor(
             "test-tensor",
-            "test-tensor",
             scale_hint=[2, 2],
             reduction_method="stride",
         )
@@ -166,7 +165,6 @@ class TestTensorFlightClient:
     def test_scaled_nearest_view(self, server_client):
         """Test visualization-oriented nearest downsampling."""
         darr = server_client.get_tensor(
-            "test-tensor",
             "test-tensor",
             scale_hint=[2, 2],
             reduction_method="nearest",
@@ -186,7 +184,6 @@ class TestTensorFlightClient:
         """Test explicit read_options-based mean downsampling."""
         darr = server_client.get_tensor(
             "test-tensor",
-            "test-tensor",
             scale_hint=[2, 2],
             reduction_method="mean",
         )
@@ -204,7 +201,6 @@ class TestTensorFlightClient:
     def test_scaled_area_view(self, server_client):
         """Test visualization-oriented area downsampling."""
         darr = server_client.get_tensor(
-            "test-tensor",
             "test-tensor",
             scale_hint=[2, 2],
             reduction_method="area",
@@ -257,7 +253,6 @@ class TestTensorFlightClient:
                 ) as client:
                     darr = client.get_tensor(
                         "mean-preserve",
-                        "mean-preserve",
                         scale_hint=[2, 2],
                         reduction_method="mean",
                     )
@@ -307,7 +302,6 @@ class TestTensorFlightClient:
                 ) as client:
                     darr = client.get_tensor(
                         "linear",
-                        "linear",
                         scale_hint=[2, 2],
                         reduction_method="linear",
                     )
@@ -349,7 +343,6 @@ class TestTensorFlightClient:
                 ) as client:
                     darr = client.get_tensor(
                         "nearest-edge",
-                        "nearest-edge",
                         scale_hint=[2, 2],
                         reduction_method="nearest",
                     )
@@ -361,21 +354,23 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_not_found_raises(self, server_client):
         """Test that requesting non-existent tensor raises error."""
-        with pytest.raises(ValueError, match="Tensor 'nonexistent' not found"):
-            server_client.get_tensor("test-tensor", "nonexistent")
+        with pytest.raises(
+            ValueError, match="Tensor 'test-tensor/nonexistent' not found"
+        ):
+            server_client.get_tensor("test-tensor/nonexistent")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_source_not_found_raises(self, server_client):
         """Test that requesting non-existent source raises error."""
         with pytest.raises(ValueError, match="Source not found"):
-            server_client.get_tensor("nonexistent-source", "some-tensor")
+            server_client.get_tensor("nonexistent-source/some-tensor")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_pb(self, server_client):
         """Test get_tensor_pb returns SerializedTensor protobuf."""
         from biopb.tensor.serialized_pb2 import SerializedTensor
 
-        pb = server_client.get_tensor_pb("test-tensor", "test-tensor")
+        pb = server_client.get_tensor_pb("test-tensor")
 
         # Verify it's a SerializedTensor
         assert isinstance(pb, SerializedTensor)
@@ -396,7 +391,7 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):
         """Test tensor_from_pb reconstructs dask array."""
-        pb = server_client.get_tensor_pb("test-tensor", "test-tensor")
+        pb = server_client.get_tensor_pb("test-tensor")
 
         # Reconstruct array
         darr = TensorFlightClient.tensor_from_pb(pb)
@@ -406,7 +401,7 @@ class TestTensorFlightClient:
         assert darr.dtype == np.uint8
 
         # Verify data values match direct get_tensor
-        direct_darr = server_client.get_tensor("test-tensor", "test-tensor")
+        direct_darr = server_client.get_tensor("test-tensor")
 
         # Top-left chunk
         np.testing.assert_array_equal(
@@ -423,7 +418,7 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_pb_serialization(self, server_client):
         """Test SerializedTensor can be serialized to bytes and reconstructed."""
-        pb = server_client.get_tensor_pb("test-tensor", "test-tensor")
+        pb = server_client.get_tensor_pb("test-tensor")
 
         # Serialize to bytes
         serialized_bytes = pb.SerializeToString()
@@ -445,7 +440,6 @@ class TestTensorFlightClient:
         """Test get_tensor_pb with slice_hint cropping."""
         pb = server_client.get_tensor_pb(
             "test-tensor",
-            "test-tensor",
             slice_hint=(slice(0, 64), slice(0, 64)),  # Top-left quadrant
         )
 
@@ -463,7 +457,6 @@ class TestTensorFlightClient:
     def test_get_tensor_pb_with_scale_hint(self, server_client):
         """Test get_tensor_pb with scale_hint."""
         pb = server_client.get_tensor_pb(
-            "test-tensor",
             "test-tensor",
             scale_hint=[2, 2],
             reduction_method="nearest",
