@@ -6,8 +6,11 @@ The MCP daemon (``mcp/__main__.py::_serve_http``) owns the distributed
 instead of spinning its own.  That decouples the cluster's lifetime from the
 kernel's: a ``restart_kernel`` / watchdog respawn / viewer-window close no longer
 tears the cluster down and re-spins N workers — the dominant restart cost on
-Windows, where each worker is a cold spawn (no fork).  Only a real daemon exit
-(the ``_shutdown`` chokepoint) closes it.
+Windows, where each worker is a cold spawn (no fork).  A real daemon exit (the
+``_shutdown`` chokepoint) closes it, as does the idle reaper (``start_reaper``)
+once the cluster has sat with *no kernel attached* for ``dask.idle_ttl`` — the
+bound on that decoupling, so a session whose viewer is closed but whose agent is
+still connected stops holding N idle workers indefinitely (biopb/biopb#409).
 
 Deliberately GUI-free and import-light: ``dask.distributed`` is imported inside
 ``ensure()`` (the cluster is spun lazily on the first kernel launch), so an idle
@@ -16,8 +19,14 @@ or never-started daemon pays nothing.
 
 import logging
 import threading
+import time
 
 logger = logging.getLogger(__name__)
+
+# Ceiling on the reaper's poll interval. The TTL is coarse (minutes), so polling
+# is cheap at this rate; a shorter TTL polls at the TTL itself, which is what
+# keeps the reaper testable without a sleep(ttl).
+_REAP_POLL_MAX = 30.0
 
 # Env var carrying the daemon cluster's scheduler address into the kernel, read
 # by _bootstrap._configure_dask ahead of the dask.address config value.
@@ -35,11 +44,24 @@ class DaskClusterHost:
     own config (see ``_bootstrap._configure_dask``).
     """
 
-    def __init__(self, config, local_dir=None):
+    def __init__(self, config, local_dir=None, kernel_alive=None):
         self._config = config
         self._local_dir = local_dir
         self._cluster = None
         self._address = None
+        # Predicate: is a kernel currently attached to our cluster? The reaper
+        # only counts idle time while this is false, because a live kernel holds
+        # a Client() on our scheduler address and nothing re-injects a new one --
+        # closing under it would strand it (see _reap_loop). Set post-construction
+        # via set_kernel_alive (the KernelHost is built after us, taking this host
+        # as an argument). None -> assume a kernel is always alive, i.e. never
+        # reap: an unknown answer must not be read as "safe to close".
+        self._kernel_alive = kernel_alive
+        # Monotonic timestamp from which the current no-kernel stretch is
+        # measured; None when a kernel is alive (or was, on the last poll).
+        self._idle_since = None
+        self._reap_thread = None
+        self._reap_stop = threading.Event()
         # Whether the *current* cluster has ever had >=1 worker register, gating
         # the liveness check: a running scheduler with 0 workers means "dead"
         # only after we've seen workers, not during the initial spawn window (see
@@ -76,6 +98,9 @@ class DaskClusterHost:
         with self._lock:
             if not self._should_own():
                 return None
+            # A kernel is launching: end any no-kernel stretch now rather than
+            # waiting for the reaper's next poll to observe the live kernel.
+            self._idle_since = None
             if self._cluster is not None:
                 if self._is_alive(self._cluster):
                     return self._address
@@ -149,12 +174,90 @@ class DaskClusterHost:
             return True
         return not self._saw_workers
 
-    def close(self):
-        """Best-effort, idempotent teardown of the owned cluster.
+    def set_kernel_alive(self, kernel_alive):
+        """Install the "is a kernel attached?" predicate the reaper gates on.
 
-        Called only on real daemon exit (the ``_shutdown`` chokepoint + atexit),
-        never on a kernel restart/reap — that is what keeps the workers warm.
+        Separate from ``__init__`` only because the ``KernelHost`` that answers
+        it is constructed *with* this host, so it cannot be passed in.
         """
+        self._kernel_alive = kernel_alive
+
+    def _idle_ttl(self):
+        from .._config import get_setting
+
+        return float(get_setting(self._config, "dask.idle_ttl"))
+
+    def start_reaper(self):
+        """Start the idle reaper, unless disabled or we own no cluster.
+
+        Idempotent. Cheap to leave running: it polls in-process state and never
+        touches dask until it actually closes something.
+        """
+        ttl = self._idle_ttl()
+        if ttl <= 0 or not self._should_own() or self._reap_thread is not None:
+            return
+        self._reap_thread = threading.Thread(
+            target=self._reap_loop, args=(ttl,), name="biopb-dask-reaper", daemon=True
+        )
+        self._reap_thread.start()
+        logger.debug("Dask idle reaper started (ttl=%.0fs)", ttl)
+
+    def _reap_loop(self, ttl):
+        """Close the cluster once it has sat with no kernel attached for *ttl*.
+
+        Reaping is gated on kernel liveness, not on dask activity: the kernel is
+        handed our scheduler address once, at launch (``KernelHost._launch`` ->
+        ``ensure()``), and holds that ``Client`` for its whole life with nothing
+        to re-inject a new address. So closing under a live kernel would strand
+        it on a dead scheduler, while closing with none attached costs only the
+        next kernel launch a re-spin (``ensure()`` self-heals). The window this
+        reclaims is real: closing the napari window tears the kernel down to idle
+        while the session child lives on for as long as the agent stays
+        connected, holding N idle workers the whole time (biopb/biopb#409).
+
+        A kernel restart / watchdog respawn dips through "not alive" for seconds,
+        far under a minutes-scale TTL, so the warm-across-restarts property the
+        host exists for is preserved.
+        """
+        poll = min(_REAP_POLL_MAX, ttl)
+        while not self._reap_stop.wait(poll):
+            with self._lock:
+                if self._cluster is None:
+                    # Nothing to reap; the stretch restarts when one is spun.
+                    self._idle_since = None
+                    continue
+                # No predicate -> we cannot prove no kernel is attached, so treat
+                # it as attached and never reap.
+                alive = True
+                if self._kernel_alive is not None:
+                    try:
+                        alive = bool(self._kernel_alive())
+                    except Exception:
+                        logger.debug("kernel liveness probe failed", exc_info=True)
+                if alive:
+                    self._idle_since = None
+                    continue
+                now = time.monotonic()
+                if self._idle_since is None:
+                    self._idle_since = now
+                elif now - self._idle_since >= ttl:
+                    logger.info(
+                        "Dask cluster idle (no kernel) for %.0fs; tearing it down. "
+                        "The next kernel launch re-spins it.",
+                        now - self._idle_since,
+                    )
+                    self._close_locked()
+                    self._idle_since = None
+
+    def close(self):
+        """Best-effort, idempotent teardown of the owned cluster and its reaper.
+
+        Called on real daemon exit (the ``_shutdown`` chokepoint + atexit). A
+        kernel restart/reap never calls this — that is what keeps the workers
+        warm; the reaper closes only the *cluster*, via ``_close_locked``, and
+        leaves itself running to handle the next spin.
+        """
+        self._reap_stop.set()
         with self._lock:
             self._close_locked()
 

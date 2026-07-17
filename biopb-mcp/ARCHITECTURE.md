@@ -183,7 +183,16 @@ The **session child** (not the kernel) owns the dask `LocalCluster`
 (`DaskClusterHost`), so it survives kernel restart/respawn/window-close — the
 kernel attaches via an injected scheduler address, with no cold worker re-spawn
 per restart (the dominant restart cost on Windows). Worker/memory changes need a
-*session* restart, not just `restart_kernel`. On an uncatchable session-child
+*session* restart, not just `restart_kernel`.
+
+That decoupling is bounded by an **idle reaper** (`dask.idle_ttl`, 900s): once the
+cluster has sat for that long with **no kernel attached** it is torn down, and the
+next kernel launch re-spins it via the same `ensure()`. It gates on kernel
+liveness, not dask activity, because the address is injected once at launch and
+nothing re-injects — closing under a live kernel would strand its `Client` on a
+dead scheduler. What it reclaims: closing the napari window drops the kernel to
+idle while the session child lives on for as long as the agent stays connected,
+otherwise holding N idle workers the whole time (**#409**). On an uncatchable session-child
 death the workers **self-terminate on scheduler loss** (which is why the `mcp`
 extra floors `distributed>=2023.9`); on Windows they fall under the shim's Job
 Object by nesting. Any distributed mode lets `interrupt_kernel` stop an in-flight
@@ -403,8 +412,9 @@ default. Sections are **flat / top-level** (each maps 1:1 to a section dataclass
   `LocalCluster`; `threads`/`synchronous` for in-process, no mid-compute cancel),
   `address` (attach to an external scheduler), `num_workers`/`threads_per_worker`/
   `memory_limit`/`dashboard_address` (dashboard loopback only), `cache_budget`
-  (cluster-wide chunk cache, split across workers). The session child owns the
-  cluster (see Lifecycle).
+  (cluster-wide chunk cache, split across workers), `idle_ttl` (900s; tear the
+  cluster down after this long with **no kernel attached**, 0 disables). The
+  session child owns the cluster (see Lifecycle).
 - **`tensor`** — `health_poll_min/max_interval` (the #44 source watcher's backoff;
   min ≤ 0 disables). (The localhost client-cache decision lives in the tensor
   client — `_resolve_cache_bytes`, off by default, `BIOPB_CACHE_LOCAL=1` to opt in.)

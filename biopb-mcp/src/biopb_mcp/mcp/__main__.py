@@ -352,6 +352,10 @@ def _serve_http(config, port, view=False):
         # its scheduler address so the kernel attaches instead of spinning its own.
         cluster_host=cluster_host,
     )
+    # Now that the kernel host exists, let the cluster's idle reaper ask it
+    # whether a kernel is attached — the one thing that makes a teardown safe.
+    cluster_host.set_kernel_alive(host.is_alive)
+    cluster_host.start_reaper()
     _server.set_kernel_host(host)
     _server.set_promote_after(get_setting(config, "kernel.promote_after"))
     # Surfaces headless state to the agent (initialize `instructions`) and the
