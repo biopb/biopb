@@ -300,7 +300,7 @@ starts on demand (above).
   handle (`job-N`) and keeps running. One job at a time. Stopping a job:
   `interrupt_current` raises `KeyboardInterrupt` into the worker thread via
   `PyThreadState_SetAsyncExc` (a `SIGINT` reaches only the main thread) and, via
-  `cancel`, also cancels in-flight distributed futures — the only mid-`compute()`
+  `_cancel`, also cancels in-flight distributed futures — the only mid-`compute()`
   stop short of `restart_kernel`. A `reason=…` threads a human-readable
   `cancel_reason` into the record so a user-triggered stop surfaces to the agent.
 - `_viewer_proxy.py` — runs **inside the kernel**. The agent-facing `viewer` is a

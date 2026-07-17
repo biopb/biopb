@@ -24,7 +24,7 @@ Design notes
 * **Stopping a job.** :func:`interrupt_current` force-stops the running job: it
   raises ``KeyboardInterrupt`` into the worker thread and, when a distributed dask
   client is active (the kernel's ``Client`` attached to the session child's
-  ``LocalCluster``), :func:`cancel` *also* cancels the client's in-flight futures
+  ``LocalCluster``), :func:`_cancel` *also* cancels the client's in-flight futures
   — the only mid-``compute()`` stop short of ``restart_kernel``.  The in-process
   ``threads`` / ``synchronous`` schedulers have no futures to cancel, so a running
   ``compute()`` under them is stopped by the raised ``KeyboardInterrupt`` once it
@@ -305,7 +305,7 @@ def poll(job_id):
     return job.snapshot()
 
 
-def cancel(job_id, reason=None):
+def _cancel(job_id, reason=None):
     job = _jobs.get(job_id)
     if job is None:
         return {"job_id": job_id, "cancelled": False, "status": "unknown"}
@@ -371,7 +371,7 @@ def interrupt_current(reason=None):
     ``SIGINT`` can't do this — Python delivers signals only to the kernel main
     thread, while the job runs in a background worker — so a pure-Python loop
     would otherwise be stoppable only by ``restart_kernel``. This first runs
-    :func:`cancel` (attribution reason + in-flight dask-future cancel), then
+    :func:`_cancel` (attribution reason + in-flight dask-future cancel), then
     forces the worker thread via :func:`_raise_in_thread`. The exception lands at
     the next bytecode, so a blocking C call ends when it returns. ``{"interrupted":
     False, "status": "idle"}`` when the kernel is idle.
@@ -380,7 +380,7 @@ def interrupt_current(reason=None):
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
     job.interrupted = True  # finalize as "interrupted"
-    cancel(job.job_id, reason=reason)
+    _cancel(job.job_id, reason=reason)
     ident = job.thread.ident if job.thread is not None else None
     raised = _raise_in_thread(ident, KeyboardInterrupt)
     return {"job_id": job.job_id, "interrupted": bool(raised)}

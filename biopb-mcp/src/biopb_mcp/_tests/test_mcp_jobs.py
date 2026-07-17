@@ -91,7 +91,7 @@ class TestJobRunnerUnit:
         self._wait(jid)
 
     def test_distributed_cancel_rebuilds_futures(self, runner):
-        # cancel() must rebuild real Future objects from dc.futures' string
+        # _cancel() must rebuild real Future objects from dc.futures' string
         # keys: Client.cancel() filters its arg through futures_of(), which
         # silently drops bare strings -- so passing list(dc.futures) cancels
         # nothing.  Assert real Futures (resolvable by futures_of) + force=True.
@@ -122,7 +122,7 @@ class TestJobRunnerUnit:
         runner["_dask_client"] = _StubClient()
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         time.sleep(0.05)
-        _jobs.cancel(jid)
+        _jobs._cancel(jid)
         passed = calls["futures"]
         assert passed and all(isinstance(f, Future) for f in passed)
         assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
