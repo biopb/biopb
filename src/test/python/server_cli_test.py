@@ -657,3 +657,111 @@ class TestVersionCommand:
         from importlib.metadata import version as _v
 
         assert cli._package_version("biopb") == _v("biopb")
+
+
+class TestControlLogs:
+    """`biopb control logs`: which file it reads, and the --level filter."""
+
+    def _write(self, tmp_path, monkeypatch, *, control="", data_plane=""):
+        c, d = tmp_path / "control.log", tmp_path / "tensor-server.log"
+        c.write_text(control)
+        d.write_text(data_plane)
+        monkeypatch.setattr(cli, "_control_log_file", lambda: c)
+        monkeypatch.setattr(cli, "_get_log_file", lambda: d)
+        return c, d
+
+    def test_defaults_to_the_control_log(self, tmp_path, monkeypatch):
+        self._write(
+            tmp_path, monkeypatch, control="control line", data_plane="plane line"
+        )
+        res = CliRunner().invoke(cli.app, ["control", "logs"])
+        assert res.exit_code == 0, res.output
+        assert "control line" in res.output
+        assert "plane line" not in res.output
+
+    def test_data_plane_selects_the_tensor_server_log(self, tmp_path, monkeypatch):
+        self._write(
+            tmp_path, monkeypatch, control="control line", data_plane="plane line"
+        )
+        res = CliRunner().invoke(cli.app, ["control", "logs", "--data-plane"])
+        assert res.exit_code == 0, res.output
+        assert "plane line" in res.output
+        assert "control line" not in res.output
+
+    def test_path_prints_the_file_and_exits(self, tmp_path, monkeypatch):
+        c, d = self._write(tmp_path, monkeypatch)
+        res = CliRunner().invoke(cli.app, ["control", "logs", "--path"])
+        assert res.exit_code == 0 and str(c) in res.output
+        res = CliRunner().invoke(cli.app, ["control", "logs", "--path", "--data-plane"])
+        assert res.exit_code == 0 and str(d) in res.output
+
+    def test_missing_log_is_reported_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "_control_log_file", lambda: tmp_path / "absent.log")
+        res = CliRunner().invoke(cli.app, ["control", "logs"])
+        # Never started is a normal state, not a failure.
+        assert res.exit_code == 0
+        assert "No log file" in res.output
+
+    def test_lines_takes_the_tail(self, tmp_path, monkeypatch):
+        self._write(
+            tmp_path, monkeypatch, control="\n".join(f"L{i}" for i in range(10))
+        )
+        res = CliRunner().invoke(cli.app, ["control", "logs", "-n", "3"])
+        assert res.exit_code == 0, res.output
+        assert "L9" in res.output and "L6" not in res.output
+
+    def test_zero_lines_shows_all(self, tmp_path, monkeypatch):
+        self._write(
+            tmp_path, monkeypatch, control="\n".join(f"L{i}" for i in range(10))
+        )
+        res = CliRunner().invoke(cli.app, ["control", "logs", "-n", "0"])
+        assert res.exit_code == 0, res.output
+        assert "L0" in res.output and "L9" in res.output
+
+    def test_bad_level_exits_1(self, tmp_path, monkeypatch):
+        self._write(tmp_path, monkeypatch, control="anything")
+        res = CliRunner().invoke(cli.app, ["control", "logs", "--level", "LOUD"])
+        assert res.exit_code == 1
+        assert "Invalid --level" in res.output
+
+    def test_level_filters_control_format_and_carries_continuations(
+        self, tmp_path, monkeypatch
+    ):
+        # Both shapes control.log actually carries: the control's basicConfig
+        # (level in the 3rd token) and uvicorn's (`LEVEL:` first). The unleveled
+        # traceback line must ride along with the ERROR record it belongs to.
+        log = "\n".join(
+            [
+                "2026-06-12 10:00:00,123 INFO biopb_control._run: booting",
+                "INFO:     Uvicorn running on http://127.0.0.1:8813",
+                "2026-06-12 10:00:01,000 ERROR biopb_control._run: tick failed",
+                "  File 'x.py', line 1, in tick",
+                "2026-06-12 10:00:02,000 INFO biopb_control._run: recovered",
+            ]
+        )
+        self._write(tmp_path, monkeypatch, control=log)
+        res = CliRunner().invoke(cli.app, ["control", "logs", "--level", "warning"])
+        assert res.exit_code == 0, res.output
+        assert "tick failed" in res.output
+        assert "line 1, in tick" in res.output  # continuation carried
+        assert "booting" not in res.output
+        assert "Uvicorn running" not in res.output
+        assert "recovered" not in res.output
+
+    def test_level_filters_the_data_plane_format(self, tmp_path, monkeypatch):
+        # tensor-server.log's own format is bracketed-timestamp; the supervisor's
+        # banner has no level and (leading the file) is kept by carry-forward.
+        log = "\n".join(
+            [
+                "--- control: starting data plane at 2026-06-12 10:00:00 ---",
+                "[2026-06-12 10:00:00] INFO biopb_tensor_server.server: serving",
+                "[2026-06-12 10:00:01] ERROR biopb_tensor_server.server: boom",
+            ]
+        )
+        self._write(tmp_path, monkeypatch, data_plane=log)
+        res = CliRunner().invoke(
+            cli.app, ["control", "logs", "--data-plane", "--level", "ERROR"]
+        )
+        assert res.exit_code == 0, res.output
+        assert "boom" in res.output
+        assert "serving" not in res.output
