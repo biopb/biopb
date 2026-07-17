@@ -222,21 +222,27 @@ machinery):
 
 ```python
 "services": {
-    "skills_enabled": True,
+    "skills_enabled": False,  # opt-in: off by default
     "skills_catalog_url": "https://biopb.org/skills/catalog.json",
     "skills_cache_ttl": 3600,
 }
 ```
 
+`skills_enabled` is **off by default** — the subsystem is present but dormant
+until a deployment opts in. When off, `find_skills` returns nothing, no catalog
+fetch is attempted, and the agent is not told to consult skills.
+
 ### 3e. Instructions
 
-Add one line to `_BASE_INSTRUCTIONS` in `_server.py`:
+`_SKILLS_INSTRUCTIONS` in `_server.py` carries the skills guidance:
 
 > "At the start of a task, call `find_skills` to check for a curated workflow before
-> improvising; read the matching `skill://<id>` resource for the steps."
+> improvising; read the matching `skill://<id>` resource for the steps. After
+> accomplishing a task, ask the user whether a new skill should be generated…"
 
-This makes discovery the default entry point and connects to the existing
-"generate a skill?" close-out prompt.
+It is **appended to `_BASE_INSTRUCTIONS` only when `skills_enabled` is true**
+(`set_skills_enabled`, wired from config in the launcher), so a default install
+never points the agent at a catalog that would come back empty.
 
 ---
 
