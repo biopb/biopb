@@ -691,14 +691,25 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
                     for cid, bounds in expand_compact_grid(up_desc)
                 ]
                 local_desc = self._localize_forwarded_descriptor(up_desc)
-                # This proxy re-emits explicit endpoints downstream (its plan
-                # leaves regular_grid False), so strip the compact-only
-                # descriptor fields -- the forwarded plan is then byte-for-byte
-                # what the explicit path produces and is never mis-detected as
-                # compact by the client.
+                # Strip the compact-only descriptor fields: a client that did NOT
+                # opt into compact gets the explicit endpoint list with a clean
+                # descriptor (no stale upstream chunk_array_id/slice_hint). A
+                # client that DID opt in triggers the local server's compact
+                # emit, which re-derives both fields from these local endpoints.
                 local_desc.ClearField("chunk_array_id")
                 local_desc.ClearField("slice_hint")
-                return TensorReadPlan(descriptor=local_desc, chunk_endpoints=endpoints)
+                # regular_grid=True passes the upstream's compactness through the
+                # proxy (the downstream half of biopb/biopb#346): the upstream
+                # sent compact only for a regular grid, and localization preserves
+                # the grid (only the array_id changed), so the local server may
+                # re-emit compact to a compact-capable client instead of the full
+                # endpoint list. An old/Java client still gets explicit endpoints
+                # -- that is gated on ITS compact_grid_ok at the local server.
+                return TensorReadPlan(
+                    descriptor=local_desc,
+                    chunk_endpoints=endpoints,
+                    regular_grid=True,
+                )
 
             endpoints = []
             for ep in info.endpoints:

@@ -234,6 +234,80 @@ class TestRemoteTensorProxy:
             upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_proxy_reemits_compact_downstream(self):
+        """The downstream half of biopb/biopb#346: a compact-capable client
+        reading through the proxy gets a compact response (no endpoint list) and
+        byte-identical pixels.
+
+        The proxy's forwarded plan is flagged regular_grid, so the local proxy
+        server re-emits compact to a client that opted in -- neither hop ships the
+        per-chunk endpoint list.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor import TensorFlightClient
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            src = np.arange(3 * 40 * 50, dtype="<i2").reshape(3, 40, 50)
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = src
+
+            upstream = self._upstream_3d(zpath)
+            try:
+                proxy = self._proxy(
+                    upstream.port,
+                    local_source_id="hpc__aics",
+                    upstream_source_id="aics",
+                )
+                try:
+                    # Raw GetFlightInfo against the PROXY, compact opted in: the
+                    # proxy re-emits compact (empty endpoints + local
+                    # chunk_array_id), so the endpoint list crosses neither hop.
+                    proxy_client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                    read_opt = TensorReadOption(
+                        tensor_id="hpc__aics", compact_grid_ok=True
+                    )
+                    cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
+                    fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+                    info = proxy_client._client.get_flight_info(
+                        fd, options=proxy_client._call_options
+                    )
+                    assert len(list(info.endpoints)) == 0
+                    resp_desc = TensorDescriptor.FromString(info.descriptor.command)
+                    assert resp_desc.chunk_array_id == "hpc__aics"
+
+                    # End-to-end read still returns the exact pixels (the client
+                    # reconstructs the local chunk_ids and do_get forwards them).
+                    darr = proxy_client.get_tensor("hpc__aics")
+                    assert darr.shape == (3, 40, 50)
+                    np.testing.assert_array_equal(darr.compute(), src)
+                    proxy_client.close()
+                finally:
+                    proxy.shutdown()
+            finally:
+                upstream.shutdown()
+
+    def _upstream_3d(self, zarr_path):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+        arr = zarr.open_array(zarr_path, mode="r")
+        upstream = TensorFlightServer("grpc://localhost:0")
+        upstream.register_source("aics", ZarrAdapter(arr, "aics", ["z", "y", "x"]))
+        _serve(upstream)
+        return upstream
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_big_endian_source_with_empty_seeded_chunk_shape(self):
         """The exact reported failure: a big-endian upstream source mirrored with
         a lean (empty chunk_shape) catalog seed reads end-to-end through the proxy.
@@ -477,10 +551,12 @@ class TestRemoteTensorProxy:
                     for ce in plan.chunk_endpoints
                 ]
                 assert got == expected
-                # The forwarded plan is indistinguishable from an explicit one:
-                # the compact-only descriptor fields are stripped.
+                # The descriptor carries no stale compact-only fields (stripped);
+                # the plan is flagged regular so the local server may re-emit
+                # compact downstream to a compact-capable client.
                 assert not plan.descriptor.chunk_array_id
                 assert not plan.descriptor.HasField("slice_hint")
+                assert plan.regular_grid is True
             finally:
                 upstream.shutdown()
 

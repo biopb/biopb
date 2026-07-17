@@ -197,8 +197,10 @@ class TensorReadPlan:
     # + edge remainder), so the plan is fully described by the descriptor's
     # shape/chunk_shape/slice_hint/scale_hint and the endpoint list is redundant.
     # Only such a plan is eligible for the compact-grid wire form (biopb/biopb#346).
-    # The base planner (`_get_read_plan`) always sets this; the remote-proxy
-    # forward path leaves it False so a forwarded plan is never sent compact.
+    # The base planner (`_get_read_plan`) always sets this. The remote-proxy
+    # forward path sets it True only when the upstream itself answered compact
+    # (so the localized grid is provably regular -- only the array_id changed);
+    # an explicit or irregular upstream response leaves it False.
     regular_grid: bool = False
 
 
