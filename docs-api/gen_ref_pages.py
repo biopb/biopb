@@ -26,7 +26,7 @@ nav = mkdocs_gen_files.Nav()
 
 
 def _is_proto(parts: tuple[str, ...]) -> bool:
-    return any(p.endswith("_pb2") or p.endswith("_pb2_grpc") for p in parts)
+    return any(p.endswith(("_pb2", "_pb2_grpc")) for p in parts)
 
 
 for pkg in PACKAGES:

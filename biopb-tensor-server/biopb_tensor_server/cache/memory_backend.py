@@ -179,9 +179,10 @@ class MemoryCacheBackend(CacheBackend):
                 raise
 
         # If pending (either waiting on another thread or we just completed), wait
-        if entry.state == EntryState.PENDING:
-            if not entry.wait_ready(self._config.pending_timeout):
-                raise TimeoutError("Cache computation timed out for key")
+        if entry.state == EntryState.PENDING and not entry.wait_ready(
+            self._config.pending_timeout
+        ):
+            raise TimeoutError("Cache computation timed out for key")
 
         # Now acquire and return
         with self._lock:

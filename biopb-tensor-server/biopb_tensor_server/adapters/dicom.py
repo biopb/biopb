@@ -151,7 +151,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 
         # Check extension
         name = ctx.name.lower()
-        if not (name.endswith(".dcm") or name.endswith(".dicom")):
+        if not name.endswith((".dcm", ".dicom")):
             return None
 
         # Cloud-storage phase 2: reading the DICOM header (even

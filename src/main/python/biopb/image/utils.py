@@ -173,13 +173,13 @@ def _deserialize_to_numpy(
         )
 
     # Get dimension sizes
-    dims = dict(
-        Z=pixels.size_z or 1,
-        Y=pixels.size_y or 1,
-        X=pixels.size_x or 1,
-        C=pixels.size_c or 1,
-        T=pixels.size_t or 1,
-    )
+    dims = {
+        "Z": pixels.size_z or 1,
+        "Y": pixels.size_y or 1,
+        "X": pixels.size_x or 1,
+        "C": pixels.size_c or 1,
+        "T": pixels.size_t or 1,
+    }
 
     # Validate: dimensions not in output must be singleton
     for axis, size in dims.items():

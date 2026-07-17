@@ -70,9 +70,9 @@ from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_ti
 # Same tree "scale" knobs as discovery_scan_test.py so the two benchmarks describe
 # the *same* tree from different angles (probe count there, syscall count here).
 SCALES = {
-    "small": dict(wells=8, fields=2, shape=(512, 512), chunks=(64, 64)),
-    "medium": dict(wells=24, fields=4, shape=(512, 512), chunks=(32, 32)),
-    "large": dict(wells=48, fields=4, shape=(1024, 1024), chunks=(32, 32)),
+    "small": {"wells": 8, "fields": 2, "shape": (512, 512), "chunks": (64, 64)},
+    "medium": {"wells": 24, "fields": 4, "shape": (512, 512), "chunks": (32, 32)},
+    "large": {"wells": 48, "fields": 4, "shape": (1024, 1024), "chunks": (32, 32)},
 }
 
 
@@ -442,17 +442,17 @@ class TestSyscallBaseline:
 
         # Persist the baseline; this — not an assertion — is the deliverable.
         out_path = _write_baseline(
-            dict(
-                scale=scale,
-                interior_files=n_files,
-                sources=n_sources,
-                state_walk_syscalls=state_c.total_syscalls,
-                claim_walk_syscalls=claim_c.total_syscalls,
-                total_syscalls=total,
-                syscalls_per_entry=round(per_entry, 2),
-                state_walk_breakdown=dict(state_c.counts),
-                claim_walk_breakdown=dict(claim_c.counts),
-            )
+            {
+                "scale": scale,
+                "interior_files": n_files,
+                "sources": n_sources,
+                "state_walk_syscalls": state_c.total_syscalls,
+                "claim_walk_syscalls": claim_c.total_syscalls,
+                "total_syscalls": total,
+                "syscalls_per_entry": round(per_entry, 2),
+                "state_walk_breakdown": dict(state_c.counts),
+                "claim_walk_breakdown": dict(claim_c.counts),
+            }
         )
         print(f"--> wrote {out_path}")
 

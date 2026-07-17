@@ -20,7 +20,7 @@ def process_input(request: proto.DetectionRequest):
 def process_result(preds):
     try:
         masks, flows, styles, _ = preds
-    except:
+    except ValueError:
         masks, flows, styles = preds
 
     pixels = serialize_from_numpy(masks)

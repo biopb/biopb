@@ -1126,9 +1126,12 @@ class TestWarmAction:
         # repeats from per-block progress): smallest first.
         names = []
         for m, k in zip(msgs, kinds, strict=True):
-            if k == "progress" and m.progress.current_name:
-                if not names or names[-1] != m.progress.current_name:
-                    names.append(m.progress.current_name)
+            if (
+                k == "progress"
+                and m.progress.current_name
+                and (not names or names[-1] != m.progress.current_name)
+            ):
+                names.append(m.progress.current_name)
         assert names == ["small", "mid", "big"]
 
     def test_warm_walk_is_recursive(self, tmp_path, monkeypatch):

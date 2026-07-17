@@ -898,10 +898,9 @@ class Reconciler:
             try:
                 self._metadata_db.sync_source_removed(source_id)
             except Exception:
-                logger.error(
+                logger.exception(
                     "Failed to remove source %s from metadata DB",
                     source_id,
-                    exc_info=True,
                 )
 
         paths_to_remove = [
@@ -915,9 +914,7 @@ class Reconciler:
         try:
             self._server.unregister_source(source_id)
         except Exception:
-            logger.error(
-                "Rollback failed to unregister source %s", source_id, exc_info=True
-            )
+            logger.exception("Rollback failed to unregister source %s", source_id)
         self._teardown_source_bookkeeping(source_id)
         self._cloud_source_ids.discard(source_id)
 
@@ -937,11 +934,10 @@ class Reconciler:
         try:
             self._server.unregister_source(source_id)
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Failed to unregister source %s: %s",
                 source_id,
                 e,
-                exc_info=True,
             )
             return False
 

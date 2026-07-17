@@ -123,7 +123,7 @@ class TestComputePrecacheScaleHint:
         assert ly <= 1024
 
     @pytest.mark.skipif(
-        True if _import_biopb_mcp() is None else False,
+        _import_biopb_mcp() is None,
         reason="biopb-mcp not importable for cross-check",
     )
     def test_matches_biopb_mcp_loop(self):

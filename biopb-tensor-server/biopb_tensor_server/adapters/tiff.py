@@ -1007,7 +1007,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdap
             data = json.loads(content)
 
             # Check for MicroManager v1 format markers
-            has_coords = any(k.startswith("Coords-") for k in data.keys())
+            has_coords = any(k.startswith("Coords-") for k in data)
             has_summary = "Summary" in data
 
             if not (has_coords or has_summary):
@@ -1132,7 +1132,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdap
         self._coord_map: Dict[Tuple[int, int, int, int], Path] = {}
         self._file_list: List[Path] = []
 
-        for key in self._raw_metadata.keys():
+        for key in self._raw_metadata:
             if key.startswith("Coords-"):
                 coords = self._raw_metadata[key]
                 # Extract path from key (Coords-Default/<filename> or Coords-<filename>)

@@ -363,10 +363,7 @@ def _resolve_plane_axes(
     non_samples = [i for i in range(ndim) if i != s_idx]
 
     # X: labeled X if usable, else the trailing non-samples axis.
-    if x_lbl is not None and x_lbl in non_samples:
-        x_idx = x_lbl
-    else:
-        x_idx = non_samples[-1]
+    x_idx = x_lbl if x_lbl is not None and x_lbl in non_samples else non_samples[-1]
 
     # Y: labeled Y if usable and distinct from X, else the trailing non-samples
     # axis that is not X.

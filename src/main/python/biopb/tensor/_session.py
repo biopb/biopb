@@ -394,7 +394,7 @@ class CatalogClient:
 
         return source_descriptors
 
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:
+    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Execute SQL query against server's source metadata database.
 
         The server-side metadata database is mandatory (biopb/biopb#225), so any
@@ -487,7 +487,7 @@ class CatalogClient:
         return self._format_query_result(table, format)
 
     @staticmethod
-    def _format_query_result(table: pa.Table, format: str):
+    def _format_query_result(table: pa.Table, format: str):  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Convert a query result Arrow table to the caller-requested format.
 
         ``"arrow"`` (the default) returns the Table unchanged -- backward

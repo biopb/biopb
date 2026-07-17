@@ -94,7 +94,7 @@ def _infer_format(output: str, format: Optional[str]) -> Literal["pb", "pickle"]
         return "pb"  # stdout default is protobuf
 
     ext = output.lower()
-    if ext.endswith(".pkl") or ext.endswith(".pickle"):
+    if ext.endswith((".pkl", ".pickle")):
         return "pickle"
     return "pb"  # default for .pb, no extension, etc.
 

@@ -1899,7 +1899,7 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
     class _FakeClient:
         _location = "grpc://fake"
 
-        def query_sources(self, sql, format="records"):
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             # source_url is now fetched so the mirror can be treed by path (#297).
             assert "tensors" in sql and "source_url" in sql and format == "records"
             return [
@@ -1922,7 +1922,7 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     class _FakeClient:
         _location = "grpc://fake"
 
-        def query_sources(self, sql, format="records"):
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
     rows, complete = fetch_upstream_catalog(_FakeClient())

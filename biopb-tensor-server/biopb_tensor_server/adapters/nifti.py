@@ -55,7 +55,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             return None
 
         name = ctx.name.lower()
-        if not (name.endswith(".nii") or name.endswith(".nii.gz")):
+        if not name.endswith((".nii", ".nii.gz")):
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -217,10 +217,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             else:
                 labels = ["t", "x", "y"]
         elif ndim == 4:
-            if time_unit >= 8:
-                labels = ["t", "x", "y", "z"]
-            else:
-                labels = ["c", "x", "y", "z"]
+            labels = ["t", "x", "y", "z"] if time_unit >= 8 else ["c", "x", "y", "z"]
         elif ndim == 5:
             # Could be vector/tensor data
             labels = ["v", "t", "x", "y", "z"]

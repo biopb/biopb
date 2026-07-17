@@ -363,7 +363,7 @@ class SourceManager:
                         self._process_event(event)
 
             except Exception as e:
-                logger.error(f"Error processing events: {e}", exc_info=True)
+                logger.exception(f"Error processing events: {e}")
 
             # Small sleep to prevent busy polling
             time.sleep(0.1)
@@ -380,7 +380,7 @@ class SourceManager:
                     event.event_type.value,
                 )
         except Exception as e:
-            logger.error(f"Error handling event {event}: {e}", exc_info=True)
+            logger.exception(f"Error handling event {event}: {e}")
 
     def _handle_rescan(self) -> None:
         """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
@@ -584,9 +584,10 @@ class SourceManager:
                 claim_path = Path(claim.primary_path).resolve(strict=False)
             except OSError:
                 continue
-            if claim_path == deleted_root or claim_path.is_relative_to(deleted_root):
-                if self._reconciler._commit_remove_source(source_id):
-                    removed_source_ids.append(source_id)
+            if (
+                claim_path == deleted_root or claim_path.is_relative_to(deleted_root)
+            ) and self._reconciler._commit_remove_source(source_id):
+                removed_source_ids.append(source_id)
 
         deleted_root_str = str(deleted_root)
         self._monitored_dirs.discard(deleted_dir)
@@ -689,9 +690,12 @@ class SourceManager:
         if entry.stable_observations < self._stable_rescans_required:
             return False
 
-        if not entry.is_directory and self._probe_open_files:
-            if not self._can_open_for_append(Path(resolved_str)):
-                return False
+        if (
+            not entry.is_directory
+            and self._probe_open_files
+            and not self._can_open_for_append(Path(resolved_str))
+        ):
+            return False
 
         entry.pending_scan = False
         return True

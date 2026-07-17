@@ -33,7 +33,7 @@ class Range:
     an inclusive floor cannot capture without an arbitrary epsilon.
     """
 
-    def __init__(self, *, min=None, max=None, exclusive_min=None, exclusive_max=None):
+    def __init__(self, *, min=None, max=None, exclusive_min=None, exclusive_max=None):  # noqa: A002 - min/max are the natural, keyword-only vocabulary for a numeric range
         self.min = min
         self.max = max
         self.exclusive_min = exclusive_min

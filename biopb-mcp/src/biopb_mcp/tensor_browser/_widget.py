@@ -338,9 +338,7 @@ def _is_onedrive_dir_name(name: str) -> bool:
     a runtime dependency of this widget.
     """
     low = name.lower()
-    return (
-        low == "onedrive" or low.startswith("onedrive -") or low.startswith("onedrive-")
-    )
+    return low == "onedrive" or low.startswith(("onedrive -", "onedrive-"))
 
 
 def _cloud_drop_warning(path: str) -> str | None:
@@ -1762,9 +1760,11 @@ class TensorBrowserWidget(QWidget):
                     == self._selected_tensor_id
                 ):
                     target_tensor = item
-            elif node_type == "source":
-                if item.data(0, Qt.ItemDataRole.UserRole) == self._selected_source_id:
-                    target_source = item
+            elif (
+                node_type == "source"
+                and item.data(0, Qt.ItemDataRole.UserRole) == self._selected_source_id
+            ):
+                target_source = item
             for i in range(item.childCount()):
                 find_recursive(item.child(i))
 
