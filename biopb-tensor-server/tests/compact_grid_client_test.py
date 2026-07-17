@@ -58,11 +58,11 @@ class TestCompactClientRead:
         )
 
         calls = []
-        real = session.expand_compact_grid
+        real = session._build_dask_array_from_compact_grid
         monkeypatch.setattr(
             session,
-            "expand_compact_grid",
-            lambda desc: (calls.append(1), real(desc))[1],
+            "_build_dask_array_from_compact_grid",
+            lambda *a, **k: (calls.append(1), real(*a, **k))[1],
         )
         try:
             client = TensorFlightClient(
@@ -115,11 +115,11 @@ class TestCompactClientRead:
         monkeypatch.setattr(base, "_get_read_plan", non_regular)
 
         calls = []
-        real = session.expand_compact_grid
+        real = session._build_dask_array_from_compact_grid
         monkeypatch.setattr(
             session,
-            "expand_compact_grid",
-            lambda desc: (calls.append(1), real(desc))[1],
+            "_build_dask_array_from_compact_grid",
+            lambda *a, **k: (calls.append(1), real(*a, **k))[1],
         )
 
         path, expected = _chunked_zarr(tmp_path)
