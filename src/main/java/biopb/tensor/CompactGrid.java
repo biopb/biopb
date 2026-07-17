@@ -49,6 +49,20 @@ final class CompactGrid {
         } catch (InvalidProtocolBufferException e) {
             throw new IllegalStateException("Failed to parse compact response descriptor", e);
         }
+        return resolveFlightEndpoints(info, descriptor);
+    }
+
+    /**
+     * As {@link #resolveFlightEndpoints(FlightInfo)}, but reusing a response
+     * descriptor the caller has already parsed off {@code info} -- avoids a
+     * second protobuf parse when the caller needs the descriptor anyway (e.g.
+     * to build a request context). {@code descriptor} must be the one carried on
+     * {@code info}'s descriptor command.
+     */
+    static List<FlightEndpoint> resolveFlightEndpoints(FlightInfo info, TensorDescriptor descriptor) {
+        if (!info.getEndpoints().isEmpty()) {
+            return info.getEndpoints();
+        }
         if (descriptor.getChunkArrayId().isEmpty()) {
             return info.getEndpoints();
         }

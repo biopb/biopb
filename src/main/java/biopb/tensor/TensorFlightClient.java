@@ -1349,7 +1349,8 @@ public class TensorFlightClient implements AutoCloseable {
         // Cache the response descriptor
         descriptors.put(responseDescriptor.getArrayId(), responseDescriptor);
 
-        return new RequestContext(responseDescriptor, CompactGrid.resolveFlightEndpoints(info));
+        return new RequestContext(
+                responseDescriptor, CompactGrid.resolveFlightEndpoints(info, responseDescriptor));
     }
 
     private static String normalizeReductionMethod(String reductionMethod) {
