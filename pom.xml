@@ -73,23 +73,23 @@
         <groupId>io.grpc</groupId>
         <artifactId>grpc-services</artifactId>
         </dependency>
-    
+
         <dependency>
         <groupId>io.grpc</groupId>
         <artifactId>grpc-protobuf</artifactId>
         </dependency>
-    
+
         <dependency>
         <groupId>io.grpc</groupId>
         <artifactId>grpc-stub</artifactId>
         </dependency>
-    
+
         <dependency>
         <groupId>io.grpc</groupId>
         <artifactId>grpc-netty-shaded</artifactId>
         <scope>runtime</scope>
         </dependency>
-    
+
         <dependency>
             <groupId>javax.annotation</groupId>
             <artifactId>javax.annotation-api</artifactId>
@@ -206,9 +206,6 @@
 					<source>11</source>
 					<failOnWarnings>false</failOnWarnings>
 					<doclint>none</doclint>
-					<!-- biopb.ome is a vestigial, unadopted metadata model (see
-					     CLAUDE.md); keep it out of the published API reference. -->
-					<excludePackageNames>biopb.ome</excludePackageNames>
 				</configuration>
 				<executions>
 					<execution>
@@ -265,12 +262,7 @@
 					<protoSourceRoot>${project.basedir}/proto</protoSourceRoot>
 					<includes>
 						<include>biopb/image/*.proto</include>
-						<!-- biopb/ome/* is a vestigial, unadopted OME model (see CLAUDE.md),
-						     excluded from Java codegen: several of its file outer-class names
-						     collide case-insensitively with message names (e.g. outer "Ome" vs
-						     message "OME"), breaking compilation on case-insensitive
-						     filesystems (macOS/Windows). -->
-							<include>biopb/tensor/*.proto</include>						
+						<include>biopb/tensor/*.proto</include>
 					</includes>
 					<!-- Skip cleanup to avoid file deletion issues on some systems -->
 					<skipCleanup>true</skipCleanup>

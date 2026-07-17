@@ -463,11 +463,10 @@ editing the code.
   default construction (no `"0"` sentinel), and the CLI's `source_id/tensor_id`
   parsing was already conformant.*
 
-- **`biopb/ome/*.proto` is vestigial.** It is a comprehensive OME metadata model
-  from an early blueprint that was **not adopted**. In practice OME/microscopy
-  metadata travels as **JSON** (e.g. `metadata_json` on a tensor descriptor,
-  `ome_metadata` dicts), not as `biopb.ome` protobuf messages. Don't treat the
-  `ome` proto package as live API.
+- **OME/microscopy metadata travels as JSON, not protobuf.** It rides on
+  `metadata_json` on a tensor descriptor and `ome_metadata` dicts — there is no
+  `biopb.ome` protobuf package (an early, comprehensive OME-in-protobuf blueprint
+  under `proto/biopb/ome/` was never adopted and was removed; see git history).
 
 - **Generated protobuf/Flight stubs are not committed** — buf regenerates them
   at build time, which keeps the polyglot stubs from drifting in the tree.
@@ -480,7 +479,7 @@ editing the code.
 
 ## Where to look first
 
-- **Protocol:** `biopb/proto/biopb/{image,tensor}/` (ignore `ome/`).
+- **Protocol:** `biopb/proto/biopb/{image,tensor}/`.
 - **Data plane:** `biopb/biopb-tensor-server/biopb_tensor_server/` —
   `server.py`, `adapters/`, `discovery.py`, the metadata DB.
 - **Compute base:** `biopb/biopb-image-runtime/src/biopb_image_base/` —
