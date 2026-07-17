@@ -691,13 +691,15 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
                     for cid, bounds in expand_compact_grid(up_desc)
                 ]
                 local_desc = self._localize_forwarded_descriptor(up_desc)
-                # Strip the compact-only descriptor fields: a client that did NOT
-                # opt into compact gets the explicit endpoint list with a clean
-                # descriptor (no stale upstream chunk_array_id/slice_hint). A
-                # client that DID opt in triggers the local server's compact
-                # emit, which re-derives both fields from these local endpoints.
+                # Strip chunk_array_id only: it is compact-only (an explicit
+                # response never carries it) and holds the UPSTREAM array_id, so a
+                # client taking the explicit fallback must not see it. Keep
+                # slice_hint -- it is the realized-bounds signal the client needs
+                # to crop a sliced read (base._get_read_plan sets it, _session
+                # crops against it), and the original explicit proxy preserved it.
+                # A compact-capable client triggers the local server's compact
+                # emit, which re-derives BOTH from these local endpoints anyway.
                 local_desc.ClearField("chunk_array_id")
-                local_desc.ClearField("slice_hint")
                 # regular_grid=True passes the upstream's compactness through the
                 # proxy (the downstream half of biopb/biopb#346): the upstream
                 # sent compact only for a regular grid, and localization preserves

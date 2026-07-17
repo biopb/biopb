@@ -297,6 +297,72 @@ class TestRemoteTensorProxy:
             finally:
                 upstream.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_proxy_sliced_read_preserves_slice_hint(self):
+        """A sliced read through the proxy keeps slice_hint on BOTH downstream
+        forms, so the client can crop the outward-snapped result.
+
+        Regression guard: the compact-forward path must not strip slice_hint. An
+        explicit-fallback client (no compact opt-in) needs it on the wire to crop;
+        a compact client gets it re-derived by the local server's compact emit.
+        Losing it silently returns the snapped (oversized) region instead of the
+        requested slice.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor import TensorFlightClient
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            SliceHint,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.arange(3 * 40 * 50, dtype="<i2").reshape(3, 40, 50)
+
+            upstream = self._upstream_3d(zpath)
+            try:
+                proxy = self._proxy(
+                    upstream.port,
+                    local_source_id="hpc__aics",
+                    upstream_source_id="aics",
+                )
+                try:
+                    pc = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                    # Request the middle z-plane; it snaps to exactly chunk 1.
+                    sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
+                    for compact in (False, True):
+                        read_opt = TensorReadOption(
+                            tensor_id="hpc__aics",
+                            slice_hint=sl,
+                            compact_grid_ok=compact,
+                        )
+                        cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
+                        fd = flight.FlightDescriptor.for_command(
+                            cmd.SerializeToString()
+                        )
+                        info = pc._client.get_flight_info(fd, options=pc._call_options)
+                        desc = TensorDescriptor.FromString(info.descriptor.command)
+                        # Both forms carry the realized-bounds crop signal.
+                        assert desc.HasField("slice_hint")
+                        assert list(desc.slice_hint.start) == [1, 0, 0]
+                        assert list(desc.slice_hint.stop) == [2, 40, 50]
+                        # ... but differ in whether the endpoint list is shipped.
+                        n_ep = len(list(info.endpoints))
+                        assert (n_ep == 0) if compact else (n_ep >= 1)
+                    pc.close()
+                finally:
+                    proxy.shutdown()
+            finally:
+                upstream.shutdown()
+
     def _upstream_3d(self, zarr_path):
         import zarr
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
@@ -551,11 +617,15 @@ class TestRemoteTensorProxy:
                     for ce in plan.chunk_endpoints
                 ]
                 assert got == expected
-                # The descriptor carries no stale compact-only fields (stripped);
-                # the plan is flagged regular so the local server may re-emit
-                # compact downstream to a compact-capable client.
+                # chunk_array_id is stripped (compact-only, holds the upstream
+                # id) but slice_hint is KEPT -- the client crops sliced reads
+                # against it, and a compact upstream response always carries it
+                # (here the full virtual extent). The plan is flagged regular so
+                # the local server may re-emit compact downstream.
                 assert not plan.descriptor.chunk_array_id
-                assert not plan.descriptor.HasField("slice_hint")
+                assert plan.descriptor.HasField("slice_hint")
+                assert list(plan.descriptor.slice_hint.start) == [0, 0, 0]
+                assert list(plan.descriptor.slice_hint.stop) == [3, 40, 50]
                 assert plan.regular_grid is True
             finally:
                 upstream.shutdown()
