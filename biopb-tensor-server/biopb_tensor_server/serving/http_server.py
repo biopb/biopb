@@ -342,18 +342,14 @@ class _SidecarContext:
         token: Optional[str],
         cache_bytes: int,
         config_path: Optional[str] = None,
-        web_host: Optional[str] = None,
-        web_port: Optional[int] = None,
         supervised: bool = False,
     ) -> None:
         self.flight_location = flight_location
         self.token = token
         self.cache_bytes = cache_bytes
         # The config file this daemon was launched with (read/written by the
-        # /api/config endpoints). web_host/web_port record this sidecar's own bind.
+        # /api/config endpoints).
         self.config_path = config_path
-        self.web_host = web_host
-        self.web_port = web_port
         # True when the biopb control spawned + supervises this data plane (it
         # sets BIOPB_DATA_PLANE_SUPERVISED in our env). Reported on
         # /api/admin/status so the admin UI routes a restart to the control (which
@@ -1441,8 +1437,6 @@ def create_app(
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
-    web_host: Optional[str] = None,
-    web_port: Optional[int] = None,
     supervised: Optional[bool] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
@@ -1462,8 +1456,6 @@ def create_app(
         cors_origins: Allowed CORS origins. Defaults to localhost variants.
         config_path: Path to the config file this daemon was launched with; the
             /api/config routes read and write it.
-        web_host: Host this HTTP sidecar was bound to (recorded on the context).
-        web_port: Port this HTTP sidecar was bound to (recorded on the context).
         supervised: Whether the biopb control owns/supervises this data plane.
             Reported on /api/admin/status so the admin UI routes a restart to the
             control (which owns the process); a self-managed plane can't be
@@ -1489,8 +1481,6 @@ def create_app(
         token=token,
         cache_bytes=cache_bytes,
         config_path=config_path,
-        web_host=web_host,
-        web_port=web_port,
         supervised=supervised,
     )
 
@@ -1634,8 +1624,6 @@ def run(
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
         config_path=config_path,
-        web_host=host,
-        web_port=port,
     )
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher

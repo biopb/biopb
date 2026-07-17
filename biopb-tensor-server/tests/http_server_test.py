@@ -893,8 +893,6 @@ def admin_client(tmp_path):
         app = create_app(
             token=None,
             config_path=str(config_path),
-            web_host="127.0.0.1",
-            web_port=8814,
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, config_path
@@ -916,8 +914,6 @@ def supervised_admin_client(tmp_path):
         app = create_app(
             token=None,
             config_path=str(config_path),
-            web_host="127.0.0.1",
-            web_port=8814,
             supervised=True,
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
@@ -1071,8 +1067,6 @@ def admin_client_with_creds(tmp_path):
         app = create_app(
             token=None,
             config_path=str(config_path),
-            web_host="127.0.0.1",
-            web_port=8814,
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, config_path
