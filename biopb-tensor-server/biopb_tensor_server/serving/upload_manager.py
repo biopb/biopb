@@ -188,6 +188,14 @@ class UploadManager:
                 chunk_shape=list(req_desc.chunk_shape),
                 dim_labels=list(req_desc.dim_labels) if req_desc.dim_labels else None,
                 ome_metadata=ome_metadata,
+                # Carry the uploader's physical calibration through the round-trip
+                # so a client re-serving scaled data doesn't lose it (issue #272).
+                physical_scale=(
+                    list(req_desc.physical_scale) if req_desc.physical_scale else None
+                ),
+                physical_unit=(
+                    list(req_desc.physical_unit) if req_desc.physical_unit else None
+                ),
             )
             self._registry.register(source_id, adapter)
             self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
@@ -268,6 +276,8 @@ class UploadManager:
             shape=req_desc.shape,
             chunk_shape=req_desc.chunk_shape,
             dtype=req_desc.dtype,
+            physical_scale=req_desc.physical_scale,
+            physical_unit=req_desc.physical_unit,
         )
 
     def write_chunk(

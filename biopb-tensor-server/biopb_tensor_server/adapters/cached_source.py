@@ -74,6 +74,8 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         chunk_shape: List[int],
         dim_labels: Optional[List[str]] = None,
         ome_metadata: Optional[dict] = None,
+        physical_scale: Optional[List[float]] = None,
+        physical_unit: Optional[List[str]] = None,
     ):
         """Initialize cache-backed source adapter.
 
@@ -84,6 +86,10 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             chunk_shape: Nominal chunk size per dimension
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
+            physical_scale: Optional per-dimension physical pixel size, aligned
+                1:1 with ``dim_labels`` (as the uploader sent it).
+            physical_unit: Optional per-dimension unit string for
+                ``physical_scale``, aligned 1:1 with ``dim_labels``.
         """
         self.source_id = source_id
         # Optional per-source capability token. When set, the Flight server
@@ -96,6 +102,12 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         self._chunk_shape = tuple(chunk_shape)
         self._dim_labels = dim_labels or [f"dim{i}" for i in range(len(shape))]
         self._ome_metadata = ome_metadata or {}
+        # Client-provided physical calibration, echoed verbatim on the wire. The
+        # uploader already aligned these to dim_labels, so unlike the file
+        # adapters there is nothing to parse or canonicalise -- storing and
+        # surfacing them is exact (issue #272).
+        self._physical_scale_vec = list(physical_scale) if physical_scale else []
+        self._physical_unit_vec = list(physical_unit) if physical_unit else []
 
         # Track actually-written chunks: start coords -> full bounds
         self._written_chunks: Dict[bytes, ChunkBounds] = {}
@@ -121,6 +133,20 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     def get_metadata(self) -> dict:
         """Return OME metadata."""
         return self._ome_metadata
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Echo the uploader's physical calibration onto the wire descriptor.
+
+        Cache-backed sources carry whatever ``physical_scale`` / ``physical_unit``
+        the DoPut request supplied, already aligned 1:1 with ``dim_labels`` (the
+        client sent it that way), so there is nothing to parse or map -- return
+        the stored vectors verbatim. Returns ``None`` when the upload carried no
+        calibration, so the base clears the fields rather than advertising empty
+        vectors. See ``TensorAdapter._physical_scale``.
+        """
+        if not self._physical_scale_vec or not self._physical_unit_vec:
+            return None
+        return list(self._physical_scale_vec), list(self._physical_unit_vec)
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds.
