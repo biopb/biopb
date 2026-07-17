@@ -1164,15 +1164,15 @@ class TensorFlightServer(flight.FlightServerBase):
             logger.warning(f"Tensor not found: {source_id}/{tensor_id} ({e})")
             raise to_flight_error(
                 TensorNotFound(
-                    f"Tensor not found: {source_id}/{tensor_id}: {e}",
+                    f"Tensor not found: {source_id}/{field}: {e}",
                     reason="unknown_field",
                 )
             ) from e
         if tensor_adapter is None:
-            logger.warning(f"Tensor not found: {source_id}/{tensor_id}")
+            logger.warning(f"Source not found: {source_id}")
             raise to_flight_error(
                 TensorNotFound(
-                    f"Tensor not found: {source_id}/{tensor_id}",
+                    f"Source not found: {source_id}",
                     reason="unknown_source",
                 )
             )
