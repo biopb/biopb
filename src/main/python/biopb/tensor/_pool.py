@@ -734,8 +734,16 @@ def _build_dask_array_from_chunk_map(
             for chunk_idx, (chunk_id, bounds) in chunk_map.items()
         }
         numblocks = tuple(len(c) for c in chunks)
+        # Name the layer from the chunk ids alone, not the whole dep_map.
+        # tokenize recurses every entry, and each block's (start, stop) is already
+        # determined by `chunks` (the grid), so hashing the bounds is redundant
+        # O(n_chunks) work -- ~1s at 80k chunks (biopb/biopb#346). Each chunk_id
+        # encodes its array_id + bounds (+ any scale suffix), so the id tuple is an
+        # injective fingerprint of the array: distinct arrays -> distinct ids ->
+        # distinct name, and a false cache hit is impossible.
+        chunk_ids = tuple(cid for cid, _start, _stop in dep_map.values())
         name = "biopb-tensor-chunk-" + tokenize(
-            dep_map, location, token, cache_bytes, schema_metadata, dtype, chunks
+            chunk_ids, location, token, cache_bytes, schema_metadata, dtype, chunks
         )
         out_ind = tuple(range(len(shape)))
         dep = BlockwiseDepDict(mapping=dep_map, numblocks=numblocks)
