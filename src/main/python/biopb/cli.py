@@ -185,6 +185,158 @@ def _get_log_file() -> Path:
 _rotate_log = _locations.rotate_log
 
 
+# --- log tailing (`biopb control logs`) ---------------------------------- #
+
+# Severity ranks for the `--level` filter.
+_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+def _tensor_line_level(line: str) -> Optional[str]:
+    """Level of a data-plane log line, or None if it has none.
+
+    tensor-server.log carries the server's own format (DEFAULT_LOG_FORMAT in
+    biopb_tensor_server.core.logging_config): `[2026-06-12 10:00:00] WARNING
+    biopb_tensor_server.x: msg`. Returns None for the supervisor's `--- control:
+    starting data plane ---` banners, blank lines, native gRPC/Arrow stdout, and
+    traceback continuations — all of which _filter_lines carries forward.
+    """
+    if not line.startswith("["):
+        return None
+    try:
+        after_ts = line.split("] ", 1)[1]
+    except IndexError:
+        return None
+    token = after_ts.split(" ", 1)[0]
+    return token if token in _LOG_LEVELS else None
+
+
+def _control_line_level(line: str) -> Optional[str]:
+    """Level of a control-plane log line, or None if it has none.
+
+    control.log interleaves two formats, both handled here: the control's
+    basicConfig (`2026-06-12 10:00:00,123 INFO biopb_control._run: msg`, level in
+    the third whitespace token) and uvicorn's (`INFO:     msg`, level first).
+    Best-effort by design — anything unrecognized pairs with the carry-forward in
+    _filter_lines rather than being hard-dropped.
+    """
+    head = line.split(":", 1)[0].split(" ", 1)[0].strip()
+    if head in _LOG_LEVELS:
+        return head
+    parts = line.split(maxsplit=3)
+    if len(parts) >= 3 and parts[2] in _LOG_LEVELS:
+        return parts[2]
+    return None
+
+
+def _filter_lines(lines, min_level: Optional[str], level_of=_tensor_line_level):
+    """Keep lines at or above `min_level`. With min_level None, keep all.
+
+    Off-format lines (no parseable level) inherit the previous line's keep/drop
+    decision, so a kept WARNING record carries its traceback continuation lines
+    along and a dropped INFO record takes its continuations with it. The initial
+    decision (before any leveled line) is keep.
+    """
+    if min_level is None:
+        return list(lines)
+    threshold = _LOG_LEVELS[min_level]
+    kept = []
+    keeping = True
+    for line in lines:
+        lvl = level_of(line)
+        if lvl is not None:
+            keeping = _LOG_LEVELS[lvl] >= threshold
+        if keeping:
+            kept.append(line)
+    return kept
+
+
+def _validate_level(level: Optional[str]) -> Optional[str]:
+    """Normalize a `--level` value to upper-case, or exit(1) if unrecognized."""
+    if level is None:
+        return None
+    norm = level.upper()
+    if norm not in _LOG_LEVELS:
+        console.print(
+            f"[red]Invalid --level '{level}'.[/red] "
+            f"Choose one of: {', '.join(_LOG_LEVELS)}"
+        )
+        raise typer.Exit(1)
+    return norm
+
+
+def _tail_and_follow(
+    log_file: Path,
+    follow: bool,
+    lines: int,
+    min_level: Optional[str],
+    level_of=_tensor_line_level,
+):
+    """Print the last `lines` lines of `log_file` (0 = all) filtered by
+    `min_level`, then optionally stream appended lines until interrupted.
+
+    `level_of` selects the per-log level parser. A missing file is reported (not
+    an error) and exits 0. Follow reopens the file when it is rotated or
+    truncated out from under us.
+    """
+    if not log_file.exists():
+        console.print(
+            f"[yellow]No log file at {log_file} — has it ever been started?[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    # Both logs rotate at 10 MB (_locations.rotate_log), so the current file is
+    # small enough to read whole and slice - no seek-based tail.
+    existing = log_file.read_text(errors="replace").splitlines()
+    tail = existing if lines <= 0 else existing[-lines:]
+    for line in _filter_lines(tail, min_level, level_of):
+        print(line)
+
+    if not follow:
+        raise typer.Exit(0)
+
+    # Flush the tail before blocking on new lines: piped/redirected stdout is
+    # block-buffered, so without this `logs -f > file` (or `| grep`) shows nothing
+    # until 4 KB accumulates -- and Ctrl-C before that loses the tail entirely.
+    sys.stdout.flush()
+
+    # Follow: poll for appended lines, reopening if the file is rotated or
+    # truncated out from under us (a restart rotates it mid-follow). Track the
+    # inode + size so a replaced or shrunk file restarts from the top.
+    try:
+        f = open(log_file, errors="replace")
+    except OSError:
+        raise typer.Exit(0)
+    try:
+        f.seek(0, os.SEEK_END)
+        last_ino = os.fstat(f.fileno()).st_ino
+        carry = ""  # buffer a partial final line until its newline arrives
+        while True:
+            chunk = f.read()
+            if chunk:
+                carry += chunk
+                parts = carry.split("\n")
+                carry = parts.pop()  # trailing partial (or "" if chunk ended on \n)
+                for line in _filter_lines(parts, min_level, level_of):
+                    print(line, flush=True)
+                continue
+            try:
+                st = os.stat(log_file)
+            except OSError:
+                st = None
+            if st is not None and (st.st_ino != last_ino or st.st_size < f.tell()):
+                f.close()
+                f = open(log_file, errors="replace")
+                last_ino = os.fstat(f.fileno()).st_ino
+                carry = ""
+                continue
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        f.close()
+    raise typer.Exit(0)
+
+
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
     """Loopback-reachable gRPC host/port from the config (default
     127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
@@ -1143,6 +1295,46 @@ def control_status(
             ("Restarts", str(data_plane.get("restarts", 0))),
         ],
     )
+
+
+@control_app.command("logs")
+def control_logs(
+    data_plane: bool = typer.Option(
+        False,
+        "--data-plane",
+        help="Show the supervised tensor server's log instead of the control's own",
+    ),
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Stream new log lines as they are written"
+    ),
+    lines: int = typer.Option(
+        200, "--lines", "-n", help="Number of lines from the end to show (0 = all)"
+    ),
+    level: Optional[str] = typer.Option(
+        None,
+        "--level",
+        help="Minimum level to show: DEBUG, INFO, WARNING, ERROR, CRITICAL",
+    ),
+    path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
+):
+    """Show the control plane's log, or the data plane's with --data-plane.
+
+    Two logs, because the control plane is two processes: the control writes its
+    own supervision / control-API log (control.log, the default here), and the
+    tensor server it supervises keeps writing the data-plane log
+    (tensor-server.log) that the control redirects its child's output to.
+
+    Reads the file straight off disk rather than through the control API, so it
+    works on a stopped or wedged control -- which is when the log matters most.
+    """
+    log_file = (
+        _get_log_file() if data_plane else _control_log_file()  # tensor-server.log
+    )
+    if path:
+        print(log_file)
+        raise typer.Exit(0)
+    level_of = _tensor_line_level if data_plane else _control_line_level
+    _tail_and_follow(log_file, follow, lines, _validate_level(level), level_of)
 
 
 @control_app.command("run")
