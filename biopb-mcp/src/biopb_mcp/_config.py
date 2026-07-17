@@ -325,6 +325,14 @@ class DaskConfig:
         "across workers. Human size (1G/512M/2GiB) or int bytes. Localhost servers "
         "cache nothing regardless; this applies to remote.",
     )
+    idle_ttl: float = _h(
+        900.0,
+        "Seconds with no kernel attached after which the session child's own "
+        "LocalCluster is torn down, freeing its workers; the next start_kernel "
+        "re-spins it. Only counts while no kernel is alive, so a live viewer or "
+        "a restart never loses the warm cluster. 0 disables. An external "
+        "dask.address is never reaped (we do not own it).",
+    )
 
 
 @dataclass
@@ -511,6 +519,7 @@ _CONSTRAINTS = {
     "DaskConfig": {
         "scheduler": Enum({"distributed", "threads", "synchronous"}),
         "num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
+        "idle_ttl": Range(min=0),  # 0 disables the idle reaper
     },
     "TensorRuntimeConfig": {
         "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
