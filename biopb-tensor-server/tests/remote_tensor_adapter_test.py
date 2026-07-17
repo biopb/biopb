@@ -234,6 +234,146 @@ class TestRemoteTensorProxy:
             upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_proxy_reemits_compact_downstream(self):
+        """The downstream half of biopb/biopb#346: a compact-capable client
+        reading through the proxy gets a compact response (no endpoint list) and
+        byte-identical pixels.
+
+        The proxy's forwarded plan is flagged regular_grid, so the local proxy
+        server re-emits compact to a client that opted in -- neither hop ships the
+        per-chunk endpoint list.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor import TensorFlightClient
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            src = np.arange(3 * 40 * 50, dtype="<i2").reshape(3, 40, 50)
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = src
+
+            upstream = self._upstream_3d(zpath)
+            try:
+                proxy = self._proxy(
+                    upstream.port,
+                    local_source_id="hpc__aics",
+                    upstream_source_id="aics",
+                )
+                try:
+                    # Raw GetFlightInfo against the PROXY, compact opted in: the
+                    # proxy re-emits compact (empty endpoints + local
+                    # chunk_array_id), so the endpoint list crosses neither hop.
+                    proxy_client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                    read_opt = TensorReadOption(
+                        tensor_id="hpc__aics", compact_grid_ok=True
+                    )
+                    cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
+                    fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+                    info = proxy_client._client.get_flight_info(
+                        fd, options=proxy_client._call_options
+                    )
+                    assert len(list(info.endpoints)) == 0
+                    resp_desc = TensorDescriptor.FromString(info.descriptor.command)
+                    assert resp_desc.chunk_array_id == "hpc__aics"
+
+                    # End-to-end read still returns the exact pixels (the client
+                    # reconstructs the local chunk_ids and do_get forwards them).
+                    darr = proxy_client.get_tensor("hpc__aics")
+                    assert darr.shape == (3, 40, 50)
+                    np.testing.assert_array_equal(darr.compute(), src)
+                    proxy_client.close()
+                finally:
+                    proxy.shutdown()
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_proxy_sliced_read_preserves_slice_hint(self):
+        """A sliced read through the proxy keeps slice_hint on BOTH downstream
+        forms, so the client can crop the outward-snapped result.
+
+        Regression guard: the compact-forward path must not strip slice_hint. An
+        explicit-fallback client (no compact opt-in) needs it on the wire to crop;
+        a compact client gets it re-derived by the local server's compact emit.
+        Losing it silently returns the snapped (oversized) region instead of the
+        requested slice.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor import TensorFlightClient
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            SliceHint,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.arange(3 * 40 * 50, dtype="<i2").reshape(3, 40, 50)
+
+            upstream = self._upstream_3d(zpath)
+            try:
+                proxy = self._proxy(
+                    upstream.port,
+                    local_source_id="hpc__aics",
+                    upstream_source_id="aics",
+                )
+                try:
+                    pc = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                    # Request the middle z-plane; it snaps to exactly chunk 1.
+                    sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
+                    for compact in (False, True):
+                        read_opt = TensorReadOption(
+                            tensor_id="hpc__aics",
+                            slice_hint=sl,
+                            compact_grid_ok=compact,
+                        )
+                        cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
+                        fd = flight.FlightDescriptor.for_command(
+                            cmd.SerializeToString()
+                        )
+                        info = pc._client.get_flight_info(fd, options=pc._call_options)
+                        desc = TensorDescriptor.FromString(info.descriptor.command)
+                        # Both forms carry the realized-bounds crop signal.
+                        assert desc.HasField("slice_hint")
+                        assert list(desc.slice_hint.start) == [1, 0, 0]
+                        assert list(desc.slice_hint.stop) == [2, 40, 50]
+                        # ... but differ in whether the endpoint list is shipped.
+                        n_ep = len(list(info.endpoints))
+                        assert (n_ep == 0) if compact else (n_ep >= 1)
+                    pc.close()
+                finally:
+                    proxy.shutdown()
+            finally:
+                upstream.shutdown()
+
+    def _upstream_3d(self, zarr_path):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+        arr = zarr.open_array(zarr_path, mode="r")
+        upstream = TensorFlightServer("grpc://localhost:0")
+        upstream.register_source("aics", ZarrAdapter(arr, "aics", ["z", "y", "x"]))
+        _serve(upstream)
+        return upstream
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_big_endian_source_with_empty_seeded_chunk_shape(self):
         """The exact reported failure: a big-endian upstream source mirrored with
         a lean (empty chunk_shape) catalog seed reads end-to-end through the proxy.
@@ -366,6 +506,127 @@ class TestRemoteTensorProxy:
                 for ce in plan.chunk_endpoints:
                     aid, _ = decode_chunk_id(ce.chunk_id)
                     assert aid == "hpc__aics"
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_forward_flight_info_compact_upstream_matches_explicit(self):
+        """A compact upstream response (biopb/biopb#346) localizes to the exact
+        same endpoints as an explicit one -- byte-for-byte chunk_ids and bounds.
+
+        The proxy sets ``compact_grid_ok`` on the upstream hop, so a regular-grid
+        upstream omits the per-chunk endpoint list; forward_flight_info then
+        regenerates it. This pins that the regenerated + localized endpoints are
+        identical to what the explicit path produces, which is what keeps the
+        downstream cache keys (derived from the local chunk_id bytes) stable
+        across the two upstream response forms.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.core.chunk import (
+            decode_chunk_id,
+            rewrite_chunk_id_array_id,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.zeros((3, 40, 50), dtype="<i2")
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source(
+                "aics",
+                ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
+            )
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__aics",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="aics",
+                )
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "aics",
+                            "dim_labels": ["z", "y", "x"],
+                            "shape": [3, 40, 50],
+                            "chunk_shape": [],
+                            "dtype": "<i2",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+
+                def _upstream_info(compact):
+                    read_opt = TensorReadOption(
+                        tensor_id="aics",
+                        with_metadata=False,
+                        compact_grid_ok=compact,
+                    )
+                    cmd = FlightCmd(source_id="aics", tensor_read=read_opt)
+                    fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+                    return adapter.client._client.get_flight_info(
+                        fd, options=adapter.client._call_options
+                    )
+
+                # The upstream genuinely answers compact for this regular grid,
+                # so forward_flight_info exercises the expand branch (not the
+                # explicit fallback).
+                info_compact = _upstream_info(True)
+                assert len(list(info_compact.endpoints)) == 0
+                assert TensorDescriptor.FromString(
+                    info_compact.descriptor.command
+                ).chunk_array_id
+
+                # The explicit reference: localize the upstream's own endpoints
+                # exactly as the explicit branch of forward_flight_info does.
+                info_explicit = _upstream_info(False)
+                assert len(list(info_explicit.endpoints)) == 3
+                expected = []
+                for ep in info_explicit.endpoints:
+                    ticket = TensorTicket.FromString(ep.ticket.ticket)
+                    bounds = ChunkBounds.FromString(ep.app_metadata)
+                    up_aid, _ = decode_chunk_id(ticket.chunk_id)
+                    local_cid = rewrite_chunk_id_array_id(
+                        ticket.chunk_id, adapter._to_local_array_id(up_aid)
+                    )
+                    expected.append(
+                        (local_cid, tuple(bounds.start), tuple(bounds.stop))
+                    )
+
+                # The real proxy path (compact upstream, since the flag is on).
+                plan = adapter.forward_flight_info(
+                    TensorReadOption(tensor_id="hpc__aics")
+                )
+                got = [
+                    (ce.chunk_id, tuple(ce.bounds.start), tuple(ce.bounds.stop))
+                    for ce in plan.chunk_endpoints
+                ]
+                assert got == expected
+                # chunk_array_id is stripped (compact-only, holds the upstream
+                # id) but slice_hint is KEPT -- the client crops sliced reads
+                # against it, and a compact upstream response always carries it
+                # (here the full virtual extent). The plan is flagged regular so
+                # the local server may re-emit compact downstream.
+                assert not plan.descriptor.chunk_array_id
+                assert plan.descriptor.HasField("slice_hint")
+                assert list(plan.descriptor.slice_hint.start) == [0, 0, 0]
+                assert list(plan.descriptor.slice_hint.stop) == [3, 40, 50]
+                assert plan.regular_grid is True
             finally:
                 upstream.shutdown()
 

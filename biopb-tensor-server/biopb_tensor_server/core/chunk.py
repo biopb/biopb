@@ -24,6 +24,7 @@ from biopb.tensor._chunk_codec import (
     decode_scale_info as decode_scale_info,
     encode_chunk_id as encode_chunk_id,
     encode_chunk_id_with_scale as encode_chunk_id_with_scale,
+    expand_compact_grid as expand_compact_grid,
     get_bounds_from_chunk_id as get_bounds_from_chunk_id,
     is_scaled_chunk as is_scaled_chunk,
     rewrite_chunk_id_array_id as rewrite_chunk_id_array_id,
