@@ -32,6 +32,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -185,14 +186,26 @@ class EmdAdapter(SourceAdapter, TensorAdapter):
         return self.list_tensor_descriptors()[0]
 
     def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
-        """Return a tensor-scoped adapter for a specific signal."""
+        """Return a tensor-scoped adapter for a specific signal.
+
+        The EMD field is the signal's integer index (``source_id/0``,
+        ``source_id/1``, ...). A non-integer field is structurally malformed
+        (``InvalidTensorId``); an integer outside the signal range is a
+        well-formed id that names no signal (``TensorNotFound``). Both are the
+        caller's mistake, terminal -- never the bare ``ValueError`` that would
+        leak as ``FlightInternalError`` (issue #378).
+        """
         field = self._within_source_field(tensor_id)
         try:
             index = int(field)
-        except (TypeError, ValueError):
-            raise ValueError(f"Unknown EMD signal: {tensor_id!r}")
+        except (TypeError, ValueError) as e:
+            raise InvalidTensorId(
+                f"Unknown EMD signal: {tensor_id!r}", reason="malformed_tensor_id"
+            ) from e
         if not (0 <= index < len(self._signals)):
-            raise ValueError(f"Unknown EMD signal: {tensor_id!r}")
+            raise TensorNotFound(
+                f"Unknown EMD signal: {tensor_id!r}", reason="unknown_field"
+            )
 
         if field in self._tensor_adapters:
             return self._tensor_adapters[field]
