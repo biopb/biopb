@@ -21,12 +21,10 @@ from __future__ import annotations
 import json
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 from biopb.tensor.descriptor_pb2 import FlightCmd, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
-
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.base import BackendAdapter
 from biopb_tensor_server.core.errors import (
@@ -76,7 +74,9 @@ class _SingleTensorAdapter(BackendAdapter):
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         super().get_data(bounds)
-        shape = tuple(int(s - a) for a, s in zip(bounds.start, bounds.stop))
+        shape = tuple(
+            int(s - a) for a, s in zip(bounds.start, bounds.stop, strict=True)
+        )
         return np.zeros(shape, dtype="uint8")
 
 
@@ -217,6 +217,61 @@ class TestHcsTotality:
         with pytest.raises(InvalidTensorId) as ei:
             obj.get_tensor_adapter("plate/A01/x")
         assert ei.value.grpc_code == "INVALID_ARGUMENT"
+
+
+# --------------------------------------------------------------------------- #
+# 4b. EMD (signal index parsing) -- a real synthetic store
+# --------------------------------------------------------------------------- #
+class TestEmdTotality:
+    """The EMD field is the signal's integer index (``source_id/0``, ...): a
+    non-integer field is structurally malformed (``InvalidTensorId``), an integer
+    outside the signal range names no signal (``TensorNotFound``)."""
+
+    def _emd_adapter(self, tmp_path):
+        # EMD reads via rosettasciio (the [em] extra) over h5py; skip this test
+        # when either is absent rather than failing at use.
+        pytest.importorskip("rsciio")
+        h5py = pytest.importorskip("h5py")
+        from biopb_tensor_server.adapters.emd import EmdAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        # One datacube -> one signal, so index 0 is the only valid field.
+        path = tmp_path / "test.emd"
+        data = np.arange(2 * 3 * 8 * 8, dtype=np.uint16).reshape(2, 3, 8, 8)
+        with h5py.File(path, "w") as f:
+            f.attrs["version_major"] = 0
+            f.attrs["version_minor"] = 2
+            g = f.create_group("data/datacube_000")
+            g.attrs["emd_group_type"] = 1
+            d = g.create_dataset("data", data=data, chunks=(1, 1, 8, 8))
+            # rsciio's NCEM reader parses one axis dataset per data dim.
+            for i, nm in enumerate(["dim1", "dim2", "dim3", "dim4"]):
+                ax = g.create_dataset(nm, data=np.arange(d.shape[i], dtype=np.float32))
+                ax.attrs["name"] = nm
+                ax.attrs["units"] = "nm"
+        return EmdAdapter.create_from_config(SourceConfig(url=str(path)))
+
+    def test_valid_signal_index_resolves(self, tmp_path):
+        adapter = self._emd_adapter(tmp_path)
+        field = adapter._within_source_field(
+            adapter.list_tensor_descriptors()[0].array_id
+        )
+        ta = adapter.get_tensor_adapter(field)
+        assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
+
+    def test_out_of_range_signal_raises_not_found(self, tmp_path):
+        adapter = self._emd_adapter(tmp_path)
+        with pytest.raises(TensorNotFound) as ei:
+            adapter.get_tensor_adapter(f"{adapter.source_id}/99")
+        assert ei.value.grpc_code == "NOT_FOUND"
+        assert ei.value.reason == "unknown_field"
+
+    def test_non_integer_signal_raises_invalid_argument(self, tmp_path):
+        adapter = self._emd_adapter(tmp_path)
+        with pytest.raises(InvalidTensorId) as ei:
+            adapter.get_tensor_adapter(f"{adapter.source_id}/xyz")
+        assert ei.value.grpc_code == "INVALID_ARGUMENT"
+        assert ei.value.reason == "malformed_tensor_id"
 
 
 # --------------------------------------------------------------------------- #
