@@ -26,6 +26,9 @@ stop. The one such daemon is the control plane (``biopb control start``).
 
 Shared by both patterns:
 
+* :mod:`biopb._lifecycle.proc` -- process liveness + create-time identity, the
+  primitive that lets a pidfile owner tell its own child from an unrelated
+  process that later inherited a reused PID.
 * :mod:`biopb._lifecycle.file_lock` -- a cross-process advisory lock that
   serializes an otherwise-racy check-then-act (e.g. ``control start``) across
   independent owners.

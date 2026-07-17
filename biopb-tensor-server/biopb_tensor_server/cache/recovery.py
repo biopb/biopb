@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from biopb._proc import is_process_running, process_create_time
+from biopb._lifecycle.proc import is_process_running, process_create_time
 
 
 @dataclass
@@ -176,7 +176,7 @@ class ProcessLock:
     crashed cache owner whose PID gets recycled (worst on Windows, which
     hard-kills at logout and reuses PIDs aggressively) would otherwise look
     "alive" forever and wedge recovery. Same fix as the daemon PID file
-    (biopb/biopb#138 item 8), reusing the shared ``biopb._proc`` primitive --
+    (biopb/biopb#138 item 8), reusing the shared ``biopb._lifecycle.proc`` primitive --
     which also avoids ``os.kill(pid, 0)``, a real Ctrl+C on Windows.
 
     Legacy lock files with no ``create_time`` (or platforms with no cheap

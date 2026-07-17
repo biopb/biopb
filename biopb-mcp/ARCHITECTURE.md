@@ -70,7 +70,7 @@ Two invariants keep the tree correct:
   never by importing them — no Qt/napari/dask/kernel enters it. Shared facts (the
   control endpoint, the session-file contract, auth predicates, the process/
   lifecycle helpers) live in **stdlib-only core-SDK modules** (`biopb._endpoints`,
-  `biopb._sessions`, `biopb._web_auth`, `biopb._proc`, `biopb._lifecycle`)
+  `biopb._sessions`, `biopb._web_auth`, `biopb._lifecycle.proc`, `biopb._lifecycle`)
   that neither side imports from the other.
 
 ### Control plane (durable root)
@@ -462,7 +462,7 @@ passthrough; explicit prefix `Mount`s (no root catch-all) keep the static
 reads that dir. The contract is stdlib-only `biopb._sessions` (shim writes,
 control reads). `resolve()`/`list_sessions()` **self-heal** by pruning records
 whose owning pid is dead — or alive on a recycled pid (create-time token mismatch,
-the #138 PID-reuse guard, via `biopb._proc`) — so a dead session expires to a clean
+the #138 PID-reuse guard, via `biopb._lifecycle.proc`) — so a dead session expires to a clean
 "session ended" rather than a hang.
 
 ### Error-propagation model
@@ -525,5 +525,5 @@ napari-skimage-regionprops. Versioning via setuptools_scm.
 - `_connection.py` — the pure client (asks the control to ensure the plane).
 - `biopb-control/src/biopb_control/` — `_control.py` (ASGI origin: SPA + plane
   proxies), `_supervisor.py` (`DataPlaneSupervisor`).
-- `biopb/{_endpoints,_sessions,_web_auth,_proc,_lifecycle}` — the
+- `biopb/{_endpoints,_sessions,_web_auth,_lifecycle}` — the
   stdlib-only cross-process seams.

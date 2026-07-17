@@ -24,11 +24,11 @@ from ._lifecycle.daemon import (
     write_pid_file as _write_pid_file,
 )
 from ._lifecycle.file_lock import LockTimeout, file_lock
-from ._locations import DEFAULT_CONFIG_DIR, find_config
-from ._proc import (
+from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
+from ._locations import DEFAULT_CONFIG_DIR, find_config
 
 console = Console()
 

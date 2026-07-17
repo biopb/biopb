@@ -9,8 +9,9 @@ signalling that pid. The one such daemon in biopb is the **control plane**
 daemons are gone, so there is a single owner today.
 
 The delicate part is *identity across a reused pid*: a pidfile records the pid
-plus a process create-time token (see :mod:`biopb._proc`), so ``stop``/``status``
-never signal or trust an unrelated process that later inherited the pid. The
+plus a process create-time token (see :mod:`biopb._lifecycle.proc`), so
+``stop``/``status`` never signal or trust an unrelated process that later
+inherited the pid. The
 pidfile is written atomically so a racing reader — or a racing writer, now that
 the shim can start the control on demand — never sees a torn record.
 
@@ -31,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-from .._proc import (
+from .proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )

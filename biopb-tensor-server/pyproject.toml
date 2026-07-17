@@ -11,7 +11,7 @@ description = "BioPB Tensor Arrow Flight server for multi-dimensional array stor
 readme = "README.md"
 license = "MIT"
 dependencies = [
-  # Floor: the cache ProcessLock imports biopb._proc (process identity primitive),
+  # Floor: the cache ProcessLock imports biopb._lifecycle.proc (process identity primitive),
   # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
   # tree, so this floor is documentation for any non-workspace install path.
   "biopb >= 0.7.0",

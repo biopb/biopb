@@ -10,7 +10,7 @@ already depend — as framework-agnostic predicates over a header *getter*, and 
 package keeps a thin binding to its own web stack (a FastAPI dependency, a
 Starlette middleware, an MCP route wrapper).
 
-Kept **stdlib-only** (like ``_endpoints`` / ``_sessions`` / ``_proc``)
+Kept **stdlib-only** (like ``_endpoints`` / ``_sessions`` / ``_lifecycle.proc``)
 so importing it never drags a web framework into the SDK/CLI/client import path.
 
 The control binds these as a Starlette middleware and the tensor sidecar as
