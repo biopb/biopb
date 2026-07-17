@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
@@ -307,6 +308,16 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
 
         with self._io_lock:
             return self._dask_arr[slices].compute()
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (µm) from the MicroManager summary metadata.
+
+        ``PixelSize_um`` (isotropic X/Y) and the z-step, projected onto the
+        ``x`` / ``y`` / ``z`` axes; position / time / channel axes get
+        ``0.0`` / ``""``. Reads the same summary dict :meth:`get_metadata`
+        returns.
+        """
+        return mm_summary_scale(self.get_metadata(), self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Return dataset summary metadata.

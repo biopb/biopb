@@ -5,7 +5,7 @@ Handles .nii and .nii.gz files using nibabel.
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -17,6 +17,12 @@ from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+
+# NIfTI ``xyzt_units`` spatial code (low 3 bits) -> a canonical unit string.
+# 0 (unknown) is intentionally absent: an uncalibrated pixdim still carries a
+# meaningful relative voxel size, reported with an empty unit.
+_NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
 
 
 class NiftiAdapter(SourceAdapter, TensorAdapter):
@@ -262,6 +268,61 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         result = dataobj[slices]
         # Cast to float64 defensively (in case no scaling is applied)
         return np.asanyarray(result, dtype=np.float64)
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim voxel size + unit from the header's ``pixdim`` / ``xyzt_units``.
+
+        NIfTI fixes ``pixdim`` by storage axis, independent of ``dim_labels``:
+        ``pixdim[1:4]`` are always the spatial X / Y / Z voxel sizes, ``pixdim[4]``
+        the time step (TR), ``pixdim[5:]`` further non-spatial axes. This adapter's
+        ``dim_labels`` are NOT guaranteed to be in storage order -- auto-derivation
+        puts the non-spatial axis first for 4D/5D (e.g. ``["t", "x", "y", "z"]``)
+        -- so the spatial sizes are consumed *in order* as the spatial labels
+        appear (``pixdim[1]`` -> the first ``x``, ``pixdim[2]`` -> ``y``,
+        ``pixdim[3]`` -> ``z``), not by ``dim_labels`` position. Indexing
+        ``pixdim`` by position would shift by the number of leading non-spatial
+        axes and misread the TR (or a 5th axis) as a spatial length on any file
+        whose spatial labels are not at the front. Non-spatial axes (t / c / v)
+        get ``0.0`` / ``""``. Returns ``None`` when no spatial axis carries a
+        positive size.
+        """
+        try:
+            pixdim = self.header.get("pixdim", None)
+            if pixdim is None:
+                return None
+            pixdim = list(pixdim)
+
+            units = self.header.get("xyzt_units", 0)
+            if isinstance(units, np.ndarray):
+                units = units.item()
+            unit_str = _NIFTI_SPATIAL_UNIT.get(int(units) & 0x07, "")
+
+            # pixdim[1:4] are the storage-fixed X/Y/Z spacings; walk them in order
+            # as the spatial labels appear, so a leading non-spatial axis doesn't
+            # shift the spatial sizes onto the wrong pixdim entry (or read the TR
+            # at pixdim[4] as a length). spatial_idx advances only on x/y/z.
+            spatial_idx = 1
+            scale: List[float] = []
+            unit: List[str] = []
+            for label in self.dim_labels:
+                v = 0.0
+                if str(label).lower() in ("x", "y", "z") and spatial_idx < len(pixdim):
+                    try:
+                        v = float(pixdim[spatial_idx])
+                    except (TypeError, ValueError):
+                        v = 0.0
+                    spatial_idx += 1
+                if v > 0:
+                    scale.append(v)
+                    unit.append(unit_str)
+                else:
+                    scale.append(0.0)
+                    unit.append("")
+            if not any(scale):
+                return None
+            return scale, unit
+        except Exception:
+            return None
 
     def get_metadata(self) -> dict:
         """Extract NIfTI header metadata.

@@ -6,6 +6,7 @@ normalisation, and scaled read planning.
 
 import os
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -599,6 +600,505 @@ class TestGetPhysicalScale:
             ["Y", "X"], scene_index=0, scenes=["s0"], images=[img]
         )
         assert adapter._physical_scale() is None
+
+    # ---- NIfTI -------------------------------------------------------------
+
+    @staticmethod
+    def _make_nifti(dim_labels, pixdim, xyzt_units):
+        from biopb_tensor_server.adapters.nifti import NiftiAdapter
+
+        a = NiftiAdapter.__new__(NiftiAdapter)
+        a.dim_labels = dim_labels
+        a.header = {"pixdim": pixdim, "xyzt_units": xyzt_units}
+        return a
+
+    def test_nifti_physical_scale_xyz_mm(self):
+        """pixdim[1:4] map onto the (positional) spatial axes with the mm unit."""
+        a = self._make_nifti(
+            ["x", "y", "z"], [1.0, 0.5, 0.5, 2.0, 0.0, 0.0, 0.0, 0.0], xyzt_units=2
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.5, 0.5, 2.0]
+        assert unit == ["mm", "mm", "mm"]
+
+    def test_nifti_physical_scale_time_axis_zeroed(self):
+        """Spatial axes carry a size; the time axis is 0.0 whatever its label."""
+        a = self._make_nifti(
+            ["x", "y", "z", "t"], [1.0, 0.5, 0.5, 2.0, 3.0], xyzt_units=3
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.5, 0.5, 2.0, 0.0]
+        assert unit == ["µm", "µm", "µm", ""]
+
+    def test_nifti_physical_scale_time_first_labels_read_fixed_pixdim(self):
+        """pixdim is storage-fixed: for a real 4D fMRI (X/Y/Z in pixdim[1:4],
+        TR in pixdim[4]) with the auto-derived ``["t","x","y","z"]`` order, the
+        leading ``t`` gets 0.0 and x/y/z read pixdim[1:4] -- so TR (pixdim[4]=3.0)
+        is never misreported as the Z length.
+        """
+        a = self._make_nifti(
+            ["t", "x", "y", "z"], [1.0, 0.5, 0.5, 2.0, 3.0], xyzt_units=2
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.5, 0.5, 2.0]
+        assert unit == ["", "mm", "mm", "mm"]
+
+    def test_nifti_physical_scale_5d_leading_nonspatial(self):
+        """5D ``["v","t","x","y","z"]``: v/t are non-spatial (0.0), and x/y/z read
+        the storage-fixed pixdim[1:4] -- not pixdim[3:6] (Z / TR / 5th axis).
+        """
+        a = self._make_nifti(
+            ["v", "t", "x", "y", "z"],
+            [1.0, 0.5, 0.5, 2.0, 3.0, 7.0],
+            xyzt_units=3,
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.5, 0.5, 2.0]
+        assert unit == ["", "", "µm", "µm", "µm"]
+
+    def test_nifti_physical_scale_unknown_unit_keeps_size(self):
+        """An uncalibrated pixdim still reports a size, with an empty unit."""
+        a = self._make_nifti(["x", "y"], [1.0, 0.3, 0.3], xyzt_units=0)
+        scale, unit = a._physical_scale()
+        assert scale == [0.3, 0.3]
+        assert unit == ["", ""]
+
+    def test_nifti_physical_scale_none_when_zero(self):
+        """All-zero pixdim -> None (nothing to advertise)."""
+        a = self._make_nifti(["x", "y", "z"], [1.0, 0.0, 0.0, 0.0], xyzt_units=2)
+        assert a._physical_scale() is None
+
+    # ---- DICOM -------------------------------------------------------------
+
+    @staticmethod
+    def _make_dicom(dim_labels, **tags):
+        import types
+
+        from biopb_tensor_server.adapters.dicom import DicomAdapter
+
+        a = DicomAdapter.__new__(DicomAdapter)
+        a.dim_labels = dim_labels
+        a.ds = types.SimpleNamespace(**tags)
+        return a
+
+    def test_dicom_physical_scale_pixelspacing_and_slice(self):
+        """PixelSpacing is [row(Y), col(X)] mm; z from SliceThickness."""
+        a = self._make_dicom(
+            ["z", "y", "x"], PixelSpacing=[0.7, 0.6], SliceThickness=3.0
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [3.0, 0.7, 0.6]
+        assert unit == ["mm", "mm", "mm"]
+
+    def test_dicom_physical_scale_prefers_spacing_between_slices(self):
+        """SpacingBetweenSlices wins over SliceThickness for the z axis."""
+        a = self._make_dicom(
+            ["z", "y", "x"],
+            PixelSpacing=[0.5, 0.5],
+            SliceThickness=3.0,
+            SpacingBetweenSlices=1.25,
+        )
+        scale, _ = a._physical_scale()
+        assert scale == [1.25, 0.5, 0.5]
+
+    def test_dicom_physical_scale_2d_no_z(self):
+        """A 2D (y, x) image carries only the in-plane spacing."""
+        a = self._make_dicom(["y", "x"], PixelSpacing=[0.4, 0.3])
+        scale, unit = a._physical_scale()
+        assert scale == [0.4, 0.3]
+        assert unit == ["mm", "mm"]
+
+    def test_dicom_physical_scale_none_without_tags(self):
+        """No spatial tags -> None."""
+        a = self._make_dicom(["y", "x"])
+        assert a._physical_scale() is None
+
+    def test_dicom_series_physical_scale(self):
+        """The series adapter reads the same tags off its first slice."""
+        import types
+
+        from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
+
+        a = DicomSeriesAdapter.__new__(DicomSeriesAdapter)
+        a.dim_labels = ["z", "y", "x"]
+        a._first_ds = types.SimpleNamespace(
+            PixelSpacing=[0.8, 0.8], SpacingBetweenSlices=2.0
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [2.0, 0.8, 0.8]
+        assert unit == ["mm", "mm", "mm"]
+
+    # ---- HDF5 --------------------------------------------------------------
+
+    @staticmethod
+    def _make_hdf5(dim_labels, attrs):
+        import types
+
+        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+        a = Hdf5Adapter.__new__(Hdf5Adapter)
+        a.dim_labels = dim_labels
+        a.h5_dataset = types.SimpleNamespace(attrs=attrs)
+        return a
+
+    def test_hdf5_element_size_um(self):
+        """element_size_um maps positionally onto the dataset axes, in µm."""
+        a = self._make_hdf5(
+            ["z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [2.0, 0.5, 0.5]
+        assert unit == ["µm", "µm", "µm"]
+
+    def test_hdf5_no_attribute(self):
+        """No element_size_um attribute -> None."""
+        a = self._make_hdf5(["z", "y", "x"], {})
+        assert a._physical_scale() is None
+
+    def test_hdf5_length_mismatch_none(self):
+        """A vector whose length != rank cannot be aligned -> None."""
+        a = self._make_hdf5(
+            ["t", "z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
+        )
+        assert a._physical_scale() is None
+
+    # ---- MicroManager (NDTiff + legacy) ------------------------------------
+
+    def test_ndtiff_physical_scale_from_summary(self):
+        """NDTiff PixelSize_um / z-step map onto x/y/z; p/t/c zeroed."""
+        import types
+
+        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
+
+        a = NdTiffAdapter.__new__(NdTiffAdapter)
+        a.dim_labels = ["p", "t", "c", "z", "y", "x"]
+        a._dataset = types.SimpleNamespace(
+            summary_metadata={"PixelSize_um": 0.16, "z-step_um": 0.5}
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.0, 0.5, 0.16, 0.16]
+        assert unit == ["", "", "", "µm", "µm", "µm"]
+
+    def test_micromanager_legacy_physical_scale(self):
+        """Legacy MicroManager reads PixelSize_um from the Summary block."""
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        a = MicroManagerLegacyAdapter.__new__(MicroManagerLegacyAdapter)
+        a.dim_labels = ["c", "z", "y", "x"]
+        a._raw_metadata = {"Summary": {"PixelSize_um": 0.16}}
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.16, 0.16]
+        assert unit == ["", "", "µm", "µm"]
+
+    # ---- TIFF sequence (real files, exercises tag reading) -----------------
+
+    @staticmethod
+    def _make_tiff_sequence(tiff_files, dim_labels):
+        from biopb_tensor_server.adapters.tiff import _SCALE_UNSET, TiffSequenceAdapter
+
+        a = TiffSequenceAdapter.__new__(TiffSequenceAdapter)
+        a._tiff_files = tiff_files
+        a.dim_labels = dim_labels
+        a._source_url = str(tiff_files[0]) if tiff_files else ""
+        a._init_file_locks()
+        a._physical_scale_cache = _SCALE_UNSET
+        return a
+
+    def test_tiff_sequence_physical_scale_resolution_tags(self):
+        """X/Y pixel size from XResolution/YResolution + centimetre unit -> µm."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "img_0.tif")
+            # 0.5 µm/px -> 20000 px/cm (ResolutionUnit=CENTIMETER).
+            tifffile.imwrite(
+                path,
+                np.zeros((8, 8), dtype=np.uint8),
+                resolution=(20000.0, 20000.0),
+                resolutionunit="CENTIMETER",
+            )
+            a = self._make_tiff_sequence([Path(path)], ["i", "y", "x"])
+            scale, unit = a._physical_scale()
+            assert scale[0] == 0.0  # opaque file axis
+            assert scale[1] == pytest.approx(0.5)
+            assert scale[2] == pytest.approx(0.5)
+            assert unit == ["", "µm", "µm"]
+
+    def test_tiff_sequence_physical_scale_imagej_spacing(self):
+        """ImageJ unit + spacing calibrate X/Y and the z (page) axis."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "stack_0.tif")
+            # ImageJ stores XY resolution in px per 'unit'; z as 'spacing'.
+            tifffile.imwrite(
+                path,
+                np.zeros((3, 8, 8), dtype=np.uint8),
+                imagej=True,
+                resolution=(1.0 / 0.325, 1.0 / 0.325),
+                metadata={"unit": "micron", "spacing": 2.0, "axes": "ZYX"},
+            )
+            a = self._make_tiff_sequence([Path(path)], ["i", "z", "y", "x"])
+            scale, unit = a._physical_scale()
+            assert scale[0] == 0.0  # opaque file axis
+            assert scale[1] == pytest.approx(2.0)  # z from ImageJ spacing
+            assert scale[2] == pytest.approx(0.325)
+            assert scale[3] == pytest.approx(0.325)
+            assert unit == ["", "µm", "µm", "µm"]
+
+    def test_tiff_sequence_physical_scale_none_without_resolution(self):
+        """A TIFF with no absolute resolution unit -> None."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "plain_0.tif")
+            tifffile.imwrite(path, np.zeros((8, 8), dtype=np.uint8))
+            a = self._make_tiff_sequence([Path(path)], ["i", "y", "x"])
+            assert a._physical_scale() is None
+
+    def test_tiff_pixel_size_um_missing_unit_is_not_assumed_inch(self):
+        """A resolution density with no ResolutionUnit tag -> None, not inch.
+
+        The TIFF spec defaults ResolutionUnit to inch, but that default is wrong
+        often enough in practice that we treat a missing unit as uncalibrated
+        rather than fabricate a micron size from it.
+        """
+        from biopb_tensor_server.adapters.tiff import _tiff_pixel_size_um
+
+        class _Tag:
+            def __init__(self, value):
+                self.value = value
+
+        class _Page:
+            def __init__(self, tags):
+                self._tags = tags
+
+            @property
+            def tags(self):
+                return self._tags
+
+        # Density present, ResolutionUnit absent -> None (no inch assumption).
+        page = _Page({"XResolution": _Tag((25400, 1))})
+        assert _tiff_pixel_size_um(page, "XResolution", None) is None
+
+        # Same density but with an explicit inch unit (code 2) -> 1.0 µm/px.
+        page = _Page({"XResolution": _Tag((25400, 1)), "ResolutionUnit": _Tag(2)})
+        assert _tiff_pixel_size_um(page, "XResolution", None) == pytest.approx(1.0)
+
+    def test_tiff_sequence_physical_scale_is_cached(self):
+        """The scale is computed once; a later call reuses it without reopening."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "img_0.tif")
+            tifffile.imwrite(
+                path,
+                np.zeros((8, 8), dtype=np.uint8),
+                resolution=(20000.0, 20000.0),
+                resolutionunit="CENTIMETER",
+            )
+            a = self._make_tiff_sequence([Path(path)], ["i", "y", "x"])
+
+            calls = {"n": 0}
+            real_compute = a._compute_physical_scale
+
+            def _counting_compute():
+                calls["n"] += 1
+                return real_compute()
+
+            a._compute_physical_scale = _counting_compute
+            first = a._physical_scale()
+            second = a._physical_scale()
+            assert first == second
+            assert first is not None
+            assert calls["n"] == 1  # reopened members[0] only once
+
+    # ---- OME-Zarr HCS plate: per-field scale (issue #272) ------------------
+
+    @staticmethod
+    def _make_hcs_plate(tmpdir):
+        """A minimal single-well/single-field HCS plate with a calibrated field.
+
+        The plate root carries no image scale; the field's ``.zattrs`` declares
+        micrometer-calibrated Y/X with a level-0 scale of [1, 0.5, 0.5].
+        """
+        import json
+
+        import zarr
+
+        plate = os.path.join(tmpdir, "plate.zarr")
+        for sub in ("", "A", "A/1", "A/1/0"):
+            d = os.path.join(plate, sub)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, ".zgroup"), "w") as f:
+                json.dump({"zarr_format": 2}, f)
+        with open(os.path.join(plate, ".zattrs"), "w") as f:
+            json.dump({"plate": {"wells": [{"path": "A/1"}]}}, f)
+        with open(os.path.join(plate, "A", "1", ".zattrs"), "w") as f:
+            json.dump({"well": {"images": [{"path": "0"}]}}, f)
+        with open(os.path.join(plate, "A", "1", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "axes": [
+                                {"name": "c", "type": "channel"},
+                                {"name": "y", "type": "space", "unit": "micrometer"},
+                                {"name": "x", "type": "space", "unit": "micrometer"},
+                            ],
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.5, 0.5]}
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                f,
+            )
+        zarr.open_array(
+            os.path.join(plate, "A", "1", "0", "0"),
+            mode="w",
+            shape=(2, 16, 16),
+            chunks=(1, 16, 16),
+            dtype="uint8",
+        )
+        return plate
+
+    @staticmethod
+    def _make_hcs_plate_second_field_missing_axes(tmpdir):
+        """A two-well plate whose second field's multiscales omits ``axes``.
+
+        Well ``A/1`` field 0 declares full c/y/x axes (micrometre-calibrated), so
+        the plate source picks up those axes; well ``A/2`` field 0 carries a
+        level-0 scale transform but NO ``axes`` array, exercising the fallback to
+        the source axes in :func:`_physical_scale_from_multiscales`.
+        """
+        import json
+
+        import zarr
+
+        plate = os.path.join(tmpdir, "plate.zarr")
+        for sub in ("", "A", "A/1", "A/1/0", "A/2", "A/2/0"):
+            d = os.path.join(plate, sub)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, ".zgroup"), "w") as f:
+                json.dump({"zarr_format": 2}, f)
+        with open(os.path.join(plate, ".zattrs"), "w") as f:
+            json.dump({"plate": {"wells": [{"path": "A/1"}, {"path": "A/2"}]}}, f)
+        for well in ("A/1", "A/2"):
+            with open(os.path.join(plate, well, ".zattrs"), "w") as f:
+                json.dump({"well": {"images": [{"path": "0"}]}}, f)
+        # Well A/1 field 0: full axes -> populates the plate source's self.axes.
+        with open(os.path.join(plate, "A", "1", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "axes": [
+                                {"name": "c", "type": "channel"},
+                                {"name": "y", "type": "space", "unit": "micrometer"},
+                                {"name": "x", "type": "space", "unit": "micrometer"},
+                            ],
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.5, 0.5]}
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                f,
+            )
+        # Well A/2 field 0: a scale transform but NO axes -> must fall back.
+        with open(os.path.join(plate, "A", "2", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.3, 0.3]}
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                },
+                f,
+            )
+        for well in ("A/1", "A/2"):
+            zarr.open_array(
+                os.path.join(plate, well, "0", "0"),
+                mode="w",
+                shape=(2, 16, 16),
+                chunks=(1, 16, 16),
+                dtype="uint8",
+            )
+        return plate
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_field_missing_axes_falls_back_to_source_axes(self):
+        """A field whose multiscales omits ``axes`` still resolves units, by
+        falling back to the plate source's axes (from the first field)."""
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = self._make_hcs_plate_second_field_missing_axes(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            # The plate source picked up axes from the first field (well A/1).
+            assert plate.axes  # non-empty
+            # Bind the second well's field, whose own multiscales has no axes.
+            field = plate.get_tensor_adapter("plate/2/0")
+            scale, unit = field._physical_scale()
+            assert scale == [0.0, 0.3, 0.3]
+            assert unit == ["", "micrometer", "micrometer"]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_plate_level_scale_is_none_but_field_carries_it(self):
+        """The plate advertises no scale; the per-field adapter (bound by full
+        array_id) surfaces the field's own physical calibration (issue #272)."""
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = self._make_hcs_plate(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            assert plate._is_hcs_plate
+            # Plate level: no image scale.
+            assert plate._physical_scale() is None
+
+            # Bind the field by its full array_id (well/field).
+            field_id = plate.list_tensor_descriptors()[0].array_id
+            field = plate.get_tensor_adapter(field_id)
+            scale, unit = field._physical_scale()
+            assert scale == [0.0, 0.5, 0.5]
+            assert unit == ["", "micrometer", "micrometer"]
 
 
 class TestOmeZarrPrecompute:
