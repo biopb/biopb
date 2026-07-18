@@ -24,6 +24,8 @@ import pyarrow.flight as flight
 import pytest
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
+    CACHE_FILE_FORMAT_VERSION,
+    FORMAT_VERSION_MARKER,
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
@@ -223,6 +225,133 @@ class TestLocateEntry:
                 assert np.array_equal(_read_via_location(loc), arrs[i])
         finally:
             be.close()
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestFormatVersionEnforcement:
+    """CACHE_FILE_FORMAT_VERSION is enforced with an on-disk marker + wipe.
+
+    The version marks the segment message layout / cache-key encoding contract.
+    Segments written under an incompatible version must be dropped at boot rather
+    than indexed and served (mis-decoded / stale). Covers: the marker is stamped
+    on init; a matching marker preserves the cache across restart; and a missing
+    (pre-enforcement), mismatched, or torn marker wipes the segments + WAL.
+    """
+
+    CFG = {"max_segment_bytes": 8 * 1024 * 1024, "max_total_bytes": 256 * 1024 * 1024}
+
+    def _seed(self, d, key=b"k0"):
+        """Write one entry into a fresh backend at ``d`` and close it."""
+        be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+        a = (np.arange(2000, dtype=np.uint16) % 500).astype(np.uint16)
+        be.get_or_acquire(key, (lambda: (_make_typed_batch(a), a.nbytes)))
+        be.release(key)
+        be.close()
+        return a
+
+    def test_marker_written_on_init(self):
+        d = tempfile.mkdtemp()
+        try:
+            be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            be.close()
+            marker = Path(d) / FORMAT_VERSION_MARKER
+            assert marker.exists()
+            assert int(marker.read_text().strip()) == CACHE_FILE_FORMAT_VERSION
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_matching_marker_preserves_cache(self):
+        """A restart at the same version keeps the segments (no wipe)."""
+        d = tempfile.mkdtemp()
+        try:
+            a = self._seed(d)
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                loc = be2.locate_entry(b"k0")
+                assert loc is not None
+                assert np.array_equal(_read_via_location(loc), a)
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_missing_marker_wipes_preexisting_cache(self):
+        """A pre-enforcement dir (segments, no marker) is wiped on next boot."""
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            marker = Path(d) / FORMAT_VERSION_MARKER
+            marker.unlink()  # simulate a cache written before enforcement shipped
+            assert list((Path(d) / "segments").glob("seg_*.arrow"))
+
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None  # wiped
+                assert not list((Path(d) / "segments").glob("seg_*.arrow"))
+                # marker re-stamped at the current version
+                assert int(marker.read_text().strip()) == CACHE_FILE_FORMAT_VERSION
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_mismatched_marker_wipes_cache(self):
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            marker = Path(d) / FORMAT_VERSION_MARKER
+            marker.write_text(f"{CACHE_FILE_FORMAT_VERSION + 1}\n")
+
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+                assert int(marker.read_text().strip()) == CACHE_FILE_FORMAT_VERSION
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_torn_marker_wipes_cache(self):
+        """An unparseable marker (torn write) is treated as a mismatch."""
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            (Path(d) / FORMAT_VERSION_MARKER).write_text("not-an-int")
+
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_partial_wipe_fails_closed(self):
+        """If the wipe leaves a segment behind, init raises instead of serving it.
+
+        ``rmtree(ignore_errors=True)`` can silently leave files (NFS unlink
+        error, held handle). A surviving ``seg_*.arrow`` would be re-indexed as
+        if current, so construction must fail rather than serve incompatible
+        bytes. Simulated by neutering ``rmtree`` so the segments survive.
+        """
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            (Path(d) / FORMAT_VERSION_MARKER).write_text(
+                f"{CACHE_FILE_FORMAT_VERSION + 1}\n"
+            )
+            with patch("biopb_tensor_server.cache.file_backend.shutil.rmtree"):
+                with pytest.raises(RuntimeError, match="survived the wipe"):
+                    ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+
+            # The aborted init must not leave the process lock held: a retry
+            # (now with rmtree working) acquires cleanly and wipes.
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+            finally:
+                be2.close()
+        finally:
             shutil.rmtree(d, ignore_errors=True)
 
 
