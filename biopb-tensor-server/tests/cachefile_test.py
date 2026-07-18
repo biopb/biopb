@@ -326,6 +326,34 @@ class TestFormatVersionEnforcement:
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_partial_wipe_fails_closed(self):
+        """If the wipe leaves a segment behind, init raises instead of serving it.
+
+        ``rmtree(ignore_errors=True)`` can silently leave files (NFS unlink
+        error, held handle). A surviving ``seg_*.arrow`` would be re-indexed as
+        if current, so construction must fail rather than serve incompatible
+        bytes. Simulated by neutering ``rmtree`` so the segments survive.
+        """
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            (Path(d) / FORMAT_VERSION_MARKER).write_text(
+                f"{CACHE_FILE_FORMAT_VERSION + 1}\n"
+            )
+            with patch("biopb_tensor_server.cache.file_backend.shutil.rmtree"):
+                with pytest.raises(RuntimeError, match="survived the wipe"):
+                    ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+
+            # The aborted init must not leave the process lock held: a retry
+            # (now with rmtree working) acquires cleanly and wipes.
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 class TestLocateViaManager:
     def test_memory_backend_returns_none(self):

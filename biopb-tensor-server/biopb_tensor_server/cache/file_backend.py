@@ -396,6 +396,17 @@ class ArrowFileBackend(CacheBackend):
         ``segments`` dir. Logs loudly only when data was actually discarded (a
         fresh dir wipe is a silent no-op). Runs before any mmap is opened, so no
         segment is mapped and the removal is safe on Windows too (issue #5).
+
+        Fail-closed on a partial wipe: ``shutil.rmtree(ignore_errors=True)`` can
+        leave files behind without surfacing an error -- an NFS unlink that
+        returns ESTALE/EIO, a permission glitch, a handle another process still
+        holds. A surviving ``seg_*.arrow`` is exactly the incompatible segment
+        we came to drop, and the boot rebuild would re-index and serve it as if
+        current. So we verify the segments are gone and raise if any remain,
+        refusing to start rather than serving mis-decoded/stale chunks -- a dead
+        cache owner's lock is stale-reclaimable, an operator can clear the dir.
+        (A stray ``.idx`` sidecar is harmless -- the rebuild globs ``.arrow`` --
+        so the check targets bodies only.)
         """
         segments_dir = self._config.cache_dir / "segments"
         wal_path = self._config.cache_dir / "wal.json"
@@ -417,6 +428,19 @@ class ArrowFileBackend(CacheBackend):
             wal_path.unlink()
         except OSError:
             pass
+
+        leftover = sorted(segments_dir.glob("seg_*.arrow"))
+        if leftover:
+            # Release the lock we hold so a same-process retry (or a stale-lock
+            # reclaim on the next start) isn't wedged by this aborted init.
+            if self._process_lock is not None:
+                self._process_lock.release()
+            raise RuntimeError(
+                f"Failed to clear the incompatible cache at {segments_dir}: "
+                f"{len(leftover)} segment file(s) survived the wipe "
+                f"(e.g. {leftover[0].name}). Refusing to start rather than serve "
+                "them; remove the cache directory manually and retry."
+            )
 
     def _recover(self) -> RecoveryStatus:
         """Recover from crash: drop incomplete writes recorded in the WAL.
