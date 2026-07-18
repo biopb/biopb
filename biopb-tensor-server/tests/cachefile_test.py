@@ -140,6 +140,35 @@ class TestLocateEntry:
             be2.close()
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_locate_hit_counts_in_top_level_stats(self, file_backend):
+        """A locate/mmap fast-path hit bumps `stats().hits`, same as do_get.
+
+        Regression for biopb/biopb#514: on the single-machine deployment a
+        cached chunk is served via `locate_entry` (mmap handoff), which credited
+        only the per-pool counter and left top-level `self._hits` at 0 -- so the
+        reported hit-rate (surfaced by the sidecar) trended to ~0 even at a high
+        true hit rate, and `stats().hits` disagreed with the per-pool counters.
+        A fast-path hit and a do_get hit must move `stats().hits` identically.
+        """
+        a = (np.arange(1000, dtype=np.uint16) % 400).astype(np.uint16)
+        # Populate: the initial acquire is a miss (creates the pending entry).
+        file_backend.get_or_acquire(b"k", (lambda: (_make_typed_batch(a), a.nbytes)))
+        file_backend.release(b"k")
+        assert file_backend.stats().hits == 0
+
+        # A locate/mmap fast-path hit must be counted at the top level.
+        assert file_backend.locate_entry(b"k") is not None
+        assert file_backend.stats().hits == 1
+        # ...and stay internally consistent with the per-pool counters.
+        s = file_backend.stats()
+        assert sum(p.hits for p in s.pool_stats.values()) == s.hits
+
+        # A do_get hit (get_or_acquire on the ready entry) moves it identically.
+        before = file_backend.stats().hits
+        file_backend.get_or_acquire(b"k", (lambda: (_make_typed_batch(a), a.nbytes)))
+        file_backend.release(b"k")
+        assert file_backend.stats().hits == before + 1
+
     def test_generation_id_is_segment_inode(self, file_backend):
         a = (np.arange(100, dtype=np.uint16)).astype(np.uint16)
         file_backend.get_or_acquire(b"g", (lambda: (_make_typed_batch(a), a.nbytes)))

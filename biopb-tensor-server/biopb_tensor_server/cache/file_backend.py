@@ -1156,8 +1156,19 @@ class ArrowFileBackend(CacheBackend):
         except OSError:
             return None
 
-        # The client is about to map this segment; treat the locate as a hit
-        # so Sieve-K doesn't evict it out from under the reader.
+        # The client is about to map this segment; treat the locate as a hit.
+        # A localhost mmap handoff is a genuine cache hit, so count it in the
+        # top-level counter too -- otherwise `stats().hits` (which the sidecar
+        # surfaces as the cache hit-rate) trends to ~0 on the single-machine
+        # deployment, where hits take this fast path but misses fall back to
+        # do_get and are counted there (biopb/biopb#514). Bump `self._hits`
+        # here, next to the per-pool bump, rather than inside
+        # `_update_segment_frequency` -- that helper is also called from the
+        # do_get accounting paths, which increment `self._hits` separately, so
+        # bumping it in the helper would double-count. `_build_chunk_location`
+        # is the sole owner of the locate-hit path, so this fires exactly once
+        # per served locate. Caller holds `self._lock`.
+        self._hits += 1
         self._update_segment_frequency(entry_info.segment_id)
 
         return ChunkLocation(
