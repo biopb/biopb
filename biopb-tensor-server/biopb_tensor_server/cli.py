@@ -494,8 +494,16 @@ def _setup_flight_server(
     static_sources, monitored_sources = _resolve_serve_sources(server_config, registry)
 
     if not static_sources and not monitored_sources:
-        console.print("[yellow]Warning: No data sources configured[/yellow]")
-        raise typer.Exit(1)
+        # An empty catalog is a valid state -- start and serve it (health SERVING,
+        # empty list_flights) rather than exiting. Sources can arrive after
+        # startup: runtime add_source (napari drag-drop), DoPut uploads, or a
+        # monitored dir that is currently empty but fills later. Refusing to boot
+        # would also make the control-plane data-plane supervisor read a healthy
+        # empty server as a crash -> backoff/restart loop (biopb/biopb#515).
+        console.print(
+            "[yellow]No data sources configured; serving an empty catalog "
+            "(sources can be added at runtime).[/yellow]"
+        )
 
     console.print(
         f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
@@ -567,10 +575,21 @@ def _setup_flight_server(
         full_rescan_interval=server_config.full_rescan_interval,
         stable_rescans_required=server_config.stable_rescans_required,
         aggressive_dir_pruning=server_config.aggressive_dir_pruning,
+        # An empty (or all-invalid) source set is a valid runtime state: build an
+        # empty manager and serve an empty catalog rather than refusing to boot
+        # (biopb/biopb#515).
+        allow_empty=True,
     )
 
+    # With allow_empty=True an empty/all-invalid source set yields an empty manager
+    # (served as an empty catalog), so a None here no longer means "no sources" --
+    # it can only be a genuine construction failure. Guard it: the startup code
+    # below dereferences source_manager unconditionally (unlike _graceful_shutdown,
+    # which tolerates None), so fail cleanly rather than with an opaque
+    # AttributeError. This exit is inside serve()/launch()'s try, so the finally
+    # still releases the cache lock (biopb/biopb#515).
     if source_manager is None:
-        console.print("[red]No sources loaded successfully[/red]")
+        console.print("[red]Failed to initialize the source manager[/red]")
         raise typer.Exit(1)
 
     # Wire the runtime add_source handler (tensor-browser drag-drop): the server
@@ -741,26 +760,34 @@ def serve(
     # Token from env var only (no auto-gen for serve - it's non-interactive)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
 
-    server, source_manager, watcher, precache_worker = _setup_flight_server(
-        server_config,
-        host=host,
-        port=port,
-        writable=writable,
-        token=token,
-    )
-
-    location = _grpc_location(host or server_config.host, port or server_config.port)
-    console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
-    console.print("Press Ctrl+C to stop\n")
-
-    # Treat SIGTERM (e.g. the control supervisor's graceful stop) like Ctrl+C so
-    # shutdown is clean.
-    _install_sigterm_handler()
-    # If launched under the control supervisor, self-terminate when it dies
-    # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
-    _deathwatch.install()
-
+    # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
+    # cache process lock -- on EVERY exit path, not just a clean serve() return.
+    # _setup_flight_server acquires the lock during cache init and can still raise
+    # afterwards (e.g. a bad static source); keeping it inside the try means such
+    # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
+    server = source_manager = watcher = precache_worker = None
     try:
+        server, source_manager, watcher, precache_worker = _setup_flight_server(
+            server_config,
+            host=host,
+            port=port,
+            writable=writable,
+            token=token,
+        )
+
+        location = _grpc_location(
+            host or server_config.host, port or server_config.port
+        )
+        console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
+        console.print("Press Ctrl+C to stop\n")
+
+        # Treat SIGTERM (e.g. the control supervisor's graceful stop) like Ctrl+C
+        # so shutdown is clean.
+        _install_sigterm_handler()
+        # If launched under the control supervisor, self-terminate when it dies
+        # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
+        _deathwatch.install()
+
         server.serve()
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
@@ -1041,72 +1068,81 @@ def launch(
             "[yellow]Local mode: no access token (loopback-only bind).[/yellow]"
         )
 
-    # --- Start Flight server ---
-    flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
-        server_config, token=effective_token
-    )
-
-    # The HTTP sidecar is co-located with the Flight server and reaches it over
-    # the loopback interface. A wildcard bind address is a bind target, not a
-    # valid connect target, so dial the matching loopback explicitly — and match
-    # the address family: the IPv4 wildcard maps to 127.0.0.1, the IPv6 wildcard
-    # to ::1. (A `::`-bound server with IPV6_V6ONLY set — the default on some
-    # hosts — would refuse an IPv4 127.0.0.1 connection.)
-    _flight_connect_host = server_config.host
-    if _flight_connect_host in ("0.0.0.0", ""):
-        _flight_connect_host = "127.0.0.1"
-    elif _flight_connect_host == "::":
-        _flight_connect_host = "::1"
-    flight_location = _grpc_location(_flight_connect_host, server_config.port)
-    flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
-    flight_thread.start()
-
-    if open_browser:
-        url = web_url
-        threading.Timer(1.5, webbrowser.open, args=(url,)).start()
-
-    # --- Build effective CORS origins ---
-    if cors_origins:
-        effective_cors = list(cors_origins)
-    else:
-        # Derive CORS origins, expanding loopback aliases for any local hostname
-        from urllib.parse import urlparse as _urlparse
-
-        _loopback_aliases: dict = {
-            "localhost": ["127.0.0.1", "[::1]"],
-            "127.0.0.1": ["localhost", "[::1]"],
-            "::1": ["localhost", "127.0.0.1"],
-            "[::1]": ["localhost", "127.0.0.1"],
-        }
-
-        def _expand_origin(url: str) -> list:
-            parsed = _urlparse(url)
-            p = parsed.port
-            port_suffix = f":{p}" if p else ""
-            scheme = parsed.scheme
-            hostname = parsed.hostname or "localhost"
-            origins = [f"{scheme}://{hostname}{port_suffix}"]
-            for alias in _loopback_aliases.get(hostname, []):
-                origins.append(f"{scheme}://{alias}{port_suffix}")
-            return origins
-
-        effective_cors = _expand_origin(web_url)
-
-        # The control front reaches this sidecar over loopback for the data API +
-        # /ws/render, so allow all loopback variants of the server's own address.
-        for origin in _expand_origin(f"http://{web_host}:{web_port}"):
-            if origin not in effective_cors:
-                effective_cors.append(origin)
-
-    # --- Start HTTP sidecar (blocks) ---
-    console.print(
-        f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]"
-    )
-    console.print("Press Ctrl+C to stop\n")
-    # uvicorn installs its own SIGINT/SIGTERM handlers and returns normally on
-    # shutdown (it does not re-raise), so cleanup must run in `finally` rather
-    # than an except block - otherwise the cache lock is never released.
+    # --- Start Flight server + HTTP sidecar ---
+    # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
+    # cache process lock -- on EVERY exit path after cache init, not just a clean
+    # uvicorn return. _setup_flight_server acquires the lock during cache init and
+    # can still raise afterwards (e.g. a bad static source, or a bind failure
+    # starting the flight thread below), so keeping the whole startup body inside
+    # the try means such an early exit no longer orphans the lock as a stale lock
+    # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
+    # returns normally on shutdown (it does not re-raise), so cleanup must run in
+    # `finally` rather than an except block regardless.
+    flight_server = source_manager = watcher = precache_worker = None
     try:
+        flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
+            server_config, token=effective_token
+        )
+
+        # The HTTP sidecar is co-located with the Flight server and reaches it over
+        # the loopback interface. A wildcard bind address is a bind target, not a
+        # valid connect target, so dial the matching loopback explicitly — and
+        # match the address family: the IPv4 wildcard maps to 127.0.0.1, the IPv6
+        # wildcard to ::1. (A `::`-bound server with IPV6_V6ONLY set — the default
+        # on some hosts — would refuse an IPv4 127.0.0.1 connection.)
+        _flight_connect_host = server_config.host
+        if _flight_connect_host in ("0.0.0.0", ""):
+            _flight_connect_host = "127.0.0.1"
+        elif _flight_connect_host == "::":
+            _flight_connect_host = "::1"
+        flight_location = _grpc_location(_flight_connect_host, server_config.port)
+        flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
+        flight_thread.start()
+
+        if open_browser:
+            url = web_url
+            threading.Timer(1.5, webbrowser.open, args=(url,)).start()
+
+        # --- Build effective CORS origins ---
+        if cors_origins:
+            effective_cors = list(cors_origins)
+        else:
+            # Derive CORS origins, expanding loopback aliases for any local
+            # hostname
+            from urllib.parse import urlparse as _urlparse
+
+            _loopback_aliases: dict = {
+                "localhost": ["127.0.0.1", "[::1]"],
+                "127.0.0.1": ["localhost", "[::1]"],
+                "::1": ["localhost", "127.0.0.1"],
+                "[::1]": ["localhost", "127.0.0.1"],
+            }
+
+            def _expand_origin(url: str) -> list:
+                parsed = _urlparse(url)
+                p = parsed.port
+                port_suffix = f":{p}" if p else ""
+                scheme = parsed.scheme
+                hostname = parsed.hostname or "localhost"
+                origins = [f"{scheme}://{hostname}{port_suffix}"]
+                for alias in _loopback_aliases.get(hostname, []):
+                    origins.append(f"{scheme}://{alias}{port_suffix}")
+                return origins
+
+            effective_cors = _expand_origin(web_url)
+
+            # The control front reaches this sidecar over loopback for the data API
+            # + /ws/render, so allow all loopback variants of the server's own
+            # address.
+            for origin in _expand_origin(f"http://{web_host}:{web_port}"):
+                if origin not in effective_cors:
+                    effective_cors.append(origin)
+
+        # --- Start HTTP sidecar (blocks) ---
+        console.print(
+            f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]"
+        )
+        console.print("Press Ctrl+C to stop\n")
         run_http_server(
             flight_location=flight_location,
             token=effective_token,

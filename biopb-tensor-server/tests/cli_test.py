@@ -190,6 +190,93 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     assert not lock_path.exists()
 
 
+def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
+    """A failure in _setup_flight_server after cache init still releases the lock.
+
+    Regression for biopb/biopb#515: cache init acquires the file-backend process
+    lock, and an early exit after that (e.g. a bad static source) used to run
+    *before/outside* serve()'s try/finally, so `_graceful_shutdown` never ran and
+    the lock file was orphaned -- the next start then treated it as a stale lock
+    and paid a crash-recovery scan. The setup call now lives inside the try, so
+    the finally releases the lock on every exit path, not just a clean return.
+    """
+    cache_dir = tmp_path / "cache"
+    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    lock_path = cache_dir / "lock"
+    assert lock_path.exists()  # held once cache init ran
+
+    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        # Stand in for a post-cache-init failure inside _setup_flight_server.
+        raise typer.Exit(1)
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _boom)
+
+    try:
+        with pytest.raises(typer.Exit):
+            cli.serve(config=Path("unused.json"))
+        # Released by the finally's graceful shutdown despite the early exit.
+        assert not lock_path.exists()
+    finally:
+        mgr = CacheManager.get_instance()
+        if mgr is not None:
+            mgr.close()
+
+
+def test_setup_empty_sources_serves_empty_catalog(tmp_path):
+    """An empty source set reaches SERVING with an empty catalog, not exit(1).
+
+    Regression for biopb/biopb#515: `_setup_flight_server` used to `raise
+    typer.Exit(1)` when no static/monitored sources were configured. An empty
+    catalog is a valid runtime state (sources arrive via runtime add_source,
+    DoPut, or a monitored dir that fills later), and under the control plane an
+    exit(1) reads as a crash -> restart loop. The server must boot and serve an
+    empty catalog (health SERVING, source_count 0).
+    """
+    import json
+
+    from pyarrow import flight
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "memory"},
+                "sources": [],
+            }
+        )
+    )
+
+    config = cli.load_config(config_path)
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        assert server.is_ready is True
+        assert source_manager is not None  # an empty manager, not None
+
+        (raw,) = list(server.do_action(None, flight.Action("health", b"")))
+        health = json.loads(bytes(raw))
+        assert health["status"] == "SERVING"
+        assert health["source_count"] == 0
+
+        # And the empty catalog lists no flights.
+        assert list(server.list_flights(None, None)) == []
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        if source_manager is not None:
+            source_manager.stop(join_timeout=1)
+        server.shutdown()
+
+
 class TestResolveLaunchToken:
     """`launch`'s token decision is fail-closed on every public listener.
 
