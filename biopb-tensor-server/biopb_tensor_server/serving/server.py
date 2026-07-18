@@ -1527,22 +1527,37 @@ class TensorFlightServer(flight.FlightServerBase):
 
         command = descriptor.command
 
-        # Try TensorDescriptor (source creation)
+        # Discriminate the command *first*, then run the handler outside the
+        # discriminating try. Both TensorDescriptor and ChunkUpload are lenient
+        # protobufs (parse rarely raises), so the real discriminator is the
+        # shape/dtype check -- a populated shape+dtype means a source creation,
+        # anything else is a chunk upload. Deciding the branch before
+        # invoking the handler keeps a genuine create/write failure (bad prefix,
+        # missing write_dir, malformed metadata_json) surfacing as itself instead
+        # of being swallowed and mis-reported as "Invalid upload command"
+        # (biopb/biopb#354).
+        req_desc: Optional[TensorDescriptor] = None
         try:
-            req_desc = TensorDescriptor.FromString(command)
-            if req_desc.shape and req_desc.dtype:
-                writer.write(self.uploads.create_source(req_desc).SerializeToString())
-                return
+            candidate = TensorDescriptor.FromString(command)
+            if candidate.shape and candidate.dtype:
+                req_desc = candidate
         except Exception:
-            pass
+            req_desc = None
 
-        # Chunk upload - use ChunkUpload wrapper
+        if req_desc is not None:
+            # Source creation -- handler runs outside the try, so its errors propagate.
+            writer.write(self.uploads.create_source(req_desc).SerializeToString())
+            return
+
+        # Chunk upload. Only the *parse* is guarded here (a command that is
+        # neither a source descriptor nor a decodable ChunkUpload is genuinely
+        # malformed); write_chunk runs outside so its own FlightServerError
+        # translation is preserved verbatim.
         try:
             upload = ChunkUpload.FromString(command)
-            self.uploads.write_chunk(upload, reader)
-            return
         except Exception as e:
             raise flight.FlightServerError(f"Invalid upload command: {e}")
+        self.uploads.write_chunk(upload, reader)
 
 
 def serve(
