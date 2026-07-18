@@ -122,7 +122,6 @@ _SIDECAR_SCHEMA = pa.schema(
         pa.field("byte_length", pa.int64()),
         pa.field("size_bytes", pa.int64()),
         pa.field("offset", pa.int64()),
-        pa.field("created_at", pa.float64()),
     ]
 )
 
@@ -639,7 +638,6 @@ class ArrowFileBackend(CacheBackend):
                 pa.array([r[2] for r in records], type=pa.int64()),
                 pa.array([r[3] for r in records], type=pa.int64()),
                 pa.array([r[4] for r in records], type=pa.int64()),
-                pa.array([st.st_mtime] * len(records), type=pa.float64()),
             ],
             schema=schema,
         )
