@@ -103,8 +103,10 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
     def get_metadata(self):
         return {}
 
-    def get_tensor_adapter(self, tensor_id):
-        return self
+    # get_tensor_adapter: inherit the total single-tensor base -- it returns self
+    # for the source's sole tensor and raises TensorNotFound for an unknown
+    # nonempty field, so a typo'd array_id no longer silently reads the base
+    # tensor (issue #378).
 
     @classmethod
     def create_from_config(

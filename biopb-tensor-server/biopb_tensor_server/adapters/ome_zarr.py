@@ -16,6 +16,7 @@ from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.base import TensorReadPlan
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.downsample import normalize_reduction_method
+from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.base import BackendAdapter
@@ -867,21 +868,23 @@ class OmeZarrAdapter(ZarrAdapter):
         # Parse tensor_id as 'well_name/field_index'
         parts = tensor_id.split("/")
         if len(parts) != 2:
-            raise ValueError(
-                f"HCS tensor_id must be 'well_name/field_index', got: {tensor_id}"
+            raise InvalidTensorId(
+                f"HCS tensor_id must be 'well_name/field_index', got: {tensor_id}",
+                reason="malformed_tensor_id",
             )
 
         well_name, field_idx_str = parts
         try:
             field_idx = int(field_idx_str)
-        except ValueError:
-            raise ValueError(
-                f"HCS field_index must be an integer, got: {field_idx_str}"
-            )
+        except ValueError as e:
+            raise InvalidTensorId(
+                f"HCS field_index must be an integer, got: {field_idx_str}",
+                reason="malformed_tensor_id",
+            ) from e
 
         # Check if well exists
         if well_name not in self._hcs_well_paths:
-            raise ValueError(f"Unknown well: {well_name}")
+            raise TensorNotFound(f"Unknown well: {well_name}", reason="unknown_field")
 
         field_key = f"{well_name}/{field_idx}"
 
@@ -922,8 +925,9 @@ class OmeZarrAdapter(ZarrAdapter):
         images = well_info.get("images", [])
 
         if field_idx >= len(images):
-            raise ValueError(
-                f"Field index {field_idx} out of range for well {well_name} (has {len(images)} fields)"
+            raise TensorNotFound(
+                f"Field index {field_idx} out of range for well {well_name} (has {len(images)} fields)",
+                reason="unknown_field",
             )
 
         field_path = images[field_idx].get("path", str(field_idx))
