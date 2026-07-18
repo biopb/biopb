@@ -53,6 +53,70 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     assert server.shutdown_calls == 1
 
 
+def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
+    monkeypatch,
+):
+    """`launch` must install the SIGTERM->KeyboardInterrupt handler.
+
+    Regression for biopb/biopb#516: under the control supervisor, `launch`
+    relied on uvicorn to handle SIGTERM, but uvicorn reverts SIGTERM to the
+    default (terminate) disposition when its loop closes, so the process was
+    signal-killed (exit 143) before the `finally` reached `_graceful_shutdown`
+    and the cache process lock leaked on every restart. Owning the handler
+    routes SIGTERM through `except KeyboardInterrupt`/`finally` instead. The
+    handler must be installed *before* the blocking HTTP server starts.
+    """
+    order: list[str] = []
+
+    flight_server = SimpleNamespace(serve=lambda: None)
+    source_manager = _FakeStoppable()
+    watcher = _FakeStoppable()
+    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+
+    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *args, **kwargs: None)
+    # Loopback bind with no token -> local mode (no token printing).
+    monkeypatch.setattr(cli, "_resolve_launch_token", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli,
+        "_setup_flight_server",
+        lambda *args, **kwargs: (flight_server, source_manager, watcher, None),
+    )
+    monkeypatch.setattr(
+        cli, "_install_sigterm_handler", lambda: order.append("install_sigterm")
+    )
+    # Stand in for uvicorn returning after a SIGTERM-driven graceful stop.
+    monkeypatch.setattr(
+        cli,
+        "run_http_server",
+        lambda **kwargs: order.append("run_http_server"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_graceful_shutdown",
+        lambda *args, **kwargs: order.append("graceful_shutdown"),
+    )
+
+    # Pass explicit values rather than typer OptionInfo defaults (calling the
+    # command as a plain function bypasses typer's default resolution; a truthy
+    # OptionInfo for open_browser would otherwise launch a real browser).
+    cli.launch(
+        config=Path("unused.json"),
+        log_level=None,
+        log_scope_biopb=True,
+        web_port=8816,
+        web_host="127.0.0.1",
+        token=None,
+        open_browser=False,
+        web_url="http://localhost:5173",
+        cors_origins=None,
+        log_file=None,
+    )
+
+    assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
+
+
 def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     """Shutdown must close the cache so the file-backend process lock is removed.
 

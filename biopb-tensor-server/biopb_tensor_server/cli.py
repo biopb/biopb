@@ -1030,11 +1030,21 @@ def launch(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
 
+    # Treat SIGTERM (the control supervisor's graceful stop, `docker/slurm stop`)
+    # like Ctrl+C so the post-uvicorn `finally` below actually runs. uvicorn does
+    # handle SIGTERM for its own HTTP shutdown, but when its event loop closes it
+    # reverts SIGTERM to the default (terminate) disposition -- so the process is
+    # signal-killed (exit 143) before control reaches `_graceful_shutdown`, and
+    # the file-cache process lock is left behind as a stale lock on every control
+    # stop/restart (biopb/biopb#516; #512's lock-release-first reorder is moot on
+    # this path until the finally actually runs). Owning the handler here routes
+    # SIGTERM through `except KeyboardInterrupt`/`finally` instead. Harmless no-op
+    # on Windows, which uses the sentinel-file path in
+    # http_server._install_windows_shutdown_listener.
+    _install_sigterm_handler()
     # If launched under the control supervisor, self-terminate when it dies
     # uncatchably so a crashed/killed control never orphans this plane into a
     # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
-    # uvicorn handles SIGTERM for the graceful stop path, so no SIGTERM handler
-    # here — only the uncatchable-death backstop.
     _deathwatch.install()
 
     # --- Token management ---
