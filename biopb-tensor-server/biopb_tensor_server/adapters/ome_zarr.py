@@ -15,8 +15,8 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescripto
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.base import TensorReadPlan
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
-from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 from biopb_tensor_server.core.downsample import normalize_reduction_method
+from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.base import BackendAdapter
