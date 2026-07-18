@@ -24,11 +24,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
-from biopb.tensor._chunk_codec import expand_compact_grid
-from biopb.tensor._pool import (
-    _build_dask_array_from_chunk_map,
-    _build_dask_array_from_compact_grid,
-)
+from biopb.tensor._pool import _build_dask_array_from_chunk_map
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -101,11 +97,6 @@ class _TensorContext:
     schema_metadata: Optional[Dict[str, str]] = (
         None  # For SHM transfer feature detection
     )
-    # A compact-grid response (biopb/biopb#346): the server omitted the endpoint
-    # list and the grid is regular, so `endpoints` is left empty and the client
-    # builds the dask array directly from the descriptor (vectorized, no
-    # per-chunk list). get_tensor_pb expands it lazily only when it must serialize.
-    is_compact: bool = False
 
 
 def _request_crop_slices(
@@ -160,7 +151,6 @@ def _fetch_endpoints_via_get_flight_info(
     read_opt = TensorReadOption(
         tensor_id=descriptor.array_id,
         with_metadata=False,
-        compact_grid_ok=True,
     )
     if descriptor.HasField("slice_hint"):
         read_opt.slice_hint.CopyFrom(descriptor.slice_hint)
@@ -195,22 +185,16 @@ def _fetch_endpoints_via_get_flight_info(
     # Check schema version compatibility
     _check_wire_protocol(info.schema)
 
-    # Parse endpoints into chunk info. A compact-grid response (biopb/biopb#346)
-    # carries no endpoints and a chunk_array_id on the response descriptor; the
-    # client regenerates the exact (chunk_id, bounds) list from the grid instead.
-    response_desc = TensorDescriptor.FromString(info.descriptor.command)
-    if not info.endpoints and response_desc.chunk_array_id:
-        endpoints = expand_compact_grid(response_desc)
-        chunks = [chunk_id for chunk_id, _bounds in endpoints]
-        chunk_bounds_list = [bounds for _chunk_id, bounds in endpoints]
-    else:
-        chunks = []
-        chunk_bounds_list = []
-        for endpoint in info.endpoints:
-            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-            bounds = ChunkBounds.FromString(endpoint.app_metadata)
-            chunks.append(ticket.chunk_id)
-            chunk_bounds_list.append(bounds)
+    # Parse endpoints into chunk info. chunk_id is an opaque server-minted token
+    # (echoed back to do_get); a chunk's bounds ride on the endpoint's
+    # app_metadata, so the client never decodes the chunk_id byte format.
+    chunks = []
+    chunk_bounds_list = []
+    for endpoint in info.endpoints:
+        ticket = TensorTicket.FromString(endpoint.ticket.ticket)
+        bounds = ChunkBounds.FromString(endpoint.app_metadata)
+        chunks.append(ticket.chunk_id)
+        chunk_bounds_list.append(bounds)
 
     client.close()
     logger.debug(f"_fetch_endpoints_via_get_flight_info: got {len(chunks)} endpoints")
@@ -1140,16 +1124,10 @@ class ChunkFetcher:
                 )
             slice_hint_proto = SliceHint(start=starts, stop=stops)
 
-        # Build TensorReadOption with flattened fields. compact_grid_ok opts into
-        # the compact response (biopb/biopb#346): a regular-grid plan comes back
-        # with no endpoints and a chunk_array_id, from which the client
-        # regenerates the (chunk_id, bounds) list -- O(1) instead of O(n_chunks)
-        # transfer/parse. An old server ignores the flag and still returns the
-        # explicit list, so this is always safe.
+        # Build TensorReadOption with flattened fields.
         read_opt = TensorReadOption(
             tensor_id=tensor_id,
             with_metadata=False,
-            compact_grid_ok=True,
         )
         if slice_hint_proto is not None:
             read_opt.slice_hint.CopyFrom(slice_hint_proto)
@@ -1182,20 +1160,14 @@ class ChunkFetcher:
             response_desc
         )
 
-        # Parse endpoints into (chunk_id, bounds) pairs. A compact-grid response
-        # (biopb/biopb#346) omits the endpoint list and carries a chunk_array_id on
-        # the descriptor; mark it compact and leave endpoints empty -- get_tensor
-        # builds the dask array directly from the descriptor (vectorized), and only
-        # get_tensor_pb expands the list, lazily, when it has to serialize it.
-        is_compact = bool(not info.endpoints and response_desc.chunk_array_id)
-        if is_compact:
-            endpoints = []
-        else:
-            endpoints = []
-            for endpoint in info.endpoints:
-                ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-                bounds = ChunkBounds.FromString(endpoint.app_metadata)
-                endpoints.append((ticket.chunk_id, bounds))
+        # Parse endpoints into (chunk_id, bounds) pairs. chunk_id is an opaque
+        # server-minted token (echoed back to do_get); a chunk's bounds ride on the
+        # endpoint's app_metadata, so the client never decodes the chunk_id format.
+        endpoints = []
+        for endpoint in info.endpoints:
+            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
+            bounds = ChunkBounds.FromString(endpoint.app_metadata)
+            endpoints.append((ticket.chunk_id, bounds))
 
         return _TensorContext(
             descriptor=response_desc,
@@ -1203,7 +1175,6 @@ class ChunkFetcher:
             read_opt=read_opt,
             original_slice_hint=slice_hint_proto,
             schema_metadata=schema_metadata,
-            is_compact=is_compact,
         )
 
     def get_tensor(
@@ -1242,28 +1213,15 @@ class ChunkFetcher:
             reduction_method=reduction_method,
         )
 
-        # Build dask array from context. A compact-grid response carries no
-        # endpoints; build straight from the descriptor with the vectorized
-        # (numpy) path, which skips materializing the per-chunk list and dict
-        # (biopb/biopb#346). Explicit-endpoint responses go through the chunk_map
-        # builder unchanged.
-        if ctx.is_compact:
-            dask_arr = _build_dask_array_from_compact_grid(
-                ctx.descriptor,
-                self._state.location,
-                self._state.token,
-                self._state.cache_bytes,
-                ctx.schema_metadata,
-            )
-        else:
-            chunks = [ep[0] for ep in ctx.endpoints]
-            chunk_bounds_list = [ep[1] for ep in ctx.endpoints]
-            dask_arr = self._build_dask_array(
-                desc=ctx.descriptor,
-                chunks=chunks,
-                chunk_bounds=chunk_bounds_list,
-                schema_metadata=ctx.schema_metadata,
-            )
+        # Build dask array from the explicit (chunk_id, bounds) endpoints.
+        chunks = [ep[0] for ep in ctx.endpoints]
+        chunk_bounds_list = [ep[1] for ep in ctx.endpoints]
+        dask_arr = self._build_dask_array(
+            desc=ctx.descriptor,
+            chunks=chunks,
+            chunk_bounds=chunk_bounds_list,
+            schema_metadata=ctx.schema_metadata,
+        )
 
         # Crop to the originally requested region.
         # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
@@ -1319,12 +1277,9 @@ class ChunkFetcher:
             reduction_method=reduction_method,
         )
 
-        # Serialize endpoints. get_tensor_pb still ships the explicit list (the pb
-        # is consumed by tensor_from_pb on worker processes), so on a compact
-        # response expand the grid here -- the one place that needs the list.
-        endpoints = (
-            expand_compact_grid(ctx.descriptor) if ctx.is_compact else ctx.endpoints
-        )
+        # Serialize the explicit endpoint list (consumed by tensor_from_pb on
+        # worker processes).
+        endpoints = ctx.endpoints
         serialized_endpoints = []
         for chunk_id, bounds in endpoints:
             ticket = TensorTicket(chunk_id=chunk_id)

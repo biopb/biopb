@@ -194,16 +194,6 @@ class TensorReadPlan:
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
 
-    # True iff chunk_endpoints tile a regular Cartesian grid (uniform chunk_shape
-    # + edge remainder), so the plan is fully described by the descriptor's
-    # shape/chunk_shape/slice_hint/scale_hint and the endpoint list is redundant.
-    # Only such a plan is eligible for the compact-grid wire form (biopb/biopb#346).
-    # The base planner (`_get_read_plan`) always sets this. The remote-proxy
-    # forward path sets it True only when the upstream itself answered compact
-    # (so the localized grid is provably regular -- only the array_id changed);
-    # an explicit or irregular upstream response leaves it False.
-    regular_grid: bool = False
-
 
 def require_resolved(desc: TensorDescriptor) -> None:
     """Guard the read-planning boundary against an unresolved descriptor.
@@ -1092,13 +1082,7 @@ def _get_read_plan(
     if reduction_method:
         logical_desc.reduction_method = reduction_method
 
-    # The grid iterated above is a regular Cartesian tiling (uniform
-    # virtual_chunk_size + edge remainder), so it is eligible for the compact
-    # wire form (biopb/biopb#346). The two adapter overrides (ome_zarr, qptiff)
-    # delegate here for their precompute plans, so they inherit this; only the
-    # remote-proxy forward path builds a plan without it.
     return TensorReadPlan(
         descriptor=logical_desc,
         chunk_endpoints=logical_endpoints,
-        regular_grid=True,
     )

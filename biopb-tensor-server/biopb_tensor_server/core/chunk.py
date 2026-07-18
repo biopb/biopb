@@ -8,33 +8,200 @@ This module contains:
 """
 
 import logging
+import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-
-# The chunk-id byte codec is a wire contract shared with the client (which
-# regenerates chunk_ids in the compact-grid read path), so it lives in the core
-# `biopb` package -- one definition both sides import. Re-exported here so every
-# existing `from biopb_tensor_server.core.chunk import encode_chunk_id` (etc.)
-# keeps resolving unchanged (biopb/biopb#346).
-from biopb.tensor._chunk_codec import (
-    cache_key_for_chunk_id as cache_key_for_chunk_id,
-    decode_chunk_id as decode_chunk_id,
-    decode_scale_info as decode_scale_info,
-    encode_chunk_id as encode_chunk_id,
-    encode_chunk_id_with_scale as encode_chunk_id_with_scale,
-    expand_compact_grid as expand_compact_grid,
-    get_bounds_from_chunk_id as get_bounds_from_chunk_id,
-    is_scaled_chunk as is_scaled_chunk,
-    rewrite_chunk_id_array_id as rewrite_chunk_id_array_id,
-)
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.downsample import ceil_div
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# chunk_id byte codec -- a STRICTLY SERVER-SIDE concern.
+#
+# A chunk_id identifies a chunk by (array_id, bounds) and is a pure function of
+# them. The server mints chunk_ids into Flight endpoint tickets and decodes them
+# on do_get; clients treat a chunk_id as an OPAQUE token (they echo the ticket
+# back and read a chunk's bounds from the endpoint's app_metadata), so this
+# format is never regenerated off-server. Keeping the codec here -- not in the
+# shared `biopb` core -- lets the server evolve it without a lockstep client/Java
+# upgrade (the compact-grid read plan that shared it, biopb/biopb#346, was
+# reverted for exactly that coupling cost).
+#
+# Format:
+# - 4 bytes: array_id length (uint32, big-endian)
+# - N bytes: array_id (UTF-8)
+# - 2 bytes: ndim (uint16, big-endian)
+# - 8*ndim bytes: bounds.start (int64, big-endian)
+# - 8*ndim bytes: bounds.stop (int64, big-endian)
+# - [scaled only] 8*ndim bytes: scale_hint (int64) + 2 bytes method len + method
+# =============================================================================
+
+
+def encode_chunk_id(
+    array_id: str,
+    bounds: "ChunkBounds",
+) -> bytes:
+    """Encode array_id and bounds into chunk_id."""
+    array_id_bytes = array_id.encode("utf-8")
+    ndim = len(bounds.start)
+
+    parts = [
+        struct.pack(">I", len(array_id_bytes)),
+        array_id_bytes,
+        struct.pack(">H", ndim),
+    ]
+
+    for val in bounds.start:
+        parts.append(struct.pack(">q", int(val)))
+    for val in bounds.stop:
+        parts.append(struct.pack(">q", int(val)))
+
+    return b"".join(parts)
+
+
+def rewrite_chunk_id_array_id(chunk_id: bytes, new_array_id: str) -> bytes:
+    """Replace only the array_id field of a chunk_id, preserving everything else.
+
+    The array_id is a self-describing length-prefixed field at the very front of
+    the chunk_id (``[uint32 len][array_id utf-8]``); every byte after it -- ndim,
+    the start/stop bounds, and any scale suffix on a scaled chunk_id -- is
+    independent of the array_id string. So a remote-tensor *proxy* can map a
+    chunk_id between its local (possibly alias-namespaced) array_id and the
+    upstream's array_id with a pure byte splice, without understanding bounds or
+    scale encoding ("understands nothing"). The splice round-trips for both
+    regular and scaled chunk_ids because ``decode_chunk_id`` / ``is_scaled_chunk``
+    / ``decode_scale_info`` all recompute their offsets from the (new) length
+    prefix.
+    """
+    old_len = struct.unpack(">I", chunk_id[:4])[0]
+    tail = chunk_id[4 + old_len :]
+    new_bytes = new_array_id.encode("utf-8")
+    return struct.pack(">I", len(new_bytes)) + new_bytes + tail
+
+
+def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
+    """Decode array_id and bounds from chunk_id. Works for both regular
+    and virtual chunk_ids (ignores virtual payload)."""
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
+
+    offset = 4 + array_id_len
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
+    offset += 2
+
+    start = []
+    for _ in range(ndim):
+        start.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
+        offset += 8
+
+    stop = []
+    for _ in range(ndim):
+        stop.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
+        offset += 8
+
+    bounds = ChunkBounds(start=start, stop=stop)
+
+    return array_id, bounds
+
+
+def get_bounds_from_chunk_id(chunk_id: bytes) -> "ChunkBounds":
+    """Extract bounds from chunk_id."""
+    _, bounds = decode_chunk_id(chunk_id)
+    return bounds
+
+
+def encode_chunk_id_with_scale(
+    array_id: str,
+    bounds: ChunkBounds,
+    scale_hint: Tuple[int, ...],
+    reduction_method: str,
+) -> bytes:
+    """Encode chunk_id with bounds and scale info appended.
+
+    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64), then
+    2 bytes method length (uint16) + method string. Detection: if
+    ``len(chunk_id) > bounds_end``, it's a scaled chunk.
+    """
+    base = encode_chunk_id(array_id, bounds)
+
+    method_bytes = reduction_method.encode("utf-8")
+
+    scale_payload = b"".join(
+        [
+            b"".join(struct.pack(">q", s) for s in scale_hint),
+            struct.pack(">H", len(method_bytes)),
+            method_bytes,
+        ]
+    )
+
+    return base + scale_payload
+
+
+def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
+    """``(ndim, bounds_end)`` for a chunk_id.
+
+    ``bounds_end`` is where the standard encoding (array_id + ndim + start +
+    stop) ends; any bytes past it are the scale payload of a scaled chunk_id
+    (see :func:`encode_chunk_id_with_scale`).
+    """
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    offset = 4 + array_id_len
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
+    return ndim, offset + 2 + ndim * 8 + ndim * 8
+
+
+def is_scaled_chunk(chunk_id: bytes) -> bool:
+    """Check if chunk_id has scale info appended after bounds."""
+    _, bounds_end = _bounds_end(chunk_id)
+    return len(chunk_id) > bounds_end
+
+
+def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
+    """Canonical cache key for a chunk_id: the reduction method is advisory.
+
+    For a scaled chunk_id, returns array_id + bounds + scale_hint with the
+    trailing ``(uint16 method_len + method bytes)`` suffix dropped, so requests
+    that differ only in reduction_method share one cache entry -- the method
+    only decides how a true miss is computed (biopb/biopb#76). Non-scaled
+    chunk_ids are returned unchanged.
+
+    The result is an opaque cache key: it is NOT a valid chunk_id and must not
+    be fed to :func:`decode_scale_info` or forwarded on the wire.
+    """
+    ndim, bounds_end = _bounds_end(chunk_id)
+    if len(chunk_id) <= bounds_end:
+        return chunk_id
+    return chunk_id[: bounds_end + ndim * 8]
+
+
+def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
+    """Decode scale_hint and reduction_method from scaled chunk_id."""
+    ndim, bounds_end = _bounds_end(chunk_id)
+
+    # Decode scale_hint
+    scale_hint = []
+    for ax in range(ndim):
+        scale_hint.append(
+            struct.unpack(
+                ">q", chunk_id[bounds_end + ax * 8 : bounds_end + ax * 8 + 8]
+            )[0]
+        )
+
+    # Decode method
+    method_offset = bounds_end + ndim * 8
+    method_len = struct.unpack(">H", chunk_id[method_offset : method_offset + 2])[0]
+    method = chunk_id[method_offset + 2 : method_offset + 2 + method_len].decode(
+        "utf-8"
+    )
+
+    return tuple(scale_hint), method
+
 
 # Constants
 # 64MB threshold for chunk splitting - enables parallel Flight transfers

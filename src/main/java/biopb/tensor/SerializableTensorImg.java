@@ -196,8 +196,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
         // Build TensorReadOption with flattened fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setTensorId(tensorId)
-                .setCompactGridOk(true);
+                .setTensorId(tensorId);
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);
@@ -231,19 +230,14 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             long[] dims = toLongArray(responseDescriptor.getShapeList());
             int[] cellDimensions = toIntArray(responseDescriptor.getChunkShapeList());
 
-            // resolveFlightEndpoints regenerates the endpoints if the server
-            // answered compact (biopb/biopb#346); an explicit response passes
-            // through unchanged.
-            List<FlightEndpoint> endpoints = CompactGrid.resolveFlightEndpoints(info);
-
             ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
-                    endpoints, dims, cellDimensions,
+                    info.getEndpoints(), dims, cellDimensions,
                     ep -> parseChunkBounds(ep.getAppMetadata()),
                     ep -> ep);
 
             if (endpointIndex == null) {
                 // Materialize all data into an ArrayImg
-                return materializeArray(client, authOption, responseDescriptor, type, dims, endpoints);
+                return materializeArray(client, authOption, responseDescriptor, type, dims, info.getEndpoints());
             }
 
             // Create lazy CellImg

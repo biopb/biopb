@@ -1278,50 +1278,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"Metadata error for {source_id}: {e}"
             ) from e
 
-        # Compact-grid response (biopb/biopb#346): when the client opted in and
-        # the plan is a regular tiling, omit the whole endpoint list and let the
-        # client regenerate every chunk_id + bounds from the descriptor -- turning
-        # O(n_chunks) serialize/transfer/parse into O(1). The descriptor already
-        # carries shape/chunk_shape/scale_hint/reduction_method; we add the two
-        # things the client cannot otherwise recover:
-        #   * chunk_array_id -- the array_id the chunk_ids are encoded with, read
-        #     off an actual endpoint. It differs from descriptor.array_id on a
-        #     precompute plan (chunk_ids carry source_id/{level}); reading it from
-        #     the endpoint is correct for every planner without special-casing.
-        #   * the realized virtual-coordinate bounds [start, stop) as slice_hint,
-        #     taken from the first/last chunk (np.ndindex emits the min/max corner
-        #     first/last), so the client's virtual-grid reconstruction is exact
-        #     even for a full read (where slice_hint was otherwise unset and the
-        #     base extent is unrecoverable under a scale_hint's ceil-division).
-        if (
-            read_opt.compact_grid_ok
-            and read_plan.regular_grid
-            and read_plan.chunk_endpoints
-        ):
-            desc = read_plan.descriptor
-            chunk_array_id, first_bounds = decode_chunk_id(
-                read_plan.chunk_endpoints[0].chunk_id
-            )
-            _, last_bounds = decode_chunk_id(read_plan.chunk_endpoints[-1].chunk_id)
-            desc.chunk_array_id = chunk_array_id
-            desc.ClearField("slice_hint")
-            desc.slice_hint.start[:] = list(first_bounds.start)
-            desc.slice_hint.stop[:] = list(last_bounds.stop)
-            logger.debug(
-                "get_flight_info: compact grid, omitting %d endpoints",
-                len(read_plan.chunk_endpoints),
-            )
-            return flight.FlightInfo(
-                schema=schema,
-                descriptor=flight.FlightDescriptor.for_command(
-                    desc.SerializeToString()
-                ),
-                endpoints=[],
-                total_records=-1,
-                total_bytes=-1,
-            )
-
-        # Convert to FlightEndpoints
+        # Convert to FlightEndpoints. Each endpoint carries the server-minted
+        # chunk_id as an opaque ticket and the chunk's bounds as app_metadata;
+        # the client echoes the ticket back to do_get and never decodes the
+        # chunk_id byte format (a strictly server-side concern).
         endpoints = []
         for ce in read_plan.chunk_endpoints:
             ticket = TensorTicket(chunk_id=ce.chunk_id)

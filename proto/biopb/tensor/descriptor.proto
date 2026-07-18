@@ -127,23 +127,12 @@ message TensorDescriptor {
   // aligned 1:1 with physical_scale. "" means unknown.
   repeated string physical_unit = 12;
 
-  // Compact-grid read plan (biopb/biopb#346). Set by GetFlightInfo *only* when
-  // the client opted in with TensorReadOption.compact_grid_ok AND the plan is a
-  // regular chunk grid: the server then returns an EMPTY endpoint list and the
-  // client regenerates every (chunk_id, bounds) arithmetically from this
-  // descriptor -- turning O(n_chunks) plan transfer/parse into O(1). Its
-  // presence (non-empty) is the signal that compact mode is active; an empty
-  // endpoint list with an unset chunk_array_id means a genuinely empty tensor,
-  // not a compact plan.
-  //
-  // This is the array_id the chunk_ids are ENCODED with, which is NOT always
-  // array_id (field 1): on a precomputed-pyramid read the plan targets a level
-  // adapter whose chunk_ids carry `source_id/{level}`, while array_id is reset
-  // to the base tensor so the client still sees one tensor. The client MUST use
-  // this value (not array_id) when reconstructing chunk_ids. In compact mode the
-  // server also always sets slice_hint to the realized base-coordinate bounds
-  // [start, stop), so the reconstruction is unambiguous even for a full read.
-  string chunk_array_id = 13;
+  // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed
+  // when the chunk_id codec was made a strictly server-side concern (the client
+  // no longer regenerates chunk_ids). Reserved so the field number/name are never
+  // reused.
+  reserved 13;
+  reserved "chunk_array_id";
 }
 
 // One resolution level of a tensor's server-advertised pyramid.
@@ -221,15 +210,11 @@ message TensorReadOption {
   // Wrapped structure: {"type": source_type, "dim_label": [...], "metadata": {...}}
   bool with_metadata = 5;
 
-  // Opt in to a compact-grid read plan (biopb/biopb#346). When true and the
-  // resolved plan is a regular chunk grid, GetFlightInfo omits the per-chunk
-  // endpoint list and instead sets TensorDescriptor.chunk_array_id so the client
-  // regenerates every chunk_id + bounds arithmetically -- O(1) plan assembly
-  // instead of O(n_chunks). Purely additive: an old server ignores this field
-  // and returns the explicit endpoint list; a new server falls back to the
-  // explicit list for any non-regular plan (or the remote-proxy path), so the
-  // client always gets a working plan either way.
-  bool compact_grid_ok = 6;
+  // 6 was compact_grid_ok, the opt-in to a compact-grid read plan
+  // (biopb/biopb#346); removed when the chunk_id codec was made a strictly
+  // server-side concern. Reserved so the field number/name are never reused.
+  reserved 6;
+  reserved "compact_grid_ok";
 }
 
 // Client command for GetFlightInfo requests.

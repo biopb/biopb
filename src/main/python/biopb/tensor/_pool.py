@@ -37,7 +37,6 @@ from dask.blockwise import BlockwiseDep, BlockwiseDepDict, blockwise as _blockwi
 from dask.delayed import delayed
 from dask.highlevelgraph import HighLevelGraph
 
-from biopb.tensor._chunk_codec import compact_grid_arrays
 from biopb.tensor.ticket_pb2 import TensorTicket
 
 logger = logging.getLogger(__name__)
@@ -786,11 +785,10 @@ def _regular_blockwise_array(
 ) -> da.Array:
     """Wrap a per-block ``BlockwiseDep`` in a single ``Blockwise`` (map_blocks) layer.
 
-    Shared by the two regular-grid builders (``_build_dask_array_from_chunk_map`` and
-    ``_build_dask_array_from_compact_grid``); ``dep`` is the only thing that differs
-    -- a materialized ``BlockwiseDepDict`` vs. a numpy-backed :class:`GridChunkDep`.
-    Built directly rather than via ``da.map_blocks`` because the dep must be indexed
-    like the output so each task gets only its own entry (biopb/biopb#278).
+    Used by the regular-grid builder ``_build_dask_array_from_chunk_map`` with a
+    materialized ``BlockwiseDepDict`` dep. Built directly rather than via
+    ``da.map_blocks`` because the dep must be indexed like the output so each task
+    gets only its own entry (biopb/biopb#278).
     """
     out_ind = tuple(range(len(chunks)))
     layer = _blockwise(
@@ -811,87 +809,3 @@ def _regular_blockwise_array(
     )
     graph = HighLevelGraph.from_collections(name, layer, dependencies=[])
     return da.Array(graph, name, chunks, dtype=dtype)
-
-
-class GridChunkDep(BlockwiseDep):
-    """Numpy-backed per-block dependency for a regular chunk grid (biopb/biopb#346).
-
-    The compact-grid alternative to a materialized ``BlockwiseDepDict``: instead of
-    building a dict of ``n_chunks`` ``block_index -> (chunk_id, start, stop)`` entries
-    up front (an O(n_chunks) Python loop over ``ChunkBounds`` objects), the triple is
-    gathered from columnar numpy arrays on ``__getitem__``. Constructing the array
-    therefore costs no per-chunk Python work, and -- because ``Blockwise`` only
-    indexes the blocks a compute actually needs -- a culled slice touches just the
-    blocks it reads. Same contract as ``BlockwiseDepDict``: indexed by a C-order block
-    index, returns the argument passed to :func:`_fetch_chunk_block`. Pickle-safe (holds
-    only numpy arrays and tuples), so it round-trips to distributed workers.
-    """
-
-    def __init__(
-        self,
-        chunk_ids: np.ndarray,
-        lstarts: np.ndarray,
-        lstops: np.ndarray,
-        numblocks: Tuple[int, ...],
-        produces_tasks: bool = False,
-    ):
-        self.chunk_ids = chunk_ids  # object array of bytes, C-order
-        self.lstarts = lstarts  # (n_chunks, ndim) int64
-        self.lstops = lstops  # (n_chunks, ndim) int64
-        self.numblocks = tuple(int(b) for b in numblocks)
-        self.produces_tasks = produces_tasks
-        # C-order strides to flatten a block index into the columnar row.
-        strides: List[int] = []
-        acc = 1
-        for b in reversed(self.numblocks):
-            strides.append(acc)
-            acc *= b
-        self._strides = tuple(reversed(strides))
-
-    def __getitem__(self, idx: Tuple[int, ...]) -> Tuple[bytes, np.ndarray, np.ndarray]:
-        lin = 0
-        for i, s in zip(idx, self._strides, strict=True):
-            lin += int(i) * s
-        return (self.chunk_ids[lin], self.lstarts[lin], self.lstops[lin])
-
-    def __len__(self) -> int:
-        n = 1
-        for b in self.numblocks:
-            n *= b
-        return n
-
-
-def _build_dask_array_from_compact_grid(
-    descriptor,
-    location: str,
-    token: Optional[str],
-    cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]],
-) -> da.Array:
-    """Build the lazy dask array straight from a compact-grid descriptor (#346).
-
-    The vectorized counterpart to going through ``expand_compact_grid`` ->
-    ``ChunkBounds`` list -> ``chunk_map`` -> ``_build_dask_array_from_chunk_map``:
-    :func:`compact_grid_arrays` produces the grid as numpy columns in a few array
-    ops, a :class:`GridChunkDep` wraps them with no per-chunk Python loop, and the
-    layer name is the O(1) grid fingerprint (the ids are a pure function of it, so
-    hashing the ``n_chunks`` ids is unnecessary). Used only on the known-regular
-    compact path; every other read still flows through the chunk_map builder.
-    """
-    grid = compact_grid_arrays(descriptor)
-    dtype = np.dtype(descriptor.dtype)
-    numblocks = tuple(len(c) for c in grid.grid_chunks)
-    dep = GridChunkDep(grid.chunk_ids, grid.lstarts, grid.lstops, numblocks)
-    name = "biopb-tensor-chunk-" + tokenize(
-        grid.fingerprint, location, token, cache_bytes, schema_metadata, dtype
-    )
-    return _regular_blockwise_array(
-        name,
-        dep,
-        grid.grid_chunks,
-        dtype,
-        location,
-        token,
-        cache_bytes,
-        schema_metadata,
-    )
