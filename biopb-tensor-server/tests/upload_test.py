@@ -519,6 +519,143 @@ class TestServerDoPutHandler:
             CacheManager.reset()
 
 
+class TestDoPutErrorTranslation:
+    """A create-source failure on the DoPut path must surface as itself, not be
+    swallowed by command discrimination and mis-reported (biopb/biopb#354).
+
+    The historical do_put used *parse-success + no-exception* as its command
+    discriminator, so a genuine create error raised after a good TensorDescriptor
+    parse fell through to the ChunkUpload branch and the client saw a misleading
+    "Invalid upload command". These tests drive both the do_put wire path and the
+    equivalent create_source Flight action.
+    """
+
+    class _MockWriter:
+        """Minimal FlightMetadataWriter: capture the response bytes."""
+
+        def __init__(self):
+            self.written = []
+
+        def write(self, buf):
+            self.written.append(buf)
+
+    @staticmethod
+    def _server(**kwargs):
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        return TensorFlightServer(
+            location="grpc://localhost:0", writable=True, **kwargs
+        )
+
+    def _do_put(self, server, req_desc):
+        descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
+        server.do_put(None, descriptor, None, self._MockWriter())
+
+    def _create_source_action(self, server, req_desc):
+        action = flight.Action("create_source", req_desc.SerializeToString())
+        list(server.do_action(None, action))
+
+    # -- invalid array_id prefix ------------------------------------------------
+
+    def test_do_put_invalid_prefix_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "Invalid array_id format" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    def test_action_invalid_prefix_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
+            self._create_source_action(server, req_desc)
+
+    # -- missing write_dir ------------------------------------------------------
+
+    def test_do_put_missing_write_dir_surfaces_real_error(self):
+        server = self._server(write_dir=None)
+        req_desc = TensorDescriptor(
+            array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "write_dir not configured" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    def test_action_missing_write_dir_surfaces_real_error(self):
+        server = self._server(write_dir=None)
+        req_desc = TensorDescriptor(
+            array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
+            self._create_source_action(server, req_desc)
+
+    # -- malformed metadata_json ------------------------------------------------
+
+    def test_do_put_malformed_metadata_json_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:test",
+            shape=[10, 10],
+            dtype="uint8",
+            chunk_shape=[5, 5],
+            metadata_json="{not valid json",
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "invalid metadata_json" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    def test_action_malformed_metadata_json_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:test",
+            shape=[10, 10],
+            dtype="uint8",
+            chunk_shape=[5, 5],
+            metadata_json="{not valid json",
+        )
+        with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
+            self._create_source_action(server, req_desc)
+
+    def test_do_put_malformed_metadata_json_ome_zarr(self):
+        """The ome_zarr branch's metadata_json is validated too, not just cache."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = self._server(write_dir=Path(tmpdir))
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:test",
+                shape=[10, 10],
+                dtype="uint8",
+                chunk_shape=[5, 5],
+                metadata_json="{not valid json",
+            )
+            with pytest.raises(
+                flight.FlightServerError, match="invalid metadata_json"
+            ):
+                self._do_put(server, req_desc)
+
+    # -- the good path still writes the resolved descriptor ---------------------
+
+    def test_do_put_valid_create_writes_response(self):
+        """A well-formed create still round-trips its resolved descriptor."""
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        writer = self._MockWriter()
+        descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
+        server.do_put(None, descriptor, None, writer)
+
+        assert len(writer.written) == 1
+        response = TensorDescriptor.FromString(writer.written[0])
+        assert response.array_id.startswith("cache_")
+
+
 class TestChunkUpload:
     """Tests for chunk upload handling."""
 

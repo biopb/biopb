@@ -177,9 +177,7 @@ class UploadManager:
             else:
                 source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
 
-            ome_metadata = (
-                json.loads(req_desc.metadata_json) if req_desc.metadata_json else {}
-            )
+            ome_metadata = self._parse_metadata_json(req_desc.metadata_json)
 
             adapter = CachedSourceAdapter(
                 source_id=source_id,
@@ -222,7 +220,7 @@ class UploadManager:
 
             # Write OME metadata
             if req_desc.metadata_json:
-                zattrs = json.loads(req_desc.metadata_json)
+                zattrs = self._parse_metadata_json(req_desc.metadata_json)
             else:
                 zattrs = self._build_minimal_ome_metadata(req_desc)
 
@@ -308,6 +306,24 @@ class UploadManager:
         logger.debug(
             f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
         )
+
+    @staticmethod
+    def _parse_metadata_json(metadata_json: str) -> dict:
+        """Parse the request's ``metadata_json``, translating a malformed payload
+        into a legible Flight error at the create boundary.
+
+        A bare ``json.loads`` would raise ``JSONDecodeError``: on the DoPut path
+        it is swallowed by the command-discrimination try (mis-surfaced as
+        "Invalid upload command"), and on the ``create_source`` Flight action it
+        escapes as a generic internal error. Either way the client gets no
+        actionable signal, so map it to ``FlightServerError`` here (biopb/biopb#354).
+        """
+        if not metadata_json:
+            return {}
+        try:
+            return json.loads(metadata_json)
+        except json.JSONDecodeError as e:
+            raise flight.FlightServerError(f"invalid metadata_json: {e}")
 
     @staticmethod
     def _build_minimal_ome_metadata(desc: TensorDescriptor) -> dict:
