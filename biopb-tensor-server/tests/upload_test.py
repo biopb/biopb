@@ -57,6 +57,33 @@ class TestCachedSourceAdapter:
         assert desc.dtype == "float32"
         assert list(desc.dim_labels) == ["y", "x"]
 
+    def test_physical_scale_echoed_verbatim(self):
+        """An uploaded calibration is surfaced 1:1 by _physical_scale (issue #272)."""
+        adapter = CachedSourceAdapter(
+            source_id="test",
+            shape=[100, 200],
+            dtype="uint16",
+            chunk_shape=[50, 100],
+            dim_labels=["y", "x"],
+            physical_scale=[0.65, 0.65],
+            physical_unit=["µm", "µm"],
+        )
+
+        scale, unit = adapter._physical_scale()
+        assert scale == [0.65, 0.65]
+        assert unit == ["µm", "µm"]
+
+    def test_physical_scale_none_without_calibration(self):
+        """No uploaded calibration -> _physical_scale is None (base clears fields)."""
+        adapter = CachedSourceAdapter(
+            source_id="test",
+            shape=[100, 200],
+            dtype="uint16",
+            chunk_shape=[50, 100],
+            dim_labels=["y", "x"],
+        )
+        assert adapter._physical_scale() is None
+
     def test_list_tensor_descriptors_single(self):
         """Cache sources are single-tensor."""
         adapter = CachedSourceAdapter(
@@ -326,6 +353,75 @@ class TestServerDoPutHandler:
         adapter = server.sources.get(response_desc.array_id)
         assert adapter is not None
         assert isinstance(adapter, CachedSourceAdapter)
+
+    def test_create_source_threads_physical_scale(self):
+        """A calibrated upload survives the create_source round-trip (issue #272).
+
+        The DoPut request descriptor already carries physical_scale / physical_unit;
+        create_source must thread them onto the CachedSourceAdapter (so the read
+        hot path advertises them) and echo them on the response descriptor.
+        """
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer(
+            location="grpc://localhost:0",
+            writable=True,
+        )
+
+        req_desc = TensorDescriptor(
+            array_id="cache:calibrated",
+            shape=[10, 100, 100],
+            dtype="uint16",
+            chunk_shape=[1, 50, 50],
+            dim_labels=["z", "y", "x"],
+            physical_scale=[2.0, 0.325, 0.325],
+            physical_unit=["µm", "µm", "µm"],
+        )
+
+        response_desc = server.uploads.create_source(req_desc)
+
+        # The response echoes the uploader's calibration.
+        assert list(response_desc.physical_scale) == [2.0, 0.325, 0.325]
+        assert list(response_desc.physical_unit) == ["µm", "µm", "µm"]
+
+        # The registered adapter surfaces it on the read hot path.
+        adapter = server.sources.get(response_desc.array_id)
+        scale, unit = adapter._physical_scale()
+        assert scale == [2.0, 0.325, 0.325]
+        assert unit == ["µm", "µm", "µm"]
+
+    def test_create_source_ome_zarr_does_not_echo_physical_scale(self):
+        """The physical-scale echo is scoped to cache sources (issue #272).
+
+        Only CachedSourceAdapter stores AND re-serves the uploaded calibration,
+        so only cache responses echo it. The ome_zarr branch persists scale via
+        the .zattrs (the minimal-metadata path drops it), so echoing req_desc
+        here would advertise a vector a later read won't reproduce -- it must not.
+        """
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = TensorFlightServer(
+                location="grpc://localhost:0",
+                writable=True,
+                write_dir=Path(tmpdir),
+            )
+
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:calibrated",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+                dim_labels=["y", "x"],
+                physical_scale=[0.5, 0.5],
+                physical_unit=["µm", "µm"],
+            )
+
+            response_desc = server.uploads.create_source(req_desc)
+
+            # No unpersisted calibration is advertised on the zarr response.
+            assert list(response_desc.physical_scale) == []
+            assert list(response_desc.physical_unit) == []
 
     def test_create_source_cache_server_generated_name(self):
         """Create cache-backed source with server-generated name."""
