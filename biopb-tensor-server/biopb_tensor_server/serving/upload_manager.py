@@ -167,6 +167,14 @@ class UploadManager:
         """
         array_id = req_desc.array_id
 
+        # Physical calibration is echoed on the response only for cache sources:
+        # they store it in the adapter AND re-serve it verbatim on the read hot
+        # path. The ome_zarr branch persists scale via the .zattrs (or drops it),
+        # so echoing req_desc here would advertise a vector a later read won't
+        # reproduce -- left None for that branch (issue #272).
+        resp_physical_scale: Optional[List[float]] = None
+        resp_physical_unit: Optional[List[str]] = None
+
         if array_id.startswith("cache:"):
             # Cache-backed source
             provided_name = array_id[6:]  # After 'cache:'
@@ -181,6 +189,15 @@ class UploadManager:
                 json.loads(req_desc.metadata_json) if req_desc.metadata_json else {}
             )
 
+            # Carry the uploader's physical calibration through the round-trip so
+            # a client re-serving scaled data doesn't lose it (issue #272).
+            resp_physical_scale = (
+                list(req_desc.physical_scale) if req_desc.physical_scale else None
+            )
+            resp_physical_unit = (
+                list(req_desc.physical_unit) if req_desc.physical_unit else None
+            )
+
             adapter = CachedSourceAdapter(
                 source_id=source_id,
                 shape=list(req_desc.shape),
@@ -188,14 +205,8 @@ class UploadManager:
                 chunk_shape=list(req_desc.chunk_shape),
                 dim_labels=list(req_desc.dim_labels) if req_desc.dim_labels else None,
                 ome_metadata=ome_metadata,
-                # Carry the uploader's physical calibration through the round-trip
-                # so a client re-serving scaled data doesn't lose it (issue #272).
-                physical_scale=(
-                    list(req_desc.physical_scale) if req_desc.physical_scale else None
-                ),
-                physical_unit=(
-                    list(req_desc.physical_unit) if req_desc.physical_unit else None
-                ),
+                physical_scale=resp_physical_scale,
+                physical_unit=resp_physical_unit,
             )
             self._registry.register(source_id, adapter)
             self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
@@ -276,8 +287,8 @@ class UploadManager:
             shape=req_desc.shape,
             chunk_shape=req_desc.chunk_shape,
             dtype=req_desc.dtype,
-            physical_scale=req_desc.physical_scale,
-            physical_unit=req_desc.physical_unit,
+            physical_scale=resp_physical_scale,
+            physical_unit=resp_physical_unit,
         )
 
     def write_chunk(

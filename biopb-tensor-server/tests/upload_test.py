@@ -390,6 +390,39 @@ class TestServerDoPutHandler:
         assert scale == [2.0, 0.325, 0.325]
         assert unit == ["µm", "µm", "µm"]
 
+    def test_create_source_ome_zarr_does_not_echo_physical_scale(self):
+        """The physical-scale echo is scoped to cache sources (issue #272).
+
+        Only CachedSourceAdapter stores AND re-serves the uploaded calibration,
+        so only cache responses echo it. The ome_zarr branch persists scale via
+        the .zattrs (the minimal-metadata path drops it), so echoing req_desc
+        here would advertise a vector a later read won't reproduce -- it must not.
+        """
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = TensorFlightServer(
+                location="grpc://localhost:0",
+                writable=True,
+                write_dir=Path(tmpdir),
+            )
+
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:calibrated",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+                dim_labels=["y", "x"],
+                physical_scale=[0.5, 0.5],
+                physical_unit=["µm", "µm"],
+            )
+
+            response_desc = server.uploads.create_source(req_desc)
+
+            # No unpersisted calibration is advertised on the zarr response.
+            assert list(response_desc.physical_scale) == []
+            assert list(response_desc.physical_unit) == []
+
     def test_create_source_cache_server_generated_name(self):
         """Create cache-backed source with server-generated name."""
         from biopb_tensor_server.serving.server import TensorFlightServer
