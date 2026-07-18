@@ -140,43 +140,105 @@ def _install_sigterm_handler() -> None:
         pass
 
 
+# How long to wait for the Flight drain before proceeding without it. The
+# control supervisor force-kills after a ~10s graceful window; keep this well
+# under that so the bounded steps that follow (source-manager join) still fit.
+_FLIGHT_DRAIN_TIMEOUT_S = 3.0
+
+
 def _graceful_shutdown(
     source_manager, watcher, flight_server, precache_worker=None
 ) -> None:
-    """Best-effort orderly shutdown.
+    """Best-effort orderly shutdown -- release the cache lock first, never hang.
 
     Step ORDER is load-bearing for clean restarts (biopb/biopb#300). ``restart``
     force-kills the daemon after a bounded graceful window (``--timeout``, 10s by
-    default), so releasing the file-cache process lock must not sit behind the
-    slow teardown steps -- otherwise a mid-teardown SIGKILL leaves a stale lock
-    and the next boot pays the full crash-recovery scan (~110s on a large
-    caching-proxy cache):
+    default), so the file-cache process lock -- whose release is a local, instant,
+    upstream-independent operation -- must be dropped FIRST, before any step that
+    can block on an unresponsive upstream. Otherwise a mid-teardown SIGKILL leaves
+    a stale lock and the next boot pays a crash-recovery scan. On a caching proxy
+    the two slow steps are both upstream-coupled -- the Flight drain (in-flight
+    ``do_get`` streams gated on a possibly-dead upstream) and the source-manager
+    join (a blocking re-list RPC to that upstream) -- so they are sequenced
+    *after* the lock release and then individually bounded:
 
     1. Stop the precache worker -- no new warm writes.
-    2. Shut down the Flight server -- drains in-flight ``do_get`` streams, after
-       which nothing writes to the cache. On a caching proxy these streams are
-       upstream-latency-gated, so this is the step that can run long.
-    3. Close the cache immediately after -- clears the WAL and releases the
-       process lock while the state is quiescent, BEFORE the source manager's
-       up-to-5s thread join. So a SIGKILL during that join still finds the lock
-       released (no stale-lock recovery next boot).
-    4. Stop the source manager and watcher last -- neither touches the chunk
-       cache, so their teardown no longer gates the lock release.
+    2. Release the process lock + clear the WAL IMMEDIATELY. Cheap and
+       upstream-independent; leaves segment writers/mmaps OPEN (closing them here
+       would race the in-flight ``do_get`` reads the drain has not finished).
+       Clearing the WAL early is safe -- index rebuild tolerates a torn tail.
+       After this, even a SIGKILL during the steps below finds the lock released.
+    3. Drain the Flight server, BOUNDED. ``FlightServerBase.shutdown()`` takes no
+       timeout and can block unbounded on an upstream-gated stream, so run it in a
+       daemon thread and join with a short bound; on timeout, proceed (the process
+       is exiting; the OS reclaims the sockets). Never call ``flight_server.wait()``.
+    4. Full cache close ONLY on a clean drain -- closes writers/mmaps for proper
+       finalization (matters on Windows). Skipped if the drain timed out: a stuck
+       in-flight ``do_get`` may still touch an mmap, so closing it could segfault,
+       and the essential work (lock + WAL) already happened in step 2. ``close()``'s
+       own lock-release is then a harmless no-op (already released).
+    5. Stop the source manager (short join) and watcher last -- neither touches the
+       chunk cache and the lock is already gone, so a long join has no value; a
+       short bound keeps a blocked upstream re-list RPC from eating the budget.
 
     Each step is isolated so a failure in one still lets the others run.
     """
+    drain_ok = {"value": False}
 
-    def _close_cache() -> None:
-        # Clear the WAL + release the file-cache process lock (no-op for memory).
+    def _release_lock() -> None:
+        # Cheap, upstream-independent: clear the WAL + drop the process lock while
+        # leaving writers/mmaps open (no-op for the memory backend).
+        manager = CacheManager.get_instance()
+        if manager is not None:
+            manager.release_process_lock()
+
+    def _bounded_drain() -> None:
+        # FlightServerBase.shutdown() blocks until in-flight RPCs finish and takes
+        # no timeout, so on a caching proxy a do_get gated on a dead upstream can
+        # block forever. Bound it: run in a daemon thread, join briefly, and
+        # proceed on timeout. Do NOT call flight_server.wait().
+        if flight_server is None:
+            drain_ok["value"] = True
+            return
+        drain_thread = threading.Thread(
+            target=flight_server.shutdown,
+            name="flight-drain",
+            daemon=True,
+        )
+        drain_thread.start()
+        drain_thread.join(_FLIGHT_DRAIN_TIMEOUT_S)
+        if drain_thread.is_alive():
+            console.print(
+                "[yellow]Flight drain did not finish within "
+                f"{_FLIGHT_DRAIN_TIMEOUT_S:g}s (upstream unresponsive?); "
+                "proceeding -- the process is exiting and the cache lock is "
+                "already released.[/yellow]"
+            )
+        else:
+            drain_ok["value"] = True
+
+    def _close_cache_if_drained() -> None:
+        # Full close (writers/mmaps) only after a clean drain. If the drain timed
+        # out a stuck do_get could still touch an mmap, so closing mid-flight
+        # risks a segfault; the lock + WAL were already handled in step 2.
+        if not drain_ok["value"]:
+            return
         manager = CacheManager.get_instance()
         if manager is not None:
             manager.close()
 
     for label, action in (
         ("precache worker", lambda: precache_worker and precache_worker.stop()),
-        ("flight server", lambda: flight_server and flight_server.shutdown()),
-        ("cache", _close_cache),
-        ("source manager", lambda: source_manager and source_manager.stop()),
+        ("cache lock", _release_lock),
+        ("flight server", _bounded_drain),
+        ("cache", _close_cache_if_drained),
+        # Short join: the lock is already released and the thread is a daemon, so a
+        # long wait has no value and only risks burning the SIGKILL budget on a
+        # blocked upstream re-list.
+        (
+            "source manager",
+            lambda: source_manager and source_manager.stop(join_timeout=1),
+        ),
         ("watcher", lambda: watcher and watcher.stop()),
     ):
         try:

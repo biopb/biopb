@@ -1385,6 +1385,26 @@ class ArrowFileBackend(CacheBackend):
         """Get recovery status from last initialization."""
         return self._recovery_status
 
+    def release_process_lock(self) -> None:
+        """Release the process lock + clear the WAL, leaving handles OPEN.
+
+        The graceful-shutdown fast path (biopb/biopb#300). This is the cheap,
+        upstream-independent half of :meth:`close`: it clears the WAL and drops
+        the cross-process lock so the next boot never sees a stale lock, but it
+        deliberately does NOT close segment writers/mmaps -- doing so mid-flight
+        would race any ``do_get`` reads still draining. Completed writes are
+        already flushed to their segment files, and clearing the WAL early is
+        safe because ``_rebuild_index_from_segments`` tolerates a torn tail
+        message (it breaks on ArrowInvalid/EOF), so torn-write safety does not
+        depend on the WAL surviving. ``ProcessLock.release()`` is idempotent, so
+        a later :meth:`close` re-releasing the lock is a harmless no-op.
+        """
+        with self._lock:
+            if self._wal:
+                self._wal.clear()
+            if self._process_lock:
+                self._process_lock.release()
+
     def close(self) -> None:
         """Close backend and release resources.
 

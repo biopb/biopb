@@ -340,11 +340,22 @@ class SourceManager:
             out.append((source_id, mtime))
         return out
 
-    def stop(self) -> None:
-        """Stop the event processing loop."""
+    def stop(self, join_timeout: float = 5) -> None:
+        """Stop the event processing loop.
+
+        ``join_timeout`` bounds the wait for the daemon event-loop thread to
+        exit. The 5s default suits steady-state callers; graceful shutdown passes
+        a short value, because the thread may be blocked inside a *blocking*
+        upstream re-list RPC (``_reconcile_one_upstream`` ->
+        ``list_upstream_source_ids`` -> Flight ``list_flights``) and, being a
+        daemon, does not need a clean join at process exit -- a long wait there
+        only burns the shutdown budget (biopb/biopb#300). Deeper cancellation of
+        that in-flight upstream RPC (reconciler/remote_tensor/client) is the
+        follow-up; it is intentionally not attempted here.
+        """
         self._running = False
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=join_timeout)
             self._thread = None
         logger.info("SourceManager stopped")
 
