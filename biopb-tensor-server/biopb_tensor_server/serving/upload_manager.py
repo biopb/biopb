@@ -207,6 +207,17 @@ class UploadManager:
                     "write_dir not configured for zarr-backed sources"
                 )
 
+            # Resolve the .zattrs payload *before* touching disk. A malformed
+            # metadata_json must fail the request without leaving a partial
+            # .zarr behind -- an orphan that would also block a corrected retry
+            # under the same name, since zarr.create refuses an existing store
+            # (biopb/biopb#354). _build_minimal_ome_metadata is pure, so this is
+            # side-effect-free either way.
+            if req_desc.metadata_json:
+                zattrs = self._parse_metadata_json(req_desc.metadata_json)
+            else:
+                zattrs = self._build_minimal_ome_metadata(req_desc)
+
             zarr_path = self._write_dir / f"{zarr_name}.zarr"
             zarr_path.mkdir(parents=True, exist_ok=True)
 
@@ -217,12 +228,6 @@ class UploadManager:
                 dtype=req_desc.dtype,
                 chunks=req_desc.chunk_shape,
             )
-
-            # Write OME metadata
-            if req_desc.metadata_json:
-                zattrs = self._parse_metadata_json(req_desc.metadata_json)
-            else:
-                zattrs = self._build_minimal_ome_metadata(req_desc)
 
             with open(zarr_path / ".zattrs", "w") as f:
                 json.dump(zattrs, f)
@@ -309,21 +314,32 @@ class UploadManager:
 
     @staticmethod
     def _parse_metadata_json(metadata_json: str) -> dict:
-        """Parse the request's ``metadata_json``, translating a malformed payload
-        into a legible Flight error at the create boundary.
+        """Parse the request's ``metadata_json`` into an OME-metadata dict,
+        translating a malformed payload into a legible Flight error at the create
+        boundary.
 
         A bare ``json.loads`` would raise ``JSONDecodeError``: on the DoPut path
         it is swallowed by the command-discrimination try (mis-surfaced as
         "Invalid upload command"), and on the ``create_source`` Flight action it
         escapes as a generic internal error. Either way the client gets no
         actionable signal, so map it to ``FlightServerError`` here (biopb/biopb#354).
+
+        Well-formed JSON that isn't an object (e.g. ``"123"`` or ``"[...]"``) is
+        rejected too: callers spread the result into adapter metadata / a
+        ``.zattrs``, both of which require a mapping, so a non-dict must fail here
+        rather than surface as a confusing error downstream.
         """
         if not metadata_json:
             return {}
         try:
-            return json.loads(metadata_json)
+            parsed = json.loads(metadata_json)
         except json.JSONDecodeError as e:
-            raise flight.FlightServerError(f"invalid metadata_json: {e}")
+            raise flight.FlightServerError(f"invalid metadata_json: {e}") from e
+        if not isinstance(parsed, dict):
+            raise flight.FlightServerError(
+                f"invalid metadata_json: expected a JSON object, got {type(parsed).__name__}"
+            )
+        return parsed
 
     @staticmethod
     def _build_minimal_ome_metadata(desc: TensorDescriptor) -> dict:

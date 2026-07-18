@@ -624,7 +624,10 @@ class TestDoPutErrorTranslation:
             self._create_source_action(server, req_desc)
 
     def test_do_put_malformed_metadata_json_ome_zarr(self):
-        """The ome_zarr branch's metadata_json is validated too, not just cache."""
+        """The ome_zarr branch's metadata_json is validated too, not just cache --
+        and metadata is parsed *before* any disk write, so a rejected request
+        leaves no orphaned .zarr behind (which would block a corrected retry
+        under the same name; biopb/biopb#354)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             server = self._server(write_dir=Path(tmpdir))
             req_desc = TensorDescriptor(
@@ -636,6 +639,57 @@ class TestDoPutErrorTranslation:
             )
             with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
                 self._do_put(server, req_desc)
+            # Nothing was written to disk -- no partial store to block a retry.
+            assert list(Path(tmpdir).iterdir()) == []
+
+    def test_do_put_ome_zarr_retry_after_bad_metadata_succeeds(self):
+        """A malformed-metadata create must not poison a corrected retry under
+        the same name: parse-first leaves no store for zarr.create to collide
+        with (biopb/biopb#354)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = self._server(write_dir=Path(tmpdir))
+            bad = TensorDescriptor(
+                array_id="ome_zarr:retry",
+                shape=[10, 10],
+                dtype="uint8",
+                chunk_shape=[5, 5],
+                metadata_json="{not valid json",
+            )
+            with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
+                self._do_put(server, bad)
+
+            # Same name, now well-formed: previously the orphaned store made
+            # zarr.create raise instead of creating the source.
+            good = TensorDescriptor(
+                array_id="ome_zarr:retry",
+                shape=[10, 10],
+                dtype="uint8",
+                chunk_shape=[5, 5],
+            )
+            writer = self._MockWriter()
+            descriptor = flight.FlightDescriptor.for_command(good.SerializeToString())
+            server.do_put(None, descriptor, None, writer)
+
+            assert len(writer.written) == 1
+            response = TensorDescriptor.FromString(writer.written[0])
+            assert response.array_id.startswith("ome_zarr_")
+
+    def test_do_put_non_object_metadata_json_surfaces_real_error(self):
+        """Well-formed JSON that is not an object is rejected: callers spread the
+        result into a mapping, so a scalar/list must fail at the create boundary
+        rather than downstream (biopb/biopb#354)."""
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:test",
+            shape=[10, 10],
+            dtype="uint8",
+            chunk_shape=[5, 5],
+            metadata_json="[1, 2, 3]",
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "expected a JSON object" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
 
     # -- the good path still writes the resolved descriptor ---------------------
 
