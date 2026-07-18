@@ -23,10 +23,16 @@ class SourceUnresolvedError(ValueError):
     succeed.
     """
 
-    # Canonical gRPC code for the Flight boundary's ``extra_info`` (the class it
-    # maps to, FlightUnavailableError, cannot express the distinction): a bare
-    # unresolved source is a precondition failure -- resolvable, but not as-is.
-    grpc_code = "FAILED_PRECONDITION"
+    # The Flight boundary can only surface an unresolved source as the *retriable*
+    # ``FlightUnavailableError`` (UNAVAILABLE): pyarrow exposes no
+    # ``FAILED_PRECONDITION`` class, and the Python client's resolve-steering keys
+    # on that class + an "unresolved" message (biopb/tensor/_session.py). A blind
+    # retry is harmless -- ``GetFlightInfo`` never resolves on serve -- and an
+    # explicit ``resolve()`` is the real recovery. So this code matches the class
+    # the boundary picks (UNAVAILABLE), keeping ``extra_info``'s retryability in
+    # step with it; the permanent-vs-transient split below is a *domain*
+    # distinction (class identity), not a separate wire status.
+    grpc_code = "UNAVAILABLE"
 
 
 class SourceResolveRetriableError(SourceUnresolvedError):
@@ -36,9 +42,12 @@ class SourceResolveRetriableError(SourceUnresolvedError):
     reason (an ``OSError`` opening or probing the now-resident path) rather than
     a permanent one (bad format, no adapter). Subclasses
     ``SourceUnresolvedError`` so every existing ``except SourceUnresolvedError``
-    / ``except ValueError`` guard still catches it; the server boundary checks
-    for this subclass *first* and maps it to a retriable status (UNAVAILABLE),
-    while a bare ``SourceUnresolvedError`` maps to a permanent status.
+    / ``except ValueError`` guard still catches it. Both surface at the Flight
+    boundary as the same retriable ``UNAVAILABLE`` (see the base's ``grpc_code``
+    note -- pyarrow has no ``FAILED_PRECONDITION`` class and the client's
+    resolve-steering keys on ``FlightUnavailableError``); this subclass exists to
+    mark the transient cause for callers and logging, not to carry a distinct wire
+    status.
     """
 
     grpc_code = "UNAVAILABLE"

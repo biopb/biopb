@@ -34,7 +34,10 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     TensorResolutionError,
 )
-from biopb_tensor_server.serving.server import to_flight_error
+from biopb_tensor_server.serving.server import (
+    _adapter_lookup_error,
+    to_flight_error,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +92,18 @@ class _NamedTensorAdapter(_SingleTensorAdapter):
         self._tensor_name = tensor_name
 
 
+class _LegacyMissAdapter(_SingleTensorAdapter):
+    """An adapter that predates the typed taxonomy: raises a *bare* ``ValueError``
+    for an unknown field (as several not-yet-converted adapters still do). The read
+    verbs' fallback must coerce this to NOT_FOUND, not leak it as INTERNAL."""
+
+    def get_tensor_adapter(self, tensor_id):
+        field = self._within_source_field(tensor_id)
+        if field and field != self.source_id:
+            raise ValueError(f"legacy: unknown field {field!r}")
+        return self
+
+
 # --------------------------------------------------------------------------- #
 # 1. Domain taxonomy -> Flight boundary mapping
 # --------------------------------------------------------------------------- #
@@ -113,20 +128,87 @@ class TestBoundaryMapping:
         }
 
     def test_unresolved_maps_to_unavailable_retriable(self):
-        # A retriable/unresolved source is UNAVAILABLE (retry), never terminal.
-        assert isinstance(
-            to_flight_error(SourceUnresolvedError("x")), flight.FlightUnavailableError
-        )
-        assert isinstance(
-            to_flight_error(SourceResolveRetriableError("y")),
-            flight.FlightUnavailableError,
-        )
+        # Both unresolved variants -> retriable FlightUnavailableError, and the
+        # extra_info code AGREES with that class (UNAVAILABLE) -- no class-says-
+        # retry / code-says-terminal mismatch. The message carries "unresolved"
+        # so the Python client's resolve-steering (substring match) still fires.
+        for exc in (SourceUnresolvedError("x"), SourceResolveRetriableError("y")):
+            err = to_flight_error(exc)
+            assert isinstance(err, flight.FlightUnavailableError)
+            assert json.loads(err.extra_info)["code"] == "UNAVAILABLE"
+            assert "unresolved" in str(err).lower()
 
     def test_taxonomy_subclasses_valueerror_for_graceful_degradation(self):
         # Like SourceUnresolvedError: existing ``except ValueError`` guards catch it.
         assert issubclass(TensorResolutionError, ValueError)
         assert issubclass(TensorNotFound, TensorResolutionError)
         assert issubclass(InvalidTensorId, TensorResolutionError)
+
+
+# --------------------------------------------------------------------------- #
+# 1b. Shared adapter-lookup fallback (get_flight_info / do_get / chunk_locate)
+# --------------------------------------------------------------------------- #
+class TestAdapterLookupFallback:
+    """Every read verb maps an adapter-lookup miss through _adapter_lookup_error,
+    so the same exception surfaces identically no matter which verb hit it -- and a
+    bare ValueError/KeyError from an adapter that predates the typed taxonomy is
+    coerced to NOT_FOUND, never leaked as a "server bug" FlightInternalError."""
+
+    def test_bare_valueerror_coerced_to_not_found(self):
+        err = _adapter_lookup_error(ValueError("legacy adapter boom"), "ctx")
+        assert isinstance(err, flight.FlightServerError)
+        assert not isinstance(err, flight.FlightInternalError)
+        assert json.loads(err.extra_info) == {
+            "code": "NOT_FOUND",
+            "reason": "unknown_field",
+        }
+
+    def test_bare_keyerror_coerced_to_not_found(self):
+        err = _adapter_lookup_error(KeyError("missing"), "ctx")
+        assert isinstance(err, flight.FlightServerError)
+        assert not isinstance(err, flight.FlightInternalError)
+        assert json.loads(err.extra_info)["code"] == "NOT_FOUND"
+
+    def test_typed_taxonomy_passes_through_with_its_code(self):
+        assert (
+            json.loads(
+                _adapter_lookup_error(
+                    InvalidTensorId("bad", reason="malformed_tensor_id"), "ctx"
+                ).extra_info
+            )["code"]
+            == "INVALID_ARGUMENT"
+        )
+        assert (
+            json.loads(
+                _adapter_lookup_error(
+                    TensorNotFound("nope", reason="unknown_field"), "ctx"
+                ).extra_info
+            )["code"]
+            == "NOT_FOUND"
+        )
+
+    def test_unresolved_stays_retriable(self):
+        err = _adapter_lookup_error(SourceUnresolvedError("not hydrated"), "ctx")
+        assert isinstance(err, flight.FlightUnavailableError)
+        assert "unresolved" in str(err).lower()
+
+    def test_do_get_bare_valueerror_is_terminal_not_internal(self):
+        # End-to-end at the verb: a stale ticket naming an unknown field on a
+        # legacy adapter (bare ValueError) must NOT read as a server bug -- do_get
+        # coerces it the same way get_flight_info does (issue #378).
+        from biopb.tensor.ticket_pb2 import TensorTicket
+        from biopb_tensor_server.core.base import encode_chunk_id
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("legacy", _LegacyMissAdapter("legacy"))
+        chunk_id = encode_chunk_id(
+            "legacy/@bad", ChunkBounds(start=[0, 0], stop=[4, 4])
+        )
+        ticket = flight.Ticket(TensorTicket(chunk_id=chunk_id).SerializeToString())
+        with pytest.raises(flight.FlightServerError) as ei:
+            server.do_get(None, ticket)
+        assert not isinstance(ei.value, flight.FlightInternalError)
+        assert json.loads(ei.value.extra_info)["code"] == "NOT_FOUND"
 
 
 # --------------------------------------------------------------------------- #
