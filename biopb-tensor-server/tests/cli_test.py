@@ -25,7 +25,9 @@ class _FakeStoppable:
     def __init__(self):
         self.stop_calls = 0
 
-    def stop(self):
+    def stop(self, join_timeout=None):
+        # _graceful_shutdown passes a short join_timeout to source_manager.stop();
+        # accept-and-ignore it here (also used as the watcher, called with no arg).
         self.stop_calls += 1
 
 
@@ -90,8 +92,11 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
             order.append("flight")
 
     class _SourceManager:
-        def stop(self):
+        def stop(self, join_timeout=None):
             order.append("source_manager")
+            # Graceful shutdown passes a short join bound (the daemon thread may
+            # be blocked in an upstream re-list); assert it is not the 5s default.
+            state["join_timeout"] = join_timeout
             # The cache lock must already be gone by the time this slow step runs.
             state["lock_at_stop"] = lock_path.exists()
             raise RuntimeError("boom")  # a failure here must not matter
@@ -102,11 +107,61 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
             watcher=None,
             flight_server=_Flight(),
         )
-        # Cache closed (lock released) between the flight drain and the join.
+        # Lock released before the flight drain and the join.
         assert order == ["flight", "source_manager"]
         assert state["lock_at_stop"] is False  # released before the join ran
+        assert state["join_timeout"] == 1  # short bound, not the 5s default
         assert not lock_path.exists()  # released despite source_manager raising
     finally:
+        mgr = CacheManager.get_instance()
+        if mgr is not None:
+            mgr.close()
+
+
+def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
+    """A wedged Flight drain must not keep the cache lock (biopb/biopb#300 follow-up).
+
+    On a caching proxy an in-flight do_get can be gated on a dead/slow upstream,
+    so FlightServerBase.shutdown() (which takes no timeout) blocks unbounded.
+    Graceful shutdown must still (a) release/unlink the cache process lock and
+    (b) return within roughly the bound instead of hanging with it.
+    """
+    import threading
+    import time
+
+    cache_dir = tmp_path / "cache"
+    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    lock_path = cache_dir / "lock"
+    assert lock_path.exists()
+
+    # Shrink the drain bound so the test is fast; the fake hangs far beyond it.
+    monkeypatch.setattr(cli, "_FLIGHT_DRAIN_TIMEOUT_S", 0.3)
+
+    release = threading.Event()  # never set until teardown -> shutdown() hangs
+    entered = threading.Event()
+
+    class _HangingFlight:
+        def shutdown(self):
+            entered.set()
+            release.wait(timeout=30)  # blocks well beyond the 0.3s bound
+
+    try:
+        start = time.monotonic()
+        cli._graceful_shutdown(
+            source_manager=None,
+            watcher=None,
+            flight_server=_HangingFlight(),
+        )
+        elapsed = time.monotonic() - start
+
+        # The drain was actually entered and is STILL stuck...
+        assert entered.is_set()
+        # ...yet the lock is gone (released BEFORE the drain) and we returned
+        # promptly rather than blocking on the wedged shutdown().
+        assert not lock_path.exists()
+        assert elapsed < 5  # ~0.3s bound, nowhere near the 30s hang
+    finally:
+        release.set()  # let the daemon drain thread unwind
         mgr = CacheManager.get_instance()
         if mgr is not None:
             mgr.close()
