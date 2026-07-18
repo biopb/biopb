@@ -105,6 +105,24 @@ class InvalidTensorId(TensorResolutionError):
     grpc_code = "INVALID_ARGUMENT"
 
 
+class UnknownResolutionError(TensorResolutionError):
+    """A resolution-path exception that could not be classified.
+
+    Canonical gRPC ``UNKNOWN`` -- the code gRPC reserves for "errors raised by
+    APIs that do not return enough error information." The Flight read boundary
+    coerces a bare ``ValueError`` / ``KeyError`` / ``AttributeError`` /
+    ``TypeError`` from an adapter's resolution to this rather than fabricating a
+    specific :class:`TensorNotFound` (which would misattribute a possible server
+    bug to the caller) or leaking a "server bug, don't retry"
+    ``FlightInternalError``. Still terminal -- it rides ``FlightServerError`` like
+    the rest of the taxonomy, so: don't blindly retry, but don't blame the client
+    either. Once every adapter raises the typed taxonomy, a genuine field miss no
+    longer reaches this fallback, so what remains here is honestly *unclassified*.
+    """
+
+    grpc_code = "UNKNOWN"
+
+
 class WriteNotSupportedError(Exception):
     """The source format has no write contract (it is read-only).
 

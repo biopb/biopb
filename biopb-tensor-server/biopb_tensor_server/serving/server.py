@@ -52,6 +52,7 @@ from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
     TensorNotFound,
     TensorResolutionError,
+    UnknownResolutionError,
 )
 from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
 from biopb_tensor_server.core.source_registry import SourceRegistry
@@ -118,14 +119,18 @@ def _adapter_lookup_error(exc: Exception, miss_context: str) -> flight.FlightErr
       (``FlightUnavailableError``), via :func:`to_flight_error`.
     - ``TensorResolutionError`` -> the typed taxonomy (terminal NOT_FOUND /
       INVALID_ARGUMENT with the precise code in ``extra_info``).
-    - a bare ``ValueError`` / ``KeyError`` from an adapter that predates the typed
-      taxonomy -> coerced to NOT_FOUND: still a field-resolution miss, the caller's
-      mistake -- never leaked as a "server bug" ``FlightInternalError``.
+    - any other bare exception (``ValueError`` / ``KeyError`` / ``AttributeError``
+      / ``TypeError``) from an adapter that predates the typed taxonomy -> coerced
+      to a terminal, honestly *unclassified* ``UNKNOWN`` -- never leaked as a
+      "server bug" ``FlightInternalError``, but not a fabricated ``NOT_FOUND``
+      either (once every adapter raises the taxonomy, a real field miss no longer
+      reaches this fallback, so what lands here could as easily be a server bug as
+      a client one -- ``UNKNOWN`` says exactly that).
     """
     if isinstance(exc, (SourceUnresolvedError, TensorResolutionError)):
         return to_flight_error(exc)
     return to_flight_error(
-        TensorNotFound(f"{miss_context}: {exc}", reason="unknown_field")
+        UnknownResolutionError(f"{miss_context}: {exc}", reason="unclassified")
     )
 
 
@@ -1147,27 +1152,32 @@ class TensorFlightServer(flight.FlightServerBase):
 
         self._authorize_source(context, source_id)
 
-        # Resolve an unset/empty tensor_id (proto3 default "") to the source's
-        # default (first) tensor. get_source / get_physical_scale are documented
-        # to accept no tensor_id, but the client sends "" for the unset case;
-        # forwarding that to a multi-tensor adapter's get_tensor_adapter selects a
-        # bogus field (a bioio scene lookup on "", OME-Zarr HCS field parsing), so
+        # Reduce the request tensor_id to the within-source field -- or None =
+        # "the source's default (first) tensor" (identity policy: array_id is
+        # source_id or source_id/field). Both a falsy tensor_id (proto3 default
+        # "") and a bare source_id reduce to None. The wire descriptor still
+        # reports the full array_id, carried by get_tensor_descriptor().
+        field = self._field_within_source(source_id, tensor_id)
+
+        # Substitute the source's default (first) tensor for every no-field
+        # request -- empty tensor_id *and* a bare source_id, both -> field None
+        # (#44). get_flight_info / get_source / get_physical_scale are documented
+        # to accept no tensor_id; forwarding None to a multi-tensor adapter's
+        # get_tensor_adapter would otherwise select a bogus field (a bioio scene
+        # lookup on None, OME-Zarr HCS field parsing crashing on None.split), so
         # honor the documented default in this one chokepoint rather than at every
         # adapter call site. The first descriptor's array_id is the same default
-        # the client's own get_tensor path resolves to (#44).
-        if not tensor_id:
+        # the client's own get_tensor path resolves to; re-reducing it yields the
+        # sole tensor's field (None for a single-tensor source, whose array_id ==
+        # source_id, so the base still returns self).
+        if field is None:
             default_adapter = self.sources.get(source_id)
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:
-                    tensor_id = descriptors[0].array_id
-
-        # Reduce the (now source-qualified, or still "" for an unknown/empty
-        # source) tensor_id to the within-source field -- or None = the source's
-        # default tensor (identity policy: array_id is source_id or
-        # source_id/field). The wire descriptor still reports the full array_id,
-        # carried by the adapter's get_tensor_descriptor().
-        field = self._field_within_source(source_id, tensor_id)
+                    field = self._field_within_source(
+                        source_id, descriptors[0].array_id
+                    )
 
         logger.debug(
             f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}, field={field}"
@@ -1187,12 +1197,14 @@ class TensorFlightServer(flight.FlightServerBase):
             TensorResolutionError,
             ValueError,
             KeyError,
+            AttributeError,
+            TypeError,
         ) as e:
             # One handler for every resolution outcome (see _adapter_lookup_error):
             # an unresolved source -> retriable "open to resolve"; a typed field
             # miss -> terminal NOT_FOUND / INVALID_ARGUMENT with the canonical code
-            # in extra_info; a bare ValueError/KeyError from a legacy adapter ->
-            # coerced to NOT_FOUND, never leaked as INTERNAL (issue #378).
+            # in extra_info; any other bare exception from a legacy adapter ->
+            # terminal UNKNOWN, never leaked as INTERNAL (issue #378).
             if not isinstance(e, SourceUnresolvedError):
                 logger.warning(f"Tensor not found: {source_id}/{field} ({e})")
             raise _adapter_lookup_error(
@@ -1376,17 +1388,26 @@ class TensorFlightServer(flight.FlightServerBase):
                 TensorResolutionError,
                 ValueError,
                 KeyError,
+                AttributeError,
+                TypeError,
             ) as e:
                 # Same resolution mapping as get_flight_info: a ticket naming a
                 # field the source no longer has -> terminal NOT_FOUND with a code
-                # (not a bare ValueError -> INTERNAL), an unresolved source ->
+                # (never a bare exception -> INTERNAL), an unresolved source ->
                 # retriable "open to resolve" (issue #378).
                 raise _adapter_lookup_error(
                     e, f"Tensor not found for chunk {tensor_ticket.chunk_id[:16]!r}"
                 ) from e
             if adapter is None:
-                raise flight.FlightServerError(
-                    f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}..."
+                # Same taxonomy as get_flight_info's tensor_adapter-is-None sibling:
+                # a stale ticket whose source is no longer registered -> terminal
+                # NOT_FOUND *with a code*, not a bare FlightServerError (issue #378).
+                raise to_flight_error(
+                    TensorNotFound(
+                        f"Adapter not found for chunk_id: "
+                        f"{tensor_ticket.chunk_id[:16]!r}",
+                        reason="unknown_source",
+                    )
                 )
 
             # Get cache manager singleton (if initialized)
@@ -1434,14 +1455,21 @@ class TensorFlightServer(flight.FlightServerBase):
             TensorResolutionError,
             ValueError,
             KeyError,
+            AttributeError,
+            TypeError,
         ) as e:
             # Same resolution mapping as get_flight_info / do_get (issue #378).
             raise _adapter_lookup_error(
                 e, f"Tensor not found for chunk {chunk_id[:16]!r}"
             ) from e
         if adapter is None:
-            raise flight.FlightServerError(
-                f"Adapter not found for chunk_id: {chunk_id[:16]}..."
+            # Same taxonomy as get_flight_info / do_get: an unregistered source ->
+            # terminal NOT_FOUND with a code, not a bare FlightServerError (#378).
+            raise to_flight_error(
+                TensorNotFound(
+                    f"Adapter not found for chunk_id: {chunk_id[:16]!r}",
+                    reason="unknown_source",
+                )
             )
 
         # Entries are stored under the method-stripped canonical key

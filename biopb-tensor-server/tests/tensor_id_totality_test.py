@@ -33,6 +33,7 @@ from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
     TensorNotFound,
     TensorResolutionError,
+    UnknownResolutionError,
 )
 from biopb_tensor_server.serving.server import (
     _adapter_lookup_error,
@@ -150,24 +151,41 @@ class TestBoundaryMapping:
 # --------------------------------------------------------------------------- #
 class TestAdapterLookupFallback:
     """Every read verb maps an adapter-lookup miss through _adapter_lookup_error,
-    so the same exception surfaces identically no matter which verb hit it -- and a
-    bare ValueError/KeyError from an adapter that predates the typed taxonomy is
-    coerced to NOT_FOUND, never leaked as a "server bug" FlightInternalError."""
+    so the same exception surfaces identically no matter which verb hit it -- and an
+    unclassified bare exception from an adapter that predates the typed taxonomy is
+    coerced to a terminal UNKNOWN (not a fabricated NOT_FOUND that misblames the
+    caller, and never a "server bug" FlightInternalError)."""
 
-    def test_bare_valueerror_coerced_to_not_found(self):
+    def test_bare_valueerror_coerced_to_unknown(self):
         err = _adapter_lookup_error(ValueError("legacy adapter boom"), "ctx")
         assert isinstance(err, flight.FlightServerError)
         assert not isinstance(err, flight.FlightInternalError)
         assert json.loads(err.extra_info) == {
-            "code": "NOT_FOUND",
-            "reason": "unknown_field",
+            "code": "UNKNOWN",
+            "reason": "unclassified",
         }
 
-    def test_bare_keyerror_coerced_to_not_found(self):
+    def test_bare_keyerror_coerced_to_unknown(self):
         err = _adapter_lookup_error(KeyError("missing"), "ctx")
         assert isinstance(err, flight.FlightServerError)
         assert not isinstance(err, flight.FlightInternalError)
-        assert json.loads(err.extra_info)["code"] == "NOT_FOUND"
+        assert json.loads(err.extra_info)["code"] == "UNKNOWN"
+
+    def test_bare_attributeerror_and_typeerror_coerced_to_unknown(self):
+        # A None.split-style crash (AttributeError) or an int(None) (TypeError) in
+        # a not-yet-converted multi-tensor resolver is unclassified -- not a client
+        # "field not found" -- so it maps to a terminal UNKNOWN, not INTERNAL.
+        for exc in (AttributeError("'NoneType' has no attr split"), TypeError("x")):
+            err = _adapter_lookup_error(exc, "ctx")
+            assert isinstance(err, flight.FlightServerError)
+            assert not isinstance(err, flight.FlightInternalError)
+            assert json.loads(err.extra_info)["code"] == "UNKNOWN"
+
+    def test_unknown_resolution_error_subclasses_the_taxonomy(self):
+        # Rides the same ValueError-based taxonomy, so existing except-guards catch
+        # it and to_flight_error picks its terminal FlightServerError class.
+        assert issubclass(UnknownResolutionError, TensorResolutionError)
+        assert UnknownResolutionError("x", reason="unclassified").grpc_code == "UNKNOWN"
 
     def test_typed_taxonomy_passes_through_with_its_code(self):
         assert (
@@ -208,7 +226,47 @@ class TestAdapterLookupFallback:
         with pytest.raises(flight.FlightServerError) as ei:
             server.do_get(None, ticket)
         assert not isinstance(ei.value, flight.FlightInternalError)
-        assert json.loads(ei.value.extra_info)["code"] == "NOT_FOUND"
+        # A bare ValueError from a legacy adapter is unclassified -> terminal UNKNOWN.
+        assert json.loads(ei.value.extra_info)["code"] == "UNKNOWN"
+
+    def test_do_get_unregistered_source_ticket_is_terminal_with_code(self):
+        # Finding #3: a stale ticket whose source is no longer registered ->
+        # _get_adapter_for_chunk returns None -> the adapter-is-None fallthrough now
+        # rides the taxonomy (terminal NOT_FOUND *with a code*), matching
+        # get_flight_info's tensor_adapter-is-None sibling, rather than a bare
+        # FlightServerError carrying no extra_info code (issue #378).
+        from biopb.tensor.ticket_pb2 import TensorTicket
+        from biopb_tensor_server.core.base import encode_chunk_id
+
+        server = TensorFlightServer("grpc://localhost:0")
+        chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
+        ticket = flight.Ticket(TensorTicket(chunk_id=chunk_id).SerializeToString())
+        with pytest.raises(flight.FlightServerError) as ei:
+            server.do_get(None, ticket)
+        assert not isinstance(ei.value, flight.FlightInternalError)
+        assert json.loads(ei.value.extra_info) == {
+            "code": "NOT_FOUND",
+            "reason": "unknown_source",
+        }
+
+    def test_chunk_locate_unregistered_source_is_terminal_with_code(self):
+        # Same fallthrough on the cache-file locate path (finding #3).
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.base import encode_chunk_id
+        from biopb_tensor_server.core.config import CacheConfig
+
+        # _handle_chunk_locate short-circuits to {"available": False} when no cache
+        # manager exists, so give it one to reach the adapter-is-None fallthrough.
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            server = TensorFlightServer("grpc://localhost:0")
+            chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
+            with pytest.raises(flight.FlightServerError) as ei:
+                server._handle_chunk_locate(chunk_id)
+            assert not isinstance(ei.value, flight.FlightInternalError)
+            assert json.loads(ei.value.extra_info)["code"] == "NOT_FOUND"
+        finally:
+            CacheManager.reset()
 
 
 # --------------------------------------------------------------------------- #
@@ -391,3 +449,38 @@ class TestGetFlightInfoBoundary:
         server.register_source("src", _SingleTensorAdapter("src"))
         info = _flight_info_for(server, "src", "")  # bare/default -> sole tensor
         assert isinstance(info, flight.FlightInfo)
+
+    def test_bare_source_id_resolves_default_single_tensor(self):
+        # A bare source_id (the #44 back-compat default) resolves to the sole
+        # tensor, same as the empty form -- both reduce to field None.
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("src", _SingleTensorAdapter("src"))
+        info = _flight_info_for(server, "src", "src")
+        assert isinstance(info, flight.FlightInfo)
+
+    def test_bare_source_id_resolves_default_multi_tensor(self, tmp_path):
+        # The chokepoint substitutes the default (first) tensor for a no-field
+        # request on a *multi-tensor* source too (#44): a bare source_id -> field
+        # None -> the first descriptor's field, rather than forwarding None to the
+        # scene resolver (which faulted -- NOT_FOUND for OME-TIFF/bioio, an
+        # uncaught None.split for OME-Zarr HCS -> INTERNAL) pre-#508.
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+        from biopb_tensor_server.fixtures import create_multi_series_ome_tiff
+
+        path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
+        server = TensorFlightServer("grpc://localhost:0")
+        adapter = OmeTiffAdapter(path, "idx")
+        adapter.list_tensor_descriptors()
+        server.register_source("idx", adapter)
+
+        # bare source_id and empty both resolve; the first tensor's array_id is
+        # what the descriptor reports.
+        for tid in ("idx", ""):
+            info = _flight_info_for(server, "idx", tid)
+            assert isinstance(info, flight.FlightInfo)
+        # an explicit unknown field on the same multi-tensor source still faults
+        # terminally (not INTERNAL), so the default-substitution did not mask misses.
+        with pytest.raises(flight.FlightServerError) as ei:
+            _flight_info_for(server, "idx", "idx/Image:999")
+        assert not isinstance(ei.value, flight.FlightInternalError)
+        assert json.loads(ei.value.extra_info)["code"] == "NOT_FOUND"
