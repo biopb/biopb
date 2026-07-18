@@ -1106,6 +1106,7 @@ def create_source_manager(
     full_rescan_interval: float = 3600.0,
     stable_rescans_required: int = 0,
     aggressive_dir_pruning: bool = False,
+    allow_empty: bool = False,
 ) -> Optional[SourceManager]:
     """Create a SourceManager for all configured sources.
 
@@ -1127,14 +1128,20 @@ def create_source_manager(
         metadata_db: MetadataDatabase to keep in sync as sources are added/removed
             (None when the feature is disabled)
         credentials_config: CredentialsConfig for remote storage authentication
+        allow_empty: When True, build and return an empty SourceManager instead of
+            None when there are no (valid) sources. An empty catalog is a valid
+            runtime state -- sources can arrive later via runtime add_source
+            (napari drag-drop), DoPut uploads, or a monitored dir that fills after
+            startup -- so the launcher serves it (health SERVING, empty
+            list_flights) rather than refusing to boot (biopb/biopb#515).
 
     Returns:
-        SourceManager if there are any sources, None otherwise
+        SourceManager if there are any sources (or allow_empty=True), None otherwise
     """
     monitored_sources = monitored_sources or []
     static_sources = static_sources or []
 
-    if not monitored_sources and not static_sources:
+    if not monitored_sources and not static_sources and not allow_empty:
         return None
 
     # A bare-host tensor-server upstream ("mirror everything") IS monitored -- its
@@ -1199,8 +1206,14 @@ def create_source_manager(
     # it is reachable -- so it counts as "something to serve" and must not let the
     # server hard-fail to start (#178: require monitor=true for bare-host recovery).
     if not monitored_dirs and not static_sources and not monitored_upstreams:
-        logger.warning("No valid sources to serve")
-        return None
+        if not allow_empty:
+            logger.warning("No valid sources to serve")
+            return None
+        # Empty is a valid runtime state (biopb/biopb#515): fall through and build
+        # an empty manager so the server serves an empty catalog and accepts
+        # sources added later (runtime add_source, DoPut, a monitored dir that
+        # fills after startup).
+        logger.warning("No sources configured yet; serving an empty catalog")
 
     # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
     # across both monitored and static sources. Under a monitored cloud root the
