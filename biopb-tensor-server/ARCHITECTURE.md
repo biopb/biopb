@@ -203,6 +203,18 @@ adapter. The default backend is an in-process LRU memory cache
 (`OrderedDict`-based, in `cache/memory_backend.py`).
 An optional `ArrowFileBackend` persists decoded chunks to disk.
 
+**Sidecar boot index (biopb/biopb#300).** Each sealed segment `seg_NNNN.arrow`
+gets a `seg_NNNN.idx` sidecar written at seal time (natural rotation and
+graceful close) recording every entry's key -> byte range. Boot restores the
+index from these small files instead of faulting the whole on-disk cache
+(previously a full body walk — tens of GB, ~52-78 s on a caching-proxy cache).
+Because a sealed segment is immutable, the sidecar needs no manifest or
+generation counter: a boot trusts one iff its recorded `.arrow` size matches the
+file on disk, and otherwise falls back to the body walk (which backfills a fresh
+sidecar, so the first boot after upgrading an old cache pays the walk once). The
+sidecar is purely additive — an older server ignores `.idx` (it globs `.arrow`)
+— and its tiny bytes are not counted toward the eviction budget.
+
 ---
 
 ## FastAPI HTTP Server

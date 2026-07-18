@@ -19,6 +19,8 @@ from biopb_tensor_server.cache import (
     MemoryCacheBackend,
 )
 from biopb_tensor_server.cache.file_backend import (
+    CACHE_KEY_FIELD,
+    SIDECAR_FORMAT_VERSION,
     SIZE_CLASS_MEDIUM_THRESHOLD,
     SIZE_CLASS_SMALL_THRESHOLD,
     SIZE_CLASS_TINY_THRESHOLD,
@@ -1795,3 +1797,311 @@ class TestWriteLockDoesNotWedgeReads:
         finally:
             backend.close()
             shutil.rmtree(cache_dir)
+
+
+class _ScanCountingBackend(ArrowFileBackend):
+    """Counts body-walk scans so a test can prove the sidecar fast path skips
+    them at boot. ``_scan_segment_records`` is the single body-reading chokepoint
+    (both the boot fallback walk and the seal-time sidecar write go through it),
+    so a zero count right after boot means no segment body was faulted in."""
+
+    def __init__(self, config):
+        self.scan_calls = 0
+        self.scanned_segments = []
+        super().__init__(config)
+
+    def _scan_segment_records(self, seg_file):
+        self.scan_calls += 1
+        self.scanned_segments.append(seg_file.name)
+        return super()._scan_segment_records(seg_file)
+
+
+class TestSegmentSidecarIndex:
+    """Per-segment sidecar index: boot restores the index from seg_NNNN.idx
+    instead of walking every segment body (biopb/biopb#300)."""
+
+    def _make_data(self, values) -> pa.RecordBatch:
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
+        )
+
+    def _make_temp_cache_dir(self):
+        return Path(tempfile.mkdtemp(prefix="biopb-cache-sidecar-test-"))
+
+    def _rotating_config(self, cache_dir):
+        # Small segment cap so entries rotate into several SEALED segments.
+        return ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=1000,
+            max_total_bytes=100 * 1024 * 1024,
+        )
+
+    def _write_entries(self, backend, n, close=True):
+        """Write n entries (values [i, i+1, i+2]); optionally close (seals +
+        writes sidecars for every segment)."""
+        for i in range(n):
+            key = f"key{i}".encode()
+            backend.start_compute(key)
+            backend.complete_entry(key, self._make_data([i, i + 1, i + 2]), 400)
+            backend.release(key)
+        if close:
+            backend.close()
+
+    def _index_snapshot(self, backend):
+        return {
+            k: (v.segment_id, v.byte_offset, v.byte_length, v.size_bytes, v.offset)
+            for k, v in backend._metadata.items()
+        }
+
+    def _seg_files(self, cache_dir):
+        return sorted((cache_dir / "segments").glob("seg_*.arrow"))
+
+    def _simulate_crash(self, backend, cache_dir):
+        """Drop OS handles the way a dying process would, without the sidecar/WAL
+        housekeeping a clean close() does; then remove the lock so a fresh backend
+        can claim the dir."""
+        for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
+            backend._close_writer(seg_id)
+        for mm in backend._segment_mmaps.values():
+            mm.close()
+        backend._segment_mmaps.clear()
+        (cache_dir / "lock").unlink(missing_ok=True)
+
+    def _tamper_sidecar_size(self, idx_path, wrong_size):
+        with pa.OSFile(str(idx_path), "rb") as f:
+            table = pa.ipc.open_file(f).read_all()
+        new_meta = {
+            b"biopb_sidecar_version": str(SIDECAR_FORMAT_VERSION).encode(),
+            b"biopb_segment_size": str(wrong_size).encode(),
+        }
+        table = table.replace_schema_metadata(new_meta)
+        with pa.OSFile(str(idx_path), "wb") as sink:
+            with pa.ipc.new_file(sink, table.schema) as w:
+                w.write_table(table)
+
+    def test_sidecar_index_matches_full_walk(self):
+        """Round-trip parity: the index restored from sidecars is byte-for-byte
+        equal to a full-walk rebuild (same keys, segment_id, byte_offset,
+        byte_length, size_bytes, offset)."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 7)  # closes -> seals every segment + sidecars
+
+        seg_files = self._seg_files(cache_dir)
+        assert len(seg_files) >= 2, "test needs multiple sealed segments"
+        for sf in seg_files:
+            assert sf.with_suffix(".idx").exists(), f"no sidecar for {sf.name}"
+
+        # Index restored from sidecars (fast path).
+        b_side = ArrowFileBackend(config)
+        side_index = self._index_snapshot(b_side)
+        b_side.close()
+
+        # Same index, rebuilt by the full body walk.
+        for idx in (cache_dir / "segments").glob("seg_*.idx"):
+            idx.unlink()
+        b_walk = ArrowFileBackend(config)
+        walk_index = self._index_snapshot(b_walk)
+        b_walk.close()
+
+        assert len(side_index) == 7
+        assert side_index == walk_index
+        shutil.rmtree(cache_dir)
+
+    def test_boot_from_sidecar_skips_body_walk(self):
+        """With sidecars present, boot reads no segment bodies, and reads still
+        return the right data."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 6)
+        assert len(self._seg_files(cache_dir)) >= 1
+
+        counting = _ScanCountingBackend(config)
+        assert counting.scan_calls == 0, "sidecar boot must not walk segment bodies"
+
+        entry, is_owner = counting.start_compute(b"key3")
+        assert is_owner is False
+        assert entry.data.column("data").to_pylist() == [[3, 4, 5]]
+        counting.release(b"key3")
+        counting.close()
+        shutil.rmtree(cache_dir)
+
+    def test_sidecar_byte_ranges_are_exact(self):
+        """After an .idx-based boot, locate_entry's byte range points exactly at
+        the entry's IPC message, and a normal read returns the same data -- proof
+        that byte_offset/byte_length (the #9 fast path) are exact."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 5)
+
+        b2 = ArrowFileBackend(config)  # sidecar boot
+        for i in range(5):
+            key = f"key{i}".encode()
+            loc = b2.locate_entry(key)
+            assert loc is not None
+            assert loc.byte_offset > 0 and loc.byte_length > 0
+
+            with pa.OSFile(loc.segment_path, "rb") as f:
+                schema = pa.ipc.open_stream(f).schema
+            with pa.memory_map(loc.segment_path, "r") as mm:
+                mm.seek(loc.byte_offset)
+                msg = pa.ipc.read_message(mm)
+                assert mm.tell() - loc.byte_offset == loc.byte_length
+                batch = pa.ipc.read_record_batch(msg, schema)
+            assert batch.column(CACHE_KEY_FIELD)[0].as_py() == key
+            assert batch.column("data").to_pylist() == [[i, i + 1, i + 2]]
+
+            entry, is_owner = b2.start_compute(key)
+            assert is_owner is False
+            assert entry.data.column("data").to_pylist() == [[i, i + 1, i + 2]]
+            b2.release(key)
+        b2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_missing_sidecar_walks_that_segment_and_backfills(self):
+        """A deleted sidecar makes only its own segment fall back to the walk; a
+        fresh sidecar is backfilled, so the next boot is fully fast."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 7)
+        seg_files = self._seg_files(cache_dir)
+        assert len(seg_files) >= 2
+
+        victim = seg_files[0]
+        victim_idx = victim.with_suffix(".idx")
+        assert victim_idx.exists()
+        victim_idx.unlink()
+
+        counting = _ScanCountingBackend(config)
+        assert counting.scan_calls == 1
+        assert counting.scanned_segments == [victim.name]
+        # All entries still hit with correct data.
+        for i in range(7):
+            key = f"key{i}".encode()
+            entry, is_owner = counting.start_compute(key)
+            assert is_owner is False
+            assert entry.data.column("data").to_pylist() == [[i, i + 1, i + 2]]
+            counting.release(key)
+        # The sidecar was backfilled.
+        assert victim_idx.exists()
+        counting.close()
+
+        # Second boot uses the backfilled sidecar: no walks.
+        counting2 = _ScanCountingBackend(config)
+        assert counting2.scan_calls == 0
+        counting2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_corrupt_sidecar_walks_that_segment_and_backfills(self):
+        """A corrupt sidecar is rejected, its segment is walked, and a valid
+        sidecar is written in its place."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 7)
+        seg_files = self._seg_files(cache_dir)
+        assert len(seg_files) >= 2
+
+        victim = seg_files[0]
+        victim_idx = victim.with_suffix(".idx")
+        victim_idx.write_bytes(b"this is not an arrow file")
+
+        counting = _ScanCountingBackend(config)
+        assert counting.scanned_segments == [victim.name]
+        for i in range(7):
+            key = f"key{i}".encode()
+            entry, is_owner = counting.start_compute(key)
+            assert is_owner is False
+            assert entry.data.column("data").to_pylist() == [[i, i + 1, i + 2]]
+            counting.release(key)
+        counting.close()
+
+        counting2 = _ScanCountingBackend(config)
+        assert counting2.scan_calls == 0  # backfilled sidecar is now valid
+        counting2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_stale_sidecar_size_is_rejected(self):
+        """A sidecar whose recorded .arrow size no longer matches the file is
+        rejected (torn/mismatched), so its segment is walked instead."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 7)
+        seg_files = self._seg_files(cache_dir)
+        assert len(seg_files) >= 2
+
+        victim = seg_files[0]
+        victim_idx = victim.with_suffix(".idx")
+        self._tamper_sidecar_size(victim_idx, victim.stat().st_size + 4096)
+
+        counting = _ScanCountingBackend(config)
+        assert victim.name in counting.scanned_segments
+        for i in range(7):
+            key = f"key{i}".encode()
+            entry, is_owner = counting.start_compute(key)
+            assert is_owner is False
+            assert entry.data.column("data").to_pylist() == [[i, i + 1, i + 2]]
+            counting.release(key)
+        counting.close()
+        shutil.rmtree(cache_dir)
+
+    def test_eviction_removes_sidecar(self):
+        """Evicting a segment removes both its .arrow and its .idx sidecar."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        self._write_entries(b1, 7)
+
+        b2 = ArrowFileBackend(config)
+        seg_id = next(iter(b2._metadata.values())).segment_id
+        seg_file = cache_dir / "segments" / f"seg_{seg_id:04d}.arrow"
+        idx_file = seg_file.with_suffix(".idx")
+        assert seg_file.exists() and idx_file.exists()
+
+        b2._do_evict_segment(seg_id)
+        assert not seg_file.exists()
+        assert not idx_file.exists()
+        b2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_crash_loads_sealed_from_sidecar_and_walks_open(self):
+        """After a crash (no clean close), the sealed segments load from their
+        sidecars while the never-sealed open segment is walked/recovered; the
+        final index is complete and correct."""
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+
+        b1 = ArrowFileBackend(config)
+        # 7 entries at size 400 with a 1000-byte cap -> 2 sealed segments
+        # (3 entries each, with sidecars) + 1 open segment (entry 6, no sidecar).
+        self._write_entries(b1, 7, close=False)
+        sealed = self._seg_files(cache_dir)
+        sidecars = list((cache_dir / "segments").glob("seg_*.idx"))
+        assert len(sealed) == 3  # two sealed + one open on disk
+        assert len(sidecars) == 2  # only the two sealed ones have sidecars
+
+        self._simulate_crash(b1, cache_dir)
+
+        counting = _ScanCountingBackend(config)
+        assert counting.scan_calls == 1, "only the open (sidecar-less) segment walks"
+        for i in range(7):
+            key = f"key{i}".encode()
+            entry, is_owner = counting.start_compute(key)
+            assert is_owner is False, f"{key!r} lost across crash"
+            assert entry.data.column("data").to_pylist() == [[i, i + 1, i + 2]]
+            counting.release(key)
+        counting.close()
+        shutil.rmtree(cache_dir)
