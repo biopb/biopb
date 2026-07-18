@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -98,6 +99,13 @@ CACHE_KEY_FIELD = "__biopb_cache_key__"
 # parse; the server reports it in chunk_locate and a client declines the fast
 # path (falls back to do_get) for any version it doesn't understand.
 CACHE_FILE_FORMAT_VERSION = 1
+
+# Name of the on-disk marker file (in the cache root, beside ``lock`` and
+# ``wal.json``) recording the CACHE_FILE_FORMAT_VERSION the segments were written
+# under. ``_enforce_format_version`` reads it at init and wipes the cache when it
+# is missing or mismatched, so a segment-layout / key-composition change can't
+# silently reuse incompatible on-disk segments. See _enforce_format_version.
+FORMAT_VERSION_MARKER = "format_version"
 
 # Per-segment sidecar index (biopb/biopb#300). Each sealed segment
 # ``seg_NNNN.arrow`` gets a ``seg_NNNN.idx`` written at seal time recording every
@@ -304,12 +312,19 @@ class ArrowFileBackend(CacheBackend):
                 "Another process is using the cache."
             )
 
+        # Enforce the segment format-version contract now that we are the
+        # exclusive owner and before anything reads the segments: a missing or
+        # mismatched marker wipes the on-disk cache (segments + WAL). Must run
+        # ahead of WAL init and the index rebuild.
+        wiped = self._enforce_format_version()
+
         # Initialize WAL
         wal_path = self._config.cache_dir / "wal.json"
         self._wal = WriteAheadLog(wal_path)
 
-        # Check for crash recovery
-        if was_stale or self._wal.has_pending():
+        # Check for crash recovery. A version wipe already dropped the segments
+        # and WAL, so there is nothing to recover from.
+        if not wiped and (was_stale or self._wal.has_pending()):
             logger.info("Cache recovery: stale lock or pending WAL entries detected")
             self._recovery_status = self._recover()
 
@@ -328,6 +343,80 @@ class ArrowFileBackend(CacheBackend):
             all_segment_ids.update(pool.queue)
         all_segment_ids.update(self._segments_legacy.keys())
         self._next_segment_id = max(all_segment_ids, default=0) + 1
+
+    def _enforce_format_version(self) -> bool:
+        """Wipe the on-disk cache when its segment format version != code.
+
+        ``CACHE_FILE_FORMAT_VERSION`` is the segment message layout / cache-key
+        encoding contract (see the constant). Segments written under one version
+        cannot be safely reused after a layout or key-composition change: the
+        boot rebuild would index them and the server would then serve mis-decoded
+        or mis-keyed (stale) chunks. The constant existed but was inert -- only
+        reported in ``cache_stats``, never checked at startup -- so any such
+        change silently reused incompatible segments. This makes it enforced: a
+        marker file records the version the on-disk segments were written under,
+        and a missing or mismatched marker drops them before the index rebuild.
+
+        A pre-enforcement cache dir has segments but no marker; that counts as a
+        mismatch, so the first boot after this ships wipes it. Discarding a
+        layout-compatible cache once is a safe, one-time re-fetch cost, whereas
+        serving incompatible bytes is a silent correctness bug -- so we err
+        toward wiping. Idempotent on a matching cache (returns False, no I/O
+        beyond the marker read).
+
+        Must run while the process lock is held and before WAL init / recovery /
+        index rebuild read the segments. Returns True iff a (re)stamp happened
+        (marker missing or mismatched), in which case the segments and WAL were
+        just wiped and there is nothing to recover.
+        """
+        marker_path = self._config.cache_dir / FORMAT_VERSION_MARKER
+        try:
+            on_disk: Optional[int] = int(marker_path.read_text().strip())
+        except (OSError, ValueError):
+            # Missing marker (pre-enforcement / fresh dir) or an unparseable one
+            # (torn write) -> treat as a mismatch and re-stamp.
+            on_disk = None
+
+        if on_disk == CACHE_FILE_FORMAT_VERSION:
+            return False
+
+        self._wipe_cache_contents(stale_version=on_disk)
+
+        # Stamp the current version. Write to a temp file and atomically replace
+        # so a crash mid-write cannot leave a torn marker that spuriously wipes a
+        # good cache on the next boot.
+        tmp_path = marker_path.with_suffix(".tmp")
+        tmp_path.write_text(f"{CACHE_FILE_FORMAT_VERSION}\n")
+        os.replace(tmp_path, marker_path)
+        return True
+
+    def _wipe_cache_contents(self, stale_version: Optional[int]) -> None:
+        """Delete the version-sensitive on-disk state (segments + WAL), leaving
+        the held process lock and marker in place, and recreate an empty
+        ``segments`` dir. Logs loudly only when data was actually discarded (a
+        fresh dir wipe is a silent no-op). Runs before any mmap is opened, so no
+        segment is mapped and the removal is safe on Windows too (issue #5).
+        """
+        segments_dir = self._config.cache_dir / "segments"
+        wal_path = self._config.cache_dir / "wal.json"
+        had_data = (segments_dir.exists() and any(segments_dir.iterdir())) or (
+            wal_path.exists()
+        )
+        if had_data:
+            logger.warning(
+                "Cache format-version mismatch (on-disk=%s, code=%d): discarding "
+                "the incompatible on-disk cache at %s before rebuild.",
+                "unversioned" if stale_version is None else stale_version,
+                CACHE_FILE_FORMAT_VERSION,
+                self._config.cache_dir,
+            )
+
+        shutil.rmtree(segments_dir, ignore_errors=True)
+        segments_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            wal_path.unlink()
+        except OSError:
+            pass
 
     def _recover(self) -> RecoveryStatus:
         """Recover from crash: drop incomplete writes recorded in the WAL.
