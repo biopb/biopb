@@ -99,6 +99,33 @@ CACHE_KEY_FIELD = "__biopb_cache_key__"
 # path (falls back to do_get) for any version it doesn't understand.
 CACHE_FILE_FORMAT_VERSION = 1
 
+# Per-segment sidecar index (biopb/biopb#300). Each sealed segment
+# ``seg_NNNN.arrow`` gets a ``seg_NNNN.idx`` written at seal time recording every
+# entry's key -> byte range, so boot restores the index from these small files
+# instead of faulting the whole on-disk cache (tens of GB on a caching proxy)
+# just to re-derive it. A sealed segment is immutable, so the sidecar needs no
+# manifest or generation counter: a boot trusts a sidecar iff its recorded
+# ``.arrow`` size matches the file on disk (a torn or mismatched sidecar falls
+# back to the body walk). Purely additive -- an older server ignores ``.idx``
+# (it globs ``.arrow``); a newer server on an old cache walks and backfills. The
+# tiny ``.idx`` bytes are deliberately NOT counted toward ``max_total_bytes``.
+SIDECAR_FORMAT_VERSION = 1
+_SIDECAR_VERSION_KEY = b"biopb_sidecar_version"
+_SIDECAR_SEGMENT_SIZE_KEY = b"biopb_segment_size"
+_SIDECAR_VERSION_BYTES = str(SIDECAR_FORMAT_VERSION).encode()
+# The key travels as a real column (not schema-only): a sidecar is an Arrow IPC
+# FILE, so this is belt-and-suspenders, but it keeps the record self-describing.
+_SIDECAR_SCHEMA = pa.schema(
+    [
+        pa.field("key", pa.binary()),
+        pa.field("byte_offset", pa.int64()),
+        pa.field("byte_length", pa.int64()),
+        pa.field("size_bytes", pa.int64()),
+        pa.field("offset", pa.int64()),
+        pa.field("created_at", pa.float64()),
+    ]
+)
+
 
 def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Return a copy of `batch` whose buffers are owned in RAM, not a file mmap.
@@ -343,119 +370,293 @@ class ArrowFileBackend(CacheBackend):
         )
 
     def _rebuild_index_from_segments(self) -> None:
-        """Scan all segment files to rebuild metadata index and pool queues."""
+        """Rebuild the metadata index and pool queues from segment files at boot.
+
+        Fast path (biopb/biopb#300): a sealed segment carries a ``seg_NNNN.idx``
+        sidecar written at seal time with each entry's key -> byte range. When it
+        validates (version + recorded ``.arrow`` size), the index is restored
+        from it WITHOUT faulting the segment body -- the walk that once read the
+        whole cache from disk (tens of GB, ~52-78 s on a caching proxy) now
+        happens once, at seal, off the boot path. A missing / stale / legacy
+        sidecar falls back to the pre-#300 body walk, which also backfills a
+        fresh sidecar so the next boot is fast.
+        """
         segments_dir = self._config.cache_dir / "segments"
-
-        for seg_file in sorted(segments_dir.glob("seg_*.arrow")):
+        seg_files = sorted(segments_dir.glob("seg_*.arrow"))
+        walked = 0
+        for seg_file in seg_files:
             try:
-                # Extract segment ID from filename
-                seg_name = seg_file.stem  # e.g., "seg_0001"
-                segment_id = int(seg_name.split("_")[1])
-
-                # Memory-map for reading
+                segment_id = int(seg_file.stem.split("_")[1])
+            except (ValueError, IndexError):
+                continue
+            try:
+                if self._load_segment_from_sidecar(segment_id, seg_file):
+                    continue
+                # No usable sidecar: walk the body once (the pre-#300 path).
+                records = self._scan_segment_records(seg_file)
+                if records is None:
+                    logger.warning(
+                        f"Discarding legacy/corrupt cache segment (unreadable or "
+                        f"without per-batch key column): {seg_file}"
+                    )
+                    self._drop_segment_files(segment_id)
+                    continue
                 mmap = pa.memory_map(str(seg_file), "r")
                 self._segment_mmaps[segment_id] = mmap
-
-                # Read all batches to extract keys and build index
-                entry_count = 0
-                segment_size = seg_file.stat().st_size
-                segment_created = seg_file.stat().st_mtime
-
-                reader = pa.RecordBatchStreamReader(mmap)
-                pool_key: Optional[Tuple[str, SizeClass]] = None
-                schema_key = "unified"  # Default for unified schema
-
-                # Segments written before the per-batch key-column fix stored
-                # the key only in schema metadata, which an IPC stream collapses
-                # to the first entry's key on read-back. Such segments cannot be
-                # indexed correctly, so drop them rather than serve wrong data.
-                if CACHE_KEY_FIELD not in reader.schema.names:
-                    logger.warning(
-                        f"Discarding legacy/corrupt cache segment without "
-                        f"per-batch key column: {seg_file}"
-                    )
-                    self._segment_mmaps.pop(segment_id, None)
-                    mmap.close()
-                    seg_file.unlink()
-                    continue
-
-                # Walk the IPC stream message-by-message so we can record the
-                # byte offset of each record batch (issue #9: the localhost
-                # cache-file handoff seeks straight to a single message). The
-                # StreamReader above only gives us the schema; reading messages
-                # directly off the mmap lets us bracket each batch with tell().
-                schema = reader.schema
-                mmap.seek(0)
-                pa.ipc.read_message(mmap)  # consume the leading schema message
-                while True:
-                    pos = mmap.tell()
-                    try:
-                        msg = pa.ipc.read_message(mmap)
-                    except (pa.ArrowInvalid, EOFError, StopIteration):
-                        break
-                    if msg is None:
-                        break
-                    msg_len = mmap.tell() - pos
-                    batch = pa.ipc.read_record_batch(msg, schema)
-                    # Extract cache key from the per-batch column.
-                    key = batch.column(CACHE_KEY_FIELD)[0].as_py()
-                    if key is not None:
-                        batch_size = sum(
-                            batch.column(name).nbytes
-                            for name in ("data", "shape", "dtype")
-                        )
-
-                        # Determine pool key for this entry
-                        size_class = _get_size_class(batch_size)
-                        pool_key = (schema_key, size_class)
-
-                        entry_info = SegmentEntryInfo(
-                            segment_id=segment_id,
-                            offset=entry_count,  # Entry index for the sequential reader
-                            size_bytes=batch_size,
-                            metadata={},
-                            created_at=segment_created,
-                            last_access_time=segment_created,  # Initialize with file mtime
-                            byte_offset=pos,
-                            byte_length=msg_len,
-                        )
-                        self._metadata[key] = entry_info
-                        entry_count += 1
-
-                # Initialize pool queue for this segment if we have entries
-                if pool_key is not None and entry_count > 0:
-                    pool_queue = self._pool_queues.get(pool_key)
-                    if pool_queue is None:
-                        pool_queue = PoolQueueInfo(pool_key=pool_key)
-                        self._pool_queues[pool_key] = pool_queue
-
-                    # Add segment to pool queue (at tail since it's oldest)
-                    pool_queue.queue.append(segment_id)
-                    pool_queue.segments[segment_id] = SieveKSegmentInfo(
-                        segment_id=segment_id,
-                        size_bytes=segment_size,
-                        created_at=segment_created,
-                        last_access_time=segment_created,
-                        entry_count=entry_count,
-                        frequency=0,  # Start with counter=0
-                        mmap_released=False,
-                    )
-                else:
-                    # Legacy tracking for segments without pool info
-                    self._segments_legacy[segment_id] = SegmentInfo(
-                        size_bytes=segment_size,
-                        created_at=segment_created,
-                        last_access_time=segment_created,
-                        entry_count=entry_count,
-                    )
-
+                self._install_segment_records(segment_id, seg_file, records)
+                walked += 1
+                # Backfill a sidecar from the records we just read -- no second
+                # body read -- so the next boot skips this segment's walk.
+                self._write_sidecar_from_records(segment_id, records)
             except Exception as e:
                 logger.error(f"Error rebuilding index from {seg_file}: {e}")
-                # Remove corrupted segment
+                self._drop_segment_files(segment_id)
+
+        if walked:
+            logger.info(
+                "Cache boot: walked %d of %d segment(s) lacking a valid sidecar "
+                "index and backfilled them; the next boot skips the walk "
+                "(biopb/biopb#300).",
+                walked,
+                len(seg_files),
+            )
+
+    def _sidecar_path(self, segment_id: int) -> Path:
+        """Path of a segment's sidecar index file (``seg_NNNN.idx``)."""
+        return self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.idx"
+
+    def _remove_segment_sidecar(self, segment_id: int) -> None:
+        """Best-effort unlink of a segment's sidecar (safe if absent)."""
+        try:
+            self._sidecar_path(segment_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _drop_segment_files(self, segment_id: int) -> None:
+        """Discard a bad segment: close its mmap and unlink both ``.arrow`` and
+        ``.idx``. Used for a legacy/corrupt segment on the boot fallback path."""
+        mmap = self._segment_mmaps.pop(segment_id, None)
+        if mmap is not None:
+            mmap.close()
+        seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        try:
+            seg_file.unlink()
+        except OSError:
+            pass
+        self._remove_segment_sidecar(segment_id)
+
+    def _scan_segment_records(self, seg_file: Path) -> Optional[list]:
+        """Walk a sealed segment's IPC stream, returning one index record per
+        entry: ``(key, byte_offset, byte_length, size_bytes, offset)``.
+
+        The single source of truth for how a segment body maps to index entries,
+        reused by the boot fallback walk and the seal-time sidecar write so every
+        index path agrees byte-for-byte. Reads message-by-message off a private
+        mmap to bracket each record batch (issue #9 needs the byte range) and
+        stops at the first unreadable/torn trailing message -- a prior partial
+        write's slack. Returns None for a legacy/corrupt segment (no per-batch key
+        column, or unreadable), signalling the caller to drop or skip it. The mmap
+        is always closed (an open handle blocks unlink on Windows, issue #5).
+        """
+        try:
+            mm = pa.memory_map(str(seg_file), "r")
+        except (OSError, pa.ArrowInvalid):
+            return None
+        try:
+            try:
+                schema = pa.ipc.open_stream(mm).schema
+            except Exception:
+                return None
+            # A segment written before the per-batch key-column fix stored the
+            # key only in schema metadata, which an IPC stream collapses to the
+            # first entry's key on read-back -- it cannot be indexed correctly.
+            if CACHE_KEY_FIELD not in schema.names:
+                return None
+            mm.seek(0)
+            pa.ipc.read_message(mm)  # consume the leading schema message
+            records = []
+            entry_index = 0
+            while True:
+                pos = mm.tell()
                 try:
-                    seg_file.unlink()
-                except OSError:
-                    pass
+                    msg = pa.ipc.read_message(mm)
+                except (pa.ArrowInvalid, EOFError, StopIteration, OSError):
+                    break
+                if msg is None:
+                    break
+                msg_len = mm.tell() - pos
+                try:
+                    batch = pa.ipc.read_record_batch(msg, schema)
+                except Exception:
+                    break
+                key = batch.column(CACHE_KEY_FIELD)[0].as_py()
+                if key is None:
+                    continue
+                size_bytes = sum(
+                    batch.column(name).nbytes for name in ("data", "shape", "dtype")
+                )
+                records.append((key, pos, msg_len, size_bytes, entry_index))
+                entry_index += 1
+            return records
+        finally:
+            mm.close()
+
+    def _install_segment_records(
+        self, segment_id: int, seg_file: Path, records: list
+    ) -> None:
+        """Populate ``_metadata`` + pool queues for one segment from its index
+        records. Shared by the sidecar fast path and the body-walk fallback so
+        both produce an identical index. Entries in a segment share a size class
+        (the pool key), so the last one's class keys the segment's pool -- same as
+        the pre-#300 walk. An empty segment falls back to legacy tracking.
+        """
+        st = seg_file.stat()
+        segment_size = st.st_size
+        segment_created = st.st_mtime  # file mtime, matching the pre-#300 walk
+        size_class: Optional[SizeClass] = None
+        for key, byte_offset, byte_length, size_bytes, offset in records:
+            self._metadata[key] = SegmentEntryInfo(
+                segment_id=segment_id,
+                offset=offset,  # entry index for the sequential reader
+                size_bytes=size_bytes,
+                metadata={},
+                created_at=segment_created,
+                last_access_time=segment_created,
+                byte_offset=byte_offset,
+                byte_length=byte_length,
+            )
+            size_class = _get_size_class(size_bytes)
+
+        entry_count = len(records)
+        if entry_count > 0 and size_class is not None:
+            pool_key = ("unified", size_class)
+            pool_queue = self._pool_queues.get(pool_key)
+            if pool_queue is None:
+                pool_queue = PoolQueueInfo(pool_key=pool_key)
+                self._pool_queues[pool_key] = pool_queue
+            # Oldest at the tail: a rebuilt segment predates this session's writes.
+            pool_queue.queue.append(segment_id)
+            pool_queue.segments[segment_id] = SieveKSegmentInfo(
+                segment_id=segment_id,
+                size_bytes=segment_size,
+                created_at=segment_created,
+                last_access_time=segment_created,
+                entry_count=entry_count,
+                frequency=0,
+                mmap_released=False,
+            )
+        else:
+            self._segments_legacy[segment_id] = SegmentInfo(
+                size_bytes=segment_size,
+                created_at=segment_created,
+                last_access_time=segment_created,
+                entry_count=entry_count,
+            )
+
+    def _load_segment_from_sidecar(self, segment_id: int, seg_file: Path) -> bool:
+        """Restore a segment's index from its ``.idx`` sidecar without reading the
+        body. Returns True on the fast path; False (fall back to the walk) if the
+        sidecar is absent, the wrong version, or stale (recorded ``.arrow`` size
+        != the file on disk). The sidecar is read fully into RAM and its handle
+        closed before we touch the segment, so it never blocks unlink (issue #5).
+        A read-only mmap of the segment is still created (cheap, and required to
+        serve reads) -- only the per-batch body reads are skipped.
+        """
+        idx_path = self._sidecar_path(segment_id)
+        if not idx_path.exists():
+            return False
+        try:
+            with pa.OSFile(str(idx_path), "rb") as f:
+                reader = pa.ipc.open_file(f)
+                meta = reader.schema.metadata or {}
+                if meta.get(_SIDECAR_VERSION_KEY) != _SIDECAR_VERSION_BYTES:
+                    return False
+                recorded = meta.get(_SIDECAR_SEGMENT_SIZE_KEY)
+                if recorded is None or int(recorded) != seg_file.stat().st_size:
+                    return False
+                table = reader.read_all()
+        except (OSError, ValueError, pa.ArrowInvalid):
+            return False  # unreadable / mismatched sidecar -> walk the body
+
+        records = list(
+            zip(
+                table.column("key").to_pylist(),
+                table.column("byte_offset").to_pylist(),
+                table.column("byte_length").to_pylist(),
+                table.column("size_bytes").to_pylist(),
+                table.column("offset").to_pylist(),
+                strict=True,  # columns of one table -> equal length
+            )
+        )
+        mmap = pa.memory_map(str(seg_file), "r")
+        self._segment_mmaps[segment_id] = mmap
+        self._install_segment_records(segment_id, seg_file, records)
+        return True
+
+    def _write_segment_sidecar(self, segment_id: int) -> None:
+        """Persist a sealed segment's key -> byte-range index to ``seg_NNNN.idx``.
+
+        The seal-time entry point (natural rotation and graceful close): derives
+        the records from the immutable segment file via ``_scan_segment_records``
+        -- so it needs no lock and no live ``_metadata``, and the sidecar is
+        guaranteed to match what a boot walk would produce. (The boot backfill
+        path already holds the records and calls ``_write_sidecar_from_records``
+        directly, avoiding a second body read.)
+        """
+        seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        if not seg_file.exists():
+            return  # segment already gone (evicted); nothing to index
+        records = self._scan_segment_records(seg_file)
+        if records:
+            self._write_sidecar_from_records(segment_id, records)
+
+    def _write_sidecar_from_records(self, segment_id: int, records: list) -> None:
+        """Write ``seg_NNNN.idx`` from already-computed index records, read at boot
+        instead of walking the body (biopb/biopb#300). Written atomically (tmp +
+        ``os.replace``) and best-effort: a failure (e.g. ENOSPC) only forfeits the
+        fast path for this one segment next boot, so it is logged and swallowed
+        rather than allowed to fail the write/close path.
+        """
+        if not records:
+            # Empty sealed segment: no sidecar. Boot walks/no-ops it -- harmless.
+            return
+        seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        try:
+            st = seg_file.stat()
+        except OSError:
+            return
+
+        schema = _SIDECAR_SCHEMA.with_metadata(
+            {
+                _SIDECAR_VERSION_KEY: _SIDECAR_VERSION_BYTES,
+                _SIDECAR_SEGMENT_SIZE_KEY: str(st.st_size).encode(),
+            }
+        )
+        table = pa.Table.from_arrays(
+            [
+                pa.array([r[0] for r in records], type=pa.binary()),
+                pa.array([r[1] for r in records], type=pa.int64()),
+                pa.array([r[2] for r in records], type=pa.int64()),
+                pa.array([r[3] for r in records], type=pa.int64()),
+                pa.array([r[4] for r in records], type=pa.int64()),
+                pa.array([st.st_mtime] * len(records), type=pa.float64()),
+            ],
+            schema=schema,
+        )
+
+        idx_path = self._sidecar_path(segment_id)
+        tmp_path = idx_path.parent / (idx_path.name + ".tmp")
+        try:
+            with pa.OSFile(str(tmp_path), "wb") as sink:
+                with pa.ipc.new_file(sink, schema) as writer:
+                    writer.write_table(table)
+            os.replace(str(tmp_path), str(idx_path))
+        except OSError as e:
+            logger.warning(f"Could not persist cache sidecar {idx_path.name}: {e}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _get_schema_key(self, schema: pa.Schema) -> str:
         """Get hashable key from schema (types, not metadata)."""
@@ -566,6 +767,13 @@ class ArrowFileBackend(CacheBackend):
                         if entry is not None and entry.is_evictable():
                             self._entries.pop(k, None)
 
+        # The segment is now sealed and immutable: persist its sidecar index so
+        # the next boot restores it without a body walk (biopb/biopb#300). Runs
+        # outside self._lock (it re-reads the file and writes a small one) so a
+        # stalled sidecar write can never wedge the read path; still under the
+        # caller's self._write_lock, so no append can race it.
+        self._write_segment_sidecar(segment_id)
+
     def _get_total_size(self) -> int:
         """Get total size across all segments."""
         total = 0
@@ -628,11 +836,12 @@ class ArrowFileBackend(CacheBackend):
         if mmap:
             mmap.close()
 
-        # Delete segment file
+        # Delete segment file and its sidecar index (whole-segment eviction).
         segments_dir = self._config.cache_dir / "segments"
         seg_file = segments_dir / f"seg_{segment_id:04d}.arrow"
         if seg_file.exists():
             seg_file.unlink()
+        self._remove_segment_sidecar(segment_id)
 
         # Remove from legacy tracking if present
         self._segments_legacy.pop(segment_id, None)
@@ -1328,10 +1537,12 @@ class ArrowFileBackend(CacheBackend):
                 mmap.close()
             self._segment_mmaps.clear()
 
-            # Delete all segment files
+            # Delete all segment files and their sidecar indexes
             segments_dir = self._config.cache_dir / "segments"
             for seg_file in segments_dir.glob("seg_*.arrow"):
                 seg_file.unlink()
+            for idx_file in segments_dir.glob("seg_*.idx"):
+                idx_file.unlink()
 
             # Clear tracking
             self._pool_queues.clear()
@@ -1411,10 +1622,21 @@ class ArrowFileBackend(CacheBackend):
         This preserves segment files for persistence across restarts.
         Only releases locks and closes handles.
         """
+        # Seal the still-open write segments (flush their streams), capturing
+        # which they are so we can persist their sidecars below. Rotation-sealed
+        # segments already have a sidecar and are not in the writer maps.
         with self._lock:
-            # Close all pool writers (and their sinks)
-            for segment_id in list(self._pool_writers.keys() | self._pool_sinks.keys()):
+            open_segment_ids = list(self._pool_writers.keys() | self._pool_sinks.keys())
+            for segment_id in open_segment_ids:
                 self._close_writer(segment_id)
+
+        # Persist a sidecar for each just-sealed segment so the next boot skips
+        # its body walk (biopb/biopb#300). Outside self._lock: writes one small
+        # file per segment, and a stalled write must not wedge the read path.
+        for segment_id in open_segment_ids:
+            self._write_segment_sidecar(segment_id)
+
+        with self._lock:
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
