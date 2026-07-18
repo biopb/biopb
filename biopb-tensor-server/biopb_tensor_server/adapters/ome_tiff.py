@@ -34,14 +34,13 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import BackendAdapter
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.core.remote import RemoteStore
@@ -389,7 +388,7 @@ def _store_reaper_loop() -> None:
 # =============================================================================
 
 
-class OmeTiffAdapter(SourceAdapter, TensorAdapter):
+class OmeTiffAdapter(TensorAdapter):
     """Pure-tifffile adapter for OME-TIFF (embedded OME-XML), single or multi-file.
 
     Dual-role, keyed on ``scene_index``:
@@ -561,7 +560,7 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
         self._cached_descriptors = descriptors if descriptors is not None else []
         return self._cached_descriptors
 
-    def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
+    def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Build (and cache) the scene adapter for a within-source field.
 
         The scene adapter is handed the scene's tifffile descriptor, so it never

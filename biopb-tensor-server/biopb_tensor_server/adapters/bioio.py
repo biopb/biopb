@@ -33,7 +33,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from bioio import BioImage
 
-    from biopb_tensor_server.core.base import BackendAdapter
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
@@ -145,7 +144,7 @@ def _claim_extensions() -> frozenset:
     return MICROSCOPY_EXTENSIONS
 
 
-class _BioioAdapterBase(SourceAdapter, TensorAdapter):
+class _BioioAdapterBase(TensorAdapter):
     """Base adapter for bioio-supported vendor formats.
 
     This base class provides full functionality for reading microscopy data
@@ -429,8 +428,8 @@ class _BioioAdapterBase(SourceAdapter, TensorAdapter):
                 f"Unknown scene: {field}", reason="unknown_field"
             ) from e
 
-    def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
-        """Get BackendAdapter for a specific scene within this source.
+    def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
+        """Get the tensor adapter for a specific scene within this source.
 
         Args:
             tensor_id: Scene identifier (scene_id from img.scenes)

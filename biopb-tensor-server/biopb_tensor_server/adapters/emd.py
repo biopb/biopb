@@ -30,19 +30,18 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import BackendAdapter
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
 
-class EmdAdapter(SourceAdapter, TensorAdapter):
+class EmdAdapter(TensorAdapter):
     """Adapter for EMD electron-microscopy files (NCEM and Velox flavors).
 
     Dual-role, like the bioio adapter:
@@ -185,7 +184,7 @@ class EmdAdapter(SourceAdapter, TensorAdapter):
         # Source-level: first signal's descriptor.
         return self.list_tensor_descriptors()[0]
 
-    def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
+    def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Return a tensor-scoped adapter for a specific signal.
 
         The EMD field is the signal's integer index (``source_id/0``,

@@ -37,7 +37,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import BackendAdapter
+    from biopb_tensor_server.core.base import SourceAdapter
     from biopb_tensor_server.core.remote import RemoteStore
 
 logger = logging.getLogger(__name__)
@@ -602,23 +602,23 @@ class AdapterRegistry:
     """
 
     def __init__(self):
-        self._adapters: List[Type[BackendAdapter]] = []
-        self._type_to_adapter: Dict[str, Type[BackendAdapter]] = {}
+        self._adapters: List[Type[SourceAdapter]] = []
+        self._type_to_adapter: Dict[str, Type[SourceAdapter]] = {}
 
-    def register(self, cls: Type[BackendAdapter]) -> None:
+    def register(self, cls: Type[SourceAdapter]) -> None:
         """Register an adapter class.
 
         Args:
-            cls: BackendAdapter subclass with claim(ctx, state) method
+            cls: SourceAdapter subclass with claim(ctx, state) method
         """
         self._adapters.append(cls)
 
-    def register_with_type(self, source_type: str, cls: Type[BackendAdapter]) -> None:
+    def register_with_type(self, source_type: str, cls: Type[SourceAdapter]) -> None:
         """Register an adapter class with explicit source type mapping.
 
         Args:
             source_type: Source type string (e.g., "zarr", "ome-tiff")
-            cls: BackendAdapter subclass
+            cls: SourceAdapter subclass
         """
         self._adapters.append(cls)
         self._type_to_adapter[source_type] = cls
@@ -665,14 +665,14 @@ class AdapterRegistry:
                 continue
         return claims
 
-    def get_adapter_for_type(self, source_type: str) -> Optional[Type[BackendAdapter]]:
+    def get_adapter_for_type(self, source_type: str) -> Optional[Type[SourceAdapter]]:
         """Get adapter class for a source type.
 
         Args:
             source_type: Source type string
 
         Returns:
-            BackendAdapter subclass or None if not registered
+            SourceAdapter subclass or None if not registered
         """
         return self._type_to_adapter.get(source_type)
 

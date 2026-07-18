@@ -26,7 +26,7 @@ import pytest
 from biopb.tensor.descriptor_pb2 import FlightCmd, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.core.base import BackendAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.errors import (
     InvalidTensorId,
     SourceResolveRetriableError,
@@ -44,7 +44,7 @@ from biopb_tensor_server.serving.server import (
 # --------------------------------------------------------------------------- #
 # Minimal adapters
 # --------------------------------------------------------------------------- #
-class _SingleTensorAdapter(BackendAdapter):
+class _SingleTensorAdapter(TensorAdapter):
     """A single-tensor source whose sole tensor is addressed by ``source_id``."""
 
     @classmethod

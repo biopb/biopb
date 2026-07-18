@@ -49,7 +49,7 @@ def _zarr_available() -> bool:
 
 def _make_typed_batch(arr: np.ndarray) -> pa.RecordBatch:
     """Build a chunk batch in the unified binary [data: binary, shape, dtype]
-    schema a compute_fn now produces (mirrors BackendAdapter.resolve_chunk_data)."""
+    schema a compute_fn now produces (mirrors TensorAdapter.resolve_chunk_data)."""
     return pack_chunk_batch(arr)
 
 

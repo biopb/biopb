@@ -12,7 +12,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import scale_by_label
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -120,7 +120,7 @@ def _dicom_physical_scale(ds, dim_labels) -> Optional[Tuple[List[float], List[st
 # =============================================================================
 
 
-class DicomAdapter(SourceAdapter, TensorAdapter):
+class DicomAdapter(TensorAdapter):
     """Adapter for single DICOM files.
 
     Handles .dcm and .dicom files with pixel data.
@@ -450,7 +450,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 # =============================================================================
 
 
-class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
+class DicomSeriesAdapter(TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
     Handles directories where multiple DICOM files share the same SeriesInstanceUID.

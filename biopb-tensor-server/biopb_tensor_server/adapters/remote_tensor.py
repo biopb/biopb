@@ -45,7 +45,6 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 from biopb_tensor_server.core.base import (
-    SourceAdapter,
     TensorAdapter,
     TensorReadPlan,
     unpack_chunk_array,
@@ -210,7 +209,7 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
         return None, False
 
 
-class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
+class RemoteTensorAdapter(TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
     _single_tensor_source = False  # an upstream source may carry several tensors

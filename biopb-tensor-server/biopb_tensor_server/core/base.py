@@ -449,7 +449,11 @@ class SourceAdapter(ABC):
         """Factory method to return adapter with specific tensor context.
 
         Transitions the adapter from source context to tensor context.
-        Single-tensor adapters return self with tensor context set.
+        Single-tensor adapters return self with tensor context set -- sound
+        because they are ``TensorAdapter`` subclasses, i.e. sources that also
+        fill the tensor role (see :class:`TensorAdapter`). A source that does
+        *not* (``UnresolvedSourceAdapter``) must override this; the default
+        below would otherwise hand back a self that cannot serve pixels.
         Multi-tensor adapters override this to return a new adapter for the tensor.
 
         Total by contract: a single-tensor source has exactly one tensor, so any
@@ -517,7 +521,7 @@ class SourceAdapter(ABC):
         return strip_source_prefix(self.source_id, tensor_id)
 
 
-class TensorAdapter(ABC):
+class TensorAdapter(SourceAdapter):
     """Abstract base class for tensor-level adapters.
 
     This interface provides methods to read specific tensors, get chunk layouts,
@@ -525,6 +529,26 @@ class TensorAdapter(ABC):
 
     Tensor-level adapters are created for specific tensors within a source, allowing
     them to maintain tensor-specific state (e.g., current scene in multi-scene files).
+
+    **A tensor adapter is a source adapter that can also serve pixels.** The two
+    roles nest rather than sit side by side, because every tensor adapter in this
+    codebase is in fact a full source object: single-tensor formats return ``self``
+    from ``get_tensor_adapter``, the multi-tensor ones (bioio / OME-TIFF / EMD)
+    return a clone of their own class with tensor context set, and the OME-Zarr /
+    QPTIFF level and HCS-field adapters are plain ``ZarrAdapter`` instances. The
+    serve path relies on it -- ``get_flight_info`` calls the source-scoped
+    ``get_metadata()`` on the tensor adapter to get an HCS field's per-field
+    metadata (biopb/biopb#253). Nesting types that reality instead of contradicting
+    it (biopb/biopb#380).
+
+    The converse does not hold: ``UnresolvedSourceAdapter`` is a source that has no
+    tensors until it resolves, and stays a plain ``SourceAdapter``. So "source" is
+    the general role and "tensor" the specialization, which is the direction this
+    inheritance encodes.
+
+    The role *scopes* stay disjoint at the point of declaration -- see the
+    role-scope guard below -- so a tensor-scoped method still can never be declared
+    on ``SourceAdapter``.
     """
 
     @abstractmethod
@@ -874,16 +898,16 @@ class TensorAdapter(ABC):
                 descriptor.physical_unit[:] = unit_vec
 
 
-class BackendAdapter(SourceAdapter, TensorAdapter):
-    pass
-
-
 # --- role-scope enforcement -------------------------------------------------
-# The two role interfaces must stay disjoint and match their declared scope, so
-# a tensor-scoped method can never silently land on SourceAdapter again (the
-# past scramble that this split fixes). Adding a public method to either ABC
-# without classifying it here fails the equality check; any overlap fails the
-# disjointness check. Underscore-private helpers are intentionally excluded.
+# The two role interfaces must stay disjoint *as declared* and match their
+# declared scope, so a tensor-scoped method can never silently land on
+# SourceAdapter again (the past scramble that this split fixes). TensorAdapter
+# inherits SourceAdapter's methods, but must not re-declare or override any of
+# them -- _public_api reads `vars(cls)`, so the checks below are about where a
+# method is written, not what an instance can answer. Adding a public method to
+# either ABC without classifying it here fails the equality check; any overlap
+# fails the disjointness check. Underscore-private helpers are intentionally
+# excluded.
 _SOURCE_SCOPED_API = frozenset(
     {
         "array_id",
