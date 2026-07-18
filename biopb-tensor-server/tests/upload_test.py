@@ -634,9 +634,7 @@ class TestDoPutErrorTranslation:
                 chunk_shape=[5, 5],
                 metadata_json="{not valid json",
             )
-            with pytest.raises(
-                flight.FlightServerError, match="invalid metadata_json"
-            ):
+            with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
                 self._do_put(server, req_desc)
 
     # -- the good path still writes the resolved descriptor ---------------------
