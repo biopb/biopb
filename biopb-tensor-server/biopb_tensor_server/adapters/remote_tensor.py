@@ -11,11 +11,12 @@ localhost ``chunk_locate`` mmap fast path *for free* -- the proxy adds no cachin
 code of its own.
 
 The adapter is, by design, **format-agnostic and chunking-agnostic**. It decodes
-no pixels and re-derives no chunk grid; the only thing it understands beyond
-pass-through is the **array_id rewrite** that maps its local (possibly
-alias-namespaced) identifiers to the upstream's and back -- a pure byte splice on
-the chunk_id's length-prefixed array_id field (``chunk.rewrite_chunk_id_array_id``),
-so bounds/scale bytes are never touched.
+no pixels and re-derives no chunk grid, and it treats the upstream's chunk_id as
+OPAQUE: a served chunk_id is a **proxy envelope** (``chunk.encode_proxy_envelope``)
+wrapping the upstream chunk_id byte-for-byte, plus a local route and the upstream's
+content_version. A later ``do_get`` peels the envelope and forwards the inner
+VERBATIM -- no decode, no rewrite of the upstream id (biopb/biopb#178 W1). The
+upstream array_id is read once at flight-info time only to build the local route.
 
 Scope of this slice (§2 of ``docs/remote-tensor-cache.md``): the adapter + its
 data path, constructible directly (and via ``create_from_config`` for the
@@ -54,8 +55,10 @@ from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     decode_chunk_id,
     encode_chunk_id,
+    encode_proxy_envelope,
+    is_proxy_envelope,
     is_scaled_chunk,
-    rewrite_chunk_id_array_id,
+    peel_proxy_envelope,
 )
 
 if TYPE_CHECKING:
@@ -685,15 +688,20 @@ class RemoteTensorAdapter(TensorAdapter):
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
                 bounds = ChunkBounds.FromString(ep.app_metadata)
-                # Map the chunk's OWN upstream array_id local-ward -- decode it
-                # rather than blanket-stamping self.array_id, so a chunk_id the
-                # upstream keyed to a different (e.g. sibling-field) array_id still
-                # rewrites to the right local id. rewrite_chunk_id_array_id touches
-                # only the array_id field, so bounds/scale bytes are preserved and
-                # a later do_get forwards the chunk_id back verbatim.
+                # Wrap the upstream chunk_id in a proxy envelope: it is carried
+                # VERBATIM (never rewritten) and forwarded byte-for-byte on do_get,
+                # so bounds/scale/version bytes are untouched and the proxy stays
+                # blind to the upstream codec. We read the chunk's OWN upstream
+                # array_id (not self.array_id -- a sibling-field chunk keeps its own)
+                # only to build the LOCAL route, so the server dispatches a later
+                # do_get back to the right local tensor view. The upstream's
+                # content_version rides the envelope so the proxy cache namespaces
+                # by upstream content.
                 upstream_aid, _ = decode_chunk_id(ticket.chunk_id)
-                local_chunk_id = rewrite_chunk_id_array_id(
-                    ticket.chunk_id, self._to_local_array_id(upstream_aid)
+                local_chunk_id = encode_proxy_envelope(
+                    ticket.chunk_id,
+                    self._to_local_array_id(upstream_aid),
+                    self.content_version,
                 )
                 endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
             return TensorReadPlan(
@@ -759,35 +767,44 @@ class RemoteTensorAdapter(TensorAdapter):
         return unpack_chunk_array(batch)
 
     def resolve_chunk_data(self, chunk_id: bytes, cache_manager=None) -> pa.RecordBatch:
-        """Serve a chunk by forwarding the (rewritten) chunk_id to the upstream.
+        """Serve a chunk by forwarding the envelope's inner chunk_id to the upstream.
 
-        Forwarding the chunk_id verbatim (only the array_id field swapped) means
-        the **upstream** does any downsampling for a scaled chunk_id and only the
-        small result crosses the network. The returned Arrow RecordBatch is cached
-        under the LOCAL chunk_id, so the segment cache and the localhost mmap fast
-        path are inherited unchanged.
+        The served chunk_id is a proxy envelope; peel it and forward the opaque
+        inner (the upstream chunk_id) VERBATIM -- no decode, no rewrite -- so the
+        **upstream** does any downsampling for a scaled chunk_id and only the small
+        result crosses the network. The result is cached under the envelope itself
+        (its canonical key), so the segment cache and the localhost mmap fast path
+        are inherited unchanged, namespaced by the upstream's content_version.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
-        local_array_id, _ = decode_chunk_id(chunk_id)
+        if not is_proxy_envelope(chunk_id):
+            # The proxy only mints envelope chunk_ids (biopb/biopb#178 W1); a
+            # non-envelope id is a stale pre-upgrade ticket. Fail clearly so the
+            # client re-opens the tensor to refresh its endpoints.
+            raise flight.FlightServerError(
+                f"proxy source {self.source_id} received a non-envelope chunk_id "
+                f"(stale pre-upgrade ticket); re-open the tensor to refresh."
+            )
+
+        route, _cv, inner = peel_proxy_envelope(chunk_id)
         should_cache = cache_manager is not None and (
-            is_scaled_chunk(chunk_id)
+            is_scaled_chunk(inner)
             or isinstance(cache_manager.backend, ArrowFileBackend)
         )
 
         def compute_fn():
-            upstream_chunk_id = rewrite_chunk_id_array_id(
-                chunk_id, self._to_upstream_array_id(local_array_id)
-            )
-            batch = self._upstream_record_batch(upstream_chunk_id)
+            # Forward the upstream chunk_id VERBATIM (the opaque inner); the upstream
+            # does any downsampling and only the result crosses the network.
+            batch = self._upstream_record_batch(inner)
             return batch, batch.nbytes
 
         if should_cache:
-            # Cache under the method-stripped canonical key (biopb/biopb#76);
-            # the full chunk_id, method included, is still forwarded upstream.
+            # The envelope is itself the canonical cache key (route + content_version
+            # + opaque inner); the inner is never parsed here.
             cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                cache_key, compute_fn, metadata={"array_id": local_array_id}
+                cache_key, compute_fn, metadata={"array_id": route}
             )
             data = entry.data
             cache_manager.release(cache_key)

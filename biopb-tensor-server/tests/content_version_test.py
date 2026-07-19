@@ -27,9 +27,13 @@ from biopb_tensor_server.core.chunk import (
     decode_scale_info,
     encode_chunk_id,
     encode_chunk_id_with_scale,
+    encode_proxy_envelope,
     get_bounds_from_chunk_id,
+    is_proxy_envelope,
     is_scaled_chunk,
+    peel_proxy_envelope,
     rewrite_chunk_id_array_id,
+    routing_array_id,
     wrap_content_version,
 )
 
@@ -125,6 +129,71 @@ class TestCacheKey:
         assert cache_key_for_chunk_id(
             wrap_content_version(legacy_with_method, CV)
         ) == cache_key_for_chunk_id(wrap_content_version(identity, CV))
+
+
+# ==============================================================================
+# Proxy envelope: opaque-inner wrapper for the remote-tensor proxy (#178 W1)
+# ==============================================================================
+
+
+class TestProxyEnvelope:
+    def test_roundtrip_with_and_without_version(self):
+        inner = encode_chunk_id("upstream/img", _bounds())
+        for cv in (CV, None):
+            env = encode_proxy_envelope(inner, "local/img", cv)
+            assert is_proxy_envelope(env)
+            route, got_cv, got_inner = peel_proxy_envelope(env)
+            assert route == "local/img"
+            assert got_cv == cv  # empty cv decodes back to None
+            assert got_inner == inner  # inner forwarded verbatim
+
+    def test_inner_is_opaque_arbitrary_bytes(self):
+        # The inner can itself be a version-wrapped / scaled upstream chunk_id; the
+        # envelope carries it byte-for-byte and never parses it.
+        inner = wrap_content_version(
+            encode_chunk_id_with_scale("upstream/img", _bounds(), (2, 2)), b"iat:99"
+        )
+        env = encode_proxy_envelope(inner, "local/img", CV)
+        assert peel_proxy_envelope(env)[2] == inner
+
+    def test_discriminators_are_mutually_exclusive(self):
+        legacy = encode_chunk_id("src/t", _bounds())
+        versioned = wrap_content_version(legacy, CV)
+        envelope = encode_proxy_envelope(legacy, "src/t", CV)
+        assert not is_proxy_envelope(legacy)  # 0x00 high byte
+        assert not is_proxy_envelope(versioned)  # 0xFF sentinel
+        assert is_proxy_envelope(envelope)  # 0xFE sentinel
+        assert legacy[0] != 0xFE and versioned[0] != 0xFE
+
+    def test_cache_key_is_envelope_verbatim_and_injective(self):
+        inner = encode_chunk_id("upstream/img", _bounds())
+        env = encode_proxy_envelope(inner, "local/img", CV)
+        assert cache_key_for_chunk_id(env) == env  # verbatim
+        # cv, route, and inner each move the key.
+        assert cache_key_for_chunk_id(
+            encode_proxy_envelope(inner, "local/img", b"v2")
+        ) != cache_key_for_chunk_id(env)
+        assert cache_key_for_chunk_id(
+            encode_proxy_envelope(inner, "other/img", CV)
+        ) != cache_key_for_chunk_id(env)
+        assert cache_key_for_chunk_id(
+            encode_proxy_envelope(
+                encode_chunk_id("upstream/j", _bounds()), "local/img", CV
+            )
+        ) != cache_key_for_chunk_id(env)
+        # Same triple -> same key (deterministic mint dedups).
+        assert cache_key_for_chunk_id(
+            encode_proxy_envelope(inner, "local/img", CV)
+        ) == cache_key_for_chunk_id(env)
+
+    def test_routing_array_id_uses_route_without_decoding_inner(self):
+        # A deliberately un-decodable inner proves routing never parses it.
+        env = encode_proxy_envelope(b"\xde\xad\xbe\xef", "local/img", CV)
+        assert routing_array_id(env) == "local/img"
+        # Non-envelope chunk_ids still route by their decoded array_id.
+        legacy = encode_chunk_id("src/t", _bounds())
+        assert routing_array_id(legacy) == "src/t"
+        assert routing_array_id(wrap_content_version(legacy, CV)) == "src/t"
 
 
 # ==============================================================================

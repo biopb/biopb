@@ -106,6 +106,85 @@ def content_version_of(chunk_id: bytes) -> Optional[bytes]:
     return _split_version(chunk_id)[0]
 
 
+# =============================================================================
+# Proxy envelope (biopb/biopb#178 W1)
+# -----------------------------------------------------------------------------
+# A remote-tensor proxy wraps the UPSTREAM's chunk_id in an envelope instead of
+# decoding/rewriting it (the old opacity violation). The inner upstream chunk_id
+# is carried VERBATIM -- the proxy never parses it -- alongside a proxy-owned
+# ``route`` (the local array_id, used to dispatch to the proxy adapter without
+# decoding the inner) and the upstream's ``content_version`` (may be empty).
+#
+# Layout: ``[0xFE sentinel][uint8 fmt][uint32 route_len][route][uint32 cv_len][cv]
+#          [inner: opaque upstream chunk_id]``
+#
+# 0xFE is a third discriminator, mutually exclusive with the 0x00 legacy high byte
+# and the 0xFF content_version sentinel, so any codec entry point can tell the
+# three apart from byte 0. Because the inner is method-free (#178 made chunk_ids
+# identity-only), the whole envelope is an injective, reduction_method-independent
+# cache key -- see cache_key_for_chunk_id.
+# =============================================================================
+
+_ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
+_ENV_FORMAT = 1  # envelope layout version (after the sentinel byte)
+
+
+def is_proxy_envelope(chunk_id: bytes) -> bool:
+    """True if ``chunk_id`` is a proxy envelope (leading 0xFE sentinel)."""
+    return bool(chunk_id) and chunk_id[0] == _ENV_SENTINEL
+
+
+def encode_proxy_envelope(
+    inner_chunk_id: bytes, route: str, content_version: Optional[bytes]
+) -> bytes:
+    """Wrap an opaque upstream ``inner_chunk_id`` in a proxy envelope.
+
+    ``route`` is the proxy's LOCAL array_id (how the server dispatches the chunk
+    back to this adapter); ``content_version`` is the upstream source's version
+    (``None``/empty when the upstream is unversioned). The inner is stored and
+    later forwarded byte-for-byte -- the proxy never interprets it.
+    """
+    route_bytes = route.encode("utf-8")
+    cv = content_version or b""
+    return (
+        struct.pack(">BBI", _ENV_SENTINEL, _ENV_FORMAT, len(route_bytes))
+        + route_bytes
+        + struct.pack(">I", len(cv))
+        + cv
+        + inner_chunk_id
+    )
+
+
+def peel_proxy_envelope(chunk_id: bytes) -> Tuple[str, Optional[bytes], bytes]:
+    """Split a proxy envelope into ``(route, content_version | None, inner)``.
+
+    Inverse of :func:`encode_proxy_envelope`. A zero-length content_version field
+    decodes back to ``None``. ``inner`` is the verbatim upstream chunk_id.
+    """
+    route_len = struct.unpack(">I", chunk_id[2:6])[0]
+    offset = 6 + route_len
+    route = chunk_id[6:offset].decode("utf-8")
+    cv_len = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
+    offset += 4
+    cv = chunk_id[offset : offset + cv_len]
+    offset += cv_len
+    inner = chunk_id[offset:]
+    return route, (cv if cv_len > 0 else None), inner
+
+
+def routing_array_id(chunk_id: bytes) -> str:
+    """The local array_id used to dispatch ``chunk_id`` to its adapter.
+
+    For a proxy envelope the ``route`` token IS the local array_id (the inner is
+    opaque and never decoded); otherwise decode it from the (possibly
+    version-wrapped) chunk_id. This is the one entry point the server routing uses
+    so an envelope never reaches :func:`decode_chunk_id`, which would misparse it.
+    """
+    if is_proxy_envelope(chunk_id):
+        return peel_proxy_envelope(chunk_id)[0]
+    return decode_chunk_id(chunk_id)[0]
+
+
 def content_version_from_path(path: object) -> Optional[bytes]:
     """Best-effort content_version for a local file/dir source (biopb/biopb#178).
 
@@ -262,7 +341,14 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     yields a distinct key and the stale entry becomes un-lookupable -- while the
     inner projection stays byte-identical to the pre-#178 key, so an UNVERSIONED
     chunk_id maps to exactly its old cache entry (no forced invalidation).
+
+    A proxy envelope is returned as-is: it already frames (route, content_version,
+    inner) with lengths, so it is an injective key, and since its inner is
+    method-free it is reduction_method-independent -- keying by it verbatim keeps
+    #76 dedup WITHOUT the proxy ever parsing the opaque inner.
     """
+    if is_proxy_envelope(chunk_id):
+        return chunk_id
     cv, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
     base = inner if len(inner) <= bounds_end else inner[: bounds_end + ndim * 8]

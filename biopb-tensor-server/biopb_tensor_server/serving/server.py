@@ -42,10 +42,9 @@ from biopb_tensor_server.core.activity import ActivityTracker
 from biopb_tensor_server.core.base import (
     SourceAdapter,
     TensorAdapter,
-    decode_chunk_id,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.chunk import cache_key_for_chunk_id
+from biopb_tensor_server.core.chunk import cache_key_for_chunk_id, routing_array_id
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
@@ -496,7 +495,10 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter responsible for the chunk, or None if not found
         """
-        array_id, *_ = decode_chunk_id(chunk_id)
+        # routing_array_id handles both a plain/versioned chunk_id and a proxy
+        # envelope (whose route token IS the local array_id) without decoding an
+        # opaque envelope inner (biopb/biopb#178 W1).
+        array_id = routing_array_id(chunk_id)
         source_id, *rest = array_id.split("/")
         rest = "/".join(rest) if rest else None
 
@@ -593,7 +595,7 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
-            source_id = decode_chunk_id(ticket.chunk_id)[0].split("/")[0]
+            source_id = routing_array_id(ticket.chunk_id).split("/")[0]
             self._authorize_source(context, source_id)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
@@ -1337,7 +1339,7 @@ class TensorFlightServer(flight.FlightServerBase):
             tensor_ticket = self._parse_ticket(ticket)
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-            source_id = decode_chunk_id(tensor_ticket.chunk_id)[0].split("/")[0]
+            source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
             self._authorize_source(context, source_id)
 
             try:
