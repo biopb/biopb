@@ -251,6 +251,11 @@ class _BioioAdapterBase(TensorAdapter):
 
         self._dask_data = None  # scene-level dask array, bound below
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
+        # Per-scene adapter cache, source-level only. Assigned here (not lazily on
+        # first get_tensor_adapter) so no code path has to hedge about whether the
+        # attribute exists; a per-instance dict, never a class attribute, for the
+        # reason spelled out in biopb/biopb#522.
+        self._tensor_adapters: dict = {}
         if scene_index is not None:
             # Scene-level: bind this scene's bioio dask array eagerly.
             self._bio_image.set_scene(scene_index)
@@ -449,12 +454,8 @@ class _BioioAdapterBase(TensorAdapter):
         # Source-level: lazy initialize tensor level adapters
         scene_idx = self._scene_index_for_field(tensor_id)
 
-        if hasattr(self, "_tensor_adapters"):
-            # Check if adapter already exists for this scene
-            if tensor_id in self._tensor_adapters:
-                return self._tensor_adapters[tensor_id]
-        else:
-            self._tensor_adapters = {}
+        if tensor_id in self._tensor_adapters:
+            return self._tensor_adapters[tensor_id]
 
         adapter = self.__class__(
             self._bio_image,
