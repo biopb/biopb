@@ -188,11 +188,15 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
 
     Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
-    ``source_url``, ``source_type``, ``metadata_json``, ``data_resident`` and the
-    per-tensor ``tensors`` STRUCT[] (biopb/biopb#224) -- everything needed to seed
-    a mirrored source's catalog entry without a per-source upstream RPC
+    ``source_url``, ``source_type``, ``metadata_json``, ``data_resident``, the
+    per-tensor ``tensors`` STRUCT[] (biopb/biopb#224), and ``indexed_at`` (the
+    upstream's per-source register timestamp) -- everything needed to seed a
+    mirrored source's catalog entry without a per-source upstream RPC
     (biopb/biopb#266). ``source_url`` carries the upstream's real path so the
     mirror can be treed by filepath in the browser (biopb/biopb#297).
+    ``indexed_at`` becomes the mirror's content_version (biopb/biopb#178): it
+    changes when the upstream re-registers the source, so the proxy's chunk cache
+    re-namespaces instead of serving stale chunks.
     ``data_resident`` is carried so an unresolved upstream
     source (``data_resident=false``, empty ``tensors``) mirrors as non-resident
     rather than being advertised resident. ``complete`` is True because the
@@ -208,7 +212,7 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     try:
         rows = client.query_sources(
             "SELECT source_id, source_url, source_type, metadata_json, "
-            "data_resident, tensors FROM sources",
+            "data_resident, tensors, indexed_at FROM sources",
             format="records",
         )
         return rows, True
@@ -428,6 +432,7 @@ class RemoteTensorAdapter(TensorAdapter):
         metadata: Optional[dict],
         data_resident: bool = True,
         source_url: Optional[str] = None,
+        indexed_at: object = None,
     ) -> bool:
         """(Re)populate the catalog surface from a bulk upstream ``query_sources``.
 
@@ -451,10 +456,24 @@ class RemoteTensorAdapter(TensorAdapter):
         the mirror's display url so the browser can tree it by the remote path
         (biopb/biopb#297).
 
+        ``indexed_at`` is the upstream source's register timestamp; it becomes this
+        mirror's ``content_version`` (``b"iat:<ts>"``, biopb/biopb#178), folded into
+        every minted proxy envelope so the chunk cache re-namespaces when the
+        upstream re-registers the source. It is set unconditionally (every reconcile
+        refreshes it) and deliberately NOT part of the ``changed`` result: a re-sync
+        re-stamps the LOCAL ``indexed_at``, so gating re-sync on it would churn; the
+        content_version only needs to ride the adapter for minting, not the catalog.
+
         We just queried the upstream, so mark it reachable. Returns whether the
         seeded catalog surface actually changed, so the caller can skip a
         redundant metadata-DB re-sync (and its ``indexed_at`` churn).
         """
+        # The upstream register timestamp is this mirror's content_version. An
+        # unversioned upstream (no indexed_at) leaves the proxy unversioned -> the
+        # envelope carries an empty cv, exactly as before this plumbing.
+        self._content_version = (
+            b"iat:" + str(indexed_at).encode() if indexed_at is not None else None
+        )
         descs: List[TensorDescriptor] = []
         for t in upstream_tensors or []:
             descs.append(
