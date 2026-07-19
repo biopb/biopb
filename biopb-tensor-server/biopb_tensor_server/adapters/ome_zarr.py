@@ -143,10 +143,12 @@ class OmeZarrAdapter(ZarrAdapter):
     # HCS-specific state (populated if _is_hcs_plate is True)
     _is_hcs_plate: bool = False
     _plate_root_path: Optional[str] = None  # Path to plate root directory
-    _hcs_well_paths: dict = {}  # well_name -> zarr path (e.g., 'A01' -> 'A01')
     _hcs_field_count: int = 0
-    _hcs_well_metadata: dict = {}  # well_name -> well .zattrs
-    _field_adapters: dict = {}  # field_key -> cached adapter
+    # The dict-valued state below is annotation-only on purpose -- see the
+    # per-instance assignments in __init__.
+    _hcs_well_paths: dict  # well_name -> zarr path (e.g., 'A01' -> 'A01')
+    _hcs_well_metadata: dict  # well_name -> well .zattrs
+    _field_adapters: dict  # field_key -> cached adapter
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -447,6 +449,15 @@ class OmeZarrAdapter(ZarrAdapter):
         # We'll override dim_labels below if OME metadata provides better ones
         super().__init__(zarr_array, source_id, dim_labels)
 
+        # Per-instance caches/state. These MUST be assigned here: a class-level
+        # mutable default is shared by every adapter in the process, so two HCS
+        # plates with the same well name would serve each other's pixels (#522).
+        self._hcs_well_paths: dict = {}
+        self._hcs_well_metadata: dict = {}
+        self._field_adapters: dict = {}
+        # Cache for level adapters (precomputed pyramid levels)
+        self._level_adapters: dict = {}
+
         self.resolution_level = resolution_level
 
         # Try to read OME metadata from .zattrs
@@ -531,9 +542,6 @@ class OmeZarrAdapter(ZarrAdapter):
                 ax.get("name", f"dim{i}") if isinstance(ax, dict) else str(ax)
                 for i, ax in enumerate(self.axes)
             ]
-
-        # Cache for level adapters (precomputed pyramid levels)
-        self._level_adapters: dict = {}
 
     def _parse_hcs_plate_structure(self, store_path: str) -> None:
         """Parse HCS plate metadata from plate.zattrs and well .zattrs files.
@@ -887,10 +895,6 @@ class OmeZarrAdapter(ZarrAdapter):
             raise TensorNotFound(f"Unknown well: {well_name}", reason="unknown_field")
 
         field_key = f"{well_name}/{field_idx}"
-
-        # Cache field adapters for reuse
-        if not hasattr(self, "_field_adapters"):
-            self._field_adapters = {}
 
         if field_key in self._field_adapters:
             return self._field_adapters[field_key]

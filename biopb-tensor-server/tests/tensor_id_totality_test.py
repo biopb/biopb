@@ -330,6 +330,8 @@ class TestHcsTotality:
         obj._is_hcs_plate = True
         obj._hcs_well_paths = {"A01": "A/1"}
         obj._hcs_well_metadata = {"A01": {"well": {"images": [{"path": "0"}]}}}
+        # __init__ is bypassed here, so mirror the per-instance caches it sets.
+        obj._field_adapters = {}
         return obj
 
     def test_unknown_well_raises_not_found(self):
