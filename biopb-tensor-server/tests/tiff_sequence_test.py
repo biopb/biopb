@@ -27,6 +27,7 @@ from biopb_tensor_server.adapters.tiff import (
     _group_tiff_sequence,
     _looks_like_tiff_sequence,
 )
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 
@@ -745,3 +746,16 @@ class TestTiffSequencePerFileLock:
                 gate.set()
                 t0.join(timeout=5)
             assert not errors
+
+
+class TestContentVersion:
+    """content_version rollout to the directory-based tiff-sequence adapter (#178)."""
+
+    def test_adapter_adopts_directory_stat_version(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_seq(tmpdir)
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            # A directory source versions off the dir's own mtime signal, which
+            # flips on member add/remove/rename -- the right O(1) signal here.
+            assert adapter.content_version is not None
+            assert adapter.content_version == content_version_from_path(str(tmpdir))

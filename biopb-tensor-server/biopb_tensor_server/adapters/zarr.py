@@ -12,6 +12,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -167,6 +168,11 @@ class ZarrAdapter(TensorAdapter):
             if hasattr(zarr_array.store, "path")
             else str(zarr_array.store)
         )
+        # Cheap content_version from the store directory's stat signature (#178):
+        # O(1) dir mtime, which flips on member add/remove/rename. A remote store
+        # path (S3/GCS) can't be stat'd -> None -> the source stays unversioned.
+        # Inherited by OmeZarrAdapter / _HcsFieldAdapter via super().__init__.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:

@@ -26,6 +26,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -241,6 +242,10 @@ class NdTiffAdapter(TensorAdapter):
         self._dataset = dataset
         self.source_id = source_id
         self._source_url = source_url
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for an NDTiff dataset dir. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
         self._io_lock = io_lock or threading.Lock()
 

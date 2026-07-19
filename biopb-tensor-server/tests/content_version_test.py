@@ -13,6 +13,7 @@ new bytes gets a fresh cache key instead of serving a stale cached chunk. Covers
 
 import os
 import tempfile
+import time
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -222,3 +223,25 @@ class TestContentVersionFromPath:
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         assert OmeTiffAdapter("", "srcid").content_version is None
+
+    def test_directory_signal_and_member_add_changes_it(self):
+        # Directory-based adapters version off the dir's own mtime, which flips on
+        # member add/remove/rename -- the O(1) signal for multi-file sources.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.bin"), "wb") as f:
+                f.write(b"x")
+            before = content_version_from_path(d)
+            assert before is not None and b":" in before
+            # A new member flips the directory's mtime. Back-to-back adds can
+            # coalesce inside one FS mtime tick (documented sub-resolution blind
+            # spot -- observed ~sub-20ms on Windows), so retry until the tick
+            # advances; real re-registrations are seconds apart and never coalesce.
+            after = before
+            for i in range(50):
+                with open(os.path.join(d, f"m{i}.bin"), "wb") as f:
+                    f.write(b"y")
+                after = content_version_from_path(d)
+                if after != before:
+                    break
+                time.sleep(0.01)
+            assert after is not None and after != before

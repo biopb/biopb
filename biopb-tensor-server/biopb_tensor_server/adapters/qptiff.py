@@ -45,7 +45,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.base import TensorAdapter, TensorReadPlan
-from biopb_tensor_server.core.chunk import normalized_scale_hint
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    normalized_scale_hint,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.downsample import normalize_reduction_method
 
@@ -142,6 +145,10 @@ class QptiffAdapter(TensorAdapter):
         self.source_id = source_id
         self._url = url or ""
         self._source_url = url or ""
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. None (unresolved / non-file url) leaves the source unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
         # One lock serialises the open/cache and metadata paths over the single
         # tifffile handle; reads run lock-free (see _read_level). RLock keeps it

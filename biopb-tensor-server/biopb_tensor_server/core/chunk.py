@@ -107,9 +107,14 @@ def content_version_from_path(path: object) -> Optional[bytes]:
     O(1) signal for multi-file sources). Returns None when the path can't be
     stat'd (e.g. a remote URL / cloud store), leaving the source unversioned.
 
-    Blind spot (documented, best-effort per #178): an in-place edit that
-    preserves mtime+size is undetectable; such sources want an explicit
-    ``volatile`` / content-hash mode, not this signal.
+    Blind spots (documented, best-effort per #178):
+    - an in-place edit that preserves mtime+size is undetectable;
+    - two changes closer together than the filesystem's mtime resolution coalesce
+      into one signal (observed ~sub-20ms on Windows dir mtimes).
+    Since content_version is sampled once at (re-)registration -- events that are
+    seconds apart -- neither blind spot bites the cache-invalidation use case.
+    A source needing byte-exact freshness wants an explicit ``volatile`` /
+    content-hash mode, not this signal.
     """
     try:
         st = os.stat(path)

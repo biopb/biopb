@@ -13,6 +13,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import scale_by_label
 from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -255,6 +256,10 @@ class DicomAdapter(TensorAdapter):
             self._source_url = str(dicom_dataset.filename)
         else:
             self._source_url = ""
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. None (unresolved / non-file url) leaves the source unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "dicom"
 
         # Get shape info
@@ -588,6 +593,10 @@ class DicomSeriesAdapter(TensorAdapter):
 
         # Source-level metadata
         self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file series. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "dicom-series"
 
         # Find and sort DICOM files
