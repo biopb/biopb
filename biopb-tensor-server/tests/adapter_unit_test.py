@@ -1113,6 +1113,44 @@ class TestGetPhysicalScale:
             assert scale == [0.0, 0.5, 0.5]
             assert unit == ["", "micrometer", "micrometer"]
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_two_plates_sharing_a_well_name_do_not_share_fields(self):
+        """Two plates with the same well/field name serve their own pixels.
+
+        The field-adapter cache used to be a class-level dict, so the second
+        plate returned the first plate's adapter -- wrong pixels under the right
+        array_id (issue #522).
+        """
+        import zarr
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plates = []
+            for name, fill in (("plateA", 111), ("plateB", 222)):
+                root = self._make_hcs_plate(os.path.join(tmpdir, name))
+                zarr.open_array(os.path.join(root, "A", "1", "0", "0"), mode="r+")[
+                    :
+                ] = fill
+                plates.append(
+                    OmeZarrAdapter.create_from_config(
+                        SourceConfig(source_id=name, url=root, type="ome-zarr-hcs")
+                    )
+                )
+
+            a, b = plates
+            # Per-instance cache, not the class dict -- the failure mode is
+            # invisible at the call site, so assert the storage location too.
+            assert "_field_adapters" in vars(a)
+            assert "_field_adapters" in vars(b)
+
+            field_id = a.list_tensor_descriptors()[0].array_id
+            fa = a.get_tensor_adapter(field_id)
+            fb = b.get_tensor_adapter(field_id.split("/", 1)[1])
+            assert fa is not fb
+            assert int(np.asarray(fa.zarr_array).flat[0]) == 111
+            assert int(np.asarray(fb.zarr_array).flat[0]) == 222
+
 
 class TestOmeZarrPrecompute:
     """Tests for OmeZarrAdapter precomputed level support."""
