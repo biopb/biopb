@@ -27,6 +27,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _store_filesystem_path(store) -> str:
+    """Resolve a zarr store to the local filesystem path it is rooted at.
+
+    One definition, two callers (biopb/biopb#530): ``__init__`` walks up from here
+    to find the group/plate ``.zattrs``, and ``_open_level_array`` walks up from
+    here to find the group root a pyramid level hangs off. They used to enumerate
+    different store shapes, so a store carrying ``root`` but not ``path`` resolved
+    correctly in one and degraded to ``str(store)`` -- a repr, not a path -- in the
+    other, which silently turns a level read into a CWD-relative open.
+
+    ``path`` is the zarr-2 attribute (``DirectoryStore`` / ``FSStore``); ``root`` is
+    the zarr-3 ``LocalStore`` one, unreachable under the current ``zarr<3`` pin and
+    kept so the 2->3 port cannot reintroduce the split.
+    """
+    store_str = str(store)
+    if store_str.startswith("file://"):
+        return str(urlparse(store_str).path)
+    path = getattr(store, "path", None)
+    if path is not None:
+        return str(path)
+    root = getattr(store, "root", None)
+    if root is not None:
+        return str(root)
+    return store_str
+
+
 def _physical_scale_from_multiscales(
     multiscales: list, fallback_axes: list
 ) -> Optional[Tuple[List[float], List[str]]]:
@@ -466,17 +492,7 @@ class OmeZarrAdapter(ZarrAdapter):
         self.channel_names = []
 
         # Determine store path for reading .zattrs
-        store = zarr_array.store
-        store_str = str(store)
-        if store_str.startswith("file://"):
-            store_path = str(urlparse(store_str).path)
-        elif hasattr(store, "path"):
-            # DirectoryStore has 'path' attribute
-            store_path = str(store.path)
-        elif hasattr(store, "root"):
-            store_path = str(store.root)
-        else:
-            store_path = store_str
+        store_path = _store_filesystem_path(zarr_array.store)
 
         # Navigate to find the plate root .zattrs (might be multiple levels up for HCS)
         # For HCS plates, array is at plate.zarr/A01/0/0, but plate .zattrs is at plate.zarr/
@@ -1156,23 +1172,31 @@ class OmeZarrAdapter(ZarrAdapter):
         """Open the Zarr array at the given level path (relative to group root)."""
         import zarr
 
-        store = self.zarr_array.store
+        store_path = _store_filesystem_path(self.zarr_array.store)
 
-        store_str = str(store.path if hasattr(store, "path") else store)
-
-        if store_str.startswith("file://"):
-            store_path = urlparse(store_str).path
-        else:
-            store_path = store_str
-
-        # Navigate to the group root
+        # Navigate to the group root. Terminate on the dirname fixed point rather
+        # than on '/', so a Windows drive root ends the walk instead of spinning
+        # forever -- the same termination bug already fixed in __init__.
         current_path = store_path.rstrip("/")
-        while current_path and current_path != "/":
+        group_root = None
+        while current_path:
             if os.path.exists(os.path.join(current_path, ".zattrs")):
+                group_root = current_path
                 break
-            current_path = os.path.dirname(current_path)
+            parent_path = os.path.dirname(current_path)
+            if parent_path == current_path:
+                break
+            current_path = parent_path
 
-        # Join with the target level path
-        level_path = os.path.join(current_path, path)
+        if group_root is None:
+            # Exhausting the walk used to leave current_path == "", so
+            # os.path.join("", path) handed zarr a *relative* path resolved
+            # against the process CWD: a level read that fails obscurely, or
+            # worse succeeds against an unrelated store (biopb/biopb#530).
+            raise FileNotFoundError(
+                f"no OME-Zarr group root (a directory holding .zattrs) at or above "
+                f"{store_path!r}; cannot open pyramid level {path!r} of source "
+                f"{self.source_id!r}"
+            )
 
-        return zarr.open_array(level_path, mode="r")
+        return zarr.open_array(os.path.join(group_root, path), mode="r")

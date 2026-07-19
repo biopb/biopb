@@ -1716,3 +1716,114 @@ class TestGetData:
             data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[32, 48]))
             assert data.shape == (32, 48)
             np.testing.assert_array_equal(data, expected)
+
+
+class TestOmeZarrStorePathResolution:
+    """One store->path resolver for both call sites (biopb/biopb#530).
+
+    ``__init__`` (find the group/plate ``.zattrs``) and ``_open_level_array``
+    (find the group root a pyramid level hangs off) used to enumerate different
+    store shapes. A store with ``root`` but no ``path`` -- the zarr-3
+    ``LocalStore`` shape -- resolved in the first and fell through to
+    ``str(store)`` in the second, which silently degrades a level read into a
+    CWD-relative open.
+    """
+
+    def test_resolver_covers_every_store_shape(self):
+        from biopb_tensor_server.adapters.ome_zarr import _store_filesystem_path
+
+        class _Store:
+            def __init__(self, repr_str, **attrs):
+                self._repr = repr_str
+                self.__dict__.update(attrs)
+
+            def __repr__(self):
+                return self._repr
+
+        # file:// URL wins over everything (checked first, as __init__ did).
+        assert _store_filesystem_path(_Store("file:///data/p.zarr")) == "/data/p.zarr"
+        # zarr 2: DirectoryStore / FSStore expose .path
+        assert _store_filesystem_path(_Store("<DirectoryStore>", path="/d/a")) == "/d/a"
+        # zarr 3: LocalStore exposes .root -- the case _open_level_array omitted
+        assert _store_filesystem_path(_Store("<LocalStore>", root="/d/b")) == "/d/b"
+        # Nothing recognizable: the repr, same degraded behaviour as before.
+        assert _store_filesystem_path(_Store("<Weird>")) == "<Weird>"
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_both_call_sites_use_the_one_resolver(self, monkeypatch):
+        """Structural: neither site may grow its own store-shape enumeration."""
+        import json
+
+        import zarr
+        from biopb_tensor_server.adapters import ome_zarr as ome_zarr_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, "test.ome.zarr")
+            root = zarr.open_group(zarr_path, mode="w")
+            root.create_dataset("0", shape=(40, 40), chunks=(20, 20), dtype="uint8")
+            root.create_dataset("1", shape=(20, 20), chunks=(10, 10), dtype="uint8")
+            zattrs = {
+                "multiscales": [
+                    {
+                        "name": "t",
+                        "axes": [
+                            {"name": "y", "type": "space"},
+                            {"name": "x", "type": "space"},
+                        ],
+                        "datasets": [
+                            {
+                                "path": "0",
+                                "coordinateTransformations": [
+                                    {"type": "scale", "scale": [1, 1]}
+                                ],
+                            },
+                            {
+                                "path": "1",
+                                "coordinateTransformations": [
+                                    {"type": "scale", "scale": [2, 2]}
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+            with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
+                json.dump(zattrs, f)
+
+            calls = []
+            real = ome_zarr_mod._store_filesystem_path
+
+            def _counting(store):
+                calls.append(store)
+                return real(store)
+
+            monkeypatch.setattr(ome_zarr_mod, "_store_filesystem_path", _counting)
+
+            base = zarr.open_group(zarr_path, mode="r")["0"]
+            adapter = ome_zarr_mod.OmeZarrAdapter(base, "test")
+            assert len(calls) == 1  # __init__
+
+            level = adapter.get_level_adapter("1")
+            assert len(calls) == 2  # _open_level_array
+            assert list(level.get_tensor_descriptor().shape) == [20, 20]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_missing_group_root_raises_instead_of_opening_a_relative_path(self):
+        """Exhausting the walk used to leave "" -> os.path.join("", "1") -> a
+        CWD-relative open: a level read that fails obscurely, or succeeds
+        against an unrelated store."""
+        import zarr
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            arr = zarr.open_array(
+                os.path.join(tmpdir, "bare.zarr"),
+                mode="w",
+                shape=(8, 8),
+                chunks=(4, 4),
+                dtype="uint8",
+            )
+            adapter = OmeZarrAdapter(arr, "bare")
+            # No .zattrs anywhere above the array: no group root to hang "1" off.
+            with pytest.raises(FileNotFoundError, match="group root"):
+                adapter._open_level_array("1")
