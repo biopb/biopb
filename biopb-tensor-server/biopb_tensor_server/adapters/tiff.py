@@ -22,7 +22,7 @@ from biopb_tensor_server.adapters._scale import (
     scale_by_label,
     unit_to_um,
 )
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -365,7 +365,7 @@ class _PerFileTiffLockMixin:
 # =============================================================================
 
 
-class TiffSequenceAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
+class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for plain TIFF file sequences in a directory (no metadata).
 
     Handles datasets where multiple TIFF files form a single logical image:
@@ -916,7 +916,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
 # =============================================================================
 
 
-class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdapter):
+class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for legacy MicroManager datasets with JSON metadata.
 
     Handles MicroManager v1 v2 datasets with metadata.txt containing:

@@ -19,7 +19,7 @@ Client (Python or TypeScript)
                                                     TensorFlightServer
                                                              │
                                               ┌──────────────────────────┐
-                                              │  BackendAdapter          │
+                                              │  TensorAdapter           │
                                               │  (Zarr / OME-Zarr /      │
                                               │   OME-TIFF / HDF5 / CZI) │
                                               └──────────────────────────┘
@@ -90,8 +90,8 @@ a client that just needs "is the port up" still uses `SERVING`. (A static-only
 config has nothing to scan, so the launcher stamps `last_full_scan_finished_at`
 directly and `full_scan_in_progress` stays `false`.)
 
-Sources are keyed by `source_id`. Each source maps to one `BackendAdapter`
-which may expose multiple tensors (e.g., multi-field).
+Sources are keyed by `source_id`. Each source maps to one adapter, which may
+expose multiple tensors (e.g., multi-field).
 
 ### Flight methods
 
@@ -170,9 +170,20 @@ level 0 is full resolution. The client reads each advertised level via the norma
   precache worker warms the *coarsest* of this same plan, so the warmed scale and
   the advertised scale can never drift.
 
-### BackendAdapter interface
+### Adapter interface
 
-All adapters implement `BackendAdapter`:
+Two role ABCs in `core/base.py`, and they **nest**: `TensorAdapter` subclasses
+`SourceAdapter`, so a tensor adapter is a source that can also serve pixels
+(biopb/biopb#380). Every concrete format adapter subclasses `TensorAdapter` and
+fills both roles in one object — `get_tensor_adapter()` returns `self` for a
+single-tensor format, and a clone of the same class (or a plain `ZarrAdapter`,
+for OME-Zarr / QPTIFF levels and HCS fields) for a multi-tensor one. The lone
+source-only adapter is `UnresolvedSourceAdapter`, which has no tensors until it
+resolves. The role *scopes* stay disjoint where they are declared — `base.py`
+asserts that at import time (`_SOURCE_SCOPED_API` / `_TENSOR_SCOPED_API`), so a
+tensor-scoped method can never be written onto `SourceAdapter`.
+
+All adapters implement:
 
 | Method | Returns |
 |--------|---------|

@@ -9,7 +9,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from biopb_tensor_server.core.discovery import DiscoveryState
 
 
-class Hdf5Adapter(SourceAdapter, TensorAdapter):
+class Hdf5Adapter(TensorAdapter):
     """Adapter for HDF5 chunked datasets.
 
     Chunk ID format:

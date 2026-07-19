@@ -28,7 +28,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ MRC_EXTENSIONS = (".mrc", ".mrcs", ".rec", ".st", ".map")
 _MRC_HEADER_BYTES = 1024
 
 
-class MrcAdapter(SourceAdapter, TensorAdapter):
+class MrcAdapter(TensorAdapter):
     """Adapter for MRC electron-microscopy volumes.
 
     Uses rosettasciio to parse the header and an own ``np.memmap`` for lazy,

@@ -44,7 +44,7 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescripto
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter, TensorReadPlan
+from biopb_tensor_server.core.base import TensorAdapter, TensorReadPlan
 from biopb_tensor_server.core.chunk import normalized_scale_hint
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.downsample import normalize_reduction_method
@@ -83,7 +83,7 @@ def _default_dim_labels(ndim: int) -> List[str]:
     return [f"dim{i}" for i in range(ndim - 2)] + ["y", "x"]
 
 
-class QptiffAdapter(SourceAdapter, TensorAdapter):
+class QptiffAdapter(TensorAdapter):
     """Adapter for Akoya PhenoImager QPTIFF (pyramidal multiplex BigTIFF).
 
     Single tensor (the baseline pyramidal multichannel image) served straight from
@@ -411,8 +411,8 @@ class QptiffAdapter(SourceAdapter, TensorAdapter):
         ``OmeZarrAdapter`` -- the level adapter is a bare ``ZarrAdapter`` over it
         with ``source_id`` inherited and ``_tensor_name = str(level)``. The base
         ``array_id`` property then yields ``source_id/{level}``; nothing hardcodes
-        the identifier. This keeps the level adapter a genuine ``BackendAdapter``
-        (not a partial ``TensorAdapter``), so any caller that treats it as a full
+        the identifier. This keeps the level adapter a genuine ``TensorAdapter``
+        -- which is itself a ``SourceAdapter`` -- so any caller that treats it as a full
         source -- metadata-DB sync, source-level ops -- finds the attributes it
         expects. All levels share the parent's one open ``tifffile`` handle (the
         ``aszarr`` stores reference it), and ``ZarrAdapter`` holds no handle of its

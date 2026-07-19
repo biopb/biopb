@@ -241,7 +241,7 @@ class TestAdvisoryReductionCacheKey:
 
 
 class TestGetScaledReadPlan:
-    """Tests for BackendAdapter.get_scaled_read_plan default implementation."""
+    """Tests for TensorAdapter.get_scaled_read_plan default implementation."""
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_default_uses_virtual_scaling(self):
@@ -336,6 +336,19 @@ class TestEmptyChunkShapeFallback:
 
         def get_data(self, bounds):  # pragma: no cover - not exercised here
             raise NotImplementedError
+
+        # The source half of the role, inherited since TensorAdapter subclasses
+        # SourceAdapter (biopb/biopb#380). Unused here -- only the chunk-grid
+        # fallback is under test -- but abstract, so they need a body.
+        @classmethod
+        def create_from_config(cls, source, credentials_config=None):
+            raise NotImplementedError
+
+        def list_tensor_descriptors(self):
+            return [self._desc]
+
+        def get_metadata(self):
+            return {}
 
     def test_empty_chunk_shape_derives_default_grid(self):
         # The reproducer: a 5-D FITS-like tensor (>i2) with no chunk_shape, as a

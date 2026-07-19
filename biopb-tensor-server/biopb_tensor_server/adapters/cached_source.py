@@ -1,7 +1,7 @@
 """Cache-backed source adapter for ephemeral uploaded data.
 
 Design: One adapter instance per cache-backed source, following the existing
-BackendAdapter pattern used by OmeZarrAdapter, etc.
+fused source+tensor adapter pattern used by OmeZarrAdapter, etc.
 
 - CachedSourceAdapter instances registered in server.sources registry (same as other adapters)
 - Metadata (shape, dtype, chunk_shape) stored in adapter instance
@@ -30,7 +30,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.base import (
     CHUNK_WIRE_SCHEMA,
-    SourceAdapter,
     TensorAdapter,
 )
 from biopb_tensor_server.core.chunk import encode_chunk_id
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class CachedSourceAdapter(SourceAdapter, TensorAdapter):
+class CachedSourceAdapter(TensorAdapter):
     """Adapter for cache-backed uploaded sources.
 
     One instance per source, registered in server.sources registry.
@@ -112,7 +111,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         # Track actually-written chunks: start coords -> full bounds
         self._written_chunks: Dict[bytes, ChunkBounds] = {}
 
-        # Required fields for BackendAdapter
+        # Required fields for the adapter interface
         self._source_url = f"cache://{source_id}"
         self._source_type = "cache"
 

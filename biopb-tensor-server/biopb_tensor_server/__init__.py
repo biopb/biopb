@@ -5,7 +5,7 @@ multi-dimensional arrays through Apache Arrow Flight protocol.
 
 Key components:
 - TensorFlightServer: Flight server implementation
-- BackendAdapter: Abstract interface for storage backends
+- SourceAdapter / TensorAdapter: the source- and tensor-level adapter interfaces
 - Adapters: ZarrAdapter, Hdf5Adapter, OmeZarrAdapter, OmeTiffAdapter, ZeissAdapter, etc.
 - Cache: CacheManager, CacheConfig for caching computed virtual chunks
 
@@ -51,7 +51,6 @@ from biopb_tensor_server.cache import (
     MemoryCacheBackend,
 )
 from biopb_tensor_server.core.base import (
-    BackendAdapter,
     SourceAdapter,
     TensorAdapter,
     TensorReadPlan,
@@ -83,7 +82,6 @@ __all__ = [
     "serve",
     "SourceAdapter",
     "TensorAdapter",
-    "BackendAdapter",
     "ChunkEndpoint",
     "TensorReadPlan",
     "ZarrAdapter",

@@ -25,7 +25,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import mm_summary_scale
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -120,7 +120,7 @@ class RemoteNdTiffFileIO:
 # =============================================================================
 
 
-class NdTiffAdapter(SourceAdapter, TensorAdapter):
+class NdTiffAdapter(TensorAdapter):
     """Adapter for Micro-Manager NDTiff storage format.
 
     Single-tensor source exposing full 5D/6D array.

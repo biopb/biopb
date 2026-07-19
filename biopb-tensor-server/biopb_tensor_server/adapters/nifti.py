@@ -11,7 +11,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 _NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
 
 
-class NiftiAdapter(SourceAdapter, TensorAdapter):
+class NiftiAdapter(TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
     Uses nibabel for lazy loading and header parsing.

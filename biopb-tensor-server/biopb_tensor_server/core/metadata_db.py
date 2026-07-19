@@ -40,7 +40,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import BackendAdapter
+    from biopb_tensor_server.core.base import SourceAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +358,7 @@ class MetadataDatabase:
             result = self._pending_results.pop(ticket_id, None)
         return result
 
-    def sync_source_added(self, source_id: str, adapter: BackendAdapter) -> None:
+    def sync_source_added(self, source_id: str, adapter: SourceAdapter) -> None:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
         Called by ``SourceManager`` when a source is registered and, for a

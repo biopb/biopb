@@ -689,7 +689,7 @@ def _create_source_adapter(source: SourceConfig, registry=None):
         registry: Optional adapter registry (uses default if None)
 
     Returns:
-        BackendAdapter instance
+        SourceAdapter instance
 
     Raises:
         ValueError: If source type is not registered

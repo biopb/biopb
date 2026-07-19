@@ -9,7 +9,7 @@ Usage:
     claims = registry.get_claims_for_path(path, visited)
 """
 
-from biopb_tensor_server.core.base import BackendAdapter, SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
@@ -84,7 +84,6 @@ except ImportError:
 __all__ = [
     "get_default_registry",
     "AdapterRegistry",
-    "BackendAdapter",
     "SourceAdapter",
     "TensorAdapter",
     "ZarrAdapter",

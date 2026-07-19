@@ -19,7 +19,7 @@ from biopb_tensor_server.core.downsample import normalize_reduction_method
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import BackendAdapter
+    from biopb_tensor_server.core.base import TensorAdapter
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
@@ -844,7 +844,7 @@ class OmeZarrAdapter(ZarrAdapter):
             # Single multiscale image
             return [self.get_tensor_descriptor()]
 
-    def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
+    def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Get adapter for a specific tensor.
 
         For HCS plates: Returns ZarrAdapter for the specific field.
@@ -854,7 +854,7 @@ class OmeZarrAdapter(ZarrAdapter):
             tensor_id: For HCS: 'well_name/field_index', for single image: optional
 
         Returns:
-            BackendAdapter for the specific tensor with tensor context set
+            TensorAdapter for the specific tensor with tensor context set
         """
         if not self._is_hcs_plate:
             # Single image: use base class behavior

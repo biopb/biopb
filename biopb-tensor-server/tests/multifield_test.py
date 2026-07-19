@@ -8,14 +8,14 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.base import (
-    BackendAdapter,
     DataSourceDescriptor,
+    TensorAdapter,
     TensorDescriptor,
     strip_source_prefix,
 )
 
 
-class MockMultifieldAdapter(BackendAdapter):
+class MockMultifieldAdapter(TensorAdapter):
     """Mock adapter simulating a multifield source with different-shaped tensors."""
 
     @classmethod
@@ -76,7 +76,7 @@ class MockMultifieldAdapter(BackendAdapter):
             )
         return descriptors
 
-    def get_tensor_adapter(self, tensor_id: str) -> BackendAdapter:
+    def get_tensor_adapter(self, tensor_id: str) -> TensorAdapter:
         """Return adapter for specific tensor - multifield override."""
         if tensor_id in self._tensor_adapters:
             return self._tensor_adapters[tensor_id]
@@ -102,7 +102,7 @@ class MockMultifieldAdapter(BackendAdapter):
         )
 
 
-class MockSingleTensorAdapter(BackendAdapter):
+class MockSingleTensorAdapter(TensorAdapter):
     """Mock adapter for a single tensor within a multifield source."""
 
     @classmethod
@@ -521,7 +521,7 @@ class TestMultifieldDifferentDtypes:
         assert descriptors[2].dtype == "uint16"
 
 
-class MockImage0Adapter(BackendAdapter):
+class MockImage0Adapter(TensorAdapter):
     """Single-tensor source whose tensor is named "Image:0".
 
     Models a single-scene aicsimageio file: every such file names its one

@@ -2,11 +2,18 @@
 
 ``base.py`` declares two role interfaces -- ``SourceAdapter`` (discover tensors,
 read source metadata, hand out tensor adapters) and ``TensorAdapter`` (read a
-specific tensor's data / descriptor / chunks / pyramid / physical scale). They
-must stay disjoint so a tensor-scoped method can never silently land on
-``SourceAdapter`` again (the scramble these tests guard against). ``base.py``
-already asserts the invariant at import time; these tests re-check it from the
-test surface and extend it to the concrete adapter registry.
+specific tensor's data / descriptor / chunks / pyramid / physical scale). Their
+*declarations* must stay disjoint so a tensor-scoped method can never silently
+land on ``SourceAdapter`` again (the scramble these tests guard against).
+``base.py`` already asserts the invariant at import time; these tests re-check it
+from the test surface and extend it to the concrete adapter registry.
+
+``TensorAdapter`` **subclasses** ``SourceAdapter`` (biopb/biopb#380): a tensor
+adapter is a source that can also serve pixels, which is what every concrete
+adapter already is. Disjointness is therefore about where a method is written
+(``vars(cls)``), not about what an instance can answer -- these tests assert
+exactly that, so an override of a source-scoped method onto ``TensorAdapter``
+still fails.
 """
 
 from biopb_tensor_server.core.base import (
@@ -22,6 +29,17 @@ def test_role_interfaces_are_disjoint():
     """No public method may belong to both role interfaces."""
     assert _public_api(SourceAdapter).isdisjoint(_public_api(TensorAdapter))
     assert _SOURCE_SCOPED_API.isdisjoint(_TENSOR_SCOPED_API)
+
+
+def test_tensor_role_nests_inside_the_source_role():
+    """A TensorAdapter IS-A SourceAdapter, and inherits (never re-declares) it."""
+    assert issubclass(TensorAdapter, SourceAdapter)
+    assert not issubclass(SourceAdapter, TensorAdapter)
+    # Inherited, not copied: the source-scoped names resolve on TensorAdapter but
+    # are declared only on SourceAdapter.
+    for name in _SOURCE_SCOPED_API:
+        assert hasattr(TensorAdapter, name), name
+        assert name not in vars(TensorAdapter), name
 
 
 def test_declared_scopes_match_the_abcs():
@@ -51,6 +69,17 @@ def test_has_native_pyramid_derives_from_levels_by_default():
         def get_data(self, bounds):  # abstract
             raise NotImplementedError
 
+        # Inherited from the SourceAdapter half of the role (biopb/biopb#380).
+        @classmethod
+        def create_from_config(cls, source, credentials_config=None):  # abstract
+            raise NotImplementedError
+
+        def list_tensor_descriptors(self):  # abstract
+            raise NotImplementedError
+
+        def get_metadata(self):  # abstract
+            raise NotImplementedError
+
     class _WithPyramid(_NoPyramid):
         def get_native_pyramid_levels(self):
             return ["level0", "level1"]  # non-None -> has a native pyramid
@@ -61,8 +90,9 @@ def test_has_native_pyramid_derives_from_levels_by_default():
 
 def test_registered_adapters_fill_both_roles():
     """Every concrete adapter in the registry is both a SourceAdapter and a
-    TensorAdapter (they serve one combined object per the multiply-inherited
-    design)."""
+    TensorAdapter -- they serve one combined object, now by inheriting the
+    nested ``TensorAdapter(SourceAdapter)`` rather than by multiple
+    inheritance."""
     from biopb_tensor_server.adapters import get_default_registry
 
     registry = get_default_registry()

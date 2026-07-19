@@ -1,7 +1,7 @@
 """Arrow Flight server for tensor storage.
 
 This module implements a Flight server that exposes chunked multi-dimensional
-arrays through the BackendAdapter interface.
+arrays through the source/tensor adapter interface.
 
 The server supports:
 - ListFlights: Browse available tensors
