@@ -1827,3 +1827,46 @@ class TestOmeZarrStorePathResolution:
             # No .zattrs anywhere above the array: no group root to hang "1" off.
             with pytest.raises(FileNotFoundError, match="group root"):
                 adapter._open_level_array("1")
+
+
+class TestTensorAdapterCacheIsAssignedAtInit:
+    """``_tensor_adapters`` exists from construction, not from first use.
+
+    The scene-adapter caches in ``ome_tiff``/``bioio`` were lazily created on the
+    first ``get_tensor_adapter`` call, so every other reader had to hedge --
+    ``hasattr(self, "_tensor_adapters")`` at the lazy-init, ``getattr(self,
+    "_tensor_adapters", {})`` in ``close()``. Assigning in ``__init__`` removes
+    the hedges and makes the per-instance invariant of biopb/biopb#522 (never a
+    shared class attribute) assertable before any tensor is bound.
+    """
+
+    def test_ome_tiff_cache_is_per_instance_from_construction(self):
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        # __init__ is lazy -- no file is opened, so a nonexistent path is fine.
+        a = OmeTiffAdapter("/nonexistent/a.ome.tif", "a")
+        b = OmeTiffAdapter("/nonexistent/b.ome.tif", "b")
+
+        assert "_tensor_adapters" in vars(a)  # instance dict, not the class
+        assert a._tensor_adapters == {}
+        assert a._tensor_adapters is not b._tensor_adapters
+
+    def test_ome_tiff_close_cascades_without_a_bound_scene(self):
+        """close() reads the cache bare now; an adapter that never served a
+        tensor must still close cleanly rather than AttributeError."""
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        OmeTiffAdapter("/nonexistent/a.ome.tif", "a").close()
+
+    def test_bioio_cache_is_per_instance_from_construction(self):
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+
+        class _FakeBioImage:  # source-level __init__ never reads the image
+            pass
+
+        a = AicsImageIoAdapter(_FakeBioImage(), None, "a", source_url="/a.czi")
+        b = AicsImageIoAdapter(_FakeBioImage(), None, "b", source_url="/b.czi")
+
+        assert "_tensor_adapters" in vars(a)
+        assert a._tensor_adapters == {}
+        assert a._tensor_adapters is not b._tensor_adapters

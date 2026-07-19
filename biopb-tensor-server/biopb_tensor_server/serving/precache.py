@@ -339,8 +339,6 @@ class PrecacheWorker:
         except Exception:
             logger.exception("precache: get_tensor_adapter failed for %s", tensor_id)
             return False
-        if tensor_adapter is None:
-            return False
         # Skip a tensor that ships its own multi-resolution pyramid (e.g. a
         # well-formed OME-Zarr image, or a pyramidal qptiff/ndtiff series): it
         # already serves overviews cheaply from its native coarse levels, so

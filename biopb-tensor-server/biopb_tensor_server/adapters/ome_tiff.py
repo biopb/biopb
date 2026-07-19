@@ -362,8 +362,11 @@ def _store_reaper_loop() -> None:
                 adapters = list(_open_store_adapters)
             now = time.monotonic()
             for adapter in adapters:
-                last = getattr(adapter, "_persistent_last_access", now)
-                if now - last <= _STORE_TTL_SECONDS:
+                # Both attributes are set unconditionally in __init__, and an
+                # adapter only enters _open_store_adapters once it has opened a
+                # store -- long after. Read them bare so a missing one fails
+                # loudly here rather than defaulting the reaper into a no-op.
+                if now - adapter._persistent_last_access <= _STORE_TTL_SECONDS:
                     continue
                 # Only close when idle AND no read is in flight. Reads no longer
                 # hold _io_lock for their duration (only to bump _active_reads), so
@@ -372,10 +375,7 @@ def _store_reaper_loop() -> None:
                 if adapter._io_lock.acquire(blocking=False):
                     try:
                         idle = time.monotonic() - adapter._persistent_last_access
-                        if (
-                            idle > _STORE_TTL_SECONDS
-                            and getattr(adapter, "_active_reads", 0) == 0
-                        ):
+                        if idle > _STORE_TTL_SECONDS and adapter._active_reads == 0:
                             adapter._close_persistent_store()
                     finally:
                         adapter._io_lock.release()
@@ -464,6 +464,12 @@ class OmeTiffAdapter(TensorAdapter):
         # probed-but-absent (None) result.
         self._raw_ome_xml = None
         self._raw_ome_xml_probed = False
+
+        # Per-scene adapter cache, source-level only. Assigned here (not lazily on
+        # first get_tensor_adapter) so no code path has to hedge about whether the
+        # attribute exists; a per-instance dict, never a class attribute, for the
+        # reason spelled out in biopb/biopb#522.
+        self._tensor_adapters: dict = {}
 
     @classmethod
     def create_from_config(
@@ -570,8 +576,6 @@ class OmeTiffAdapter(TensorAdapter):
         field = self._within_source_field(tensor_id)
         scene_idx = self._scene_index_for_field(field)
 
-        if not hasattr(self, "_tensor_adapters"):
-            self._tensor_adapters = {}
         if field in self._tensor_adapters:
             return self._tensor_adapters[field]
 
@@ -635,7 +639,7 @@ class OmeTiffAdapter(TensorAdapter):
                     self._close_persistent_store()
                     break
             time.sleep(0.005)
-        for adapter in list(getattr(self, "_tensor_adapters", {}).values()):
+        for adapter in list(self._tensor_adapters.values()):
             if adapter is not self:
                 try:
                     adapter.close()
