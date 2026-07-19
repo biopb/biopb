@@ -154,20 +154,16 @@ class UnresolvedSourceAdapter(SourceAdapter):
     def close(self) -> None:
         """Release the resolved adapter's handles (biopb/biopb#71).
 
-        The registry's cleanup hook is duck-typed, so without this the wrapper
-        answers ``getattr(adapter, "close", None)`` with ``None`` and silently
-        skips cleanup -- defeating the working ``close()`` of the very adapters
-        that need it most (the resolved cloud OME-TIFF / QPTIFF). Unresolved is a
-        no-op; safe to call twice.
+        This proxy delegates six methods to ``self._resolved``; ``close`` was the
+        omitted seventh, so cleanup silently skipped exactly the resolved cloud
+        OME-TIFF / QPTIFF sources whose ``close()`` already works. Unresolved is
+        a no-op; safe to call twice.
         """
         with self._lock:
             resolved = self._resolved
             self._resolved = None
-        if resolved is None:
-            return
-        close = getattr(resolved, "close", None)
-        if callable(close):
-            close()
+        if resolved is not None:
+            resolved.close()
 
     # --- resolution (the consented hook) ------------------------------------
 

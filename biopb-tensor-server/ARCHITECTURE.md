@@ -222,11 +222,16 @@ be justified by open cost.
 | O(1) in file size (~0.05–0.1 ms, <0.3% of a 64 MB chunk read) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
 | O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`; `ome-tiff` additionally reaps an idle store (`BIOPB_TIFF_STORE_TTL`) | `ome-tiff`, `qptiff`, `ndtiff` |
 
-Adapters in the second row expose `close()` (plus a `__del__` backstop, refs
-nulled before the underlying close, safe to call twice); `SourceRegistry`
-duck-types it on `unregister` / `close_all`. `UnresolvedSourceAdapter` forwards
-`close()` to the adapter it resolved to — without that forward the duck-typed
-hook silently skips cleanup for every resolved cloud source.
+`close()` is **declared on `SourceAdapter`** with a concrete no-op default (and
+classified in `_SOURCE_SCOPED_API`, so adding it had to be a deliberate interface
+decision) — the same shape as `CacheBackend.release_process_lock`, and for the
+same reason `put_chunk` is declared rather than sniffed: an optional capability
+the registry drives on *every* adapter belongs in the interface. `SourceRegistry`
+calls it directly on `unregister` / `close_all`. Second-row adapters override it
+(plus a `__del__` backstop, refs nulled before the underlying close, safe to call
+twice). `UnresolvedSourceAdapter` forwards it to the adapter it resolved to —
+that forward was the omitted seventh of seven delegated methods, and a duck-typed
+hook could not see the omission.
 
 ### Chunk caching
 
