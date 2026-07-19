@@ -53,14 +53,13 @@ class TestArrayIdByteSplice:
         )
 
         bounds = ChunkBounds(start=[0, 0], stop=[128, 128])
-        scaled = encode_chunk_id_with_scale("lab__img", bounds, [2, 2], "stride")
+        scaled = encode_chunk_id_with_scale("lab__img", bounds, [2, 2])
         assert is_scaled_chunk(scaled)
 
         out = rewrite_chunk_id_array_id(scaled, "img")
-        assert is_scaled_chunk(out)  # suffix preserved
-        scale_hint, method = decode_scale_info(out)
-        assert list(scale_hint) == [2, 2]
-        assert method == "stride"
+        assert is_scaled_chunk(out)  # scale suffix preserved
+        # decode_scale_info returns the scale_hint only (method left the chunk_id, #178).
+        assert list(decode_scale_info(out)) == [2, 2]
 
 
 class TestSplitGrpcUrl:

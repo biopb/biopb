@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 # Default matches PyramidConfig.reduction_method so an unspecified-method
 # request agrees with the advertised pyramid levels and what precache warms.
 _DEFAULT_REDUCTION_METHOD = "area"
+# Public alias: since reduction_method left the chunk_id (biopb/biopb#178) it is
+# advisory (the cache key never distinguished it, #76), so a cold compute that has
+# no request in scope -- resolve_chunk_data on the do_get path -- downsamples with
+# this default.
+DEFAULT_REDUCTION_METHOD = _DEFAULT_REDUCTION_METHOD
 _SUPPORTED_REDUCTION_METHODS = {"nearest", "area", "precompute"}
 _METHOD_ALIASES = {
     "stride": "nearest",

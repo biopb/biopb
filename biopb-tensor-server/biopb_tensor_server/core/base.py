@@ -50,6 +50,7 @@ from biopb_tensor_server.core.chunk import (
     normalized_slice_bounds,
 )
 from biopb_tensor_server.core.downsample import (
+    DEFAULT_REDUCTION_METHOD,
     ceil_div,
     downsample_block,
     get_output_dtype,
@@ -743,9 +744,14 @@ class TensorAdapter(SourceAdapter):
             result_arr = self.get_data(bounds)
 
             if is_scaled_chunk_flag:
-                scale_hint, reduction_method = decode_scale_info(chunk_id)
+                scale_hint = decode_scale_info(chunk_id)
+                # reduction_method left the chunk_id (#178): it is advisory (the
+                # cache key never distinguished it, #76) and do_get carries no
+                # request here, so a cold compute uses the server default.
                 # Crop and downsample (no padding needed - bounds aligned via floor_div)
-                result_arr = downsample_block(result_arr, scale_hint, reduction_method)
+                result_arr = downsample_block(
+                    result_arr, scale_hint, DEFAULT_REDUCTION_METHOD
+                )
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
             # string, wrapped zero-copy. This preserves the exact dtype including
@@ -1128,10 +1134,11 @@ def _get_read_plan(
 
         # NO splitting check needed - safe_chunk_size guarantees it fits
 
-        # Encode: array_id + virtual_bounds + optional scale_hint
+        # Encode: array_id + virtual_bounds + optional scale_hint (identity only;
+        # reduction_method is advisory and no longer carried in the chunk_id, #178).
         if scale_hint is not None:
             chunk_id = encode_chunk_id_with_scale(
-                base_desc.array_id, virtual_bounds, scale_hint, reduction_method
+                base_desc.array_id, virtual_bounds, scale_hint
             )
         else:
             chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)

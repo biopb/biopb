@@ -56,7 +56,7 @@ class TestCodecWrapper:
     def test_wrap_roundtrip_regular_and_scaled(self):
         for base in (
             encode_chunk_id("src/t", _bounds()),
-            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "mean"),
+            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2)),
         ):
             wrapped = wrap_content_version(base, CV)
             assert wrapped[0] == _CV_SENTINEL
@@ -71,10 +71,11 @@ class TestCodecWrapper:
 
     def test_scale_detection_and_decode_through_wrapper(self):
         legacy = encode_chunk_id("src/t", _bounds())
-        scaled = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "mean")
+        scaled = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
         assert is_scaled_chunk(wrap_content_version(legacy, CV)) is False
         assert is_scaled_chunk(wrap_content_version(scaled, CV)) is True
-        assert decode_scale_info(wrap_content_version(scaled, CV)) == ((2, 2), "mean")
+        # decode_scale_info returns the scale_hint only (method left the chunk_id).
+        assert decode_scale_info(wrap_content_version(scaled, CV)) == (2, 2)
 
     def test_rewrite_array_id_preserves_version(self):
         wrapped = wrap_content_version(encode_chunk_id("src/t", _bounds()), CV)
@@ -89,7 +90,7 @@ class TestCodecWrapper:
 
 
 # ==============================================================================
-# Cache key: backward-compat, version-sensitivity, method-advisory
+# Cache key: backward-compat, version-sensitivity, identity-only chunk_ids
 # ==============================================================================
 
 
@@ -98,11 +99,9 @@ class TestCacheKey:
         # An unversioned chunk_id maps to exactly its pre-#178 cache entry.
         legacy = encode_chunk_id("src/t", _bounds())
         assert cache_key_for_chunk_id(legacy) == legacy
-        scaled = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "mean")
-        # legacy scaled key drops the advisory method suffix
-        assert cache_key_for_chunk_id(scaled) == cache_key_for_chunk_id(
-            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "max")
-        )
+        # A scaled chunk_id is now pure identity, so its key is itself.
+        scaled = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        assert cache_key_for_chunk_id(scaled) == scaled
 
     def test_versioned_key_differs_from_unversioned(self):
         legacy = encode_chunk_id("src/t", _bounds())
@@ -116,14 +115,16 @@ class TestCacheKey:
             cache_key_for_chunk_id(wrap_content_version(legacy, b"v2"))
         )
 
-    def test_method_stays_advisory_within_a_version(self):
-        a = wrap_content_version(
-            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "mean"), CV
-        )
-        b = wrap_content_version(
-            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "max"), CV
-        )
-        assert cache_key_for_chunk_id(a) == cache_key_for_chunk_id(b)
+    def test_legacy_method_suffix_maps_to_identity_key(self):
+        # An OLD-format scaled chunk_id carried a trailing (uint16 len + method)
+        # suffix; cache_key_for_chunk_id strips it, so it maps to exactly the same
+        # key as the new identity chunk_id -- no cache wipe on the #178 wire change.
+        identity = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        legacy_with_method = identity + b"\x00\x03max"  # uint16(3) + b"max"
+        assert cache_key_for_chunk_id(legacy_with_method) == identity
+        assert cache_key_for_chunk_id(
+            wrap_content_version(legacy_with_method, CV)
+        ) == cache_key_for_chunk_id(wrap_content_version(identity, CV))
 
 
 # ==============================================================================

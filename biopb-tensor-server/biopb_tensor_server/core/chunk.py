@@ -40,7 +40,15 @@ logger = logging.getLogger(__name__)
 # - 2 bytes: ndim (uint16, big-endian)
 # - 8*ndim bytes: bounds.start (int64, big-endian)
 # - 8*ndim bytes: bounds.stop (int64, big-endian)
-# - [scaled only] 8*ndim bytes: scale_hint (int64) + 2 bytes method len + method
+# - [scaled only] 8*ndim bytes: scale_hint (int64)
+#
+# The chunk_id is pure IDENTITY (array_id + bounds + scale_hint). The scaled form
+# used to carry a trailing reduction_method (uint16 len + bytes), but the cache
+# key always stripped it (advisory, biopb/biopb#76) and the compute path is the
+# only consumer -- so the method left the wire format entirely (biopb/biopb#178).
+# A cold downsample uses the server default; see core.base.resolve_chunk_data.
+# (An older chunk_id that still carries a method suffix stays readable: decode /
+# is_scaled / cache_key all ignore the trailing bytes, so no cache wipe is needed.)
 #
 # content_version wrapper (biopb/biopb#178)
 # -----------------------------------------
@@ -203,26 +211,16 @@ def encode_chunk_id_with_scale(
     array_id: str,
     bounds: ChunkBounds,
     scale_hint: Tuple[int, ...],
-    reduction_method: str,
 ) -> bytes:
-    """Encode chunk_id with bounds and scale info appended.
+    """Encode an identity scaled chunk_id: bounds encoding + scale_hint.
 
-    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64), then
-    2 bytes method length (uint16) + method string. Detection: if
-    ``len(chunk_id) > bounds_end``, it's a scaled chunk.
+    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64).
+    Detection: if ``len(chunk_id) > bounds_end``, it's a scaled chunk. The
+    reduction_method is NOT encoded -- it is advisory and sourced server-side at
+    compute time (biopb/biopb#178, #76).
     """
     base = encode_chunk_id(array_id, bounds)
-
-    method_bytes = reduction_method.encode("utf-8")
-
-    scale_payload = b"".join(
-        [
-            b"".join(struct.pack(">q", s) for s in scale_hint),
-            struct.pack(">H", len(method_bytes)),
-            method_bytes,
-        ]
-    )
-
+    scale_payload = b"".join(struct.pack(">q", s) for s in scale_hint)
     return base + scale_payload
 
 
@@ -248,12 +246,13 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
 
 
 def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
-    """Canonical cache key for a chunk_id: the reduction method is advisory.
+    """Canonical cache key for a chunk_id.
 
-    For a scaled chunk_id, returns array_id + bounds + scale_hint with the
-    trailing ``(uint16 method_len + method bytes)`` suffix dropped, so requests
-    that differ only in reduction_method share one cache entry -- the method
-    only decides how a true miss is computed (biopb/biopb#76). Non-scaled
+    A current chunk_id is already pure identity (array_id + bounds [+ scale_hint]),
+    so the key equals the inner bytes. The projection to ``bounds_end + ndim*8`` is
+    retained only to stay byte-compatible with an OLDER chunk_id that still carried
+    a trailing reduction_method suffix (biopb/biopb#76): dropping it means a cache
+    entry warmed under the old format is still hit under the new one. Non-scaled
     chunk_ids are returned unchanged.
 
     The result is an opaque cache key: it is NOT a valid chunk_id and must not
@@ -270,12 +269,16 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     return wrap_content_version(base, cv) if cv is not None else base
 
 
-def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
-    """Decode scale_hint and reduction_method from scaled chunk_id."""
+def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
+    """Decode the scale_hint from a scaled chunk_id.
+
+    Reads only the ndim int64 scale_hint after the bounds encoding. The
+    reduction_method is no longer part of the chunk_id (biopb/biopb#178); any
+    trailing bytes from an older method-carrying chunk_id are ignored.
+    """
     _, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
-    # Decode scale_hint
     scale_hint = []
     for ax in range(ndim):
         scale_hint.append(
@@ -284,14 +287,7 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
             )[0]
         )
 
-    # Decode method
-    method_offset = bounds_end + ndim * 8
-    method_len = struct.unpack(">H", chunk_id[method_offset : method_offset + 2])[0]
-    method = chunk_id[method_offset + 2 : method_offset + 2 + method_len].decode(
-        "utf-8"
-    )
-
-    return tuple(scale_hint), method
+    return tuple(scale_hint)
 
 
 # Constants

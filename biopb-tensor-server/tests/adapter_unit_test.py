@@ -185,7 +185,7 @@ class TestReductionMethodNormalization:
 class TestAdvisoryReductionCacheKey:
     """reduction_method is advisory: excluded from the cache key (biopb#76)."""
 
-    def test_cache_key_strips_method(self):
+    def test_scaled_cache_key_is_identity(self):
         from biopb_tensor_server.core.chunk import (
             cache_key_for_chunk_id,
             encode_chunk_id,
@@ -193,19 +193,25 @@ class TestAdvisoryReductionCacheKey:
         )
 
         bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
-        nearest_id = encode_chunk_id_with_scale("arr", bounds, (4, 4), "nearest")
-        area_id = encode_chunk_id_with_scale("arr", bounds, (4, 4), "area")
-        other_scale = encode_chunk_id_with_scale("arr", bounds, (2, 2), "area")
+        # reduction_method left the chunk_id (#178), so a scaled chunk_id is pure
+        # identity and its cache key is itself; a different scale is a different key.
+        scaled = encode_chunk_id_with_scale("arr", bounds, (4, 4))
+        other_scale = encode_chunk_id_with_scale("arr", bounds, (2, 2))
 
-        assert cache_key_for_chunk_id(nearest_id) == cache_key_for_chunk_id(area_id)
-        assert cache_key_for_chunk_id(nearest_id) != cache_key_for_chunk_id(other_scale)
+        assert cache_key_for_chunk_id(scaled) == scaled
+        assert cache_key_for_chunk_id(scaled) != cache_key_for_chunk_id(other_scale)
 
         raw_id = encode_chunk_id("arr", bounds)
         assert cache_key_for_chunk_id(raw_id) == raw_id
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_cache_hit_across_reduction_methods(self):
-        """A chunk warmed under one method serves a request for another."""
+    def test_cache_hit_on_repeated_scaled_read(self):
+        """A warmed scaled chunk serves a repeat read from cache.
+
+        The scaled chunk_id is method-independent (reduction_method left the wire
+        format, #178), so every read at the same bounds/scale maps to one entry --
+        the read plan mints an identical chunk_id regardless of requested method.
+        """
         import zarr
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
@@ -222,21 +228,17 @@ class TestAdvisoryReductionCacheKey:
             cache_manager = CacheManager(CacheConfig(backend="memory"))
 
             bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
-            area_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4), "area")
-            nearest_id = encode_chunk_id_with_scale(
-                "test-array", bounds, (4, 4), "nearest"
-            )
+            scaled_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4))
 
-            first = adapter.resolve_chunk_data(area_id, cache_manager)
+            first = adapter.resolve_chunk_data(scaled_id, cache_manager)
             stats = cache_manager.stats()
             assert stats.misses == 1
 
-            second = adapter.resolve_chunk_data(nearest_id, cache_manager)
+            second = adapter.resolve_chunk_data(scaled_id, cache_manager)
             stats = cache_manager.stats()
             assert stats.misses == 1
             assert stats.hits == 1
 
-            # The advisory method means the warmed (area) data is served.
             assert first.column("data").to_pylist() == second.column("data").to_pylist()
 
 
