@@ -1402,12 +1402,15 @@ def _discover_tensor_server(
     token = _resolve_upstream_token(source, credentials_config)
     client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
     try:
-        ids, _complete = list_upstream_source_ids(client)
+        ids, _complete = list_upstream_source_ids(client, endpoint)
         upstream_ids = sorted(ids)
     finally:
-        close = getattr(client, "close", None)
-        if close is not None:
-            close()
+        # Never let a failing close() replace the upstream error propagating out
+        # of the try: body (biopb/biopb#529).
+        try:
+            client.close()
+        except Exception:
+            logger.debug("error closing upstream client", exc_info=True)
 
     expanded = []
     for upstream_id in upstream_ids:

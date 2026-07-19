@@ -1702,8 +1702,6 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
-        _location = "grpc://fake"
-
         def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             # source_url is now fetched so the mirror can be treed by path (#297).
             assert "tensors" in sql and "source_url" in sql and format == "records"
@@ -1716,7 +1714,7 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
                 }
             ]
 
-    rows, complete = fetch_upstream_catalog(_FakeClient())
+    rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
     assert complete is True
     assert rows[0]["source_url"] == "file:///d/a.zarr"
 
@@ -1725,14 +1723,66 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
-        _location = "grpc://fake"
-
         def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
-    rows, complete = fetch_upstream_catalog(_FakeClient())
+    rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
     assert rows is None
     assert complete is False
+
+
+def test_fallback_warning_names_the_upstream_from_its_location_argument(caplog):
+    """The upstream is named from the caller's endpoint, not from the SDK client's
+    private ``_location`` (biopb/biopb#529). The fake declares no such attribute,
+    so a reintroduced probe degrades the warning to "?" and fails this test."""
+    import logging
+
+    from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
+
+    class _FakeClient:
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+            raise RuntimeError("no metadata DB")
+
+        def list_sources(self):
+            return {"a": object()}
+
+    with caplog.at_level(logging.WARNING):
+        ids, complete = list_upstream_source_ids(_FakeClient(), "grpc://lab:8815")
+
+    assert (ids, complete) == (["a"], False)
+    assert "grpc://lab:8815" in caplog.text
+
+
+def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeypatch):
+    """A broken channel fails BOTH the upstream call and the cleanup ``close()``.
+
+    The ``finally:`` used to call ``close()`` unguarded (behind a dead
+    ``getattr(client, "close", None)`` probe that only covered an SDK too old to
+    install), so the close error replaced the upstream one on the way out --
+    losing the diagnosis exactly when it matters (biopb/biopb#529).
+    """
+    import biopb.tensor as biopb_tensor
+    from biopb_tensor_server.core.config import SourceConfig, _discover_tensor_server
+
+    class _BrokenClient:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def query_sources(self, *_a, **_k):
+            raise RuntimeError("channel is dead")
+
+        def list_sources(self):
+            raise RuntimeError("upstream unreachable")
+
+        def close(self):
+            raise RuntimeError("close on a broken channel")
+
+    monkeypatch.setattr(biopb_tensor, "TensorFlightClient", _BrokenClient)
+
+    with pytest.raises(RuntimeError, match="upstream unreachable"):
+        _discover_tensor_server(
+            SourceConfig(url="grpc://host:8815", type="tensor-server"), None
+        )
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
