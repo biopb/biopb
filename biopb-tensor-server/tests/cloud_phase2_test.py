@@ -375,6 +375,30 @@ class TestUnresolvedProxy:
         assert desc.source_type == "ome-zarr"
         assert proxy.is_resolved is False
 
+    def test_close_forwards_to_the_resolved_adapter(self):
+        """The proxy must not swallow the inner adapter's close (biopb/biopb#71).
+
+        ``_close_adapter`` is duck-typed, so a proxy without ``close`` silently
+        skips cleanup for exactly the resolved cloud OME-TIFF / QPTIFF sources
+        whose ``close()`` is the one that matters.
+        """
+        proxy = self._make_proxy("/data/cloud/x.zarr")
+        closed = []
+
+        class _Inner:
+            def close(self):
+                closed.append(True)
+
+        proxy._resolved = _Inner()
+        proxy.close()
+        assert closed == [True]
+        assert proxy.is_resolved is False
+        proxy.close()  # idempotent
+        assert closed == [True]
+
+    def test_close_on_unresolved_proxy_is_a_noop(self):
+        self._make_proxy("/data/cloud/x.zarr").close()  # does not raise
+
     def test_serve_surface_refuses_until_resolved(self):
         # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
         # on its own -- it refuses with SourceUnresolvedError until resolve() has

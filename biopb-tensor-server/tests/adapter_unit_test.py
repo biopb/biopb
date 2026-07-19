@@ -745,13 +745,11 @@ class TestGetPhysicalScale:
 
     @staticmethod
     def _make_hdf5(dim_labels, attrs):
-        import types
-
         from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 
         a = Hdf5Adapter.__new__(Hdf5Adapter)
         a.dim_labels = dim_labels
-        a.h5_dataset = types.SimpleNamespace(attrs=attrs)
+        a._element_size_um = attrs.get("element_size_um")
         return a
 
     def test_hdf5_element_size_um(self):

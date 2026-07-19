@@ -6,13 +6,24 @@ interchange format for cryo-EM / cryo-ET, tomography, and FIB-SEM.
 Reader: rosettasciio's ``rsciio.mrc`` parses the header (dim labels, voxel scale,
 dtype, extended-header size). But reads are NOT routed through rsciio's dask
 array -- MRC is a flat, C-contiguous blob at a fixed byte offset, so this adapter
-holds ONE long-lived ``np.memmap`` and slices it per ``get_data(bounds)``. That
-serves an arbitrary sub-region touching only the requested pages, with no
-per-read memmap reopen (rsciio's dask path re-opens a memmap per block per
-compute; see biopb/biopb#94). ``metadata_file=None`` disables rsciio's DE-movie
-4D-STEM auto-discovery, guaranteeing the contiguous layout the memmap assumes;
-if the on-disk region is too small for that layout the adapter falls back to
-rsciio's lazy dask array.
+maps the data region itself with ``np.memmap`` and slices it per
+``get_data(bounds)``, serving an arbitrary sub-region while touching only the
+requested pages. ``metadata_file=None`` disables rsciio's DE-movie 4D-STEM
+auto-discovery, guaranteeing the contiguous layout the memmap assumes; a file
+whose data region cannot back that layout is rejected at registration.
+
+The mapping is created and released **per read** (biopb/biopb#71). A long-lived
+mapping pinned the file for as long as the source stayed catalogued, which on
+Windows makes the volume undeletable and on POSIX means an unlinked multi-GB
+tomogram frees no disk space -- ``ls`` shows it gone, ``df`` disagrees. Mapping
+costs ~0.05 ms against a ~34 ms 64 MB chunk read (0.14%) and is O(1) in file
+size, so there is nothing to amortise.
+
+There is deliberately **no rsciio-dask fallback** for an unmappable layout. That
+array's graph holds a memmap of its own, so the fallback reintroduced exactly the
+pin this adapter exists to avoid -- silently, on a path nobody would think to
+check. An MRC we cannot map is a registration failure, not a source served with
+worse properties than the format's contract promises.
 
 Chunk ID format:
 - array_id prefix + whole-array bounds (base class splits oversized single chunk)
@@ -20,8 +31,6 @@ Chunk ID format:
 Single chunk strategy - base class handles splitting for oversized arrays.
 """
 
-import logging
-import threading
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
@@ -30,8 +39,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -108,7 +115,6 @@ class MrcAdapter(TensorAdapter):
             original_metadata=sig["original_metadata"],
             dim_labels=source.dim_labels,
             source_url=url,
-            lazy_data=data,
         )
 
     def __init__(
@@ -122,7 +128,6 @@ class MrcAdapter(TensorAdapter):
         original_metadata: dict,
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
-        lazy_data=None,
     ):
         self.source_id = source_id
         self._url = url
@@ -130,7 +135,6 @@ class MrcAdapter(TensorAdapter):
         self._dtype = np.dtype(dtype)
         self._axes = axes
         self._original_metadata = original_metadata
-        self._io_lock = threading.Lock()
 
         self._source_url = source_url if source_url else url
         self._source_type = "mrc"
@@ -145,24 +149,28 @@ class MrcAdapter(TensorAdapter):
                 for i, ax in enumerate(axes)
             ]
 
-        # Own long-lived memmap over the contiguous data region. Falls back to
-        # rsciio's lazy dask array if the on-disk region can't back the layout.
-        offset = _MRC_HEADER_BYTES + int(std_header.get("NEXT", 0) or 0)
-        self._mm = None
-        self._lazy_data = lazy_data
-        try:
-            self._mm = np.memmap(
-                url, dtype=self._dtype, mode="r", offset=offset, shape=self._shape
-            )
-        except (ValueError, OSError):
-            # Region too small / unmappable: use rsciio's dask array instead.
-            if lazy_data is None:
-                raise
-            logger.warning(
-                "MRC %s: contiguous memmap unavailable; falling back to rsciio "
-                "lazy read",
-                url,
-            )
+        # Offset of the contiguous data region; reads map from here (per read --
+        # see the module docstring). Probe the mapping once now so an unmappable
+        # layout fails at registration rather than on the first read.
+        self._offset = _MRC_HEADER_BYTES + int(std_header.get("NEXT", 0) or 0)
+        self._release(self._map())
+
+    def _map(self) -> np.memmap:
+        """Map the data region read-only. Caller must ``_release`` the result."""
+        return np.memmap(
+            self._url,
+            dtype=self._dtype,
+            mode="r",
+            offset=self._offset,
+            shape=self._shape,
+        )
+
+    @staticmethod
+    def _release(mm: np.memmap) -> None:
+        """Drop the mapping now, rather than whenever the GC gets to it."""
+        underlying = getattr(mm, "_mmap", None)
+        if underlying is not None:
+            underlying.close()
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
@@ -177,24 +185,22 @@ class MrcAdapter(TensorAdapter):
         return [self.get_tensor_descriptor()]
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read a sub-region. Slices the own memmap (or the dask fallback)."""
+        """Read a sub-region through a fresh memmap."""
         super().get_data(bounds)
         slices = tuple(
             slice(int(s), int(e))
             for s, e in zip(bounds.start, bounds.stop, strict=True)
         )
-        if self._mm is not None:
-            # No lock on the fast path: a read-only np.memmap has no shared cursor
-            # (unlike a seekable file handle), so indexing computes byte offsets
-            # directly and the copy lands in a fresh buffer -- concurrent reads are
-            # thread-safe. Skipping the lock lets parallel do_get chunk reads of one
-            # MRC source run at once. Copy out so the result is independent of the
-            # mapping.
-            return np.array(self._mm[slices])
-        # Fallback: rsciio's dask array reopens a memmap per block on compute; keep
-        # it under the lock (the slow, rarely-taken path).
-        with self._io_lock:
-            return self._lazy_data[slices].compute()
+        # No lock: each read owns its own mapping, and a read-only np.memmap has
+        # no shared cursor (unlike a seekable file handle) -- indexing computes
+        # byte offsets directly and the copy lands in a fresh buffer. So parallel
+        # do_get chunk reads of one MRC source run at once. Copy out so the result
+        # outlives the mapping.
+        mm = self._map()
+        try:
+            return np.array(mm[slices])
+        finally:
+            self._release(mm)
 
     def _physical_scale(self) -> Optional[tuple]:
         """Voxel size + unit per dimension, from the reader's axis scales.

@@ -122,6 +122,37 @@ class TestNiftiAdapterClaim:
             assert claim is None
 
 
+class TestNiftiAdapterClose:
+    """close() reclaims a remote source's downloaded temp file (biopb/biopb#71)."""
+
+    def test_close_unlinks_temp_file(self):
+        import nibabel as nib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nii_path = Path(tmpdir) / "downloaded.nii"
+            create_synthetic_nifti(nii_path)
+
+            # What create_from_config's remote branch builds: an adapter serving
+            # out of a NamedTemporaryFile(delete=False) nothing else removes.
+            adapter = NiftiAdapter(
+                nib.load(str(nii_path)), "remote_source", temp_file=nii_path
+            )
+            adapter.close()
+
+            assert not nii_path.exists()
+            adapter.close()  # idempotent
+
+    def test_close_leaves_a_local_source_file_alone(self):
+        import nibabel as nib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nii_path = Path(tmpdir) / "local.nii"
+            create_synthetic_nifti(nii_path)
+
+            NiftiAdapter(nib.load(str(nii_path)), "local_source").close()
+            assert nii_path.exists()
+
+
 class TestNiftiAdapter:
     """Tests for NiftiAdapter functionality."""
 

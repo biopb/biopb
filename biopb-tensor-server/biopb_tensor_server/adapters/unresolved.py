@@ -149,6 +149,26 @@ class UnresolvedSourceAdapter(SourceAdapter):
                 tensor_id = descriptors[0].array_id
         return self._resolved.get_tensor_adapter(tensor_id)
 
+    # --- lifecycle -----------------------------------------------------------
+
+    def close(self) -> None:
+        """Release the resolved adapter's handles (biopb/biopb#71).
+
+        The registry's cleanup hook is duck-typed, so without this the wrapper
+        answers ``getattr(adapter, "close", None)`` with ``None`` and silently
+        skips cleanup -- defeating the working ``close()`` of the very adapters
+        that need it most (the resolved cloud OME-TIFF / QPTIFF). Unresolved is a
+        no-op; safe to call twice.
+        """
+        with self._lock:
+            resolved = self._resolved
+            self._resolved = None
+        if resolved is None:
+            return
+        close = getattr(resolved, "close", None)
+        if callable(close):
+            close()
+
     # --- resolution (the consented hook) ------------------------------------
 
     def resolve(self) -> DataSourceDescriptor:

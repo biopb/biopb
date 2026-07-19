@@ -107,11 +107,11 @@ class NiftiAdapter(TensorAdapter):
 
             fs.get_file(fs_path, str(tmp_path))
 
-            # Load NIfTI from temp file
+            # Load NIfTI from temp file. nibabel reads lazily off this path, so
+            # the download must outlive the call -- close() unlinks it when the
+            # source is unregistered (biopb/biopb#71); until then it is a real
+            # disk cost the size of the remote volume.
             nifti_img = nib.load(str(tmp_path))
-
-            # Note: temp file is NOT deleted - nibabel caches data internally
-            # The OS will clean up temp files eventually
 
             return cls(
                 nifti_img,
@@ -435,3 +435,30 @@ class NiftiAdapter(TensorAdapter):
         )
 
         return metadata
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def close(self) -> None:
+        """Delete the downloaded temp file backing a remote source.
+
+        Local sources hold nothing (nibabel keeps no fd or mapping); a remote one
+        is served out of a ``NamedTemporaryFile(delete=False)`` that nothing ever
+        removed, so every remote NIfTI leaked its own size onto disk until reboot
+        (biopb/biopb#71). Safe to call twice.
+        """
+        temp_file = getattr(self, "_temp_file", None)
+        self._temp_file = None
+        self.nifti_img = None
+        if temp_file is not None:
+            try:
+                Path(temp_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def __del__(self):
+        # GC backstop: an adapter dropped without an explicit close() (e.g. a
+        # failed registration) must not strand its download.
+        try:
+            self.close()
+        except Exception:
+            pass
