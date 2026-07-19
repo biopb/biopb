@@ -36,6 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
+    _version_header,
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
@@ -236,6 +237,16 @@ class SourceAdapter(ABC):
     # total for every other adapter.
     _capability_token: Optional[str] = None
 
+    # Optional content-version token (biopb/biopb#178). When set, it is folded
+    # into every chunk_id this source mints (via ``get_read_plan``) and hence into
+    # the cache key, so a re-registered source with new bytes gets a fresh cache
+    # namespace instead of serving stale cached chunks. None (the base default,
+    # like ``capability_token``) means "unversioned" -- the pre-#178 behavior, and
+    # byte-identical chunk_ids / cache keys -- so an adapter opts in only when it
+    # has a cheap, reliable change signal (e.g. a local file's stat signature).
+    # An opaque token: the codec never interprets it, only namespaces by it.
+    _content_version: Optional[bytes] = None
+
     # Display-only override for the catalog ``source_url`` (the descriptor field
     # the tensor-browser / web viewer group the tree by). Normally None, so the
     # descriptor derives ``source_url`` from the raw path via ``to_catalog_url``.
@@ -280,6 +291,12 @@ class SourceAdapter(ABC):
     @capability_token.setter
     def capability_token(self, value: Optional[str]) -> None:
         self._capability_token = value
+
+    @property
+    def content_version(self) -> Optional[bytes]:
+        """Opaque content-version token folded into this source's chunk_ids, or
+        None when the source is unversioned (see ``_content_version``)."""
+        return self._content_version
 
     @property
     def array_id(self) -> str:
@@ -765,7 +782,15 @@ class TensorAdapter(SourceAdapter):
         """
         base_desc = self.get_tensor_descriptor()
         chunk_size = self.get_chunk_size()
-        return _get_read_plan(base_desc, request_desc, chunk_size)
+        # content_version is a SourceAdapter property; every TensorAdapter is a
+        # SourceAdapter, so it is always present -- an unversioned source returns
+        # None.
+        return _get_read_plan(
+            base_desc,
+            request_desc,
+            chunk_size,
+            content_version=self.content_version,
+        )
 
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
@@ -929,6 +954,7 @@ _SOURCE_SCOPED_API = frozenset(
         "source_url",
         "source_type",
         "capability_token",
+        "content_version",
         "claim",
         "create_from_config",
         "list_tensor_descriptors",
@@ -982,11 +1008,16 @@ def _get_read_plan(
     base_desc: TensorDescriptor,
     request_desc: TensorDescriptor,
     chunk_size: Tuple[int, ...],
+    content_version: Optional[bytes] = None,
 ) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
+
+    ``content_version`` (biopb/biopb#178), when set, is folded into every minted
+    chunk_id so the cache namespaces by it. It is constant across the grid, so the
+    wrapper header is precomputed once and prepended per chunk (one concat).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
@@ -1050,6 +1081,13 @@ def _get_read_plan(
     # NO NEED to check splitting here - safe_chunk_size ensures it's always safe
     logical_endpoints: List[ChunkEndpoint] = []
 
+    # content_version is constant across the grid, so build its wrapper header
+    # once (biopb/biopb#178) and prepend to each chunk_id -- one concat per chunk,
+    # not a re-encode. None -> unversioned -> chunk_ids are byte-identical to pre-#178.
+    version_header = (
+        _version_header(content_version) if content_version is not None else b""
+    )
+
     # Compute number of chunks along each axis
     n_chunks_per_axis = tuple(
         ceil_div(realized_stop[ax] - realized_start[ax], virtual_chunk_size[ax])
@@ -1099,7 +1137,7 @@ def _get_read_plan(
             chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
 
         logical_endpoints.append(
-            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
+            ChunkEndpoint(chunk_id=version_header + chunk_id, bounds=logical_bounds)
         )
 
     # Build descriptor

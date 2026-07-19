@@ -8,6 +8,7 @@ This module contains:
 """
 
 import logging
+import os
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
@@ -40,7 +41,81 @@ logger = logging.getLogger(__name__)
 # - 8*ndim bytes: bounds.start (int64, big-endian)
 # - 8*ndim bytes: bounds.stop (int64, big-endian)
 # - [scaled only] 8*ndim bytes: scale_hint (int64) + 2 bytes method len + method
+#
+# content_version wrapper (biopb/biopb#178)
+# -----------------------------------------
+# An OPTIONAL content-version header may be prepended, folding a source's
+# content_version into the chunk_id (and hence the cache key) so a re-registered
+# source with new bytes can't be masked by a stale cached chunk. A legacy
+# chunk_id always begins with ``struct.pack(">I", array_id_len)`` whose high byte
+# is 0x00 (array_id is far under 16 MB), so a leading 0xFF sentinel is an
+# unambiguous, backward-compatible discriminator: an UNVERSIONED chunk_id is byte
+# -identical to the pre-#178 format (existing cache entries stay valid), and the
+# version, when present, is a constant header the read-plan mint precomputes once
+# and prepends to every chunk_id (so the per-chunk cost is one concat, not a
+# re-encode). The whole codec strips this header first, so decode / scale / rewrite
+# operate on the inner legacy chunk_id and only cache_key_for_chunk_id keeps the
+# version (that is the point -- a different version -> a different key -> the old
+# entry is un-lookupable, not mis-served). Clients treat the whole thing as opaque.
 # =============================================================================
+
+_CV_SENTINEL = 0xFF  # leading byte marking a version-wrapped chunk_id
+_CV_FORMAT = 1  # wrapper layout version (after the sentinel byte)
+
+
+def _version_header(content_version: bytes) -> bytes:
+    """The constant prefix that wraps a chunk_id with a content_version.
+
+    ``[0xFF sentinel][uint8 fmt][uint32 cv_len][cv bytes]``. Precompute once per
+    read plan (content_version is constant across a source's chunks) and prepend.
+    """
+    return (
+        struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT, len(content_version))
+        + content_version
+    )
+
+
+def wrap_content_version(inner_chunk_id: bytes, content_version: bytes) -> bytes:
+    """Prepend a content_version header to a legacy (inner) chunk_id."""
+    return _version_header(content_version) + inner_chunk_id
+
+
+def _split_version(chunk_id: bytes) -> Tuple[Optional[bytes], bytes]:
+    """Split a chunk_id into ``(content_version | None, inner_legacy_chunk_id)``.
+
+    Unversioned chunk_ids (no 0xFF sentinel) pass through unchanged, so every
+    codec function below can strip first and reuse the pre-#178 logic verbatim.
+    """
+    if not chunk_id or chunk_id[0] != _CV_SENTINEL:
+        return None, chunk_id
+    cv_len = struct.unpack(">I", chunk_id[2:6])[0]
+    inner_offset = 6 + cv_len
+    return chunk_id[6:inner_offset], chunk_id[inner_offset:]
+
+
+def content_version_of(chunk_id: bytes) -> Optional[bytes]:
+    """The chunk_id's content_version, or None if it carries no version header."""
+    return _split_version(chunk_id)[0]
+
+
+def content_version_from_path(path: object) -> Optional[bytes]:
+    """Best-effort content_version for a local file/dir source (biopb/biopb#178).
+
+    The stat signature ``mtime_ns:size`` -- O(1), no read, already the cheap
+    change signal ``build_entry_signature`` uses. For a directory source this is
+    the directory's own mtime, which flips on member add/remove/rename (the right
+    O(1) signal for multi-file sources). Returns None when the path can't be
+    stat'd (e.g. a remote URL / cloud store), leaving the source unversioned.
+
+    Blind spot (documented, best-effort per #178): an in-place edit that
+    preserves mtime+size is undetectable; such sources want an explicit
+    ``volatile`` / content-hash mode, not this signal.
+    """
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError, TypeError):
+        return None
+    return f"{st.st_mtime_ns}:{st.st_size}".encode()
 
 
 def encode_chunk_id(
@@ -79,15 +154,18 @@ def rewrite_chunk_id_array_id(chunk_id: bytes, new_array_id: str) -> bytes:
     / ``decode_scale_info`` all recompute their offsets from the (new) length
     prefix.
     """
-    old_len = struct.unpack(">I", chunk_id[:4])[0]
-    tail = chunk_id[4 + old_len :]
+    cv, inner = _split_version(chunk_id)
+    old_len = struct.unpack(">I", inner[:4])[0]
+    tail = inner[4 + old_len :]
     new_bytes = new_array_id.encode("utf-8")
-    return struct.pack(">I", len(new_bytes)) + new_bytes + tail
+    rewritten = struct.pack(">I", len(new_bytes)) + new_bytes + tail
+    return wrap_content_version(rewritten, cv) if cv is not None else rewritten
 
 
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
     """Decode array_id and bounds from chunk_id. Works for both regular
-    and virtual chunk_ids (ignores virtual payload)."""
+    and virtual chunk_ids (ignores virtual payload) and version-wrapped ones."""
+    _, chunk_id = _split_version(chunk_id)
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
@@ -144,11 +222,12 @@ def encode_chunk_id_with_scale(
 
 
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
-    """``(ndim, bounds_end)`` for a chunk_id.
+    """``(ndim, bounds_end)`` for an INNER (legacy, version-stripped) chunk_id.
 
     ``bounds_end`` is where the standard encoding (array_id + ndim + start +
     stop) ends; any bytes past it are the scale payload of a scaled chunk_id
-    (see :func:`encode_chunk_id_with_scale`).
+    (see :func:`encode_chunk_id_with_scale`). Callers must pass a version-stripped
+    chunk_id (offsets and the length comparison are relative to the inner bytes).
     """
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     offset = 4 + array_id_len
@@ -158,8 +237,9 @@ def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
 
 def is_scaled_chunk(chunk_id: bytes) -> bool:
     """Check if chunk_id has scale info appended after bounds."""
-    _, bounds_end = _bounds_end(chunk_id)
-    return len(chunk_id) > bounds_end
+    _, inner = _split_version(chunk_id)
+    _, bounds_end = _bounds_end(inner)
+    return len(inner) > bounds_end
 
 
 def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
@@ -173,15 +253,21 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
 
     The result is an opaque cache key: it is NOT a valid chunk_id and must not
     be fed to :func:`decode_scale_info` or forwarded on the wire.
+
+    A content_version (biopb/biopb#178) is kept in the key -- so a version bump
+    yields a distinct key and the stale entry becomes un-lookupable -- while the
+    inner projection stays byte-identical to the pre-#178 key, so an UNVERSIONED
+    chunk_id maps to exactly its old cache entry (no forced invalidation).
     """
-    ndim, bounds_end = _bounds_end(chunk_id)
-    if len(chunk_id) <= bounds_end:
-        return chunk_id
-    return chunk_id[: bounds_end + ndim * 8]
+    cv, inner = _split_version(chunk_id)
+    ndim, bounds_end = _bounds_end(inner)
+    base = inner if len(inner) <= bounds_end else inner[: bounds_end + ndim * 8]
+    return wrap_content_version(base, cv) if cv is not None else base
 
 
 def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     """Decode scale_hint and reduction_method from scaled chunk_id."""
+    _, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
     # Decode scale_hint
