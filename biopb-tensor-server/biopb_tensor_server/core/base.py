@@ -508,6 +508,21 @@ class SourceAdapter(ABC):
             f"source {self.source_id!r} ({self._source_type}) does not support writes"
         )
 
+    def close(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
+        """Release any long-lived OS handles this source holds.
+
+        Declared here, rather than sniffed with ``getattr(adapter, "close",
+        None)``, for the same reason :meth:`put_chunk` is: an optional capability
+        the registry drives on every adapter belongs in the interface, where a
+        delegating wrapper's author can see it. ``UnresolvedSourceAdapter``
+        forwarding everything *except* ``close`` is precisely what a duck-typed
+        hook could not catch (biopb/biopb#71).
+
+        Most adapters hold nothing between reads -- see the file-handle policy in
+        ARCHITECTURE.md -- so the default is a no-op and only the persistent-handle
+        adapters override it. An override must be safe to call twice.
+        """
+
     def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
         """Reduce a source-qualified array_id to its within-source field, for the
         multi-tensor ``get_tensor_adapter`` overrides.
@@ -924,6 +939,7 @@ _SOURCE_SCOPED_API = frozenset(
         "is_resident",
         "get_tensor_adapter",
         "put_chunk",
+        "close",
     }
 )
 _TENSOR_SCOPED_API = frozenset(

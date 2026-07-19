@@ -23,18 +23,22 @@ from biopb_tensor_server.core.base import SourceAdapter
 logger = logging.getLogger(__name__)
 
 
-def _close_adapter(adapter) -> None:
+def _close_adapter(adapter: Optional[SourceAdapter]) -> None:
     """Best-effort release of an adapter's resources (e.g. open file handles).
 
-    Adapters that hold long-lived handles expose ``close()``; others don't.
-    Never raises -- shutdown/unregister must not fail on a balky adapter.
+    ``SourceAdapter.close()`` is declared on the ABC with a no-op default, so
+    this calls it rather than sniffing for it: a wrapper that forwards every
+    other method but not ``close`` is then a visible omission in the interface
+    instead of a silent skip (biopb/biopb#71). Never raises -- shutdown and
+    unregister must not fail on a balky adapter, and the registry also accepts
+    non-inheriting test doubles.
     """
-    close = getattr(adapter, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:  # pragma: no cover - cleanup must not fail
-            logger.debug("error closing source adapter", exc_info=True)
+    if adapter is None:  # unregister of an id that was never registered
+        return
+    try:
+        adapter.close()
+    except Exception:  # pragma: no cover - cleanup must not fail
+        logger.debug("error closing source adapter", exc_info=True)
 
 
 class SourceRegistry:

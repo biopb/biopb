@@ -100,10 +100,29 @@ class TestMrcAdapter:
             assert list(desc.dim_labels) == ["z", "y", "x"]
             assert list(desc.chunk_shape) == [4, 8, 8]  # single chunk
 
-    def test_uses_memmap(self):
+    def test_unmappable_layout_fails_at_registration(self):
+        """No rsciio-dask fallback (biopb/biopb#71): that array's graph holds a
+        memmap, so falling back would silently reintroduce the file pin. A file
+        whose data region can't back the header's layout is a hard failure."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            adapter, _ = self._adapter(tmpdir)
-            assert adapter._mm is not None  # own memmap, not the dask fallback
+            p = Path(tmpdir) / "truncated.mrc"
+            create_synthetic_mrc(p, shape=(4, 8, 8))
+            with open(p, "rb") as f:
+                head = f.read()
+            p.write_bytes(head[: 1024 + 64])  # header + a fraction of the data
+            with pytest.raises((ValueError, OSError)):
+                MrcAdapter.create_from_config(SourceConfig(url=str(p)))
+
+    def test_holds_no_mapping_between_reads(self):
+        """No long-lived mapping (biopb/biopb#71): the file is pinned only for the
+        duration of a read, so deleting a catalogued volume frees its blocks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
+            adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
+            maps = Path("/proc/self/maps")
+            if not maps.exists():  # non-Linux: no mapping table to inspect
+                pytest.skip("/proc/self/maps unavailable")
+            assert ".mrc" not in maps.read_text()
 
     def test_get_data_subregion(self):
         with tempfile.TemporaryDirectory() as tmpdir:

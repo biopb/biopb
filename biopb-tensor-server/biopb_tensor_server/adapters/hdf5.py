@@ -1,6 +1,15 @@
 """HDF5 adapter for tensor storage.
 
 Relies on OS page cache for raw data caching.
+
+Reopen-per-read (biopb/biopb#71): the adapter snapshots the dataset's shape /
+dtype / chunk grid / attrs at construction and keeps NO ``h5py.File`` open, so a
+catalogued source never pins its file. Holding the handle for the lifetime of the
+catalog entry made an ``.h5`` undeletable on Windows and kept its blocks
+allocated after an unlink on POSIX. Reopening costs ~0.09 ms against a ~35 ms
+64 MB chunk read (0.26%) and is O(1) in file size, so there is nothing to amortise
+-- unlike OME-TIFF, whose open is linear in IFD count and therefore keeps a
+persistent handle plus a reaper.
 """
 
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
@@ -81,9 +90,8 @@ class Hdf5Adapter(TensorAdapter):
                 f"HDF5 source '{source.source_id}' requires 'dataset' path in config"
             )
 
-        f = h5py.File(str(source.url), "r")
-        dataset = f[source.dataset]
-        return cls(dataset, source.source_id, source.dim_labels)
+        with h5py.File(str(source.url), "r") as f:
+            return cls(f[source.dataset], source.source_id, source.dim_labels)
 
     def __init__(
         self,
@@ -93,21 +101,40 @@ class Hdf5Adapter(TensorAdapter):
     ):
         """Initialize HDF5 adapter.
 
+        Everything the adapter needs is copied off *h5_dataset* here; the dataset
+        (and the file behind it) is not retained, so the caller may close it
+        immediately. Reads reopen the file (see the module docstring).
+
         Args:
             h5_dataset: h5py Dataset object
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
         """
-        self.h5_dataset = h5_dataset
         self.source_id = source_id
         self.dim_labels = dim_labels or [
             f"dim{i}" for i in range(len(h5_dataset.shape))
         ]
 
-        # Source-level metadata for DataSourceDescriptor
-        self._source_url = (
-            h5_dataset.file.filename if hasattr(h5_dataset, "file") else ""
+        self._path = h5_dataset.file.filename if hasattr(h5_dataset, "file") else ""
+        self._dataset_path = h5_dataset.name
+        self._shape = tuple(int(s) for s in h5_dataset.shape)
+        self._dtype = np.dtype(h5_dataset.dtype)
+        # A contiguous (unchunked) dataset reports chunks=None; the whole array
+        # is then one chunk, which the base class splits if oversized.
+        self._chunks = (
+            tuple(int(c) for c in h5_dataset.chunks) if h5_dataset.chunks else None
         )
+        # element_size_um is the only attribute anything reads; snapshot it so
+        # _physical_scale needs no open file.
+        attrs = getattr(h5_dataset, "attrs", None)
+        self._element_size_um = (
+            attrs["element_size_um"]
+            if attrs is not None and "element_size_um" in attrs
+            else None
+        )
+
+        # Source-level metadata for DataSourceDescriptor
+        self._source_url = self._path
         self._source_type = "hdf5"
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -122,20 +149,25 @@ class Hdf5Adapter(TensorAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
+        import h5py
+
         super().get_data(bounds)
         slices = tuple(
             slice(int(s), int(e))
             for s, e in zip(bounds.start, bounds.stop, strict=True)
         )
-        return self.h5_dataset[slices]
+        # Each read gets its own handle, so concurrent do_get chunk reads need no
+        # lock and the file is pinned only for the duration of the read.
+        with h5py.File(self._path, "r") as f:
+            return f[self._dataset_path][slices]
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
-            shape=list(self.h5_dataset.shape),
-            chunk_shape=list(self.h5_dataset.chunks),
-            dtype=self.h5_dataset.dtype.str,
+            shape=list(self._shape),
+            chunk_shape=list(self._chunks or self._shape),
+            dtype=self._dtype.str,
         )
 
     def list_tensor_descriptors(self):
@@ -152,10 +184,9 @@ class Hdf5Adapter(TensorAdapter):
         be aligned, so both yield ``None`` rather than a guess.
         """
         try:
-            attrs = getattr(self.h5_dataset, "attrs", None)
-            if attrs is None or "element_size_um" not in attrs:
+            if self._element_size_um is None:
                 return None
-            vals = [float(v) for v in np.atleast_1d(attrs["element_size_um"]).tolist()]
+            vals = [float(v) for v in np.atleast_1d(self._element_size_um).tolist()]
             if len(vals) != len(self.dim_labels):
                 return None
             scale: List[float] = []
@@ -180,7 +211,7 @@ class Hdf5Adapter(TensorAdapter):
             Dict with dataset info (shape, dtype, chunks)
         """
         return {
-            "shape": list(self.h5_dataset.shape),
-            "dtype": str(self.h5_dataset.dtype),
-            "chunks": list(self.h5_dataset.chunks) if self.h5_dataset.chunks else None,
+            "shape": list(self._shape),
+            "dtype": str(self._dtype),
+            "chunks": list(self._chunks) if self._chunks else None,
         }

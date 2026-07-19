@@ -3,7 +3,6 @@
 Handles .nii and .nii.gz files using nibabel.
 """
 
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -107,11 +106,11 @@ class NiftiAdapter(TensorAdapter):
 
             fs.get_file(fs_path, str(tmp_path))
 
-            # Load NIfTI from temp file
+            # Load NIfTI from temp file. nibabel reads lazily off this path, so
+            # the download must outlive the call -- close() unlinks it when the
+            # source is unregistered (biopb/biopb#71); until then it is a real
+            # disk cost the size of the remote volume.
             nifti_img = nib.load(str(tmp_path))
-
-            # Note: temp file is NOT deleted - nibabel caches data internally
-            # The OS will clean up temp files eventually
 
             return cls(
                 nifti_img,
@@ -150,7 +149,6 @@ class NiftiAdapter(TensorAdapter):
         self.nifti_img = nifti_img
         self.source_id = source_id
         self.header = nifti_img.header
-        self._io_lock = threading.Lock()
         self._temp_file = temp_file  # Track temp file for potential cleanup
 
         # Source-level metadata for DataSourceDescriptor
@@ -252,6 +250,7 @@ class NiftiAdapter(TensorAdapter):
 
         Raises:
             ValueError: If bounds exceed array shape
+            RuntimeError: If the source has been closed.
         """
         super().get_data(bounds)
         slices = tuple(
@@ -259,9 +258,24 @@ class NiftiAdapter(TensorAdapter):
             for s, e in zip(bounds.start, bounds.stop, strict=True)
         )
 
+        # Take the image reference once, then check it: close() races a read only
+        # by nulling this attribute, and the read of a reference is atomic under
+        # the GIL, so a local ref is either the image or None -- never torn. That
+        # makes read-after-close the RuntimeError below (matching NdTiffAdapter)
+        # instead of a racy AttributeError on None, with no lock: nibabel is
+        # thread-safe on the decode, so serializing here would only cost parallel
+        # do_get chunk reads of one source.
+        #
+        # Residual, deliberately not closed: close() can unlink the temp file
+        # after this line but before nibabel lazily opens the path, surfacing as
+        # an OSError. Closing it needs an in-flight-read drain (see
+        # OmeTiffAdapter.close), which is not worth the machinery for a race that
+        # requires unregistering a remote source mid-read.
+        img = self.nifti_img
+        if img is None:
+            raise RuntimeError(f"NIfTI source {self.source_id!r} is closed")
         # nibabel dataobj lazy slicing applies slope/intercept scaling.
-        # nibabel handles thread safety internally, so no io_lock needed.
-        dataobj = self.nifti_img.dataobj
+        dataobj = img.dataobj
         result = dataobj[slices]
         # Cast to float64 defensively (in case no scaling is applied)
         return np.asanyarray(result, dtype=np.float64)
@@ -435,3 +449,37 @@ class NiftiAdapter(TensorAdapter):
         )
 
         return metadata
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def close(self) -> None:
+        """Delete the downloaded temp file backing a remote source.
+
+        Local sources hold nothing (nibabel keeps no fd or mapping); a remote one
+        is served out of a ``NamedTemporaryFile(delete=False)`` that nothing ever
+        removed, so every remote NIfTI leaked its own size onto disk until reboot
+        (biopb/biopb#71).
+
+        Takes no lock, deliberately: ``__del__`` calls this, and the repo's rule
+        is that a finalizer never acquires one (see ``OmeTiffAdapter.close``).
+        Nothing needs one either -- the writes below are single-reference
+        assignments, ``unlink(missing_ok=True)`` tolerates the double-unlink of
+        two concurrent closers, and ``get_data`` reads the reference atomically.
+        Safe to call twice, and concurrently.
+        """
+        temp_file = getattr(self, "_temp_file", None)
+        self._temp_file = None
+        self.nifti_img = None
+        if temp_file is not None:
+            try:
+                Path(temp_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def __del__(self):
+        # GC backstop: an adapter dropped without an explicit close() (e.g. a
+        # failed registration) must not strand its download.
+        try:
+            self.close()
+        except Exception:
+            pass

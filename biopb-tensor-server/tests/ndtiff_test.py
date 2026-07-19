@@ -227,6 +227,42 @@ class TestNdTiffGetData:
 
 
 @pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")
+class TestNdTiffClose:
+    """close() releases the acquisition's per-file readers (biopb/biopb#71)."""
+
+    @staticmethod
+    def _adapter():
+        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
+
+        dataset = MagicMock()
+        dataset.axes.keys.return_value = ["channel", "row", "column"]
+        dask = MagicMock()
+        dask.shape = (3, 64, 64)
+        dask.dtype = np.dtype("uint8")
+        dataset.as_array.return_value = dask
+        return NdTiffAdapter(dataset, "test-ndtiff", "/test/path"), dataset
+
+    def test_close_closes_dataset_and_drops_dask(self):
+        adapter, dataset = self._adapter()
+        adapter.close()
+        dataset.close.assert_called_once()
+        # The dask graph pins the dataset, so it must go too.
+        assert adapter._dask_arr is None
+
+    def test_close_is_idempotent(self):
+        adapter, dataset = self._adapter()
+        adapter.close()
+        adapter.close()
+        dataset.close.assert_called_once()
+
+    def test_read_after_close_fails_loudly(self):
+        adapter, _ = self._adapter()
+        adapter.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+
+
+@pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")
 class TestNdTiffServerClient:
     """Integration tests for NDTiff adapter with server/client."""
 

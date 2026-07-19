@@ -117,3 +117,42 @@ def test_unresolved_proxy_is_source_only():
         "has_native_pyramid",
     ):
         assert not hasattr(UnresolvedSourceAdapter, name)
+
+
+def test_close_is_a_declared_capability_not_a_duck_typed_one():
+    """``close()`` is on the interface, with a no-op default (biopb/biopb#71).
+
+    The registry's cleanup hook used to sniff ``getattr(adapter, "close", None)``,
+    which made a wrapper that forwards everything *except* close an invisible
+    omission rather than a missing override. Declaring it means every adapter --
+    including a delegating proxy -- answers the call.
+    """
+    assert "close" in _SOURCE_SCOPED_API
+    assert callable(SourceAdapter.close)
+
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+
+    for cls in set(get_default_registry()._adapters) | {UnresolvedSourceAdapter}:
+        assert callable(getattr(cls, "close", None)), cls
+
+
+def test_close_default_is_a_harmless_no_op():
+    """An adapter holding no handles inherits close() and it does nothing."""
+
+    class _Handleless(SourceAdapter):
+        source_id = "x"
+
+        def list_tensor_descriptors(self):
+            return []
+
+        def get_metadata(self):
+            return {}
+
+        @classmethod
+        def create_from_config(cls, source, credentials_config=None):
+            return cls()
+
+    a = _Handleless()
+    a.close()
+    a.close()  # idempotent, like every override must be

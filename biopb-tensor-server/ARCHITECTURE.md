@@ -203,9 +203,35 @@ Concrete adapters:
 | `QptiffAdapter` | Akoya PhenoImager QPTIFF (claimed by the `.qptiff` extension; a `.tif`-named QPTIFF needs an explicit `type: qptiff`) — pyramidal multiplex whole-slide via tifffile, serving the native on-disk pyramid as `precompute` levels (2nd native-pyramid adapter after OME-Zarr). Module: `adapters/qptiff.py` |
 | `TiffSequenceAdapter` | Plain TIFF stacks (directory of non-OME `.tif`) |
 | `Hdf5Adapter` | HDF5 chunked datasets |
-| `MrcAdapter` | MRC electron-microscopy volumes (`.mrc/.mrcs/.rec/.st/.map`) — header parsed by rosettasciio, reads served from an own `np.memmap`. Module: `adapters/mrc.py` |
+| `MrcAdapter` | MRC electron-microscopy volumes (`.mrc/.mrcs/.rec/.st/.map`) — header parsed by rosettasciio, reads served from an own per-read `np.memmap`. Module: `adapters/mrc.py` |
 | `EmdAdapter` | EMD electron-microscopy datasets (`.emd`, NCEM + Velox) via rosettasciio; multi-signal → multi-tensor, native HDF5 chunk grid. Module: `adapters/emd.py` |
 | `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via bioio (successor to aicsimageio; per-format `bioio-*` plugins). Module: `adapters/bioio.py` |
+
+### Adapter file-handle policy (biopb/biopb#71)
+
+A source stays catalogued for as long as the server runs, so an adapter that
+opens its file at registration pins it *continuously* — not just until shutdown.
+That is user-visible: on Windows the pinned file cannot be deleted, moved, or
+renamed (and deletion is what would have released it, so nothing ever does), and
+on POSIX an unlinked multi-GB volume frees no disk space. The default is
+therefore **hold nothing between reads**; a persistent handle is opt-in and must
+be justified by open cost.
+
+| Open cost | Policy | Adapters |
+|---|---|---|
+| O(1) in file size (~0.05–0.1 ms, <0.3% of a 64 MB chunk read) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
+| O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`; `ome-tiff` additionally reaps an idle store (`BIOPB_TIFF_STORE_TTL`) | `ome-tiff`, `qptiff`, `ndtiff` |
+
+`close()` is **declared on `SourceAdapter`** with a concrete no-op default (and
+classified in `_SOURCE_SCOPED_API`, so adding it had to be a deliberate interface
+decision) — the same shape as `CacheBackend.release_process_lock`, and for the
+same reason `put_chunk` is declared rather than sniffed: an optional capability
+the registry drives on *every* adapter belongs in the interface. `SourceRegistry`
+calls it directly on `unregister` / `close_all`. Second-row adapters override it
+(plus a `__del__` backstop, refs nulled before the underlying close, safe to call
+twice). `UnresolvedSourceAdapter` forwards it to the adapter it resolved to —
+that forward was the omitted seventh of seven delegated methods, and a duck-typed
+hook could not see the omission.
 
 ### Chunk caching
 

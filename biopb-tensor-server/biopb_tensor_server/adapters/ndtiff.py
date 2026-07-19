@@ -115,6 +115,13 @@ class RemoteNdTiffFileIO:
         return self._store.isdir(path)
 
 
+def _close_dataset(dataset) -> None:
+    """Close an NDTiffDataset if it offers close(). Tolerates a test double."""
+    close = getattr(dataset, "close", None)
+    if callable(close):
+        close()
+
+
 # =============================================================================
 # NdTiffAdapter - Adapter for NDTiff storage format
 # =============================================================================
@@ -307,6 +314,8 @@ class NdTiffAdapter(TensorAdapter):
         )
 
         with self._io_lock:
+            if self._dask_arr is None:
+                raise RuntimeError(f"NDTiff source {self.source_id!r} is closed")
             return self._dask_arr[slices].compute()
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
@@ -336,3 +345,35 @@ class NdTiffAdapter(TensorAdapter):
             elif isinstance(meta, dict):
                 return meta
         return {}
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def close(self) -> None:
+        """Close the dataset's per-file readers (biopb/biopb#71).
+
+        ``NDTiffDataset.__init__`` eagerly opens *every* ``NDTiffStack_*.tif`` in
+        the acquisition, so one registered source pins as many fds as the
+        acquisition has files -- routinely hundreds, which on Windows makes the
+        whole folder undeletable. Upstream's ``close()`` closes every reader; the
+        dask array must go first because its graph holds the dataset.
+
+        The handles stay persistent between reads rather than being reopened per
+        read (unlike hdf5/mrc): the reopen unit here is the *whole* acquisition,
+        so a per-read reopen would open thousands of files to serve one plane.
+        """
+        with self._io_lock:
+            self._dask_arr = None
+            dataset = self._dataset
+            self._dataset = None
+        _close_dataset(dataset)
+
+    def __del__(self):
+        # GC backstop: release the fds even without an explicit close(). No lock
+        # -- nothing references the adapter, so no read can be in flight.
+        try:
+            dataset = getattr(self, "_dataset", None)
+            self._dask_arr = None
+            self._dataset = None
+            _close_dataset(dataset)
+        except Exception:
+            pass

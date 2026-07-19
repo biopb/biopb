@@ -5,6 +5,7 @@ Uses synthetic test fixtures from conftest.py - no external data required.
 
 import importlib.util
 import os
+import pathlib
 import tempfile
 
 import numpy as np
@@ -267,3 +268,31 @@ class TestHdf5Adapter:
             assert desc.array_id == "hdf5-test"
             assert tuple(desc.shape) == shape
             assert tuple(desc.chunk_shape) == chunks
+
+    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
+    def test_holds_no_handle_between_reads(self, hdf5_dataset):
+        """A catalogued HDF5 source pins no fd (biopb/biopb#71): the adapter
+        outlives the file it was built from, and reads reopen per call."""
+        import h5py
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+        h5_path, shape, chunks = hdf5_dataset
+
+        with h5py.File(h5_path, "r") as f:
+            adapter = Hdf5Adapter(f["data"], "hdf5-test")
+
+        # The constructing handle is gone, yet the read still serves.
+        data = adapter.get_data(ChunkBounds(start=[0] * len(shape), stop=list(shape)))
+        assert data.shape == shape
+
+        fd_dir = pathlib.Path("/proc/self/fd")
+        if not fd_dir.exists():  # non-Linux: no fd table to inspect
+            pytest.skip("/proc/self/fd unavailable")
+        open_files = set()
+        for fd in fd_dir.iterdir():
+            try:
+                open_files.add(os.path.realpath(fd))
+            except OSError:
+                pass
+        assert os.path.realpath(h5_path) not in open_files
