@@ -489,19 +489,23 @@ class Reconciler:
             # Complete: the server-side DuckDB catalog is not truncated like
             # list_sources() (which would both miss sources AND spuriously remove
             # the ones past the cap below).
-            rows, complete = fetch_upstream_catalog(client)
+            rows, complete = fetch_upstream_catalog(client, endpoint)
             if rows is not None:
                 seed_by_up_id = {r["source_id"]: r for r in rows}
                 upstream_ids = list(seed_by_up_id.keys())
             else:
                 # Legacy upstream without a SQL catalog: id-only enumeration, no
                 # seed -> each added source syncs via a live per-source RPC.
-                upstream_ids, complete = list_upstream_source_ids(client)
+                upstream_ids, complete = list_upstream_source_ids(client, endpoint)
                 seed_by_up_id = {}
         finally:
-            close = getattr(client, "close", None)
-            if close is not None:
-                close()
+            # An exception here would replace whatever is propagating out of the
+            # try: body -- and a broken channel is exactly when both an upstream
+            # failure and a failing close() happen together (biopb/biopb#529).
+            try:
+                client.close()
+            except Exception:
+                logger.debug("error closing upstream client", exc_info=True)
 
         desired = {_namespaced_source_id(alias, up_id): up_id for up_id in upstream_ids}
 

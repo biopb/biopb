@@ -144,8 +144,15 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
-def list_upstream_source_ids(client) -> tuple[List[str], bool]:
+def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
     """Every source_id on an upstream tensor server. Returns ``(ids, complete)``.
+
+    ``location`` is the upstream endpoint, named in the fallback warning. It is a
+    parameter rather than something read off the client because the callers
+    already computed it (``_split_grpc_url``) to build the client, and the SDK
+    exposes no public accessor -- reaching for ``client._location`` was borrowing
+    another package's private state to recover a value that was in scope
+    (biopb/biopb#529).
 
     Enumerating a catalog with ``list_sources()`` is **unsafe**: it is capped at
     the server's ``max_list_flights_results``, so a large upstream is silently
@@ -167,14 +174,14 @@ def list_upstream_source_ids(client) -> tuple[List[str], bool]:
             "back to the capped list_sources() -- the mirror may be incomplete "
             "(%d sources seen). Enable the upstream's metadata DB for a complete "
             "mirror.",
-            getattr(client, "_location", "?"),
+            location,
             exc,
             len(ids),
         )
         return ids, False
 
 
-def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
+def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]], bool]:
     """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
 
     Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
@@ -191,6 +198,9 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
     ``rows`` is ``None`` when the upstream has no SQL catalog (``query_sources``
     errors) -- the caller then falls back to id-only enumeration
     (``list_upstream_source_ids``) and the per-source live sync path.
+
+    ``location`` names the upstream in the fallback warning; see
+    :func:`list_upstream_source_ids` for why it is a parameter.
     """
     try:
         rows = client.query_sources(
@@ -203,7 +213,7 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
         logger.warning(
             "upstream %s bulk catalog fetch failed (%s); falling back to id-only "
             "enumeration + per-source sync",
-            getattr(client, "_location", "?"),
+            location,
             exc,
         )
         return None, False
