@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
@@ -96,6 +97,8 @@ class UploadManager:
         self._metadata_db = metadata_db
         self._lock = threading.RLock()
         self._states: Dict[str, _UploadState] = {}
+        # Monotonic generation clock for biopb-written (cache:) sources (#178).
+        self._last_generation: int = 0
 
     # -- progress state machine ------------------------------------------------
 
@@ -154,6 +157,26 @@ class UploadManager:
         with self._lock:
             self._states.pop(source_id, None)
 
+    def _next_content_version(self) -> bytes:
+        """A process-monotonic generation token for a biopb-written cache: source.
+
+        cache: sources have deterministic ids (``cache:<name>`` -> a fixed
+        ``source_id``), so a re-upload reuses the id. Without a fresh namespace,
+        ``CacheManager.start_compute`` finds the prior upload's chunk already present
+        and refuses to overwrite it -- serving stale data (biopb/biopb#178). Folding a
+        distinct token into each upload's chunk_ids sidesteps that.
+
+        Wall-clock ns keeps the token distinct across a restart, where a persisted
+        file cache may still hold the prior upload's chunks; ``max(..., last + 1)``
+        keeps it strictly increasing even if the clock steps backwards. This is the
+        cache: analogue of the file adapters' stat signature -- those sources have no
+        file to stat, so biopb (the writer) supplies the version itself.
+        """
+        with self._lock:
+            gen = max(time.time_ns(), self._last_generation + 1)
+            self._last_generation = gen
+        return f"gen:{gen}".encode()
+
     # -- write path ------------------------------------------------------------
 
     def create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:
@@ -205,6 +228,7 @@ class UploadManager:
                 ome_metadata=ome_metadata,
                 physical_scale=resp_physical_scale,
                 physical_unit=resp_physical_unit,
+                content_version=self._next_content_version(),
             )
             self._registry.register(source_id, adapter)
             self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
