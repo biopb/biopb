@@ -1384,6 +1384,12 @@ install_biopb() {
     # still overrides on a fresh install (power users / unattended provisioning)
     # and skips the samples. An empty DATA_DIR is the "keep existing" sentinel;
     # otherwise we write a config whose `sources` points at DATA_DIR (biopb/biopb#34).
+    # Always download the sample bundle into SAMPLES_DIR (idempotent -- skips when
+    # already at this release; honors BIOPB_INSTALL_SAMPLES=0). Whether the server
+    # is *pointed* at the samples stays the fresh-install-only decision below; this
+    # only guarantees the bytes are present on every run.
+    _seed_samples "$SAMPLES_DIR"
+
     local DATA_DIR
     # Watch a user's own data dir (new files auto-register); leave the static
     # sample bundle unmonitored. The sample bundle is also given an alias so it
@@ -1403,11 +1409,11 @@ install_biopb() {
         DATA_DIR="$BIOPB_DATA_DIR"
         _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
     else
-        # Fresh install, no override: seed samples and point the config at them.
+        # Fresh install, no override: point the config at the sample bundle
+        # (already downloaded above).
         DATA_DIR="$SAMPLES_DIR"
         MONITOR="false"
         ALIAS="samples"
-        _seed_samples "$SAMPLES_DIR"
         _ok "Data directory: $DATA_DIR (sample images)"
     fi
 
