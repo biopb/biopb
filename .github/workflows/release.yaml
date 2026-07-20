@@ -103,21 +103,24 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_REF:-}" == refs/tags/release-v* ]]; then
             REL="${GITHUB_REF#refs/tags/release-v}"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
           else
             REL="dryrun"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
           echo "release=$REL" >> "$GITHUB_OUTPUT"
           echo "installer version: $REL"
 
       # Pin the engine baked into the .exe to THIS exact release tag, so the GUI
       # installer installs its own paired release rather than whatever is newest at
-      # run time -- the twin of the biopb.org publish-time stamp. Unlike that step,
-      # this runs for prereleases too: an rc .exe is attached to its own rc release,
-      # so it must install that rc (an empty pin + default stable channel would
-      # wrongly pull the latest STABLE). Tag builds only; a dry-run dispatch leaves
-      # the placeholder empty (compile check installs latest).
+      # run time. This is a separate job with its own checkout, so it stamps the
+      # engine itself (the release job's "Pin installers to this release" stamps the
+      # copies that job ships). Runs for prereleases too: an rc .exe is attached to
+      # its own rc release, so it must install that rc (an empty pin + default stable
+      # channel would wrongly pull the latest STABLE). Tag builds only; a dry-run
+      # dispatch leaves the placeholder empty (compile check installs latest).
       - name: Pin engine to this release
-        if: startsWith(github.ref, 'refs/tags/release-v')
+        if: steps.iver.outputs.is_tag == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -323,10 +326,43 @@ jobs:
           sha256sum *.whl *.tar.gz versions.json biopb-setup-*.exe > SHA256SUMS
           cat SHA256SUMS
 
+      # Bake this release's identity into the installers so EVERY copy that ships
+      # below -- the GitHub-release assets AND the biopb.org publish -- installs the
+      # exact release it came from, not "whatever is newest at run time". Runs for
+      # ANY release-v* tag (stable OR rc): a copy downloaded from an rc release must
+      # install that rc. (Only the biopb.org *rsync* is later gated to stable, since
+      # that canonical URL tracks the latest stable release.) install.ps1 fetches
+      # the engine from biopb.org at run time, so it can't self-contain a release;
+      # instead its stamp makes it ask that engine for this exact release via
+      # BIOPB_INSTALL_VERSION. The grep guards + bash -n fail the run if a
+      # placeholder was renamed, so an unpinned installer can never silently ship.
+      #
+      # Placed AFTER the wheel build on purpose: editing the tree earlier would make
+      # setuptools_scm see a dirty checkout and stamp the wheels with a +dirty local
+      # version. SHA256SUMS (above) does not cover the install scripts, so stamping
+      # them here does not invalidate it.
+      - name: Pin installers to this release
+        if: steps.ver.outputs.is_tag == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"   # release-vX.Y.Z[rcN]
+          sed -i "s|^BIOPB_PINNED_RELEASE=.*|BIOPB_PINNED_RELEASE=\"$TAG\"|" install/install.sh
+          sed -i "s|^\$script:BiopbPinnedRelease = .*|\$script:BiopbPinnedRelease = '$TAG'|" \
+            install/install.ps1 install/biopb-engine.ps1
+          grep -qE '^BIOPB_PINNED_RELEASE="release-v[0-9]' install/install.sh \
+            || { echo "::error::install.sh release pin was not stamped"; exit 1; }
+          for f in install/install.ps1 install/biopb-engine.ps1; do
+            grep -qE "^\\\$script:BiopbPinnedRelease = 'release-v[0-9]" "$f" \
+              || { echo "::error::$f release pin was not stamped"; exit 1; }
+          done
+          bash -n install/install.sh   # the stamped copy must still parse
+          echo "pinned installers to $TAG"
+
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
-      # uploaded. Installer scripts come from the repo-root install/ (the
-      # canonical copy users track — see docs/release-model.md).
+      # uploaded. Installer scripts come from the repo-root install/ (the canonical
+      # copy users track — see docs/release-model.md), now pinned to this release
+      # by the step above.
       - name: Create GitHub release
         if: steps.ver.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v2
@@ -342,6 +378,7 @@ jobs:
             release-wheels/biopb-setup-*.exe
             install/install.sh
             install/install.ps1
+            install/biopb-engine.ps1
           body: |
             ## biopb deployment ${{ github.ref_name }}
 
@@ -363,7 +400,9 @@ jobs:
               `release` version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
               the wheel set against it before installing
-            - `install.sh` / `install.ps1` — bootstrap installers
+            - `install.sh` / `install.ps1` — bootstrap installers, pinned to this
+              release; `biopb-engine.ps1` — the Windows install engine `install.ps1`
+              fetches (so a lone `install.ps1` installs exactly this release)
             - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
               will warn "Unknown publisher" until a signing cert is provisioned)
 
@@ -384,42 +423,18 @@ jobs:
       # opts into candidates on demand). The guard job already blocks an off-main
       # final tag, so no on-main recheck is needed here. Served from a reserved
       # /install/ subtree that biopb-site's deploy excludes from its --delete
-      # (mirrors api-docs.yaml's /docs/api/). `bash -n` first: a broken install.sh
-      # would break every `curl | bash`, so refuse to publish it (the release is
-      # already out and installable; only the live URL is held back, and the run
-      # reddens to alert).
+      # (mirrors api-docs.yaml's /docs/api/). The scripts were already pinned and
+      # parse-checked by "Pin installers to this release" above (same job, same
+      # tree, nothing touches install/ in between), so this step just mirrors them.
       - name: Publish install scripts to biopb.org
         if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
         run: |
           set -euo pipefail
-          # Bash parse check on the POSIX installer; presence check on the
-          # PowerShell scripts (no pwsh tokenizer on the runner by default).
-          bash -n install/install.sh
-          test -s install/install.ps1
-          test -s install/biopb-engine.ps1
-
           # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
           # renamed/removed upstream) -- mirrors api-docs.yaml.
           mkdir -p _install_publish
           cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
-
-          # Pin the served installer to THIS exact release, so the copy at
-          # biopb.org installs the release it was published beside rather than
-          # whatever is newest at run time (the whole point of pairing them). Stamp
-          # only the staged copies, never the repo tree. install.ps1 needs no stamp
-          # -- it fetches the engine from biopb.org at run time, and the engine is
-          # pinned here. The guards fail the run if a placeholder was renamed, so an
-          # unpinned installer can never silently ship.
-          TAG="${GITHUB_REF#refs/tags/}"   # release-vX.Y.Z (stable; step is prerelease-gated)
-          sed -i "s|^BIOPB_PINNED_RELEASE=.*|BIOPB_PINNED_RELEASE=\"$TAG\"|" _install_publish/install.sh
-          sed -i "s|^\$script:BiopbPinnedRelease = .*|\$script:BiopbPinnedRelease = '$TAG'|" _install_publish/biopb-engine.ps1
-          grep -qE '^BIOPB_PINNED_RELEASE="release-v[0-9]' _install_publish/install.sh \
-            || { echo "::error::install.sh release pin was not stamped"; exit 1; }
-          grep -qE "^\\\$script:BiopbPinnedRelease = 'release-v[0-9]" _install_publish/biopb-engine.ps1 \
-            || { echo "::error::biopb-engine.ps1 release pin was not stamped"; exit 1; }
-          bash -n _install_publish/install.sh   # re-check the stamped copy parses
-          echo "pinned served installer to $TAG"
 
           mkdir -p ~/.ssh
           echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519

@@ -138,18 +138,33 @@ via `biopb.org`) from a `release-v*` GitHub release of `biopb/biopb`:
 `RELEASE_TAG_PREFIX = "release-v"`. Asset regexes and the `file://` install are
 unchanged.
 
-**The served installer is pinned to its paired release.** Because the scripts are
-now published *with* each release (from the tagged commit — see
-`install-scripts` in the per-tag table below), the publish step stamps the exact
-tag into `BIOPB_PINNED_RELEASE` (`install.sh`) / `$script:BiopbPinnedRelease`
-(`biopb-engine.ps1`), and the Windows `.exe` gets the same stamp in the
-`windows-installer` job. So a served/bundled installer installs the *exact*
-release it shipped with, not "whatever is newest at run time" — re-fetching the
-one-liner is how a user moves forward. A **raw / git-checkout** copy has an empty
-pin and tracks the **latest stable** release (prereleases skipped). Overrides:
-`BIOPB_INSTALL_VERSION=X.Y.Z` installs/downgrades to an exact release;
-`BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since rc builds
-are not published to `biopb.org`).
+**Every shipped installer is pinned to its paired release.** The scripts are
+published *with* each release (from the tagged commit), and `release.yaml`'s **Pin
+installers to this release** step stamps the exact tag into `BIOPB_PINNED_RELEASE`
+(`install.sh`) / `$script:BiopbPinnedRelease` (`install.ps1`, `biopb-engine.ps1`)
+*before* they ship — so this holds for **all** the copies that leave a release:
+the GitHub-release **assets** (`install.sh`/`install.ps1`), the **biopb.org**
+publish, and the Windows **`.exe`** engine (stamped in the `windows-installer`
+job). Stamping runs for **every** `release-v*` tag, stable or rc, so a copy
+downloaded from an rc release installs that rc — only the *biopb.org rsync* is
+gated to stable (that canonical URL tracks the latest stable release). The result:
+any installer you download from a given release installs the *exact* release it
+came from, not "whatever is newest at run time"; re-fetching is how you move
+forward. A **raw / git-checkout** copy has an empty pin and tracks the **latest
+stable** release (prereleases skipped).
+
+`install.ps1` is a thin bootstrapper that loads the install *engine*
+(`biopb-engine.ps1`) and drives it. When it is pinned (or `BIOPB_INSTALL_VERSION`
+is set) it fetches the engine **from that release's GitHub assets** — a versioned
+copy that matches the wheels — instead of the unversioned biopb.org one, falling
+back to biopb.org only if the release predates the engine-as-asset. So a lone
+`install.ps1` downloaded from a release is self-contained: one script resolves a
+release and pulls the engine **and** wheels from it, exactly like `install.sh`
+(no separate engine download — which is why `biopb-engine.ps1` is also a release
+asset). A sibling `biopb-engine.ps1` on disk (a checkout) still wins. Overrides
+(all paths): `BIOPB_INSTALL_VERSION=X.Y.Z` installs/downgrades to an exact
+release; `BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since
+rc builds are not published to `biopb.org`).
 
 **Canonical location: the repo-root `install/`** — this is the copy users track.
 The full-stack installer design (formerly staged in `biopb-mcp/install/`) was
