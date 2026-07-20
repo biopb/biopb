@@ -1355,6 +1355,93 @@ function Invoke-BiopbInstall {
         $seedSamples = $true
     }
 
+    # Always download the sample bundle into $SamplesDir (idempotent -- skips when
+    # already at this release; honors BIOPB_INSTALL_SAMPLES=0). Runs on every install
+    # regardless of the keep-vs-seed decision below: whether the server is *pointed*
+    # at the samples stays a fresh-install choice ($seedSamples), but the bytes are
+    # fetched on every run. Fails soft -- a missing asset / download error / checksum
+    # mismatch just warns and leaves the folder as-is.
+    if ($env:BIOPB_INSTALL_SAMPLES -ne '0') {
+        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null } }
+        $sTag = if ($release) { $release.tag_name } else { "" }
+        if ($sTag) {
+            $sVersionFile = Join-Path $SamplesDir ".version"
+            $sInstalled = if (Test-Path -LiteralPath $sVersionFile) { (Get-Content -Raw -LiteralPath $sVersionFile).Trim() } else { "" }
+            if ($sInstalled -eq $sTag) {
+                Report-Ok "Sample images already up to date ($sTag)"
+            } else {
+                Report-Info "Downloading sample images ($sTag)..."
+                $sAsset = $release.assets | Where-Object { $_.name -eq 'biopb-samples.tar.gz' } | Select-Object -First 1
+                $sUrl = if ($sAsset) { $sAsset.browser_download_url } else { "$RepoUrl/releases/download/$sTag/biopb-samples.tar.gz" }
+                $sTarball = Join-Path $env:TEMP "biopb-samples.tar.gz"
+                $sOk = $true
+                try { Invoke-WebRequest -Uri $sUrl -OutFile $sTarball } catch { $sOk = $false }
+                # Soft checksum check: never seed corrupt/tampered data, but never
+                # abort the install over it. $expectedSum stays $null on any lookup
+                # miss (older release, fetch error) -> treated as "not verifiable".
+                if ($sOk) {
+                    $expectedSum = $null
+                    try {
+                        $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
+                        if ($sumsAsset) {
+                            # Download to a temp file and read it back rather than
+                            # reading .Content directly: on PowerShell 5.1 (the GUI
+                            # installer's shell) GitHub serves SHA256SUMS as
+                            # application/octet-stream, so .Content is a byte[] and
+                            # splitting it on "`n" yields per-byte tokens -- the
+                            # lookup never matches and the check silently no-ops.
+                            # -OutFile + Get-Content -Raw matches the wheel path above.
+                            $sSumsFile = Join-Path $env:TEMP "biopb-samples-SHA256SUMS"
+                            Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sSumsFile -UseBasicParsing
+                            foreach ($line in ((Get-Content -Raw -LiteralPath $sSumsFile) -split "`n")) {
+                                $parts = $line.Trim() -split '\s+', 2
+                                if ($parts.Count -eq 2 -and ($parts[1] -replace '^\*','') -eq 'biopb-samples.tar.gz') { $expectedSum = $parts[0].ToLower(); break }
+                            }
+                            Remove-Item -LiteralPath $sSumsFile -Force -ErrorAction SilentlyContinue
+                        }
+                    } catch { $expectedSum = $null }
+                    if ($expectedSum) {
+                        $actualSum = (Get-FileHash -LiteralPath $sTarball -Algorithm SHA256).Hash.ToLower()
+                        if ($actualSum -ne $expectedSum) {
+                            Report-Warn "Sample bundle checksum mismatch; skipping sample images"
+                            $sOk = $false
+                        }
+                    }
+                }
+                if ($sOk) {
+                    # Sync the bundle in without a blunt Remove-Item -Recurse on
+                    # the user-facing monitored data dir. Extract to a staging
+                    # dir, delete only the previous bundle's files (tracked in
+                    # .bundle-manifest) so a shrunk bundle leaves no orphans,
+                    # then copy the new set in -- drag-dropped user files in the
+                    # samples dir survive a re-seed.
+                    $sStage = Join-Path $env:TEMP "biopb-samples-stage"
+                    Remove-Item -LiteralPath $sStage -Recurse -Force -ErrorAction SilentlyContinue
+                    New-Item -ItemType Directory -Force -Path $sStage | Out-Null
+                    tar -xzf $sTarball -C $sStage
+                    New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null
+                    $sManifest = Join-Path $SamplesDir ".bundle-manifest"
+                    if (Test-Path -LiteralPath $sManifest) {
+                        foreach ($rel in (Get-Content -LiteralPath $sManifest)) {
+                            if ($rel) { Remove-Item -LiteralPath (Join-Path $SamplesDir $rel) -Force -ErrorAction SilentlyContinue }
+                        }
+                    }
+                    $sFiles = Get-ChildItem -LiteralPath $sStage -Recurse -File | ForEach-Object { $_.FullName.Substring($sStage.Length + 1) }
+                    Set-Content -LiteralPath $sManifest -Value $sFiles
+                    Copy-Item -Path (Join-Path $sStage '*') -Destination $SamplesDir -Recurse -Force
+                    Remove-Item -LiteralPath $sStage -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $sTarball -Force -ErrorAction SilentlyContinue
+                    Set-FileUtf8NoBom -Path $sVersionFile -Content $sTag
+                    Report-Ok "Sample images installed to: $SamplesDir"
+                } else {
+                    Report-Warn "Sample images not installed; starting with an empty data folder"
+                }
+            }
+        } else {
+            Report-Warn "Could not fetch release; sample images not installed"
+        }
+    }
+
     # $activeConfig is the file the running server will read -- the JSON we write,
     # or the untouched existing file when the user keeps it.
     $activeConfig = $existingConfig
@@ -1393,91 +1480,6 @@ function Invoke-BiopbInstall {
         # monitored so newly added files auto-register.
         $isMonitored = -not $seedSamples
 
-        # Fresh install with no chosen dir: populate the sample bundle first so the
-        # folder we point at is non-empty. Fails soft -- a missing asset / download
-        # error / checksum mismatch just leaves an empty folder (the user can then
-        # drag-drop their own data). Mirrors the webapp fetch above; honors
-        # BIOPB_INSTALL_SAMPLES=0 to skip.
-        if ($seedSamples -and ($env:BIOPB_INSTALL_SAMPLES -ne '0')) {
-            if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null } }
-            $sTag = if ($release) { $release.tag_name } else { "" }
-            if ($sTag) {
-                $sVersionFile = Join-Path $SamplesDir ".version"
-                $sInstalled = if (Test-Path -LiteralPath $sVersionFile) { (Get-Content -Raw -LiteralPath $sVersionFile).Trim() } else { "" }
-                if ($sInstalled -eq $sTag) {
-                    Report-Ok "Sample images already up to date ($sTag)"
-                } else {
-                    Report-Info "Downloading sample images ($sTag)..."
-                    $sAsset = $release.assets | Where-Object { $_.name -eq 'biopb-samples.tar.gz' } | Select-Object -First 1
-                    $sUrl = if ($sAsset) { $sAsset.browser_download_url } else { "$RepoUrl/releases/download/$sTag/biopb-samples.tar.gz" }
-                    $sTarball = Join-Path $env:TEMP "biopb-samples.tar.gz"
-                    $sOk = $true
-                    try { Invoke-WebRequest -Uri $sUrl -OutFile $sTarball } catch { $sOk = $false }
-                    # Soft checksum check: never seed corrupt/tampered data, but never
-                    # abort the install over it. $expectedSum stays $null on any lookup
-                    # miss (older release, fetch error) -> treated as "not verifiable".
-                    if ($sOk) {
-                        $expectedSum = $null
-                        try {
-                            $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
-                            if ($sumsAsset) {
-                                # Download to a temp file and read it back rather than
-                                # reading .Content directly: on PowerShell 5.1 (the GUI
-                                # installer's shell) GitHub serves SHA256SUMS as
-                                # application/octet-stream, so .Content is a byte[] and
-                                # splitting it on "`n" yields per-byte tokens -- the
-                                # lookup never matches and the check silently no-ops.
-                                # -OutFile + Get-Content -Raw matches the wheel path above.
-                                $sSumsFile = Join-Path $env:TEMP "biopb-samples-SHA256SUMS"
-                                Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sSumsFile -UseBasicParsing
-                                foreach ($line in ((Get-Content -Raw -LiteralPath $sSumsFile) -split "`n")) {
-                                    $parts = $line.Trim() -split '\s+', 2
-                                    if ($parts.Count -eq 2 -and ($parts[1] -replace '^\*','') -eq 'biopb-samples.tar.gz') { $expectedSum = $parts[0].ToLower(); break }
-                                }
-                                Remove-Item -LiteralPath $sSumsFile -Force -ErrorAction SilentlyContinue
-                            }
-                        } catch { $expectedSum = $null }
-                        if ($expectedSum) {
-                            $actualSum = (Get-FileHash -LiteralPath $sTarball -Algorithm SHA256).Hash.ToLower()
-                            if ($actualSum -ne $expectedSum) {
-                                Report-Warn "Sample bundle checksum mismatch; skipping sample images"
-                                $sOk = $false
-                            }
-                        }
-                    }
-                    if ($sOk) {
-                        # Sync the bundle in without a blunt Remove-Item -Recurse on
-                        # the user-facing monitored data dir. Extract to a staging
-                        # dir, delete only the previous bundle's files (tracked in
-                        # .bundle-manifest) so a shrunk bundle leaves no orphans,
-                        # then copy the new set in -- drag-dropped user files in the
-                        # samples dir survive a re-seed.
-                        $sStage = Join-Path $env:TEMP "biopb-samples-stage"
-                        Remove-Item -LiteralPath $sStage -Recurse -Force -ErrorAction SilentlyContinue
-                        New-Item -ItemType Directory -Force -Path $sStage | Out-Null
-                        tar -xzf $sTarball -C $sStage
-                        New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null
-                        $sManifest = Join-Path $SamplesDir ".bundle-manifest"
-                        if (Test-Path -LiteralPath $sManifest) {
-                            foreach ($rel in (Get-Content -LiteralPath $sManifest)) {
-                                if ($rel) { Remove-Item -LiteralPath (Join-Path $SamplesDir $rel) -Force -ErrorAction SilentlyContinue }
-                            }
-                        }
-                        $sFiles = Get-ChildItem -LiteralPath $sStage -Recurse -File | ForEach-Object { $_.FullName.Substring($sStage.Length + 1) }
-                        Set-Content -LiteralPath $sManifest -Value $sFiles
-                        Copy-Item -Path (Join-Path $sStage '*') -Destination $SamplesDir -Recurse -Force
-                        Remove-Item -LiteralPath $sStage -Recurse -Force -ErrorAction SilentlyContinue
-                        Remove-Item -LiteralPath $sTarball -Force -ErrorAction SilentlyContinue
-                        Set-FileUtf8NoBom -Path $sVersionFile -Content $sTag
-                        Report-Ok "Sample images installed to: $SamplesDir"
-                    } else {
-                        Report-Warn "Sample images not installed; starting with an empty data folder"
-                    }
-                }
-            } else {
-                Report-Warn "Could not fetch release; sample images not installed"
-            }
-        }
         # Whenever the config points at the samples dir (fresh install), ensure it
         # exists -- even when seeding was skipped via BIOPB_INSTALL_SAMPLES=0 or
         # failed soft -- so the server never starts pointed at a missing dir. Emit
