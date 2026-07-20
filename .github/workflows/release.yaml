@@ -109,6 +109,24 @@ jobs:
           echo "release=$REL" >> "$GITHUB_OUTPUT"
           echo "installer version: $REL"
 
+      # Pin the engine baked into the .exe to THIS exact release tag, so the GUI
+      # installer installs its own paired release rather than whatever is newest at
+      # run time -- the twin of the biopb.org publish-time stamp. Unlike that step,
+      # this runs for prereleases too: an rc .exe is attached to its own rc release,
+      # so it must install that rc (an empty pin + default stable channel would
+      # wrongly pull the latest STABLE). Tag builds only; a dry-run dispatch leaves
+      # the placeholder empty (compile check installs latest).
+      - name: Pin engine to this release
+        if: startsWith(github.ref, 'refs/tags/release-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"   # release-vX.Y.Z[rcN]
+          sed -i "s|^\$script:BiopbPinnedRelease = .*|\$script:BiopbPinnedRelease = '$TAG'|" install/biopb-engine.ps1
+          grep -qE "^\\\$script:BiopbPinnedRelease = 'release-v[0-9]" install/biopb-engine.ps1 \
+            || { echo "::error::biopb-engine.ps1 release pin was not stamped"; exit 1; }
+          echo "pinned bundled engine to $TAG"
+
       # Inno Setup 6.3+ (for the x64os arch identifier the .iss requires).
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -380,16 +398,34 @@ jobs:
           test -s install/install.ps1
           test -s install/biopb-engine.ps1
 
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
-
           # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
           # renamed/removed upstream) -- mirrors api-docs.yaml.
           mkdir -p _install_publish
           cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
+
+          # Pin the served installer to THIS exact release, so the copy at
+          # biopb.org installs the release it was published beside rather than
+          # whatever is newest at run time (the whole point of pairing them). Stamp
+          # only the staged copies, never the repo tree. install.ps1 needs no stamp
+          # -- it fetches the engine from biopb.org at run time, and the engine is
+          # pinned here. The guards fail the run if a placeholder was renamed, so an
+          # unpinned installer can never silently ship.
+          TAG="${GITHUB_REF#refs/tags/}"   # release-vX.Y.Z (stable; step is prerelease-gated)
+          sed -i "s|^BIOPB_PINNED_RELEASE=.*|BIOPB_PINNED_RELEASE=\"$TAG\"|" _install_publish/install.sh
+          sed -i "s|^\$script:BiopbPinnedRelease = .*|\$script:BiopbPinnedRelease = '$TAG'|" _install_publish/biopb-engine.ps1
+          grep -qE '^BIOPB_PINNED_RELEASE="release-v[0-9]' _install_publish/install.sh \
+            || { echo "::error::install.sh release pin was not stamped"; exit 1; }
+          grep -qE "^\\\$script:BiopbPinnedRelease = 'release-v[0-9]" _install_publish/biopb-engine.ps1 \
+            || { echo "::error::biopb-engine.ps1 release pin was not stamped"; exit 1; }
+          bash -n _install_publish/install.sh   # re-check the stamped copy parses
+          echo "pinned served installer to $TAG"
+
+          mkdir -p ~/.ssh
+          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
+
           ssh -i ~/.ssh/id_ed25519 jyu@biopb.org 'mkdir -p /var/www/biopb.org/install'
           rsync -avz --delete -e "ssh -i ~/.ssh/id_ed25519" \
             _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/
