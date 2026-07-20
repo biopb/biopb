@@ -9,7 +9,7 @@ racing agent sessions) can invoke it at once. See
 import time
 
 import pytest
-from biopb._lifecycle.file_lock import LockTimeout, file_lock
+from biopb._lifecycle.file_lock import ExclusiveFileLock, LockTimeout, file_lock
 
 
 class TestFileLock:
@@ -55,6 +55,70 @@ class TestFileLock:
         # The lock file persists after release (its existence conveys nothing;
         # the lock lives on the fd, not the file).
         assert lock.exists()
+
+
+class TestExclusiveFileLock:
+    """The lifetime-scoped form, held across a process's run rather than a block.
+
+    Used by the tensor server's cache directory, which is owned from init until
+    close (biopb/biopb#544).
+    """
+
+    def test_holds_until_released(self, tmp_path):
+        lock = tmp_path / "x.lock"
+        held = ExclusiveFileLock(lock)
+        assert held.acquire() is True
+        assert held.is_held() is True
+        # Exclusion is per open-file-description / per handle, so a second lock
+        # object is refused even inside this one process.
+        assert ExclusiveFileLock(lock).acquire() is False
+        held.release()
+        assert held.is_held() is False
+        assert ExclusiveFileLock(lock).acquire() is True
+
+    def test_acquire_defaults_to_non_blocking(self, tmp_path):
+        lock = tmp_path / "x.lock"
+        held = ExclusiveFileLock(lock)
+        assert held.acquire() is True
+        # A cache-dir owner wants the immediate answer, not a queue: the default
+        # timeout of 0 returns at once rather than waiting out a poll interval.
+        t0 = time.monotonic()
+        assert ExclusiveFileLock(lock).acquire() is False
+        assert time.monotonic() - t0 < 0.2
+        held.release()
+
+    def test_acquire_can_wait_for_the_holder(self, tmp_path):
+        lock = tmp_path / "x.lock"
+        held = ExclusiveFileLock(lock)
+        held.acquire()
+        t0 = time.monotonic()
+        assert ExclusiveFileLock(lock).acquire(timeout=0.5, poll=0.05) is False
+        assert time.monotonic() - t0 >= 0.4  # actually waited, not failed fast
+        held.release()
+
+    def test_acquire_and_release_are_idempotent(self, tmp_path):
+        lock = tmp_path / "x.lock"
+        held = ExclusiveFileLock(lock)
+        assert held.acquire() is True
+        assert held.acquire() is True  # already ours
+        held.release()
+        held.release()  # shutdown paths may release twice
+        assert held.is_held() is False
+        assert ExclusiveFileLock(lock).acquire() is True
+
+    def test_failed_acquire_leaks_no_descriptor(self, tmp_path):
+        lock = tmp_path / "x.lock"
+        held = ExclusiveFileLock(lock)
+        held.acquire()
+        loser = ExclusiveFileLock(lock)
+        for _ in range(200):
+            assert loser.acquire() is False
+        # A losing acquire must close its fd; 200 of them would otherwise sit on
+        # the process fd table until GC (and on Windows pin the file).
+        assert loser.is_held() is False
+        held.release()
+        assert loser.acquire() is True
+        loser.release()
 
 
 class TestAtomicPidWrite:

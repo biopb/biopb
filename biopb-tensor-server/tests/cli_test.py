@@ -5,7 +5,27 @@ import biopb_tensor_server.cli as cli
 import pytest
 import typer
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.cache.recovery import ProcessLock
 from biopb_tensor_server.core.config import CacheConfig
+
+
+def _cache_lock_is_free(lock_path: Path) -> bool:
+    """Whether the cache lock at `lock_path` has been released cleanly.
+
+    Release is no longer observable as the lock file disappearing: exclusion is
+    an OS lock on an open descriptor and the file is deliberately permanent
+    (unlinking it would let a racing acquirer lock a different file by the same
+    name). What "released" means now is that another owner can take it -- and,
+    since a clean release also removes the `.owner` record, that the next owner
+    does not see a crash (biopb/biopb#544).
+    """
+    probe = ProcessLock(lock_path)
+    if not probe.acquire():
+        return False
+    clean = not probe.is_stale()
+    probe.release()
+    return clean
+
 
 _VALID_TOKEN = "a" * 32  # 32 URL-safe chars: passes _web_auth.valid_token
 
@@ -127,11 +147,11 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     config = CacheConfig(backend="file", file_cache_dir=cache_dir)
     CacheManager.initialize(config)
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()  # lock held while server "runs"
+    assert not _cache_lock_is_free(lock_path)  # held while server "runs"
 
     try:
         cli._graceful_shutdown(source_manager=None, watcher=None, flight_server=None)
-        assert not lock_path.exists()  # released on shutdown
+        assert _cache_lock_is_free(lock_path)  # released on shutdown
     finally:
         mgr = CacheManager.get_instance()
         if mgr is not None:
@@ -146,7 +166,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()
+    assert not _cache_lock_is_free(lock_path)
 
     order = []
     state = {}
@@ -162,7 +182,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
             # be blocked in an upstream re-list); assert it is not the 5s default.
             state["join_timeout"] = join_timeout
             # The cache lock must already be gone by the time this slow step runs.
-            state["lock_at_stop"] = lock_path.exists()
+            state["lock_at_stop"] = not _cache_lock_is_free(lock_path)
             raise RuntimeError("boom")  # a failure here must not matter
 
     try:
@@ -175,7 +195,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
         assert order == ["flight", "source_manager"]
         assert state["lock_at_stop"] is False  # released before the join ran
         assert state["join_timeout"] == 1  # short bound, not the 5s default
-        assert not lock_path.exists()  # released despite source_manager raising
+        assert _cache_lock_is_free(lock_path)  # released despite source_manager raising
     finally:
         mgr = CacheManager.get_instance()
         if mgr is not None:
@@ -196,7 +216,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()
+    assert not _cache_lock_is_free(lock_path)
 
     # Shrink the drain bound so the test is fast; the fake hangs far beyond it.
     monkeypatch.setattr(cli, "_FLIGHT_DRAIN_TIMEOUT_S", 0.3)
@@ -222,7 +242,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
         assert entered.is_set()
         # ...yet the lock is gone (released BEFORE the drain) and we returned
         # promptly rather than blocking on the wedged shutdown().
-        assert not lock_path.exists()
+        assert _cache_lock_is_free(lock_path)
         assert elapsed < 5  # ~0.3s bound, nowhere near the 30s hang
     finally:
         release.set()  # let the daemon drain thread unwind
@@ -236,7 +256,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()
+    assert not _cache_lock_is_free(lock_path)
 
     server = _FakeServer()
     server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
@@ -251,7 +271,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
 
     cli.serve(config=Path("unused.toml"))
 
-    assert not lock_path.exists()
+    assert _cache_lock_is_free(lock_path)
 
 
 def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
@@ -267,7 +287,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()  # held once cache init ran
+    assert not _cache_lock_is_free(lock_path)  # held once cache init ran
 
     server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
@@ -284,7 +304,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
         with pytest.raises(typer.Exit):
             cli.serve(config=Path("unused.json"))
         # Released by the finally's graceful shutdown despite the early exit.
-        assert not lock_path.exists()
+        assert _cache_lock_is_free(lock_path)
     finally:
         mgr = CacheManager.get_instance()
         if mgr is not None:
