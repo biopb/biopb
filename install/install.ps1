@@ -38,6 +38,20 @@ $ProgressPreference = 'SilentlyContinue'
 # Served from biopb.org alongside install.ps1 (see docs/release-model.md).
 $EngineUrl = "https://biopb.org/biopb-engine.ps1"
 
+# Release pin -- stamped at publish, empty in the committed source (twin of
+# install.sh's BIOPB_PINNED_RELEASE). This bootstrapper always fetches the engine
+# from biopb.org (the latest stable bootstrapper), so unlike the self-contained
+# install.sh it can't carry a release in its own body; instead, when stamped, it
+# tells that engine to install THIS exact release via BIOPB_INSTALL_VERSION. So a
+# copy of install.ps1 downloaded from a specific release installs that release. An
+# explicit $env:BIOPB_INSTALL_VERSION or the RC channel wins. Keep the
+# `$script:BiopbPinnedRelease =` LHS verbatim -- release.yaml anchors its rewrite on it.
+$script:BiopbPinnedRelease = ''
+if ($script:BiopbPinnedRelease -and (-not $env:BIOPB_INSTALL_VERSION) `
+        -and (-not ($env:BIOPB_INSTALL_RC -and ($env:BIOPB_INSTALL_RC -ne '0')))) {
+    $env:BIOPB_INSTALL_VERSION = $script:BiopbPinnedRelease
+}
+
 $ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
 
 # Non-interactive / unmanned mode: $env:BIOPB_NONINTERACTIVE = "1" suppresses every

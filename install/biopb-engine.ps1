@@ -113,11 +113,12 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 # Release pin -- stamped at publish, empty in the committed source (the bash
 # installer's BIOPB_PINNED_RELEASE twin). release.yaml rewrites this line to the
 # exact `release-vX.Y.Z` it ships alongside -- both when publishing the engine to
-# biopb.org AND when the windows-installer job bakes it into the Inno .exe -- so a
-# served/bundled engine installs THAT release, not whatever is newest at run time.
-# Empty here so a raw fetch of the committed engine still tracks the latest stable
-# release. Override at run time with $env:BIOPB_INSTALL_VERSION. Keep the
-# `$script:BiopbPinnedRelease =` LHS verbatim -- release.yaml anchors its rewrite on it.
+# biopb.org (the "Pin installers to this release" step) AND when the
+# windows-installer job bakes it into the Inno .exe -- so a served/bundled engine
+# installs THAT release, not whatever is newest at run time. Empty here so a raw
+# fetch of the committed engine still tracks the latest stable release. Override at
+# run time with $env:BIOPB_INSTALL_VERSION. Keep the `$script:BiopbPinnedRelease =`
+# LHS verbatim -- the stamp anchors on it.
 $script:BiopbPinnedRelease = ''
 
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default

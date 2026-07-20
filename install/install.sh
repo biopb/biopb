@@ -38,15 +38,16 @@ else
     RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; DIM=''; RESET=''
 fi
 
-# Release pin -- stamped at publish, empty in the committed source. The biopb.org
-# publish step (release.yaml) rewrites this line to the exact `release-vX.Y.Z` it
-# ships alongside, so the served installer installs THAT release rather than
-# whatever is newest at run time. The installer and release are now published
-# together (from the same tagged commit), so querying "latest" would only
-# reintroduce the skew that pairing removes. Left empty here so a git-checkout or
-# raw `curl` of this committed file still tracks the latest stable release.
-# Override at run time with BIOPB_INSTALL_VERSION. Keep the `BIOPB_PINNED_RELEASE=`
-# LHS verbatim -- release.yaml anchors its rewrite on it.
+# Release pin -- stamped at publish, empty in the committed source. release.yaml's
+# "Pin installers to this release" step rewrites this line to the exact
+# `release-vX.Y.Z` before it ships this file (both as a GitHub-release asset and to
+# biopb.org), so any copy downloaded from a given release installs THAT release
+# rather than whatever is newest at run time -- the installer and release are
+# published together, so querying "latest" would only reintroduce the skew that
+# pairing removes. Left empty here so a git-checkout or raw `curl` of this
+# committed file still tracks the latest stable release. Override at run time with
+# BIOPB_INSTALL_VERSION. Keep the `BIOPB_PINNED_RELEASE=` LHS verbatim -- the stamp
+# anchors on it.
 BIOPB_PINNED_RELEASE=""
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
