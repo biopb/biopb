@@ -376,6 +376,7 @@ jobs:
             release-wheels/biopb-setup-*.exe
             install/install.sh
             install/install.ps1
+            install/biopb-engine.ps1
           body: |
             ## biopb deployment ${{ github.ref_name }}
 
@@ -397,7 +398,9 @@ jobs:
               `release` version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
               the wheel set against it before installing
-            - `install.sh` / `install.ps1` — bootstrap installers
+            - `install.sh` / `install.ps1` — bootstrap installers, pinned to this
+              release; `biopb-engine.ps1` — the Windows install engine `install.ps1`
+              fetches (so a lone `install.ps1` installs exactly this release)
             - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
               will warn "Unknown publisher" until a signing cert is provisioned)
 

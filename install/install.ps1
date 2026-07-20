@@ -16,12 +16,17 @@
     install brain, two skins, so the console and GUI can never drift.
 
     The engine is loaded from a sibling biopb-engine.ps1 when present (local
-    checkout / unpacked installer), otherwise downloaded from biopb.org (the
-    `irm | iex` path, where there is no script file on disk).
+    checkout / unpacked installer); otherwise, when this bootstrapper is pinned to
+    a release (stamped at publish, or via $env:BIOPB_INSTALL_VERSION), it fetches
+    the engine from THAT release's GitHub assets, falling back to biopb.org. So a
+    lone install.ps1 downloaded from a release installs exactly that release -- one
+    script, like install.sh, no separate engine download.
 
-    This installs prebuilt wheels from the latest biopb release-v* GitHub
-    deployment. By default it tracks the latest STABLE release; set
-    $env:BIOPB_INSTALL_RC = "1" to track the latest release candidate.
+    This installs prebuilt wheels from a biopb release-v* GitHub deployment. A
+    copy served from biopb.org / attached to a release is pinned to that release; a
+    raw checkout tracks the latest STABLE release. Overrides:
+    $env:BIOPB_INSTALL_VERSION = "X.Y.Z" installs/downgrades to an exact release;
+    $env:BIOPB_INSTALL_RC = "1" tracks the latest release candidate.
 
     Unattended upgrades: set $env:BIOPB_NONINTERACTIVE = "1" to suppress every
     prompt (keeps an existing config; leaves remote plugins off unless
@@ -39,17 +44,35 @@ $ProgressPreference = 'SilentlyContinue'
 $EngineUrl = "https://biopb.org/biopb-engine.ps1"
 
 # Release pin -- stamped at publish, empty in the committed source (twin of
-# install.sh's BIOPB_PINNED_RELEASE). This bootstrapper always fetches the engine
-# from biopb.org (the latest stable bootstrapper), so unlike the self-contained
-# install.sh it can't carry a release in its own body; instead, when stamped, it
-# tells that engine to install THIS exact release via BIOPB_INSTALL_VERSION. So a
-# copy of install.ps1 downloaded from a specific release installs that release. An
-# explicit $env:BIOPB_INSTALL_VERSION or the RC channel wins. Keep the
-# `$script:BiopbPinnedRelease =` LHS verbatim -- release.yaml anchors its rewrite on it.
+# install.sh's BIOPB_PINNED_RELEASE). Keep the `$script:BiopbPinnedRelease =` LHS
+# verbatim -- release.yaml's "Pin installers to this release" step anchors its
+# rewrite on it.
 $script:BiopbPinnedRelease = ''
-if ($script:BiopbPinnedRelease -and (-not $env:BIOPB_INSTALL_VERSION) `
-        -and (-not ($env:BIOPB_INSTALL_RC -and ($env:BIOPB_INSTALL_RC -ne '0')))) {
-    $env:BIOPB_INSTALL_VERSION = $script:BiopbPinnedRelease
+
+# Resolve the exact release this bootstrapper should install, if any ($EngineTag):
+#   $env:BIOPB_INSTALL_VERSION  explicit override (release-vX.Y.Z | vX.Y.Z | X.Y.Z)
+#   > the baked pin             (stamped at publish; empty in a raw checkout)
+# The RC channel, and an unstamped raw copy, leave it empty -> the engine resolves
+# "latest" itself. A concrete tag does two things: Resolve-EngineSource fetches the
+# engine from THAT release's assets (a versioned copy matching the wheels, not the
+# unversioned biopb.org one), and we hand the same tag to the engine so it installs
+# exactly it. That is what makes the Windows one-liner self-contained like
+# install.sh -- one script resolves a release and pulls everything (engine +
+# wheels) from it, instead of needing a second engine download.
+$EngineTag = ''
+if ($env:BIOPB_INSTALL_VERSION) {
+    $EngineTag = $env:BIOPB_INSTALL_VERSION
+    if     ($EngineTag.StartsWith('release-v')) { }                                    # release-v0.11.0
+    elseif ($EngineTag.StartsWith('v'))         { $EngineTag = "release-v$($EngineTag.Substring(1))" }  # v0.11.0
+    else                                        { $EngineTag = "release-v$EngineTag" } # 0.11.0
+} elseif (($env:BIOPB_INSTALL_RC) -and ($env:BIOPB_INSTALL_RC -ne '0')) {
+    $EngineTag = ''
+} elseif ($script:BiopbPinnedRelease) {
+    $EngineTag = $script:BiopbPinnedRelease
+}
+if ($EngineTag) {
+    if ($EngineTag -notmatch '^[A-Za-z0-9._+/-]+$') { throw "Invalid release version: $EngineTag" }
+    $env:BIOPB_INSTALL_VERSION = $EngineTag   # the engine installs exactly this (also covers the biopb.org fallback)
 }
 
 $ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
@@ -99,10 +122,27 @@ function Wait-ForExit {
 # still skips. (AllSigned / GPO-locked machines still need a signed engine --
 # nothing short of signing helps there.)
 function Resolve-EngineSource {
-    # $PSScriptRoot is empty under `irm | iex` (no file on disk) -> download.
+    # A sibling engine on disk (a full checkout, or the legacy two-file layout)
+    # wins -- it is exactly the code under test. $PSScriptRoot is empty under
+    # `irm | iex` (no file on disk).
     $local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'biopb-engine.ps1' } else { $null }
     if ($local -and (Test-Path -LiteralPath $local)) {
         return (Get-Content -Raw -LiteralPath $local)
+    }
+    # When the exact release is known ($EngineTag -- a stamped bootstrapper or
+    # BIOPB_INSTALL_VERSION), fetch the engine FROM THAT RELEASE's assets: a
+    # versioned, immutable copy that matches the wheels we install, so a lone
+    # install.ps1 downloaded from a release is fully self-contained (no second
+    # download). Old releases predate the engine-as-asset, so fall back to the
+    # biopb.org copy on any fetch error.
+    if ($EngineTag) {
+        $releaseEngine = "https://github.com/biopb/biopb/releases/download/$EngineTag/biopb-engine.ps1"
+        try {
+            Write-Inf "Fetching install engine ($EngineTag)..."
+            return (Invoke-RestMethod -Uri $releaseEngine)
+        } catch {
+            Write-Inf "Engine not attached to $EngineTag; falling back to biopb.org..."
+        }
     }
     Write-Inf "Fetching install engine..."
     return (Invoke-RestMethod -Uri $EngineUrl)
