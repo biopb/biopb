@@ -380,11 +380,9 @@ class ServicesConfig:
         "queried via GetOpNames and exposed as callables in the kernel's `ops` dict.",
     )
     skills_enabled: bool = _h(
-        False,
-        "Master switch for skills discovery/retrieval. Off by default (opt-in): "
-        "find_skills returns nothing, no catalog fetch is attempted, and the agent "
-        "is not told to consult skills. Set true to enable the curated-workflow "
-        "catalog.",
+        True,
+        "Master switch for skills discovery/retrieval. When off, find_skills returns "
+        "nothing and no catalog fetch is attempted.",
     )
     skills_catalog_url: str = _h(
         "https://biopb.org/skills/catalog.json",

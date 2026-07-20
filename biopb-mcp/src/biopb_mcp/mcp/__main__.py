@@ -361,9 +361,6 @@ def _serve_http(config, port, view=False):
     # Surfaces headless state to the agent (initialize `instructions`) and the
     # viewer-dependent tools (take_screenshot / server_status).
     _server.set_headless(headless)
-    # Advertise the curated-skills catalog only when it is enabled (off by
-    # default) — mirrors what find_skills / the skill:// resource actually serve.
-    _server.set_skills_enabled(get_setting(config, "services.skills_enabled"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
