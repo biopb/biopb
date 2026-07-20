@@ -110,6 +110,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 
+# Release pin -- stamped at publish, empty in the committed source (the bash
+# installer's BIOPB_PINNED_RELEASE twin). release.yaml rewrites this line to the
+# exact `release-vX.Y.Z` it ships alongside -- both when publishing the engine to
+# biopb.org AND when the windows-installer job bakes it into the Inno .exe -- so a
+# served/bundled engine installs THAT release, not whatever is newest at run time.
+# Empty here so a raw fetch of the committed engine still tracks the latest stable
+# release. Override at run time with $env:BIOPB_INSTALL_VERSION. Keep the
+# `$script:BiopbPinnedRelease =` LHS verbatim -- release.yaml anchors its rewrite on it.
+$script:BiopbPinnedRelease = ''
+
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
 # (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived
 # napari/Qt process -- machine-specific state that has no business in a roaming
@@ -576,16 +586,25 @@ function Remove-McpClients {
     }
 }
 
-# Fetch the latest GitHub release metadata for a given tag prefix. The monorepo
-# hosts several release lines, so /releases/latest is NOT component-specific: list
-# releases (date-desc) and take the newest whose tag is a CLEAN $TagPrefix+X.Y.Z.
-# With -AllowRc the regex also admits a PEP 440 prerelease suffix. PEP 440 lets the
-# prerelease marker be glued to the version (1.0rc1) OR dot-separated (1.0.rc1);
-# the tag convention here uses the dot form (e.g. release-v0.10.0.rc5), so the
-# regex tolerates an optional '.' before a/b/rc (matches both spellings).
+# Fetch GitHub release metadata for the deployment line. With -PinTag set (the
+# served/bundled-engine default, or $env:BIOPB_INSTALL_VERSION), fetch THAT exact
+# release by tag -- one API call, no listing, so the installer/release pairing
+# can't skew. Otherwise resolve live: the monorepo hosts several release lines, so
+# /releases/latest is NOT component-specific -- list releases (date-desc) and take
+# the newest whose tag is a CLEAN $TagPrefix+X.Y.Z. With -AllowRc the regex also
+# admits a PEP 440 prerelease suffix. PEP 440 lets the prerelease marker be glued
+# to the version (1.0rc1) OR dot-separated (1.0.rc1); the tag convention here uses
+# the dot form (e.g. release-v0.10.0.rc5), so the regex tolerates an optional '.'
+# before a/b/rc (matches both spellings).
 function Get-LatestRelease {
-    param([string]$Repo, [string]$TagPrefix = "", [bool]$AllowRc = $false)
+    param([string]$Repo, [string]$TagPrefix = "", [bool]$AllowRc = $false, [string]$PinTag = "")
     $headers = @{ "User-Agent" = "biopb-installer" }
+    if ($PinTag) {
+        # Validate before the tag goes into the URL -- it comes from the
+        # environment / a stamped line, so never trust it into a request raw.
+        if ($PinTag -notmatch '^[A-Za-z0-9._+/-]+$') { throw "Unexpected release tag format: $PinTag" }
+        return Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$PinTag" -Headers $headers
+    }
     $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
         -Headers $headers
     $rx = if ($AllowRc) {
@@ -896,6 +915,25 @@ function Invoke-BiopbInstall {
 
     # Release channel: -Rc (or BIOPB_INSTALL_RC env) admits the latest candidate.
     $AllowRc = [bool]$Rc -or (($env:BIOPB_INSTALL_RC) -and ($env:BIOPB_INSTALL_RC -ne '0'))
+
+    # Effective release to install ($PinTag). Precedence (twin of install.sh):
+    #   BIOPB_INSTALL_VERSION  explicit override -- install/downgrade to an exact
+    #                          release (accepts release-vX.Y.Z, vX.Y.Z, or X.Y.Z)
+    #   > RC channel           query the latest CANDIDATE live (ignores any pin;
+    #                          rc builds are not published to biopb.org)
+    #   > $script:BiopbPinnedRelease  the tag stamped into this engine at publish
+    #   > "" (empty)           raw engine: track the latest stable release
+    $PinTag = ""
+    if ($env:BIOPB_INSTALL_VERSION) {
+        $PinTag = $env:BIOPB_INSTALL_VERSION
+        if     ($PinTag.StartsWith($ReleaseTagPrefix)) { }                               # release-v0.11.0
+        elseif ($PinTag.StartsWith("v"))               { $PinTag = "$ReleaseTagPrefix$($PinTag.Substring(1))" }  # v0.11.0
+        else                                           { $PinTag = "$ReleaseTagPrefix$PinTag" }                  # 0.11.0
+    } elseif ($AllowRc) {
+        $PinTag = ""
+    } elseif ($script:BiopbPinnedRelease) {
+        $PinTag = $script:BiopbPinnedRelease
+    }
     $release = $null
 
     # ===== 0. System Check =====
@@ -1033,9 +1071,11 @@ function Invoke-BiopbInstall {
 
     # Resolve the wheel set from a single release-v* build (a matched set);
     # never let the resolver pull biopb/tensor-server/mcp from PyPI.
-    try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null }
+    try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null }
     if (-not $release) {
-        if ($AllowRc) {
+        if ($PinTag) {
+            throw "Could not fetch biopb release $PinTag from $ReleaseRepo (check the version exists and your network; omit BIOPB_INSTALL_VERSION to install the latest stable release)."
+        } elseif ($AllowRc) {
             throw "Could not fetch the latest biopb release candidate from $ReleaseRepo (check network, or unset the RC channel for stable)."
         } else {
             throw "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo (check network and rerun)."
@@ -1236,7 +1276,7 @@ function Invoke-BiopbInstall {
     $WebappOk = $false
     if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
 
-    if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
+    if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null } }
     $latestTag = if ($release) { $release.tag_name } else { "" }
 
     if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
@@ -1358,7 +1398,7 @@ function Invoke-BiopbInstall {
         # drag-drop their own data). Mirrors the webapp fetch above; honors
         # BIOPB_INSTALL_SAMPLES=0 to skip.
         if ($seedSamples -and ($env:BIOPB_INSTALL_SAMPLES -ne '0')) {
-            if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
+            if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null } }
             $sTag = if ($release) { $release.tag_name } else { "" }
             if ($sTag) {
                 $sVersionFile = Join-Path $SamplesDir ".version"

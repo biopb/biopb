@@ -134,10 +134,22 @@ needed.
 ## Installer
 
 The user-facing installer is `install.sh` / `install.ps1`, fetched (by end users,
-via `biopb.org`) from the **latest `release-v*` GitHub release** of `biopb/biopb`:
-`RELEASE_TAG_PREFIX = "release-v"`, and **prereleases are skipped** so an
-`a`/`b`/`rc` test release never becomes the default download. Asset regexes and
-the `file://` install are unchanged.
+via `biopb.org`) from a `release-v*` GitHub release of `biopb/biopb`:
+`RELEASE_TAG_PREFIX = "release-v"`. Asset regexes and the `file://` install are
+unchanged.
+
+**The served installer is pinned to its paired release.** Because the scripts are
+now published *with* each release (from the tagged commit — see
+`install-scripts` in the per-tag table below), the publish step stamps the exact
+tag into `BIOPB_PINNED_RELEASE` (`install.sh`) / `$script:BiopbPinnedRelease`
+(`biopb-engine.ps1`), and the Windows `.exe` gets the same stamp in the
+`windows-installer` job. So a served/bundled installer installs the *exact*
+release it shipped with, not "whatever is newest at run time" — re-fetching the
+one-liner is how a user moves forward. A **raw / git-checkout** copy has an empty
+pin and tracks the **latest stable** release (prereleases skipped). Overrides:
+`BIOPB_INSTALL_VERSION=X.Y.Z` installs/downgrades to an exact release;
+`BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since rc builds
+are not published to `biopb.org`).
 
 **Canonical location: the repo-root `install/`** — this is the copy users track.
 The full-stack installer design (formerly staged in `biopb-mcp/install/`) was
@@ -151,7 +163,17 @@ single source of truth.
 |---|---|---|
 | `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb`) + Maven Central (`biopb` Java) + Docker `biopb-image-base:A` |
 | `server-v*` | `tensor-server-ci` | Docker `biopb-tensor-server:S` |
-| `release-v*` | `release.yaml` | GitHub release (wheel set + sdist + webapp + samples + installers) |
+| `release-v*` | `release.yaml` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag, the canonical `biopb.org/{install.sh,install.ps1,biopb-engine.ps1}` |
+
+The canonical install scripts are published by a **step inside `release.yaml`**,
+after the GitHub release is created (formerly a standalone push-to-main
+`install-scripts.yaml`). Folding it in means the live installer publishes *only*
+if the release succeeds — a failed release can never leave a `biopb.org`
+installer newer than any release it can install. The step is gated to a **stable**
+tag: the `guard` job already blocks an off-main final tag, and prereleases
+(`…rc/a/b`) are skipped so the canonical URL keeps tracking the latest stable
+release (`install.sh` defaults to stable; `BIOPB_INSTALL_RC=1` opts into
+candidates on demand).
 
 `mcp-ci` and `control-ci` keep their PR test/build jobs but **do not publish**.
 `tensor-server-ci` and `image-runtime-ci` keep their PR test/verify-build jobs and

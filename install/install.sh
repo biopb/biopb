@@ -16,12 +16,16 @@
 # BIOPB_REMOTE_PLUGINS=1). Example:
 #   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
 #
-# This installs prebuilt wheels from the latest biopb GitHub release-v*
-# deployment (the single release that carries all three mutually-paired wheels).
-# By default it tracks the latest STABLE release (clean X.Y.Z). Set
-# BIOPB_INSTALL_RC=1 to instead track the latest release candidate (a/b/rc
-# prerelease, typically cut off the dev branch) — the fast path for testing an
-# upcoming release before it lands on main.
+# This installs prebuilt wheels from a biopb GitHub release-v* deployment (the
+# single release that carries all mutually-paired wheels). The copy served at
+# biopb.org is PINNED to the exact release it was published alongside (stamped
+# into BIOPB_PINNED_RELEASE below), so re-fetching the one-liner is how you move
+# to a newer version. A raw / git-checkout copy has no pin and tracks the latest
+# STABLE release. Overrides:
+#   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release
+#   BIOPB_INSTALL_RC=1           track the latest release candidate (a/b/rc,
+#                                typically cut off dev) — the fast path for
+#                                testing an upcoming release before it lands.
 #
 # Requirements: curl, tar
 #
@@ -33,6 +37,17 @@ if [ -t 1 ]; then
 else
     RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; DIM=''; RESET=''
 fi
+
+# Release pin -- stamped at publish, empty in the committed source. The biopb.org
+# publish step (release.yaml) rewrites this line to the exact `release-vX.Y.Z` it
+# ships alongside, so the served installer installs THAT release rather than
+# whatever is newest at run time. The installer and release are now published
+# together (from the same tagged commit), so querying "latest" would only
+# reintroduce the skew that pairing removes. Left empty here so a git-checkout or
+# raw `curl` of this committed file still tracks the latest stable release.
+# Override at run time with BIOPB_INSTALL_VERSION. Keep the `BIOPB_PINNED_RELEASE=`
+# LHS verbatim -- release.yaml anchors its rewrite on it.
+BIOPB_PINNED_RELEASE=""
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
@@ -429,35 +444,45 @@ _ensure_local_bin_on_path() {
 # unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
 _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
-    # The monorepo hosts several release lines, so /releases/latest is NOT
-    # component-specific. List releases (date-desc) and take the newest whose
-    # tag matches the deployment line, then fetch that release by tag. By default
-    # the match requires a CLEAN version (release-vX.Y.Z) so prerelease tags
-    # (release-v…a/b/rc — release candidates cut off dev) are skipped and never
-    # become the default download. With BIOPB_INSTALL_RC=1 the regex also admits
-    # a PEP 440 prerelease suffix, so the newest candidate wins.
-    local _releases
-    _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
-    local _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$"
-    [ "${ALLOW_RC:-0}" = "1" ] && \
-        _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$"
-    # `|| true`: an error/empty response makes grep exit 1, which under
-    # `set -euo pipefail` would abort the installer from this command
-    # substitution. We want to return 1 and let the caller print a friendly
-    # message, so the empty-tag check below handles it.
-    RELEASE_TAG=$(printf '%s' "$_releases" \
-        | grep '"tag_name"' \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-        | grep -E "$_tag_re" | head -1) || true
+    if [ -n "${PIN_TAG:-}" ]; then
+        # Exact pin (served-installer default, or BIOPB_INSTALL_VERSION): install
+        # this precise release. One API call, by tag -- no listing, no "newest
+        # wins", so the installer/release pairing can't skew and we stay well
+        # under the unauthenticated rate limit.
+        RELEASE_TAG="$PIN_TAG"
+    else
+        # No pin (git-checkout / raw, or the rc channel): resolve live. The
+        # monorepo hosts several release lines, so /releases/latest is NOT
+        # component-specific. List releases (date-desc) and take the newest whose
+        # tag matches the deployment line. By default the match requires a CLEAN
+        # version (release-vX.Y.Z) so prerelease tags (release-v…a/b/rc — cut off
+        # dev) are skipped; with BIOPB_INSTALL_RC=1 the regex also admits a PEP 440
+        # prerelease suffix, so the newest candidate wins.
+        local _releases
+        _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
+        local _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$"
+        [ "${ALLOW_RC:-0}" = "1" ] && \
+            _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$"
+        # `|| true`: an error/empty response makes grep exit 1, which under
+        # `set -euo pipefail` would abort the installer from this command
+        # substitution. We want to return 1 and let the caller print a friendly
+        # message, so the empty-tag check below handles it.
+        RELEASE_TAG=$(printf '%s' "$_releases" \
+            | grep '"tag_name"' \
+            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+            | grep -E "$_tag_re" | head -1) || true
+    fi
     [ -n "${RELEASE_TAG:-}" ] || return 1
-    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
+    # Validate the tag BEFORE it goes into the by-tag URL -- a pinned value comes
+    # from the environment / a stamped line, so never trust it into a request raw.
     if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
         _warn "Unexpected release tag format: $RELEASE_TAG"
         RELEASE_TAG=""
         return 1
     fi
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
     return 0
 }
 
@@ -614,6 +639,71 @@ _seed_samples() {
     rm -rf "$tmpdir"
 }
 
+# Whether `pid` is alive AND is a biopb process (not a reused PID). We only
+# force-kill PIDs whose command line still mentions biopb, so a stale pidfile
+# pointing at a since-recycled PID never takes out an unrelated process.
+_pid_is_biopb() {
+    local pid="$1" cmd=""
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    else
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null)   # macOS / no procfs
+    fi
+    case "$cmd" in
+        *biopb*) return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Stop every biopb service this machine might be running, robustly across release
+# lines. `biopb control stop` alone is NOT enough on two paths that matter here:
+#   - Pre-upgrade, `biopb` on PATH is still the OLD binary. v0.10 and earlier had
+#     no `control` subcommand at all -- the services were `biopb server` and
+#     `biopb mcp` -- so `control stop` just errors and their daemons keep holding
+#     the gRPC/http ports; the freshly installed control plane then refuses to
+#     bind (port conflict) and the upgrade appears to "not start".
+#   - A daemon started out-of-band, or one whose control plane is wedged, isn't
+#     reachable through any CLI verb we can call.
+# So try every known stop verb (an absent subcommand is a harmless nonzero exit),
+# then fall back to killing whatever the recorded pidfiles still point at. The
+# pidfile locations are version-independent constants, so this works without
+# knowing which release wrote them. Best-effort throughout.
+_stop_all_biopb_services() {
+    if command -v biopb >/dev/null 2>&1; then
+        biopb control stop >/dev/null 2>&1 || true   # v0.11+ control plane
+        biopb server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
+        biopb mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
+    fi
+
+    # Fallback: SIGTERM (then SIGKILL) any biopb PID still recorded in a known
+    # pidfile, then drop the file. control.pid is XDG-state aware; the legacy
+    # daemons hard-coded ~/.local/share (not XDG), so probe both.
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local share_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local pidfile pid tries
+    for pidfile in \
+        "$state_dir/control.pid" \
+        "$HOME/.local/share/biopb/tensor-server.pid" \
+        "$share_dir/biopb/tensor-server.pid" \
+        "$HOME/.local/share/biopb-mcp/mcp-server.pid" \
+        "$share_dir/biopb-mcp/mcp-server.pid"; do
+        [ -f "$pidfile" ] || continue
+        IFS= read -r pid < "$pidfile" 2>/dev/null || pid=""
+        pid=${pid//[!0-9]/}   # first line may be "pid<newline>token"; keep digits
+        if [ -n "$pid" ] && _pid_is_biopb "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            tries=0
+            while [ "$tries" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 0.2
+                tries=$((tries + 1))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile" 2>/dev/null || true
+    done
+}
+
 # Print the tail of the server log, indented, for diagnosing a bad startup.
 _tail_log() {
     local log="$1"
@@ -649,9 +739,9 @@ _start_control_plane() {
     # Belt-and-suspenders: the real upgrade stop already ran before uv tool
     # install (above), so this is a no-op on a clean upgrade path. Kept for the
     # first-install case where a pre-existing plane was started out-of-band and
-    # the pre-install stop missed it, and the "standalone biopb server" legacy
-    # case noted below. Best-effort.
-    biopb control stop >/dev/null 2>&1 || true
+    # the pre-install stop missed it, and the legacy <=v0.10 server/mcp daemon
+    # case. Best-effort.
+    _stop_all_biopb_services
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
@@ -842,6 +932,29 @@ install_biopb() {
         ALLOW_RC=1
     else
         ALLOW_RC=0
+    fi
+
+    # Effective release to install (PIN_TAG). Precedence:
+    #   BIOPB_INSTALL_VERSION  explicit override -- install/downgrade to any exact
+    #                          release (accepts release-vX.Y.Z, vX.Y.Z, or X.Y.Z)
+    #   > BIOPB_INSTALL_RC=1    query the latest CANDIDATE (rc isn't published to
+    #                          biopb.org, so this always resolves live, ignoring
+    #                          any baked pin)
+    #   > BIOPB_PINNED_RELEASE  the tag stamped into the served installer at publish
+    #   > "" (empty)           git-checkout / raw: track the latest stable release
+    # Empty PIN_TAG makes _fetch_latest_release fall back to the list-newest query.
+    PIN_TAG=""
+    if [ -n "${BIOPB_INSTALL_VERSION:-}" ]; then
+        PIN_TAG="$BIOPB_INSTALL_VERSION"
+        case "$PIN_TAG" in
+            "${RELEASE_TAG_PREFIX}"*) : ;;                              # release-v0.11.0
+            v*) PIN_TAG="${RELEASE_TAG_PREFIX}${PIN_TAG#v}" ;;          # v0.11.0 -> release-v0.11.0
+            *)  PIN_TAG="${RELEASE_TAG_PREFIX}${PIN_TAG}" ;;            # 0.11.0  -> release-v0.11.0
+        esac
+    elif [ "$ALLOW_RC" = "1" ]; then
+        PIN_TAG=""
+    elif [ -n "${BIOPB_PINNED_RELEASE:-}" ]; then
+        PIN_TAG="$BIOPB_PINNED_RELEASE"
     fi
 
     printf "\n%s" "${CYAN}"
@@ -1037,11 +1150,16 @@ install_biopb() {
     # thread-safety test — and so the napari[all] Qt binding is the tested one.
     local napari_req="napari[all]"
     if ! _fetch_latest_release; then
-        _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
-        if [ "$ALLOW_RC" = "1" ]; then
+        if [ -n "${PIN_TAG:-}" ]; then
+            _err "Could not fetch biopb release $PIN_TAG from $RELEASE_REPO."
+            _info "Check the version exists and your network, then rerun. To install the latest stable release instead:"
+            _cmd "curl -fsSL https://biopb.org/install.sh | bash"
+        elif [ "$ALLOW_RC" = "1" ]; then
+            _err "Could not fetch a biopb release candidate from $RELEASE_REPO."
             _info "No release candidate found. Check your network, or install the stable release:"
             _cmd "curl -fsSL https://biopb.org/install.sh | bash"
         else
+            _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
             _info "Check your network and rerun. To try the latest release candidate:"
             _cmd "curl -fsSL https://biopb.org/install.sh | BIOPB_INSTALL_RC=1 bash"
         fi
@@ -1166,15 +1284,15 @@ install_biopb() {
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so
     # the next agent reconnect already brings up the just-installed code.
     #
-    # Stop the control plane (and the data plane it owns) BEFORE swapping the
-    # binary. The old binary reads control.pid from the old path it was written
-    # to; stopping before uv tool install means reader+writer agree on the
-    # location, and the new binary's control start binds clean ports. Best-effort;
-    # a no-op on a first install (no biopb on PATH).
-    if command -v biopb >/dev/null 2>&1; then
-        _info "Stopping any running biopb control plane before upgrade..."
-        biopb control stop >/dev/null 2>&1 || true
-    fi
+    # Stop every running biopb service (and the data plane it owns) BEFORE
+    # swapping the binary, so the new control start binds clean ports. This must
+    # be robust across release lines: on an upgrade `biopb` on PATH is still the
+    # OLD binary, and v0.10-and-earlier has no `control` subcommand, so a bare
+    # `biopb control stop` would leave its `server`/`mcp` daemons holding the
+    # ports. _stop_all_biopb_services covers both eras (CLI verbs + pidfile kill).
+    # No-op on a first install (no biopb on PATH, no pidfiles).
+    _info "Stopping any running biopb services before upgrade..."
+    _stop_all_biopb_services
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -1571,15 +1689,12 @@ uninstall_biopb() {
     # 1. Stop the daemons first. On some platforms a live process keeps its files
     #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
     #    engine hits exactly this — os error 5), so stopping precedes removal.
-    #    The control plane goes first: it owns the data plane, so `control stop` is a
-    #    complete teardown of that pair and stops it respawning what follows.
+    #    _stop_all_biopb_services tears down the control plane AND the legacy
+    #    <=v0.10 server/mcp daemons (an old install being uninstalled by a newer
+    #    script), falling back to pidfile kills for anything the CLI can't reach.
     _step "[1/3] Stopping biopb services..."
-    if command -v biopb &>/dev/null; then
-        biopb control stop &>/dev/null || true
-        _ok "biopb services stopped (if they were running)"
-    else
-        _info "biopb command not on PATH; nothing to stop"
-    fi
+    _stop_all_biopb_services
+    _ok "biopb services stopped (if they were running)"
 
     # 2. Unregister from agents BEFORE removing the package, while `claude` and
     #    the config paths are still meaningful.
