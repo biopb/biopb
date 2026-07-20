@@ -13,8 +13,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-from biopb_tensor_server import discovery
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core import discovery
+from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
     _is_skippable_system_dir,
     walk_with_identity_tracking,

@@ -46,35 +46,33 @@ class _HeadlessViewer:
 def _configure_dask(config: dict):
     """Set up dask in the kernel process.
 
-    Returns ``(client, cluster)``:
+    The kernel never owns a cluster: the session child (``biopb_mcp.mcp``) spins
+    and owns the ``LocalCluster`` (see :class:`_cluster.DaskClusterHost`) and
+    injects its address. Returns a distributed ``Client`` (or ``None`` for the
+    in-process scheduler):
 
     * ``"distributed"`` + an address (``BIOPB_DASK_ADDRESS`` injected by the
-      daemon, or an external ``mcp.dask.address``) -> a ``Client`` attached to
-      that scheduler; ``cluster`` is ``None``. This is the default: the daemon
-      owns the cluster (``mcp.dask.owner="daemon"``) and injects its address.
-    * ``"distributed"`` + no address + ``owner="daemon"`` -> the daemon has no
-      cluster (disabled or a spin failure), so degrade to the in-process
-      ``threads`` scheduler rather than spinning a competing kernel-local one.
-    * ``"distributed"`` + no address + ``owner="kernel"`` (escape hatch) -> a
-      kernel-local multi-process ``LocalCluster`` and a ``Client`` bound to it.
-    * ``"threads"`` / ``"synchronous"`` -> in-process scheduler; both ``None``.
+      session child, or an external ``dask.address``) -> a ``Client`` attached
+      to that scheduler.
+    * ``"distributed"`` + no address -> the session child has no cluster
+      (disabled or a spin failure), so degrade to the in-process ``threads``
+      scheduler rather than spinning a competing kernel-local one.
+    * ``"threads"`` / ``"synchronous"`` -> in-process scheduler.
 
-    ``cancel_job`` can stop an in-flight ``compute()`` in any distributed mode
-    (it holds a real ``Client``), not just the kernel-local one. A failure
-    spinning/attaching degrades gracefully to ``threads`` rather than aborting
-    the bootstrap.
+    ``interrupt_kernel`` can stop an in-flight ``compute()`` in any distributed
+    mode (it holds a real ``Client``). A failure attaching degrades gracefully to
+    ``threads`` rather than aborting the bootstrap.
     """
     import dask
 
     from .._config import get_setting
 
-    scheduler = get_setting(config, "mcp.dask.scheduler")
-    num_workers = get_setting(config, "mcp.dask.num_workers") or None
-    owner = get_setting(config, "mcp.dask.owner")
-    # The daemon-injected address (its owned cluster) wins over the configured
-    # external one; either takes the plain Client(address) attach path.
+    scheduler = get_setting(config, "dask.scheduler")
+    num_workers = get_setting(config, "dask.num_workers") or None
+    # The session-child-injected address (its owned cluster) wins over the
+    # configured external one; either takes the plain Client(address) attach path.
     address = os.environ.get("BIOPB_DASK_ADDRESS") or get_setting(
-        config, "mcp.dask.address"
+        config, "dask.address"
     )
 
     if scheduler == "distributed":
@@ -84,47 +82,18 @@ def _configure_dask(config: dict):
             if address:
                 client = Client(address)
                 logger.info("Dask attached to distributed scheduler at %s", address)
-                return client, None
+                return client
 
-            if owner != "kernel":
-                # owner == "daemon" (default): the daemon owns the cluster and
-                # would have injected BIOPB_DASK_ADDRESS. No address here means it
-                # has none (disabled or spin failure) -> threads, not a competing
-                # kernel-local cluster.
-                logger.info(
-                    "No daemon dask address; using in-process threads scheduler"
-                )
-                scheduler = "threads"
-            else:
-                from dask.distributed import LocalCluster
-
-                # Put worker spill dirs under a launcher-owned temp dir (when set)
-                # so the launcher can rmtree them on shutdown — a group-SIGKILL of
-                # the kernel leaves workers no chance to clean up after themselves
-                # (issue #13, secondary disk-leak note).
-                local_directory = os.environ.get("BIOPB_DASK_LOCAL_DIR") or None
-
-                cluster = LocalCluster(
-                    n_workers=num_workers,
-                    processes=True,
-                    threads_per_worker=get_setting(
-                        config, "mcp.dask.threads_per_worker"
-                    ),
-                    memory_limit=get_setting(config, "mcp.dask.memory_limit"),
-                    dashboard_address=get_setting(config, "mcp.dask.dashboard_address"),
-                    local_directory=local_directory,
-                )
-                client = Client(cluster)
-                logger.info(
-                    "Dask using kernel-local cluster: %d worker(s) at %s",
-                    len(cluster.workers),
-                    cluster.scheduler_address,
-                )
-                return client, cluster
+            # No address: the session child owns the cluster and would have
+            # injected BIOPB_DASK_ADDRESS. None here means it has none (disabled
+            # or a spin failure) -> in-process threads, not a competing
+            # kernel-local cluster.
+            logger.info("No injected dask address; using in-process threads scheduler")
+            scheduler = "threads"
         except Exception:
-            # Covers a missing `distributed` install, an unreachable address, or
-            # a LocalCluster spawn failure -- degrade to the in-process scheduler
-            # so the bootstrap (and the viewer) survives.
+            # A missing `distributed` install or an unreachable address --
+            # degrade to the in-process scheduler so the bootstrap (and the
+            # viewer) survives.
             logger.exception(
                 "Distributed dask unavailable; "
                 "falling back to in-process threads scheduler"
@@ -133,7 +102,7 @@ def _configure_dask(config: dict):
 
     dask.config.set(scheduler=scheduler, num_workers=num_workers)
     logger.info("Dask scheduler: %s, num_workers: %s", scheduler, num_workers)
-    return None, None
+    return None
 
 
 def _make_cache_plugin(location, token, cache_bytes):
@@ -174,7 +143,7 @@ def _make_cache_plugin(location, token, cache_bytes):
 def _register_cache_plugin(dask_client, url, token, config: dict, planned_workers=None):
     """Split the data-plane chunk-cache budget across dask workers.
 
-    Divides ``mcp.dask.cache_budget`` evenly across the workers and installs a
+    Divides ``dask.cache_budget`` evenly across the workers and installs a
     worker-init plugin so each worker (current and future) caps its per-process
     cache at ``budget // n_workers`` -- bounding the aggregate cache that would
     otherwise be replicated per worker.
@@ -202,7 +171,7 @@ def _register_cache_plugin(dask_client, url, token, config: dict, planned_worker
             planned_workers or len(dask_client.scheduler_info().get("workers", {})),
         )
 
-        budget_cfg = get_setting(config, "mcp.dask.cache_budget")
+        budget_cfg = get_setting(config, "dask.cache_budget")
         budget = (
             int(budget_cfg)
             if isinstance(budget_cfg, int | float)
@@ -334,6 +303,191 @@ def _start_update_check(viewer, config):
     threading.Thread(target=_worker, name="biopb-update-check", daemon=True).start()
 
 
+# Load-bearing namespace names a user plugin (#92) must not shadow. The merge
+# guard skips any of these; the startup-file save/restore protects all except the
+# two owned by the background dask-attach thread (below), which it must not race.
+_RESERVED_NAMES = frozenset(
+    {
+        "viewer",
+        "client",
+        "np",
+        "da",
+        "ops",
+        "run_on_main",
+        "_conn",
+        "_jobs",
+        "_dask_client",
+        "_dask_attach_done",
+        "_viewer_window_alive",
+        "_resync_view",
+    }
+)
+# Written only by the daemon attach thread (its sole-writer invariant, step 3), so
+# a plugin exec must NOT snapshot+restore them — that would race the attach and
+# could revert a just-attached Client.
+_ATTACH_OWNED = frozenset({"_dask_client", "_dask_attach_done"})
+
+
+def _public_names(mapping: dict) -> dict:
+    """The names a module/mapping plugin contributes: ``__all__`` if declared, else
+    every public (non-``_``) name that is not itself an imported module (so a
+    plugin's ``import numpy as np`` doesn't leak ``np`` into the namespace)."""
+    import types
+
+    declared = mapping.get("__all__")
+    if isinstance(declared, list | tuple):
+        return {k: mapping[k] for k in declared if k in mapping}
+    return {
+        k: v
+        for k, v in mapping.items()
+        if not k.startswith("_") and not isinstance(v, types.ModuleType)
+    }
+
+
+def _merge_names(ip, names: dict, *, source: str) -> None:
+    """Merge plugin-contributed *names* into the kernel namespace, skipping any
+    reserved load-bearing name (warned, never silently)."""
+    ns = ip.user_ns
+    for key, value in names.items():
+        if key in _RESERVED_NAMES:
+            logger.warning(
+                "kernel plugin %s would shadow reserved name %r; skipped",
+                source,
+                key,
+            )
+            continue
+        ns[key] = value
+
+
+def _load_startup_files(ip, plugin_dir) -> None:
+    """Exec each ``*.py`` in *plugin_dir* directly in the kernel namespace.
+
+    IPython ``startup/`` semantics: a file's top-level defs land beside ``viewer``/
+    ``client``/``ops``, and its functions resolve those live handles as globals at
+    call time -- exactly like agent ``execute_code`` (which also runs in this
+    namespace), so ``client`` refreshed per-job is seen. Fail-open per file. Any
+    load-bearing name the file overwrites is restored (warned); the two
+    attach-thread-owned names are left untouched to avoid racing that thread.
+    """
+    try:
+        paths = sorted(plugin_dir.glob("*.py"))
+    except OSError:
+        return
+    ns = ip.user_ns
+    protect = _RESERVED_NAMES - _ATTACH_OWNED
+    for path in paths:
+        if path.name.startswith("_"):
+            continue
+        saved = {k: ns[k] for k in protect if k in ns}
+        try:
+            code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            exec(code, ns)  # noqa: S102 - user plugin; this kernel is RCE by design
+            logger.info("Loaded kernel plugin file: %s", path.name)
+        except Exception:
+            logger.exception("kernel plugin file %s failed to load", path.name)
+        finally:
+            for key, value in saved.items():
+                if ns.get(key) is not value:
+                    logger.warning(
+                        "kernel plugin %s overwrote reserved name %r; restored",
+                        path.name,
+                        key,
+                    )
+                    ns[key] = value
+
+
+def _load_entry_point_plugins(ip) -> None:
+    """Load ``biopb_mcp.namespace`` entry-point packages into the namespace.
+
+    An entry point resolving to a ``register(namespace)`` callable is called with a
+    read-through snapshot of the live namespace (it can inspect the handles and add
+    names); one resolving to a module or mapping has its public names merged. All
+    merges pass the reserved-name guard; fail-open per entry point.
+    """
+    from biopb._kernel_plugins import NAMESPACE_ENTRY_POINT_GROUP
+
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:  # pragma: no cover - stdlib since 3.8
+        return
+    try:
+        eps = list(entry_points(group=NAMESPACE_ENTRY_POINT_GROUP))
+    except Exception:
+        logger.debug("kernel plugin: entry-point discovery failed", exc_info=True)
+        return
+
+    import types
+    from collections.abc import Mapping
+
+    for ep in eps:
+        try:
+            obj = ep.load()
+        except Exception:
+            logger.exception("kernel plugin entry point %r failed to import", ep.name)
+            continue
+        try:
+            if isinstance(obj, types.ModuleType):
+                _merge_names(ip, _public_names(vars(obj)), source=ep.name)
+            elif isinstance(obj, Mapping):
+                # A returned mapping is a namespace-like source (like a module), so
+                # filter it the same way: public names / honor __all__, drop the
+                # odd dunder. (A register() hook, by contrast, writes literally.)
+                _merge_names(ip, _public_names(dict(obj)), source=ep.name)
+            elif callable(obj):
+                # A read-through snapshot: register() sees the live handles, and we
+                # merge only what it newly bound (guarded) rather than let it write
+                # straight into user_ns and clobber a built-in.
+                snapshot = dict(ip.user_ns)
+                obj(snapshot)
+                writes = {
+                    k: v
+                    for k, v in snapshot.items()
+                    if ip.user_ns.get(k, _MISSING) is not v
+                }
+                _merge_names(ip, writes, source=ep.name)
+            else:
+                logger.warning(
+                    "kernel plugin entry point %r is not a register()/module/mapping;"
+                    " ignored",
+                    ep.name,
+                )
+                continue
+            logger.info("Loaded kernel plugin entry point: %s", ep.name)
+        except Exception:
+            logger.exception("kernel plugin entry point %r failed to load", ep.name)
+
+
+def _load_namespace_plugins(ip, config) -> None:
+    """Load user "bring your own tool" plugins into the kernel namespace (#92).
+
+    Two sources, both fail-open per unit so one bad plugin never breaks the
+    bootstrap (the ``build_ops`` / skills precedent): ``*.py`` files under
+    ``~/.config/biopb/kernel/`` and installed ``biopb_mcp.namespace`` entry points.
+    Called after the built-in handles exist (step 7) so plugins can reference them.
+    Gated by ``services.namespace_enabled``.
+    """
+    from .._config import get_setting
+
+    if not get_setting(config, "services.namespace_enabled", True):
+        logger.info("kernel plugins disabled (services.namespace_enabled=false)")
+        return
+    from biopb._locations import mcp_plugin_dir
+
+    try:
+        _load_startup_files(ip, mcp_plugin_dir())
+    except Exception:
+        logger.exception("kernel plugin: startup-file load failed")
+    try:
+        _load_entry_point_plugins(ip)
+    except Exception:
+        logger.exception("kernel plugin: entry-point load failed")
+
+
+# Sentinel for "key absent" in the entry-point snapshot diff (a plugin may bind a
+# value that equals None, so `.get(k)` alone can't distinguish absent from None).
+_MISSING = object()
+
+
 def bootstrap():
     """Entry point called from the kernel's exec_lines."""
     try:
@@ -353,6 +507,7 @@ def bootstrap():
 
 
 def _bootstrap_impl():
+    from biopb import _algorithms
     from IPython import get_ipython
 
     from .._config import get_setting, load_config
@@ -401,16 +556,16 @@ def _bootstrap_impl():
     conn = TensorConnection(config)
 
     # 3. Attach dask on a background thread so the viewer opens immediately. The
-    #    cluster is daemon-owned and may still be registering workers, and even a
-    #    bare Client(address) connect costs a round-trip; the viewer never needs
-    #    the distributed cluster (its interactive reads pin to a single-process
-    #    scheduler, issue #8) — only the agent's explicit da.compute() uses the
-    #    distributed default, which is set once the Client attaches. Until then
-    #    `_dask_client` is None; cancel_job / server_status guard for that.
+    #    cluster is session-child-owned and may still be registering workers, and
+    #    even a bare Client(address) connect costs a round-trip; the viewer never
+    #    needs the distributed cluster (its interactive reads pin to a
+    #    single-process scheduler, issue #8) — only the agent's explicit
+    #    da.compute() uses the distributed default, which is set once the Client
+    #    attaches. Until then `_dask_client` is None; interrupt_kernel /
+    #    server_status guard for that.
     import threading
 
     ip.user_ns["_dask_client"] = None
-    ip.user_ns["_dask_cluster"] = None
     # False until the attach thread resolves (to a Client or, for threads mode /
     # a degrade, None). Lets server_status distinguish "still attaching" from
     # "no distributed cluster".
@@ -419,34 +574,25 @@ def _bootstrap_impl():
     # The connect hook and the attach thread race to register the chunk-cache
     # plugin; whichever runs second (both hold this lock) registers it, since it
     # needs both a ready Client and a live (url, token). register_plugin is named
-    # / idempotent so a double-register is harmless. planned_workers divides the
-    # budget by the cluster's *planned* worker_spec count (None for an attached
-    # address -> _register_cache_plugin falls back to the live scheduler count).
+    # / idempotent so a double-register is harmless. The kernel always attaches to
+    # the session child's cluster, so the budget splits across its live worker
+    # count (see _register_cache_plugin).
     _dask_lock = threading.Lock()
     _dask_state = {
         "client": None,
-        "cluster": None,
         "connected": False,
         "url": None,
         "token": None,
     }
 
     def _register_cache_if_ready():
-        # Caller holds _dask_lock. Splits mcp.dask.cache_budget across the worker
+        # Caller holds _dask_lock. Splits dask.cache_budget across the worker
         # processes (localhost workers clamp it to 0 themselves). No-op until both
         # a Client and a connection exist.
         client = _dask_state["client"]
         if client is None or not _dask_state["connected"]:
             return
-        cluster = _dask_state["cluster"]
-        planned = (
-            len(cluster.worker_spec)
-            if cluster is not None and hasattr(cluster, "worker_spec")
-            else None
-        )
-        _register_cache_plugin(
-            client, _dask_state["url"], _dask_state["token"], config, planned
-        )
+        _register_cache_plugin(client, _dask_state["url"], _dask_state["token"], config)
 
     # on_connect fires (in the kernel) after every successful connect with the
     # final (url, token): it bounds the dask chunk cache (token only known
@@ -465,11 +611,10 @@ def _bootstrap_impl():
     conn.on_connect = _on_connect
 
     def _attach_dask():
-        client, cluster = _configure_dask(config)
+        client = _configure_dask(config)
         with _dask_lock:
-            _dask_state.update(client=client, cluster=cluster)
+            _dask_state["client"] = client
             ip.user_ns["_dask_client"] = client
-            ip.user_ns["_dask_cluster"] = cluster
             ip.user_ns["_dask_attach_done"] = True
             _register_cache_if_ready()
 
@@ -480,7 +625,7 @@ def _bootstrap_impl():
     #    single-process scheduler so they share the main-process chunk cache
     #    instead of scattering across the distributed cluster (issue #8).
     #    Headless: no viewer — `viewer` is a self-describing sentinel instead.
-    compute_scheduler = get_setting(config, "mcp.viewer.compute_scheduler")
+    compute_scheduler = get_setting(config, "viewer.compute_scheduler")
     if headless:
         viewer = _HeadlessViewer()
         logger.info("Headless mode: no napari viewer (no display).")
@@ -509,7 +654,7 @@ def _bootstrap_impl():
         # slice before capturing so the agent still sees the requested frame
         # (resync_view_for_capture).
         os.environ["NAPARI_ASYNC"] = (
-            "1" if get_setting(config, "mcp.viewer.async_slicing") else "0"
+            "1" if get_setting(config, "viewer.async_slicing") else "0"
         )
 
         try:
@@ -557,7 +702,7 @@ def _bootstrap_impl():
     try:
         ops = build_ops(
             client_getter=lambda: conn.client,
-            server_urls=get_setting(config, "mcp.services.process_image_servers"),
+            server_urls=_algorithms.servers_from_config(config),
             op_names_timeout=get_setting(config, "timeout.get_op_names"),
             run_timeout=get_setting(config, "timeout.process_image"),
             channel_options=channel_options,
@@ -586,9 +731,9 @@ def _bootstrap_impl():
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
-    #    _dask_client/_dask_cluster were seeded to None at step 3 and are filled
-    #    by the background attach thread; not set here so it stays the sole
-    #    writer (a threads-mode attach can finish before this runs).
+    #    _dask_client was seeded to None at step 3 and is filled by the background
+    #    attach thread; not set here so it stays the sole writer (a threads-mode
+    #    attach can finish before this runs).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
     from ._helpers import resync_view_for_capture, viewer_window_alive
@@ -603,11 +748,17 @@ def _bootstrap_impl():
             "_conn": conn,
             "_jobs": _jobs,
             "run_on_main": _jobs.run_on_main,
-            "cancelled": _jobs.cancelled,
             "_viewer_window_alive": lambda: viewer_window_alive(viewer),
             "_resync_view": lambda: resync_view_for_capture(viewer),
         }
     )
+
+    # 7b. User "bring your own tool" plugins (#92): load *.py files from
+    #     ~/.config/biopb/kernel/ and biopb_mcp.namespace entry points into the
+    #     namespace now that the built-in handles (viewer/client/np/da/ops) exist,
+    #     so a plugin's code can reference them. Fail-open per plugin; the reserved
+    #     handles are guarded against a shadowing plugin.
+    _load_namespace_plugins(ip, config)
 
     # 8. Background source-catalog watcher (issue #44): a daemon thread that
     #    health-checks the server and re-lists sources when its source_count
@@ -618,8 +769,8 @@ def _bootstrap_impl():
     #    runs even headless where there is no Qt loop.
     try:
         conn.start_source_watch(
-            min_interval=get_setting(config, "mcp.tensor.health_poll_min_interval"),
-            max_interval=get_setting(config, "mcp.tensor.health_poll_max_interval"),
+            min_interval=get_setting(config, "tensor.health_poll_min_interval"),
+            max_interval=get_setting(config, "tensor.health_poll_max_interval"),
         )
     except Exception:
         logger.exception("Failed to start source watcher")

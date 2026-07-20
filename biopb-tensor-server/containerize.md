@@ -4,9 +4,10 @@
 
 This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container includes:
 
-- **FastAPI HTTP Server** (port 8814) - Serves React webapp, API endpoints, and health checks
+- **Control plane** (port 8813) - The single public web origin: serves the browser UI (dashboard at `/`, data viewer at `/viewer`), reverse-proxies the data-plane API + health checks under `/data_plane/*`, and forwards the access token to the private sidecar
 - **TensorFlightServer** (gRPC on port 8815) - Arrow Flight server for tensor data
-- **Webapp** - React-based image browser UI (served by FastAPI)
+- **HTTP sidecar** (port 8814, internal) - FastAPI data-plane API behind the control plane; API-only, bound to loopback and not published
+- **Webapp** - React-based image browser UI (one SPA, served by the control plane at its root)
 
 ## Build Instructions
 
@@ -21,13 +22,17 @@ _Pre-built docker image is uploaded to docker hub (docker://jiyuuchc/biopb-tenso
 
 ### Dependency Version Notes
 
-**numpy < 2.0 required**: The tensor server requires `numpy < 2.0` due to compatibility issues with `tifffile` and `aicsimageio`. numpy 2.0+ removed `ndarray.newbyteorder()` which older tifffile versions rely on. This constraint is enforced in `pyproject.toml` and `benchmarks/biopb-bench.def`.
+The tensor server runs on **numpy 2.x**. Two version pins are load-bearing and
+enforced in `pyproject.toml` (see `docs/aicsimageio-to-bioio-migration.md` for
+the full rationale):
 
-If you encounter `AttributeError: 'numpy.ndarray' object has no attribute 'newbyteorder'` when reading TIFF files, ensure numpy is pinned to < 2.0:
+- **`zarr < 3`** — biopb's Zarr/OME-Zarr adapters target the Zarr 2.x API.
+- **`tifffile >= 2024.8.10, < 2025.5.21`** — the lower bound is numpy-2 safe;
+  the upper bound keeps tifffile's `aszarr` store on Zarr 2 (2025.5.21 dropped
+  Zarr 2), which the OME-TIFF read path depends on.
 
-```bash
-pip install "numpy<2.0"
-```
+Vendor microscopy formats (CZI, LIF, ND2, DV, …) are read via **bioio** (the
+maintained successor to aicsimageio), installed through the `[aics]` extra.
 
 ### Step 1: Build Wheel Locally
 
@@ -39,14 +44,17 @@ pip wheel ./biopb-tensor-server --no-deps -w wheels/
 
 ### Step 2: Build Webapp Locally
 
-The webapp is served directly by FastAPI. Build with:
+The webapp is served by the control plane (the container's web origin), not the
+FastAPI sidecar. Build the SPA for the control front — the viewer targets the
+control-proxied data plane:
 
 ```bash
 # From repository root
-VITE_TENSOR_API="" pnpm --filter @biopb/web build
+pnpm -C web install
+VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
 ```
 
-This creates `biopb-tensor-server/packages/web/dist/` which is copied into the Docker image.
+This creates `web/packages/app/dist/`, which the Docker image copies to `/app/webapp`.
 
 ### Step 3: Build Docker Image
 
@@ -61,23 +69,29 @@ docker build --memory=4g --memory-swap=8g -t biopb-tensor-server:latest -f biopb
 ## Docker Usage
 
 ```bash
-docker run -d \
+docker run -d --init \
     --name biopb-tensor \
-    -p 8814:8814 \
+    -p 8813:8813 \
     -p 8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
     biopb-tensor-server:latest
 ```
 
+> `--init` runs a small init as PID 1 to reap zombies. The container's PID 1 is
+> the control plane, which handles `docker stop` (SIGTERM) gracefully and reaps
+> its own tensor-server child; `--init` is optional belt-and-suspenders for any
+> unrelated orphaned grandchildren. Publish `8813` (the web origin) and `8815`
+> (Flight gRPC); the HTTP sidecar `8814` is loopback-internal — do not publish it.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored |
+| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored. Its `[server].port` **must equal gRPC=`BIOPB_BASE_PORT`+5** and `[server].host` must be loopback-reachable (`0.0.0.0`/`127.0.0.1`), or the control plane's liveness probe won't see the data plane as serving |
 | `DATA_DIR` | `/data` | Container path of microscopy files; mount the host dir onto it with `-v /host/data:/data` (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
-| `BIOPB_BASE_PORT` | `8810` | Base port in container - HTTP=BASE+4, gRPC=BASE+5 |
+| `BIOPB_BASE_PORT` | `8810` | Base port in container. Derived: **control web origin=BASE+3** (publish this), HTTP sidecar=BASE+4 (loopback-internal), gRPC Flight=BASE+5 (publish for SDK clients) |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written. **Not to be confused with**  `$TMPDIR` |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
@@ -112,14 +126,17 @@ docker run \
 ### Examples
 
 ```bash
-# Custom base port (HTTP=9004, gRPC=9005)
-docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
+# Custom base port (BIOPB_BASE_PORT=9000 -> web origin=9003, gRPC=9005;
+# the HTTP sidecar 9004 stays loopback-internal and is not published)
+docker run -d -p 9003:9003 -p 9005:9005 -v ~/data:/data \
     -e BIOPB_BASE_PORT=9000 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
-# With custom config file
-docker run -d -p 8814:8814 -p 8815:8815 \
+# With custom config file. Its [server].port must match gRPC=BASE+5 (8815 here)
+# and bind a loopback-reachable host (0.0.0.0 or 127.0.0.1); otherwise the control
+# plane's liveness probe never sees the data plane. See the CONFIG_FILE note below.
+docker run -d -p 8813:8813 -p 8815:8815 \
     -v ~/my-config.json:/custom.json \
     -v ~/data:/data \
     -e CONFIG_FILE=/custom.json \
@@ -128,7 +145,7 @@ docker run -d -p 8814:8814 -p 8815:8815 \
 
 # Localhost-only access. A token is still required.
 docker run -d \
-    -p 127.0.0.1:8814:8814 \
+    -p 127.0.0.1:8813:8813 \
     -p 127.0.0.1:8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=mytoken \
@@ -170,8 +187,7 @@ singularity run \
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
-| `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check). **Takes effect only together with `BIOPB_BIND_LOCALHOST=true`** — dev bypass is permitted only on a loopback `--web-host`. Use only on a trusted node reached via localhost. |
-| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to localhost (useful on shared nodes; also the prerequisite for `BIOPB_WEB_DEV_BYPASS`). |
+| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to loopback → **local mode, no token** (useful on shared nodes reached via localhost). A public container bind still auto-generates a token. |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Singularity auto-binds host `/tmp`, so the cache lands at `/tmp/biopb-cache-<uid>` on host disk (persistent). Set it to relocate — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
@@ -199,10 +215,9 @@ srun --pty singularity run \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
-# Dev mode for debugging (no token, localhost only on shared HPC node)
+# Local mode (no token, loopback bind only on a shared HPC node)
 singularity run \
     --env DATA_DIR=$HOME/data \
-    --env BIOPB_WEB_DEV_BYPASS=true \
     --env BIOPB_BIND_LOCALHOST=true \
     biopb-tensor-server.sif
 ```
@@ -212,11 +227,12 @@ singularity run \
 These checks report service readiness, not completion of monitored dataset discovery. A healthy container can still have zero visible monitored sources briefly after startup while stability gating defers initial registration.
 
 ```bash
-# Liveness (HTTP)
-curl http://localhost:8814/livez
+# Control-plane liveness (the container's web origin)
+curl http://localhost:8813/health
 
-# Readiness (HTTP)
-curl http://localhost:8814/readyz
+# Tensor-server liveness/readiness, proxied under the /data_plane namespace
+curl http://localhost:8813/data_plane/livez
+curl http://localhost:8813/data_plane/readyz
 
 # Flight server health action (gRPC)
 # Use Flight's do_action("health") for gRPC health status
@@ -224,18 +240,23 @@ curl http://localhost:8814/readyz
 
 ## Access the Webapp
 
-1. Open `http://localhost:8814/` in browser
+1. Open `http://localhost:8813/` in browser (the dashboard); the data viewer is at `/viewer`
 2. Enter the token (shown once in container logs, or set via `BIOPB_TENSOR_TOKEN`)
 3. Browse microscopy datasets
 
 ## Architecture
 
 ```
-Container (external ports 8814, 8815)
-├── FastAPI HTTP Server (8814)
-│   ├── /                      → React SPA (static files from /app/webapp)
+Container (external ports 8813, 8815)
+├── Control plane (8813, the single web origin)
+│   ├── /                      → React SPA (static files from /app/webapp): dashboard
+│   ├── /viewer, /admin        → the same SPA: dataviewer/admin
+│   ├── /data_plane/*          → reverse-proxied to the FastAPI sidecar (data API + /ws/render)
+│   └── /health                → control liveness
+│
+├── FastAPI HTTP Server (8814, internal/loopback — API-only, no static)
 │   ├── /api/*                 → API endpoints (sources, slice, render)
-│   ├── /livez, /readyz        → health endpoints
+│   └── /livez, /readyz        → health endpoints
 │
 └── TensorFlightServer (8815)  → Arrow Flight gRPC (direct access)
     ├── do_action("health")    → health check action
@@ -243,7 +264,7 @@ Container (external ports 8814, 8815)
     └── do_get                 → fetch tensor data
 ```
 
-FastAPI serves both the webapp and API endpoints on port 8814. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
+The **control plane** is the container's single web origin (port 8813): it serves the SPA bundle at its root (dashboard `/`, dataviewer `/viewer`) and reverse-proxies the data-plane API under `/data_plane/*` to the FastAPI sidecar, which is API-only and binds privately to `127.0.0.1:8814` inside the container. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
 
 ### Network Binding Control
 
@@ -253,7 +274,7 @@ all interfaces (`0.0.0.0`) inside the container. Docker's port forwarding
 token-authenticated. The HTTP sidecar connects to the Flight server over loopback whenever it binds to a wildcard address — which is what this entrypoint always generates — so the bind change never affects the sidecar.
 
 **For localhost-only access:**
-- **Docker**: Use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` to restrict to host's localhost
+- **Docker**: Use `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` to restrict to host's localhost
 - **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind both HTTP and gRPC to localhost (useful on shared nodes)
 
 Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since it would break external access (services bound to 127.0.0.1 inside a container cannot be reached from outside).
@@ -266,20 +287,21 @@ Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since
 | OME-TIFF | `.ome.tiff`, `.ome.tif` | Single- and multi-file; native (`tifffile`) |
 | TIFF | `.tif`, `.tiff` | Standard TIFF and TIFF sequences; native |
 | Micro-Manager | NDTiff (`NDTiff.index`), legacy (`metadata.txt`) | Multi-file MM acquisitions; native (`ndtiff`) |
-| Zeiss | `.czi`, `.lsm` | Native (`aicspylibczi`; `.lsm` via `tifffile`) |
-| Leica | `.lif` | Native (`readlif`) |
-| Nikon | `.nd2` | Native (`aicsimageio[nd2]`) |
-| DeltaVision | `.dv` | Native (`aicsimageio[dv]`) |
-| Olympus | `.oif`, `.oib` | Native (`aicsimageio`) |
-| Imaris | `.ims` | Native (`aicsimageio`) |
+| Zeiss | `.czi`, `.lsm` | Native (`bioio-czi`; `.lsm` via `tifffile`) |
+| Leica | `.lif` | Native (`bioio-lif`) |
+| Nikon | `.nd2` | Native (`bioio-nd2`) |
+| DeltaVision | `.dv` | Native (`bioio-dv`) |
+| Olympus | `.oif`, `.oib` | Java Bio-Formats (`bioio-bioformats`) |
+| Imaris | `.ims` | Java Bio-Formats (`bioio-bioformats`) |
 | HDF5 | `.h5`, `.hdf5` | Requires explicit dataset path in config |
 | DICOM | `.dcm` | Single files and multi-file series; native (`pydicom`) |
 | NIfTI | `.nii`, `.nii.gz` | Native (`nibabel`) |
-| Zeiss (legacy) | `.zvi` | No native Python reader — bundled Java Bio-Formats (`bioformats-jar`) |
+| Zeiss (legacy) | `.zvi` | No native Python reader — Java Bio-Formats (`bioio-bioformats`) |
 
-Other formats are also handled but omitted here for brevity: additional
-Bio-Formats types (`.lei`, `.vsi`) and assorted scientific/image formats via the
-`aicsimageio` fallback.
+Vendor readers are provided by **bioio** (successor to aicsimageio), each as its
+own `bioio-*` plugin. Other formats are also handled but omitted here for
+brevity: additional Bio-Formats types (`.lei`, `.vsi`) and assorted
+scientific/image formats via the generic bioio fallback.
 
 ## Troubleshooting
 
@@ -300,7 +322,7 @@ Common causes:
 
 - Verify token matches `BIOPB_TENSOR_TOKEN`
 - Check token is 16-128 characters, URL-safe (`[A-Za-z0-9_-]`)
-- Note: `BIOPB_WEB_DEV_BYPASS` (dev-mode no-token bypass) has **no effect in Docker** — the container always binds `0.0.0.0`, so token enforcement stays on. It works only under Singularity with `BIOPB_BIND_LOCALHOST=true`.
+- Note: a Docker container always binds `0.0.0.0` (remote mode), so token enforcement stays on. The tokenless local mode via `BIOPB_BIND_LOCALHOST=true` works only under Singularity.
 
 ### Files not appearing in webapp
 

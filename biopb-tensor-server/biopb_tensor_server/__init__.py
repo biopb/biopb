@@ -5,7 +5,7 @@ multi-dimensional arrays through Apache Arrow Flight protocol.
 
 Key components:
 - TensorFlightServer: Flight server implementation
-- BackendAdapter: Abstract interface for storage backends
+- SourceAdapter / TensorAdapter: the source- and tensor-level adapter interfaces
 - Adapters: ZarrAdapter, Hdf5Adapter, OmeZarrAdapter, OmeTiffAdapter, ZeissAdapter, etc.
 - Cache: CacheManager, CacheConfig for caching computed virtual chunks
 
@@ -14,6 +14,9 @@ Note: This package is not distributed via PyPI. Install locally with:
 """
 
 from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+# OME-TIFF is pure-tifffile (always available); it lives in its own module.
+from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.tiff import (
     MicroManagerLegacyAdapter,
@@ -21,19 +24,17 @@ from biopb_tensor_server.adapters.tiff import (
 )
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
-# Optional aicsimageio adapters
+# Optional bioio vendor-format adapters (installed via the [aics] extra)
 try:
-    from biopb_tensor_server.adapters.aicsimageio import (
+    from biopb_tensor_server.adapters.bioio import (
         AicsImageIoAdapter,
         DvAdapter,
         LeicaAdapter,
         NikonAdapter,
         OlympusAdapter,
-        OmeTiffAdapter,
         ZeissAdapter,
     )
 except ImportError:
-    OmeTiffAdapter = None  # type: ignore
     ZeissAdapter = None  # type: ignore
     LeicaAdapter = None  # type: ignore
     NikonAdapter = None  # type: ignore
@@ -41,12 +42,6 @@ except ImportError:
     OlympusAdapter = None  # type: ignore
     AicsImageIoAdapter = None  # type: ignore
 
-from biopb_tensor_server.base import (
-    BackendAdapter,
-    SourceAdapter,
-    TensorAdapter,
-    TensorReadPlan,
-)
 from biopb_tensor_server.cache import (
     CacheBackend,
     CacheEntry,
@@ -55,11 +50,16 @@ from biopb_tensor_server.cache import (
     EntryState,
     MemoryCacheBackend,
 )
-from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.base import (
+    SourceAdapter,
+    TensorAdapter,
+    TensorReadPlan,
+)
+from biopb_tensor_server.core.chunk import ChunkEndpoint
+from biopb_tensor_server.core.config import (
     CacheConfig,
 )
-from biopb_tensor_server.server import (
+from biopb_tensor_server.serving.server import (
     TensorFlightServer,
     serve,
 )
@@ -82,7 +82,6 @@ __all__ = [
     "serve",
     "SourceAdapter",
     "TensorAdapter",
-    "BackendAdapter",
     "ChunkEndpoint",
     "TensorReadPlan",
     "ZarrAdapter",

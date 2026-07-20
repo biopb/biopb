@@ -19,7 +19,7 @@ import biopb.image as proto
 from biopb_image_base import (
     run_server,            # Run server (optionally with embedded cache)
     decode_image_data,     # Decode ImageData to numpy/dask
-    encode_image,          # Encode numpy array to ImageData (eager)
+    return_lazy_or_eager,  # Return result inline (small) or as a lazy tensor ref (large)
     BiopbServicerBase,     # Base class for servicers
 )
 
@@ -58,17 +58,23 @@ docker run --rm -p 50051:50051 \
     python /opt/biopb/my_servicer.py
 ```
 
-### Update biopb-mcp config
+### Register the server with biopb-mcp
 
-Update the field `mcp.services.process_image_servers`
-to include your new server:
+Add your server's URL to the `services.process_image_servers` list in the
+biopb-mcp config (`~/.config/biopb/mcp-config.json`):
+
 ``` json
-"mcp": {
+{
     "services": {
         "process_image_servers": ["grpc://your_ip_address:50051"]
     }
 }
 ```
+
+Each URL is queried via `GetOpNames` and exposed as callables in the kernel's
+`ops` dict. You can also edit this without touching the file: the browser
+dashboard's **MCP Settings** page (served by the control) edits the same
+`mcp-config.json`.
 
 ## Architecture
 This subproject provides:
@@ -125,8 +131,9 @@ Or manually (build wheels yourself):
 ```bash
 cd /path/to/biopb  # repo root
 
-# Build wheel first
+# Build wheels first (the Dockerfile installs both biopb and biopb_tensor_server)
 pip wheel . --no-deps -w wheels/
+pip wheel biopb-tensor-server/ --no-deps -w wheels/
 
 # Build Docker image
 docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
@@ -142,8 +149,13 @@ The mock servicer is available for pytest and explicit development workflows. Ru
 docker run --rm -p 50051:50051 -p 50052:8817 -v tensor-cache:/data/cache \
     biopb-image-base \
     python -m biopb_image_base.mock_servicer \
-    --cache-dir /data/cache --cache-size 32GB
+    --cache-dir /data/cache --cache-size 32GB \
+    --tensor-external-location grpc://localhost:50052
 ```
+
+`--tensor-external-location` is **required** when the embedded cache binds
+`0.0.0.0` — it is the address clients use to reach the cache (here the mapped host
+port). Pass `--local` instead to bind loopback and skip it.
 
 **With docker-compose:**
 

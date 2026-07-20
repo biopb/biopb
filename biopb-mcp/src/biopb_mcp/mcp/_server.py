@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
 
-from . import _resources
+from . import _resources, _skills
 from ._kernel import KernelHost
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,11 @@ _promote_after: float = 10.0
 # launcher (set_headless) before serving. Viewer-dependent tools return a clear
 # message and the agent is told via the initialize `instructions` field.
 _headless: bool = False
+
+# This process's logfile path (set by the launcher), surfaced by server_status so
+# an agent can find its own log. None when output goes to a terminal (foreground
+# `--transport http` / `biopb mcp view`) rather than a file.
+_session_log_path: str | None = None
 
 # Handed to the client in the initialize handshake (the only handshake-time
 # carrier MCP defines). Clients that honor it inject it into the model's
@@ -48,6 +53,10 @@ _BASE_INSTRUCTIONS = (
     "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
     "start of the session (and again to recover after a failure or after the "
     "user closes the viewer window); it blocks until the kernel is ready.\n"
+    "\n"
+    "At the start of a task, call `find_skills` to check for a curated workflow "
+    "before improvising; read the matching `skill://<id>` resource for the "
+    "steps.\n"
     "\n"
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
@@ -107,9 +116,9 @@ def build_transport_security(
     """Build DNS-rebinding protection settings for the loopback server.
 
     The loopback allowlists are always enforced; ``extra_origins`` /
-    ``extra_hosts`` (from ``config['mcp']['transport']``) are appended so an
-    admin fronting
-    the server with a reverse proxy can permit the proxy's Host/Origin.
+    ``extra_hosts`` (from ``transport.allowed_origins`` /
+    ``transport.allowed_hosts``) are appended so an admin fronting the server
+    with a reverse proxy can permit the proxy's Host/Origin.
     """
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -303,6 +312,12 @@ def set_promote_after(seconds: float):
     _promote_after = float(seconds)
 
 
+def set_session_log_path(path: str | None):
+    """Record this process's logfile path for server_status to report."""
+    global _session_log_path
+    _session_log_path = path
+
+
 def set_headless(headless: bool):
     """Mark the session compute-only (no viewer) and advertise it to the agent
     via the initialize ``instructions`` field.
@@ -434,9 +449,36 @@ def get_ops_guide() -> str:
     return _resources.OPS
 
 
+@mcp.resource("skill://{skill_id}")
+def get_skill(skill_id: str) -> str:
+    """Full workflow body for a curated skill; discover ids with `find_skills`.
+
+    The catalog (metadata) is served separately via the `find_skills` tool; this
+    resource lazily fetches one skill's markdown body, verifies it against the
+    catalog checksum, and caches it. Fail-open: returns a short explanatory
+    string rather than erroring when a skill is unknown or unreachable.
+    """
+    return _skills.get_skill_body(skill_id)
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def find_skills(query: str = "") -> list:
+    """Discover curated biopb workflows ("skills"). Call at the start of a task.
+
+    Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
+    labels"). `query` filters by title/description/tags; empty returns all.
+    Each result includes a `uri` (`skill://<id>`) — read that resource for the
+    full step-by-step workflow. Prefer an existing skill over improvising.
+
+    Fail-open: returns an empty list (never errors) when the catalog is
+    unreachable and nothing is cached or bundled.
+    """
+    return _skills.find_skills(query)
 
 
 @mcp.tool()
@@ -498,8 +540,9 @@ def execute_code(python_code: str) -> str:
     Code runs in a background thread so it does not block the main thread.
     If it finishes quickly the result is returned inline; otherwise this returns
     a job handle (job-N) and the code keeps running. Poll it with poll_job,
-    watch it with take_screenshot / server_status, and stop it with cancel_job
-    (cooperative) or restart_kernel (guaranteed). Only one job runs at a time.
+    watch it with take_screenshot / server_status, and stop it with
+    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
+    runs at a time.
 
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
@@ -520,8 +563,8 @@ def execute_code(python_code: str) -> str:
       predicate hides them; use `data_resident` to filter on residency on
       purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
-      (auto-handles the multiscale pyramid). client.get_tensor(source_id,
-      tensor_id=None) returns a lazy dask array without adding a layer.
+      (auto-handles the multiscale pyramid). client.get_tensor(array_id)
+      returns a lazy dask array without adding a layer.
     """
     host = _kernel_host
     if host is None:
@@ -536,7 +579,7 @@ def execute_code(python_code: str) -> str:
         running = submitted.get("running_job_id")
         return (
             f"A job ({running}) is already running. Poll it with "
-            f"poll_job('{running}'), or stop it with cancel_job('{running}') / "
+            f"poll_job('{running}'), or stop it with interrupt_kernel / "
             "restart_kernel before starting another."
         )
 
@@ -557,7 +600,7 @@ def execute_code(python_code: str) -> str:
     return (
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
-        f"server_status; stop with cancel_job('{job_id}') or restart_kernel.\n"
+        f"server_status; stop with interrupt_kernel or restart_kernel.\n"
         "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
     )
 
@@ -566,7 +609,7 @@ def execute_code(python_code: str) -> str:
 def poll_job(job_id: str) -> str:
     """Get the status and output of a job started by execute_code.
 
-    Returns the job's status (running/ok/error/cancelled), elapsed time, and
+    Returns the job's status (running/ok/error/interrupted), elapsed time, and
     output so far (full output once terminal). Job records persist until the
     kernel is restarted (older terminal jobs are eventually evicted).
     """
@@ -581,33 +624,6 @@ def poll_job(job_id: str) -> str:
         return f"No such job '{job_id}'."
     note = _window_note(window_alive) if snap.get("status") != "running" else ""
     return _format_job_status(snap) + note
-
-
-@mcp.tool()
-def cancel_job(job_id: str) -> str:
-    """Request cancellation of a running job (cooperative; best-effort).
-
-    Sets a flag the job's code can poll via cancelled(), and—if a distributed
-    dask cluster is in use—cancels its in-flight futures. Pure-Python loops that
-    don't check cancelled(), in-process dask, and native gRPC calls won't stop
-    this way; use restart_kernel for a guaranteed stop.
-    """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
-
-    data, res, _window_alive = _run_job_call(host, "cancel(" + repr(job_id) + ")")
-    if data is None:
-        return _format_execute_result(res)
-    status = data.get("status")
-    if data.get("cancelled"):
-        return (
-            f"Cancellation requested for {job_id} (cooperative). If it does not "
-            "stop, use restart_kernel for a guaranteed stop."
-        )
-    if status == "unknown":
-        return f"No such job '{job_id}'."
-    return f"Job {job_id}: {status} (nothing to cancel)."
 
 
 @mcp.tool()
@@ -632,10 +648,10 @@ def inspect_object(object_path: str) -> str:
 def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
-    Stronger than cancel_job: it does not require the code to check cancelled().
-    The job runs in a background worker thread, so a SIGINT (which Python delivers
-    only to the kernel main thread) can't reach it — this raises the exception
-    directly into the worker. Best-effort: it lands at the next bytecode, so a
+    Also cancels the job's in-flight dask futures. The job runs in a background
+    worker thread, so a SIGINT (which Python delivers only to the kernel main
+    thread) can't reach it — this raises the exception directly into the worker.
+    Best-effort: it lands at the next bytecode, so a
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
     it returns to Python; if the kernel stays stuck, use restart_kernel — the
     guaranteed stop.
@@ -659,10 +675,12 @@ def start_kernel() -> str:
     """Start the napari kernel on demand (it does not auto-start).
 
     The MCP server stays cheap and idle until you call this; it then brings up
-    the child IPython kernel, the napari viewer window, dask, and the tensor
-    client. This BLOCKS until the kernel is ready (or the bring-up fails), so on
-    return you can use execute_code / take_screenshot / inspect_object directly
-    (no polling needed). A ready kernel is a no-op.
+    the child IPython kernel, dask, the tensor client, and -- unless the session
+    is headless -- the napari viewer window. This BLOCKS until the kernel is
+    ready (or the bring-up fails), so on return you can use execute_code /
+    inspect_object directly, plus take_screenshot when a viewer is present (no
+    polling needed). A ready kernel is a no-op. The return message reports
+    whether the session is headless.
 
     Call this once at the start of a session. It is also the recovery path:
     after a failed start, a dead kernel, or the user closing the viewer window
@@ -674,6 +692,14 @@ def start_kernel() -> str:
         return "Error: kernel host not initialized"
     result = host.ensure_started()
     if result.get("state") == "ready":
+        if _headless:
+            # No napari window in a headless session, so take_screenshot is
+            # unavailable -- say so rather than claiming a viewer that isn't there.
+            return (
+                "Kernel ready (headless -- no napari viewer; screenshots "
+                "unavailable). dask and the tensor client are up; use "
+                "execute_code / inspect_object now."
+            )
         return (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
             "use execute_code / take_screenshot now."
@@ -690,9 +716,10 @@ def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the napari viewer and tensor client.
-    All variables defined in previous execute_code calls are lost, and a new
-    desktop viewer window replaces the old one.
+    respawns a fresh kernel, rebuilding the tensor client and -- unless the
+    session is headless -- the napari viewer. All variables defined in previous
+    execute_code calls are lost; when a viewer is present, a new desktop window
+    replaces the old one.
     """
     host = _kernel_host
     if host is None:
@@ -701,6 +728,12 @@ def restart_kernel() -> str:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
+    if _headless:
+        # No napari window in a headless session -- don't claim a rebuilt viewer.
+        return (
+            "Kernel restarted (headless -- no napari viewer). dask and the "
+            "tensor client are up; previous variables are gone."
+        )
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
@@ -729,6 +762,7 @@ def server_status() -> str:
         f"  memory_available: {mem.available / (1024**3):.1f} GB",
         f"  memory_used_percent: {mem.percent}%",
         f"  process_rss: {proc_mem.rss / (1024**2):.0f} MB",
+        f"  log_file: {_session_log_path or 'stdout (not file-logged)'}",
         "",
     ]
 
@@ -742,9 +776,7 @@ def server_status() -> str:
         lines.append(f"  url: {obs['url']}")
         lines.append(f"  mode: {obs['mode']}")
     else:
-        lines.append(
-            "  status: not running (mcp.observe.enabled off or failed to start)"
-        )
+        lines.append("  status: not running (observe.enabled off or failed to start)")
     lines.append("")
     lines.append("## Kernel")
 
@@ -814,12 +846,21 @@ def server_status() -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
+def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
     """Run the MCP server in the foreground (streamable-http).
 
     ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
     allowlist (see :func:`build_transport_security`).  They are applied before
     serving, when the streamable-http app reads ``transport_security``.
+
+    ``sock`` is an already-bound listening socket. When given we serve over it
+    with an explicit ``uvicorn.Server`` instead of letting FastMCP bind ``port``
+    itself: the de-daemonized shim-owned child (ARCHITECTURE.md, Lifecycle)
+    binds port 0 up front so it can report the OS-assigned port back to
+    its shim *before* serving, then hands the socket here. The Starlette app
+    FastMCP builds carries the ``session_manager.run()`` lifespan on its own
+    (``streamable_http_app``), so a plain uvicorn run drives it — identical to
+    the ``mcp.run`` path, only with the socket pre-bound.
     """
     mcp.settings.transport_security = build_transport_security(
         allowed_origins, allowed_hosts
@@ -827,9 +868,24 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
     mcp.settings.host = "127.0.0.1"
     mcp.settings.port = port
     logger.info("MCP server listening on http://127.0.0.1:%d/mcp", port)
-    mcp.run(transport="streamable-http")
+    if sock is None:
+        mcp.run(transport="streamable-http")
+        return
+
+    import asyncio
+
+    import uvicorn
+
+    config = uvicorn.Config(
+        mcp.streamable_http_app(),
+        host="127.0.0.1",
+        port=port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve(sockets=[sock]))
 
 
-# run_stdio() is gone: this process serves http only (daemon migration,
-# Direction 1). stdio clients are served by the launcher's bridge mode
+# run_stdio() is gone: this process serves http only (the shim-owned session
+# model). stdio clients are served by the launcher's bridge mode
 # instead — see `_shim`, which fronts this server's /mcp endpoint.

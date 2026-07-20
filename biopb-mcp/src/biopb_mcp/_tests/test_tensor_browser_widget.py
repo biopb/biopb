@@ -210,6 +210,18 @@ def _connected_with(conn, sources, *, use_server_query=False):
     conn.auto_connect.side_effect = _side_effect
 
 
+class TestTreeLayoutStability:
+    """The tree pins its horizontal scrollbar off so a content-width change on
+    an otherwise-unchanged refresh can't toggle the bar and shift rows
+    vertically on non-overlay-scrollbar platforms (biopb/biopb#367)."""
+
+    def test_horizontal_scrollbar_pinned_off(self, widget):
+        from qtpy.QtCore import Qt
+
+        w, _, _ = widget
+        assert w._tree_widget.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+
+
 class TestConnect:
     def test_shows_connecting_then_builds_tree(self, widget):
         w, conn, workers = widget
@@ -306,15 +318,16 @@ class TestConnect:
         assert w._refresh_button.isEnabled()
         assert "SQL filter" in w._filter_input.placeholderText()
 
-    def test_connect_button_retargets_to_typed_url(self, widget):
+    def test_connect_button_applies_token_and_reconnects(self, widget):
         w, conn, workers = widget
-        w._server_input.setText("grpc://other:9")
+        # The data-plane URL is no longer user-editable (#413): the control owns
+        # it and auto_connect resolves it. The Connect button only picks up the
+        # typed token and reconnects; there is no Server URL field to type into.
+        assert not hasattr(w, "_server_input")
         w._token_input.setText("secret")
 
         w._on_connect_clicked()
 
-        # The typed URL/token are pushed onto the connection before connecting.
-        assert conn.url == "grpc://other:9"
         assert conn.token == "secret"
         assert len(workers) == 1  # a connect worker was started
 
@@ -559,6 +572,9 @@ class TestResidencyIndicator:
         item = w._tree_widget.topLevelItem(0)
         assert item.text(0).startswith(_RESIDENCY_GLYPH)
         assert "Not resident" in item.toolTip(0)
+        # The full label rides in the tooltip too, so an elided long name is
+        # still readable on hover (biopb/biopb#367).
+        assert item.text(0) in item.toolTip(0)
         assert item.foreground(0).color().name() == "#888888"
 
     def test_resident_source_unmarked_with_tooltip(self, widget):
@@ -569,6 +585,7 @@ class TestResidencyIndicator:
         item = w._tree_widget.topLevelItem(0)
         assert _RESIDENCY_GLYPH not in item.text(0)
         assert "Resident" in item.toolTip(0)
+        assert item.text(0) in item.toolTip(0)
 
     def test_unknown_residency_has_no_indicator(self, widget):
         from biopb_mcp.tensor_browser._widget import _RESIDENCY_GLYPH
@@ -577,7 +594,10 @@ class TestResidencyIndicator:
         w._add_tree_node(w._tree_widget, self._node(None))
         item = w._tree_widget.topLevelItem(0)
         assert _RESIDENCY_GLYPH not in item.text(0)
-        assert item.toolTip(0) == ""
+        # The row still carries a full-label tooltip (biopb/biopb#367), but with
+        # no residency note appended for an unknown state.
+        assert item.toolTip(0) == item.text(0)
+        assert "resident" not in item.toolTip(0).lower()
 
 
 class TestRemoveButton:

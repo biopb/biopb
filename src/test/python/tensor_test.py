@@ -31,7 +31,7 @@ def _zarr_available() -> bool:
     try:
         import zarr
 
-        zarr.open_array
+        _ = zarr.open_array
         return True
     except ImportError:
         return False
@@ -97,14 +97,14 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_shape(self, server_client):
         """Test tensor shape retrieval."""
-        darr = server_client.get_tensor("test-tensor", "test-tensor")
+        darr = server_client.get_tensor("test-tensor")
         assert darr.shape == (128, 128)
         assert darr.dtype == np.uint8
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_read_chunks(self, server_client):
         """Test reading different chunks."""
-        darr = server_client.get_tensor("test-tensor", "test-tensor")
+        darr = server_client.get_tensor("test-tensor")
 
         # Top-left chunk
         data = darr[:64, :64].compute()
@@ -125,7 +125,7 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_cache_reuse(self, server_client):
         """Test that cache is reused."""
-        darr = server_client.get_tensor("test-tensor", "test-tensor")
+        darr = server_client.get_tensor("test-tensor")
 
         # First read
         data1 = darr[:64, :64].compute()
@@ -148,7 +148,6 @@ class TestTensorFlightClient:
         """Test explicit per-call scaled reads using stride downsampling."""
         darr = server_client.get_tensor(
             "test-tensor",
-            "test-tensor",
             scale_hint=[2, 2],
             reduction_method="stride",
         )
@@ -166,7 +165,6 @@ class TestTensorFlightClient:
     def test_scaled_nearest_view(self, server_client):
         """Test visualization-oriented nearest downsampling."""
         darr = server_client.get_tensor(
-            "test-tensor",
             "test-tensor",
             scale_hint=[2, 2],
             reduction_method="nearest",
@@ -186,7 +184,6 @@ class TestTensorFlightClient:
         """Test explicit read_options-based mean downsampling."""
         darr = server_client.get_tensor(
             "test-tensor",
-            "test-tensor",
             scale_hint=[2, 2],
             reduction_method="mean",
         )
@@ -204,7 +201,6 @@ class TestTensorFlightClient:
     def test_scaled_area_view(self, server_client):
         """Test visualization-oriented area downsampling."""
         darr = server_client.get_tensor(
-            "test-tensor",
             "test-tensor",
             scale_hint=[2, 2],
             reduction_method="area",
@@ -257,7 +253,6 @@ class TestTensorFlightClient:
                 ) as client:
                     darr = client.get_tensor(
                         "mean-preserve",
-                        "mean-preserve",
                         scale_hint=[2, 2],
                         reduction_method="mean",
                     )
@@ -307,7 +302,6 @@ class TestTensorFlightClient:
                 ) as client:
                     darr = client.get_tensor(
                         "linear",
-                        "linear",
                         scale_hint=[2, 2],
                         reduction_method="linear",
                     )
@@ -349,7 +343,6 @@ class TestTensorFlightClient:
                 ) as client:
                     darr = client.get_tensor(
                         "nearest-edge",
-                        "nearest-edge",
                         scale_hint=[2, 2],
                         reduction_method="nearest",
                     )
@@ -361,21 +354,23 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_not_found_raises(self, server_client):
         """Test that requesting non-existent tensor raises error."""
-        with pytest.raises(ValueError, match="Tensor 'nonexistent' not found"):
-            server_client.get_tensor("test-tensor", "nonexistent")
+        with pytest.raises(
+            ValueError, match="Tensor 'test-tensor/nonexistent' not found"
+        ):
+            server_client.get_tensor("test-tensor/nonexistent")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_source_not_found_raises(self, server_client):
         """Test that requesting non-existent source raises error."""
         with pytest.raises(ValueError, match="Source not found"):
-            server_client.get_tensor("nonexistent-source", "some-tensor")
+            server_client.get_tensor("nonexistent-source/some-tensor")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_pb(self, server_client):
         """Test get_tensor_pb returns SerializedTensor protobuf."""
         from biopb.tensor.serialized_pb2 import SerializedTensor
 
-        pb = server_client.get_tensor_pb("test-tensor", "test-tensor")
+        pb = server_client.get_tensor_pb("test-tensor")
 
         # Verify it's a SerializedTensor
         assert isinstance(pb, SerializedTensor)
@@ -396,7 +391,7 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):
         """Test tensor_from_pb reconstructs dask array."""
-        pb = server_client.get_tensor_pb("test-tensor", "test-tensor")
+        pb = server_client.get_tensor_pb("test-tensor")
 
         # Reconstruct array
         darr = TensorFlightClient.tensor_from_pb(pb)
@@ -406,7 +401,7 @@ class TestTensorFlightClient:
         assert darr.dtype == np.uint8
 
         # Verify data values match direct get_tensor
-        direct_darr = server_client.get_tensor("test-tensor", "test-tensor")
+        direct_darr = server_client.get_tensor("test-tensor")
 
         # Top-left chunk
         np.testing.assert_array_equal(
@@ -423,7 +418,7 @@ class TestTensorFlightClient:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_pb_serialization(self, server_client):
         """Test SerializedTensor can be serialized to bytes and reconstructed."""
-        pb = server_client.get_tensor_pb("test-tensor", "test-tensor")
+        pb = server_client.get_tensor_pb("test-tensor")
 
         # Serialize to bytes
         serialized_bytes = pb.SerializeToString()
@@ -445,7 +440,6 @@ class TestTensorFlightClient:
         """Test get_tensor_pb with slice_hint cropping."""
         pb = server_client.get_tensor_pb(
             "test-tensor",
-            "test-tensor",
             slice_hint=(slice(0, 64), slice(0, 64)),  # Top-left quadrant
         )
 
@@ -464,7 +458,6 @@ class TestTensorFlightClient:
         """Test get_tensor_pb with scale_hint."""
         pb = server_client.get_tensor_pb(
             "test-tensor",
-            "test-tensor",
             scale_hint=[2, 2],
             reduction_method="nearest",
         )
@@ -482,7 +475,9 @@ class TestTensorFlightClient:
 
     def test_get_upload_status_pb_uses_tensor_descriptor_array_id(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        # Upload lifecycle lives in the UploadSession collaborator (#278 item C),
+        # so the _pb conveniences resolve status through client._upload -- mock there.
+        client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "PENDING",
@@ -498,12 +493,12 @@ class TestTensorFlightClient:
         finally:
             client.close()
 
-        client.get_upload_status.assert_called_once_with("cache_test")
+        client._upload.get_upload_status.assert_called_once_with("cache_test")
         assert status["state"] == "PENDING"
 
     def test_wait_for_upload_ready_pb_returns_when_ready(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        client._upload.get_upload_status = Mock(
             side_effect=[
                 {
                     "source_id": "cache_test",
@@ -532,11 +527,11 @@ class TestTensorFlightClient:
             client.close()
 
         assert status["state"] == "READY"
-        assert client.get_upload_status.call_count == 2
+        assert client._upload.get_upload_status.call_count == 2
 
     def test_wait_for_upload_ready_pb_times_out(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "PENDING",
@@ -573,7 +568,7 @@ class TestTensorFlightClient:
 
     def test_wait_for_upload_ready_pb_raises_on_failed_state(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "FAILED",
@@ -685,9 +680,16 @@ class TestQuerySourcesFormat:
         ]
 
     def test_unknown_format_rejected_before_network(self):
-        # Validated at the top of query_sources, so a bad format fails fast
-        # without a server / connection.
+        # Validated at the top of query_sources (now on CatalogClient, #278 item
+        # C), so a bad format fails fast without a server / connection.
+        from biopb.tensor._session import CatalogClient, _ClientState
+
         client = TensorFlightClient.__new__(TensorFlightClient)
+        client._catalog = CatalogClient(
+            _ClientState(
+                client=None, call_options=None, location="", token=None, cache_bytes=0
+            )
+        )
         with pytest.raises(ValueError, match="unknown format"):
             client.query_sources("SELECT 1", format="polars")
 
@@ -731,13 +733,20 @@ class TestGetPhysicalScale:
 
     @staticmethod
     def _client():
-        # Build without __init__ (no connection); the method only touches the
-        # in-memory descriptor cache and (on a miss) _fetch_tensor_descriptor,
-        # which we stub.
+        # Build without __init__ (no connection): wire the shared state + the
+        # CatalogClient collaborator that now owns get_physical_scale (#278 item
+        # C). The method only touches the in-memory descriptor cache and (on a
+        # miss) the catalog's _fetch_tensor_descriptor, which we stub there.
+        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
         client = TensorFlightClient.__new__(TensorFlightClient)
-        client._descriptors = {}
-        client._sources = {}
-        client._fetch_tensor_descriptor = Mock()
+        state = _ClientState(
+            client=None, call_options=None, location="", token=None, cache_bytes=0
+        )
+        client._state = state
+        client._catalog = CatalogClient(state)
+        client._fetcher = ChunkFetcher(state, client._catalog)
+        client._catalog._fetch_tensor_descriptor = Mock()
         return client
 
     @staticmethod
@@ -763,7 +772,7 @@ class TestGetPhysicalScale:
         scale, unit = client.get_physical_scale("src/t1")
         assert scale == [2.0, 0.325, 0.325]
         assert unit == ["micrometer", "micrometer", "micrometer"]
-        client._fetch_tensor_descriptor.assert_not_called()
+        client._catalog._fetch_tensor_descriptor.assert_not_called()
 
     def test_none_when_summary_empty(self):
         # Old server / no physical sizes -> empty repeated field -> None.
@@ -780,12 +789,12 @@ class TestGetPhysicalScale:
         # (removed with the array_id-keyed accessor, #75).
         client = self._client()
         desc, _ = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
-        client._fetch_tensor_descriptor.return_value = desc
+        client._catalog._fetch_tensor_descriptor.return_value = desc
 
         scale, unit = client.get_physical_scale("src")  # bare source id -> default
         assert scale == [1.0, 0.5, 0.5]
         assert unit == ["", "micrometer", "micrometer"]
-        client._fetch_tensor_descriptor.assert_called_once_with("src", None)
+        client._catalog._fetch_tensor_descriptor.assert_called_once_with("src", None)
 
     def test_fetch_error_propagates(self):
         # A real fetch failure (server unreachable, source not found) must NOT be
@@ -793,7 +802,9 @@ class TestGetPhysicalScale:
         # physical scale recorded". Only a fetched descriptor with an empty
         # summary yields None (test_none_when_summary_empty).
         client = self._client()
-        client._fetch_tensor_descriptor.side_effect = ConnectionError("unreachable")
+        client._catalog._fetch_tensor_descriptor.side_effect = ConnectionError(
+            "unreachable"
+        )
 
         with pytest.raises(ConnectionError):
             client.get_physical_scale("src")

@@ -18,7 +18,7 @@ from biopb_tensor_server.cache.memory_backend import (
     MemoryCacheBackend,
     MemoryCacheConfig,
 )
-from biopb_tensor_server.config import CacheConfig
+from biopb_tensor_server.core.config import CacheConfig
 
 
 class CacheManager:
@@ -172,6 +172,15 @@ class CacheManager:
     def stats(self) -> CacheStats:
         """Get cache statistics."""
         return self._backend.stats()
+
+    def release_process_lock(self) -> None:
+        """Release the cross-process cache lock + clear the WAL, handles left open.
+
+        Delegates to the backend's fast graceful-shutdown path (no-op on the
+        memory backend). Callers guard the singleton for ``None`` themselves
+        (``CacheManager.get_instance()``).
+        """
+        self._backend.release_process_lock()
 
     def close(self) -> None:
         """Close manager."""

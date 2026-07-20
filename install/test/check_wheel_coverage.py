@@ -9,10 +9,10 @@ extension from source. That fallback is exactly what broke Intel-macOS installs
 when ``cryptography`` 49 dropped its x86_64/universal2 wheel (see ``install.sh``
 and issue #45's sibling, #355).
 
-It resolves the SAME requirements install.sh does, *including* the per-platform
-constraints install.sh applies (see ``INSTALLER_CONSTRAINTS``), so a clean run
-means "an installer-equivalent resolve is wheel-clean on this platform," not
-merely "the raw dependency graph is." Run from the repo root.
+It resolves the SAME requirements install.sh does, *including* the dependency
+overrides install.sh applies (see ``INSTALLER_OVERRIDES``), so a clean run means
+"an installer-equivalent resolve is wheel-clean on this platform," not merely "the
+raw dependency graph is." Run from the repo root.
 
 Why not a uv ``--only-binary`` diff: ``--only-binary=:all:`` also rejects
 pure-Python *sdist-only* packages (e.g. ``asciitree``), which build anywhere
@@ -34,30 +34,51 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-# The set install.sh installs (see install_biopb(): TENSOR_EXTRAS and the *_req
-# vars). Local packages are given as paths so uv reads their real dependency
-# metadata from this checkout rather than from a published release.
-INSTALLER_REQUIREMENTS = [
-    ".[tensor]",
-    "./biopb-tensor-server[web,aics,medical,ndtiff,hdf5]",
-    "./biopb-mcp[mcp]",
-    "napari[all]",
-]
+# The format extras install.sh always installs (see install_biopb(): TENSOR_EXTRAS).
+_BASE_TENSOR_EXTRAS = ["web", "aics", "medical", "ndtiff"]
 
-# Extra constraints install.sh applies for specific platforms. Mirror them here so
+# install.sh adds the Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw)
+# on every platform EXCEPT Intel macOS, where pylibczirw ships no wheel. Mirror that
+# so the check reflects the set install.sh actually installs per target.
+_CZI_UNAVAILABLE_TARGETS = {"x86_64-apple-darwin"}
+
+
+def installer_requirements(target: str) -> list[str]:
+    """The requirement set install.sh installs for ``target``.
+
+    Local packages are given as paths so uv reads their real dependency metadata
+    from this checkout rather than from a published release.
+    """
+    extras = list(_BASE_TENSOR_EXTRAS)
+    if target not in _CZI_UNAVAILABLE_TARGETS:
+        extras.append("czi")
+    return [
+        ".[tensor]",
+        f"./biopb-tensor-server[{','.join(extras)}]",
+        "./biopb-mcp[mcp]",
+        "./biopb-control",
+        "napari[all]",
+    ]
+
+
+# Dependency overrides install.sh applies (on every platform). Mirror them here so
 # a green run reflects the *installer's* resolve, not the unconstrained graph.
-INSTALLER_CONSTRAINTS = {
-    # cryptography >= 49 ships arm64-only macOS wheels; install.sh caps it on Intel
-    # macOS so uv picks 48.x's universal2 wheel. See install.sh + issue #355.
-    "x86_64-apple-darwin": ["cryptography<49"],
-}
+INSTALLER_OVERRIDES = [
+    # install.sh overrides the MCP SDK's unconditional `pyjwt[crypto]` back to plain
+    # `pyjwt`, dropping `cryptography` (arm64-only macOS wheels since 49) and its
+    # cffi/Rust/OpenSSL build surface from the closure entirely. See install.sh +
+    # issue #355 (supersedes the old Intel-mac `cryptography<49` pin).
+    "pyjwt>=2.10.1",
+]
 
 
 def _mac_x86(tag: str) -> bool:
@@ -97,22 +118,36 @@ def resolve(target: str, python_version: str) -> dict[str, str]:
     (path/file) requirements resolve to non-``name==version`` lines and are
     skipped -- they are this repo's own packages, never the wheel-gap risk.
     """
-    reqs = INSTALLER_REQUIREMENTS + INSTALLER_CONSTRAINTS.get(target, [])
-    proc = subprocess.run(
-        [
-            "uv",
-            "pip",
-            "compile",
-            "--python-version",
-            python_version,
-            "--python-platform",
-            target,
-            "-",
-        ],
-        input="\n".join(reqs) + "\n",
-        text=True,
-        capture_output=True,
-    )
+    reqs = installer_requirements(target)
+    # install.sh passes its overrides via `--overrides <file>`; mirror that with a
+    # temp file rather than folding them into the requirement list (an override is
+    # not a plain requirement -- it rewrites another package's dep, e.g. dropping
+    # pyjwt's `crypto` extra, which a bare requirement line cannot do).
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as ov:
+        ov.write("\n".join(INSTALLER_OVERRIDES) + "\n")
+        override_path = ov.name
+    try:
+        proc = subprocess.run(
+            [
+                "uv",
+                "pip",
+                "compile",
+                "--python-version",
+                python_version,
+                "--python-platform",
+                target,
+                "--override",
+                override_path,
+                "-",
+            ],
+            input="\n".join(reqs) + "\n",
+            text=True,
+            capture_output=True,
+        )
+    finally:
+        os.unlink(override_path)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         sys.exit(f"uv pip compile failed for {target}")
@@ -186,6 +221,7 @@ def main() -> None:
                 pool.map(
                     lambda kv: missing_wheel(kv[0], kv[1], compatible), pinned.items()
                 ),
+                strict=True,
             )
             if bad
         ]
@@ -199,8 +235,8 @@ def main() -> None:
             print(f"  - {n}=={v}")
         print(
             "\nThis is the failure mode that breaks `curl install.sh | bash` "
-            "on this platform. Pin/patch it in install.sh (see the "
-            "cryptography<49 precedent) or upstream a wheel."
+            "on this platform. Pin/override it in install.sh (see the pyjwt->drop-"
+            "cryptography override precedent) or upstream a wheel."
         )
         sys.exit(1)
 

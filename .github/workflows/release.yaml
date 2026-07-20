@@ -1,12 +1,11 @@
-# All-in-one product deployment, triggered by a single `release-v*` tag.
-# See docs/release-model.md. Produces, from the tagged commit:
-#   - a GitHub release (wheel triple + mcp sdist + webapp + installers) — the
-#     installer's single source of truth;
-#   - Docker images for biopb-tensor-server and biopb-image-base, each tagged
-#     with ITS OWN package version (+ :latest), published idempotently (skipped
-#     if that version is already in the registry).
-# PyPI is intentionally NOT part of this — biopb/biopb-mcp publish to PyPI on
-# their own v*/mcp-v* tags.
+# Product deployment (the GitHub release bundle), triggered by a single
+# `release-v*` tag. See docs/release-model.md. Produces, from the tagged commit,
+# the GitHub release: wheel set + mcp sdist + webapp + samples + installers — the
+# installer's single source of truth.
+# Docker images are NOT built here: biopb-tensor-server ships on its own
+# `server-v*` tag (tensor-server-ci) and biopb-image-base on the SDK `v*` tag
+# (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI on its
+# own `v*` tag (biopb-mcp is no longer on PyPI; it ships only as the wheel set here).
 name: Release (deployment)
 
 on:
@@ -24,6 +23,57 @@ permissions:
   contents: read
 
 jobs:
+  # Gate: a FINAL release-v* deployment must be cut from a commit that is on
+  # main. Tags are branch-agnostic, so nothing stops `release-v1.2.3` being
+  # pushed onto a dev-forked release branch before it merges — but a final
+  # release moves Docker :latest and ships a non-prerelease GitHub release (the
+  # installer's source of truth), so publishing it off unmerged code is a
+  # mistake. RC/prerelease tags (…rc1/a1/b1) are EXEMPT: by design they are cut
+  # off dev to validate the deployment before it lands on main
+  # (docs/release-model.md). When a final tag points at an off-main commit we
+  # skip the whole run (a noop) rather than publish it. Manual workflow_dispatch
+  # is a dry run that never pushes, so it always proceeds.
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+          fetch-depth: 0  # full history so the on-main ancestry check resolves
+
+      - name: Decide whether to release
+        id: decide
+        run: |
+          set -euo pipefail
+          # Not a release-v* tag ref -- the usual case is a manual
+          # workflow_dispatch from a branch. The downstream deploy steps are
+          # themselves `is_tag`-gated (also keyed on this ref), so a non-tag ref
+          # never pushes: there is nothing to guard, so proceed.
+          if [[ "${GITHUB_REF:-}" != refs/tags/release-v* ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "non-release-tag ref (dry run) -> proceed"
+            exit 0
+          fi
+          REL="${GITHUB_REF#refs/tags/release-v}"
+          # A PEP 440 prerelease (…rc/a/b) is branch-agnostic by design.
+          if [[ ! "$REL" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "prerelease $REL -> proceed (exempt from the on-main check)"
+            exit 0
+          fi
+          # Final release: require the tagged commit to be reachable from main.
+          git fetch --no-tags --quiet origin main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "final release $REL is on main -> proceed"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::final release tag $REL points at a commit not on main; skipping the deployment (noop). Merge the commit to main and re-tag, or cut an rc."
+          fi
+
   # Build the Windows GUI installer (Inno Setup) on a Windows runner and hand it
   # to the release job as an artifact. The installer is an ONLINE bootstrapper
   # (ships only install/biopb-engine.ps1; wheels/napari are fetched at run time),
@@ -31,8 +81,10 @@ jobs:
   # for now: no code-signing cert is provisioned yet, so the .exe trips a
   # SmartScreen "Unknown publisher" warning. Wire up signing later by registering
   # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss
-  # (see docs/windows-installer.md "Code signing").
+  # (see install/docs/windows-installer.md "Code signing").
   windows-installer:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -51,11 +103,32 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_REF:-}" == refs/tags/release-v* ]]; then
             REL="${GITHUB_REF#refs/tags/release-v}"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
           else
             REL="dryrun"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
           echo "release=$REL" >> "$GITHUB_OUTPUT"
           echo "installer version: $REL"
+
+      # Pin the engine baked into the .exe to THIS exact release tag, so the GUI
+      # installer installs its own paired release rather than whatever is newest at
+      # run time. This is a separate job with its own checkout, so it stamps the
+      # engine itself (the release job's "Pin installers to this release" stamps the
+      # copies that job ships). Runs for prereleases too: an rc .exe is attached to
+      # its own rc release, so it must install that rc (an empty pin + default stable
+      # channel would wrongly pull the latest STABLE). Tag builds only; a dry-run
+      # dispatch leaves the placeholder empty (compile check installs latest).
+      - name: Pin engine to this release
+        if: steps.iver.outputs.is_tag == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"   # release-vX.Y.Z[rcN]
+          sed -i "s|^\$script:BiopbPinnedRelease = .*|\$script:BiopbPinnedRelease = '$TAG'|" install/biopb-engine.ps1
+          grep -qE "^\\\$script:BiopbPinnedRelease = 'release-v[0-9]" install/biopb-engine.ps1 \
+            || { echo "::error::biopb-engine.ps1 release pin was not stamped"; exit 1; }
+          echo "pinned bundled engine to $TAG"
 
       # Inno Setup 6.3+ (for the x64os arch identifier the .iss requires).
       - name: Install Inno Setup
@@ -76,12 +149,12 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: windows-installer
+    needs: [guard, windows-installer]
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: write   # create the GitHub release
-      packages: write   # push to ghcr.io
     env:
       # Single source of truth for the sample build's skimage pin: used by BOTH
       # the cache key and the build command below, so they can never drift (a bump
@@ -106,33 +179,36 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
+          # The JS workspace lives in web/; the repo root has no package.json, so
+          # pin pnpm here (matches web/package.json's packageManager).
+          version: 9.12.3
           run_install: false
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # wheels/ feeds the Docker builds (both Dockerfiles COPY
-      # wheels/biopb-*.whl + wheels/biopb_tensor_server-*.whl). release-wheels/
-      # holds the GitHub-release assets (the triple + mcp sdist + webapp).
+      # Build the wheel set the GitHub release ships (the installer file://-installs
+      # these). release-wheels/ holds the GitHub-release assets; biopb-mcp also
+      # ships an sdist.
       - name: Build wheels
         run: |
-          uv build --package biopb --wheel --out-dir wheels
-          uv build --package biopb-tensor-server --wheel --out-dir wheels
+          uv build --package biopb --wheel --out-dir release-wheels
+          uv build --package biopb-tensor-server --wheel --out-dir release-wheels
           uv build --package biopb-mcp --out-dir release-wheels
-          cp wheels/*.whl release-wheels/
+          uv build --package biopb-control --wheel --out-dir release-wheels
 
       - name: Build webapp
         run: |
-          pnpm install --frozen-lockfile
-          pnpm sync-version
-          pnpm --filter @biopb/tensor-flight-client build
-          VITE_TENSOR_API="" pnpm --filter @biopb/web build
-          tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
+          pnpm -C web install --frozen-lockfile
+          pnpm -C web run sync-version
+          pnpm -C web --filter @biopb/tensor-flight-client build
+          # The control front is the single web origin: it serves this bundle at
+          # its root and proxies the data API + WS under /data_plane. Base is "/".
+          VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
+          tar -czf release-wheels/webapp.tar.gz -C web/packages/app dist
 
       # Curated CC0 sample images (docs/release-model.md). A fresh, config-less
       # install seeds these so the product opens onto real microscopy data instead
@@ -143,7 +219,7 @@ jobs:
       # (installer extracts with no strip). The default (lite) set omits the
       # ~250 MB palisades_of_vogt sample.
       #
-      # The bundle is STATIC -- it only changes when tools/build_samples.py (the
+      # The bundle is STATIC -- it only changes when .github/scripts/build_samples.py (the
       # curated set) or the skimage pin change -- so cache it keyed on exactly
       # those inputs. That keeps skimage's third-party pooch fetch OFF the release
       # critical path in the common case (unchanged set -> cache hit -> no build,
@@ -155,21 +231,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: release-wheels/biopb-samples.tar.gz
-          key: samples-${{ hashFiles('tools/build_samples.py') }}-${{ env.SAMPLES_SKIMAGE_PIN }}
+          key: samples-${{ hashFiles('.github/scripts/build_samples.py') }}-${{ env.SAMPLES_SKIMAGE_PIN }}
 
       - name: Build sample dataset
         if: steps.samplecache.outputs.cache-hit != 'true'
         run: |
           set -uo pipefail
           # Retry rides out a transient pooch/skimage blip. On persistent failure
-          # we do NOT abort here -- wheels/webapp/images are the shipped product and
+          # we do NOT abort here -- wheels/webapp are the shipped product and
           # are already built -- we leave the tarball absent and let the
           # "Verify sample bundle" step below fail the run loudly.
           ok=0
           for attempt in 1 2 3; do
             if uv run --no-project \
                  --with "$SAMPLES_SKIMAGE_PIN" --with pooch --with tifffile \
-                 python tools/build_samples.py --out samples; then
+                 python .github/scripts/build_samples.py --out samples; then
               ok=1; break
             fi
             if [ "$attempt" -lt 3 ]; then
@@ -202,19 +278,11 @@ jobs:
             PRERELEASE=true
           fi
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          tver=$(ls wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
+          # The tensor server has its own version line (server-v*), so its wheel
+          # version can differ from REL; read it off the built wheel for the
+          # versions.json manifest rather than assuming it equals REL.
+          tver=$(ls release-wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
-          # When the release commit is NOT also tagged server-v*, setuptools_scm
-          # yields a PEP 440 dev/local version (e.g. 0.4.6.dev6+gf7f1075). The '+'
-          # local segment is legal in a wheel name but ILLEGAL in a Docker
-          # reference ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}), so tagging an image with
-          # it fails the build. Map any out-of-set char to '_' for the Docker tag;
-          # a clean X.Y.Z release is unchanged. The gate's manifest-inspect and the
-          # image tags both use this so they agree on the same reference.
-          tdocker=$(printf '%s' "$tver" | sed -E 's/[^A-Za-z0-9_.-]/_/g')
-          echo "tensor_docker=$tdocker" >> "$GITHUB_OUTPUT"
-          ibver=$(grep -E '^version[[:space:]]*=' biopb-image-runtime/pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "imagebase=$ibver" >> "$GITHUB_OUTPUT"
           # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
           # of truth). Surface it as a release attribute so the installer pins the
           # same napari the wheel was built/tested against (see install/install.sh).
@@ -228,98 +296,19 @@ jobs:
           nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[all\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
           [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
           echo "napari=$nver" >> "$GITHUB_OUTPUT"
-          # versions.json — the installer-readable release-attribute manifest.
+          # versions.json — the installer-readable release-attribute manifest. The
+          # installer reads `napari` (pins the tested Qt binding) and `release`
+          # (the update baseline); `tensor_server` reports the shipped wheel's
+          # version (its own server-v* line). Docker versions are NOT here — the
+          # images ship on their own tags (server-v* / v*), not from this bundle.
           cat > release-wheels/versions.json <<EOF
-          { "release": "$REL", "tensor_server": "$tver", "image_base": "$ibver", "napari": "$nver" }
+          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver" }
           EOF
-          # Docker tag lists. A version-pinned tag always; :latest is moved ONLY
-          # for a clean X.Y.Z release. An rc/a/b prerelease (e.g. cut off `dev`)
-          # publishes its pinned tag but must NOT clobber :latest — same guard the
-          # GitHub release / installer already apply to prereleases.
-          owner="${{ github.repository_owner }}"
-          {
-            echo "tensor_tags<<TAGS_EOF"
-            echo "ghcr.io/$owner/biopb-tensor-server:$tdocker"
-            echo "docker.io/jiyuuchc/biopb-tensor-server:$tdocker"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-tensor-server:latest"
-              echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
-            fi
-            echo "TAGS_EOF"
-            echo "imagebase_tags<<TAGS_EOF"
-            echo "ghcr.io/$owner/biopb-image-base:$ibver"
-            echo "docker.io/jiyuuchc/biopb-image-base:$ibver"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-image-base:latest"
-              echo "docker.io/jiyuuchc/biopb-image-base:latest"
-            fi
-            echo "TAGS_EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "tensor-server=$tver  image-base=$ibver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
-
-      - name: Login to ghcr.io
-        if: steps.ver.outputs.is_tag == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Login to Docker Hub
-        if: steps.ver.outputs.is_tag == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: jiyuuchc
-          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
-
-      # Idempotent publish: on a tag, build+push an image only if its version is
-      # not already in the registry (image-base, being stable, is normally
-      # skipped). On a dry run (workflow_dispatch), always build with --load to
-      # verify, never push.
-      - name: Decide which images to publish
-        id: gate
-        run: |
-          set -euo pipefail
-          owner="${{ github.repository_owner }}"
-          decide() {  # $1=image name  $2=version
-            if [[ "${{ steps.ver.outputs.is_tag }}" != "true" ]]; then echo verify; return; fi
-            if docker manifest inspect "ghcr.io/$owner/$1:$2" >/dev/null 2>&1; then echo skip; else echo push; fi
-          }
-          t=$(decide biopb-tensor-server "${{ steps.ver.outputs.tensor_docker }}")
-          i=$(decide biopb-image-base "${{ steps.ver.outputs.imagebase }}")
-          echo "tensor=$t" >> "$GITHUB_OUTPUT"
-          echo "imagebase=$i" >> "$GITHUB_OUTPUT"
-          echo "tensor-server: $t   image-base: $i"
-
-      - name: tensor-server image
-        if: steps.gate.outputs.tensor != 'skip'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: biopb-tensor-server/Dockerfile
-          push: ${{ steps.gate.outputs.tensor == 'push' }}
-          load: ${{ steps.gate.outputs.tensor == 'verify' }}
-          build-args: |
-            MEMORY=4g
-          tags: ${{ steps.ver.outputs.tensor_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: image-base image
-        if: steps.gate.outputs.imagebase != 'skip'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: biopb-image-runtime/Dockerfile
-          push: ${{ steps.gate.outputs.imagebase == 'push' }}
-          load: ${{ steps.gate.outputs.imagebase == 'verify' }}
-          tags: ${{ steps.ver.outputs.imagebase_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          echo "tensor-server=$tver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
-      # now (no cert yet — see docs/windows-installer.md).
+      # now (no cert yet — see install/docs/windows-installer.md).
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
@@ -327,7 +316,7 @@ jobs:
           path: release-wheels
 
       # One digest file over every attached binary asset. The installers verify
-      # the wheel triple against it before file://-installing (issue #87 trust
+      # the wheel set against it before file://-installing (issue #87 trust
       # item); a future release-signing step would sign this file. Bare basenames
       # (cd into the dir) so the lines match the names the installer sees on disk.
       - name: Checksums (SHA256SUMS)
@@ -337,10 +326,43 @@ jobs:
           sha256sum *.whl *.tar.gz versions.json biopb-setup-*.exe > SHA256SUMS
           cat SHA256SUMS
 
+      # Bake this release's identity into the installers so EVERY copy that ships
+      # below -- the GitHub-release assets AND the biopb.org publish -- installs the
+      # exact release it came from, not "whatever is newest at run time". Runs for
+      # ANY release-v* tag (stable OR rc): a copy downloaded from an rc release must
+      # install that rc. (Only the biopb.org *rsync* is later gated to stable, since
+      # that canonical URL tracks the latest stable release.) install.ps1 fetches
+      # the engine from biopb.org at run time, so it can't self-contain a release;
+      # instead its stamp makes it ask that engine for this exact release via
+      # BIOPB_INSTALL_VERSION. The grep guards + bash -n fail the run if a
+      # placeholder was renamed, so an unpinned installer can never silently ship.
+      #
+      # Placed AFTER the wheel build on purpose: editing the tree earlier would make
+      # setuptools_scm see a dirty checkout and stamp the wheels with a +dirty local
+      # version. SHA256SUMS (above) does not cover the install scripts, so stamping
+      # them here does not invalidate it.
+      - name: Pin installers to this release
+        if: steps.ver.outputs.is_tag == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"   # release-vX.Y.Z[rcN]
+          sed -i "s|^BIOPB_PINNED_RELEASE=.*|BIOPB_PINNED_RELEASE=\"$TAG\"|" install/install.sh
+          sed -i "s|^\$script:BiopbPinnedRelease = .*|\$script:BiopbPinnedRelease = '$TAG'|" \
+            install/install.ps1 install/biopb-engine.ps1
+          grep -qE '^BIOPB_PINNED_RELEASE="release-v[0-9]' install/install.sh \
+            || { echo "::error::install.sh release pin was not stamped"; exit 1; }
+          for f in install/install.ps1 install/biopb-engine.ps1; do
+            grep -qE "^\\\$script:BiopbPinnedRelease = 'release-v[0-9]" "$f" \
+              || { echo "::error::$f release pin was not stamped"; exit 1; }
+          done
+          bash -n install/install.sh   # the stamped copy must still parse
+          echo "pinned installers to $TAG"
+
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
-      # uploaded. Installer scripts come from the repo-root install/ (the
-      # canonical copy users track — see docs/release-model.md).
+      # uploaded. Installer scripts come from the repo-root install/ (the canonical
+      # copy users track — see docs/release-model.md), now pinned to this release
+      # by the step above.
       - name: Create GitHub release
         if: steps.ver.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v2
@@ -356,6 +378,7 @@ jobs:
             release-wheels/biopb-setup-*.exe
             install/install.sh
             install/install.ps1
+            install/biopb-engine.ps1
           body: |
             ## biopb deployment ${{ github.ref_name }}
 
@@ -367,28 +390,64 @@ jobs:
             ```
 
             ### Assets
-            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
-              version-paired wheel triple (installer `file://`-installs these)
+            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
+              `biopb_control-*.whl` — the version-paired wheel set (installer
+              `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
             - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install
               seeds so the viewer opens onto real data (see `LICENSES.txt` inside)
             - `versions.json` — release manifest (pins `napari`; carries the
               `release` version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
-              the wheel triple against it before installing
-            - `install.sh` / `install.ps1` — bootstrap installers
+              the wheel set against it before installing
+            - `install.sh` / `install.ps1` — bootstrap installers, pinned to this
+              release; `biopb-engine.ps1` — the Windows install engine `install.ps1`
+              fetches (so a lone `install.ps1` installs exactly this release)
             - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
               will warn "Unknown publisher" until a signing cert is provisioned)
 
             ### Docker
-            - `ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}`
-            - `ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}`
+            The Docker images ship on their own tags, not from this release:
+            `biopb-tensor-server` on `server-v*` (tensor-server-ci) and
+            `biopb-image-base` on the SDK `v*` tag (image-runtime-ci).
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+      # Publish the canonical bootstrap install scripts to biopb.org, PAIRED WITH
+      # this release. Folded in here (was a standalone push-to-main workflow,
+      # install-scripts.yaml) so it runs ONLY after "Create GitHub release" above
+      # succeeds -- a failed release can no longer leave a live installer at
+      # biopb.org that is newer than any release it can install. Gated to a STABLE
+      # release: `is_tag` skips dry runs, `!prerelease` keeps the canonical URL on
+      # the latest stable release (install.sh defaults to stable; BIOPB_INSTALL_RC=1
+      # opts into candidates on demand). The guard job already blocks an off-main
+      # final tag, so no on-main recheck is needed here. Served from a reserved
+      # /install/ subtree that biopb-site's deploy excludes from its --delete
+      # (mirrors api-docs.yaml's /docs/api/). The scripts were already pinned and
+      # parse-checked by "Pin installers to this release" above (same job, same
+      # tree, nothing touches install/ in between), so this step just mirrors them.
+      - name: Publish install scripts to biopb.org
+        if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
+        run: |
+          set -euo pipefail
+          # Stage exactly the three served scripts, then mirror with --delete so
+          # the reserved /install/ subtree holds only these (and drops any file
+          # renamed/removed upstream) -- mirrors api-docs.yaml.
+          mkdir -p _install_publish
+          cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
+
+          mkdir -p ~/.ssh
+          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/id_ed25519 jyu@biopb.org 'mkdir -p /var/www/biopb.org/install'
+          rsync -avz --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/
+
       # Feedback gate for the sample bundle. The build above fails SOFT so a flaky
-      # third-party fetch never blocks shipping the real product (wheels/webapp/
-      # images), and the release publishes above regardless. But a MISSING bundle
+      # third-party fetch never blocks shipping the real product (wheels/webapp),
+      # and the release publishes above regardless. But a MISSING bundle
       # means every fresh install lands on an empty viewer, so make it loud rather
       # than a swallowed ::warning:: nobody reads on a green run: fail the run here
       # (GitHub emails the run's actor and the tag shows a red check) AFTER the
@@ -397,7 +456,7 @@ jobs:
       - name: Verify sample bundle present
         run: |
           if [ ! -f release-wheels/biopb-samples.tar.gz ]; then
-            echo "::error::Release built WITHOUT biopb-samples.tar.gz -- fresh installs will land on an empty folder. If a release published, cut a follow-up once this is green: re-run for a transient skimage/pooch outage, or fix tools/build_samples.py."
+            echo "::error::Release built WITHOUT biopb-samples.tar.gz -- fresh installs will land on an empty folder. If a release published, cut a follow-up once this is green: re-run for a transient skimage/pooch outage, or fix .github/scripts/build_samples.py."
             exit 1
           fi
           echo "sample bundle present: $(ls -l release-wheels/biopb-samples.tar.gz)"

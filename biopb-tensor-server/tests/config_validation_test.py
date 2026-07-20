@@ -9,8 +9,8 @@ later on the request path. Enforcement lives in each dataclass's
 import logging
 
 import pytest
-from biopb_tensor_server import config as cfg
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core import config as cfg
+from biopb_tensor_server.core.config import (
     CacheConfig,
     MetadataDbConfig,
     PrecacheConfig,
@@ -300,3 +300,55 @@ def test_valid_config_does_not_warn_unknown(caplog):
             }
         )
     assert not _unknown(caplog)
+
+
+# --- defaults are owned solely by the dataclasses (biopb/biopb#277 item A) ----
+
+
+def _scalar_fields(cls):
+    import dataclasses
+
+    inst = cls()
+    for f in dataclasses.fields(cls):
+        if f.name.startswith("_"):
+            continue
+        value = getattr(inst, f.name)
+        if dataclasses.is_dataclass(value) or isinstance(value, list):
+            continue  # nested section / list, not a scalar default
+        yield f.name
+
+
+def test_empty_config_reproduces_dataclass_defaults():
+    """An empty config must construct every scalar exactly as the dataclass
+    default. If parse_config re-hardcoded a default that drifted from the
+    dataclass, this diverges -- so no default is written in two places."""
+    parsed = parse_config({})
+    for section_obj, defaults in (
+        (parsed, ServerConfig()),
+        (parsed.cache, CacheConfig()),
+        (parsed.pyramid, PyramidConfig()),
+        (parsed.precache, PrecacheConfig()),
+        (parsed.metadata_db, MetadataDbConfig()),
+    ):
+        for name in _scalar_fields(type(defaults)):
+            assert getattr(section_obj, name) == getattr(defaults, name), (
+                f"{type(defaults).__name__}.{name}: parse_config({{}}) gave "
+                f"{getattr(section_obj, name)!r}, dataclass default is "
+                f"{getattr(defaults, name)!r}"
+            )
+
+
+def test_present_keys_override_defaults_only_where_set():
+    """A partial config carries only the keys it sets; the rest fall through to
+    the dataclass defaults (including the on-disk MB->bytes alias)."""
+    default_cache = CacheConfig()
+    cfgobj = parse_config(
+        {
+            "server": {"port": 9000},
+            "cache": {"file_max_segment_mb": 32},
+        }
+    )
+    assert cfgobj.port == 9000
+    assert cfgobj.host == ServerConfig().host  # untouched -> default
+    assert cfgobj.cache.file_max_segment_bytes == 32 * 1024 * 1024
+    assert cfgobj.cache.memory_max_bytes == default_cache.memory_max_bytes

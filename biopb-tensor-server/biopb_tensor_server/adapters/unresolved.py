@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter, to_catalog_url
-from biopb_tensor_server.errors import (
+from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter, to_catalog_url
+from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
 )
@@ -42,8 +42,8 @@ from biopb_tensor_server.errors import (
 if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import AdapterRegistry
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import AdapterRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,22 @@ class UnresolvedSourceAdapter(SourceAdapter):
                 tensor_id = descriptors[0].array_id
         return self._resolved.get_tensor_adapter(tensor_id)
 
+    # --- lifecycle -----------------------------------------------------------
+
+    def close(self) -> None:
+        """Release the resolved adapter's handles (biopb/biopb#71).
+
+        This proxy delegates six methods to ``self._resolved``; ``close`` was the
+        omitted seventh, so cleanup silently skipped exactly the resolved cloud
+        OME-TIFF / QPTIFF sources whose ``close()`` already works. Unresolved is
+        a no-op; safe to call twice.
+        """
+        with self._lock:
+            resolved = self._resolved
+            self._resolved = None
+        if resolved is not None:
+            resolved.close()
+
     # --- resolution (the consented hook) ------------------------------------
 
     def resolve(self) -> DataSourceDescriptor:
@@ -208,8 +224,8 @@ class UnresolvedSourceAdapter(SourceAdapter):
         A fresh DiscoveryState is used so consumed_paths from the original scan
         do not suppress this source's own member claims.
         """
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         resolved_type = self._source_type
         dim_labels = self._config.dim_labels

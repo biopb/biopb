@@ -30,23 +30,31 @@ curl -fsSL https://biopb.org/install.sh | bash
 
 ## Deploy to data server
 ```bash
-docker run -d --rm \
+docker run -d --rm --init \
     --name biopb-tensor \
-    -p 8814:8814 -p 8815:8815 \
+    -p 8813:8813 -p 8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
     jiyuuchc/biopb-tensor-server:latest
 ```
 
-See [deploy.md](deploy.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
+The container runs the **control plane** as its single web origin: open
+`http://localhost:8813` for the dashboard, with the data viewer at
+`http://localhost:8813/viewer`. The
+Arrow Flight gRPC endpoint stays on `:8815` for SDK clients. The HTTP sidecar
+(`:8814`) is now internal to the container and is not published. `--init` gives
+the container a reaping init as PID 1 — optional, since the control plane (PID 1)
+handles `docker stop` and reaps its own child, but it cleans up any stray orphans.
+
+See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
 ## Security
 
 - Token-based authentication on both gRPC and HTTP for browser access
 - Transport is **unencrypted** by default! Only deploy on trusted intranet!
 - If BIOPB_TENSOR_TOKEN is not given, the server generates a random token that can be viewed with `docker logs biopb-tensor`
-- Dev mode (`--dev` flag or `BIOPB_WEB_DEV_BYPASS=1`) disables token enforcement!
-- Bind to localhost-only `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
+- **Local mode** (loopback `server.host`, the default) enforces no token — the single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
+- Bind to localhost-only `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
 
 ## Configuration
 
@@ -63,7 +71,7 @@ You can create custom config file to fine-tune server behavior, e.g.,specifying 
   "sources": [
     { "url": "/data" },
     {
-      "source_id": "my-zarr",
+      "alias": "my-zarr",
       "type": "zarr",
       "url": "/experiment.zarr",
       "dim_labels": ["z", "y", "x"]
@@ -78,7 +86,7 @@ discovery; a specific source like `my-zarr` lets you override its metadata.
 To use your custom configuration:
 
 ```bash
-docker run -d -p 8814:8814 -p 8815:8815 \
+docker run -d -p 8813:8813 -p 8815:8815 \
     -v ~/biopb.json:/custom.json \
     -v ~/data:/data \
     -v ~/experiment.zarr:/experiment.zarr \
@@ -103,7 +111,7 @@ Directory monitoring uses a claim-based discovery protocol with periodic rescans
 
 ### Requirements
 
-- Python >= 3.8
+- Python >= 3.10, < 3.13
 - pyarrow >= 14.0.0
 - Node.js / pnpm (for web app and TS client)
 
@@ -122,11 +130,11 @@ pip install -e "biopb-tensor-server/[web,aics,ome-zarr,medical]"
 ### Launch
 
 ```bash
-# Interactive launch with auto-generated token
+# Local mode (loopback server.host — no token required)
 biopb-tensor-server launch --config biopb.json
 
-# Dev mode (localhost, no token required)
-biopb-tensor-server launch --config biopb.json --dev
+# Remote mode (public server.host — token required, auto-generated if omitted)
+biopb-tensor-server launch --config biopb.json --token mytoken...
 
 # gRPC only (no web sidecar)
 biopb-tensor-server serve --config biopb.json
@@ -134,18 +142,22 @@ biopb-tensor-server serve --config biopb.json
 
 ### Web App
 
-The React web viewer is served directly by the FastAPI server. Build it before running the server:
+The browser UI is one Vite + React SPA in the top-level `web/` workspace (not the
+FastAPI sidecar, which is API-only). Build it before running the server:
 
 ```bash
-# Production build (output → packages/web/dist/)
-pnpm --filter @biopb/web build
+# Production build (output → web/packages/app/dist/)
+pnpm -C web install && pnpm -C web build
 ```
 
-The webapp files are copied into the Docker image and served at the HTTP port (8814). On first load you will be prompted for the access token printed by the `launch` command.
+The bundle is copied into the Docker image and served by the **control plane**,
+the single web origin (`:8813`): the dashboard at `/` and the data viewer at
+`/viewer`. On first load you will be prompted for the access token (printed in
+the container logs, or set via `BIOPB_TENSOR_TOKEN`).
 
 For development with hot reload, run the dev server separately:
 ```bash
-pnpm --filter @biopb/web dev   # runs on :5173
+pnpm -C web dev   # runs on :5173, proxies to a live control on :8813
 ```
 
 ### CLI Reference
@@ -154,7 +166,7 @@ pnpm --filter @biopb/web dev   # runs on :5173
 biopb-tensor-server serve    Start the gRPC Flight server only
 biopb-tensor-server launch   Start Flight server + HTTP sidecar for web
 biopb-tensor-server validate Check a config file (JSON; legacy TOML)
-biopb-tensor-server list     List all data sources and tensors in a config
+biopb-tensor-server list-tensors  List all data sources and tensors in a config
 biopb-tensor-server version  Show version information
 ```
 
@@ -165,9 +177,7 @@ biopb-tensor-server version  Show version information
 | `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
 | `--web-port` | 8814 | HTTP server port |
 | `--web-host` | 127.0.0.1 | HTTP server bind address |
-| `--static-dir` | (none) | Directory with static webapp files (API-only if unset) |
-| `--token` | (prompt/auto) | Website access token |
-| `--dev` | false | Skip token check (localhost only) |
+| `--token` | (auto) | Website access token (remote mode; auto-generated if omitted) |
 | `--open` | false | Open browser after startup |
 | `--web-url` | http://localhost:5173 | Base URL of web app (CORS + --open) |
 | `--cors` | (derived from --web-url) | Extra CORS origins (repeatable) |
@@ -193,8 +203,9 @@ client = TensorFlightClient("grpc://localhost:8815", token="your-token")
 # List available sources
 sources = client.list_sources()
 
-# Get a lazy array for a specific tensor
-arr = client.get_tensor("my-zarr", tensor_id="0", scale_hint=[1, 2, 2])
+# Get a lazy array for a specific tensor (by its globally-unique array_id:
+# "source_id/field" for a multi-tensor source, or "source_id" for a single one)
+arr = client.get_tensor("my-zarr/0", scale_hint=[1, 2, 2])
 
 # Obtain a slice (lazy, chunks fetched on demand)
 data = arr[5, :, :]
@@ -218,7 +229,7 @@ pip install -e ".[test]"
 pytest
 
 # http/web tests
-cd packages/tensor-flight-client
+cd web/packages/tensor-flight-client
 pnpm test
 ```
 

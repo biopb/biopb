@@ -21,13 +21,14 @@ Design notes
   :func:`install`) routes a job thread's prints into that job's buffer instead
   of the kernel's iopub stream — keeping worker output out of iopub and away
   from the main-thread ``<<JOB_JSON>>`` reply line.
-* **Cancellation is cooperative.** :func:`cancel` sets a per-job event that job
-  code may poll via ``cancelled()``; when a distributed dask client is active
-  (the default kernel-local ``LocalCluster``) it *also* cancels the client's
-  in-flight futures — the only mid-``compute()`` stop short of
-  ``restart_kernel``.  The in-process ``threads`` / ``synchronous`` schedulers
-  have no futures to cancel, so a running ``compute()`` under them can only be
-  stopped by ``restart_kernel``.
+* **Stopping a job.** :func:`interrupt_current` force-stops the running job: it
+  raises ``KeyboardInterrupt`` into the worker thread and, when a distributed dask
+  client is active (the kernel's ``Client`` attached to the session child's
+  ``LocalCluster``), :func:`_cancel` *also* cancels the client's in-flight futures
+  — the only mid-``compute()`` stop short of ``restart_kernel``.  The in-process
+  ``threads`` / ``synchronous`` schedulers have no futures to cancel, so a running
+  ``compute()`` under them is stopped by the raised ``KeyboardInterrupt`` once it
+  returns to Python bytecode, or by ``restart_kernel``.
 """
 
 import ast
@@ -70,7 +71,6 @@ class _Job:
         "stdout",
         "result_text",
         "error_text",
-        "cancel_event",
         "cancel_reason",
         "interrupted",
         "thread",
@@ -84,15 +84,14 @@ class _Job:
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
         self.code = code
-        # running | ok | error | cancelled | interrupted
+        # running | ok | error | interrupted
         self.status = "running"
         self.stdout = io.StringIO()
         self.result_text = ""
         self.error_text = ""
-        self.cancel_event = threading.Event()
         # Set by interrupt_current(): the job was force-stopped with a
-        # KeyboardInterrupt raised into its thread (vs. a plain cooperative
-        # cancel). Distinguished so the UI/agent can tell the two stops apart.
+        # KeyboardInterrupt raised into its thread, so its finalizer labels the
+        # stop "interrupted" rather than a generic "error".
         self.interrupted = False
         # Human-readable reason a *user* acted on this job (cancel/interrupt via
         # the observe web UI). Threaded into the finalized error_text so the
@@ -216,16 +215,6 @@ def run_on_main(fn, *args, **kwargs):
         caller.deleteLater()
 
 
-def cancelled():
-    """True if the current job thread has been asked to cancel.
-
-    Bound into the kernel namespace so job code can cooperatively check it
-    (e.g. ``if cancelled(): break``).  Returns False off a job thread.
-    """
-    job = _jobs_by_thread.get(threading.get_ident())
-    return bool(job is not None and job.cancel_event.is_set())
-
-
 # -- execution --------------------------------------------------------------
 
 
@@ -254,25 +243,18 @@ def _run(job, code):
     finally:
         _jobs_by_thread.pop(threading.get_ident(), None)
         job.finished = time.monotonic()
-        # interrupted (forced KeyboardInterrupt) is distinct from a plain
-        # cooperative cancel; check it first since interrupt_current sets the
-        # cancel flag too.
+        # A user-triggered interrupt raises KeyboardInterrupt into the thread,
+        # surfacing here as exc; interrupt_current flags it so the stop is
+        # labeled "interrupted" rather than a generic "error".
         if job.interrupted:
             job.status = "interrupted"
-        elif job.cancel_event.is_set():
-            job.status = "cancelled"
         else:
             job.status = "error" if exc else "ok"
-        # Surface a user-attributed stop (cancel/interrupt via the observe web
-        # UI) to the agent: prefix error_text with the reason so poll_job /
-        # execute_code render it. A cancel that left no traceback gets the
-        # reason as its whole error_text; an interrupt's KeyboardInterrupt
-        # traceback is annotated with who triggered it.
-        if job.cancel_reason and job.status in (
-            "cancelled",
-            "error",
-            "interrupted",
-        ):
+        # Surface a user-attributed stop (interrupt via the observe web UI) to
+        # the agent: prefix error_text with the reason so poll_job /
+        # execute_code render it. The interrupt's KeyboardInterrupt traceback is
+        # annotated with who triggered it.
+        if job.cancel_reason and job.status in ("error", "interrupted"):
             job.error_text = (
                 job.cancel_reason
                 if not job.error_text
@@ -323,17 +305,17 @@ def poll(job_id):
     return job.snapshot()
 
 
-def cancel(job_id, reason=None):
+def _cancel(job_id, reason=None):
     job = _jobs.get(job_id)
     if job is None:
         return {"job_id": job_id, "cancelled": False, "status": "unknown"}
     if job.status != "running":
         return {"job_id": job_id, "cancelled": False, "status": job.status}
-    # Set the reason before the event: the job only unwinds after observing the
-    # event / future-cancel, so its finalizer is guaranteed to see the reason.
+    # Set the reason before cancelling futures: the job only unwinds after the
+    # future-cancel makes its gather raise, so its finalizer is guaranteed to
+    # see the reason.
     if reason:
         job.cancel_reason = reason
-    job.cancel_event.set()
     # Distributed dask: cancel in-flight futures.  This is what actually stops a
     # blocking ``.compute()`` -- its tasks ARE registered in ``dc.futures`` for
     # the duration of the internal ``gather``, so cancelling them makes that
@@ -387,10 +369,9 @@ def interrupt_current(reason=None):
     raised directly into the job's worker thread.
 
     ``SIGINT`` can't do this — Python delivers signals only to the kernel main
-    thread, while the job runs in a background worker — so an uncooperative
-    pure-Python loop (one that never checks :func:`cancelled`) would otherwise be
-    stoppable only by ``restart_kernel``. This first runs the cooperative
-    :func:`cancel` (flag, attribution reason, in-flight dask-future cancel), then
+    thread, while the job runs in a background worker — so a pure-Python loop
+    would otherwise be stoppable only by ``restart_kernel``. This first runs
+    :func:`_cancel` (attribution reason + in-flight dask-future cancel), then
     forces the worker thread via :func:`_raise_in_thread`. The exception lands at
     the next bytecode, so a blocking C call ends when it returns. ``{"interrupted":
     False, "status": "idle"}`` when the kernel is idle.
@@ -398,8 +379,8 @@ def interrupt_current(reason=None):
     job = _running_job()
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
-    job.interrupted = True  # finalize as "interrupted", not "cancelled"
-    cancel(job.job_id, reason=reason)
+    job.interrupted = True  # finalize as "interrupted"
+    _cancel(job.job_id, reason=reason)
     ident = job.thread.ident if job.thread is not None else None
     raised = _raise_in_thread(ident, KeyboardInterrupt)
     return {"job_id": job.job_id, "interrupted": bool(raised)}

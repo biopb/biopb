@@ -220,6 +220,15 @@ class CacheBackend(ABC):
     def close(self) -> None:
         """Close backend and release resources."""
 
+    def release_process_lock(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
+        """Release the cross-process cache lock (+ WAL) without closing handles.
+
+        The graceful-shutdown fast path (biopb/biopb#300): release the lock
+        *first*, cheaply and upstream-independently, while segment writers/mmaps
+        stay open for any still-draining reads. Backends with no process lock
+        (memory) inherit this no-op default; the file backend overrides it.
+        """
+
 
 def get_or_compute_with_context(
     backend: CacheBackend,

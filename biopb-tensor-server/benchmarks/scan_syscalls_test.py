@@ -5,7 +5,7 @@ is that each filesystem entry costs ~20-30 metadata syscalls per forced rescan,
 spread across the two walks the rescan runs back to back, and that most of those
 syscalls are redundant:
 
-- the **state walk** ``SourceManager._scan_tree_state`` — captures a stat-signature
+- the **state walk** ``TreeScanner._scan_tree_state`` — captures a stat-signature
   per entry for change/stability tracking;
 - the **claim walk** — asks the adapters to claim each stable entry. Post-#56 item 4
   this no longer re-walks the filesystem: ``discover_sources_from_entries`` drives the
@@ -59,20 +59,20 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     discover_sources_from_entries,
 )
-from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.sources.source_manager import SourceManager
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
 
 # Same tree "scale" knobs as discovery_scan_test.py so the two benchmarks describe
 # the *same* tree from different angles (probe count there, syscall count here).
 SCALES = {
-    "small": dict(wells=8, fields=2, shape=(512, 512), chunks=(64, 64)),
-    "medium": dict(wells=24, fields=4, shape=(512, 512), chunks=(32, 32)),
-    "large": dict(wells=48, fields=4, shape=(1024, 1024), chunks=(32, 32)),
+    "small": {"wells": 8, "fields": 2, "shape": (512, 512), "chunks": (64, 64)},
+    "medium": {"wells": 24, "fields": 4, "shape": (512, 512), "chunks": (32, 32)},
+    "large": {"wells": 48, "fields": 4, "shape": (1024, 1024), "chunks": (32, 32)},
 }
 
 
@@ -162,8 +162,8 @@ class _SyscallCounter:
         import builtins
         import pathlib
 
-        import biopb_tensor_server.discovery as discovery
-        import biopb_tensor_server.source_manager as source_manager
+        import biopb_tensor_server.core.discovery as discovery
+        import biopb_tensor_server.sources.tree_scanner as tree_scanner
 
         c = self.counts
 
@@ -214,7 +214,7 @@ class _SyscallCounter:
         # --- logical get_file_identity (now reuses the caller's stat; #56) ---
         # Both walks call it, but each module that does `from ... import
         # get_file_identity` holds its own binding, so patch every such module —
-        # patching only discovery would miss the state walk's calls (source_manager).
+        # patching only discovery would miss the state walk's calls (tree_scanner).
         # Accept the optional stat_result arg #56 added.
         orig_identity = discovery.get_file_identity
 
@@ -222,7 +222,7 @@ class _SyscallCounter:
             c["logical_get_file_identity"] += 1
             return orig_identity(path, *args, **kwargs)
 
-        for mod in (discovery, source_manager):
+        for mod in (discovery, tree_scanner):
             self._saved[(mod.__name__, "get_file_identity")] = mod.get_file_identity
             mod.get_file_identity = identity_wrapper
 
@@ -234,7 +234,7 @@ class _SyscallCounter:
             os.scandir = self._saved[("os", "scandir")]
             builtins.open = self._saved[("builtins", "open")]
             pathlib.Path.resolve = self._saved[("Path", "resolve")]
-            for mod in (discovery, source_manager):
+            for mod in (discovery, tree_scanner):
                 mod.get_file_identity = self._saved[(mod.__name__, "get_file_identity")]
 
     @property
@@ -250,7 +250,7 @@ def _make_manager(root: Path) -> SourceManager:
     discovery gate on the first pass (so the claim walk actually probes the whole
     tree); ``probe_open_files=True`` exercises the per-file append probe (#56 item 5);
     ``full_rescan_interval=0`` forces the full sweep. ``server=None`` is safe: the two
-    measured methods (``_refresh_entry_state`` and the snapshot-driven claim phase)
+    measured methods (``TreeScanner.scan`` and the snapshot-driven claim phase)
     never touch it — only reconcile/registration would, and we don't run that here.
     """
     return SourceManager(
@@ -267,20 +267,28 @@ def _make_manager(root: Path) -> SourceManager:
 
 
 def _run_state_walk(manager: SourceManager) -> None:
-    """Phase 1: the stat-signature sweep. publish=True so the claim walk's
-    ``_should_scan_resolved`` gate sees the freshly captured entry state."""
-    manager._refresh_entry_state(force_full=True, publish=True)
+    """Phase 1: the stat-signature sweep. Publish the snapshot into the manager's
+    live caches so the claim walk's ``_should_scan_resolved`` gate sees it."""
+    snapshot = manager._scanner.scan(
+        monitored_dirs=manager._monitored_dirs,
+        cloud_roots=manager._cloud_roots,
+        force_full=True,
+        prev_entry_states=manager._entry_states,
+        prev_cloud_entry_states=manager._cloud_entry_states,
+    )
+    manager._entry_states = snapshot.entry_states
+    manager._skipped_stable_dirs = snapshot.skipped_dirs
 
 
 def _run_claim_walk(manager: SourceManager, root: Path):
     """Phase 2: adapter discovery driven from the state walk's published snapshot —
     exactly how ``_handle_rescan`` drives it post-#56 item 4 (no second filesystem
-    walk). ``_run_state_walk`` published ``_entry_state``/``_skipped_stable_dirs``, so
-    this consumes them just like the runtime rescan does."""
+    walk). ``_run_state_walk`` published ``_entry_states``/``_skipped_stable_dirs``,
+    so this consumes them just like the runtime rescan does."""
     return discover_sources_from_entries(
         (
-            (path_str, entry[0], entry[1])
-            for path_str, entry in manager._entry_state.items()
+            (path_str, entry.is_directory, entry.signature)
+            for path_str, entry in manager._entry_states.items()
         ),
         manager._registry,
         path_filter=manager._should_scan_resolved,
@@ -434,17 +442,17 @@ class TestSyscallBaseline:
 
         # Persist the baseline; this — not an assertion — is the deliverable.
         out_path = _write_baseline(
-            dict(
-                scale=scale,
-                interior_files=n_files,
-                sources=n_sources,
-                state_walk_syscalls=state_c.total_syscalls,
-                claim_walk_syscalls=claim_c.total_syscalls,
-                total_syscalls=total,
-                syscalls_per_entry=round(per_entry, 2),
-                state_walk_breakdown=dict(state_c.counts),
-                claim_walk_breakdown=dict(claim_c.counts),
-            )
+            {
+                "scale": scale,
+                "interior_files": n_files,
+                "sources": n_sources,
+                "state_walk_syscalls": state_c.total_syscalls,
+                "claim_walk_syscalls": claim_c.total_syscalls,
+                "total_syscalls": total,
+                "syscalls_per_entry": round(per_entry, 2),
+                "state_walk_breakdown": dict(state_c.counts),
+                "claim_walk_breakdown": dict(claim_c.counts),
+            }
         )
         print(f"--> wrote {out_path}")
 

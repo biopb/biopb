@@ -111,8 +111,8 @@ def _get_path_parts(url: str) -> List[str]:
     also avoids netloc/port misparsing of a basename like ``exp:2.zarr``.
 
     Mirror of the web viewer's ``getPathParts`` in
-    ``biopb-tensor-server/packages/web/src/components/SourceTree.tsx`` — keep the
-    two behaviorally in lockstep.
+    ``web/packages/app/src/components/SourceTree.tsx`` — keep the two
+    behaviorally in lockstep.
     """
     if not url:
         return []
@@ -338,9 +338,7 @@ def _is_onedrive_dir_name(name: str) -> bool:
     a runtime dependency of this widget.
     """
     low = name.lower()
-    return (
-        low == "onedrive" or low.startswith("onedrive -") or low.startswith("onedrive-")
-    )
+    return low == "onedrive" or low.startswith(("onedrive -", "onedrive-"))
 
 
 def _cloud_drop_warning(path: str) -> str | None:
@@ -915,7 +913,7 @@ class TensorBrowserWidget(QWidget):
         # Compact connection summary row: a single clickable line showing the
         # server + state ("server_url — connected") with a trailing disclosure
         # caret. Clicking it toggles the advanced connection controls
-        # (URL/token/Connect/Refresh). Those controls are touched once at setup;
+        # (token/Connect/Refresh). Those controls are touched once at setup;
         # day-to-day the user only needs to see *that* they are connected, so
         # they are collapsed by default. The caret + pointing-hand cursor are the
         # affordance that the line is expandable (biopb/biopb-mcp).
@@ -929,20 +927,14 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._status_summary)
 
         # Advanced connection panel — hidden until the summary line is clicked.
-        # Holds the server URL, token, and Connect/Refresh controls.
+        # Holds the token and Connect/Refresh controls. The data-plane URL is NOT
+        # user-editable: the control (control plane) owns the data plane and is the
+        # single source of truth for its endpoint (#413), so the URL is resolved at
+        # connect time, not typed here. The summary line shows the resolved URL.
         self._advanced_panel = QWidget()
         adv_layout = QVBoxLayout(self._advanced_panel)
         adv_layout.setContentsMargins(0, 0, 0, 0)
         adv_layout.setSpacing(4)
-
-        # Server URL input (label and input on same row)
-        server_layout = QHBoxLayout()
-        server_layout.addWidget(QLabel("Server:"))
-        self._server_input = QLineEdit()
-        self._server_input.setText(self._conn.url)
-        self._server_input.setPlaceholderText("Flight server URL")
-        server_layout.addWidget(self._server_input)
-        adv_layout.addLayout(server_layout)
 
         # Token input (label, input, and toggle on same row)
         token_layout = QHBoxLayout()
@@ -1000,6 +992,13 @@ class TensorBrowserWidget(QWidget):
         _header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
+        # Column 0 stretches to the viewport and row text elides (ElideRight is
+        # the QTreeView default), so a horizontal scrollbar is never needed. Pin
+        # it off: left ScrollBarAsNeeded, its show/hide toggles as the widest
+        # row's text crosses the viewport width, and on non-overlay-scrollbar
+        # platforms (Windows) the bar steals viewport height -- shifting every
+        # row vertically on an otherwise-unchanged refresh (biopb/biopb#367).
+        self._tree_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._show_context_menu)
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
@@ -1051,8 +1050,11 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._message_label)
 
     def _on_connect_clicked(self, *args):
-        """Connect button handler: retarget to the typed URL/token, connect."""
-        self._conn.url = self._server_input.text().strip()
+        """Connect button handler: (re)connect, picking up the typed token.
+
+        The data-plane URL is not typed here (#413) -- ``auto_connect`` resolves
+        it from the control -- so this only refreshes the token and reconnects.
+        """
         self._conn.token = self._token_input.text().strip() or None
         self._start_connect()
 
@@ -1164,7 +1166,7 @@ class TensorBrowserWidget(QWidget):
         connected without expanding the advanced panel. The caret signals that
         the line is clickable to reveal the connection settings.
         """
-        # The URL is user-supplied (Server field / config); it is embedded in a
+        # The URL is control-derived / config fallback (#413); it is embedded in a
         # rich-text QLabel, so escape it or a '&'/'<' would corrupt the markup.
         url = html.escape(self._conn.url or "(no server)")
         if self._connecting:
@@ -1604,6 +1606,9 @@ class TensorBrowserWidget(QWidget):
 
         if node.node_type == "folder":
             item.setText(0, node.name)
+            # The horizontal scrollbar is pinned off (biopb/biopb#367), so a long
+            # or deeply-indented label that elides is only readable on hover.
+            item.setToolTip(0, node.name)
             for child in node.children:
                 self._add_tree_node(item, child)
         else:
@@ -1621,17 +1626,25 @@ class TensorBrowserWidget(QWidget):
 
             # Residency indicator: flag non-resident (remote/dehydrated) sources
             # with a leading cloud glyph and greyed text; resident sources stay
-            # plain. Both known states get an explanatory tooltip; an unknown
-            # state (old server) is left unmarked.
+            # plain. Both known states get an explanatory note; an unknown state
+            # (old server) is left unmarked.
             residency = _residency_state(src)
+            residency_note = None
             if residency == "remote":
                 display_name = f"{_RESIDENCY_GLYPH} {display_name}"
                 item.setForeground(0, QColor("#888"))
-                item.setToolTip(0, _REMOTE_TOOLTIP)
+                residency_note = _REMOTE_TOOLTIP
             elif residency == "resident":
-                item.setToolTip(0, _RESIDENT_TOOLTIP)
+                residency_note = _RESIDENT_TOOLTIP
 
             item.setText(0, display_name)
+            # The horizontal scrollbar is pinned off (biopb/biopb#367), so the
+            # full label -- which elides when it outgrows the panel -- is only
+            # readable on hover; carry the residency note on a second line.
+            item.setToolTip(
+                0,
+                f"{display_name}\n{residency_note}" if residency_note else display_name,
+            )
 
             # Add nested tensor items for multi-tensor sources
             if len(src.tensors) > 1:
@@ -1747,9 +1760,11 @@ class TensorBrowserWidget(QWidget):
                     == self._selected_tensor_id
                 ):
                     target_tensor = item
-            elif node_type == "source":
-                if item.data(0, Qt.ItemDataRole.UserRole) == self._selected_source_id:
-                    target_source = item
+            elif (
+                node_type == "source"
+                and item.data(0, Qt.ItemDataRole.UserRole) == self._selected_source_id
+            ):
+                target_source = item
             for i in range(item.childCount()):
                 find_recursive(item.child(i))
 

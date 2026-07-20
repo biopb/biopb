@@ -3,23 +3,28 @@
 Handles .nii and .nii.gz files using nibabel.
 """
 
-import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
 
 
-class NiftiAdapter(SourceAdapter, TensorAdapter):
+# NIfTI ``xyzt_units`` spatial code (low 3 bits) -> a canonical unit string.
+# 0 (unknown) is intentionally absent: an uncalibrated pixdim still carries a
+# meaningful relative voxel size, reported with an empty unit.
+_NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
+
+
+class NiftiAdapter(TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
     Uses nibabel for lazy loading and header parsing.
@@ -49,7 +54,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             return None
 
         name = ctx.name.lower()
-        if not (name.endswith(".nii") or name.endswith(".nii.gz")):
+        if not name.endswith((".nii", ".nii.gz")):
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -101,11 +106,11 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
             fs.get_file(fs_path, str(tmp_path))
 
-            # Load NIfTI from temp file
+            # Load NIfTI from temp file. nibabel reads lazily off this path, so
+            # the download must outlive the call -- close() unlinks it when the
+            # source is unregistered (biopb/biopb#71); until then it is a real
+            # disk cost the size of the remote volume.
             nifti_img = nib.load(str(tmp_path))
-
-            # Note: temp file is NOT deleted - nibabel caches data internally
-            # The OS will clean up temp files eventually
 
             return cls(
                 nifti_img,
@@ -144,7 +149,6 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         self.nifti_img = nifti_img
         self.source_id = source_id
         self.header = nifti_img.header
-        self._io_lock = threading.Lock()
         self._temp_file = temp_file  # Track temp file for potential cleanup
 
         # Source-level metadata for DataSourceDescriptor
@@ -211,10 +215,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             else:
                 labels = ["t", "x", "y"]
         elif ndim == 4:
-            if time_unit >= 8:
-                labels = ["t", "x", "y", "z"]
-            else:
-                labels = ["c", "x", "y", "z"]
+            labels = ["t", "x", "y", "z"] if time_unit >= 8 else ["c", "x", "y", "z"]
         elif ndim == 5:
             # Could be vector/tensor data
             labels = ["v", "t", "x", "y", "z"]
@@ -249,16 +250,90 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
         Raises:
             ValueError: If bounds exceed array shape
+            RuntimeError: If the source has been closed.
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
+        # Take the image reference once, then check it: close() races a read only
+        # by nulling this attribute, and the read of a reference is atomic under
+        # the GIL, so a local ref is either the image or None -- never torn. That
+        # makes read-after-close the RuntimeError below (matching NdTiffAdapter)
+        # instead of a racy AttributeError on None, with no lock: nibabel is
+        # thread-safe on the decode, so serializing here would only cost parallel
+        # do_get chunk reads of one source.
+        #
+        # Residual, deliberately not closed: close() can unlink the temp file
+        # after this line but before nibabel lazily opens the path, surfacing as
+        # an OSError. Closing it needs an in-flight-read drain (see
+        # OmeTiffAdapter.close), which is not worth the machinery for a race that
+        # requires unregistering a remote source mid-read.
+        img = self.nifti_img
+        if img is None:
+            raise RuntimeError(f"NIfTI source {self.source_id!r} is closed")
         # nibabel dataobj lazy slicing applies slope/intercept scaling.
-        # nibabel handles thread safety internally, so no io_lock needed.
-        dataobj = self.nifti_img.dataobj
+        dataobj = img.dataobj
         result = dataobj[slices]
         # Cast to float64 defensively (in case no scaling is applied)
         return np.asanyarray(result, dtype=np.float64)
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim voxel size + unit from the header's ``pixdim`` / ``xyzt_units``.
+
+        NIfTI fixes ``pixdim`` by storage axis, independent of ``dim_labels``:
+        ``pixdim[1:4]`` are always the spatial X / Y / Z voxel sizes, ``pixdim[4]``
+        the time step (TR), ``pixdim[5:]`` further non-spatial axes. This adapter's
+        ``dim_labels`` are NOT guaranteed to be in storage order -- auto-derivation
+        puts the non-spatial axis first for 4D/5D (e.g. ``["t", "x", "y", "z"]``)
+        -- so the spatial sizes are consumed *in order* as the spatial labels
+        appear (``pixdim[1]`` -> the first ``x``, ``pixdim[2]`` -> ``y``,
+        ``pixdim[3]`` -> ``z``), not by ``dim_labels`` position. Indexing
+        ``pixdim`` by position would shift by the number of leading non-spatial
+        axes and misread the TR (or a 5th axis) as a spatial length on any file
+        whose spatial labels are not at the front. Non-spatial axes (t / c / v)
+        get ``0.0`` / ``""``. Returns ``None`` when no spatial axis carries a
+        positive size.
+        """
+        try:
+            pixdim = self.header.get("pixdim", None)
+            if pixdim is None:
+                return None
+            pixdim = list(pixdim)
+
+            units = self.header.get("xyzt_units", 0)
+            if isinstance(units, np.ndarray):
+                units = units.item()
+            unit_str = _NIFTI_SPATIAL_UNIT.get(int(units) & 0x07, "")
+
+            # pixdim[1:4] are the storage-fixed X/Y/Z spacings; walk them in order
+            # as the spatial labels appear, so a leading non-spatial axis doesn't
+            # shift the spatial sizes onto the wrong pixdim entry (or read the TR
+            # at pixdim[4] as a length). spatial_idx advances only on x/y/z.
+            spatial_idx = 1
+            scale: List[float] = []
+            unit: List[str] = []
+            for label in self.dim_labels:
+                v = 0.0
+                if str(label).lower() in ("x", "y", "z") and spatial_idx < len(pixdim):
+                    try:
+                        v = float(pixdim[spatial_idx])
+                    except (TypeError, ValueError):
+                        v = 0.0
+                    spatial_idx += 1
+                if v > 0:
+                    scale.append(v)
+                    unit.append(unit_str)
+                else:
+                    scale.append(0.0)
+                    unit.append("")
+            if not any(scale):
+                return None
+            return scale, unit
+        except Exception:
+            return None
 
     def get_metadata(self) -> dict:
         """Extract NIfTI header metadata.
@@ -374,3 +449,37 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         )
 
         return metadata
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def close(self) -> None:
+        """Delete the downloaded temp file backing a remote source.
+
+        Local sources hold nothing (nibabel keeps no fd or mapping); a remote one
+        is served out of a ``NamedTemporaryFile(delete=False)`` that nothing ever
+        removed, so every remote NIfTI leaked its own size onto disk until reboot
+        (biopb/biopb#71).
+
+        Takes no lock, deliberately: ``__del__`` calls this, and the repo's rule
+        is that a finalizer never acquires one (see ``OmeTiffAdapter.close``).
+        Nothing needs one either -- the writes below are single-reference
+        assignments, ``unlink(missing_ok=True)`` tolerates the double-unlink of
+        two concurrent closers, and ``get_data`` reads the reference atomically.
+        Safe to call twice, and concurrently.
+        """
+        temp_file = getattr(self, "_temp_file", None)
+        self._temp_file = None
+        self.nifti_img = None
+        if temp_file is not None:
+            try:
+                Path(temp_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def __del__(self):
+        # GC backstop: an adapter dropped without an explicit close() (e.g. a
+        # failed registration) must not strand its download.
+        try:
+            self.close()
+        except Exception:
+            pass

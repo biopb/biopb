@@ -18,21 +18,22 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.adapters._scale import mm_summary_scale
+from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from ndtiff import NDTiffDataset
 
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.remote import RemoteStore
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.core.remote import RemoteStore
 
 
 # =============================================================================
@@ -114,12 +115,19 @@ class RemoteNdTiffFileIO:
         return self._store.isdir(path)
 
 
+def _close_dataset(dataset) -> None:
+    """Close an NDTiffDataset if it offers close(). Tolerates a test double."""
+    close = getattr(dataset, "close", None)
+    if callable(close):
+        close()
+
+
 # =============================================================================
 # NdTiffAdapter - Adapter for NDTiff storage format
 # =============================================================================
 
 
-class NdTiffAdapter(SourceAdapter, TensorAdapter):
+class NdTiffAdapter(TensorAdapter):
     """Adapter for Micro-Manager NDTiff storage format.
 
     Single-tensor source exposing full 5D/6D array.
@@ -189,7 +197,7 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
 
         if source.is_remote:
             # Remote storage: create RemoteStore and wrap with RemoteNdTiffFileIO
-            from biopb_tensor_server.remote import RemoteStore
+            from biopb_tensor_server.core.remote import RemoteStore
 
             store = RemoteStore.from_config(
                 url=source.url,
@@ -300,10 +308,25 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
             Numpy array with data within the requested bounds
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         with self._io_lock:
+            if self._dask_arr is None:
+                raise RuntimeError(f"NDTiff source {self.source_id!r} is closed")
             return self._dask_arr[slices].compute()
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (µm) from the MicroManager summary metadata.
+
+        ``PixelSize_um`` (isotropic X/Y) and the z-step, projected onto the
+        ``x`` / ``y`` / ``z`` axes; position / time / channel axes get
+        ``0.0`` / ``""``. Reads the same summary dict :meth:`get_metadata`
+        returns.
+        """
+        return mm_summary_scale(self.get_metadata(), self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Return dataset summary metadata.
@@ -322,3 +345,35 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
             elif isinstance(meta, dict):
                 return meta
         return {}
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def close(self) -> None:
+        """Close the dataset's per-file readers (biopb/biopb#71).
+
+        ``NDTiffDataset.__init__`` eagerly opens *every* ``NDTiffStack_*.tif`` in
+        the acquisition, so one registered source pins as many fds as the
+        acquisition has files -- routinely hundreds, which on Windows makes the
+        whole folder undeletable. Upstream's ``close()`` closes every reader; the
+        dask array must go first because its graph holds the dataset.
+
+        The handles stay persistent between reads rather than being reopened per
+        read (unlike hdf5/mrc): the reopen unit here is the *whole* acquisition,
+        so a per-read reopen would open thousands of files to serve one plane.
+        """
+        with self._io_lock:
+            self._dask_arr = None
+            dataset = self._dataset
+            self._dataset = None
+        _close_dataset(dataset)
+
+    def __del__(self):
+        # GC backstop: release the fds even without an explicit close(). No lock
+        # -- nothing references the adapter, so no read can be in flight.
+        try:
+            dataset = getattr(self, "_dataset", None)
+            self._dask_arr = None
+            self._dataset = None
+            _close_dataset(dataset)
+        except Exception:
+            pass

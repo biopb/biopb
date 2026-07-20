@@ -1,12 +1,13 @@
-"""Tests for the stdio bridge ("shim") to the http daemon.
+"""Tests for the stdio bridge ("shim") to its owned http session child.
 
-Unit tests cover the daemon-activation logic (probe / spawn / timeout), the
+Unit tests cover the session-spawn logic (dynamic-port handoff, env
+inheritance, startup/timeout), the port-report file parsing, the reap, the
 faithful initialize replay (the `instructions` field above all — losing it is
 the defect that disqualified delegating to mcp-proxy), and the request
 forwarding of the vendored proxy. One end-to-end test runs the real thing:
-``biopb-mcp --transport stdio`` as a subprocess, which must spawn the http
-daemon, bridge a full JSON-RPC session, and leave the daemon running after
-the client hangs up.
+``biopb-mcp --transport stdio`` as a subprocess, which must spawn its own http
+session child, bridge a full JSON-RPC session, and — the shim-owned session model —
+**reap** that child when the client hangs up (the shared daemon used to survive).
 """
 
 import json
@@ -16,9 +17,12 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 
 import anyio
 import pytest
+from biopb import _sessions
+from biopb._lifecycle.owned_child import OwnedChild
 from mcp import types
 
 from biopb_mcp.mcp import _shim
@@ -31,7 +35,35 @@ def _free_port():
 
 
 def _cfg(**transport):
-    return {"mcp": {"transport": transport}}
+    return {"transport": transport}
+
+
+# A stand-in session child: reads its port-report file from the env, binds a
+# dynamic port, publishes it atomically (temp + os.replace, as the real child
+# does), then accepts connections so the readiness probe succeeds. It must
+# accept, not merely listen(): the probe opens a fresh TCP connection on every
+# poll, and an un-drained backlog makes a later probe fail on macOS's stricter
+# socket stack (the real uvicorn child accepts, so this is a fixture artifact).
+_FAKE_CHILD = (
+    "import os, socket, sys, threading, time\n"
+    "pf = os.environ['BIOPB_PORT_REPORT_FILE']\n"
+    "s = socket.socket()\n"
+    "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+    "s.bind(('127.0.0.1', 0))\n"
+    "port = s.getsockname()[1]\n"
+    "tmp = pf + '.tmp'\n"
+    "open(tmp, 'w').write(str(port))\n"
+    "os.replace(tmp, pf)\n"
+    "s.listen(16)\n"
+    "def _serve():\n"
+    "    while True:\n"
+    "        try:\n"
+    "            conn, _ = s.accept(); conn.close()\n"
+    "        except OSError:\n"
+    "            break\n"
+    "threading.Thread(target=_serve, daemon=True).start()\n"
+    "time.sleep(30)\n"
+)
 
 
 class TestPortListening:
@@ -45,116 +77,303 @@ class TestPortListening:
         assert _shim._port_listening(_free_port()) is False
 
 
-class TestDaemonCommand:
-    def test_module_reentry_when_not_frozen(self):
-        cmd = _shim._daemon_command(8765)
+class TestSessionCommand:
+    def test_module_reentry_binds_dynamic_port(self):
+        cmd = _shim._session_command()
         assert cmd[:3] == [sys.executable, "-m", "biopb_mcp.mcp"]
-        assert cmd[3:] == ["--transport", "http", "--port", "8765"]
+        # Dynamic port: the child reports the OS-assigned one back via a file.
+        assert cmd[3:] == ["--transport", "http", "--port", "0"]
 
     def test_frozen_build_calls_its_own_binary(self, monkeypatch):
         # PyInstaller: sys.executable IS the launcher; no module tree to -m.
         monkeypatch.setattr(sys, "frozen", True, raising=False)
-        cmd = _shim._daemon_command(8765)
-        assert cmd == [sys.executable, "--transport", "http", "--port", "8765"]
+        cmd = _shim._session_command()
+        assert cmd == [sys.executable, "--transport", "http", "--port", "0"]
 
 
-class TestOpenDaemonLog:
-    def test_uses_configured_path(self, tmp_path):
-        path = tmp_path / "d.log"
-        f = _shim._open_daemon_log(_cfg(kernel_log=str(path)))
-        try:
-            f.write(b"hello\n")
-        finally:
-            f.close()
-        assert path.read_bytes() == b"hello\n"
+class TestReadPortFile:
+    def test_valid_port(self, tmp_path):
+        p = tmp_path / "port.txt"
+        p.write_text("8899")
+        assert _shim._read_port_file(str(p)) == 8899
 
-    def test_empty_path_defaults_under_log_dir(self, tmp_path, monkeypatch):
+    def test_missing_file(self, tmp_path):
+        assert _shim._read_port_file(str(tmp_path / "nope.txt")) is None
+
+    def test_empty_file_not_yet_reported(self, tmp_path):
+        p = tmp_path / "port.txt"
+        p.write_text("")
+        assert _shim._read_port_file(str(p)) is None
+
+    def test_garbage_is_none(self, tmp_path):
+        p = tmp_path / "port.txt"
+        p.write_text("not-a-port")
+        assert _shim._read_port_file(str(p)) is None
+
+    def test_nonpositive_is_none(self, tmp_path):
+        p = tmp_path / "port.txt"
+        p.write_text("0")
+        assert _shim._read_port_file(str(p)) is None
+
+
+class TestSessionLogPath:
+    def test_default_is_per_session_under_sessions_dir(self, tmp_path, monkeypatch):
         import biopb_mcp._config as cfg
 
         monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
-        f = _shim._open_daemon_log(_cfg(kernel_log=""))
-        try:
-            assert (tmp_path / "mcp-server.log").exists()
-        finally:
-            f.close()
+        p = _shim._session_log_path(_cfg(), "20260101-000000-42")
+        assert p == str(tmp_path / "sessions" / "20260101-000000-42.log")
 
-    def test_falls_back_to_stderr_on_open_error(self):
-        f = _shim._open_daemon_log(
-            _cfg(kernel_log="/nonexistent_dir/deep/path/kernel.log")
-        )
-        assert f is getattr(sys.stderr, "buffer", sys.stderr)
+    def test_kernel_log_override_forces_single_file(self, tmp_path):
+        override = tmp_path / "one.log"
+        p = _shim._session_log_path(_cfg(kernel_log=str(override)), "sid")
+        assert p == str(override)
 
 
-class TestEnsureDaemon:
-    def test_no_spawn_when_already_listening(self, monkeypatch):
-        def _no_spawn(*a, **k):
-            raise AssertionError("must not spawn when the port is served")
+class TestPruneSessionLogs:
+    def test_keeps_newest_n_by_mtime(self, tmp_path, monkeypatch):
+        import biopb_mcp._config as cfg
 
-        monkeypatch.setattr(_shim.subprocess, "Popen", _no_spawn)
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            s.listen(1)
-            assert _shim.ensure_daemon({}, s.getsockname()[1]) is False
+        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        for i in range(7):
+            p = sessions / f"s{i}.log"
+            p.write_text("x")
+            os.utime(p, (1000 + i, 1000 + i))  # ascending mtime: s6 newest
+        _shim._prune_session_logs(3)
+        assert sorted(q.name for q in sessions.glob("*.log")) == [
+            "s4.log",
+            "s5.log",
+            "s6.log",
+        ]
 
-    def test_spawns_and_waits_until_listening(self, tmp_path, monkeypatch):
-        port = _free_port()
-        # Stand-in daemon: sleeps briefly (simulating import time), then binds
-        # and *accepts* connections. It must accept, not merely listen(): the
-        # readiness probe opens a fresh TCP connection on every poll, and an
-        # un-drained accept backlog makes a later probe fail on macOS's stricter
-        # socket stack (the real uvicorn daemon accepts, so this is a fixture
-        # artifact, not a production bug).
-        script = (
-            "import socket, sys, threading, time\n"
-            "time.sleep(1)\n"
-            "s = socket.socket()\n"
-            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-            "s.bind(('127.0.0.1', int(sys.argv[1])))\n"
-            "s.listen(16)\n"
-            "def _serve():\n"
-            "    while True:\n"
-            "        try:\n"
-            "            conn, _ = s.accept()\n"
-            "            conn.close()\n"
-            "        except OSError:\n"
-            "            break\n"
-            "threading.Thread(target=_serve, daemon=True).start()\n"
-            "time.sleep(30)\n"
-        )
+    def test_missing_dir_is_noop(self, tmp_path, monkeypatch):
+        import biopb_mcp._config as cfg
+
+        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path / "nope")
+        _shim._prune_session_logs(5)  # must not raise
+
+
+class TestSpawnSession:
+    def test_reports_port_and_waits_until_listening(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            _shim,
-            "_daemon_command",
-            lambda p: [sys.executable, "-c", script, str(p)],
+            _shim, "_session_command", lambda: [sys.executable, "-c", _FAKE_CHILD]
         )
-        # Track the detached child by handle so we reap it deterministically
-        # (no pattern-matching / pkill).
-        spawned = []
-        real_popen = _shim.subprocess.Popen
-
-        def _tracking_popen(*args, **kwargs):
-            proc = real_popen(*args, **kwargs)
-            spawned.append(proc)
-            return proc
-
-        monkeypatch.setattr(_shim.subprocess, "Popen", _tracking_popen)
         cfg = _cfg(kernel_log=str(tmp_path / "d.log"))
+        child, url, session_id = _shim.spawn_session(cfg, timeout=15)
         try:
-            assert _shim.ensure_daemon(cfg, port, timeout=15) is True
+            m = re.match(r"http://127\.0\.0\.1:(\d+)/mcp$", url)
+            assert m, url
+            port = int(m.group(1))
             assert _shim._port_listening(port) is True
+            assert child.poll() is None  # still running while we bridge
+            if os.name == "nt":
+                assert child.job is not None  # Windows: a kill-on-close Job Object
+            else:
+                assert child.job is None  # POSIX: reaped via the group, not a job
+            # Self-registered so the control can discover + proxy to it.
+            rec = _sessions.read_session(session_id)
+            assert rec is not None
+            assert rec["port"] == port and rec["pid"] == child.pid
+            assert rec["mcp_url"] == url
         finally:
-            for proc in spawned:
-                proc.kill()
+            _shim._reap_session(child, session_id)
+        assert child.poll() is not None  # reaped on the way out
+        # Reap de-registers, so the record is gone.
+        assert _sessions.read_session(session_id) is None
 
-    def test_timeout_when_daemon_dies_on_boot(self, tmp_path, monkeypatch):
-        port = _free_port()
+    def test_inherits_live_env_and_wires_dynamic_port(self, tmp_path, monkeypatch):
+        # The #98 fix: the child inherits THIS shim's current environment, so a
+        # live DISPLAY flows through instead of a value frozen into a daemon.
+        monkeypatch.setenv("DISPLAY", ":test-99")
+        captured = {}
+
+        class _FakeProc:
+            pid = 4242
+            returncode = None
+
+            def poll(self):
+                return None
+
+        def _fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            # Stand in for the child publishing its port.
+            with open(kwargs["env"]["BIOPB_PORT_REPORT_FILE"], "w") as f:
+                f.write("54321")
+            return _FakeProc()
+
+        from biopb._lifecycle import owned_child
+
+        monkeypatch.setattr(owned_child.subprocess, "Popen", _fake_popen)
+        monkeypatch.setattr(_shim, "_await_listening", lambda *a, **k: None)
+
+        child, url, session_id = _shim.spawn_session(
+            _cfg(kernel_log=str(tmp_path / "d.log")), timeout=5
+        )
+        assert url == "http://127.0.0.1:54321/mcp"
+        assert captured["env"]["DISPLAY"] == ":test-99"
+        assert captured["env"]["BIOPB_PORT_REPORT_FILE"]  # port channel wired
+        # session log path handed to the child (here the kernel_log override).
+        assert captured["env"]["BIOPB_MCP_SESSION_LOG"] == str(tmp_path / "d.log")
+        assert captured["cmd"][-2:] == ["--port", "0"]  # dynamic port
+
+    def test_raises_when_child_dies_before_reporting(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             _shim,
-            "_daemon_command",
-            lambda p: [sys.executable, "-c", "raise SystemExit(1)"],
+            "_session_command",
+            lambda: [sys.executable, "-c", "raise SystemExit(3)"],
         )
         cfg = _cfg(kernel_log=str(tmp_path / "d.log"))
-        with pytest.raises(TimeoutError, match="daemon log"):
-            _shim.ensure_daemon(cfg, port, timeout=1)
+        with pytest.raises(RuntimeError, match="before reporting its port"):
+            _shim.spawn_session(cfg, timeout=5)
+
+
+class TestReapSession:
+    def test_reaps_running_child(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        assert proc.poll() is None
+        _shim._reap_session(OwnedChild.adopt(proc))
+        assert proc.poll() is not None
+
+    def test_idempotent_on_dead_child(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        # Both calls must be no-op-safe on an already-dead child.
+        child = OwnedChild.adopt(proc)
+        _shim._reap_session(child)
+        _shim._reap_session(child)
+        assert proc.poll() is not None
+
+
+class _FakeProc:
+    """psutil.Process stand-in for the ancestor-walk: a cmdline + a parent link."""
+
+    def __init__(self, cmdline, parent=None):
+        self._cmdline = cmdline
+        self._parent = parent
+
+    def cmdline(self):
+        return self._cmdline
+
+    def parent(self):
+        return self._parent
+
+    @property
+    def pid(self):
+        return 4242
+
+
+def _fake_psutil(me):
+    import types as _types
+
+    mod = _types.SimpleNamespace(Process=lambda *a, **k: me)
+    return mod
+
+
+class TestFindClientProcess:
+    """The ancestor walk that skips our own launcher stubs to reach the real
+    client -- the fix's crux (``getppid()`` is the stub, not the client, on a
+    venv built atop Store Python, where the stub outlives the client)."""
+
+    def test_walks_past_our_launcher_chain_to_client(self, monkeypatch):
+        # serve (us) -> venv launcher stub -> the client (claude). Both of our
+        # processes carry the shim argv (biopb + stdio); the client carries none.
+        client = _FakeProc([r"C:\claude.exe", "mcp"])
+        stub = _FakeProc(
+            [r"C:\.venv\python.exe", "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+            parent=client,
+        )
+        me = _FakeProc(
+            [r"python3.10.exe", "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+            parent=stub,
+        )
+        monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
+        assert _shim._find_client_process() is client
+
+    def test_none_when_chain_reaches_top(self, monkeypatch):
+        # If every ancestor still looks like ours (no foreign client found), do
+        # not guess -- return None so the watchdog does not arm.
+        stub = _FakeProc(["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"])
+        me = _FakeProc(
+            ["python", "-m", "biopb_mcp.mcp", "--transport", "stdio"], parent=stub
+        )
+        monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
+        assert _shim._find_client_process() is None
+
+    def test_none_on_unreadable_ancestor(self, monkeypatch):
+        class _Boom:
+            def cmdline(self):
+                raise RuntimeError("access denied")
+
+            def parent(self):
+                return None
+
+        me = _FakeProc(["python", "-m", "biopb_mcp.mcp", "stdio"], parent=_Boom())
+        monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(me))
+        assert _shim._find_client_process() is None
+
+
+class TestClientDeathWatchdog:
+    """The Windows gap-filler: reap the owned session when the stdio client dies
+    without the bridge seeing stdin EOF (a surviving client helper holding the
+    stdin write handle). The reap/exit decision is tested OS-independently by
+    driving ``_client_deathwatch`` directly; arming is Windows-only."""
+
+    def test_installer_is_noop_off_windows(self):
+        if os.name == "nt":
+            pytest.skip("Windows arms a real watchdog thread")
+        assert _shim._install_client_death_watchdog(object(), "sid") is None
+
+    def test_not_armed_when_client_unidentifiable(self, monkeypatch):
+        monkeypatch.setattr(_shim, "_is_windows", lambda: True)
+        monkeypatch.setattr(_shim, "_find_client_process", lambda: None)
+        assert _shim._install_client_death_watchdog(object(), "sid") is None
+
+    def test_not_armed_when_client_handle_unopenable(self, monkeypatch):
+        # A client we found but cannot open (returns None) must not arm --
+        # never reap a live session off a baseline we could not establish.
+        monkeypatch.setattr(_shim, "_is_windows", lambda: True)
+        monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
+        monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: None)
+        assert _shim._install_client_death_watchdog(object(), "sid") is None
+
+    def test_arms_thread_when_client_found_and_openable(self, monkeypatch):
+        import threading
+
+        monkeypatch.setattr(_shim, "_is_windows", lambda: True)
+        monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
+        monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: "HANDLE")
+        monkeypatch.setattr(_shim, "_client_deathwatch", lambda *a, **k: None)
+        t = _shim._install_client_death_watchdog(object(), "sid")
+        assert isinstance(t, threading.Thread)
+        t.join(timeout=5)
+
+    def test_reaps_and_exits_when_client_exits(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: True)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda c, s=None: events.append(("reap", s))
+        )
+        monkeypatch.setattr(
+            _shim.os, "_exit", lambda code: events.append(("exit", code))
+        )
+        _shim._client_deathwatch("HANDLE", 4242, object(), "sid")
+        # The client's exit must both reap (de-registering the session) and exit.
+        assert events == [("reap", "sid"), ("exit", 0)]
+
+    def test_does_not_reap_on_wait_error(self, monkeypatch):
+        # An undecided wait (error / not-signalled) must NOT tear down a session
+        # that may still be live -- the other teardown paths remain the backstop.
+        events = []
+        monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: False)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda *a, **k: events.append("reap")
+        )
+        monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append("exit"))
+        _shim._client_deathwatch("HANDLE", 4242, object(), "sid")
+        assert events == []
 
 
 class _FakeRemote:
@@ -219,9 +438,9 @@ class TestBuildProxy:
 
 class TestReplayInitOptions:
     def test_instructions_and_identity_survive(self):
-        # The whole point of vendoring the bridge: nothing from the daemon's
+        # The whole point of vendoring the bridge: nothing from the child's
         # initialize result may be dropped on the floor (mcp-proxy loses
-        # `instructions`; docs/mcp-proxy-vet.md finding 2).
+        # `instructions`).
         init = types.InitializeResult(
             protocolVersion="2025-03-26",
             capabilities=types.ServerCapabilities(
@@ -237,33 +456,95 @@ class TestReplayInitOptions:
         assert opts.capabilities is init.capabilities
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX process management in the test"
-)
-class TestEndToEnd:
-    """The real thing: shim subprocess spawns the daemon and bridges stdio."""
+# --------------------------------------------------------------------------- #
+# End-to-end: platform-aware helpers
+#
+# The shim and its owned child use real OS process management, which differs by
+# platform. biopb_mcp resolves every dir under ``Path.home()`` (``os.path.
+# expanduser('~')``), which reads ``HOME`` on POSIX and ``USERPROFILE`` (then
+# ``HOMEDRIVE``+``HOMEPATH``) on Windows — so isolation sets the right var. And
+# liveness must not perturb the child: ``os.kill(pid, 0)`` is a probe on POSIX
+# but on Windows *any* signal other than CTRL_* is an unconditional
+# TerminateProcess, so Windows checks liveness with ``psutil`` instead. These
+# helpers let one e2e cover all three OSes rather than skipping Windows (where
+# the reap is the very thing #403 was about).
+# --------------------------------------------------------------------------- #
+def _home_env(tmp_path):
+    """Env that redirects ``Path.home()`` to ``tmp_path`` (isolates config/log/pid)."""
+    env = os.environ.copy()
+    home = str(tmp_path)
+    if os.name == "nt":
+        env["USERPROFILE"] = home
+        drive, tail = os.path.splitdrive(home)
+        env["HOMEDRIVE"], env["HOMEPATH"] = drive, tail
+    else:
+        env["HOME"] = home
+    # The XDG base dirs override HOME in _locations; drop any inherited
+    # values so the HOME-based defaults (state/config/data under tmp_path) apply.
+    for var in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        env.pop(var, None)
+    return env
 
-    def test_full_session_and_daemon_survival(self, tmp_path):
-        port = _free_port()
-        env = os.environ.copy()
-        env["HOME"] = str(tmp_path)  # isolate config + log dirs
+
+def _pid_alive(pid):
+    """Whether ``pid`` names a live process — WITHOUT killing or perturbing it."""
+    if os.name == "nt":
+        import psutil  # a biopb-mcp[mcp] dep; only needed on the Windows leg
+
+        return psutil.pid_exists(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours
+
+
+def _await_dead(pid, timeout):
+    """Poll until ``pid`` is gone (reaping is asynchronous to the shim's exit)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"owned child {pid} still alive after {timeout:.0f}s")
+
+
+def _force_kill(pid):
+    """Best-effort teardown of a still-running child (SIGKILL / TerminateProcess)."""
+    try:
+        if os.name == "nt":
+            import psutil
+
+            psutil.Process(pid).kill()
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def _extract(pattern, text, what):
+    m = re.search(pattern, text)
+    assert m, f"could not find {what} in daemon log:\n{text[-2000:]}"
+    return m.group(1)
+
+
+class TestEndToEnd:
+    """The real thing (all OSes): the shim spawns its OWN session child, bridges
+    a full stdio session, and reaps that child when the client disconnects."""
+
+    def test_session_is_private_and_reaped_on_disconnect(self, tmp_path):
+        env = _home_env(tmp_path)  # isolate config + log dirs, per platform
 
         shim = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "biopb_mcp.mcp",
-                "--transport",
-                "stdio",
-                "--port",
-                str(port),
-            ],
+            [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
         )
-        daemon_pid = None
+        child_pid = None
         try:
 
             def send(obj):
@@ -292,31 +573,105 @@ class TestEndToEnd:
             tools = json.loads(shim.stdout.readline())["result"]["tools"]
             assert {"start_kernel", "execute_code"} <= {t["name"] for t in tools}
 
-            # Client hangs up; the shim must exit promptly and cleanly...
-            shim.stdin.close()
-            assert shim.wait(timeout=15) == 0
-
-            # ...while the daemon survives (uvicorn logs its pid to the
-            # daemon log, which the spawned-detached daemon writes under the
-            # isolated HOME).
-            log = (
-                (tmp_path / ".local/share/biopb-mcp/log/mcp-server.log")
-                .read_bytes()
-                .decode(errors="replace")
+            # The owned child logs its PID (uvicorn's "Started server process
+            # [pid]") and its dynamic listen URL (_server.run) to its own
+            # per-session logfile under log/sessions/ (NOT the shared
+            # mcp-server.log — that separation is the session-log feature).
+            sessions_dir = tmp_path / ".local/state/biopb/mcp/sessions"
+            session_logs = list(sessions_dir.glob("*.log"))
+            assert len(session_logs) == 1, session_logs
+            log = session_logs[0].read_bytes().decode(errors="replace")
+            child_pid = int(
+                _extract(r"Started server process \[(\d+)\]", log, "child pid")
             )
-            daemon_pid = int(
-                re.search(r"Started server process \[(\d+)\]", log).group(1)
-            )
+            port = int(_extract(r"http://127\.0\.0\.1:(\d+)/mcp", log, "listen port"))
+            assert _pid_alive(child_pid)  # up now
             assert _shim._port_listening(port) is True
-            os.kill(daemon_pid, 0)  # alive
+
+            # Self-registered for control discovery while up (the shared biopb
+            # data tree, isolated here via HOME).
+            reg_dir = tmp_path / ".local/state/biopb/sessions"
+            records = list(reg_dir.glob("*.json"))
+            assert len(records) == 1, records
+            rec = json.loads(records[0].read_text())
+            # The record carries the session's port and the pid the shim owns and
+            # reaps (spawn_session registers proc.pid). On POSIX that equals the
+            # uvicorn pid the log reports (child_pid); on Windows a Store-Python/uv
+            # launcher shim sits between them, so proc.pid is the launcher, not the
+            # inner child_pid. Assert the record is live and routable rather than
+            # pid-equal to the inner process.
+            assert rec["port"] == port
+            assert isinstance(rec["pid"], int) and _pid_alive(rec["pid"])
+
+            # Client hangs up: the shim must exit AND reap its private child
+            # (the shared daemon used to survive — that is exactly what changed).
+            shim.stdin.close()
+            assert shim.wait(timeout=40) == 0
+            _await_dead(child_pid, timeout=20)
+            assert _shim._port_listening(port) is False  # server truly gone
+            # Reap de-registered it — no routing ghost left behind.
+            assert list(reg_dir.glob("*.json")) == []
         finally:
             if shim.poll() is None:
                 shim.kill()
-            if daemon_pid is None:
-                # Best effort: find the daemon via its commandline.
-                subprocess.run(
-                    ["pkill", "-f", f"--transport http --port {port}"],
-                    check=False,
-                )
-            else:
-                os.kill(daemon_pid, signal.SIGTERM)
+            if child_pid is not None:
+                _force_kill(child_pid)
+
+
+class TestServe:
+    def test_fires_control_start_before_spawning_child(self, monkeypatch):
+        """serve() kicks off the control (fire-and-forget) BEFORE spawning the
+        child, so the lean control boots in parallel with the child's import-
+        dominated startup and is up by the time the child needs the data plane."""
+        calls = []
+
+        class _FakeProc:
+            pid = 4242
+
+        monkeypatch.setattr(
+            _shim._control_client,
+            "start_control_detached",
+            lambda: calls.append("control"),
+        )
+
+        def _fake_spawn(config, *a, **k):
+            calls.append("spawn")
+            return _FakeProc(), "http://127.0.0.1:1/mcp", "sid"
+
+        monkeypatch.setattr(_shim, "spawn_session", _fake_spawn)
+        monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
+        monkeypatch.setattr(
+            _shim, "_install_client_death_watchdog", lambda *a, **k: None
+        )
+        monkeypatch.setattr(_shim, "run_bridge", lambda url: calls.append("bridge"))
+        monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
+
+        _shim.serve(object())
+        assert calls == ["control", "spawn", "bridge"]
+
+    def test_control_start_failure_does_not_block_serve(self, monkeypatch):
+        """A control-start that raises must never abort the shim -- the bridge is
+        the priority; control errors surface later, from the session child."""
+
+        class _FakeProc:
+            pid = 4242
+
+        def _boom():
+            raise RuntimeError("control start blew up")
+
+        monkeypatch.setattr(_shim._control_client, "start_control_detached", _boom)
+        monkeypatch.setattr(
+            _shim,
+            "spawn_session",
+            lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", "sid"),
+        )
+        monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
+        monkeypatch.setattr(
+            _shim, "_install_client_death_watchdog", lambda *a, **k: None
+        )
+        bridged = []
+        monkeypatch.setattr(_shim, "run_bridge", lambda url: bridged.append(url))
+        monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
+
+        _shim.serve(object())
+        assert bridged == ["http://127.0.0.1:1/mcp"]

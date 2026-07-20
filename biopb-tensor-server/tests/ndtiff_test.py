@@ -18,7 +18,7 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 
 def _ndtiff_available() -> bool:
@@ -227,6 +227,42 @@ class TestNdTiffGetData:
 
 
 @pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")
+class TestNdTiffClose:
+    """close() releases the acquisition's per-file readers (biopb/biopb#71)."""
+
+    @staticmethod
+    def _adapter():
+        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
+
+        dataset = MagicMock()
+        dataset.axes.keys.return_value = ["channel", "row", "column"]
+        dask = MagicMock()
+        dask.shape = (3, 64, 64)
+        dask.dtype = np.dtype("uint8")
+        dataset.as_array.return_value = dask
+        return NdTiffAdapter(dataset, "test-ndtiff", "/test/path"), dataset
+
+    def test_close_closes_dataset_and_drops_dask(self):
+        adapter, dataset = self._adapter()
+        adapter.close()
+        dataset.close.assert_called_once()
+        # The dask graph pins the dataset, so it must go too.
+        assert adapter._dask_arr is None
+
+    def test_close_is_idempotent(self):
+        adapter, dataset = self._adapter()
+        adapter.close()
+        adapter.close()
+        dataset.close.assert_called_once()
+
+    def test_read_after_close_fails_loudly(self):
+        adapter, _ = self._adapter()
+        adapter.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+
+
+@pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")
 class TestNdTiffServerClient:
     """Integration tests for NDTiff adapter with server/client."""
 
@@ -276,7 +312,7 @@ class TestNdTiffServerClient:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             # Get tensor - for single-tensor source, tensor_id = source_id
-            arr = client.get_tensor("ndtiff-test", "ndtiff-test")
+            arr = client.get_tensor("ndtiff-test")
 
             # Verify shape
             assert arr.shape == (3, 32, 32)
@@ -321,7 +357,7 @@ class TestNdTiffCreateFromConfig:
     def test_create_from_local_config(self):
         """Test creating adapter from local SourceConfig."""
         from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
-        from biopb_tensor_server.config import SourceConfig
+        from biopb_tensor_server.core.config import SourceConfig
 
         with patch("ndtiff.NDTiffDataset") as mock_ndtiff:
             # Mock dataset

@@ -53,7 +53,9 @@ def test_worker_maps_single_result(_qapp):
 
     captured = {}
     worker.done.connect(
-        lambda payload: captured.update(zip(("added", "already", "failed"), payload))
+        lambda payload: captured.update(
+            zip(("added", "already", "failed"), payload, strict=True)
+        )
     )
     worker.run()  # synchronous; direct-connected slot fires inline
 

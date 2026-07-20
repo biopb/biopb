@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     DiscoveryState,
     discover_sources,
@@ -43,9 +43,9 @@ from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_ti
 # fixed (one plate + a few sibling tiffs) across scales, so any growth in scan
 # cost under `naive` comes purely from chunk-file fan-out.
 SCALES = {
-    "small": dict(wells=8, fields=2, shape=(512, 512), chunks=(64, 64)),
-    "medium": dict(wells=24, fields=4, shape=(512, 512), chunks=(32, 32)),
-    "large": dict(wells=48, fields=4, shape=(1024, 1024), chunks=(32, 32)),
+    "small": {"wells": 8, "fields": 2, "shape": (512, 512), "chunks": (64, 64)},
+    "medium": {"wells": 24, "fields": 4, "shape": (512, 512), "chunks": (32, 32)},
+    "large": {"wells": 48, "fields": 4, "shape": (1024, 1024), "chunks": (32, 32)},
 }
 
 
@@ -106,7 +106,7 @@ def _scan(root: Path, registry, *, prune: bool) -> DiscoveryState:
 
 
 def _identity(path: Path) -> str:
-    from biopb_tensor_server.discovery import get_file_identity
+    from biopb_tensor_server.core.discovery import get_file_identity
 
     return get_file_identity(path)
 

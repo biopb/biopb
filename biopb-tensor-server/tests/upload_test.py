@@ -16,18 +16,8 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.chunk import encode_chunk_id, get_bounds_from_chunk_id
-from biopb_tensor_server.config import CacheConfig
-
-
-class MockMetadataWriter:
-    """Mock FlightMetadataWriter for testing."""
-
-    def __init__(self):
-        self.metadata = None
-
-    def write(self, metadata: bytes):
-        self.metadata = metadata
+from biopb_tensor_server.core.chunk import encode_chunk_id, get_bounds_from_chunk_id
+from biopb_tensor_server.core.config import CacheConfig
 
 
 class TestCachedSourceAdapter:
@@ -66,6 +56,33 @@ class TestCachedSourceAdapter:
         assert list(desc.chunk_shape) == [50, 100]
         assert desc.dtype == "float32"
         assert list(desc.dim_labels) == ["y", "x"]
+
+    def test_physical_scale_echoed_verbatim(self):
+        """An uploaded calibration is surfaced 1:1 by _physical_scale (issue #272)."""
+        adapter = CachedSourceAdapter(
+            source_id="test",
+            shape=[100, 200],
+            dtype="uint16",
+            chunk_shape=[50, 100],
+            dim_labels=["y", "x"],
+            physical_scale=[0.65, 0.65],
+            physical_unit=["µm", "µm"],
+        )
+
+        scale, unit = adapter._physical_scale()
+        assert scale == [0.65, 0.65]
+        assert unit == ["µm", "µm"]
+
+    def test_physical_scale_none_without_calibration(self):
+        """No uploaded calibration -> _physical_scale is None (base clears fields)."""
+        adapter = CachedSourceAdapter(
+            source_id="test",
+            shape=[100, 200],
+            dtype="uint16",
+            chunk_shape=[50, 100],
+            dim_labels=["y", "x"],
+        )
+        assert adapter._physical_scale() is None
 
     def test_list_tensor_descriptors_single(self):
         """Cache sources are single-tensor."""
@@ -168,7 +185,7 @@ class TestCachedSourceAdapter:
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
         # Verify data matches - the chunk is the unified binary schema now.
-        from biopb_tensor_server.base import unpack_chunk_array
+        from biopb_tensor_server.core.base import unpack_chunk_array
 
         arr = unpack_chunk_array(batch)
         np.testing.assert_array_equal(arr, test_data)
@@ -269,7 +286,7 @@ class TestCachedSourceAdapter:
             assert pa.types.is_binary(batch.column("data").type)
 
             # Verify data can be reconstructed
-            from biopb_tensor_server.base import unpack_chunk_array
+            from biopb_tensor_server.core.base import unpack_chunk_array
 
             reconstructed = unpack_chunk_array(batch)
             assert reconstructed.shape == data.shape
@@ -309,7 +326,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_cache_backed(self):
         """Create cache-backed source."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",  # Use random port
@@ -326,23 +343,89 @@ class TestServerDoPutHandler:
         )
 
         # Process creation
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
+        response_desc = server.uploads.create_source(req_desc)
 
         # Check response
-        assert writer.metadata is not None
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        assert response_desc is not None
         assert response_desc.array_id.startswith("cache_")
 
         # Check adapter was registered
-        adapter = server._sources.get(response_desc.array_id)
+        adapter = server.sources.get(response_desc.array_id)
         assert adapter is not None
         assert isinstance(adapter, CachedSourceAdapter)
 
+    def test_create_source_threads_physical_scale(self):
+        """A calibrated upload survives the create_source round-trip (issue #272).
+
+        The DoPut request descriptor already carries physical_scale / physical_unit;
+        create_source must thread them onto the CachedSourceAdapter (so the read
+        hot path advertises them) and echo them on the response descriptor.
+        """
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer(
+            location="grpc://localhost:0",
+            writable=True,
+        )
+
+        req_desc = TensorDescriptor(
+            array_id="cache:calibrated",
+            shape=[10, 100, 100],
+            dtype="uint16",
+            chunk_shape=[1, 50, 50],
+            dim_labels=["z", "y", "x"],
+            physical_scale=[2.0, 0.325, 0.325],
+            physical_unit=["µm", "µm", "µm"],
+        )
+
+        response_desc = server.uploads.create_source(req_desc)
+
+        # The response echoes the uploader's calibration.
+        assert list(response_desc.physical_scale) == [2.0, 0.325, 0.325]
+        assert list(response_desc.physical_unit) == ["µm", "µm", "µm"]
+
+        # The registered adapter surfaces it on the read hot path.
+        adapter = server.sources.get(response_desc.array_id)
+        scale, unit = adapter._physical_scale()
+        assert scale == [2.0, 0.325, 0.325]
+        assert unit == ["µm", "µm", "µm"]
+
+    def test_create_source_ome_zarr_does_not_echo_physical_scale(self):
+        """The physical-scale echo is scoped to cache sources (issue #272).
+
+        Only CachedSourceAdapter stores AND re-serves the uploaded calibration,
+        so only cache responses echo it. The ome_zarr branch persists scale via
+        the .zattrs (the minimal-metadata path drops it), so echoing req_desc
+        here would advertise a vector a later read won't reproduce -- it must not.
+        """
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = TensorFlightServer(
+                location="grpc://localhost:0",
+                writable=True,
+                write_dir=Path(tmpdir),
+            )
+
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:calibrated",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+                dim_labels=["y", "x"],
+                physical_scale=[0.5, 0.5],
+                physical_unit=["µm", "µm"],
+            )
+
+            response_desc = server.uploads.create_source(req_desc)
+
+            # No unpersisted calibration is advertised on the zarr response.
+            assert list(response_desc.physical_scale) == []
+            assert list(response_desc.physical_unit) == []
+
     def test_create_source_cache_server_generated_name(self):
         """Create cache-backed source with server-generated name."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -356,15 +439,12 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
         assert response_desc.array_id.startswith("cache_")
 
     def test_create_source_not_writable_raises(self):
         """Non-writable server rejects source creation."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -378,17 +458,16 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        # The writable check is in do_put, not _handle_create_source
-        # This test verifies _handle_create_source can be called on non-writable server
-        # (the check happens at do_put level)
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        # Source should be created (do_put would reject before reaching this)
-        assert writer.metadata is not None
+        # The writable check is in do_put, not the UploadManager. This test
+        # verifies create_source itself works on a non-writable server (the check
+        # happens at the do_put boundary).
+        response_desc = server.uploads.create_source(req_desc)
+        # Source should be created (do_put would reject before reaching this).
+        assert response_desc is not None
 
     def test_create_source_ome_zarr_requires_write_dir(self):
         """Zarr-backed source requires write_dir."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -403,13 +482,12 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        writer = MockMetadataWriter()
         with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
-            server._handle_create_source(req_desc, writer)
+            server.uploads.create_source(req_desc)
 
     def test_create_source_ome_zarr_with_write_dir(self):
         """Create zarr-backed source with write_dir."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
@@ -426,10 +504,7 @@ class TestServerDoPutHandler:
                 dim_labels=["y", "x"],
             )
 
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
             assert response_desc.array_id.startswith("ome_zarr_")
 
             # Check zarr directory was created
@@ -439,8 +514,8 @@ class TestServerDoPutHandler:
     def test_ome_zarr_upload_synced_to_catalog(self):
         """File-backed (durable) uploads are added to the catalog so they are
         discoverable via list_sources/query_sources (biopb/biopb#265)."""
-        from biopb_tensor_server.metadata_db import MetadataDatabase
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db = MetadataDatabase()
@@ -457,10 +532,7 @@ class TestServerDoPutHandler:
                 chunk_shape=[32, 32],
                 dim_labels=["y", "x"],
             )
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
 
             # The durable upload appears in the catalog.
             descriptors, _ = db.list_source_descriptors()
@@ -469,8 +541,8 @@ class TestServerDoPutHandler:
     def test_cache_upload_not_synced_but_readable_by_id(self):
         """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
         the row would dangle), but stay readable by their returned id."""
-        from biopb_tensor_server.metadata_db import MetadataDatabase
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         db = MetadataDatabase()
         server = TensorFlightServer(
@@ -482,22 +554,19 @@ class TestServerDoPutHandler:
             dtype="uint8",
             chunk_shape=[32, 32],
         )
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
 
         # Not enumerable via the catalog...
         descriptors, _ = db.list_source_descriptors()
         assert response_desc.array_id not in {d.source_id for d in descriptors}
         # ...but still registered and readable by its returned id.
         assert isinstance(
-            server._sources.get(response_desc.array_id), CachedSourceAdapter
+            server.sources.get(response_desc.array_id), CachedSourceAdapter
         )
 
     def test_create_source_invalid_prefix(self):
         """Invalid array_id prefix raises error."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -511,14 +580,13 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        writer = MockMetadataWriter()
         with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
-            server._handle_create_source(req_desc, writer)
+            server.uploads.create_source(req_desc)
 
     def test_create_source_action_round_trip(self):
         """Live client create_source should return the server-assigned source_id."""
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -540,11 +608,200 @@ class TestServerDoPutHandler:
                 chunk_shape=(5, 5),
             )
             assert source_id.startswith("cache_")
-            assert source_id in server._sources
+            assert source_id in server.sources
         finally:
             client.close()
             server.shutdown()
             CacheManager.reset()
+
+
+class TestDoPutErrorTranslation:
+    """A create-source failure on the DoPut path must surface as itself, not be
+    swallowed by command discrimination and mis-reported (biopb/biopb#354).
+
+    The historical do_put used *parse-success + no-exception* as its command
+    discriminator, so a genuine create error raised after a good TensorDescriptor
+    parse fell through to the ChunkUpload branch and the client saw a misleading
+    "Invalid upload command". These tests drive both the do_put wire path and the
+    equivalent create_source Flight action.
+    """
+
+    class _MockWriter:
+        """Minimal FlightMetadataWriter: capture the response bytes."""
+
+        def __init__(self):
+            self.written = []
+
+        def write(self, buf):
+            self.written.append(buf)
+
+    @staticmethod
+    def _server(**kwargs):
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        return TensorFlightServer(
+            location="grpc://localhost:0", writable=True, **kwargs
+        )
+
+    def _do_put(self, server, req_desc):
+        descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
+        server.do_put(None, descriptor, None, self._MockWriter())
+
+    def _create_source_action(self, server, req_desc):
+        action = flight.Action("create_source", req_desc.SerializeToString())
+        list(server.do_action(None, action))
+
+    # -- invalid array_id prefix ------------------------------------------------
+
+    def test_do_put_invalid_prefix_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "Invalid array_id format" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    def test_action_invalid_prefix_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
+            self._create_source_action(server, req_desc)
+
+    # -- missing write_dir ------------------------------------------------------
+
+    def test_do_put_missing_write_dir_surfaces_real_error(self):
+        server = self._server(write_dir=None)
+        req_desc = TensorDescriptor(
+            array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "write_dir not configured" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    def test_action_missing_write_dir_surfaces_real_error(self):
+        server = self._server(write_dir=None)
+        req_desc = TensorDescriptor(
+            array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
+            self._create_source_action(server, req_desc)
+
+    # -- malformed metadata_json ------------------------------------------------
+
+    def test_do_put_malformed_metadata_json_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:test",
+            shape=[10, 10],
+            dtype="uint8",
+            chunk_shape=[5, 5],
+            metadata_json="{not valid json",
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "invalid metadata_json" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    def test_action_malformed_metadata_json_surfaces_real_error(self):
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:test",
+            shape=[10, 10],
+            dtype="uint8",
+            chunk_shape=[5, 5],
+            metadata_json="{not valid json",
+        )
+        with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
+            self._create_source_action(server, req_desc)
+
+    def test_do_put_malformed_metadata_json_ome_zarr(self):
+        """The ome_zarr branch's metadata_json is validated too, not just cache --
+        and metadata is parsed *before* any disk write, so a rejected request
+        leaves no orphaned .zarr behind (which would block a corrected retry
+        under the same name; biopb/biopb#354)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = self._server(write_dir=Path(tmpdir))
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:test",
+                shape=[10, 10],
+                dtype="uint8",
+                chunk_shape=[5, 5],
+                metadata_json="{not valid json",
+            )
+            with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
+                self._do_put(server, req_desc)
+            # Nothing was written to disk -- no partial store to block a retry.
+            assert list(Path(tmpdir).iterdir()) == []
+
+    def test_do_put_ome_zarr_retry_after_bad_metadata_succeeds(self):
+        """A malformed-metadata create must not poison a corrected retry under
+        the same name: parse-first leaves no store for zarr.create to collide
+        with (biopb/biopb#354)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = self._server(write_dir=Path(tmpdir))
+            bad = TensorDescriptor(
+                array_id="ome_zarr:retry",
+                shape=[10, 10],
+                dtype="uint8",
+                chunk_shape=[5, 5],
+                metadata_json="{not valid json",
+            )
+            with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
+                self._do_put(server, bad)
+
+            # Same name, now well-formed: previously the orphaned store made
+            # zarr.create raise instead of creating the source.
+            good = TensorDescriptor(
+                array_id="ome_zarr:retry",
+                shape=[10, 10],
+                dtype="uint8",
+                chunk_shape=[5, 5],
+            )
+            writer = self._MockWriter()
+            descriptor = flight.FlightDescriptor.for_command(good.SerializeToString())
+            server.do_put(None, descriptor, None, writer)
+
+            assert len(writer.written) == 1
+            response = TensorDescriptor.FromString(writer.written[0])
+            assert response.array_id.startswith("ome_zarr_")
+
+    def test_do_put_non_object_metadata_json_surfaces_real_error(self):
+        """Well-formed JSON that is not an object is rejected: callers spread the
+        result into a mapping, so a scalar/list must fail at the create boundary
+        rather than downstream (biopb/biopb#354)."""
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:test",
+            shape=[10, 10],
+            dtype="uint8",
+            chunk_shape=[5, 5],
+            metadata_json="[1, 2, 3]",
+        )
+        with pytest.raises(flight.FlightServerError) as exc:
+            self._do_put(server, req_desc)
+        assert "expected a JSON object" in str(exc.value)
+        assert "Invalid upload command" not in str(exc.value)
+
+    # -- the good path still writes the resolved descriptor ---------------------
+
+    def test_do_put_valid_create_writes_response(self):
+        """A well-formed create still round-trips its resolved descriptor."""
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
+        writer = self._MockWriter()
+        descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
+        server.do_put(None, descriptor, None, writer)
+
+        assert len(writer.written) == 1
+        response = TensorDescriptor.FromString(writer.written[0])
+        assert response.array_id.startswith("cache_")
 
 
 class TestChunkUpload:
@@ -552,7 +809,7 @@ class TestChunkUpload:
 
     def test_upload_chunk_cache_backed(self):
         """Upload chunk to cache-backed source."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -570,10 +827,7 @@ class TestChunkUpload:
             dtype="uint8",
             chunk_shape=[50, 50],
         )
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
         source_id = response_desc.array_id
 
         # Upload chunk
@@ -592,17 +846,17 @@ class TestChunkUpload:
                 return pa.Table.from_batches([batch])
 
         # Process upload (returns None now)
-        server._handle_chunk_upload(upload, MockReader())
+        server.uploads.write_chunk(upload, MockReader())
 
         # Check chunk was stored
-        adapter = server._sources.get(source_id)
+        adapter = server.sources.get(source_id)
         assert adapter is not None
 
         CacheManager.reset()
 
     def test_upload_chunk_cache_backed_preserves_logical_shape(self):
         """Cache-backed uploads must store shape metadata for reconstruction."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -619,10 +873,7 @@ class TestChunkUpload:
             dtype="uint8",
             chunk_shape=[50, 50],
         )
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
         source_id = response_desc.array_id
 
         bounds = ChunkBounds(start=[10, 20], stop=[40, 60])
@@ -635,7 +886,7 @@ class TestChunkUpload:
             def read_all(self):
                 return pa.Table.from_batches([batch])
 
-        server._handle_chunk_upload(upload, MockReader())
+        server.uploads.write_chunk(upload, MockReader())
 
         chunk_id = encode_chunk_id(source_id, bounds)
         cache_manager = CacheManager.get_instance()
@@ -647,7 +898,7 @@ class TestChunkUpload:
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
-        from biopb_tensor_server.base import unpack_chunk_array
+        from biopb_tensor_server.core.base import unpack_chunk_array
 
         reconstructed = unpack_chunk_array(stored_batch)
         assert reconstructed.shape == data.shape
@@ -658,7 +909,7 @@ class TestChunkUpload:
 
     def test_upload_chunk_missing_source(self):
         """Upload to missing source raises error."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -675,7 +926,7 @@ class TestChunkUpload:
                 return pa.Table.from_arrays([pa.array([1, 2, 3])], ["data"])
 
         with pytest.raises(flight.FlightServerError, match="Source not found"):
-            server._handle_chunk_upload(upload, MockReader())
+            server.uploads.write_chunk(upload, MockReader())
 
 
 class TestOmeZarrChunkAlignment:
@@ -685,7 +936,7 @@ class TestOmeZarrChunkAlignment:
         """Aligned chunk upload is accepted."""
         pytest.importorskip("zarr")
 
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             CacheManager.reset()
@@ -705,10 +956,7 @@ class TestOmeZarrChunkAlignment:
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
             source_id = response_desc.array_id
 
             # Upload aligned chunk
@@ -725,7 +973,7 @@ class TestOmeZarrChunkAlignment:
                     return pa.Table.from_batches([batch])
 
             # Should succeed
-            server._handle_chunk_upload(upload, MockReader())
+            server.uploads.write_chunk(upload, MockReader())
 
             CacheManager.reset()
 
@@ -733,7 +981,7 @@ class TestOmeZarrChunkAlignment:
         """Unaligned chunk upload is rejected."""
         pytest.importorskip("zarr")
 
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
@@ -749,10 +997,7 @@ class TestOmeZarrChunkAlignment:
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
             source_id = response_desc.array_id
 
             # Upload unaligned chunk (start not on grid)
@@ -769,7 +1014,7 @@ class TestOmeZarrChunkAlignment:
                     return pa.Table.from_batches([batch])
 
             with pytest.raises(flight.FlightServerError, match="not aligned"):
-                server._handle_chunk_upload(upload, MockReader())
+                server.uploads.write_chunk(upload, MockReader())
 
 
 class TestBuildMinimalOmeMetadata:
@@ -777,7 +1022,7 @@ class TestBuildMinimalOmeMetadata:
 
     def test_minimal_metadata_structure(self):
         """Generated metadata has required fields."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(location="grpc://localhost:0")
 
@@ -789,7 +1034,7 @@ class TestBuildMinimalOmeMetadata:
             dim_labels=["z", "y", "x"],
         )
 
-        metadata = server._build_minimal_ome_metadata(desc)
+        metadata = server.uploads._build_minimal_ome_metadata(desc)
 
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
@@ -802,7 +1047,7 @@ class TestBuildMinimalOmeMetadata:
 
     def test_axis_types_detected(self):
         """Axis types are detected from labels."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(location="grpc://localhost:0")
 
@@ -813,7 +1058,7 @@ class TestBuildMinimalOmeMetadata:
             dim_labels=["c", "z", "y", "x"],
         )
 
-        metadata = server._build_minimal_ome_metadata(desc)
+        metadata = server.uploads._build_minimal_ome_metadata(desc)
         axes = metadata["multiscales"][0]["axes"]
 
         assert axes[0]["type"] == "channel"  # 'c' detected as channel

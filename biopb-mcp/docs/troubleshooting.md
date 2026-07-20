@@ -11,24 +11,25 @@ over Arrow Flight. The server URL is resolved in this order:
 
 ### Auto-starting a local tensor server
 
-If the initial connection fails, the URL is local, and the `biopb`
-command-line tool is on your `PATH`, the browser offers to start a local server
-for you by running `biopb server start`. If `biopb` is **not** installed, this
-offer is skipped silently — install the full
-[biopb](https://github.com/biopb/biopb) system, or point `BIOPB_TENSOR_URL` at a
-server that is already running.
+If the initial connection fails and the URL is local, the client asks the
+**control plane** to bring the data plane up for you — it launches
+`biopb control start`, which supervises the tensor server as a subprocess. If the
+`biopb` command-line tool is **not** installed, this is skipped silently —
+install the full [biopb](https://github.com/biopb/biopb) system, or point
+`BIOPB_TENSOR_URL` at a server that is already running.
 
 ### Startup failures
 
 When auto-start fails, the browser shows the underlying cause inline; the full
-server output is written to `~/.local/share/biopb/logs/`. Common causes:
+server output is written to `~/.local/state/biopb/logs/` (the MCP session's own
+log is under `~/.local/state/biopb/mcp/`). Common causes:
 
 - **Port already in use** — most likely on a shared machine or HPC node where
   another user already holds the default port (gRPC `8815`). Either point at the
   existing server (`BIOPB_TENSOR_URL`), or give your own a free port: the
   containerized/HPC server honors `BIOPB_BASE_PORT` (e.g. `BIOPB_BASE_PORT=9000`;
   HTTP=`BASE+4`, gRPC=`BASE+5`), while a local `biopb server start` takes its
-  gRPC `port` from the TOML config and its HTTP port from `--web-port`.
+  gRPC `port` from the config file (`biopb.json`) and its HTTP port from `--web-port`.
 - **Server started but not reachable in time** — startup exceeded the timeout;
   check the server log for the real error and try connecting again once it is up.
 

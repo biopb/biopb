@@ -31,6 +31,7 @@ BOOTSTRAP_SRC = """\
 import numpy as np
 import dask.array as da
 
+from biopb import _algorithms
 from biopb_mcp._config import load_config, get_setting
 from biopb_mcp._connection import TensorConnection
 from biopb_mcp.mcp._process_ops import build_ops
@@ -43,7 +44,7 @@ client = _conn.client
 _mb = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
 ops = build_ops(
     client_getter=lambda: _conn.client,
-    server_urls=get_setting(config, "mcp.services.process_image_servers"),
+    server_urls=_algorithms.servers_from_config(config),
     op_names_timeout=get_setting(config, "timeout.get_op_names"),
     run_timeout=get_setting(config, "timeout.process_image"),
     channel_options=[
@@ -164,8 +165,8 @@ _INTRO = (
     "source ids and napari viewer layers from the live session do not exist on a "
     "fresh kernel, so any cell that chains `ops` source ids or reads `viewer` "
     "layers needs the same live server (or edits). In-namespace Python variables "
-    "*do* carry across cells. Cells whose header reads `cancelled` / `interrupted` "
-    "/ `error` are kept verbatim — re-running one may re-trigger the same hang or "
+    "*do* carry across cells. Cells whose header reads `interrupted` / `error` "
+    "are kept verbatim — re-running one may re-trigger the same hang or "
     "failure, so skip or edit it. Only the most recent jobs are retained, so a "
     "long session may be missing its start. `auto_connect()` persists the server "
     "URL to your config; under a headless `nbconvert --execute` the `viewer` "

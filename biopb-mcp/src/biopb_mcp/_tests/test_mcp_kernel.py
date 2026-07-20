@@ -9,12 +9,14 @@ import os
 import signal
 import sys
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
+from biopb_mcp.mcp import _kernel  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
@@ -22,15 +24,13 @@ class TestConfigureDask:
     """Unit tests for _configure_dask (no kernel / no display needed)."""
 
     def test_in_process_scheduler_returns_no_client(self):
-        """threads/synchronous schedulers yield no client and no cluster."""
+        """threads/synchronous schedulers yield no client."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask({"mcp": {"dask": {"scheduler": "threads"}}})
-        assert client is None
-        assert cluster is None
+        assert _configure_dask({"dask": {"scheduler": "threads"}}) is None
 
     def test_external_address_connects_without_cluster(self, monkeypatch):
-        """distributed + an explicit address attaches a Client, no cluster."""
+        """distributed + an explicit address attaches a Client."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
@@ -45,22 +45,19 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
+        client = _configure_dask(
             {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "tcp://1.2.3.4:8786",
-                    }
+                "dask": {
+                    "scheduler": "distributed",
+                    "address": "tcp://1.2.3.4:8786",
                 }
             }
         )
         assert isinstance(client, _FakeClient)
         assert created["address"] == "tcp://1.2.3.4:8786"
-        assert cluster is None
 
     def test_injected_address_takes_precedence(self, monkeypatch):
-        """BIOPB_DASK_ADDRESS (daemon-injected) wins over the config address."""
+        """BIOPB_DASK_ADDRESS (session-child-injected) wins over the config address."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
@@ -75,109 +72,30 @@ class TestConfigureDask:
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
-            {"mcp": {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}}
+        _configure_dask(
+            {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}
         )
         assert created["address"] == "tcp://daemon:8786"
-        assert cluster is None
 
-    def test_daemon_owner_no_address_falls_back_to_threads(self, monkeypatch):
-        """owner='daemon' with no injected address -> threads, not a competing
-        kernel-local cluster (LocalCluster must never be constructed)."""
+    def test_no_address_falls_back_to_threads(self, monkeypatch):
+        """distributed + no injected address -> in-process threads. The kernel
+        never owns a cluster, so LocalCluster must never be constructed here."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
         monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
 
         def _must_not_spin(*args, **kwargs):
-            raise AssertionError("owner=daemon must not spin a kernel-local cluster")
+            raise AssertionError("the kernel must never spin a LocalCluster")
 
         monkeypatch.setattr(dd, "LocalCluster", _must_not_spin)
 
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
-            {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "",
-                        "owner": "daemon",
-                    }
-                }
-            }
+        assert (
+            _configure_dask({"dask": {"scheduler": "distributed", "address": ""}})
+            is None
         )
-        assert client is None
-        assert cluster is None
-
-    def test_kernel_owner_spins_local_cluster(self, monkeypatch):
-        """owner='kernel' (escape hatch) spins a kernel-local LocalCluster."""
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-        spun = {}
-
-        class _FakeCluster:
-            def __init__(self, **kwargs):
-                spun["kwargs"] = kwargs
-                self.scheduler_address = "tcp://local:1"
-                self.workers = {"w0": object()}
-
-        class _FakeClient:
-            def __init__(self, target):
-                spun["client_target"] = target
-
-        monkeypatch.setattr(dd, "LocalCluster", _FakeCluster)
-        monkeypatch.setattr(dd, "Client", _FakeClient)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        client, cluster = _configure_dask(
-            {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "",
-                        "owner": "kernel",
-                    }
-                }
-            }
-        )
-        assert isinstance(cluster, _FakeCluster)
-        assert isinstance(client, _FakeClient)
-        assert spun["client_target"] is cluster
-
-    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
-        """A LocalCluster spawn failure degrades to in-process, not a crash.
-
-        Uses owner='kernel' so the LocalCluster branch is actually reached.
-        """
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("no cluster for you")
-
-        monkeypatch.setattr(dd, "LocalCluster", _boom)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        client, cluster = _configure_dask(
-            {
-                "mcp": {
-                    "dask": {
-                        "scheduler": "distributed",
-                        "address": "",
-                        "owner": "kernel",
-                    }
-                }
-            }
-        )
-        assert client is None
-        assert cluster is None
 
 
 class TestClusterAddressInjection:
@@ -728,7 +646,7 @@ class TestParentDeathPipe:
     """Fix 1: kernel self-terminates when the launcher process dies."""
 
     def test_deathwatch_install_noop_without_fd(self, monkeypatch):
-        from biopb_mcp.mcp import _deathwatch
+        from biopb._lifecycle import deathwatch as _deathwatch
 
         monkeypatch.delenv(_deathwatch.ENV_FD, raising=False)
         assert _deathwatch.install() is False
@@ -739,7 +657,7 @@ class TestParentDeathPipe:
         # close the write end (the launcher "dying"); the watcher thread should
         # hit EOF and call the group-kill. killpg is stubbed so we record the
         # call instead of killing the test process.
-        from biopb_mcp.mcp import _deathwatch
+        from biopb._lifecycle import deathwatch as _deathwatch
 
         r, w = os.pipe()
         monkeypatch.setenv(_deathwatch.ENV_FD, str(r))
@@ -1116,3 +1034,135 @@ class TestTokenReportPipe:
             assert "round-trip-tok" in res["stdout"]
         finally:
             host.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object wiring (#403)")
+class TestWindowsJobObjectWiring:
+    """KernelHost's kill-on-close Job Object wiring (biopb/biopb#403).
+
+    Windows-only: the wired branches gate on os.name == 'nt', and faking that
+    globally is unsafe (pathlib picks WindowsPath, which cannot be instantiated
+    off Windows). So these run for real on the Windows CI runner and only fake
+    _winjob -- pinning the KernelHost orchestration (create the job once, assign
+    each launched kernel to it, tree-kill on teardown, and drop the handle only
+    on the terminal shutdown() path) without invoking the actual Win32 calls
+    (those are covered end-to-end by TestWinJobReal).
+    """
+
+    def _host(self, monkeypatch, fake):
+        host = KernelHost(health_probe_code=None)
+        monkeypatch.setattr(_kernel, "_winjob", fake)
+        return host
+
+    def test_launch_creates_job_once_and_assigns_each_kernel(self, monkeypatch):
+        fake = MagicMock()
+        fake.create_kill_on_close_job.return_value = "JOB"
+        host = self._host(monkeypatch, fake)
+        monkeypatch.setattr(host, "_kernel_pid", lambda: 4321)
+
+        host._assign_kernel_to_job()
+        host._assign_kernel_to_job()  # a restart reuses the job, not recreates it
+
+        fake.create_kill_on_close_job.assert_called_once()
+        assert host._winjob == "JOB"
+        assert fake.assign_process.call_count == 2
+        fake.assign_process.assert_called_with("JOB", 4321)
+
+    def test_shutdown_current_tree_kills_and_keeps_handle(self, monkeypatch):
+        fake = MagicMock()
+        host = self._host(monkeypatch, fake)
+        host._winjob = "JOB"
+
+        host._shutdown_current()  # the restart / respawn path
+
+        fake.terminate_job.assert_called_once_with("JOB")
+        fake.close_job.assert_not_called()  # kept so the next kernel reuses it
+        assert host._winjob == "JOB"
+
+    def test_shutdown_closes_handle(self, monkeypatch):
+        fake = MagicMock()
+        host = self._host(monkeypatch, fake)
+        host._winjob = "JOB"
+
+        host.shutdown()  # the terminal daemon-exit path
+
+        fake.terminate_job.assert_called_once_with("JOB")  # via _shutdown_current
+        fake.close_job.assert_called_once_with("JOB")
+        assert host._winjob is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Win32 Job Object (Windows CI)")
+class TestWinJobReal:
+    """Exercise the real _winjob ctypes path on Windows CI: a member process
+    must die when the job is terminated or its last handle closes (#403)."""
+
+    def _sleeper(self):
+        import subprocess
+
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+
+    def test_close_job_kills_member(self):
+        from biopb._lifecycle import winjob as _winjob
+
+        job = _winjob.create_kill_on_close_job()
+        assert job is not None
+        proc = self._sleeper()
+        try:
+            assert _winjob.assign_process(job, proc.pid) is True
+            # Closing the last handle fires KILL_ON_JOB_CLOSE -- the daemon-death
+            # guarantee, needing no in-process teardown code.
+            _winjob.close_job(job)
+            job = None
+            proc.wait(timeout=10)  # raises if the OS did not reap it
+        finally:
+            if job is not None:
+                _winjob.close_job(job)
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_terminate_job_kills_member_and_keeps_job_usable(self):
+        from biopb._lifecycle import winjob as _winjob
+
+        job = _winjob.create_kill_on_close_job()
+        assert job is not None
+        proc = self._sleeper()
+        try:
+            assert _winjob.assign_process(job, proc.pid) is True
+            _winjob.terminate_job(job)
+            proc.wait(timeout=10)  # tree-killed from outside
+            # Still usable after terminate: a restart reassigns a fresh kernel.
+            proc2 = self._sleeper()
+            try:
+                assert _winjob.assign_process(job, proc2.pid) is True
+            finally:
+                proc2.kill()
+        finally:
+            _winjob.close_job(job)
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_wait_for_process_observes_exit(self):
+        # The client-death watchdog primitive: a handle-based wait must unblock
+        # with True exactly when the watched process exits (immune to pid reuse).
+        import threading
+
+        from biopb._lifecycle import winjob as _winjob
+
+        proc = self._sleeper()
+        handle = _winjob.open_for_wait(proc.pid)
+        assert handle is not None
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.update(done=_winjob.wait_for_process(handle))
+        )
+        t.start()
+        try:
+            assert t.is_alive()  # still blocked while the process lives
+            proc.kill()
+            t.join(timeout=10)
+            assert not t.is_alive()
+            assert result.get("done") is True
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            t.join(timeout=5)

@@ -101,8 +101,8 @@ def bench_real_server(
     """Benchmark real TensorFlightServer."""
     from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     location = f"grpc://127.0.0.1:{port}"
     edge = int(np.sqrt(batch.nbytes / 2))  # uint16 = 2 bytes

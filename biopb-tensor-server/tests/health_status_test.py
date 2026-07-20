@@ -11,7 +11,7 @@ import json
 import threading
 import time
 
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.serving.server import TensorFlightServer
 from pyarrow import flight
 
 

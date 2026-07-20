@@ -6,6 +6,7 @@ normalisation, and scaled read planning.
 
 import os
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -17,9 +18,9 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import (
     OmeZarrAdapter,
     ZarrAdapter,
-    downsample as _ds,
 )
-from biopb_tensor_server.config import parse_config
+from biopb_tensor_server.core import downsample as _ds
+from biopb_tensor_server.core.config import parse_config
 
 
 def _zarr_available() -> bool:
@@ -27,7 +28,7 @@ def _zarr_available() -> bool:
     try:
         import zarr
 
-        zarr.open_array
+        _ = zarr.open_array
         return True
     except ImportError:
         return False
@@ -64,7 +65,7 @@ class TestTensorConfig:
         """The removed [compute] section is warn-and-ignore, never an error."""
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.config"):
+        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.core.config"):
             config = parse_config(
                 {
                     "server": {
@@ -164,7 +165,9 @@ class TestReductionMethodNormalization:
     def test_linear_aliases_to_area_with_warning(self, caplog):
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.downsample"):
+        with caplog.at_level(
+            logging.WARNING, logger="biopb_tensor_server.core.downsample"
+        ):
             assert _ds.normalize_reduction_method("linear") == "area"
         assert any("deprecated" in rec.getMessage() for rec in caplog.records)
 
@@ -173,7 +176,7 @@ class TestReductionMethodNormalization:
             _ds.normalize_reduction_method("cubic")
 
     def test_pyramid_config_accepts_linear_alias(self):
-        from biopb_tensor_server.config import PyramidConfig
+        from biopb_tensor_server.core.config import PyramidConfig
 
         # Tolerated deprecated alias: old configs must keep validating.
         PyramidConfig(reduction_method="linear")
@@ -183,7 +186,7 @@ class TestAdvisoryReductionCacheKey:
     """reduction_method is advisory: excluded from the cache key (biopb#76)."""
 
     def test_cache_key_strips_method(self):
-        from biopb_tensor_server.chunk import (
+        from biopb_tensor_server.core.chunk import (
             cache_key_for_chunk_id,
             encode_chunk_id,
             encode_chunk_id_with_scale,
@@ -205,8 +208,8 @@ class TestAdvisoryReductionCacheKey:
         """A chunk warmed under one method serves a request for another."""
         import zarr
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.chunk import encode_chunk_id_with_scale
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
+        from biopb_tensor_server.core.config import CacheConfig
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.zarr")
@@ -238,7 +241,7 @@ class TestAdvisoryReductionCacheKey:
 
 
 class TestGetScaledReadPlan:
-    """Tests for BackendAdapter.get_scaled_read_plan default implementation."""
+    """Tests for TensorAdapter.get_scaled_read_plan default implementation."""
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_default_uses_virtual_scaling(self):
@@ -314,7 +317,7 @@ class TestEmptyChunkShapeFallback:
     the full-rank shape, so every read of such a source raised IndexError.
     """
 
-    from biopb_tensor_server.base import TensorAdapter
+    from biopb_tensor_server.core.base import TensorAdapter
 
     class _StubTensorAdapter(TensorAdapter):
         """Minimal tensor adapter whose descriptor carries no chunk_shape."""
@@ -334,13 +337,26 @@ class TestEmptyChunkShapeFallback:
         def get_data(self, bounds):  # pragma: no cover - not exercised here
             raise NotImplementedError
 
+        # The source half of the role, inherited since TensorAdapter subclasses
+        # SourceAdapter (biopb/biopb#380). Unused here -- only the chunk-grid
+        # fallback is under test -- but abstract, so they need a body.
+        @classmethod
+        def create_from_config(cls, source, credentials_config=None):
+            raise NotImplementedError
+
+        def list_tensor_descriptors(self):
+            return [self._desc]
+
+        def get_metadata(self):
+            return {}
+
     def test_empty_chunk_shape_derives_default_grid(self):
         # The reproducer: a 5-D FITS-like tensor (>i2) with no chunk_shape, as a
         # remote-proxy source seeded from the lean upstream catalog.
         shape = [1, 1, 1000, 512, 512]
         adapter = self._StubTensorAdapter(shape, ">i2", ["T", "C", "Z", "Y", "X"])
 
-        from biopb_tensor_server.chunk import compute_safe_chunk_size
+        from biopb_tensor_server.core.chunk import compute_safe_chunk_size
 
         chunk = adapter.get_chunk_size()
         # A full-rank grid (no longer a 0-length tuple).
@@ -371,7 +387,7 @@ class TestEmptyChunkShapeFallback:
         # An unresolved descriptor (shape known, dtype still empty) must fail the
         # read-planning boundary cleanly, not blow up on np.dtype("") in the
         # default-grid fallback (biopb/biopb#292 follow-up).
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter(
             [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
@@ -380,7 +396,7 @@ class TestEmptyChunkShapeFallback:
             adapter.get_chunk_size()
 
     def test_unresolved_empty_shape_raises_source_unresolved(self):
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):
@@ -432,7 +448,7 @@ class TestGetPhysicalScale:
                 ]
             }
             adapter = self._make_ome_zarr(tmpdir, zattrs)
-            scale, unit = adapter.get_physical_scale()
+            scale, unit = adapter._physical_scale()
             assert scale == [0.325, 0.325]
             assert unit == ["micrometer", "micrometer"]
 
@@ -462,7 +478,7 @@ class TestGetPhysicalScale:
                 ]
             }
             adapter = self._make_ome_zarr(tmpdir, zattrs)
-            scale, unit = adapter.get_physical_scale()
+            scale, unit = adapter._physical_scale()
             assert scale == [0.5, 0.5]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -488,7 +504,7 @@ class TestGetPhysicalScale:
                 ]
             }
             adapter = self._make_ome_zarr(tmpdir, zattrs)
-            assert adapter.get_physical_scale() is None
+            assert adapter._physical_scale() is None
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_ome_zarr_channel_axis_zeroed(self):
@@ -516,7 +532,7 @@ class TestGetPhysicalScale:
             adapter = self._make_ome_zarr(
                 tmpdir, zattrs, shape=(2, 100, 100), chunks=(1, 50, 50)
             )
-            scale, unit = adapter.get_physical_scale()
+            scale, unit = adapter._physical_scale()
             assert scale == [0.0, 0.5, 0.5]
             assert unit == ["", "micrometer", "micrometer"]
 
@@ -531,22 +547,22 @@ class TestGetPhysicalScale:
                 zarr_path, mode="w", shape=(64, 64), chunks=(32, 32), dtype="uint8"
             )
             adapter = ZarrAdapter(arr, "plain", ["y", "x"])
-            assert adapter.get_physical_scale() is None
+            assert adapter._physical_scale() is None
 
     def _make_aics_adapter(self, dim_labels, scene_index, scenes, images):
         """Build an AicsImageIoAdapterBase without __init__ (no real file)."""
         from unittest.mock import MagicMock
 
-        from biopb_tensor_server.adapters.aicsimageio import (
-            _AicsImageIoAdapterBase,
+        from biopb_tensor_server.adapters.bioio import (
+            _BioioAdapterBase,
         )
 
-        a = _AicsImageIoAdapterBase.__new__(_AicsImageIoAdapterBase)
+        a = _BioioAdapterBase.__new__(_BioioAdapterBase)
         a.dim_labels = dim_labels
         a.scene_index = scene_index
-        a._aics_image = MagicMock()
-        a._aics_image.scenes = scenes
-        a._aics_image.ome_metadata.images = images
+        a._bio_image = MagicMock()
+        a._bio_image.scenes = scenes
+        a._bio_image.ome_metadata.images = images
         return a
 
     @staticmethod
@@ -568,7 +584,7 @@ class TestGetPhysicalScale:
         adapter = self._make_aics_adapter(
             ["T", "C", "Z", "Y", "X"], scene_index=0, scenes=["s0"], images=[img]
         )
-        scale, unit = adapter.get_physical_scale()
+        scale, unit = adapter._physical_scale()
         assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]
         assert unit == ["", "", "µm", "µm", "µm"]
 
@@ -587,7 +603,7 @@ class TestGetPhysicalScale:
             scenes=["s0", "s1"],
             images=[img0, img1],
         )
-        scale, _ = adapter.get_physical_scale()
+        scale, _ = adapter._physical_scale()
         assert scale == [0.0, 0.5, 0.5]
 
     def test_aics_physical_scale_none_when_no_sizes(self):
@@ -596,7 +612,542 @@ class TestGetPhysicalScale:
         adapter = self._make_aics_adapter(
             ["Y", "X"], scene_index=0, scenes=["s0"], images=[img]
         )
-        assert adapter.get_physical_scale() is None
+        assert adapter._physical_scale() is None
+
+    # ---- NIfTI -------------------------------------------------------------
+
+    @staticmethod
+    def _make_nifti(dim_labels, pixdim, xyzt_units):
+        from biopb_tensor_server.adapters.nifti import NiftiAdapter
+
+        a = NiftiAdapter.__new__(NiftiAdapter)
+        a.dim_labels = dim_labels
+        a.header = {"pixdim": pixdim, "xyzt_units": xyzt_units}
+        return a
+
+    def test_nifti_physical_scale_xyz_mm(self):
+        """pixdim[1:4] map onto the (positional) spatial axes with the mm unit."""
+        a = self._make_nifti(
+            ["x", "y", "z"], [1.0, 0.5, 0.5, 2.0, 0.0, 0.0, 0.0, 0.0], xyzt_units=2
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.5, 0.5, 2.0]
+        assert unit == ["mm", "mm", "mm"]
+
+    def test_nifti_physical_scale_time_axis_zeroed(self):
+        """Spatial axes carry a size; the time axis is 0.0 whatever its label."""
+        a = self._make_nifti(
+            ["x", "y", "z", "t"], [1.0, 0.5, 0.5, 2.0, 3.0], xyzt_units=3
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.5, 0.5, 2.0, 0.0]
+        assert unit == ["µm", "µm", "µm", ""]
+
+    def test_nifti_physical_scale_time_first_labels_read_fixed_pixdim(self):
+        """pixdim is storage-fixed: for a real 4D fMRI (X/Y/Z in pixdim[1:4],
+        TR in pixdim[4]) with the auto-derived ``["t","x","y","z"]`` order, the
+        leading ``t`` gets 0.0 and x/y/z read pixdim[1:4] -- so TR (pixdim[4]=3.0)
+        is never misreported as the Z length.
+        """
+        a = self._make_nifti(
+            ["t", "x", "y", "z"], [1.0, 0.5, 0.5, 2.0, 3.0], xyzt_units=2
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.5, 0.5, 2.0]
+        assert unit == ["", "mm", "mm", "mm"]
+
+    def test_nifti_physical_scale_5d_leading_nonspatial(self):
+        """5D ``["v","t","x","y","z"]``: v/t are non-spatial (0.0), and x/y/z read
+        the storage-fixed pixdim[1:4] -- not pixdim[3:6] (Z / TR / 5th axis).
+        """
+        a = self._make_nifti(
+            ["v", "t", "x", "y", "z"],
+            [1.0, 0.5, 0.5, 2.0, 3.0, 7.0],
+            xyzt_units=3,
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.5, 0.5, 2.0]
+        assert unit == ["", "", "µm", "µm", "µm"]
+
+    def test_nifti_physical_scale_unknown_unit_keeps_size(self):
+        """An uncalibrated pixdim still reports a size, with an empty unit."""
+        a = self._make_nifti(["x", "y"], [1.0, 0.3, 0.3], xyzt_units=0)
+        scale, unit = a._physical_scale()
+        assert scale == [0.3, 0.3]
+        assert unit == ["", ""]
+
+    def test_nifti_physical_scale_none_when_zero(self):
+        """All-zero pixdim -> None (nothing to advertise)."""
+        a = self._make_nifti(["x", "y", "z"], [1.0, 0.0, 0.0, 0.0], xyzt_units=2)
+        assert a._physical_scale() is None
+
+    # ---- DICOM -------------------------------------------------------------
+
+    @staticmethod
+    def _make_dicom(dim_labels, **tags):
+        import types
+
+        from biopb_tensor_server.adapters.dicom import DicomAdapter
+
+        a = DicomAdapter.__new__(DicomAdapter)
+        a.dim_labels = dim_labels
+        a.ds = types.SimpleNamespace(**tags)
+        return a
+
+    def test_dicom_physical_scale_pixelspacing_and_slice(self):
+        """PixelSpacing is [row(Y), col(X)] mm; z from SliceThickness."""
+        a = self._make_dicom(
+            ["z", "y", "x"], PixelSpacing=[0.7, 0.6], SliceThickness=3.0
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [3.0, 0.7, 0.6]
+        assert unit == ["mm", "mm", "mm"]
+
+    def test_dicom_physical_scale_prefers_spacing_between_slices(self):
+        """SpacingBetweenSlices wins over SliceThickness for the z axis."""
+        a = self._make_dicom(
+            ["z", "y", "x"],
+            PixelSpacing=[0.5, 0.5],
+            SliceThickness=3.0,
+            SpacingBetweenSlices=1.25,
+        )
+        scale, _ = a._physical_scale()
+        assert scale == [1.25, 0.5, 0.5]
+
+    def test_dicom_physical_scale_2d_no_z(self):
+        """A 2D (y, x) image carries only the in-plane spacing."""
+        a = self._make_dicom(["y", "x"], PixelSpacing=[0.4, 0.3])
+        scale, unit = a._physical_scale()
+        assert scale == [0.4, 0.3]
+        assert unit == ["mm", "mm"]
+
+    def test_dicom_physical_scale_none_without_tags(self):
+        """No spatial tags -> None."""
+        a = self._make_dicom(["y", "x"])
+        assert a._physical_scale() is None
+
+    def test_dicom_series_physical_scale(self):
+        """The series adapter reads the same tags off its first slice."""
+        import types
+
+        from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
+
+        a = DicomSeriesAdapter.__new__(DicomSeriesAdapter)
+        a.dim_labels = ["z", "y", "x"]
+        a._first_ds = types.SimpleNamespace(
+            PixelSpacing=[0.8, 0.8], SpacingBetweenSlices=2.0
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [2.0, 0.8, 0.8]
+        assert unit == ["mm", "mm", "mm"]
+
+    # ---- HDF5 --------------------------------------------------------------
+
+    @staticmethod
+    def _make_hdf5(dim_labels, attrs):
+        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+        a = Hdf5Adapter.__new__(Hdf5Adapter)
+        a.dim_labels = dim_labels
+        a._element_size_um = attrs.get("element_size_um")
+        return a
+
+    def test_hdf5_element_size_um(self):
+        """element_size_um maps positionally onto the dataset axes, in µm."""
+        a = self._make_hdf5(
+            ["z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [2.0, 0.5, 0.5]
+        assert unit == ["µm", "µm", "µm"]
+
+    def test_hdf5_no_attribute(self):
+        """No element_size_um attribute -> None."""
+        a = self._make_hdf5(["z", "y", "x"], {})
+        assert a._physical_scale() is None
+
+    def test_hdf5_length_mismatch_none(self):
+        """A vector whose length != rank cannot be aligned -> None."""
+        a = self._make_hdf5(
+            ["t", "z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
+        )
+        assert a._physical_scale() is None
+
+    # ---- MicroManager (NDTiff + legacy) ------------------------------------
+
+    def test_ndtiff_physical_scale_from_summary(self):
+        """NDTiff PixelSize_um / z-step map onto x/y/z; p/t/c zeroed."""
+        import types
+
+        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
+
+        a = NdTiffAdapter.__new__(NdTiffAdapter)
+        a.dim_labels = ["p", "t", "c", "z", "y", "x"]
+        a._dataset = types.SimpleNamespace(
+            summary_metadata={"PixelSize_um": 0.16, "z-step_um": 0.5}
+        )
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.0, 0.5, 0.16, 0.16]
+        assert unit == ["", "", "", "µm", "µm", "µm"]
+
+    def test_micromanager_legacy_physical_scale(self):
+        """Legacy MicroManager reads PixelSize_um from the Summary block."""
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        a = MicroManagerLegacyAdapter.__new__(MicroManagerLegacyAdapter)
+        a.dim_labels = ["c", "z", "y", "x"]
+        a._raw_metadata = {"Summary": {"PixelSize_um": 0.16}}
+        scale, unit = a._physical_scale()
+        assert scale == [0.0, 0.0, 0.16, 0.16]
+        assert unit == ["", "", "µm", "µm"]
+
+    # ---- TIFF sequence (real files, exercises tag reading) -----------------
+
+    @staticmethod
+    def _make_tiff_sequence(tiff_files, dim_labels):
+        from biopb_tensor_server.adapters.tiff import _SCALE_UNSET, TiffSequenceAdapter
+
+        a = TiffSequenceAdapter.__new__(TiffSequenceAdapter)
+        a._tiff_files = tiff_files
+        a.dim_labels = dim_labels
+        a._source_url = str(tiff_files[0]) if tiff_files else ""
+        a._init_file_locks()
+        a._physical_scale_cache = _SCALE_UNSET
+        return a
+
+    def test_tiff_sequence_physical_scale_resolution_tags(self):
+        """X/Y pixel size from XResolution/YResolution + centimetre unit -> µm."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "img_0.tif")
+            # 0.5 µm/px -> 20000 px/cm (ResolutionUnit=CENTIMETER).
+            tifffile.imwrite(
+                path,
+                np.zeros((8, 8), dtype=np.uint8),
+                resolution=(20000.0, 20000.0),
+                resolutionunit="CENTIMETER",
+            )
+            a = self._make_tiff_sequence([Path(path)], ["i", "y", "x"])
+            scale, unit = a._physical_scale()
+            assert scale[0] == 0.0  # opaque file axis
+            assert scale[1] == pytest.approx(0.5)
+            assert scale[2] == pytest.approx(0.5)
+            assert unit == ["", "µm", "µm"]
+
+    def test_tiff_sequence_physical_scale_imagej_spacing(self):
+        """ImageJ unit + spacing calibrate X/Y and the z (page) axis."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "stack_0.tif")
+            # ImageJ stores XY resolution in px per 'unit'; z as 'spacing'.
+            tifffile.imwrite(
+                path,
+                np.zeros((3, 8, 8), dtype=np.uint8),
+                imagej=True,
+                resolution=(1.0 / 0.325, 1.0 / 0.325),
+                metadata={"unit": "micron", "spacing": 2.0, "axes": "ZYX"},
+            )
+            a = self._make_tiff_sequence([Path(path)], ["i", "z", "y", "x"])
+            scale, unit = a._physical_scale()
+            assert scale[0] == 0.0  # opaque file axis
+            assert scale[1] == pytest.approx(2.0)  # z from ImageJ spacing
+            assert scale[2] == pytest.approx(0.325)
+            assert scale[3] == pytest.approx(0.325)
+            assert unit == ["", "µm", "µm", "µm"]
+
+    def test_tiff_sequence_physical_scale_none_without_resolution(self):
+        """A TIFF with no absolute resolution unit -> None."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "plain_0.tif")
+            tifffile.imwrite(path, np.zeros((8, 8), dtype=np.uint8))
+            a = self._make_tiff_sequence([Path(path)], ["i", "y", "x"])
+            assert a._physical_scale() is None
+
+    def test_tiff_pixel_size_um_missing_unit_is_not_assumed_inch(self):
+        """A resolution density with no ResolutionUnit tag -> None, not inch.
+
+        The TIFF spec defaults ResolutionUnit to inch, but that default is wrong
+        often enough in practice that we treat a missing unit as uncalibrated
+        rather than fabricate a micron size from it.
+        """
+        from biopb_tensor_server.adapters.tiff import _tiff_pixel_size_um
+
+        class _Tag:
+            def __init__(self, value):
+                self.value = value
+
+        class _Page:
+            def __init__(self, tags):
+                self._tags = tags
+
+            @property
+            def tags(self):
+                return self._tags
+
+        # Density present, ResolutionUnit absent -> None (no inch assumption).
+        page = _Page({"XResolution": _Tag((25400, 1))})
+        assert _tiff_pixel_size_um(page, "XResolution", None) is None
+
+        # Same density but with an explicit inch unit (code 2) -> 1.0 µm/px.
+        page = _Page({"XResolution": _Tag((25400, 1)), "ResolutionUnit": _Tag(2)})
+        assert _tiff_pixel_size_um(page, "XResolution", None) == pytest.approx(1.0)
+
+    def test_tiff_sequence_physical_scale_is_cached(self):
+        """The scale is computed once; a later call reuses it without reopening."""
+        try:
+            import tifffile
+        except ImportError:
+            pytest.skip("tifffile not available")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "img_0.tif")
+            tifffile.imwrite(
+                path,
+                np.zeros((8, 8), dtype=np.uint8),
+                resolution=(20000.0, 20000.0),
+                resolutionunit="CENTIMETER",
+            )
+            a = self._make_tiff_sequence([Path(path)], ["i", "y", "x"])
+
+            calls = {"n": 0}
+            real_compute = a._compute_physical_scale
+
+            def _counting_compute():
+                calls["n"] += 1
+                return real_compute()
+
+            a._compute_physical_scale = _counting_compute
+            first = a._physical_scale()
+            second = a._physical_scale()
+            assert first == second
+            assert first is not None
+            assert calls["n"] == 1  # reopened members[0] only once
+
+    # ---- OME-Zarr HCS plate: per-field scale (issue #272) ------------------
+
+    @staticmethod
+    def _make_hcs_plate(tmpdir):
+        """A minimal single-well/single-field HCS plate with a calibrated field.
+
+        The plate root carries no image scale; the field's ``.zattrs`` declares
+        micrometer-calibrated Y/X with a level-0 scale of [1, 0.5, 0.5].
+        """
+        import json
+
+        import zarr
+
+        plate = os.path.join(tmpdir, "plate.zarr")
+        for sub in ("", "A", "A/1", "A/1/0"):
+            d = os.path.join(plate, sub)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, ".zgroup"), "w") as f:
+                json.dump({"zarr_format": 2}, f)
+        with open(os.path.join(plate, ".zattrs"), "w") as f:
+            json.dump({"plate": {"wells": [{"path": "A/1"}]}}, f)
+        with open(os.path.join(plate, "A", "1", ".zattrs"), "w") as f:
+            json.dump({"well": {"images": [{"path": "0"}]}}, f)
+        with open(os.path.join(plate, "A", "1", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "axes": [
+                                {"name": "c", "type": "channel"},
+                                {"name": "y", "type": "space", "unit": "micrometer"},
+                                {"name": "x", "type": "space", "unit": "micrometer"},
+                            ],
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.5, 0.5]}
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                f,
+            )
+        zarr.open_array(
+            os.path.join(plate, "A", "1", "0", "0"),
+            mode="w",
+            shape=(2, 16, 16),
+            chunks=(1, 16, 16),
+            dtype="uint8",
+        )
+        return plate
+
+    @staticmethod
+    def _make_hcs_plate_second_field_missing_axes(tmpdir):
+        """A two-well plate whose second field's multiscales omits ``axes``.
+
+        Well ``A/1`` field 0 declares full c/y/x axes (micrometre-calibrated), so
+        the plate source picks up those axes; well ``A/2`` field 0 carries a
+        level-0 scale transform but NO ``axes`` array, exercising the fallback to
+        the source axes in :func:`_physical_scale_from_multiscales`.
+        """
+        import json
+
+        import zarr
+
+        plate = os.path.join(tmpdir, "plate.zarr")
+        for sub in ("", "A", "A/1", "A/1/0", "A/2", "A/2/0"):
+            d = os.path.join(plate, sub)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, ".zgroup"), "w") as f:
+                json.dump({"zarr_format": 2}, f)
+        with open(os.path.join(plate, ".zattrs"), "w") as f:
+            json.dump({"plate": {"wells": [{"path": "A/1"}, {"path": "A/2"}]}}, f)
+        for well in ("A/1", "A/2"):
+            with open(os.path.join(plate, well, ".zattrs"), "w") as f:
+                json.dump({"well": {"images": [{"path": "0"}]}}, f)
+        # Well A/1 field 0: full axes -> populates the plate source's self.axes.
+        with open(os.path.join(plate, "A", "1", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "axes": [
+                                {"name": "c", "type": "channel"},
+                                {"name": "y", "type": "space", "unit": "micrometer"},
+                                {"name": "x", "type": "space", "unit": "micrometer"},
+                            ],
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.5, 0.5]}
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                f,
+            )
+        # Well A/2 field 0: a scale transform but NO axes -> must fall back.
+        with open(os.path.join(plate, "A", "2", "0", ".zattrs"), "w") as f:
+            json.dump(
+                {
+                    "multiscales": [
+                        {
+                            "datasets": [
+                                {
+                                    "path": "0",
+                                    "coordinateTransformations": [
+                                        {"type": "scale", "scale": [1, 0.3, 0.3]}
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                },
+                f,
+            )
+        for well in ("A/1", "A/2"):
+            zarr.open_array(
+                os.path.join(plate, well, "0", "0"),
+                mode="w",
+                shape=(2, 16, 16),
+                chunks=(1, 16, 16),
+                dtype="uint8",
+            )
+        return plate
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_field_missing_axes_falls_back_to_source_axes(self):
+        """A field whose multiscales omits ``axes`` still resolves units, by
+        falling back to the plate source's axes (from the first field)."""
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = self._make_hcs_plate_second_field_missing_axes(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            # The plate source picked up axes from the first field (well A/1).
+            assert plate.axes  # non-empty
+            # Bind the second well's field, whose own multiscales has no axes.
+            field = plate.get_tensor_adapter("plate/2/0")
+            scale, unit = field._physical_scale()
+            assert scale == [0.0, 0.3, 0.3]
+            assert unit == ["", "micrometer", "micrometer"]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_plate_level_scale_is_none_but_field_carries_it(self):
+        """The plate advertises no scale; the per-field adapter (bound by full
+        array_id) surfaces the field's own physical calibration (issue #272)."""
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = self._make_hcs_plate(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            assert plate._is_hcs_plate
+            # Plate level: no image scale.
+            assert plate._physical_scale() is None
+
+            # Bind the field by its full array_id (well/field).
+            field_id = plate.list_tensor_descriptors()[0].array_id
+            field = plate.get_tensor_adapter(field_id)
+            scale, unit = field._physical_scale()
+            assert scale == [0.0, 0.5, 0.5]
+            assert unit == ["", "micrometer", "micrometer"]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_two_plates_sharing_a_well_name_do_not_share_fields(self):
+        """Two plates with the same well/field name serve their own pixels.
+
+        The field-adapter cache used to be a class-level dict, so the second
+        plate returned the first plate's adapter -- wrong pixels under the right
+        array_id (issue #522).
+        """
+        import zarr
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plates = []
+            for name, fill in (("plateA", 111), ("plateB", 222)):
+                root = self._make_hcs_plate(os.path.join(tmpdir, name))
+                zarr.open_array(os.path.join(root, "A", "1", "0", "0"), mode="r+")[
+                    :
+                ] = fill
+                plates.append(
+                    OmeZarrAdapter.create_from_config(
+                        SourceConfig(source_id=name, url=root, type="ome-zarr-hcs")
+                    )
+                )
+
+            a, b = plates
+            # Per-instance cache, not the class dict -- the failure mode is
+            # invisible at the call site, so assert the storage location too.
+            assert "_field_adapters" in vars(a)
+            assert "_field_adapters" in vars(b)
+
+            field_id = a.list_tensor_descriptors()[0].array_id
+            fa = a.get_tensor_adapter(field_id)
+            fb = b.get_tensor_adapter(field_id.split("/", 1)[1])
+            assert fa is not fb
+            assert int(np.asarray(fa.zarr_array).flat[0]) == 111
+            assert int(np.asarray(fb.zarr_array).flat[0]) == 222
 
 
 class TestOmeZarrPrecompute:
@@ -1060,3 +1611,262 @@ class TestGetData:
             data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[64, 64]))
             assert data.shape == (64, 64)
             np.testing.assert_array_equal(data, expected)
+
+    def test_micromanager_rgb_get_data_not_collapsed(self):
+        """RGB (YXS) MM frame must read the plane, not index row 0 (biopb#220).
+
+        A photometric-RGB img file gives a ``YXS`` aszarr series, so ``shape[-2:]``
+        is ``(X, samples)``. The old ``zarr_arr[0, y, x]`` indexed Y=0 and returned
+        garbage of the wrong shape; ``get_data`` must instead resolve Y/X from the
+        axes string and fix the samples axis at 0. Non-square H!=W so a Y/X swap is
+        caught too.
+        """
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fname = "img_channel000_position000_time000000000_z000.tif"
+            h, w = 8, 6
+            # Distinct per-sample content so a wrong samples pick is detectable;
+            # channel 0 (red) is the plane get_data should return.
+            red = np.arange(h * w, dtype=np.uint8).reshape(h, w)
+            rgb = np.stack([red, red + 100, red + 200], axis=-1)  # (H, W, 3) YXS
+            tifffile.imwrite(os.path.join(tmpdir, fname), rgb, photometric="rgb")
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Positions": 1,
+                    "Frames": 1,
+                    "Slices": 1,
+                    "AxisOrder": ["time", "channel", "z", "position"],
+                },
+                f"Coords-{fname}": {
+                    "PositionIndex": 0,
+                    "TimeIndex": 0,
+                    "ChannelIndex": 0,
+                    "SliceIndex": 0,
+                },
+                f"Metadata-{fname}": {"Width": w, "Height": h},
+            }
+            with open(os.path.join(tmpdir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            adapter = MicroManagerLegacyAdapter(tmpdir, "mmrgb")
+
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.shape) == [h, w]
+
+            data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[h, w]))
+            assert data.shape == (h, w)
+            np.testing.assert_array_equal(data, red)
+
+    def test_micromanager_v2_separate_files_no_displaysettings(self):
+        """A v2 "separate image files" acquisition with no DisplaySettings.json
+        constructs when claimed at the position folder (biopb/biopb#314).
+
+        Layout: an acquisition root holding only a ``Default/`` position folder
+        (no ``DisplaySettings.json`` at the root), whose ``metadata.txt`` carries
+        ``Coords-Default/...`` keys prefixed with the folder's own name. With no
+        DisplaySettings.json the root is invisible, so discovery claims the
+        ``Default/`` folder directly and the adapter is rooted there -- the
+        leading ``Default/`` segment then doubles the path. ``__init__`` must
+        strip that redundant self-name segment and still resolve the file.
+        """
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "Default")
+            os.makedirs(data_dir)
+            fname = "img_channel000_position000_time000000000_z000.tif"
+            expected = np.arange(32 * 48, dtype=np.uint16).reshape(32, 48)
+            tifffile.imwrite(
+                os.path.join(data_dir, fname), expected, photometric="minisblack"
+            )
+            # Keys carry the position-folder prefix, written relative to the root.
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Positions": 1,
+                    "Frames": 1,
+                    "Slices": 1,
+                    "AxisOrder": ["time", "channel", "z", "position"],
+                },
+                f"Coords-Default/{fname}": {
+                    "PositionIndex": 0,
+                    "TimeIndex": 0,
+                    "ChannelIndex": 0,
+                    "SliceIndex": 0,
+                },
+                f"Metadata-Default/{fname}": {"Width": 48, "Height": 32},
+            }
+            with open(os.path.join(data_dir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            # Claimed at the position folder (v1 path fires on its metadata.txt).
+            adapter = MicroManagerLegacyAdapter(data_dir, "mm_v2")
+
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.shape) == [32, 48]
+
+            data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[32, 48]))
+            assert data.shape == (32, 48)
+            np.testing.assert_array_equal(data, expected)
+
+
+class TestOmeZarrStorePathResolution:
+    """One store->path resolver for both call sites (biopb/biopb#530).
+
+    ``__init__`` (find the group/plate ``.zattrs``) and ``_open_level_array``
+    (find the group root a pyramid level hangs off) used to enumerate different
+    store shapes. A store with ``root`` but no ``path`` -- the zarr-3
+    ``LocalStore`` shape -- resolved in the first and fell through to
+    ``str(store)`` in the second, which silently degrades a level read into a
+    CWD-relative open.
+    """
+
+    def test_resolver_covers_every_store_shape(self):
+        from biopb_tensor_server.adapters.ome_zarr import _store_filesystem_path
+
+        class _Store:
+            def __init__(self, repr_str, **attrs):
+                self._repr = repr_str
+                self.__dict__.update(attrs)
+
+            def __repr__(self):
+                return self._repr
+
+        # file:// URL wins over everything (checked first, as __init__ did).
+        assert _store_filesystem_path(_Store("file:///data/p.zarr")) == "/data/p.zarr"
+        # zarr 2: DirectoryStore / FSStore expose .path
+        assert _store_filesystem_path(_Store("<DirectoryStore>", path="/d/a")) == "/d/a"
+        # zarr 3: LocalStore exposes .root -- the case _open_level_array omitted
+        assert _store_filesystem_path(_Store("<LocalStore>", root="/d/b")) == "/d/b"
+        # Nothing recognizable: the repr, same degraded behaviour as before.
+        assert _store_filesystem_path(_Store("<Weird>")) == "<Weird>"
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_both_call_sites_use_the_one_resolver(self, monkeypatch):
+        """Structural: neither site may grow its own store-shape enumeration."""
+        import json
+
+        import zarr
+        from biopb_tensor_server.adapters import ome_zarr as ome_zarr_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, "test.ome.zarr")
+            root = zarr.open_group(zarr_path, mode="w")
+            root.create_dataset("0", shape=(40, 40), chunks=(20, 20), dtype="uint8")
+            root.create_dataset("1", shape=(20, 20), chunks=(10, 10), dtype="uint8")
+            zattrs = {
+                "multiscales": [
+                    {
+                        "name": "t",
+                        "axes": [
+                            {"name": "y", "type": "space"},
+                            {"name": "x", "type": "space"},
+                        ],
+                        "datasets": [
+                            {
+                                "path": "0",
+                                "coordinateTransformations": [
+                                    {"type": "scale", "scale": [1, 1]}
+                                ],
+                            },
+                            {
+                                "path": "1",
+                                "coordinateTransformations": [
+                                    {"type": "scale", "scale": [2, 2]}
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+            with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
+                json.dump(zattrs, f)
+
+            calls = []
+            real = ome_zarr_mod._store_filesystem_path
+
+            def _counting(store):
+                calls.append(store)
+                return real(store)
+
+            monkeypatch.setattr(ome_zarr_mod, "_store_filesystem_path", _counting)
+
+            base = zarr.open_group(zarr_path, mode="r")["0"]
+            adapter = ome_zarr_mod.OmeZarrAdapter(base, "test")
+            assert len(calls) == 1  # __init__
+
+            level = adapter.get_level_adapter("1")
+            assert len(calls) == 2  # _open_level_array
+            assert list(level.get_tensor_descriptor().shape) == [20, 20]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_missing_group_root_raises_instead_of_opening_a_relative_path(self):
+        """Exhausting the walk used to leave "" -> os.path.join("", "1") -> a
+        CWD-relative open: a level read that fails obscurely, or succeeds
+        against an unrelated store."""
+        import zarr
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            arr = zarr.open_array(
+                os.path.join(tmpdir, "bare.zarr"),
+                mode="w",
+                shape=(8, 8),
+                chunks=(4, 4),
+                dtype="uint8",
+            )
+            adapter = OmeZarrAdapter(arr, "bare")
+            # No .zattrs anywhere above the array: no group root to hang "1" off.
+            with pytest.raises(FileNotFoundError, match="group root"):
+                adapter._open_level_array("1")
+
+
+class TestTensorAdapterCacheIsAssignedAtInit:
+    """``_tensor_adapters`` exists from construction, not from first use.
+
+    The scene-adapter caches in ``ome_tiff``/``bioio`` were lazily created on the
+    first ``get_tensor_adapter`` call, so every other reader had to hedge --
+    ``hasattr(self, "_tensor_adapters")`` at the lazy-init, ``getattr(self,
+    "_tensor_adapters", {})`` in ``close()``. Assigning in ``__init__`` removes
+    the hedges and makes the per-instance invariant of biopb/biopb#522 (never a
+    shared class attribute) assertable before any tensor is bound.
+    """
+
+    def test_ome_tiff_cache_is_per_instance_from_construction(self):
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        # __init__ is lazy -- no file is opened, so a nonexistent path is fine.
+        a = OmeTiffAdapter("/nonexistent/a.ome.tif", "a")
+        b = OmeTiffAdapter("/nonexistent/b.ome.tif", "b")
+
+        assert "_tensor_adapters" in vars(a)  # instance dict, not the class
+        assert a._tensor_adapters == {}
+        assert a._tensor_adapters is not b._tensor_adapters
+
+    def test_ome_tiff_close_cascades_without_a_bound_scene(self):
+        """close() reads the cache bare now; an adapter that never served a
+        tensor must still close cleanly rather than AttributeError."""
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        OmeTiffAdapter("/nonexistent/a.ome.tif", "a").close()
+
+    def test_bioio_cache_is_per_instance_from_construction(self):
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+
+        class _FakeBioImage:  # source-level __init__ never reads the image
+            pass
+
+        a = AicsImageIoAdapter(_FakeBioImage(), None, "a", source_url="/a.czi")
+        b = AicsImageIoAdapter(_FakeBioImage(), None, "b", source_url="/b.czi")
+
+        assert "_tensor_adapters" in vars(a)
+        assert a._tensor_adapters == {}
+        assert a._tensor_adapters is not b._tensor_adapters

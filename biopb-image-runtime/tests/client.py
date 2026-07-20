@@ -203,15 +203,16 @@ def streaming(
     try:
         with grpc.insecure_channel(SERVER) as channel:
             stub = proto.ProcessImageStub(channel)
-            response_count = 0
             start_time = time.perf_counter()
 
-            for response in stub.RunStream(
-                _stream_messages(test_image, iterations),
-                metadata=METADATA,
-                timeout=60,
+            for response_count, _response in enumerate(
+                stub.RunStream(
+                    _stream_messages(test_image, iterations),
+                    metadata=METADATA,
+                    timeout=60,
+                ),
+                start=1,
             ):
-                response_count += 1
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
                 print(f"  Response {response_count}: received in {elapsed_ms:.1f}ms")
 

@@ -5,21 +5,22 @@ Handles single DICOM files and multi-file DICOM series using pydicom.
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.adapters._scale import scale_by_label
+from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
 
 
 # =============================================================================
@@ -76,12 +77,50 @@ def _derive_orientation_from_iop(iop: List[float]) -> str:
         return "axial"
 
 
+def _dicom_physical_scale(ds, dim_labels) -> Optional[Tuple[List[float], List[str]]]:
+    """Per-dim physical size (mm) + unit from a DICOM dataset's spatial tags.
+
+    Shared by the single-file and series adapters (both read the same tags off
+    ``ds`` -- the sole file, or the series' first slice). ``PixelSpacing`` is
+    ``[row-spacing, column-spacing]`` in mm, i.e. the Y then X pixel size; the
+    through-plane spacing (``z`` / multi-frame ``frame`` axis) comes from
+    ``SpacingBetweenSlices`` when present, else ``SliceThickness``. Non-spatial
+    axes get ``0.0`` / ``""``. Returns ``None`` when no positive size is present.
+    """
+    row_sp = col_sp = None
+    ps = getattr(ds, "PixelSpacing", None)
+    if ps is not None and len(ps) >= 2:
+        try:
+            row_sp = float(ps[0])
+            col_sp = float(ps[1])
+        except (TypeError, ValueError):
+            row_sp = col_sp = None
+
+    z_sp = None
+    for attr in ("SpacingBetweenSlices", "SliceThickness"):
+        val = getattr(ds, attr, None)
+        if val is None:
+            continue
+        try:
+            z_sp = float(val)
+        except (TypeError, ValueError):
+            z_sp = None
+        if z_sp and z_sp > 0:
+            break
+
+    return scale_by_label(
+        dim_labels,
+        {"y": row_sp, "x": col_sp, "z": z_sp, "frame": z_sp},
+        "mm",
+    )
+
+
 # =============================================================================
 # DicomAdapter - Single file
 # =============================================================================
 
 
-class DicomAdapter(SourceAdapter, TensorAdapter):
+class DicomAdapter(TensorAdapter):
     """Adapter for single DICOM files.
 
     Handles .dcm and .dicom files with pixel data.
@@ -112,7 +151,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 
         # Check extension
         name = ctx.name.lower()
-        if not (name.endswith(".dcm") or name.endswith(".dicom")):
+        if not name.endswith((".dcm", ".dicom")):
             return None
 
         # Cloud-storage phase 2: reading the DICOM header (even
@@ -277,12 +316,19 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         # Serialize IO for thread safety
         with self._io_lock:
             pixel_data = self.ds.pixel_array
             return pixel_data[slices]
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (mm) from this file's ``PixelSpacing`` etc."""
+        return _dicom_physical_scale(self.ds, self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Extract DICOM metadata.
@@ -404,7 +450,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 # =============================================================================
 
 
-class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
+class DicomSeriesAdapter(TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
     Handles directories where multiple DICOM files share the same SeriesInstanceUID.
@@ -664,12 +710,17 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         import pydicom
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])
 
         # Determine output shape
-        out_shape = tuple(int(e - s) for s, e in zip(bounds.start, bounds.stop))
+        out_shape = tuple(
+            int(e - s) for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         dtype = np.dtype(self._dtype)
 
         # Serialize IO for thread safety
@@ -691,6 +742,15 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
                     # Apply spatial slices and assign to result
                     result[i] = pixel_data[slices[1:]]
                 return result
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (mm) from the series' first-slice spatial tags.
+
+        X/Y from ``PixelSpacing``; the ``z`` (slice) axis from
+        ``SpacingBetweenSlices`` / ``SliceThickness`` -- both read off
+        ``_first_ds``, the same slice ``get_metadata`` reports from.
+        """
+        return _dicom_physical_scale(self._first_ds, self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Extract DICOM series metadata.

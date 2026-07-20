@@ -1,23 +1,28 @@
-"""Minimal loopback web UI for observing and controlling the kernel.
+"""Loopback data API backing the observe web UI.
 
-A small web interface (``/observe`` + ``/api/*``) that shows ``execute_code``
-job history with truncated output and exposes global control knobs — interrupt
-the current job (force a KeyboardInterrupt into its thread), hard-restart the
-kernel, and save the session as a notebook. On by default (opt-out via
-``mcp.observe.enabled``).
+The ``/api/*`` calls behind the observe page: ``execute_code`` job history with
+truncated output plus global control knobs — interrupt the current job (force a
+KeyboardInterrupt into its thread), hard-restart the kernel, and save the session
+as a notebook. On by default (opt-out via ``observe.enabled``).
 
-It is hosted in the *MCP server process* (the one that owns the
+The observe **page** itself is served by the control front — it is the React
+``ObservePage`` in the ``web/`` SPA, served at ``/session/<id>/observe`` — and it
+calls back into this API at ``/session/<id>/api/*``, which the control proxies to
+this child. So this module owns only the API; the presentation moved to the
+single web origin (see ``biopb-control`` / ``web/``).
+
+The API is hosted in the *MCP server process* (the one that owns the
 :class:`~biopb_mcp.mcp._kernel.KernelHost`), so controls are direct method calls
 and reads reuse the same in-kernel job round-trip the tools use — no new IPC, and
 no dependence on the dask scheduler/dashboard.
 
 **Mounted on the http server.** :func:`register_http_routes` mounts the routes
 on the *existing* FastMCP Starlette app via ``mcp.custom_route``, so they share
-the MCP loop and port (``mcp.transport.port``) with ``/mcp``. The server is
-http-only (daemon migration, docs/daemon-migration.md), so the UI is always
+the MCP loop and port (``transport.port``) with ``/mcp``. The server is
+http-only (ARCHITECTURE.md, Lifecycle), so the API is always
 available — stdio clients reach it too: they connect through the launcher's
-stdio→http bridge (``mcp/_shim.py``) and so hit ``/observe`` on the shared
-daemon like any other http client. (It was once skipped under a stdio-*serving*
+stdio→http bridge (``mcp/_shim.py``) and so hit ``/api/*`` on the shared daemon
+like any other http client. (It was once skipped under a stdio-*serving*
 launcher, where standing a second uvicorn up inside the protocol process risked
 the fd-1 JSON-RPC channel and raced the one ``KernelHost`` — that launcher no
 longer exists.)
@@ -27,7 +32,11 @@ Host/Origin guard (:func:`_check_origin`) — FastMCP's transport-security only
 wraps the ``/mcp`` mount, not sibling custom routes. The guard reuses the SDK's
 :class:`TransportSecurityMiddleware` host/origin validators with the same
 loopback allowlist as the MCP port. There is no token: loopback bind + Host/Origin
-is the whole boundary (same trust model as the MCP server).
+is the whole boundary (same trust model as the MCP server). When the control
+front proxies these ``/api/*`` calls (``/session/<id>/api/*`` -> this child), that
+trusted loopback hop presents a loopback Host and no Origin, so the guard still
+passes; the SPA derives its API base from ``window.location`` (the
+``/session/<id>`` prefix), so this process needs no knowledge of its prefix.
 """
 
 import functools
@@ -37,7 +46,6 @@ import logging
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.applications import Starlette
 from starlette.responses import (
-    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
     Response,
@@ -78,7 +86,7 @@ def configure(
     """Apply config before registering/serving (idempotent).
 
     ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
-    allowlist (e.g. a reverse-proxy front), mirroring ``mcp.transport``.
+    allowlist (e.g. a reverse-proxy front), mirroring the ``transport`` section.
     """
     global _max_output_chars, _poll_interval_ms, _extra_origins, _extra_hosts
     global _mw
@@ -188,10 +196,6 @@ def _truncate_tail(text):
 # ---------------------------------------------------------------------------
 
 
-async def _observe_page(request):
-    return HTMLResponse(_OBSERVE_HTML.replace("__POLL_MS__", str(_poll_interval_ms)))
-
-
 async def _api_jobs(request):
     host, err = _require_host()
     if err is not None:
@@ -273,13 +277,23 @@ async def _api_status(request):
     host, err = _require_host()
     if err is not None:
         return err
-    return JSONResponse({**host.health(), "headless": _server._headless})
+    # poll_interval_ms rides the status payload so the observe SPA (served by the
+    # control front, not this child) can adopt the launcher-tuned cadence instead
+    # of hardcoding it — the page is now static and can't be server-templated.
+    return JSONResponse(
+        {
+            **host.health(),
+            "headless": _server._headless,
+            "poll_interval_ms": _poll_interval_ms,
+        }
+    )
 
 
-# (path, methods, handler) — shared by the http custom routes and the
-# standalone stdio app so both surfaces are identical.
+# (path, methods, handler) — shared by the http custom routes and the standalone
+# stdio app so both surfaces are identical. The observe *page* is served by the
+# control front (the React ObservePage in web/); this child serves only the
+# /api/* data + control calls that page makes.
 _ROUTES = [
-    ("/observe", ["GET"], _route(_observe_page)),
     ("/api/jobs", ["GET"], _route(_api_jobs)),
     ("/api/jobs/{job_id}", ["GET"], _route(_api_job_detail)),
     ("/api/notebook", ["GET"], _route(_api_notebook)),
@@ -306,7 +320,7 @@ def register_http_routes():
     for path, methods, handler in _ROUTES:
         _server.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
-    logger.info("observe UI mounted on the MCP app at /observe")
+    logger.info("observe API mounted on the MCP app at /api/*")
 
 
 def _build_standalone_app():
@@ -320,277 +334,20 @@ def _build_standalone_app():
 
 
 def describe(mcp_port=None):
-    """Where the observe UI is served, for ``server_status``.
+    """Whether the observe data API is mounted, for ``server_status``.
 
     Returns ``{"running": bool, "url": str | None, "mode": str | None}``. Runs in
     the MCP server process, so it needs no kernel round-trip. ``mcp_port`` is the
-    MCP app's port (the UI shares it).
+    MCP app's port (the API shares it). The observe *page* is served by the
+    control front at ``/session/<id>/observe`` (the React SPA in ``web/``); this
+    child hosts only the ``/api/*`` calls it makes, so ``url`` points at the API
+    root rather than a page.
     """
     if _mounted_http:
         host = f"127.0.0.1:{mcp_port}" if mcp_port else "127.0.0.1"
         return {
             "running": True,
-            "url": f"http://{host}/observe",
-            "mode": "mounted on the MCP app (http)",
+            "url": f"http://{host}/api",
+            "mode": "observe API on the MCP app (http); page served by the control",
         }
     return {"running": False, "url": None, "mode": None}
-
-
-# ---------------------------------------------------------------------------
-# Frontend (single static page; vanilla JS polling, no build step)
-# ---------------------------------------------------------------------------
-
-_OBSERVE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>biopb-mcp · observe</title>
-<style>
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
-  header { padding: 10px 16px; background: #1b1b1b; border-bottom: 1px solid #333;
-           display: flex; align-items: center; gap: 12px; position: sticky; top: 0; }
-  h1 { font-size: 15px; margin: 0; font-weight: 600; }
-  #status { font-size: 12px; color: #9aa; margin-right: auto; }
-  button { font: inherit; padding: 4px 10px; border: 1px solid #444; border-radius: 4px;
-           background: #222; color: #ddd; cursor: pointer; }
-  button:hover { background: #2c2c2c; }
-  button.danger { border-color: #844; }
-  button.primary { background: #1d6b3f; border-color: #2a5; color: #eafff0;
-                   font-weight: 600; margin-right: 6px; }
-  button.primary:hover { background: #25804b; }
-  main { padding: 12px 16px; }
-  .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
-  .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
-  .row:hover { background: #1a1a1a; }
-  .jid { font-weight: 600; }
-  .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; text-transform: uppercase; }
-  .running { background: #243; color: #7e7; }
-  .ok { background: #234; color: #8bf; }
-  .error { background: #422; color: #f99; }
-  .cancelled { background: #432; color: #fc9; }
-  .interrupted { background: #324; color: #c9f; }
-  .preview { color: #8a8; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
-             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
-  .elapsed { color: #888; font-size: 12px; margin-left: auto; }
-  .detail { border-top: 1px solid #333; padding: 10px 12px; display: none; }
-  .job.open .detail { display: block; }
-  .label { color: #6a8; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin: 8px 0 2px; }
-  .label:first-child { margin-top: 0; }
-  pre { white-space: pre-wrap; word-break: break-word; margin: 0;
-        background: #0c0c0c; padding: 8px; border-radius: 4px; max-height: 50vh; overflow: auto;
-        font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-  pre.code { background: #0a0d0a; border-left: 2px solid #2a5; max-height: 30vh; }
-  .meta { color: #888; font-size: 12px; margin-bottom: 4px; }
-  .empty { color: #777; padding: 20px; text-align: center; }
-</style>
-</head>
-<body>
-<header>
-  <h1>biopb-mcp · observe</h1>
-  <span id="status">…</span>
-  <button id="save" class="primary">⤓ Save notebook</button>
-  <button id="interrupt">Interrupt</button>
-  <button id="restart" class="danger">Restart kernel</button>
-</header>
-<main><div id="jobs"><div class="empty">loading…</div></div></main>
-<script>
-const POLL = __POLL_MS__;
-const expanded = new Set();
-const rows = new Map();          // job_id -> row record (DOM kept across polls)
-let lastNewest = null;
-
-function setStatus(t) { document.getElementById('status').textContent = t; }
-
-async function jpost(url) {
-  try {
-    const r = await fetch(url, {method: 'POST'});
-    return await r.json().catch(() => ({}));
-  } catch (e) { return {error: String(e)}; }
-}
-
-// Build a row's stable DOM once; later polls patch text nodes in place (no
-// teardown), which is what kills the per-poll flicker.
-function makeRow(id) {
-  const wrap = document.createElement('div');
-  wrap.className = 'job';
-  wrap.innerHTML =
-      '<div class="row">'
-    +   '<span class="jid">' + id + '</span>'
-    +   '<span class="badge"></span>'
-    +   '<span class="preview"></span>'
-    +   '<span class="elapsed"></span>'
-    + '</div><div class="detail"></div>';
-  const rec = {
-    wrap,
-    badge: wrap.querySelector('.badge'),
-    preview: wrap.querySelector('.preview'),
-    elapsed: wrap.querySelector('.elapsed'),
-    detail: wrap.querySelector('.detail'),
-    status: null, renderedFor: null, built: false,
-  };
-  wrap.querySelector('.row').onclick = () => {
-    if (expanded.has(id)) { expanded.delete(id); wrap.classList.remove('open'); }
-    else { expanded.add(id); wrap.classList.add('open');
-           rec.renderedFor = null; renderDetail(rec, id); }
-  };
-  rows.set(id, rec);
-  return rec;
-}
-
-async function renderDetail(rec, id) {
-  let d;
-  try {
-    const r = await fetch('/api/jobs/' + encodeURIComponent(id));
-    if (!r.ok) return;
-    d = await r.json();
-  } catch (e) { return; }
-
-  if (!rec.built) {              // build skeleton once; updates patch text only
-    rec.detail.innerHTML =
-        (d.code ? '<div class="label">code</div><pre class="code"></pre>' : '')
-      + '<div class="label">output</div><div class="meta"></div><pre class="out"></pre>';
-    rec.codePre = rec.detail.querySelector('pre.code');
-    rec.meta = rec.detail.querySelector('.meta');
-    rec.out = rec.detail.querySelector('pre.out');
-    if (rec.codePre) rec.codePre.textContent = d.code || '';
-    rec.built = true;
-  }
-
-  const note = d.truncated ? ('stdout truncated to last of ' + d.stdout_len + ' chars · ') : '';
-  rec.meta.textContent = note + d.elapsed + 's'
-    + (d.window_alive === false ? ' · viewer window closed' : '');
-
-  const text = ((d.stdout || '')
-    + (d.result_text ? '\\n' + d.result_text : '')
-    + (d.error_text ? '\\n' + d.error_text : '')) || '(no output)';
-  if (rec.out.textContent !== text) {
-    // For a live job, keep the tail visible — but only if the user is already
-    // at the bottom, so scrolling up to read isn't yanked back.
-    const stick = rec.status === 'running'
-      && (rec.out.scrollHeight - rec.out.scrollTop - rec.out.clientHeight < 4);
-    rec.out.textContent = text;
-    if (stick) rec.out.scrollTop = rec.out.scrollHeight;
-  }
-}
-
-async function poll() {
-  let data;
-  try { data = await (await fetch('/api/jobs')).json(); }
-  catch (e) { setStatus('unreachable'); return; }
-  if (data.busy) return;                 // transient; keep current render
-  const jobs = data.jobs || [];
-  const box = document.getElementById('jobs');
-
-  if (!jobs.length) {
-    box.innerHTML = '<div class="empty">no jobs yet</div>';
-    rows.clear(); expanded.clear(); lastNewest = null; return;
-  }
-  const empty = box.querySelector('.empty');
-  if (empty) empty.remove();
-
-  const newest = jobs[jobs.length - 1].job_id;
-  if (newest !== lastNewest) {            // autocollapse all but the newest
-    expanded.clear(); expanded.add(newest); lastNewest = newest;
-  }
-
-  const seen = new Set();
-  let prevEl = null;
-  for (let k = jobs.length - 1; k >= 0; k--) {   // render newest-first
-    const j = jobs[k];
-    seen.add(j.job_id);
-    const rec = rows.get(j.job_id) || makeRow(j.job_id);
-    rec.status = j.status;
-
-    if (rec.badge.textContent !== j.status) {
-      rec.badge.textContent = j.status;
-      rec.badge.className = 'badge ' + j.status;
-    }
-    const el = j.elapsed + 's';
-    if (rec.elapsed.textContent !== el) rec.elapsed.textContent = el;
-    const pv = j.code_preview || '';
-    if (rec.preview.textContent !== pv) rec.preview.textContent = pv;
-
-    const open = expanded.has(j.job_id);
-    rec.wrap.classList.toggle('open', open);
-    // Terminal jobs never change -> render their detail once. Only the running
-    // job is refreshed each poll.
-    if (open && (j.status === 'running' || rec.renderedFor !== j.status)) {
-      renderDetail(rec, j.job_id);
-      rec.renderedFor = j.status;
-    }
-
-    const want = prevEl ? prevEl.nextSibling : box.firstChild;
-    if (rec.wrap !== want) box.insertBefore(rec.wrap, want);
-    prevEl = rec.wrap;
-  }
-
-  for (const [id, rec] of rows) {          // drop rows for evicted jobs
-    if (!seen.has(id)) { rec.wrap.remove(); rows.delete(id); expanded.delete(id); }
-  }
-}
-
-async function pollStatus() {
-  try {
-    const s = await (await fetch('/api/status')).json();
-    const bits = [s.alive ? 'alive' : 'dead'];
-    if (s.headless) bits.push('headless');
-    if (s.busy) bits.push('busy');
-    if (!s.ready) bits.push('starting');
-    setStatus('kernel: ' + bits.join(' · '));
-  } catch (e) { setStatus('unreachable'); }
-}
-
-document.getElementById('save').onclick = async () => {
-  let r;
-  try { r = await fetch('/api/notebook'); }
-  catch (e) { alert('Save failed: ' + e); return; }
-  if (!r.ok) { alert('Save failed (' + r.status + ')'); return; }
-  const blob = await r.blob();
-  const name = r.headers.get('X-Filename') || 'biopb-mcp-session.ipynb';
-
-  // Chromium (secure context, and 127.0.0.1 counts): native Save-As dialog so
-  // the user picks the folder + filename. Firefox/Safari lack it -> prompt for a
-  // name (preset as default) and save to the default download location.
-  if (window.showSaveFilePicker) {
-    let handle;
-    try {
-      handle = await window.showSaveFilePicker({
-        suggestedName: name,
-        types: [{description: 'Jupyter notebook',
-                 accept: {'application/x-ipynb+json': ['.ipynb']}}],
-      });
-    } catch (e) { if (e.name === 'AbortError') return; }   // user cancelled
-    if (handle) {
-      const w = await handle.createWritable();
-      await w.write(blob); await w.close();
-      return;
-    }
-  }
-  const chosen = prompt('Save notebook as:', name);
-  if (chosen === null) return;                              // user cancelled
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = chosen || name;
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
-};
-document.getElementById('interrupt').onclick = async () => {
-  const d = await jpost('/api/kernel/interrupt');
-  if (d && d.interrupted === false && d.status === 'idle') alert('No running job.');
-  poll();
-};
-document.getElementById('restart').onclick = async () => {
-  if (!confirm('Hard-restart the kernel? All variables and layers are lost.')) return;
-  await jpost('/api/kernel/restart');
-  document.getElementById('jobs').innerHTML = '';
-  rows.clear(); expanded.clear(); lastNewest = null; poll();
-};
-
-poll(); pollStatus();
-setInterval(poll, POLL);
-setInterval(pollStatus, POLL);
-</script>
-</body>
-</html>
-"""

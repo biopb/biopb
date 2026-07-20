@@ -23,7 +23,7 @@ def _zarr_available() -> bool:
     try:
         import zarr
 
-        zarr.open_array
+        _ = zarr.open_array
         return True
     except ImportError:
         return False
@@ -34,14 +34,31 @@ def _h5py_available() -> bool:
     return importlib.util.find_spec("h5py") is not None
 
 
-def _bioformats_available() -> bool:
-    """Check if bioformats_jar is available for companion.ome support."""
-    try:
-        import bioformats_jar  # noqa: F401  # availability probe
+# Directory of real vendor samples (CZI/ND2/LIF) for the fixture-gated read
+# tests. BIOPB_TEST_VENDOR_DIR overrides the checked-in default.
+_VENDOR_FIXTURE_DIR = Path(__file__).parent / "data" / "vendor"
 
-        return True
-    except ImportError:
-        return False
+
+def _vendor_fixture(ext: str):
+    """First sample file with the given extension, or None if none provided.
+
+    Looks in $BIOPB_TEST_VENDOR_DIR (if set) then tests/data/vendor/. Returns a
+    path string so a test can read through the real reader plugin, or None so it
+    self-skips when no sample is present.
+    """
+    import os
+
+    roots = []
+    env = os.environ.get("BIOPB_TEST_VENDOR_DIR")
+    if env:
+        roots.append(Path(env))
+    roots.append(_VENDOR_FIXTURE_DIR)
+    for root in roots:
+        if root.is_dir():
+            hits = sorted(root.glob(f"*{ext}"))
+            if hits:
+                return str(hits[0])
+    return None
 
 
 class TestZarrIntegration:
@@ -78,7 +95,7 @@ class TestZarrIntegration:
             assert "zarr-integration" in sources
 
             # Get tensor (source_id matches tensor_id for single-tensor sources)
-            darr = client.get_tensor("zarr-integration", "zarr-integration")
+            darr = client.get_tensor("zarr-integration")
             assert darr.shape == shape
             assert darr.dtype == np.uint8
 
@@ -161,7 +178,6 @@ class TestZarrIntegration:
             # Test stride downsampling
             darr = client.get_tensor(
                 "zarr-scaled",
-                "zarr-scaled",
                 scale_hint=[2, 2],
                 reduction_method="stride",
             )
@@ -206,7 +222,6 @@ class TestOmeZarrIntegration:
 
             # Test precompute method for scale 2
             darr = client.get_tensor(
-                "ome-zarr-integration",
                 "ome-zarr-integration",
                 scale_hint=[2, 2],
                 reduction_method="precompute",
@@ -254,7 +269,6 @@ class TestOmeZarrIntegration:
 
             # Request scale 3 - no matching level, should use virtual scaling
             darr = client.get_tensor(
-                "ome-zarr-virtual",
                 "ome-zarr-virtual",
                 scale_hint=[3, 3],
                 reduction_method="nearest",
@@ -334,8 +348,8 @@ class TestOmeZarrIntegration:
             # A normal get_tensor (with_metadata=False) populates the cached
             # descriptor's summary; get_physical_scale reads it with no extra
             # full-OME fetch.
-            client.get_tensor("phys", "phys")
-            scale, unit = client.get_physical_scale("phys", "phys")
+            client.get_tensor("phys")
+            scale, unit = client.get_physical_scale("phys")
             assert list(scale) == [0.5, 0.25]
             assert list(unit) == ["micrometer", "micrometer"]
 
@@ -364,23 +378,23 @@ class TestOmeZarrIntegration:
             client = TensorFlightClient(
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
-            client.get_tensor("plain", "plain")
-            assert client.get_physical_scale("plain", "plain") is None
+            client.get_tensor("plain")
+            assert client.get_physical_scale("plain") is None
             client.close()
         finally:
             server.shutdown()
 
 
 class TestOmeTiffIntegration:
-    """Integration tests for OME-TIFF files (now handled by AicsImageIoAdapter)."""
+    """Integration tests for OME-TIFF files (now handled by OmeTiffAdapter)."""
 
     def test_tiled_tiff_read(self, tiled_ome_tiff):
         """Test reading from tiled OME-TIFF through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-integration")
+        adapter = OmeTiffAdapter(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -398,12 +412,12 @@ class TestOmeTiffIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor("ome-tiff-integration", scene_id)
+            # scene_id is the source-qualified array_id (e.g. 'ome-tiff-integration/Image:0')
+            darr = client.get_tensor(scene_id)
 
-            # AICSImage uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
+            # OME-TIFF uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
             # Original fixture creates (C, Y, X) = (3, 128, 128) with CYX axes
-            # aicsimageio interprets this as T=1, C=3, Z=1, Y=128, X=128
+            # interpreted as T=1, C=3, Z=1, Y=128, X=128
             expected_shape = (1, 3, 1, 128, 128)
             assert darr.shape == expected_shape
             assert darr.dtype == np.uint16
@@ -421,11 +435,11 @@ class TestOmeTiffIntegration:
 
     def test_channel_access(self, tiled_ome_tiff):
         """Test accessing different channels through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-channels")
+        adapter = OmeTiffAdapter(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -443,8 +457,8 @@ class TestOmeTiffIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor("ome-tiff-channels", scene_id)
+            # scene_id is the source-qualified array_id (e.g. 'ome-tiff-channels/Image:0')
+            darr = client.get_tensor(scene_id)
 
             # Read channel 0 (value = 1) - C axis is index 1 in TCZYX
             data0 = darr[0:1, 0:1].compute()
@@ -462,17 +476,77 @@ class TestOmeTiffIntegration:
         finally:
             server.shutdown()
 
+    def test_read_path_never_parses_ome_model(self, tmp_path):
+        """biopb/biopb#213: end-to-end, GetFlightInfo + DoGet over a registered
+        OME-TIFF must not trigger a heavy bioio (BioImage) reader parse.
+
+        A tripwire is installed on the registered adapter's ``_bio_image`` AFTER
+        registration, then a full client round-trip drives GetFlightInfo (via the
+        #350 ``plan_flight_info`` seam, which also fills the physical scale) and
+        DoGet. Physical scale carries real units, proving the whole chain --
+        descriptor, physical scale, and pixels -- is served from tifffile.
+        """
+        import tifffile
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        class _Tripwire:
+            def __getattr__(self, name):
+                raise AssertionError(
+                    f"heavy reader (BioImage) touched on read path: .{name}"
+                )
+
+        path = str(tmp_path / "e2e.ome.tif")
+        data = np.zeros((3, 64, 64), np.uint16)
+        for c in range(3):
+            data[c] = c + 1
+        tifffile.imwrite(
+            path,
+            data,
+            photometric="minisblack",
+            metadata={
+                "axes": "CYX",
+                "PhysicalSizeX": 0.325,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": 0.325,
+                "PhysicalSizeYUnit": "µm",
+            },
+        )
+        adapter = OmeTiffAdapter(path, "ome213")
+        array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("ome213", adapter)
+        server.mark_ready()
+        adapter._bio_image = _Tripwire()  # any OME parse from here is a failure
+        try:
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
+            darr = client.get_tensor(array_id)  # GetFlightInfo (array_id addressing)
+            assert darr.shape == (1, 3, 1, 64, 64)
+
+            scale, unit = client.get_physical_scale(array_id)
+            assert list(scale) == [0.0, 0.0, 0.0, 0.325, 0.325]
+            assert list(unit) == ["", "", "", "µm", "µm"]
+
+            data = darr[:1, 1:2, :1, :32, :32].compute()  # DoGet
+            assert data.shape == (1, 1, 1, 32, 32)
+            assert (data == 2).all()  # channel 1 -> value 2
+            client.close()
+        finally:
+            server.shutdown()
+
 
 class TestMultiSeriesOmeTiffIntegration:
-    """Integration tests for multi-series OME-TIFF with server/client (now handled by AicsImageIoAdapter)."""
+    """Integration tests for multi-series OME-TIFF with server/client (now handled by OmeTiffAdapter)."""
 
     def test_multi_series_list_tensors(self, multi_series_ome_tiff):
         """Test listing all series as tensors in multi-series OME-TIFF."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-test")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-test")
 
         # List all tensors (series)
         descriptors = adapter.list_tensor_descriptors()
@@ -484,11 +558,11 @@ class TestMultiSeriesOmeTiffIntegration:
 
     def test_multi_series_tensor_access(self, multi_series_ome_tiff):
         """Test accessing specific series via get_tensor_adapter."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-access")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
         descriptors = adapter.list_tensor_descriptors()
@@ -499,18 +573,18 @@ class TestMultiSeriesOmeTiffIntegration:
             series_adapter = adapter.get_tensor_adapter(scene_id)
             desc = series_adapter.get_tensor_descriptor()
 
-            # Verify shape matches expected (aicsimageio uses TCZYX order)
+            # Verify shape matches expected (OME-TIFF uses TCZYX order)
             assert len(desc.shape) == 5  # T, C, Z, Y, X
             assert desc.shape[3] == 64  # height
             assert desc.shape[4] == 64  # width
 
     def test_multi_series_server_client(self, multi_series_ome_tiff):
         """Test reading from multi-series OME-TIFF through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-server")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multi-series-server", adapter)
@@ -532,12 +606,12 @@ class TestMultiSeriesOmeTiffIntegration:
             descriptors = adapter.list_tensor_descriptors()
             first_scene_id = descriptors[0].array_id
 
-            # Get first series tensor - tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor("multi-series-server", first_scene_id)
+            # first_scene_id is the source-qualified array_id (e.g. 'multi-series-server/Image:0')
+            darr = client.get_tensor(first_scene_id)
 
             # Read data
             data = darr.compute()
-            # aicsimageio uses TCZYX order: (T, C, Z, Y, X)
+            # OME-TIFF uses TCZYX order: (T, C, Z, Y, X)
             # Fixture uses CYX axes, so C=2, Z=1
             assert data.shape[1] == 2  # C planes per series (from CYX first axis)
 
@@ -549,13 +623,13 @@ class TestMultiSeriesOmeTiffIntegration:
             server.shutdown()
 
     def test_lazy_tile_loading(self, multi_series_ome_tiff):
-        """Test that aicsimageio provides tile-level lazy loading."""
+        """Test that the OME-TIFF adapter provides tile-level lazy loading."""
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "lazy-tile-test")
+        adapter = OmeTiffAdapter(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
         descriptors = adapter.list_tensor_descriptors()
@@ -573,74 +647,21 @@ class TestMultiSeriesOmeTiffIntegration:
 
 
 class TestCompanionOmeIntegration:
-    """Integration tests for companion OME files (claimed by OmeTiffAdapter; read
-    via aicsimageio/bioformats)."""
+    """`.companion.ome` support was dropped when OmeTiffAdapter went pure-tifffile
+    (it was bioformats-only, with no tifffile path). It is no longer claimed."""
 
-    @pytest.mark.skipif(
-        not _bioformats_available(), reason="bioformats_jar not available"
-    )
-    def test_companion_claim(self, companion_ome_dataset):
-        """Test claiming companion.ome file."""
-        # .companion.ome is handled by OmeTiffAdapter (the generic
-        # AicsImageIoAdapter excludes it); the claim parses the OME-XML and groups
-        # the referenced TIFFs into one multi-file source.
+    def test_companion_ome_is_not_claimed(self, companion_ome_dataset):
+        # The pure-tifffile OmeTiffAdapter declines .companion.ome (only tifffile
+        # embedded-OME-XML is supported); the generic AicsImageIoAdapter also
+        # excludes it. So a companion sidecar is claimed by no one.
         from pathlib import Path
 
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
-        companion_path, tiff_files, metadata_info = companion_ome_dataset
-
-        # Test claim method
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
-
+        companion_path, _tiff_files, _metadata_info = companion_ome_dataset
         ctx = ClaimContext(Path(companion_path))
-        state = DiscoveryState()
-        claim = OmeTiffAdapter.claim(ctx, state)
-        assert claim is not None
-        assert claim.source_type == "ome-tiff"
-        # Primary path is the first referenced TIFF (the master), not the
-        # companion sidecar.
-        assert str(claim.primary_path) == tiff_files[0]
-        # The companion sidecar and every referenced TIFF are consumed (tracked
-        # via try_claim_path).
-        assert companion_path in state.consumed_paths
-        for tiff_file in tiff_files:
-            assert tiff_file in state.consumed_paths
-
-    @pytest.mark.skipif(
-        not _bioformats_available(), reason="bioformats_jar not available"
-    )
-    def test_companion_data_access(self, companion_ome_dataset):
-        """Test reading data from companion OME dataset."""
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
-
-        companion_path, tiff_files, metadata_info = companion_ome_dataset
-
-        # Create adapter from companion file
-        adapter = AicsImageIoAdapter.create_from_url(companion_path, "companion-test")
-
-        # Get first series
-        descriptors = adapter.list_tensor_descriptors()
-        assert len(descriptors) > 0
-
-        # Read data. The companion OME-XML yields a full TCZYX tensor (the
-        # referenced TIFFs stack along Z), so read by the descriptor's own shape
-        # and locate the Z axis by label rather than assuming a 3-D layout.
-        desc = descriptors[0]
-        series_adapter = adapter.get_tensor_adapter(desc.array_id)
-
-        shape = list(desc.shape)
-        dim_labels = list(desc.dim_labels)
-        bounds = ChunkBounds(start=[0] * len(shape), stop=shape)
-        data = series_adapter.get_data(bounds)
-        assert tuple(data.shape) == tuple(shape)
-
-        z_axis = dim_labels.index("Z")
-        assert shape[z_axis] == metadata_info["n_files"]
-        # The first plane along Z comes from data_001.tif (filled with value 1).
-        first_plane = data.take(indices=0, axis=z_axis)
-        assert first_plane.mean() == 1
+        assert OmeTiffAdapter.claim(ctx, DiscoveryState()) is None
 
 
 class TestHdf5Integration:
@@ -671,12 +692,51 @@ class TestHdf5Integration:
                     f"grpc://localhost:{server.port}", cache_bytes=10_000_000
                 )
 
-                darr = client.get_tensor("hdf5-integration", "hdf5-integration")
+                darr = client.get_tensor("hdf5-integration")
                 assert darr.shape == shape
 
                 data = darr.compute()
                 assert data.shape == shape
 
+                client.close()
+            finally:
+                server.shutdown()
+
+    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
+    def test_hdf5_element_size_um_reaches_client(self, temp_dir):
+        """An ilastik/Imaris element_size_um attribute rides the descriptor to
+        the client as physical_scale (issue #272)."""
+        import os
+
+        import h5py
+        import numpy as np
+        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+        h5_path = os.path.join(temp_dir, "calibrated.h5")
+        with h5py.File(h5_path, "w") as f:
+            dset = f.create_dataset(
+                "data", data=np.zeros((4, 16, 16), dtype="uint8"), chunks=(1, 16, 16)
+            )
+            dset.attrs["element_size_um"] = np.array([2.0, 0.25, 0.25])
+
+        with h5py.File(h5_path, "r") as f:
+            adapter = Hdf5Adapter(f["data"], "cal", ["z", "y", "x"])
+
+            server = TensorFlightServer("grpc://localhost:0")
+            server.register_source("cal", adapter)
+            server.mark_ready()
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                client = TensorFlightClient(
+                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+                )
+                client.get_tensor("cal")
+                scale, unit = client.get_physical_scale("cal")
+                assert list(scale) == [2.0, 0.25, 0.25]
+                assert list(unit) == ["µm", "µm", "µm"]
                 client.close()
             finally:
                 server.shutdown()
@@ -715,7 +775,7 @@ class TestCacheIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            darr = client.get_tensor("cache-test", "cache-test")
+            darr = client.get_tensor("cache-test")
 
             # First read
             data1 = darr[: chunks[0], : chunks[1]].compute()
@@ -761,7 +821,7 @@ class TestCacheIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            darr = client.get_tensor("cache-regions", "cache-regions")
+            darr = client.get_tensor("cache-regions")
 
             # Read first chunk
             darr[: chunks[0], : chunks[1]].compute()
@@ -808,7 +868,7 @@ class TestConcurrentAccess:
             client = TensorFlightClient(
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
-            darr = client.get_tensor("concurrent-test", "concurrent-test")
+            darr = client.get_tensor("concurrent-test")
             data = darr[: chunks[0], : chunks[1]].compute()
             results.append((client_id, data.mean()))
             client.close()
@@ -830,13 +890,167 @@ class TestConcurrentAccess:
             raise
 
 
+class TestBioioReadPath:
+    """Exercise the bioio *read* path, not just claim() routing.
+
+    Reading through bioio needs the matching ``bioio-*`` reader plugin installed;
+    a missing one surfaces here as ``UnsupportedFileFormatError`` rather than
+    silently at runtime. In particular ``bioio-ome-tiff`` claims ONLY OME-TIFF,
+    so plain TIFF and Zeiss LSM depend on ``bioio-tifffile`` -- the coverage gap
+    that let that plugin get dropped from the ``[aics]`` extra once.
+    """
+
+    def _read_full(self, path, adapter_cls=None):
+        """Register a file as a bioio source and read its first tensor whole.
+
+        ``adapter_cls`` selects the concrete adapter to read through -- the
+        generic ``AicsImageIoAdapter`` by default, or a vendor subclass
+        (``ZeissAdapter`` etc.) to exercise the exact class discovery would
+        route a real file to. The read itself lives on the shared base, so the
+        subclass only matters for provenance; the companion claim assertion
+        (``_assert_claims``) is what pins the routing.
+        """
+        from bioio import BioImage
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+
+        adapter_cls = adapter_cls or AicsImageIoAdapter
+        src = adapter_cls(
+            BioImage(path), scene_index=None, source_id="s", source_url=path
+        )
+        descs = src.list_tensor_descriptors()
+        assert descs, "bioio produced no tensor descriptors"
+        scene = src.get_tensor_adapter(descs[0].array_id)
+        desc = scene.get_tensor_descriptor()
+        data = scene.get_data(
+            ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
+        )
+        return desc, data
+
+    @staticmethod
+    def _assert_claims(path, adapter_cls, source_type):
+        """The vendor adapter claims the extension and tags the right type."""
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+
+        claim = adapter_cls.claim(ClaimContext(Path(path)), DiscoveryState())
+        assert claim is not None, f"{adapter_cls.__name__} did not claim {path}"
+        assert claim.source_type == source_type
+
+    def test_plain_tiff_read_via_bioio(self, tmp_path):
+        """Plain (non-OME) TIFF reads through bioio-tifffile (the generic
+        AicsImageIoAdapter fallback path)."""
+        import tifffile
+
+        arr = np.arange(5 * 8 * 8, dtype=np.uint16).reshape(5, 8, 8)
+        path = str(tmp_path / "plain.tif")
+        tifffile.imwrite(path, arr)
+
+        desc, data = self._read_full(path)
+        assert tuple(data.shape) == tuple(desc.shape)  # data matches its descriptor
+        assert data.dtype == np.uint16
+        # Pixels round-trip. bioio may permute or insert singleton axes, so
+        # compare value multisets rather than a fixed layout.
+        np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
+
+    def test_lsm_read_via_bioio(self, tmp_path):
+        """Zeiss .lsm (a TIFF variant) reads through bioio-tifffile -- the path
+        ZeissAdapter takes for .lsm. Guards the bioio-tifffile dependency."""
+        import tifffile
+
+        arr = np.arange(5 * 8 * 8, dtype=np.uint16).reshape(5, 8, 8)
+        path = str(tmp_path / "img.lsm")
+        tifffile.imwrite(path, arr)
+
+        desc, data = self._read_full(path)
+        assert tuple(data.shape) == tuple(desc.shape)
+        np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
+
+    def test_dv_read_via_bioio(self, tmp_path):
+        """DeltaVision .dv reads through bioio-dv (its ``mrc`` backend), the
+        path DvAdapter takes. Guards the bioio-dv dependency.
+
+        DV is the one true vendor format here that a Python lib can *write*
+        (``mrc.imwrite``, which bioio-dv also reads through), so it gets real,
+        self-contained read-path coverage in CI -- CZI/ND2/LIF have no open
+        writer and are fixture-gated below.
+        """
+        pytest.importorskip("bioio_dv")
+        mrc = pytest.importorskip("mrc")  # bioio-dv's reader backend
+        from biopb_tensor_server.adapters.bioio import DvAdapter
+
+        # A Z-stack keeps the mrc header at C=1 (a bare 3-D block is otherwise
+        # mis-read as 3 channels with mismatched coordinate metadata).
+        arr = np.arange(5 * 16 * 16, dtype=np.int16).reshape(5, 16, 16)
+        path = str(tmp_path / "sample.dv")
+        mrc.imwrite(path, arr)
+
+        self._assert_claims(path, DvAdapter, "dv")
+        desc, data = self._read_full(path, DvAdapter)
+        assert tuple(data.shape) == tuple(desc.shape)
+        assert desc.dtype == np.dtype(np.int16).str
+        np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
+
+    # ---- Fixture-gated true-vendor formats (no open writer) ----------------
+    #
+    # CZI, ND2 and LIF have no Python library that writes a file their bioio
+    # plugin will read back faithfully (a synthesized CZI, for instance, lacks
+    # the Scenes / Channel / Pixels metadata bioio-czi's OME transform demands
+    # and fails validation), so these can only be exercised against a real
+    # sample. Drop tiny samples in a directory and point BIOPB_TEST_VENDOR_DIR
+    # at it (or the default tests/data/vendor/) and the matching test reads one
+    # through its adapter; otherwise it self-skips. This is the hook the planned
+    # installer-wheel-coverage CI provisions fixtures for (issue #361).
+
+    @pytest.mark.parametrize(
+        "plugin, ext, source_type",
+        [
+            ("bioio_czi", ".czi", "zeiss"),
+            ("bioio_nd2", ".nd2", "nikon"),
+            ("bioio_lif", ".lif", "leica"),
+        ],
+    )
+    def test_vendor_fixture_read_via_bioio(self, plugin, ext, source_type):
+        """A real CZI/ND2/LIF sample claims + reads through its adapter.
+
+        Skips cleanly when the plugin is absent (slim install) or no sample is
+        provisioned, so it never fails spuriously -- but catches a dropped
+        plugin the moment a fixture is present.
+        """
+        pytest.importorskip(plugin)
+        from biopb_tensor_server.adapters.bioio import (
+            LeicaAdapter,
+            NikonAdapter,
+            ZeissAdapter,
+        )
+
+        adapter_cls = {
+            "zeiss": ZeissAdapter,
+            "nikon": NikonAdapter,
+            "leica": LeicaAdapter,
+        }[source_type]
+
+        path = _vendor_fixture(ext)
+        if path is None:
+            pytest.skip(
+                f"no *{ext} sample found (set BIOPB_TEST_VENDOR_DIR or add one "
+                f"to {_VENDOR_FIXTURE_DIR})"
+            )
+
+        self._assert_claims(path, adapter_cls, source_type)
+        desc, data = self._read_full(path, adapter_cls)
+        # Descriptor and read agree, the read is non-trivial, and dtype matches.
+        assert tuple(data.shape) == tuple(desc.shape)
+        assert data.size > 0
+        assert data.dtype.str == desc.dtype
+
+
 class TestAicsImageIoAdapterClaim:
     """Tests for AicsImageIoAdapter.claim() scope limits."""
 
     def test_claim_generic_files_rejected(self):
         """Generic file types (txt, csv, cfg) should not be claimed."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Test various generic file types that bioformats supports
@@ -852,11 +1066,14 @@ class TestAicsImageIoAdapterClaim:
 
     def test_microscopy_files_always_claimed(self):
         """Microscopy/scientific extensions are claimed regardless of the flag."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            for ext in [".tif", ".tiff", ".mrc", ".ims", ".fits", ".nrrd"]:
+            # NOTE: .mrc/.mrcs are intentionally absent -- no bioio plugin can read
+            # a plain cryo-EM MRC, so they are owned by MrcAdapter now, not this
+            # generic bioio adapter (biopb/biopb#94; see test_mrc_not_claimed).
+            for ext in [".tif", ".tiff", ".ims", ".fits", ".nrrd"]:
                 path = Path(tmpdir) / f"test{ext}"
                 path.write_bytes(b"\x00")  # Dummy content
 
@@ -867,11 +1084,28 @@ class TestAicsImageIoAdapterClaim:
                 assert claim is not None, f"AicsImageIoAdapter should claim {ext} files"
                 assert claim.source_type == "aics"
 
+    def test_mrc_not_claimed(self):
+        """MRC is NOT claimed by the generic bioio adapter (biopb/biopb#94).
+
+        No installed bioio plugin can read a plain cryo-EM MRC, so claiming it
+        here produced a claim-then-error. MRC is owned by MrcAdapter, which is
+        registered ahead of the bioio adapters.
+        """
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for ext in [".mrc", ".mrcs"]:
+                path = Path(tmpdir) / f"test{ext}"
+                path.write_bytes(b"\x00")
+                claim = AicsImageIoAdapter.claim(ClaimContext(path), DiscoveryState())
+                assert claim is None, f"bioio must not claim {ext}"
+
     def test_generic_images_rejected_by_default(self):
         """Generic raster/video must NOT be claimed during discovery by default
         (biopb/biopb#40) — they flood the catalog with screenshots/icons/movies."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             for ext in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".mp4", ".mov"]:
@@ -888,11 +1122,11 @@ class TestAicsImageIoAdapterClaim:
 
     def test_generic_images_claimed_when_opted_in(self):
         """With claim_generic_images enabled, generic raster/video are claimed."""
-        from biopb_tensor_server.adapters.aicsimageio import (
+        from biopb_tensor_server.adapters.bioio import (
             AicsImageIoAdapter,
             set_claim_generic_images,
         )
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         set_claim_generic_images(True)
         try:

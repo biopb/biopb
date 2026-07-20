@@ -1,7 +1,7 @@
 """Tests for periodic rescan watcher behavior."""
 
 import pytest
-from biopb_tensor_server.watcher import (
+from biopb_tensor_server.sources.watcher import (
     PeriodicRescanWatcher,
     WatcherEventType,
     get_watcher,
@@ -12,10 +12,12 @@ def test_periodic_watcher_emits_rescan_after_interval(monkeypatch, tmp_path):
     current_time = {"value": 100.0}
 
     monkeypatch.setattr(
-        "biopb_tensor_server.watcher.time.monotonic",
+        "biopb_tensor_server.sources.watcher.time.monotonic",
         lambda: current_time["value"],
     )
-    monkeypatch.setattr("biopb_tensor_server.watcher.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "biopb_tensor_server.sources.watcher.time.sleep", lambda _: None
+    )
 
     # initial_immediate=False: testing the steady-state cadence (first tick after
     # one interval), not the progressive-discovery immediate-first-tick.
@@ -38,10 +40,12 @@ def test_periodic_watcher_emits_immediately_by_default(monkeypatch, tmp_path):
     current_time = {"value": 100.0}
 
     monkeypatch.setattr(
-        "biopb_tensor_server.watcher.time.monotonic",
+        "biopb_tensor_server.sources.watcher.time.monotonic",
         lambda: current_time["value"],
     )
-    monkeypatch.setattr("biopb_tensor_server.watcher.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "biopb_tensor_server.sources.watcher.time.sleep", lambda _: None
+    )
 
     watcher = PeriodicRescanWatcher(rescan_interval=30.0)  # default immediate
     watcher.start({tmp_path})
@@ -81,10 +85,12 @@ def test_periodic_watcher_reschedules_after_emit(monkeypatch, tmp_path):
     current_time = {"value": 50.0}
 
     monkeypatch.setattr(
-        "biopb_tensor_server.watcher.time.monotonic",
+        "biopb_tensor_server.sources.watcher.time.monotonic",
         lambda: current_time["value"],
     )
-    monkeypatch.setattr("biopb_tensor_server.watcher.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "biopb_tensor_server.sources.watcher.time.sleep", lambda _: None
+    )
 
     watcher = PeriodicRescanWatcher(rescan_interval=2.0, initial_immediate=False)
     watcher.start({tmp_path})

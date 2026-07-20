@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters.nifti import NiftiAdapter
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 # Every test here builds/reads NIfTI via nibabel (the [nifti]/[medical] extra);
 # skip the whole module when it is not installed rather than erroring.
@@ -120,6 +120,52 @@ class TestNiftiAdapterClaim:
             claim = NiftiAdapter.claim(ctx, state)
 
             assert claim is None
+
+
+class TestNiftiAdapterClose:
+    """close() reclaims a remote source's downloaded temp file (biopb/biopb#71)."""
+
+    def test_close_unlinks_temp_file(self):
+        import nibabel as nib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nii_path = Path(tmpdir) / "downloaded.nii"
+            create_synthetic_nifti(nii_path)
+
+            # What create_from_config's remote branch builds: an adapter serving
+            # out of a NamedTemporaryFile(delete=False) nothing else removes.
+            adapter = NiftiAdapter(
+                nib.load(str(nii_path)), "remote_source", temp_file=nii_path
+            )
+            adapter.close()
+
+            assert not nii_path.exists()
+            adapter.close()  # idempotent
+
+    def test_read_after_close_fails_loudly(self):
+        """Same RuntimeError NdTiffAdapter raises -- not an AttributeError on the
+        nulled image reference, which is what a bare read would surface."""
+        import nibabel as nib
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nii_path = Path(tmpdir) / "closed.nii"
+            create_synthetic_nifti(nii_path, shape=(8, 8, 4))
+
+            adapter = NiftiAdapter(nib.load(str(nii_path)), "s")
+            adapter.close()
+            with pytest.raises(RuntimeError, match="closed"):
+                adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[8, 8, 4]))
+
+    def test_close_leaves_a_local_source_file_alone(self):
+        import nibabel as nib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nii_path = Path(tmpdir) / "local.nii"
+            create_synthetic_nifti(nii_path)
+
+            NiftiAdapter(nib.load(str(nii_path)), "local_source").close()
+            assert nii_path.exists()
 
 
 class TestNiftiAdapter:

@@ -11,15 +11,24 @@ description = "BioPB Tensor Arrow Flight server for multi-dimensional array stor
 readme = "README.md"
 license = "MIT"
 dependencies = [
-  "biopb",
+  # Floor: the cache ProcessLock imports biopb._lifecycle.proc (process identity primitive),
+  # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
+  # tree, so this floor is documentation for any non-workspace install path.
+  "biopb >= 0.7.0",
   "pyarrow >= 14.0.0",
-  "zarr >= 2.0.0",
+  "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port. See docs/aicsimageio-to-bioio-migration.md
   "dask[array] >= 2024.0.0",
   "cachey >= 0.1.0",  # required by biopb.tensor.client (SDK TensorFlightClient); the SDK only declares it under its [tensor] extra, which we don't pull
   "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FSStore
-  "tifffile >= 2021.8.30",
-  "numpy < 2.0",
-  "scipy < 1.16",  # scipy >=1.16 requires numpy>=2.0; pulled in transitively via dask[array]'s scipy.sparse import. Keep aligned with the numpy<2.0 pin above.
+  # Lower bound: numpy-2 safe (older tifffile called the removed ndarray.newbyteorder).
+  # Upper bound: tifffile 2025.5.21 dropped Zarr 2 support and requires Zarr 3
+  # (2025.5.10 is the last release that reads via a Zarr-2 store). OmeTiffAdapter's
+  # read path opens series.aszarr() as a Zarr-2 store, matching the zarr<3 pin
+  # above, so tifffile must stay on the Zarr-2 line. See
+  # docs/aicsimageio-to-bioio-migration.md.
+  "tifffile >= 2024.8.10, < 2025.5.21",
+  "numpy",
+  "scipy",
   "typer >= 0.12.0",
   "tomli >= 2.0.0; python_version < '3.11'",
   "duckdb",
@@ -44,12 +53,35 @@ dependencies = [
     # so the dependency list stays defined once, in [web].
     "biopb-tensor-server[web]",
   ]
+  # Vendor microscopy formats via bioio (successor to aicsimageio). Each reader
+  # is its own plugin with modern, uncapped deps, so none re-imposes the
+  # numpy<2 / tifffile<2023.3.15 caps aicsimageio did. See
+  # docs/aicsimageio-to-bioio-migration.md.
   aics = [
-    "aicsimageio >= 4.0.0",
-    "aicspylibczi >= 3.1.1",
-    "readlif >= 0.6.4",
-    "aicsimageio[nd2]",
-    "aicsimageio[dv]",
+    "bioio >= 3.0",
+    "bioio-lif",       # Leica LIF (readlif)
+    "bioio-nd2",       # Nikon ND2
+    "bioio-dv",        # DeltaVision DV (mrc)
+    "bioio-tifffile",  # plain/non-OME TIFF and Zeiss LSM (ZeissAdapter's .lsm path)
+    "bioio-ome-tiff",  # remote/exotic OME-TIFF the pure-tifffile OmeTiffAdapter declines
+    "bioio-imageio",   # generic raster/video fallback
+    # bioio-czi (Zeiss CZI) is carved into its own [czi] extra, NOT bundled here:
+    # its pylibczirw dep ships no Intel-macOS wheel, so bundling it would
+    # source-build libCZI (and fail) on every Intel Mac. install.sh adds [czi] on
+    # all platforms except Intel macOS; a direct install that wants CZI uses [aics,czi].
+    # NOTE: bioio-ome-zarr is deliberately NOT listed. (1) It is redundant --
+    # biopb reads OME-Zarr/Zarr via its own OmeZarrAdapter/ZarrAdapter, which win
+    # in the registry ahead of the generic bioio fallback, so a .zarr store never
+    # reaches a bioio reader. (2) It requires zarr>=3, which collides with the
+    # zarr<3 pin above; adopting it is the same trigger as the deferred zarr 2->3
+    # port. See docs/aicsimageio-to-bioio-migration.md.
+  ]
+  # Zeiss CZI reader, split out of [aics]: bioio-czi -> pylibczirw publishes
+  # arm64-macOS / Linux / Windows wheels but NO Intel-macOS wheel (any version),
+  # so on an Intel Mac it would compile libCZI from source and fail. The installers
+  # add this everywhere except Intel macOS. See docs/aicsimageio-to-bioio-migration.md.
+  czi = [
+    "bioio-czi",
   ]
   ndtiff = [
     "ndtiff >= 3.0.0",
@@ -65,7 +97,7 @@ dependencies = [
   # reader (ZVI, ...). A JDK is NOT a build/system dependency: scyjava + cjdk
   # download a small, user-cached JDK on first read.
   bioformats = [
-    "bioformats_jar",
+    "bioio-bioformats",
     "scyjava >= 1.9.0",
     "cjdk >= 0.5.0",
   ]
@@ -79,6 +111,22 @@ dependencies = [
     "pydicom >= 2.4.0",
     "nibabel >= 5.0.0",
   ]
+  # Akoya PhenoImager QPTIFF (.qptiff): read via tifffile (a core dep), but its
+  # compressed tiles (JPEG/LZW) decode through imagecodecs. Registration is gated
+  # on imagecodecs (adapters/__init__.py), so this extra is what turns QPTIFF
+  # support on. See biopb/biopb#135.
+  qptiff = [
+    "imagecodecs >= 2023.1.23",
+  ]
+  # Electron-microscopy formats: MRC (.mrc/.mrcs/.rec/.st/.map) and EMD (.emd,
+  # both Berkeley/NCEM and Velox/ThermoFisher). One reader covers all of them:
+  # rosettasciio is HyperSpy's I/O backend, extracted to stand alone (no hyperspy
+  # dep). Its EMD lazy path forwards the native HDF5 chunk grid; MRC is parsed
+  # from rosettasciio's header and served from an own np.memmap. The [hdf5] extra
+  # pulls h5py for the EMD path.
+  em = [
+    "rosettasciio[hdf5]",
+  ]
 
 [project.scripts]
   biopb-tensor-server = "biopb_tensor_server.cli:app"
@@ -87,11 +135,17 @@ dependencies = [
 where = ["."]
 include = ["biopb_tensor_server*"]
 
-# Version derived from git tags (server-vX.Y.Z format)
+# Version derived from git tags (server-vX.Y.Z tensor-server tag)
 [tool.setuptools_scm]
 version_file = "biopb_tensor_server/_version.py"
 root = ".."
-tag_regex = "^server-v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+# The tensor server has its OWN version line, keyed to the per-package tag
+# `server-v*` — its Docker image is cut on that tag by tensor-server-ci, on its
+# own cadence, independent of the product `release-v*` bundle and the SDK `v*`
+# line. `.+` so a prerelease (`server-v0.11.0rc1`) is captured, not just X.Y.Z.
+# The `--match` below keeps `git describe` from grabbing the nearest tag of
+# another prefix (`release-v*` / the SDK's `v*`) and mis-versioning the wheel.
+tag_regex = "^server-v(?P<version>.+)$"
 
 [tool.setuptools_scm.scm.git]
 describe_command = "git describe --tags --match 'server-v*'"

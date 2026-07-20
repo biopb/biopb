@@ -36,10 +36,18 @@ def _done_body(files_total=3, files_done=3, bytes_total=300, bytes_done=300):
 
 
 def _bare_client():
+    from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+    # add_source / resolve / warm now live on CatalogClient (#278 item C); build
+    # the shared state + collaborators (no connection) and inject the fake flight
+    # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
-    client._sources = {}
-    client._descriptors = {}
-    client._call_options = None
+    state = _ClientState(
+        client=None, call_options=None, location="", token=None, cache_bytes=0
+    )
+    client._state = state
+    client._catalog = CatalogClient(state)
+    client._fetcher = ChunkFetcher(state, client._catalog)
     return client
 
 
@@ -74,7 +82,7 @@ class _FakeFlight:
 class TestWarm:
     def test_progress_reported_then_terminal_done_returned(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [
                 _FakeResult(_progress_body(0, name="a")),
                 _FakeResult(_progress_body(1, bytes_done=100, name="b")),
@@ -85,15 +93,15 @@ class TestWarm:
 
         out = client.warm("cloud_x", on_progress=seen.append)
 
-        assert client._client.action.type == "warm"
-        assert bytes(client._client.action.body) == b"cloud_x"
+        assert client._state.client.action.type == "warm"
+        assert bytes(client._state.client.action.body) == b"cloud_x"
         assert out.files_done == 3 and out.bytes_done == 300  # terminal `done`
         assert [p.files_done for p in seen] == [0, 1]  # progress arms only
         assert seen[1].current_name == "b"
 
     def test_should_cancel_raises_resolve_cancelled(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(_progress_body(0)), _FakeResult(_done_body())]
         )
         with pytest.raises(ResolveCancelled):
@@ -101,7 +109,7 @@ class TestWarm:
 
     def test_empty_bodies_skipped(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(b""), _FakeResult(_done_body(files_total=0, files_done=0))]
         )
         out = client.warm("cloud_x")
@@ -109,7 +117,7 @@ class TestWarm:
 
     def test_old_server_unknown_action_maps_to_clear_error(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             raise_exc=flight.FlightServerError("Unknown action: warm")
         )
         with pytest.raises(RuntimeError, match="too old"):
@@ -117,7 +125,7 @@ class TestWarm:
 
     def test_other_flight_error_propagates(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             raise_exc=flight.FlightServerError("boom something else")
         )
         with pytest.raises(flight.FlightServerError, match="boom"):
@@ -125,7 +133,7 @@ class TestWarm:
 
     def test_no_terminal_done_raises(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(_progress_body(0)), _FakeResult(_progress_body(1))]
         )
         with pytest.raises(RuntimeError, match="no terminal status"):

@@ -64,8 +64,8 @@ def _run_server_process(
 ) -> None:
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     location = f"grpc://127.0.0.1:{port}"
     server = None
@@ -287,7 +287,7 @@ def _close_clients(clients) -> None:
 def _create_prewarmed_arrays(clients, assignments: List[Dict]) -> List:
     """Pre-create dask arrays for each client (removes get_flight_info from benchmark)."""
     arrays = []
-    for client, spec in zip(clients, assignments):
+    for client, spec in zip(clients, assignments, strict=True):
         arr = client.get_tensor(
             spec["id"],
             slice_hint=READ_WINDOW,

@@ -69,7 +69,7 @@ def viewer_window_alive(viewer) -> bool:
 def resync_view_for_capture(viewer, timeout: float = 30.0) -> None:
     """Wait for the current view's slice to load before a screenshot.
 
-    With async slicing on (``mcp.viewer.async_slicing``) a dims/zoom change
+    With async slicing on (``viewer.async_slicing``) a dims/zoom change
     fetches the new slice *off* the Qt main thread, so a screenshot taken right
     after could capture the previous (pre-load) frame -- fine for an interactive
     human, wrong for the agent, which expects ``take_screenshot`` to reflect the
@@ -163,18 +163,19 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
         sources = connection.sources or {}
         src = sources.get(source_id)
         if src is None:
-            # Not in the (possibly truncated) cached catalog — fetch the
-            # descriptor directly from the server.  Requires
-            # TensorFlightClient.get_source (added to biopb separately); until
-            # that ships this stays a no-op and we raise as before.
-            get_source = getattr(client, "get_source", None)
-            if get_source is not None:
-                src = get_source(source_id, tensor_id)
-            else:
+            # Not in the (possibly truncated) cached catalog — fetch the tensor
+            # descriptor directly from the server and wrap it as a single-tensor
+            # source (a bare source_id resolves the source's default tensor).
+            from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+
+            try:
+                desc = client.get_descriptor(tensor_id or source_id)
+            except Exception as exc:
                 raise ValueError(
                     f"Source '{source_id}' not found. "
                     f"Available: {list(sources.keys())[:20]}"
-                )
+                ) from exc
+            src = DataSourceDescriptor(source_id=source_id, tensors=[desc])
 
         if tensor_id is None:
             if len(src.tensors) == 1 and src.tensors[0]:

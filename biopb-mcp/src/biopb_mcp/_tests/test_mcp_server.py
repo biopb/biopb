@@ -373,24 +373,9 @@ class TestJobTools:
         result = _server.poll_job("job-1")
         assert "viewer window is closed" not in result
 
-    def test_cancel_job_requests_cancellation(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-1", cancelled=True, status="running"
-        )
-        result = _server.cancel_job("job-1")
-        assert "Cancellation requested" in result
-        assert "restart_kernel" in result
-
-    def test_cancel_job_nothing_to_cancel(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-1", cancelled=False, status="ok"
-        )
-        assert "nothing to cancel" in _server.cancel_job("job-1")
-
     def test_job_tools_no_host(self):
         _server._kernel_host = None
         assert "not initialized" in _server.poll_job("job-1")
-        assert "not initialized" in _server.cancel_job("job-1")
 
 
 # -----------------------------------------------------------------------
@@ -456,6 +441,16 @@ class TestInterruptRestart:
         server_with_host.restart.assert_called_once()
         assert "restarted" in result.lower()
 
+    def test_restart_headless_reports_no_viewer(self, server_with_host):
+        # A headless restart rebuilds no napari window, so the message must not
+        # promise a rebuilt viewer that isn't there.
+        _server.set_headless(True)
+        result = _server.restart_kernel()
+        server_with_host.restart.assert_called_once()
+        assert "restarted" in result.lower()
+        assert "headless" in result.lower()
+        assert "rebuilt" not in result.lower()  # no viewer to rebuild
+
     def test_restart_reports_failure(self, server_with_host):
         server_with_host.restart.side_effect = RuntimeError("nope")
         result = _server.restart_kernel()
@@ -474,6 +469,17 @@ class TestStartKernel:
         server_with_host.ensure_started.assert_called_once()
         assert "ready" in result.lower()
         assert "execute_code" in result
+
+    def test_ready_headless_reports_no_viewer(self, server_with_host):
+        # In a headless session there is no napari window and take_screenshot is
+        # unavailable, so the ready message must say so and not promise a viewer.
+        _server.set_headless(True)
+        server_with_host.ensure_started.return_value = {"state": "ready"}
+        result = _server.start_kernel()
+        assert "ready" in result.lower()
+        assert "headless" in result.lower()
+        assert "execute_code" in result
+        assert "take_screenshot" not in result  # not offered when headless
 
     def test_error_state_message(self, server_with_host):
         server_with_host.ensure_started.return_value = {
@@ -561,7 +567,9 @@ class TestServerStatus:
         monkeypatch.setattr(_observe, "_mounted_http", True)
         result = _server.server_status()
         assert "## Observe" in result
-        assert "/observe" in result
+        # The observe page is served by the control front; this child hosts only
+        # the /api/* it calls, so server_status points at the API mount.
+        assert "/api" in result
         assert "http://127.0.0.1:" in result
 
     def test_reports_observe_even_when_kernel_not_initialized(self, monkeypatch):
@@ -572,7 +580,7 @@ class TestServerStatus:
         monkeypatch.setattr(_observe, "_mounted_http", True)
         result = _server.server_status()
         assert "## Observe" in result
-        assert "/observe" in result
+        assert "/api" in result
 
     def test_starting_kernel_skips_query(self, server_with_host):
         # Kernel still booting (launcher serves the handshake first): report the

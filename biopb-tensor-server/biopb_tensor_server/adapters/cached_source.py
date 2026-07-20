@@ -1,16 +1,16 @@
 """Cache-backed source adapter for ephemeral uploaded data.
 
 Design: One adapter instance per cache-backed source, following the existing
-BackendAdapter pattern used by OmeZarrAdapter, etc.
+fused source+tensor adapter pattern used by OmeZarrAdapter, etc.
 
-- CachedSourceAdapter instances registered in server._sources dict (same as other adapters)
+- CachedSourceAdapter instances registered in server.sources registry (same as other adapters)
 - Metadata (shape, dtype, chunk_shape) stored in adapter instance
 - Chunk data stored in CacheManager keyed by chunk_id
 - When cache evicts chunks, adapter returns Flight error on read (source "gone")
 - "Dead" adapters accumulate until server restart (acceptable for ephemeral sources)
 
 Registration flow (bypasses discovery/registry):
-DoPut → direct instantiation → server._sources
+DoPut → direct instantiation → server.sources registry
 
 Chunk ID format: array_id + "/" + chunk_key
 Chunk data: stored in CacheManager keyed by full chunk_id
@@ -27,20 +27,23 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import CHUNK_WIRE_SCHEMA, SourceAdapter, TensorAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.chunk import encode_chunk_id
+from biopb_tensor_server.core.base import (
+    CHUNK_WIRE_SCHEMA,
+    TensorAdapter,
+)
+from biopb_tensor_server.core.chunk import encode_chunk_id
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.core.config import SourceConfig
 
 logger = logging.getLogger(__name__)
 
 
-class CachedSourceAdapter(SourceAdapter, TensorAdapter):
+class CachedSourceAdapter(TensorAdapter):
     """Adapter for cache-backed uploaded sources.
 
-    One instance per source, registered in server._sources dict.
+    One instance per source, registered in server.sources registry.
 
     Chunk ID format: array_id + "/" + chunk_key (bounds start coords as "0/1/2")
     Chunk data stored in CacheManager keyed by full chunk_id.
@@ -70,6 +73,8 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         chunk_shape: List[int],
         dim_labels: Optional[List[str]] = None,
         ome_metadata: Optional[dict] = None,
+        physical_scale: Optional[List[float]] = None,
+        physical_unit: Optional[List[str]] = None,
     ):
         """Initialize cache-backed source adapter.
 
@@ -80,23 +85,33 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             chunk_shape: Nominal chunk size per dimension
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
+            physical_scale: Optional per-dimension physical pixel size, aligned
+                1:1 with ``dim_labels`` (as the uploader sent it).
+            physical_unit: Optional per-dimension unit string for
+                ``physical_scale``, aligned 1:1 with ``dim_labels``.
         """
         self.source_id = source_id
         # Optional per-source capability token. When set, the Flight server
         # requires callers to present a matching Bearer token to read this
         # source (see TensorFlightServer._authorize_source). None = no per-source
         # gate (falls back to the server-wide token, if any).
-        self.token: Optional[str] = None
+        self._capability_token: Optional[str] = None
         self._shape = tuple(shape)
         self._dtype = dtype
         self._chunk_shape = tuple(chunk_shape)
         self._dim_labels = dim_labels or [f"dim{i}" for i in range(len(shape))]
         self._ome_metadata = ome_metadata or {}
+        # Client-provided physical calibration, echoed verbatim on the wire. The
+        # uploader already aligned these to dim_labels, so unlike the file
+        # adapters there is nothing to parse or canonicalise -- storing and
+        # surfacing them is exact (issue #272).
+        self._physical_scale_vec = list(physical_scale) if physical_scale else []
+        self._physical_unit_vec = list(physical_unit) if physical_unit else []
 
         # Track actually-written chunks: start coords -> full bounds
         self._written_chunks: Dict[bytes, ChunkBounds] = {}
 
-        # Required fields for BackendAdapter
+        # Required fields for the adapter interface
         self._source_url = f"cache://{source_id}"
         self._source_type = "cache"
 
@@ -117,6 +132,20 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     def get_metadata(self) -> dict:
         """Return OME metadata."""
         return self._ome_metadata
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Echo the uploader's physical calibration onto the wire descriptor.
+
+        Cache-backed sources carry whatever ``physical_scale`` / ``physical_unit``
+        the DoPut request supplied, already aligned 1:1 with ``dim_labels`` (the
+        client sent it that way), so there is nothing to parse or map -- return
+        the stored vectors verbatim. Returns ``None`` when the upload carried no
+        calibration, so the base clears the fields rather than advertising empty
+        vectors. See ``TensorAdapter._physical_scale``.
+        """
+        if not self._physical_scale_vec or not self._physical_unit_vec:
+            return None
+        return list(self._physical_scale_vec), list(self._physical_unit_vec)
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds.
@@ -150,6 +179,14 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         # Pass the flat element values (a primitive Arrow array), NOT a list<T>
         # wrapper -- write_chunk_arrow stores the raw value buffer directly.
         self.write_chunk_arrow(bounds, pa.array(data.ravel()), data.shape, data.dtype)
+
+    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+        """Arbitrary-bounds write: cache-backed sources accept any bounds.
+
+        Delegates straight to ``write_chunk_arrow`` (no NumPy round-trip -- the
+        Arrow value buffer is stored as the unified binary chunk schema).
+        """
+        self.write_chunk_arrow(bounds, data, expected_shape, dtype)
 
     def write_chunk_arrow(
         self,

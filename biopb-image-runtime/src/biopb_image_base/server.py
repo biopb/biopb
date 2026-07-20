@@ -86,7 +86,8 @@ def _iter_chunk_bounds(
     chunk_shape: Sequence[int],
 ) -> Iterator[ChunkBounds]:
     chunk_starts = [
-        range(0, int(dim), int(chunk)) for dim, chunk in zip(shape, chunk_shape)
+        range(0, int(dim), int(chunk))
+        for dim, chunk in zip(shape, chunk_shape, strict=True)
     ]
     for start_coords in product(*chunk_starts):
         stop_coords = [
@@ -97,7 +98,10 @@ def _iter_chunk_bounds(
 
 
 def _bounds_to_slices(bounds: ChunkBounds) -> tuple[slice, ...]:
-    return tuple(slice(start, stop) for start, stop in zip(bounds.start, bounds.stop))
+    return tuple(
+        slice(start, stop)
+        for start, stop in zip(bounds.start, bounds.stop, strict=True)
+    )
 
 
 def _build_registration_tensor(
@@ -183,9 +187,9 @@ class EmbeddedTensorCache:
         # that receives this SerializedTensor (carried in its auth_token). The
         # embedded server runs writable=False and writes happen in-process, so
         # this token gates read-back without a server-wide secret.
-        adapter.token = secrets.token_urlsafe(32)
+        adapter.capability_token = secrets.token_urlsafe(32)
         self._server.register_source(source_id, adapter)
-        self._server.initialize_upload(source_id, array_template.shape, chunk_shape)
+        self._server.uploads.initialize(source_id, array_template.shape, chunk_shape)
         return source_id, array_template, chunk_shape
 
     def create_array(
@@ -206,7 +210,7 @@ class EmbeddedTensorCache:
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
             location=self._external_location,
-            auth_token=self._server._get_source_adapter(source_id).token,
+            auth_token=self._server.sources.get(source_id).capability_token,
         )
 
     def upload_array_chunks(
@@ -215,14 +219,14 @@ class EmbeddedTensorCache:
         endpoint: ChunkBounds,
         chunk: np.ndarray,
     ) -> None:
-        adapter = self._server._get_source_adapter(source_id)
+        adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
         adapter.write_chunk(endpoint, chunk)
-        self._server.mark_upload_chunk(source_id, endpoint)
+        self._server.uploads.mark_chunk(source_id, endpoint)
 
     def get_upload_status(self, source_id: str) -> dict:
-        return self._server.get_upload_status(source_id)
+        return self._server.uploads.status(source_id)
 
     def create_source(
         self,
@@ -277,7 +281,7 @@ class EmbeddedTensorCache:
         from biopb.tensor.ticket_pb2 import TensorTicket
 
         # Get adapter from server
-        adapter = self._server._get_source_adapter(source_id)
+        adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
 
@@ -296,7 +300,7 @@ class EmbeddedTensorCache:
         serialized = SerializedTensor(
             tensor_descriptor=descriptor,
             location=self._external_location,
-            auth_token=adapter.token or "",
+            auth_token=adapter.capability_token or "",
             endpoints=endpoints,
         )
 
@@ -323,8 +327,8 @@ def _start_embedded_tensor_cache(
         Tuple of (tensor_server, location_url)
     """
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     # Clean stale lock file (from previous run/crash)
     lock_path = cache_dir / "lock"
@@ -349,7 +353,7 @@ def _start_embedded_tensor_cache(
 
     # Read-only over Flight: results are written in-process (adapter.write_chunk),
     # so the Flight write path (do_put / create_source) is pure attack surface here.
-    # Read-back is gated by per-source capability tokens (adapter.token).
+    # Read-back is gated by per-source capability tokens (adapter.capability_token).
     tensor_server = TensorFlightServer(
         location,
         writable=False,

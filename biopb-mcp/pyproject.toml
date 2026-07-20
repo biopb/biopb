@@ -33,6 +33,10 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
+    # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
+    # requirement explicit.
+    "scipy",
     # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
     # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
     # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
@@ -69,13 +73,14 @@ tables = [
 # can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
 # version as a `versions.json` release attribute that install.sh reads to pin
 # `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
-# distributed floor: the daemon owns the LocalCluster (DaskClusterHost), so its
-# worker processes live in the *daemon's* process group, not the kernel's. On an
-# abnormal daemon death (SIGKILL/OOM) neither _shutdown nor the atexit close runs
-# to reap them — the sole remaining cleanup is dask's own "worker shuts down when
-# it loses the scheduler" behavior, which only holds since the `reconnect` era
-# ended (>=2023.9). Pin a floor so orphan-hardening (issue #13) can't silently
-# regress on an older distributed. See mcp/_deathwatch and mcp/_cluster.
+# distributed floor: the session child owns the LocalCluster (DaskClusterHost),
+# so its worker processes live in the *session child's* process group, not the
+# kernel's. On an abnormal session-child death (SIGKILL/OOM) neither _shutdown nor
+# the atexit close runs to reap them — the sole remaining cleanup is dask's own
+# "worker shuts down when it loses the scheduler" behavior, which only holds since
+# the `reconnect` era ended (>=2023.9). Pin a floor so orphan-hardening (issue #13)
+# can't silently regress on an older distributed. See biopb._lifecycle.deathwatch
+# and mcp/_cluster.
 mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6"]
 3d = ["vedo"] # 3d rendering from mesh
 
@@ -119,6 +124,11 @@ testing = [
 
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
+# Light console entry (stdlib + biopb._locations only, no kernel/napari
+# import) the installer calls to seed the built-in example kernel plugins
+# (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
+# tool" example, delivered as a visible file rather than a buried entry point.
+biopb-mcp-seed-plugins = "biopb_mcp.plugins._seed:_cli"
 
 [project.entry-points."napari.manifest"]
 biopb-mcp = "biopb_mcp:napari.yaml"
@@ -141,25 +151,28 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
+# Bundled skills snapshot (mcp/_skills_bundle/): last-resort offline fallback for
+# the curated catalog + bodies (see mcp/_skills.py).
+"biopb_mcp.mcp" = ["_skills_bundle/*.json", "_skills_bundle/*.md"]
 
-# Versioned off the shared monorepo git history. Like biopb-tensor-server, this
-# package lives in a subdir (root = "..") and is keyed to its OWN tag prefix so
-# its version never picks up the client's `v*` or the server's `server-v*` tags.
-# The matched `git describe` is mandatory here: without --match, describe would
-# return the most recent tag of ANY prefix and mis-version the wheel.
+# Versioned off the shared monorepo git history. Product component: keyed to the
+# single product tag `release-v*` (not a per-package prefix), so mcp, the tensor
+# server, the control, and the web bundle all share one product version. The
+# package lives in a subdir (root = ".."). The matched `git describe` is mandatory
+# here: without --match, describe would return the nearest tag of ANY prefix
+# (e.g. the SDK's `v*`) and mis-version the wheel.
 #
-# The version group captures everything after `mcp-v` and lets packaging/PEP 440
-# validate it, so prerelease tags work too: mcp-v0.7.1, mcp-v0.7.1a1 (alpha),
-# mcp-v0.7.1rc1, … — handy for test releases (PyPI accepts prereleases and
-# `pip install` ignores them by default). A non-PEP-440 suffix (e.g. -test)
-# still fails, by design.
+# The version group captures everything after `release-v` and lets packaging/PEP
+# 440 validate it, so prerelease tags work too: release-v0.11.0, release-v0.11.0rc1
+# (rc), release-v0.11.0a1 (alpha), … A non-PEP-440 suffix (e.g. -test) still fails,
+# by design.
 [tool.setuptools_scm]
 version_file = "src/biopb_mcp/_version.py"
 root = ".."
-tag_regex = "^mcp-v(?P<version>.+)$"
+tag_regex = "^release-v(?P<version>.+)$"
 
 [tool.setuptools_scm.scm.git]
-describe_command = "git describe --tags --match 'mcp-v*'"
+describe_command = "git describe --tags --match 'release-v*'"
 
 [tool.pytest.ini_options]
 qt_api = "pyqt6"

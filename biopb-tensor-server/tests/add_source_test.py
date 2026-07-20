@@ -17,8 +17,8 @@ import numpy as np
 import pytest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import DiscoveryState
-from biopb_tensor_server.source_manager import (
+from biopb_tensor_server.core.discovery import DiscoveryState
+from biopb_tensor_server.sources.source_manager import (
     DND_URL_PREFIX,
     SourceManager,
     _drop_catalog_url,
@@ -104,7 +104,7 @@ class TestAddLocalSource:
 
         assert len(added) == 1 and not already and not failed
         sid = added[0].source_id
-        assert sid in server._sources
+        assert sid in server.sources
 
     def test_dropped_single_source_reroots_to_basename(self, tmp_path):
         """A dropped dataset's catalog source_url is re-rooted at its own
@@ -162,8 +162,8 @@ class TestAddLocalSource:
         catches a drop that lands inside it. The containment guard keys on
         os.path.realpath, so the seeded claim must store the resolved path (case
         4 over a symlinked config path)."""
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.source_manager import create_source_manager
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.sources.source_manager import create_source_manager
 
         real = tmp_path / "real"
         real.mkdir()
@@ -197,12 +197,12 @@ class TestAddLocalSource:
         getting its own root. End-to-end: resolve_all_sources computes the
         catalog_url from the alias, create_source_manager threads it as the
         descriptor's display source_url override (never the source_id)."""
-        from biopb_tensor_server.config import (
+        from biopb_tensor_server.core.config import (
             ServerConfig,
             SourceConfig,
             resolve_all_sources,
         )
-        from biopb_tensor_server.source_manager import create_source_manager
+        from biopb_tensor_server.sources.source_manager import create_source_manager
 
         root = tmp_path / "acquisition"
         root.mkdir()
@@ -223,11 +223,11 @@ class TestAddLocalSource:
 
         urls = sorted(
             adapter.get_source_descriptor().source_url
-            for adapter in server._sources.values()
+            for adapter in server.sources.values()
         )
         assert urls == ["exp/a.zarr", "exp/b.zarr"]
         # Display-only: source_id still hashes the raw path, not the alias.
-        assert all("exp" not in sid for sid in server._sources)
+        assert all("exp" not in sid for sid in server.sources)
 
     def test_readd_same_path_is_already_present(self, tmp_path):
         manager, _ = _make_manager()
@@ -320,7 +320,7 @@ class TestAddLocalSource:
 
         assert 1 <= len(added) < 3  # stopped early, kept what was registered
         for desc in added:
-            assert desc.source_id in server._sources
+            assert desc.source_id in server.sources
 
 
 class TestAddSourceRoundtrip:
@@ -373,11 +373,11 @@ class TestRemoveDroppedRoot:
         added, *_ = _drain(manager.add_local_source(zpath))
         sid = added[0].source_id
         assert added[0].source_url == "dnd://exp.zarr"
-        assert sid in server._sources
+        assert sid in server.sources
 
         removed, failed = manager.remove_dropped_root("dnd://exp.zarr")
         assert removed == [sid] and not failed
-        assert sid not in server._sources
+        assert sid not in server.sources
 
     def test_remove_dropped_folder_removes_all_siblings_as_a_unit(self, tmp_path):
         manager, server = _make_manager()
@@ -392,7 +392,7 @@ class TestRemoveDroppedRoot:
         removed, failed = manager.remove_dropped_root("dnd://my_experiment")
         assert set(removed) == sids and not failed
         for sid in sids:
-            assert sid not in server._sources
+            assert sid not in server.sources
 
     def test_remove_root_matches_only_its_own_branch(self, tmp_path):
         # A sibling drop sharing a name prefix must NOT be swept up.
@@ -407,7 +407,7 @@ class TestRemoveDroppedRoot:
 
         removed, failed = manager.remove_dropped_root("dnd://exp.zarr")
         assert removed == [sid_a] and not failed
-        assert sid_b in server._sources  # exp2.zarr untouched
+        assert sid_b in server.sources  # exp2.zarr untouched
 
     def test_remove_non_dnd_root_rejected(self):
         # Authorization boundary: only drag-dropped (dnd://) sources are removable.
@@ -508,7 +508,7 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         added, _already, failed = _drain(manager.add_local_source(str(drop)))
         assert len(added) == 1 and not failed
         sid = added[0].source_id
-        assert sid in server._sources
+        assert sid in server.sources
         # Re-rooted for a tidy display root, but NOT stamped ``dnd://``: it sits
         # under a monitored root, so the rescan re-discovers it -- it is not
         # safely removable, so it must not carry the removable marker.
@@ -517,6 +517,6 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         # First rescan is force_full; the second is the steady-state incremental
         # that actually reaped the source before the fix (~20 s after the drop).
         manager._rescan_monitored_dirs()
-        assert sid in server._sources, "reaped by the initial force_full rescan"
+        assert sid in server.sources, "reaped by the initial force_full rescan"
         manager._rescan_monitored_dirs()
-        assert sid in server._sources, "reaped by the steady-state incremental rescan"
+        assert sid in server.sources, "reaped by the steady-state incremental rescan"

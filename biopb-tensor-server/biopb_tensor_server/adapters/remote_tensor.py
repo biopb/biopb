@@ -44,13 +44,12 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
-from biopb_tensor_server.base import (
-    SourceAdapter,
+from biopb_tensor_server.core.base import (
     TensorAdapter,
     TensorReadPlan,
     unpack_chunk_array,
 )
-from biopb_tensor_server.chunk import (
+from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     cache_key_for_chunk_id,
     decode_chunk_id,
@@ -60,7 +59,7 @@ from biopb_tensor_server.chunk import (
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.core.config import SourceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +144,15 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
-def list_upstream_source_ids(client) -> tuple[List[str], bool]:
+def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
     """Every source_id on an upstream tensor server. Returns ``(ids, complete)``.
+
+    ``location`` is the upstream endpoint, named in the fallback warning. It is a
+    parameter rather than something read off the client because the callers
+    already computed it (``_split_grpc_url``) to build the client, and the SDK
+    exposes no public accessor -- reaching for ``client._location`` was borrowing
+    another package's private state to recover a value that was in scope
+    (biopb/biopb#529).
 
     Enumerating a catalog with ``list_sources()`` is **unsafe**: it is capped at
     the server's ``max_list_flights_results``, so a large upstream is silently
@@ -168,14 +174,14 @@ def list_upstream_source_ids(client) -> tuple[List[str], bool]:
             "back to the capped list_sources() -- the mirror may be incomplete "
             "(%d sources seen). Enable the upstream's metadata DB for a complete "
             "mirror.",
-            getattr(client, "_location", "?"),
+            location,
             exc,
             len(ids),
         )
         return ids, False
 
 
-def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
+def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]], bool]:
     """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
 
     Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
@@ -192,6 +198,9 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
     ``rows`` is ``None`` when the upstream has no SQL catalog (``query_sources``
     errors) -- the caller then falls back to id-only enumeration
     (``list_upstream_source_ids``) and the per-source live sync path.
+
+    ``location`` names the upstream in the fallback warning; see
+    :func:`list_upstream_source_ids` for why it is a parameter.
     """
     try:
         rows = client.query_sources(
@@ -204,13 +213,13 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
         logger.warning(
             "upstream %s bulk catalog fetch failed (%s); falling back to id-only "
             "enumeration + per-source sync",
-            getattr(client, "_location", "?"),
+            location,
             exc,
         )
         return None, False
 
 
-class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
+class RemoteTensorAdapter(TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
     _single_tensor_source = False  # an upstream source may carry several tensors
@@ -262,9 +271,9 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         self._upstream_source_id = upstream_source_id
         self._token = token
         # Per-source capability token for the LOCAL server's auth (server reads
-        # adapter.token in _authorize_source). Proxied sources inherit server-wide
-        # auth, so leave it unset.
-        self.token: Optional[str] = None
+        # adapter.capability_token in _authorize_source). Proxied sources inherit
+        # server-wide auth, so leave it unset.
+        self._capability_token: Optional[str] = None
 
         self._client = None  # lazy TensorFlightClient to the upstream
         # Best-effort reachability, updated by every catalog-surface call to the
@@ -574,20 +583,26 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         view._tensor_name = field
         return view
 
-    def get_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
-        """Not implemented for the caching proxy yet -- always ``None``.
+    def plan_flight_info(self, read_opt, pyramid_config):
+        """Forward the upstream's authoritative GetFlightInfo, else plan locally.
 
-        The local server fills ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` on every ``GetFlightInfo`` from ``get_physical_scale()``,
-        so mirroring the upstream's scale would mean a per-open ``get_descriptor``
-        RPC to the upstream on every serve. That is the wrong layer: the mirror
-        catalog is bulk-seeded from a single upstream ``query_sources``
-        (biopb/biopb#266), and physical scale should ride that seed / the mirrored
-        descriptor rather than a lazy per-open round-trip. Until #266 carries it,
-        return ``None`` -- the proxy advertises no physical scale, exactly like a
-        format that carries none. Tracked by #266.
+        A caching proxy mirrors its upstream 1:1 and re-derives no chunk grid,
+        pyramid, or physical scale of its own, so consult the upstream once
+        (``forward_flight_info``) and use its localized plan verbatim -- the
+        forwarded descriptor already carries the upstream's native grid, its
+        server-advertised pyramid, and its physical scale (kept by
+        ``_localize_forwarded_descriptor``; only ``metadata_json`` is stripped and
+        refilled locally from the mirror catalog). On an upstream failure the
+        forward returns ``None`` and we fall back to the base local planner --
+        never worse than a non-proxy adapter (biopb/biopb#295). On that fallback
+        the proxy advertises no physical scale of its own (inherited
+        ``_physical_scale`` default ``None``, exactly as before; tracked by
+        #266/#274).
         """
-        return None
+        plan = self.forward_flight_info(read_opt)
+        if plan is not None:
+            return plan
+        return super().plan_flight_info(read_opt, pyramid_config)
 
     # -------------------------------------------------------------- tensor layer
 
@@ -707,7 +722,10 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         only the descriptor + endpoints.
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
-        up_read_opt = TensorReadOption(tensor_id=upstream_array_id, with_metadata=False)
+        up_read_opt = TensorReadOption(
+            tensor_id=upstream_array_id,
+            with_metadata=False,
+        )
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
         if read_opt.scale_hint:

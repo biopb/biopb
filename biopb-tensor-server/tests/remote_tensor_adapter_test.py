@@ -26,7 +26,7 @@ def _zarr_available() -> bool:
 class TestArrayIdByteSplice:
     def test_rewrite_preserves_bounds_tail(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.chunk import (
+        from biopb_tensor_server.core.chunk import (
             decode_chunk_id,
             encode_chunk_id,
             rewrite_chunk_id_array_id,
@@ -45,7 +45,7 @@ class TestArrayIdByteSplice:
 
     def test_rewrite_preserves_scale_suffix(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.chunk import (
+        from biopb_tensor_server.core.chunk import (
             decode_scale_info,
             encode_chunk_id_with_scale,
             is_scaled_chunk,
@@ -150,7 +150,7 @@ def _db_upstream(zarr_path, source_ids, max_list_flights_results=None):
     """
     import zarr
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
     arr = zarr.open_array(zarr_path, mode="r")
     db = MetadataDatabase()
@@ -232,6 +232,72 @@ class TestRemoteTensorProxy:
                 proxy.shutdown()
         finally:
             upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_proxy_sliced_read_preserves_slice_hint(self):
+        """A sliced read through the proxy keeps slice_hint on the forwarded plan,
+        so the client can crop the outward-snapped result.
+
+        Regression guard: the forward path must not strip slice_hint. The client
+        needs it on the wire to crop; losing it silently returns the snapped
+        (oversized) region instead of the requested slice.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor import TensorFlightClient
+        from biopb.tensor.descriptor_pb2 import (
+            FlightCmd,
+            SliceHint,
+            TensorDescriptor,
+            TensorReadOption,
+        )
+        from pyarrow import flight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.arange(3 * 40 * 50, dtype="<i2").reshape(3, 40, 50)
+
+            upstream = self._upstream_3d(zpath)
+            try:
+                proxy = self._proxy(
+                    upstream.port,
+                    local_source_id="hpc__aics",
+                    upstream_source_id="aics",
+                )
+                try:
+                    pc = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                    # Request the middle z-plane; it snaps to exactly chunk 1.
+                    sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
+                    read_opt = TensorReadOption(tensor_id="hpc__aics", slice_hint=sl)
+                    cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
+                    fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+                    info = pc._client.get_flight_info(fd, options=pc._call_options)
+                    desc = TensorDescriptor.FromString(info.descriptor.command)
+                    # The forwarded plan carries the realized-bounds crop signal.
+                    assert desc.HasField("slice_hint")
+                    assert list(desc.slice_hint.start) == [1, 0, 0]
+                    assert list(desc.slice_hint.stop) == [2, 40, 50]
+                    # The explicit endpoint list is shipped.
+                    assert len(list(info.endpoints)) >= 1
+                    pc.close()
+                finally:
+                    proxy.shutdown()
+            finally:
+                upstream.shutdown()
+
+    def _upstream_3d(self, zarr_path):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+        arr = zarr.open_array(zarr_path, mode="r")
+        upstream = TensorFlightServer("grpc://localhost:0")
+        upstream.register_source("aics", ZarrAdapter(arr, "aics", ["z", "y", "x"]))
+        _serve(upstream)
+        return upstream
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_big_endian_source_with_empty_seeded_chunk_shape(self):
@@ -316,7 +382,7 @@ class TestRemoteTensorProxy:
         from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
-        from biopb_tensor_server.chunk import decode_chunk_id
+        from biopb_tensor_server.core.chunk import decode_chunk_id
 
         with tempfile.TemporaryDirectory() as tmp:
             zpath = f"{tmp}/vol.zarr"
@@ -564,7 +630,7 @@ class TestBareHostExpansion:
 
     def test_expansion_mirrors_all_sources_namespaced(self, simple_zarr_array):
         from biopb_tensor_server import TensorFlightServer
-        from biopb_tensor_server.config import SourceConfig, discover_sources
+        from biopb_tensor_server.core.config import SourceConfig, discover_sources
 
         zarr_path, shape, _ = simple_zarr_array
         upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
@@ -605,7 +671,7 @@ class TestBareHostExpansion:
         expansion must mirror EVERY upstream source via the complete server-side
         catalog -- otherwise a large upstream is silently under-mirrored."""
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server.config import SourceConfig, discover_sources
+        from biopb_tensor_server.core.config import SourceConfig, discover_sources
 
         zarr_path, _, _ = simple_zarr_array
         # cap list_flights at 1 while registering 3 sources
@@ -632,8 +698,8 @@ def test_create_from_config_resolves_token_from_credentials_profile():
     """A per-upstream credentials profile (storage_type=biopb-tensor) supplies the
     upstream bearer token to the adapter -- the multi-upstream auth path (§1/§3)."""
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.remote import CredentialProfile, CredentialsConfig
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.remote import CredentialProfile, CredentialsConfig
 
     creds = CredentialsConfig(
         default_profile=None,
@@ -669,7 +735,7 @@ def _phys_zarr_cls():
     from biopb_tensor_server import ZarrAdapter
 
     class _PhysZarr(ZarrAdapter):
-        def get_physical_scale(self):
+        def _physical_scale(self):
             return list(_PHYS_SCALE), list(_PHYS_UNIT)
 
     return _PhysZarr
@@ -679,7 +745,7 @@ def _upstream_with_metadata(zarr_path):
     """An upstream server whose metadata DB holds one source ('img') with metadata."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
-    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
     arr = zarr.open_array(zarr_path, mode="r")
     db = MetadataDatabase()  # in-memory, enabled
@@ -776,12 +842,13 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
-    """The proxy's get_physical_scale() *method* returns None even when the
-    upstream advertises a scale: physical scale is surfaced at a different layer
-    -- it rides the whole-call forward (forward_flight_info -> the upstream
-    descriptor's physical_scale), not a per-open get_descriptor RPC from this
-    method (biopb/biopb#295). See test_physical_scale_surfaced_through_proxy for
-    the end-to-end path."""
+    """The proxy's own ``_physical_scale()`` hook returns None (it does not
+    override it) even when the upstream advertises a scale: physical scale is
+    surfaced at a different layer -- it rides the whole-call forward
+    (plan_flight_info -> forward_flight_info -> the upstream descriptor's
+    physical_scale), not a per-open get_descriptor RPC from this hook
+    (biopb/biopb#295). See test_physical_scale_surfaced_through_proxy for the
+    end-to-end path."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
@@ -797,7 +864,7 @@ def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        assert adapter.get_physical_scale() is None
+        assert adapter._physical_scale() is None
     finally:
         upstream.shutdown()
 
@@ -844,10 +911,10 @@ def test_physical_scale_surfaced_through_proxy(simple_zarr_array):
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_server_get_flight_info_uses_proxy_forward():
-    """server.get_flight_info special-cases a proxy: it forwards to the upstream
-    and returns ITS native pyramid, rather than running the local planner (which
-    would advertise a *computed*, non-native pyramid). Calls the server method
-    directly to exercise the isinstance(RemoteTensorAdapter) branch (biopb/biopb#295).
+    """A proxy tensor forwards to the upstream and returns ITS native pyramid,
+    rather than running the local planner (which would advertise a *computed*,
+    non-native pyramid). Calls server.get_flight_info directly to exercise the
+    proxy's plan_flight_info forward (biopb/biopb#295).
     """
     import tempfile
 
@@ -970,9 +1037,9 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, shape, _ = simple_zarr_array
     upstream, up_register, up_unregister = _db_upstream(zarr_path, ["img"])
@@ -1022,8 +1089,8 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
     re-list upstream, and excludes the single-source grpc://host/<id> form."""
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.source_manager import create_source_manager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.sources.source_manager import create_source_manager
 
     zarr_path, _, _ = simple_zarr_array
     server = TensorFlightServer("grpc://localhost:0")
@@ -1060,9 +1127,9 @@ def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):
     from unittest.mock import MagicMock
 
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     manager = SourceManager(
         server=MagicMock(),
@@ -1091,9 +1158,9 @@ def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path)
     from unittest.mock import MagicMock
 
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     manager = SourceManager(
         server=MagicMock(),
@@ -1140,10 +1207,10 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.metadata_db import MetadataDatabase
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -1204,9 +1271,9 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     upstream, up_register, _ = _db_upstream(zarr_path, ["img"])
@@ -1290,6 +1357,7 @@ class TestUnreachableUpstream:
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from pyarrow import flight
 
         adapter = RemoteTensorAdapter(
             source_id="lab__img",
@@ -1297,7 +1365,8 @@ class TestUnreachableUpstream:
             upstream_source_id="img",
         )
         # the serve path must NOT silently degrade -- a missing chunk is an error
-        with pytest.raises(Exception):
+        # (a dead upstream surfaces as a Flight transport / socket error).
+        with pytest.raises((flight.FlightError, OSError)):
             adapter.get_data(ChunkBounds(start=[0, 0], stop=[8, 8]))
 
     def test_transparent_recovery_when_upstream_returns(self, simple_zarr_array):
@@ -1339,8 +1408,8 @@ def test_unreachable_sole_monitored_upstream_does_not_block_startup():
     the server starting -- the re-list recovers it once reachable (#178)."""
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.source_manager import create_source_manager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.sources.source_manager import create_source_manager
 
     server = TensorFlightServer("grpc://localhost:0")
     manager = create_source_manager(
@@ -1412,8 +1481,8 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.chunk import encode_chunk_id
-    from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.core.chunk import encode_chunk_id
+    from biopb_tensor_server.core.config import CacheConfig
 
     zarr_path, shape, chunks = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -1633,9 +1702,7 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
-        _location = "grpc://fake"
-
-        def query_sources(self, sql, format="records"):
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             # source_url is now fetched so the mirror can be treed by path (#297).
             assert "tensors" in sql and "source_url" in sql and format == "records"
             return [
@@ -1647,7 +1714,7 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
                 }
             ]
 
-    rows, complete = fetch_upstream_catalog(_FakeClient())
+    rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
     assert complete is True
     assert rows[0]["source_url"] == "file:///d/a.zarr"
 
@@ -1656,14 +1723,66 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
-        _location = "grpc://fake"
-
-        def query_sources(self, sql, format="records"):
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
-    rows, complete = fetch_upstream_catalog(_FakeClient())
+    rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
     assert rows is None
     assert complete is False
+
+
+def test_fallback_warning_names_the_upstream_from_its_location_argument(caplog):
+    """The upstream is named from the caller's endpoint, not from the SDK client's
+    private ``_location`` (biopb/biopb#529). The fake declares no such attribute,
+    so a reintroduced probe degrades the warning to "?" and fails this test."""
+    import logging
+
+    from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
+
+    class _FakeClient:
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+            raise RuntimeError("no metadata DB")
+
+        def list_sources(self):
+            return {"a": object()}
+
+    with caplog.at_level(logging.WARNING):
+        ids, complete = list_upstream_source_ids(_FakeClient(), "grpc://lab:8815")
+
+    assert (ids, complete) == (["a"], False)
+    assert "grpc://lab:8815" in caplog.text
+
+
+def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeypatch):
+    """A broken channel fails BOTH the upstream call and the cleanup ``close()``.
+
+    The ``finally:`` used to call ``close()`` unguarded (behind a dead
+    ``getattr(client, "close", None)`` probe that only covered an SDK too old to
+    install), so the close error replaced the upstream one on the way out --
+    losing the diagnosis exactly when it matters (biopb/biopb#529).
+    """
+    import biopb.tensor as biopb_tensor
+    from biopb_tensor_server.core.config import SourceConfig, _discover_tensor_server
+
+    class _BrokenClient:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def query_sources(self, *_a, **_k):
+            raise RuntimeError("channel is dead")
+
+        def list_sources(self):
+            raise RuntimeError("upstream unreachable")
+
+        def close(self):
+            raise RuntimeError("close on a broken channel")
+
+    monkeypatch.setattr(biopb_tensor, "TensorFlightClient", _BrokenClient)
+
+    with pytest.raises(RuntimeError, match="upstream unreachable"):
+        _discover_tensor_server(
+            SourceConfig(url="grpc://host:8815", type="tensor-server"), None
+        )
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -1673,10 +1792,10 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
     local catalog is populated from the same result."""
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.metadata_db import MetadataDatabase
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
@@ -1700,9 +1819,9 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
 
             manager._reconcile_upstreams()
 
-            assert set(proxy._sources) == {"lab__img", "lab__img2"}
+            assert set(proxy.sources) == {"lab__img", "lab__img2"}
             for sid in ("lab__img", "lab__img2"):
-                adapter = proxy._sources[sid]
+                adapter = proxy.sources.get(sid)
                 assert adapter._descriptors_cache is not None  # seeded, not live
                 assert adapter._metadata_cache is not None
                 assert adapter._client is None  # no per-source upstream dial
@@ -1804,10 +1923,10 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
     catalog row (residency + tensors) without a per-source RPC."""
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.metadata_db import MetadataDatabase
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     up_db = MetadataDatabase()
     upstream = TensorFlightServer("grpc://localhost:0", metadata_db=up_db)
@@ -1847,7 +1966,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             resident, tensors = _row()
             assert resident is False  # unresolved mirror, not advertised resident
             assert tensors == []
-            assert proxy._sources["lab__cloud"].is_resident() is False
+            assert proxy.sources.get("lab__cloud").is_resident() is False
 
             # upstream resolves the source in place (same source_id)
             up_db.sync_source_added(
@@ -1874,7 +1993,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             assert resident is True  # refreshed from the bulk re-list
             assert len(tensors) == 1
             assert tensors[0]["array_id"] == "lab__cloud"  # localized
-            assert proxy._sources["lab__cloud"].is_resident() is True
+            assert proxy.sources.get("lab__cloud").is_resident() is True
         finally:
             proxy.shutdown()
     finally:

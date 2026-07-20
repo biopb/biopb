@@ -25,8 +25,8 @@ def _free_tcp_port() -> int:
 @pytest.fixture
 def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     CacheManager.reset()
     CacheManager.initialize(
@@ -52,8 +52,8 @@ def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
 def served_embedded_cache(tmp_path: Path):
     """An embedded cache backed by a real served (read-only) Flight server."""
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     CacheManager.reset()
     CacheManager.initialize(

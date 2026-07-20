@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# biopb stack installer (biopb-mcp + biopb + biopb-tensor-server)
+# biopb stack installer (biopb-mcp + biopb + biopb-tensor-server + biopb-control)
 # Usage: curl -fsSL https://biopb.org/install.sh | bash
 #
 # Idempotent: rerun to upgrade to latest version
@@ -16,12 +16,16 @@
 # BIOPB_REMOTE_PLUGINS=1). Example:
 #   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
 #
-# This installs prebuilt wheels from the latest biopb GitHub release-v*
-# deployment (the single release that carries all three mutually-paired wheels).
-# By default it tracks the latest STABLE release (clean X.Y.Z). Set
-# BIOPB_INSTALL_RC=1 to instead track the latest release candidate (a/b/rc
-# prerelease, typically cut off the dev branch) — the fast path for testing an
-# upcoming release before it lands on main.
+# This installs prebuilt wheels from a biopb GitHub release-v* deployment (the
+# single release that carries all mutually-paired wheels). The copy served at
+# biopb.org is PINNED to the exact release it was published alongside (stamped
+# into BIOPB_PINNED_RELEASE below), so re-fetching the one-liner is how you move
+# to a newer version. A raw / git-checkout copy has no pin and tracks the latest
+# STABLE release. Overrides:
+#   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release
+#   BIOPB_INSTALL_RC=1           track the latest release candidate (a/b/rc,
+#                                typically cut off dev) — the fast path for
+#                                testing an upcoming release before it lands.
 #
 # Requirements: curl, tar
 #
@@ -33,6 +37,18 @@ if [ -t 1 ]; then
 else
     RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; DIM=''; RESET=''
 fi
+
+# Release pin -- stamped at publish, empty in the committed source. release.yaml's
+# "Pin installers to this release" step rewrites this line to the exact
+# `release-vX.Y.Z` before it ships this file (both as a GitHub-release asset and to
+# biopb.org), so any copy downloaded from a given release installs THAT release
+# rather than whatever is newest at run time -- the installer and release are
+# published together, so querying "latest" would only reintroduce the skew that
+# pairing removes. Left empty here so a git-checkout or raw `curl` of this
+# committed file still tracks the latest stable release. Override at run time with
+# BIOPB_INSTALL_VERSION. Keep the `BIOPB_PINNED_RELEASE=` LHS verbatim -- the stamp
+# anchors on it.
+BIOPB_PINNED_RELEASE=""
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
@@ -66,47 +82,6 @@ _py() {
     else
         uv run --no-project python "$@"
     fi
-}
-
-# Merge a biopb stdio MCP entry into JSON <file> under top-level key <parent>
-# (e.g. "mcpServers" or "mcp"). <style> picks the entry shape: "stdio" for the
-# standard {command,args} form — no "type" (Claude Desktop, Cursor, the canonical
-# mcp.json) — and "opencode" for opencode's {type:"local", command:[...]} form.
-# <command> and the trailing args are the `biopb-mcp` invocation the client
-# spawns. Preserves all other content, creates the file (and parents) if absent,
-# and writes atomically. JSON-escaping happens in Python, so a command path with
-# spaces is safe. Uses Python (always present) instead of jq, which labs may not
-# have. Returns non-zero and leaves the file untouched on any error.
-_mcp_merge() {
-    local file="$1" parent="$2" style="$3" command="$4"; shift 4
-    mkdir -p "$(dirname "$file")"
-    _py - "$file" "$parent" "$style" "$command" "$@" 2>/dev/null <<'PY'
-import json, os, sys
-path, parent, style, command, *cmd_args = sys.argv[1:]
-try:
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-except FileNotFoundError:
-    data = {}
-if not isinstance(data, dict):
-    sys.exit("%s: top-level JSON is not an object" % path)
-if style == "opencode":
-    entry = {"type": "local", "command": [command, *cmd_args], "enabled": True}
-else:
-    # Standard mcpServers stdio form (Claude Desktop, Cursor, the canonical
-    # mcp.json): bare command+args, no "type" — that is the form every
-    # mcpServers client accepts (a stray "type" trips stricter validators).
-    entry = {"command": command, "args": cmd_args}
-section = data.get(parent)
-if not isinstance(section, dict):
-    section = data[parent] = {}
-section["biopb"] = entry
-tmp = path + ".biopb.tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
-PY
 }
 
 # Write the opencode zen API key into opencode's credential store
@@ -217,27 +192,12 @@ os.replace(tmp, out)
 PY
 }
 
-# Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
-# Cursor, …). biopb-mcp speaks stdio, so the client spawns the command itself.
-# Usage: _mcp_json_merge <config-file> <command> <label> [args...]
-# Returns 0 only if biopb was actually written into the client's config.
-_mcp_json_merge() {
-    local file="$1" command="$2" label="$3"; shift 3
-    if _mcp_merge "$file" "mcpServers" "stdio" "$command" "$@"; then
-        _ok "$label: registered biopb ($file)"
-        return 0
-    fi
-    _warn "$label: could not update $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
-    return 1
-}
-
 # Detect AI agents (MCP clients) already on the system that biopb-mcp can plug into.
 # Populates the DETECTED_AGENTS array with human-readable names; if it comes back empty,
 # the MCP-configuration step offers to install one (opencode) before registering biopb.
 _detect_agents() {
     DETECTED_AGENTS=()
     command -v claude &>/dev/null && DETECTED_AGENTS+=("Claude Code")
-    [ -d "$HOME/.hermes" ] && DETECTED_AGENTS+=("Hermes")
     case "$PLATFORM" in
         macOS)     [ -d "$HOME/Library/Application Support/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
         Linux|WSL) [ -d "$HOME/.config/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
@@ -331,23 +291,18 @@ _install_opencode() {
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
 _setup_mcp() {
+    # Resolve the absolute biopb-mcp path for the canonical mcp.json fallback
+    # (per-client registration resolves its own path inside `biopb agents`). GUI
+    # agents don't inherit the shell PATH, so the absolute path is what works.
     local mcp_cmd
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
 
-    # biopb-mcp speaks MCP over stdio: the AI agent spawns it as a child process
-    # (`biopb-mcp --transport stdio`). Recent biopb-mcp makes that child a thin
-    # bridge that brings up — and shares across clients — a local http daemon on
-    # demand (the daemon outlives any one client). The client contract is
-    # unchanged, so each client still needs the *command* to run, not a URL —
-    # and we register the resolved absolute path so GUI agents (e.g. Claude
-    # Desktop), which don't inherit the shell PATH, can still find it.
-    local mcp_args=(--transport stdio)
-
     # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
     # Preserved if it already exists so the user's tweaks survive a rerun.
-    local mcp_config_dir="$HOME/.config/biopb-mcp"
-    local mcp_config="$mcp_config_dir/config.json"
-    mkdir -p "$mcp_config_dir"
+    # Co-located with the tensor config in ~/.config/biopb (distinct from the
+    # client-definition mcp.json written below); the schema is flat sections.
+    local mcp_config="$CONFIG_DIR/mcp-config.json"
+    mkdir -p "$CONFIG_DIR"
     if [ -f "$mcp_config" ]; then
         _ok "biopb-mcp config exists at $mcp_config (preserved)"
     else
@@ -383,91 +338,64 @@ _setup_mcp() {
         # default, so no shm opt-out is seeded here anymore.
         cat > "$mcp_config" << EOF
 {
-  "mcp": {
-    "services": {
-      "process_image_servers": [
+  "services": {
+    "process_image_servers": [
 $process_image_servers
-      ]
-    }
+    ]
   }
 }
 EOF
         _ok "Created biopb-mcp config: $mcp_config"
     fi
 
-    # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
-    if _mcp_merge "$CONFIG_DIR/mcp.json" "mcpServers" "stdio" "$mcp_cmd" "${mcp_args[@]}"; then
-        _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
+    # they load into the agent kernel namespace at startup and are visible as a
+    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
+    # there (not only an installed module) so it is user-visible/editable and
+    # loads via the robust startup-file path. Idempotent (never clobbers a
+    # user-edited file); best-effort so a failure never aborts the install.
+    local seed_cmd
+    seed_cmd=$(command -v biopb-mcp-seed-plugins 2>/dev/null || true)
+    if [ -n "$seed_cmd" ] && "$seed_cmd" >/dev/null 2>&1; then
+        _ok "Seeded example kernel plugins: $CONFIG_DIR/kernel/"
     else
-        _warn "Could not write $CONFIG_DIR/mcp.json"
+        _note "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
     fi
 
-    # Assume the user has no working wiring until a branch below actually writes
-    # biopb into a client's config; cleared (0) only on a real registration, so a
-    # detected-but-unregistered client (failed `claude mcp add`, unwritable file,
-    # or Hermes' manual-only path) still gets the canonical fallback at the end.
-    local need_to_show_mcp_config=1
+    # Canonical standalone definition (standard mcpServers JSON; most clients
+    # accept it) -- a manual fallback the summary points at if nothing auto-wired.
+    # A fixed-shape standalone file, so a plain heredoc suffices (no merge).
+    cat > "$CONFIG_DIR/mcp.json" << EOF
+{
+  "mcpServers": {
+    "biopb": {
+      "command": "$mcp_cmd",
+      "args": ["--transport", "stdio"]
+    }
+  }
+}
+EOF
+    _ok "MCP definition written: $CONFIG_DIR/mcp.json"
 
-    # --- Claude Code (managed through the `claude` CLI) ---
-    if command -v claude &>/dev/null; then
-        if claude mcp get biopb &>/dev/null; then
-            _ok "Claude Code: biopb already registered"
-            need_to_show_mcp_config=0
-        elif claude mcp add --scope user biopb -- "$mcp_cmd" "${mcp_args[@]}" &>/dev/null; then
-            _ok "Claude Code: registered biopb (user scope)"
-            need_to_show_mcp_config=0
-        else
-            _warn "Claude Code detected but registration failed — add it manually:"
-            _cmd "claude mcp add --scope user biopb -- $mcp_cmd ${mcp_args[*]}"
-        fi
+    # Register with every detected client through the single source of truth:
+    # `biopb agents` (core biopb._agents), the same catalog + write logic the
+    # control-plane dashboard uses. It resolves the absolute biopb-mcp path and
+    # writes each client's own config (Claude Code via its CLI, the rest via an
+    # atomic JSON merge that preserves the user's other servers), so this installer
+    # no longer carries a second copy. `|| true`: a per-client failure must never
+    # abort the install (set -e). Its per-client results print directly.
+    local biopb_cmd
+    biopb_cmd=$(command -v biopb 2>/dev/null || echo "biopb")
+    "$biopb_cmd" agents register --all || true
+
+    # Manual-fallback notice fires only if nothing ended up registered. Ask the
+    # same source of truth rather than tracking it ourselves; grep keeps us jq-free
+    # (the one-line --json carries `"state": "registered"` for any wired client).
+    if "$biopb_cmd" agents list --json 2>/dev/null | grep -q '"state": "registered"'; then
+        MCP_NEEDS_MANUAL=0
+    else
+        MCP_NEEDS_MANUAL=1
     fi
-
-    # --- Hermes (NousResearch) — YAML config at ~/.hermes/config.yaml ---
-    if [ -d "$HOME/.hermes" ]; then
-        if [ -f "$HOME/.hermes/config.yaml" ] && grep -qE '^\s*biopb:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
-            _ok "Hermes: biopb already present in config.yaml"
-            need_to_show_mcp_config=0
-        else
-            # We can't safely edit Hermes' YAML, so we only print the snippet — that
-            # is not an actual setup, so the flag stays set.
-            _ok "Hermes detected"
-            _info "Add the following under 'mcp_servers:' in $HOME/.hermes/config.yaml:"
-            printf "    %sbiopb:\n      command: \"%s\"\n      args: [\"--transport\", \"stdio\"]%s\n" "$DIM" "$mcp_cmd" "$RESET"
-        fi
-    fi
-
-    # --- Claude Desktop ---
-    local cd_cfg=""
-    case "$PLATFORM" in
-        macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
-        Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
-    esac
-    if [ -n "$cd_cfg" ] && [ -d "$(dirname "$cd_cfg")" ]; then
-        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop" "${mcp_args[@]}" && need_to_show_mcp_config=0
-    fi
-
-    # --- Cursor ---
-    if [ -d "$HOME/.cursor" ]; then
-        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor" "${mcp_args[@]}" && need_to_show_mcp_config=0
-    fi
-
-    # --- opencode ---
-    local opencode_cfg_dir="$HOME/.config/opencode"
-    if command -v opencode &>/dev/null || [ -d "$opencode_cfg_dir" ]; then
-        local opencode_cfg="$opencode_cfg_dir/opencode.json"
-        if _mcp_merge "$opencode_cfg" "mcp" "opencode" "$mcp_cmd" "${mcp_args[@]}"; then
-            _ok "opencode: registered biopb ($opencode_cfg)"
-            need_to_show_mcp_config=0
-        else
-            _warn "opencode: could not update $opencode_cfg — add biopb manually"
-            _info "Add under 'mcp' in $opencode_cfg:"
-            printf "    %s\"biopb\": {\"type\": \"local\", \"command\": [\"%s\", \"--transport\", \"stdio\"], \"enabled\": true}%s\n" "$DIM" "$mcp_cmd" "$RESET"
-        fi
-    fi
-
-    # Nothing auto-wired biopb into a client. Defer the notice to the final
-    # summary (via a global) so it groups with the other warnings there.
-    MCP_NEEDS_MANUAL="$need_to_show_mcp_config"
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -517,35 +445,45 @@ _ensure_local_bin_on_path() {
 # unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
 _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
-    # The monorepo hosts several release lines, so /releases/latest is NOT
-    # component-specific. List releases (date-desc) and take the newest whose
-    # tag matches the deployment line, then fetch that release by tag. By default
-    # the match requires a CLEAN version (release-vX.Y.Z) so prerelease tags
-    # (release-v…a/b/rc — release candidates cut off dev) are skipped and never
-    # become the default download. With BIOPB_INSTALL_RC=1 the regex also admits
-    # a PEP 440 prerelease suffix, so the newest candidate wins.
-    local _releases
-    _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
-    local _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$"
-    [ "${ALLOW_RC:-0}" = "1" ] && \
-        _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$"
-    # `|| true`: an error/empty response makes grep exit 1, which under
-    # `set -euo pipefail` would abort the installer from this command
-    # substitution. We want to return 1 and let the caller print a friendly
-    # message, so the empty-tag check below handles it.
-    RELEASE_TAG=$(printf '%s' "$_releases" \
-        | grep '"tag_name"' \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-        | grep -E "$_tag_re" | head -1) || true
+    if [ -n "${PIN_TAG:-}" ]; then
+        # Exact pin (served-installer default, or BIOPB_INSTALL_VERSION): install
+        # this precise release. One API call, by tag -- no listing, no "newest
+        # wins", so the installer/release pairing can't skew and we stay well
+        # under the unauthenticated rate limit.
+        RELEASE_TAG="$PIN_TAG"
+    else
+        # No pin (git-checkout / raw, or the rc channel): resolve live. The
+        # monorepo hosts several release lines, so /releases/latest is NOT
+        # component-specific. List releases (date-desc) and take the newest whose
+        # tag matches the deployment line. By default the match requires a CLEAN
+        # version (release-vX.Y.Z) so prerelease tags (release-v…a/b/rc — cut off
+        # dev) are skipped; with BIOPB_INSTALL_RC=1 the regex also admits a PEP 440
+        # prerelease suffix, so the newest candidate wins.
+        local _releases
+        _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
+        local _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$"
+        [ "${ALLOW_RC:-0}" = "1" ] && \
+            _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$"
+        # `|| true`: an error/empty response makes grep exit 1, which under
+        # `set -euo pipefail` would abort the installer from this command
+        # substitution. We want to return 1 and let the caller print a friendly
+        # message, so the empty-tag check below handles it.
+        RELEASE_TAG=$(printf '%s' "$_releases" \
+            | grep '"tag_name"' \
+            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+            | grep -E "$_tag_re" | head -1) || true
+    fi
     [ -n "${RELEASE_TAG:-}" ] || return 1
-    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
+    # Validate the tag BEFORE it goes into the by-tag URL -- a pinned value comes
+    # from the environment / a stamped line, so never trust it into a request raw.
     if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
         _warn "Unexpected release tag format: $RELEASE_TAG"
         RELEASE_TAG=""
         return 1
     fi
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
     return 0
 }
 
@@ -702,6 +640,71 @@ _seed_samples() {
     rm -rf "$tmpdir"
 }
 
+# Whether `pid` is alive AND is a biopb process (not a reused PID). We only
+# force-kill PIDs whose command line still mentions biopb, so a stale pidfile
+# pointing at a since-recycled PID never takes out an unrelated process.
+_pid_is_biopb() {
+    local pid="$1" cmd=""
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    else
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null)   # macOS / no procfs
+    fi
+    case "$cmd" in
+        *biopb*) return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Stop every biopb service this machine might be running, robustly across release
+# lines. `biopb control stop` alone is NOT enough on two paths that matter here:
+#   - Pre-upgrade, `biopb` on PATH is still the OLD binary. v0.10 and earlier had
+#     no `control` subcommand at all -- the services were `biopb server` and
+#     `biopb mcp` -- so `control stop` just errors and their daemons keep holding
+#     the gRPC/http ports; the freshly installed control plane then refuses to
+#     bind (port conflict) and the upgrade appears to "not start".
+#   - A daemon started out-of-band, or one whose control plane is wedged, isn't
+#     reachable through any CLI verb we can call.
+# So try every known stop verb (an absent subcommand is a harmless nonzero exit),
+# then fall back to killing whatever the recorded pidfiles still point at. The
+# pidfile locations are version-independent constants, so this works without
+# knowing which release wrote them. Best-effort throughout.
+_stop_all_biopb_services() {
+    if command -v biopb >/dev/null 2>&1; then
+        biopb control stop >/dev/null 2>&1 || true   # v0.11+ control plane
+        biopb server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
+        biopb mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
+    fi
+
+    # Fallback: SIGTERM (then SIGKILL) any biopb PID still recorded in a known
+    # pidfile, then drop the file. control.pid is XDG-state aware; the legacy
+    # daemons hard-coded ~/.local/share (not XDG), so probe both.
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local share_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local pidfile pid tries
+    for pidfile in \
+        "$state_dir/control.pid" \
+        "$HOME/.local/share/biopb/tensor-server.pid" \
+        "$share_dir/biopb/tensor-server.pid" \
+        "$HOME/.local/share/biopb-mcp/mcp-server.pid" \
+        "$share_dir/biopb-mcp/mcp-server.pid"; do
+        [ -f "$pidfile" ] || continue
+        IFS= read -r pid < "$pidfile" 2>/dev/null || pid=""
+        pid=${pid//[!0-9]/}   # first line may be "pid<newline>token"; keep digits
+        if [ -n "$pid" ] && _pid_is_biopb "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            tries=0
+            while [ "$tries" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 0.2
+                tries=$((tries + 1))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile" 2>/dev/null || true
+    done
+}
+
 # Print the tail of the server log, indented, for diagnosing a bad startup.
 _tail_log() {
     local log="$1"
@@ -712,110 +715,101 @@ _tail_log() {
     done
 }
 
-# Start (or restart) the background data server, then report its health.
-# Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
-# Starting now lets the pre-cache warm overviews before the user opens anything,
-# and a restart makes an already-running (stale) server pick up the new code.
-_start_data_server() {
-    local log_file="$HOME/.local/share/biopb/logs/tensor-server.log"
+# Start the control plane (biopb control), which spawns and supervises the data
+# plane. Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
+# Starting now lets the pre-cache warm overviews before the user opens anything.
+# The control plane owns the data plane exclusively, so we first retire any prior
+# control plane so the freshly installed one can spawn and own a new plane -- it
+# refuses an in-use gRPC port.
+_start_control_plane() {
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local control_log="$state_dir/logs/control.log"
+    local server_log="$state_dir/logs/tensor-server.log"
 
     if [ "${BIOPB_NO_SERVER_START:-0}" = "1" ]; then
-        _info "Skipping server start (BIOPB_NO_SERVER_START=1)"
-        _info "  start it later with: ${CYAN}biopb server start${RESET}"
+        _info "Skipping control-plane start (BIOPB_NO_SERVER_START=1)"
+        _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
     if ! command -v biopb >/dev/null 2>&1; then
-        _warn "biopb not found on PATH; skipping server start"
-        _info "  start it later with: ${CYAN}biopb server start${RESET}"
+        _warn "biopb not found on PATH; skipping control-plane start"
+        _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
 
-    # 'restart' loads the just-installed code if a server is already running,
-    # and is a plain start otherwise.
-    biopb server restart >/dev/null 2>&1 || true
+    # Belt-and-suspenders: the real upgrade stop already ran before uv tool
+    # install (above), so this is a no-op on a clean upgrade path. Kept for the
+    # first-install case where a pre-existing plane was started out-of-band and
+    # the pre-install stop missed it, and the legacy <=v0.10 server/mcp daemon
+    # case. Best-effort.
+    _stop_all_biopb_services
 
-    # Ask the daemon for its health, polling until it reaches SERVING (or 60s).
-    # stderr carries live progress ("data server starting - N found so far...")
-    # and is intentionally NOT swallowed so the user sees the wait; stdout is the
-    # JSON verdict we parse below.
-    local out health count
-    out=$(biopb server status --json --wait 60) || out=""
+    # Start the control plane; it brings up the data plane by default. Don't
+    # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
+    # process makes the control plane refuse, and the CLI prints the real cause.
+    local start_out
+    if ! start_out=$(biopb control start 2>&1); then
+        _warn "Control plane failed to start:"
+        # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
+        # yields one loop pass whose trailing false test would make the while's
+        # exit status 1, and `set -o pipefail` + `set -e` would abort the
+        # installer here -- before the log tail / recovery hint below.
+        printf '%s\n' "$start_out" | while IFS= read -r line; do
+            if [ -n "$line" ]; then _info "  $line"; fi
+        done
+        _tail_log "$control_log"
+        _info "  full log: ${CYAN}$control_log${RESET}"
+        _info "  after fixing the cause, run: ${CYAN}biopb control start${RESET}"
+        return 0
+    fi
 
-    # Tolerate an older biopb that predates --json/--wait: fall back to a plain
-    # liveness check so the installer still works during a version transition.
-    if [ -z "$out" ]; then
-        if biopb server status 2>/dev/null | grep -q "Running"; then
-            _ok "Data server started"
-        else
-            _warn "Data server may not have started"
-            _tail_log "$log_file"
-            _info "  full log: ${CYAN}$log_file${RESET}"
+    # `control start` returns once its control API is listening but before the data
+    # plane finishes booting, so poll `control status` until the plane reports serving.
+    # Progressive discovery (biopb/biopb#212) reaches SERVING as soon as the
+    # server binds and scans in the background, so not-serving after 60s points to
+    # a real startup failure (crash, port in use, wedged bind), not a slow scan.
+    # `control status --json` carries only the plane's state (the lean control plane
+    # does no Flight health query, so no source_count here -- it climbs in the background).
+    local out i=0
+    while [ "$i" -lt 60 ]; do
+        out=$(biopb control status --json 2>/dev/null || echo "")
+        if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"serving"'; then
+            _ok "Control plane started — data plane serving; catalog + pre-cache building in the background"
+            return 0
         fi
-        return 0
+        if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"conflict"'; then
+            _warn "Data-plane gRPC port is held by another process; the control plane will not adopt it"
+            _info "  stop that server, then: ${CYAN}biopb control start${RESET}"
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    # Timed out. Attribute the failure to the right layer instead of always
+    # blaming the tensor server: `biopb control start` returned only once the
+    # control API was listening, but the control process can crash afterwards --
+    # and then `control status` is unreachable, never reports serving, and we'd
+    # time out here pointing at the wrong log. The last status seen tells us
+    # which: control_api:true means the control plane is up and the fault is in
+    # the tensor server it supervises; otherwise the control plane itself died.
+    if printf '%s' "$out" | grep -q '"control_api"[[:space:]]*:[[:space:]]*true'; then
+        _warn "Data plane did not reach serving within 60s"
+        _info "  the control plane is up but its tensor server failed to start or is wedged:"
+        _tail_log "$server_log"
+        _info "  full log: ${CYAN}$server_log${RESET}"
+    else
+        _warn "Control plane stopped responding within 60s"
+        _info "  it started but its control API is now unreachable (the control process likely crashed):"
+        _tail_log "$control_log"
+        _info "  full log: ${CYAN}$control_log${RESET}"
     fi
-
-    health=$(printf '%s' "$out" | sed -n 's/.*"health"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    count=$(printf '%s' "$out" | sed -n 's/.*"source_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-
-    if [ "$health" != "SERVING" ]; then
-        # Progressive discovery (biopb/biopb#212) decoupled SERVING from the data
-        # folder scan: the server reaches SERVING as soon as it binds and scans in
-        # the background, so a big folder no longer holds it out of SERVING. Not
-        # SERVING after 60s therefore points to a real startup failure (crash,
-        # port already in use, or a wedged bind), not a slow scan.
-        _warn "Data server did not reach SERVING within 60s"
-        _info "  it likely failed to start or is wedged (a slow folder scan no"
-        _info "  longer blocks SERVING, so this is not just \"still scanning\"):"
-        _tail_log "$log_file"
-        _info "  full log: ${CYAN}$log_file${RESET}"
-        _info "  recheck once with: ${CYAN}biopb server status --wait 30${RESET}"
-        return 0
-    fi
-
-    if [ -z "$count" ] || [ "$count" = "0" ]; then
-        # SERVING no longer implies a complete catalog: the folder scan runs in
-        # the background and registers sources as it walks. status --wait returns
-        # at the first SERVING, which is normally *before* the scan has indexed
-        # anything -- so 0 sources here usually just means "scan not finished
-        # yet," not "empty folder." The count climbs on its own shortly after.
-        _info "Data server is up; catalog is still building in the background"
-        _info "  no sources indexed yet — normal right after a (re)start"
-        _info "  recheck in a moment: ${CYAN}biopb server status${RESET}"
-        _info "  if it stays at 0, confirm the data folder holds supported images:"
-        _cmd "  ${ACTIVE_CONFIG:-$CONFIG_FILE}"
-        return 0
-    fi
-
-    _ok "Data server ready — $count data source(s) so far; still scanning + pre-caching in the background"
+    _info "  recheck with: ${CYAN}biopb control status${RESET}"
 }
 
-# Stop a running biopb-mcp daemon (best-effort) so the just-installed code takes
-# effect. UNLIKE the data server we deliberately do NOT restart it: the MCP
-# daemon owns a *visible* napari viewer and is brought up on demand by each AI
-# client's stdio bridge, so a plain stop is enough — the next agent reconnect
-# spawns a fresh (new-code) daemon via ensure_daemon, without the installer
-# popping a viewer window the user never asked for. Stopping does close any open
-# viewer and drops live agent sessions, so we announce it, and only act when a
-# daemon is actually running (a first install / not-running case stays silent).
-_stop_mcp_server() {
-    command -v biopb >/dev/null 2>&1 || return 0
-
-    # `biopb mcp status --json` -> {"running": true|false, ...}. Only proceed on
-    # a live daemon so nothing is printed (or torn down) when none is up.
-    if ! biopb mcp status --json 2>/dev/null \
-        | grep -q '"running"[[:space:]]*:[[:space:]]*true'; then
-        return 0
-    fi
-
-    _info "Stopping the biopb MCP server so the update takes effect"
-    _info "  (this closes any open napari viewer; it restarts on demand)"
-    biopb mcp stop >/dev/null 2>&1 || true
-}
-
-# Precompile the tool env's Python bytecode (.py -> .pyc) so the first
-# `biopb mcp start` and first `start_kernel` don't pay the one-time compile cost
+# Precompile the tool env's Python bytecode (.py -> .pyc) so the first MCP
+# session and first `start_kernel` don't pay the one-time compile cost
 # (biopb/biopb#384). This covers BOTH trees regardless of which process imports
-# them — the (smaller) server stack the `biopb mcp` daemon loads, and the heavy
+# them — the (smaller) server stack an MCP session child loads, and the heavy
 # napari/Qt tree the child kernel loads on first `start_kernel`, which is where
 # the user waits longest. Admin-free, so it runs on every install; idempotent —
 # a rerun after an upgrade just compiles the newly added files. Best-effort: a
@@ -839,6 +833,72 @@ _precompile_bytecode() {
     _ok "Bytecode precompiled (first viewer launch will be faster)"
 }
 
+# Drop a double-clickable "biopb Dashboard" shortcut on the user's Desktop that
+# runs `biopb dashboard` (start the control plane if needed, then open the
+# browser). Best-effort: a failure only means no icon, never aborts the install.
+# Skip with BIOPB_INSTALL_SHORTCUT=0. GUI launchers do NOT inherit the shell
+# PATH, so the shortcut invokes biopb by its absolute path. Requires PLATFORM set.
+_install_desktop_shortcut() {
+    if [ "${BIOPB_INSTALL_SHORTCUT:-1}" = "0" ]; then
+        _note "Desktop shortcut skipped (BIOPB_INSTALL_SHORTCUT=0)"
+        return 0
+    fi
+
+    local biopb_bin
+    biopb_bin=$(command -v biopb 2>/dev/null || echo "$HOME/.local/bin/biopb")
+
+    # Only place an icon where a desktop already exists -- creating ~/Desktop on a
+    # headless box (a compute node, a container) would leave a launcher nobody sees.
+    local desktop_dir="$HOME/Desktop"
+    [ -d "$desktop_dir" ] || { _note "No Desktop directory; skipping shortcut"; return 0; }
+
+    case "$PLATFORM" in
+        macOS)
+            # A .command file is the standard double-clickable launcher on macOS.
+            local shortcut="$desktop_dir/biopb Dashboard.command"
+            cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
+#!/bin/bash
+# biopb Dashboard — starts the control plane (if needed) and opens the browser.
+exec "$biopb_bin" dashboard
+EOF
+            chmod +x "$shortcut" 2>/dev/null || true
+            _ok "Desktop shortcut created: $shortcut"
+            ;;
+        Linux|WSL)
+            local shortcut="$desktop_dir/biopb-dashboard.desktop"
+            # Brand the launcher with the webapp's logo (shipped in the webapp
+            # bundle at $WEBAPP_DIR); omit the line if the fetch failed so we never
+            # point Icon= at a missing file.
+            local icon_line=""
+            [ -f "$WEBAPP_DIR/biopb-logo.png" ] && icon_line="Icon=$WEBAPP_DIR/biopb-logo.png"
+            cat > "$shortcut" <<EOF || { _note "Could not write $shortcut; skipping"; return 0; }
+[Desktop Entry]
+Type=Application
+Name=biopb Dashboard
+Comment=Start the biopb control plane and open the dashboard
+Exec=$biopb_bin dashboard
+${icon_line}
+Terminal=false
+Categories=Science;Education;
+EOF
+            chmod +x "$shortcut" 2>/dev/null || true
+            # GNOME/Nautilus won't run a launcher on double-click until it is
+            # marked trusted; best-effort (an absent/older gio just no-ops).
+            gio set "$shortcut" metadata::trusted true 2>/dev/null || true
+            # Also register it in the app menu so it's findable without the icon.
+            local apps_dir="$HOME/.local/share/applications"
+            if mkdir -p "$apps_dir" 2>/dev/null; then
+                cp -f "$shortcut" "$apps_dir/biopb-dashboard.desktop" 2>/dev/null || true
+            fi
+            _ok "Desktop shortcut created: $shortcut"
+            ;;
+        *)
+            _note "Desktop shortcut not supported on this platform"
+            ;;
+    esac
+    return 0
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -849,14 +909,20 @@ install_biopb() {
     BIOPB_REPO_URL="https://github.com/biopb/biopb"
     REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
     RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
-    # The monorepo hosts multiple release lines (release-v*, v*, mcp-v*,
-    # server-v*). The all-in-one deployment the installer wants is the
-    # release-v* one (see docs/release-model.md), so the release fetch filters
-    # by this prefix instead of using /releases/latest (which is repo-wide).
+    # The monorepo hosts two release lines: the product `release-v*` and the SDK
+    # `v*` (see docs/release-model.md). The all-in-one deployment the installer
+    # wants is the `release-v*` one, so the release fetch filters by this prefix
+    # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
-    WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
-    SAMPLES_DIR="$HOME/.local/share/biopb/samples"
-    CONFIG_DIR="$HOME/.config/biopb"
+    # On-disk trees follow XDG (matching biopb._locations): config in the
+    # config tree, portable assets (webapp/samples) in the data tree, and logs /
+    # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
+    # conventional dirs, so writer (installer) and reader (code) never disagree.
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/biopb"
+    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local data_base="${XDG_DATA_HOME:-$HOME/.local/share}/biopb"
+    WEBAPP_DIR="$data_base/webapp"
+    SAMPLES_DIR="$data_base/samples"
 
     # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
     # BIOPB_INSTALL_RC=1 also admits the latest release candidate (a/b/rc
@@ -867,6 +933,29 @@ install_biopb() {
         ALLOW_RC=1
     else
         ALLOW_RC=0
+    fi
+
+    # Effective release to install (PIN_TAG). Precedence:
+    #   BIOPB_INSTALL_VERSION  explicit override -- install/downgrade to any exact
+    #                          release (accepts release-vX.Y.Z, vX.Y.Z, or X.Y.Z)
+    #   > BIOPB_INSTALL_RC=1    query the latest CANDIDATE (rc isn't published to
+    #                          biopb.org, so this always resolves live, ignoring
+    #                          any baked pin)
+    #   > BIOPB_PINNED_RELEASE  the tag stamped into the served installer at publish
+    #   > "" (empty)           git-checkout / raw: track the latest stable release
+    # Empty PIN_TAG makes _fetch_latest_release fall back to the list-newest query.
+    PIN_TAG=""
+    if [ -n "${BIOPB_INSTALL_VERSION:-}" ]; then
+        PIN_TAG="$BIOPB_INSTALL_VERSION"
+        case "$PIN_TAG" in
+            "${RELEASE_TAG_PREFIX}"*) : ;;                              # release-v0.11.0
+            v*) PIN_TAG="${RELEASE_TAG_PREFIX}${PIN_TAG#v}" ;;          # v0.11.0 -> release-v0.11.0
+            *)  PIN_TAG="${RELEASE_TAG_PREFIX}${PIN_TAG}" ;;            # 0.11.0  -> release-v0.11.0
+        esac
+    elif [ "$ALLOW_RC" = "1" ]; then
+        PIN_TAG=""
+    elif [ -n "${BIOPB_PINNED_RELEASE:-}" ]; then
+        PIN_TAG="$BIOPB_PINNED_RELEASE"
     fi
 
     printf "\n%s" "${CYAN}"
@@ -935,15 +1024,14 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    # No longer offered interactively (biopb/biopb#237). The web interface now
-    # carries the server admin page (config / status / restart) on top of the
-    # image viewer, so it is installed by default rather than being optional.
+    # The web interface is NOT optional (biopb/biopb#237, dashboard redesign):
+    # `biopb dashboard` -- the one-command entry point and the Desktop shortcut the
+    # installer drops -- boots the control plane and opens its web UI, so the SPA is
+    # always installed. (A legacy BIOPB_INSTALL_WEBAPP=0 is silently ignored now.)
     # Bio-Formats stays off by default: the Python adapters now cover the formats
-    # most labs use, and it pulls in a heavyweight Java toolchain. Both remain
-    # overridable for scripted installs via env vars:
-    #   BIOPB_INSTALL_WEBAPP=0      skip the web interface (API-only server)
+    # most labs use, and it pulls in a heavyweight Java toolchain. It remains
+    # overridable for scripted installs via env var:
     #   BIOPB_INSTALL_BIOFORMATS=1  add Bio-Formats (Java fetched on first use)
-    if [ "${BIOPB_INSTALL_WEBAPP:-1}" != "0" ]; then INSTALL_WEBAPP=1; else INSTALL_WEBAPP=0; fi
     if [ "${BIOPB_INSTALL_BIOFORMATS:-0}" = "1" ]; then INSTALL_BIOFORMATS=1; else INSTALL_BIOFORMATS=0; fi
 
     # ===== Non-interactive / unmanned mode =====
@@ -987,11 +1075,11 @@ install_biopb() {
     # biopb-mcp (always installed) requires Python >= 3.10.
     MIN_MINOR=10
 
-    # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
-    # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
-    # interpreter lxml is built from source — which fails on a fresh machine
-    # without libxml2/libxslt dev headers (the common WSL install failure).
-    # Cap at 3.12, the newest Python with a prebuilt lxml 4.x wheel; if the
+    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
+    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
+    # default `aics` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
+    # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
+    # libCZI), which fails on a fresh machine without a C++ toolchain. If the
     # system Python is newer we fall back to a uv-managed 3.12 below.
     MAX_MINOR=12
 
@@ -1010,7 +1098,7 @@ install_biopb() {
                 _ok "Using system Python: $(python3 --version)"
                 PYTHON_SPEC=$(command -v python3)
             elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
-                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (aicsimageio's lxml<5 has no wheel for 3.13+)"
+                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
                 PYTHON_VERSION=""
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"
@@ -1029,42 +1117,63 @@ install_biopb() {
     # ===== 3. Install biopb packages =====
     _step "[3/7] Installing biopb packages..."
 
-    TENSOR_EXTRAS="web,aics,medical,ndtiff,hdf5"
+    # The HDF5 reader ([hdf5] -> h5py) is NOT bundled by default: .h5 is a niche
+    # source format here, and h5py is cleanly gated behind its own opt-in extra
+    # (nothing else in this set pulls it), so a user who needs it installs
+    # biopb-tensor-server[hdf5]. Kept out of the default to slim the install.
+    TENSOR_EXTRAS="web,aics,medical,ndtiff"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"
+    fi
+    # The Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw) ships no
+    # Intel-macOS wheel, so including it there would source-build libCZI and fail.
+    # Add it everywhere except Intel macOS (arm64 macOS, Linux, and Windows all
+    # have a wheel).
+    if [ "$PLATFORM" = "macOS" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
+        _info "  skipping CZI reader on Intel macOS (bioio-czi has no Intel-mac wheel)"
+    else
+        TENSOR_EXTRAS="$TENSOR_EXTRAS,czi"
     fi
 
     # Resolve where the three packages come from. They must be installed as a
     # matched set from a single build: the tensor server is self-contained and
     # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
     # coupled to both — so all three are pinned to the sibling wheels from one
-    # release-v* deployment (release CI builds the mutually-paired triple from
+    # release-v* deployment (release CI builds the mutually-paired set from
     # the tagged commit) and the resolver is never allowed to pull biopb /
     # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
     # set — no PyPI-vs-release version skew.
-    local biopb_req tensor_req mcp_req
+    local biopb_req tensor_req mcp_req control_req
     # napari is the one runtime dep resolved from PyPI. We pin it to the exact
     # version this release was built/tested against (carried in its versions.json
     # attribute, read below) so the deployed object graph matches the graph-walk
     # thread-safety test — and so the napari[all] Qt binding is the tested one.
     local napari_req="napari[all]"
     if ! _fetch_latest_release; then
-        _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
-        if [ "$ALLOW_RC" = "1" ]; then
+        if [ -n "${PIN_TAG:-}" ]; then
+            _err "Could not fetch biopb release $PIN_TAG from $RELEASE_REPO."
+            _info "Check the version exists and your network, then rerun. To install the latest stable release instead:"
+            _cmd "curl -fsSL https://biopb.org/install.sh | bash"
+        elif [ "$ALLOW_RC" = "1" ]; then
+            _err "Could not fetch a biopb release candidate from $RELEASE_REPO."
             _info "No release candidate found. Check your network, or install the stable release:"
             _cmd "curl -fsSL https://biopb.org/install.sh | bash"
         else
+            _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
             _info "Check your network and rerun. To try the latest release candidate:"
             _cmd "curl -fsSL https://biopb.org/install.sh | BIOPB_INSTALL_RC=1 bash"
         fi
         exit 1
     fi
-    local mcp_url sdk_url tensor_url
+    local mcp_url sdk_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
     sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
+    # biopb-control (control plane) wheel. Its filename uses an underscore
+    # (biopb_control-…), so the sdk regex `biopb-…` above never matches it.
+    control_url=$(_release_asset_url 'biopb_control-[^/]+\.whl')
+    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
         _err "Release $RELEASE_TAG is missing one of the biopb wheels."
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
@@ -1098,25 +1207,29 @@ install_biopb() {
     local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
     local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
     local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+    local control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
+    curl -fsSL "$control_url" -o "$control_whl"
     # Verify the downloaded wheels against the release's SHA256SUMS before they
     # are file://-installed (aborts on a mismatch; fails open on an older release
     # without the manifest). See the auto-updater trust item in issue #87.
-    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl"
+    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl" "$control_whl"
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
-    # `biopb[tensor]`) to the downloaded set rather than to PyPI.
+    # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set rather than PyPI.
     mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
     biopb_req="biopb[tensor] @ file://$sdk_whl"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
+    control_req="biopb-control @ file://$control_whl"
 
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime:
-    #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
-    #     so the server must be importable from biopb's interpreter (this also
-    #     restores `from biopb_tensor_server.config import load_config`);
+    #   - the control plane (`biopb control`) supervises the data plane by running
+    #     `sys.executable -m biopb_tensor_server.cli`, so the server must be
+    #     importable from biopb's interpreter (this also restores
+    #     `from biopb_tensor_server.config import load_config`);
     #   - biopb-mcp is a napari plugin + MCP server that talks to the tensor
     #     server and runs a napari viewer in this same env.
     # biopb is the primary tool (exposes the `biopb` command); --with adds the
@@ -1126,7 +1239,7 @@ install_biopb() {
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
     # psutil) — without it `import mcp` fails; the extra is applied to the pinned
     # wheel/ref ($mcp_req) just like the others. It now ships in the biopb-mcp
-    # release alongside biopb + tensor-server (one matched triple), so unlike the
+    # release alongside biopb + tensor-server (one matched set, now four wheels), so unlike the
     # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
     # dep still resolved from PyPI, but pinned to the release's versions.json
     # version ($napari_req, set above) so it matches the tested build.
@@ -1144,23 +1257,43 @@ install_biopb() {
         --with "$napari_req"
         --with-executables-from biopb-mcp
     )
+    # biopb-control (control plane): supervises the data plane. `biopb control …` is
+    # exposed through the core `biopb` CLI, which spawns `python -m biopb_control`,
+    # so it only needs to be importable in this shared env; --with-executables-from
+    # also links the standalone `biopb-control` script for direct `biopb-control run`.
+    _info "  including biopb-control"
+    install_args+=(
+        --with "$control_req"
+        --with-executables-from biopb-control
+    )
 
-    # cryptography >= 49 dropped its universal2/x86_64 macOS wheel and now ships
-    # arm64 only, so on an Intel Mac uv finds no wheel and compiles the Rust/OpenSSL
-    # sdist -- which fails on a stock machine without OpenSSL dev headers. It reaches
-    # us purely transitively (mcp -> pyjwt[crypto]), so cap it below 49 on Intel macOS
-    # where uv then picks 48.x's universal2 wheel. arm64 macOS, Linux, and Windows all
-    # have a 49 wheel and are unaffected. Remove once cryptography ships an Intel-mac
-    # wheel again (or biopb-mcp's MCP dep drops the pyjwt crypto extra).
-    if [ "$PLATFORM" = "macOS" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
-        install_args+=(--with "cryptography<49")
-        _info "  pinning cryptography<49 (Intel macOS: 49 dropped its x86_64 wheel)"
-    fi
+    # biopb-mcp reaches `cryptography` only transitively, via the MCP SDK's
+    # unconditional `pyjwt[crypto]` -- asymmetric-JWT / OAuth signing we never use,
+    # since we run over localhost stdio. Override that dep back to plain `pyjwt` and
+    # cryptography (plus its cffi / Rust / OpenSSL build surface) falls out of the
+    # resolved closure entirely. That also retires the Intel-macOS wheel problem the
+    # old `cryptography<49` pin worked around: cryptography>=49 ships arm64-only macOS
+    # wheels, so an Intel Mac found no wheel and compiled the sdist -- failing on a
+    # stock machine without OpenSSL dev headers. Supersedes the Intel-mac pin from
+    # 024ca79 (biopb#355). Safe because pyjwt imports cryptography lazily, only for
+    # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine.
+    printf 'pyjwt>=2.10.1\n' > "$WHEELS_DIR/overrides.txt"
+    install_args+=(--overrides "$WHEELS_DIR/overrides.txt")
+    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override)"
 
-    # Retire any running old-code MCP daemon before the new wheels land, so the
-    # next agent reconnect brings up the just-installed code (the daemon is
-    # spawned on demand, so there is nothing to restart here).
-    _stop_mcp_server
+    # No MCP server to stop before the new wheels land: each AI client's stdio
+    # shim spawns and owns its own ephemeral session, reaped on disconnect, so
+    # the next agent reconnect already brings up the just-installed code.
+    #
+    # Stop every running biopb service (and the data plane it owns) BEFORE
+    # swapping the binary, so the new control start binds clean ports. This must
+    # be robust across release lines: on an upgrade `biopb` on PATH is still the
+    # OLD binary, and v0.10-and-earlier has no `control` subcommand, so a bare
+    # `biopb control stop` would leave its `server`/`mcp` daemons holding the
+    # ports. _stop_all_biopb_services covers both eras (CLI verbs + pidfile kill).
+    # No-op on a first install (no biopb on PATH, no pidfiles).
+    _info "Stopping any running biopb services before upgrade..."
+    _stop_all_biopb_services
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -1187,41 +1320,44 @@ install_biopb() {
     fi
 
     # ===== 4. Webapp =====
+    # Mandatory (the dashboard is the SPA). WEBAPP_OK tracks whether it is actually
+    # on disk after this step, so the summary can flag a failed fetch -- the only
+    # way it can be missing now is a network/asset error, not a user opt-out.
     _step "[4/7] Installing web interface..."
 
-    if [ "$INSTALL_WEBAPP" = "1" ]; then
-        mkdir -p "$WEBAPP_DIR"
+    WEBAPP_OK=0
+    mkdir -p "$WEBAPP_DIR"
 
-        # Reuses the release metadata already fetched for the wheels (cached).
-        if _fetch_latest_release; then
-            INSTALLED_TAG=""
-            [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
-            if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
-                _ok "Web interface already up to date ($RELEASE_TAG)"
-            else
-                _info "Downloading $RELEASE_TAG..."
-                rm -rf "${WEBAPP_DIR:?}"
-                mkdir -p "$WEBAPP_DIR"
-                local webapp_url
-                webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
-                webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
-                local tmp
-                tmp=$(mktemp)
-                if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
-                    tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
-                    printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
-                    _ok "Web interface installed to: $WEBAPP_DIR"
-                else
-                    _warn "No webapp.tar.gz in release $RELEASE_TAG; server will run in API-only mode"
-                fi
-                rm -f "$tmp"
-            fi
+    # Reuses the release metadata already fetched for the wheels (cached).
+    if _fetch_latest_release; then
+        INSTALLED_TAG=""
+        [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
+        if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
+            _ok "Web interface already up to date ($RELEASE_TAG)"
+            WEBAPP_OK=1
         else
-            _warn "Could not fetch latest release, web interface not installed"
-            _info "Server will run in API-only mode"
+            _info "Downloading $RELEASE_TAG..."
+            rm -rf "${WEBAPP_DIR:?}"
+            mkdir -p "$WEBAPP_DIR"
+            local webapp_url
+            webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
+            webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
+            local tmp
+            tmp=$(mktemp)
+            if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
+                tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
+                printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
+                _ok "Web interface installed to: $WEBAPP_DIR"
+                WEBAPP_OK=1
+            else
+                _warn "Could not download the web interface (webapp.tar.gz) from $RELEASE_TAG"
+                _info "  the dashboard needs it -- rerun this script to retry"
+            fi
+            rm -f "$tmp"
         fi
     else
-        _info "Skipped"
+        _warn "Could not fetch the latest release; web interface not installed"
+        _info "  the dashboard needs it -- rerun this script to retry"
     fi
 
     # ===== 5. Config =====
@@ -1248,6 +1384,12 @@ install_biopb() {
     # still overrides on a fresh install (power users / unattended provisioning)
     # and skips the samples. An empty DATA_DIR is the "keep existing" sentinel;
     # otherwise we write a config whose `sources` points at DATA_DIR (biopb/biopb#34).
+    # Always download the sample bundle into SAMPLES_DIR (idempotent -- skips when
+    # already at this release; honors BIOPB_INSTALL_SAMPLES=0). Whether the server
+    # is *pointed* at the samples stays the fresh-install-only decision below; this
+    # only guarantees the bytes are present on every run.
+    _seed_samples "$SAMPLES_DIR"
+
     local DATA_DIR
     # Watch a user's own data dir (new files auto-register); leave the static
     # sample bundle unmonitored. The sample bundle is also given an alias so it
@@ -1267,11 +1409,11 @@ install_biopb() {
         DATA_DIR="$BIOPB_DATA_DIR"
         _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
     else
-        # Fresh install, no override: seed samples and point the config at them.
+        # Fresh install, no override: point the config at the sample bundle
+        # (already downloaded above).
         DATA_DIR="$SAMPLES_DIR"
         MONITOR="false"
         ALIAS="samples"
-        _seed_samples "$SAMPLES_DIR"
         _ok "Data directory: $DATA_DIR (sample images)"
     fi
 
@@ -1279,7 +1421,22 @@ install_biopb() {
     # or the untouched existing file when the user keeps it (shown in the summary).
     local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
-        _ok "Keeping current config: $EXISTING_CONFIG"
+        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
+        # convert it in place to the canonical JSON via `biopb server
+        # migrate-config` (settings preserved verbatim, old file backed up to
+        # biopb.toml.bak) so an upgraded install stops warning about the
+        # deprecated format. A JSON config is already canonical -- nothing to do.
+        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && command -v biopb >/dev/null 2>&1; then
+            _info "Migrating legacy TOML config to canonical JSON..."
+            if biopb server migrate-config >/dev/null 2>&1; then
+                ACTIVE_CONFIG="$CONFIG_FILE"
+                _ok "Migrated config: $LEGACY_CONFIG -> $CONFIG_FILE (old file backed up)"
+            else
+                _warn "Could not migrate legacy config; keeping $LEGACY_CONFIG"
+            fi
+        else
+            _ok "Keeping current config: $EXISTING_CONFIG"
+        fi
     else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
@@ -1304,14 +1461,12 @@ install_biopb() {
         fi
     fi
 
-    # ===== 6. Start the data server =====
-    # Before MCP wiring so a typo in the data dir (step 5) surfaces right after
-    # the choice, while pre-cache gets the earliest possible head start.
-    _step "[6/7] Starting data server..."
-    _start_data_server
-
-    # ===== 7. Wire biopb-mcp into the user's agent system =====
-    _step "[7/7] Configuring MCP client..."
+    # ===== 6. Wire biopb-mcp into the user's agent system =====
+    # Before starting the control plane: agent wiring is quick and self-contained,
+    # so the client is configured even if the (slower) control-plane start is
+    # interrupted -- and the control plane comes up on demand anyway when the agent
+    # first launches biopb-mcp.
+    _step "[6/7] Configuring MCP client..."
 
     # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
     # agents; if none is present, offer to install opencode so the user ends up
@@ -1335,6 +1490,13 @@ install_biopb() {
     fi
     _setup_mcp
 
+    # ===== 7. Start the control plane (which owns the data plane) =====
+    _step "[7/7] Starting control plane..."
+    _start_control_plane
+
+    # Drop a "biopb Dashboard" launcher on the Desktop (runs `biopb dashboard`).
+    _install_desktop_shortcut
+
     # ===== Summary =====
     # Two groups, in order: all informational blocks, then all warnings. Every
     # block is one headline line, optional indented detail lines, then one blank
@@ -1346,13 +1508,14 @@ install_biopb() {
 
     # Headlines via _info (indent 2, matching _ok/_warn), detail lines indent 4.
     # --- informational blocks ---
-    if [ "$INSTALL_WEBAPP" = "1" ]; then
-        _info "Web interface available at http://localhost:8814"
+    if [ "$WEBAPP_OK" = "1" ]; then
+        _info "Web interface available at http://localhost:8813"
+        _info "  open it anytime with: ${CYAN}biopb dashboard${RESET} (or the Desktop shortcut)"
         echo ""
     fi
 
     _info "biopb-mcp configuration file:"
-    _cmd "  $HOME/.config/biopb-mcp/config.json"
+    _cmd "  $HOME/.config/biopb/mcp-config.json"
     echo ""
 
     _info "Data server configuration file:"
@@ -1369,9 +1532,9 @@ install_biopb() {
         echo ""
     fi
 
-    if [ "$INSTALL_WEBAPP" = "0" ]; then
-        _warn "Web interface not installed (BIOPB_INSTALL_WEBAPP=0)"
-        _info "  rerun without that env var to install it"
+    if [ "$WEBAPP_OK" = "0" ]; then
+        _warn "Web interface not installed (download failed)"
+        _info "  the dashboard won't work until you rerun this script to fetch it"
         echo ""
     fi
 
@@ -1418,7 +1581,9 @@ install_biopb() {
 # Remove the biopb stdio entry from a JSON MCP config: delete the "biopb" key
 # under top-level <parent> in <file>. No-op when the file, the parent section,
 # or the entry is absent (the file is left byte-for-byte untouched). Preserves
-# all other content and writes atomically — the exact inverse of _mcp_merge.
+# all other content and writes atomically — the inverse of the merge that
+# registration performs. Kept hand-rolled (not delegated to `biopb agents
+# unregister`) so teardown never depends on the biopb tool it is removing.
 # Prints "removed" iff it deleted an entry, so callers can report per client.
 _mcp_unmerge() {
     local file="$1" parent="$2"
@@ -1507,7 +1672,7 @@ Options:
                 biopb from detected AI agents, and remove the package
                 environment. Keeps config and cached data unless --purge.
   --purge       With --uninstall, also delete config and cached/state data
-                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb, and
+                (~/.config/biopb, ~/.local/state/biopb, ~/.local/share/biopb, and
                 the file cache under the temp dir). Implies --uninstall. Never
                 touches your image data.
   -h, --help    Show this help.
@@ -1531,14 +1696,12 @@ uninstall_biopb() {
     # 1. Stop the daemons first. On some platforms a live process keeps its files
     #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
     #    engine hits exactly this — os error 5), so stopping precedes removal.
+    #    _stop_all_biopb_services tears down the control plane AND the legacy
+    #    <=v0.10 server/mcp daemons (an old install being uninstalled by a newer
+    #    script), falling back to pidfile kills for anything the CLI can't reach.
     _step "[1/3] Stopping biopb services..."
-    if command -v biopb &>/dev/null; then
-        biopb server stop &>/dev/null || true
-        biopb mcp stop &>/dev/null || true
-        _ok "Data server and MCP server stopped (if they were running)"
-    else
-        _info "biopb command not on PATH; nothing to stop"
-    fi
+    _stop_all_biopb_services
+    _ok "biopb services stopped (if they were running)"
 
     # 2. Unregister from agents BEFORE removing the package, while `claude` and
     #    the config paths are still meaningful.
@@ -1597,9 +1760,11 @@ PY
 
         local d
         for d in \
-            "$HOME/.config/biopb" \
+            "${XDG_CONFIG_HOME:-$HOME/.config}/biopb" \
             "$HOME/.config/biopb-mcp" \
-            "$HOME/.local/share/biopb"; do
+            "${XDG_STATE_HOME:-$HOME/.local/state}/biopb" \
+            "${XDG_DATA_HOME:-$HOME/.local/share}/biopb" \
+            "$HOME/.local/share/biopb-mcp"; do
             if [ -e "$d" ]; then
                 rm -rf "$d"
                 _ok "Removed $d"
@@ -1608,7 +1773,7 @@ PY
         _info "Your image data was not touched."
     else
         _info "Config and cached data were kept. Remove them with --purge, or:"
-        _cmd "  rm -rf ~/.config/biopb ~/.config/biopb-mcp ~/.local/share/biopb"
+        _cmd "  rm -rf ~/.config/biopb ~/.local/state/biopb ~/.local/share/biopb"
         _cmd "  rm -rf \"\${TMPDIR:-/tmp}/biopb-cache-\$(id -u)\"   # file cache"
     fi
 

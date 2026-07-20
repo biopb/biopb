@@ -15,12 +15,12 @@ on a not-yet-mounted monitored directory. These tests pin the new behavior:
   and skips unresolvable entries only when asked.
 """
 
-import biopb_tensor_server.config as config_mod
+import biopb_tensor_server.core.config as config_mod
 import numpy as np
 import pytest
 import tifffile
 from biopb_tensor_server.cli import _resolve_serve_sources
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
     resolve_all_sources,
@@ -154,7 +154,7 @@ class TestResolveServeSources:
         SourceManager's background re-list owns discovering its sources instead,
         so _resolve_serve_sources must not touch the network at all here.
         """
-        import biopb_tensor_server.config as cfg_mod
+        import biopb_tensor_server.core.config as cfg_mod
 
         def _boom(*_a, **_k):  # pragma: no cover - must never be reached
             raise AssertionError("upstream must not be enumerated at startup")
@@ -163,10 +163,43 @@ class TestResolveServeSources:
             "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
             _boom,
         )
-        # Guard the import site used inside _discover_tensor_server too.
-        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom, raising=False)
+        # Guard the expansion entry point too. No raising=False: if
+        # _discover_tensor_server is renamed/removed, this setattr must fail loudly
+        # rather than silently create a dead attribute and let the test pass blind.
+        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom)
 
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=True)
+        cfg = _config(upstream)
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
+        assert static_sources == []
+
+    def test_unmonitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
+        """A bare-host ``grpc://host:port`` upstream with ``monitor=false`` is ALSO
+        routed to the background re-list -- never inline-expanded into static
+        sources (biopb/biopb#178 regression).
+
+        Inline static expansion registered every mirrored source through a blocking
+        per-source ``get_descriptor`` RPC before ``mark_ready()``, so a large
+        upstream both stalled SERVING (~1h for a few hundred OME-TIFF proxies) and
+        skipped the bulk-seed fast path. A bare-host upstream always mirrors via the
+        seeded reconcile; ``monitor=false`` only tunes the re-list cadence, so
+        ``_resolve_serve_sources`` must not touch the network here either.
+        """
+        import biopb_tensor_server.core.config as cfg_mod
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never be reached
+            raise AssertionError("upstream must not be enumerated at startup")
+
+        monkeypatch.setattr(
+            "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
+            _boom,
+        )
+        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom)
+
+        upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=False)
         cfg = _config(upstream)
 
         static_sources, monitored_sources = _resolve_serve_sources(cfg)
@@ -296,13 +329,13 @@ class TestAliasTreeRoot:
     """
 
     def test_alias_catalog_url_single_source_is_bare_root(self):
-        from biopb_tensor_server.config import _alias_catalog_url
+        from biopb_tensor_server.core.config import _alias_catalog_url
 
         # Configured entry IS the source (file / dataset dir): alias is the root.
         assert _alias_catalog_url("exp", "/data/exp.zarr", "/data/exp.zarr") == "exp"
 
     def test_alias_catalog_url_preserves_subtree(self):
-        from biopb_tensor_server.config import _alias_catalog_url
+        from biopb_tensor_server.core.config import _alias_catalog_url
 
         assert _alias_catalog_url("exp", "/data/exp", "/data/exp/a.tif") == "exp/a.tif"
         assert (
@@ -311,7 +344,7 @@ class TestAliasTreeRoot:
         )
 
     def test_alias_catalog_url_non_relativizable_is_bare_root(self):
-        from biopb_tensor_server.config import _alias_catalog_url
+        from biopb_tensor_server.core.config import _alias_catalog_url
 
         # Primary not under the root (defensive) -> alias-only root, never "../".
         assert _alias_catalog_url("exp", "/data/exp", "/elsewhere/x.tif") == "exp"

@@ -11,15 +11,15 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
 
 
-class ZarrAdapter(SourceAdapter, TensorAdapter):
+class ZarrAdapter(TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
@@ -103,8 +103,10 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
     def get_metadata(self):
         return {}
 
-    def get_tensor_adapter(self, tensor_id):
-        return self
+    # get_tensor_adapter: inherit the total single-tensor base -- it returns self
+    # for the source's sole tensor and raises TensorNotFound for an unknown
+    # nonempty field, so a typo'd array_id no longer silently reads the base
+    # tensor (issue #378).
 
     @classmethod
     def create_from_config(
@@ -124,7 +126,7 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         import zarr
         from zarr.storage import FSStore
 
-        from biopb_tensor_server.remote import RemoteStore
+        from biopb_tensor_server.core.remote import RemoteStore
 
         if source.is_remote:
             # Remote storage: use RemoteStore for filesystem creation
@@ -180,7 +182,10 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
         return self.zarr_array[slices]
 
     def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
@@ -201,12 +206,53 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         if data.shape != expected_shape:
             padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
             src_slices = tuple(
-                slice(0, min(d, es)) for d, es in zip(data.shape, expected_shape)
+                slice(0, min(d, es))
+                for d, es in zip(data.shape, expected_shape, strict=True)
             )
             padded[src_slices] = data[src_slices]
             data = padded
 
         self.zarr_array[slices] = data
+
+    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+        """Chunk-aligned write: ``bounds`` must land on the zarr chunk grid.
+
+        Absorbs the alignment/reshape the DoPut handler used to perform inline,
+        then delegates the store to ``write_chunk``. The grid comes straight off
+        ``self.zarr_array.chunks`` -- the same grid ``write_chunk`` writes into
+        (and equal to the descriptor's ``chunk_shape``) -- so validation and
+        storage never disagree, and the method stays purely source-level.
+        """
+        arr = data.to_numpy()
+        if expected_shape:
+            arr = arr.reshape(expected_shape)
+        chunk_shape = list(self.zarr_array.chunks)
+
+        # start must align to the chunk grid
+        for d, (start, chunk_size) in enumerate(
+            zip(bounds.start, chunk_shape, strict=True)
+        ):
+            if start % chunk_size != 0:
+                raise ValueError(
+                    f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
+                )
+
+        # size may only shrink at the edge, never exceed the nominal chunk
+        actual_size = [
+            stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
+        ]
+        for d, (actual, expected) in enumerate(
+            zip(actual_size, chunk_shape, strict=True)
+        ):
+            if actual > expected:
+                raise ValueError(
+                    f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
+                )
+
+        chunk_idx = tuple(
+            int(s // cs) for s, cs in zip(bounds.start, chunk_shape, strict=True)
+        )
+        self.write_chunk(chunk_idx, arr)
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(

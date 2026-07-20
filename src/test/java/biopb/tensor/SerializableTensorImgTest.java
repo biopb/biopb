@@ -7,7 +7,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.net.URI;
 
 import org.apache.arrow.flight.Location;
 import org.junit.Test;
@@ -63,13 +62,12 @@ public class SerializableTensorImgTest {
         assertEquals(28, serialized.length);
     }
 
-    // Tests for parseLocation edge cases
-    // (private method, but behavior can be verified through reconstruction)
+    // Tests for the shared LocationUris.parse location-string parser
 
     @Test
     public void testParseLocationGrpcUri() {
         String uri = "grpc://localhost:8815";
-        Location loc = parseLocation(uri);
+        Location loc = LocationUris.parse(uri);
 
         assertNotNull(loc);
         // Location should contain localhost and port 8815
@@ -80,7 +78,7 @@ public class SerializableTensorImgTest {
     @Test
     public void testParseLocationGrpcTcpUri() {
         String uri = "grpc+tcp://localhost:9000";
-        Location loc = parseLocation(uri);
+        Location loc = LocationUris.parse(uri);
 
         assertNotNull(loc);
     }
@@ -89,7 +87,7 @@ public class SerializableTensorImgTest {
     public void testParseLocationNoScheme() {
         // URI without scheme should default to grpc
         String uri = "localhost:8815";
-        Location loc = parseLocation(uri);
+        Location loc = LocationUris.parse(uri);
 
         assertNotNull(loc);
     }
@@ -97,7 +95,7 @@ public class SerializableTensorImgTest {
     @Test
     public void testParseLocationIpAddress() {
         String uri = "grpc://127.0.0.1:8815";
-        Location loc = parseLocation(uri);
+        Location loc = LocationUris.parse(uri);
 
         assertNotNull(loc);
     }
@@ -373,16 +371,4 @@ public class SerializableTensorImgTest {
         }
     }
 
-    private static Location parseLocation(String uri) {
-        try {
-            return new Location(URI.create(uri));
-        } catch (Exception e) {
-            URI parsed = URI.create(uri);
-            String scheme = parsed.getScheme();
-            if (scheme == null) {
-                return Location.forGrpcInsecure(parsed.getHost(), parsed.getPort());
-            }
-            return new Location(parsed);
-        }
-    }
 }

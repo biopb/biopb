@@ -15,25 +15,26 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 
 import net.imglib2.Cursor;
-import net.imglib2.FinalInterval;
 import net.imglib2.Interval;
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
-import net.imglib2.view.Views;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgOptions;
 import net.imglib2.cache.img.SingleCellArrayImg;
 import net.imglib2.cache.img.optional.CacheOptions.CacheType;
 import net.imglib2.img.array.ArrayImg;
 import net.imglib2.img.array.ArrayImgFactory;
-import net.imglib2.img.cell.CellGrid;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
-import net.imglib2.type.numeric.integer.UnsignedByteType;
-import net.imglib2.type.numeric.integer.UnsignedIntType;
-import net.imglib2.type.numeric.integer.UnsignedShortType;
-import net.imglib2.type.numeric.real.DoubleType;
-import net.imglib2.type.numeric.real.FloatType;
+
+import static biopb.tensor.TensorChunkCodec.cellCount;
+import static biopb.tensor.TensorChunkCodec.createType;
+import static biopb.tensor.TensorChunkCodec.estimateChunkBytes;
+import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
+import static biopb.tensor.TensorChunkCodec.parseTicket;
+import static biopb.tensor.TensorChunkCodec.toIntArray;
+import static biopb.tensor.TensorChunkCodec.toLongArray;
+import static biopb.tensor.TensorChunkCodec.writeChunk;
 
 /**
  * Externalizable wrapper for tensor images that enables serialization.
@@ -187,7 +188,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             throw new IllegalStateException("Cannot reconstruct tensor: missing connection parameters");
         }
 
-        Location location = parseLocation(locationUri);
+        Location location = LocationUris.parse(locationUri);
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         TensorConnectionPool.PooledConnection conn = TensorConnectionPool.getConnection(location, token, allocator);
         FlightClient client = conn.getClient();
@@ -229,8 +230,10 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             long[] dims = toLongArray(responseDescriptor.getShapeList());
             int[] cellDimensions = toIntArray(responseDescriptor.getChunkShapeList());
 
-            EndpointIndex endpointIndex = buildEndpointIndex(responseDescriptor, dims, cellDimensions,
-                    info.getEndpoints());
+            ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
+                    info.getEndpoints(), dims, cellDimensions,
+                    ep -> parseChunkBounds(ep.getAppMetadata()),
+                    ep -> ep);
 
             if (endpointIndex == null) {
                 // Materialize all data into an ArrayImg
@@ -249,36 +252,11 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             RandomAccessibleInterval<T> rai = (RandomAccessibleInterval<T>) factory.create(dims, type,
                     cell -> loadCell(cell, endpointIndex, client, authOption));
 
-            // Apply cropping if needed
+            // Crop back to the originally requested region (the server snaps
+            // slice_hint outward to chunk-aligned bounds, so shape may exceed it).
             if (sliceHint != null && responseDescriptor.hasSliceHint()) {
-                SliceHint realized = responseDescriptor.getSliceHint();
-                int ndim = responseDescriptor.getShapeCount();
-                long[] cropMin = new long[ndim];
-                long[] cropMax = new long[ndim];
-                boolean needsCrop = false;
-                for (int ax = 0; ax < ndim; ax++) {
-                    long reqStart = sliceHint.getStart(ax);
-                    long reqStop = sliceHint.getStop(ax);
-                    long retStart = realized.getStart(ax);
-                    long scale = 1L;
-                    // Use scale_hint directly from TensorDescriptor
-                    if (responseDescriptor.getScaleHintCount() > ax) {
-                        scale = responseDescriptor.getScaleHint(ax);
-                    }
-                    if (scale > 1L) {
-                        cropMin[ax] = (reqStart - retStart) / scale;
-                        cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
-                    } else {
-                        cropMin[ax] = reqStart - retStart;
-                        cropMax[ax] = reqStop - retStart - 1L;
-                    }
-                    if (cropMin[ax] != 0 || cropMax[ax] != rai.max(ax)) {
-                        needsCrop = true;
-                    }
-                }
-                if (needsCrop) {
-                    rai = Views.zeroMin(Views.interval(rai, new FinalInterval(cropMin, cropMax)));
-                }
+                rai = RegionCrop.cropToRequest(rai, sliceHint, responseDescriptor.getSliceHint(),
+                        responseDescriptor.getScaleHintList());
             }
 
             return rai;
@@ -323,23 +301,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
     // Helper methods (adapted from TensorFlightClient)
 
-    private static Location parseLocation(String uri) {
-        try {
-            // Use the Location constructor that accepts URI
-            return new Location(java.net.URI.create(uri));
-        } catch (Exception e) {
-            // Fallback for edge cases - parse URI components manually
-            java.net.URI parsed = java.net.URI.create(uri);
-            String scheme = parsed.getScheme();
-            if (scheme == null) {
-                // Default to grpc+tcp if no scheme
-                return Location.forGrpcInsecure(parsed.getHost(), parsed.getPort());
-            }
-            // Let Location constructor handle it
-            return new Location(parsed);
-        }
-    }
-
     @SuppressWarnings("unchecked")
     private static <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> materializeArray(
             FlightClient client,
@@ -364,12 +325,12 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
     private static <T extends NativeType<T> & RealType<T>> void loadCell(
             SingleCellArrayImg<T, ?> cell,
-            EndpointIndex endpointIndex,
+            ChunkGridIndex<FlightEndpoint> endpointIndex,
             FlightClient client,
             CredentialCallOption authOption) {
 
         long cellIndex = endpointIndex.indexFor(cell);
-        FlightEndpoint endpoint = endpointIndex.endpoints.get(cellIndex);
+        FlightEndpoint endpoint = endpointIndex.get(cellIndex);
         if (endpoint == null) {
             throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
         }
@@ -378,68 +339,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
         double[] values = fetchChunkValues(client, authOption, ticket.getChunkId().toByteArray());
         writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    private static EndpointIndex buildEndpointIndex(
-            TensorDescriptor descriptor,
-            long[] dims,
-            int[] cellDimensions,
-            List<FlightEndpoint> endpoints) {
-
-        if (dims.length == 0 || endpoints.isEmpty()) {
-            return null;
-        }
-
-        CellGrid grid = new CellGrid(dims, cellDimensions);
-        java.util.Map<Long, FlightEndpoint> endpointMap = new java.util.HashMap<>();
-        long[] gridDimensions = grid.getGridDimensions();
-        long[] gridPosition = new long[dims.length];
-        long[] expectedMin = new long[dims.length];
-        int[] expectedDimensions = new int[dims.length];
-
-        for (FlightEndpoint endpoint : endpoints) {
-            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-            if (bounds.getStartCount() != dims.length || bounds.getStopCount() != dims.length) {
-                return null;
-            }
-
-            for (int axis = 0; axis < dims.length; axis++) {
-                long start = bounds.getStart(axis);
-                long stop = bounds.getStop(axis);
-                int nominalCellDimension = cellDimensions[axis];
-                if (start < 0 || stop < start || nominalCellDimension <= 0) {
-                    return null;
-                }
-                if (start % nominalCellDimension != 0) {
-                    return null;
-                }
-                gridPosition[axis] = start / nominalCellDimension;
-                if (gridPosition[axis] >= gridDimensions[axis]) {
-                    return null;
-                }
-            }
-
-            grid.getCellDimensions(gridPosition, expectedMin, expectedDimensions);
-            for (int axis = 0; axis < dims.length; axis++) {
-                if (expectedMin[axis] != bounds.getStart(axis)) {
-                    return null;
-                }
-                if ((long) expectedDimensions[axis] != bounds.getStop(axis) - bounds.getStart(axis)) {
-                    return null;
-                }
-            }
-
-            long cellIndex = grid.getCellGridIndexFlat(gridPosition);
-            if (endpointMap.put(cellIndex, endpoint) != null) {
-                return null;
-            }
-        }
-
-        if (endpointMap.size() != cellCount(gridDimensions)) {
-            return null;
-        }
-
-        return new EndpointIndex(grid, cellDimensions, endpointMap);
     }
 
     private static double[] fetchChunkValues(
@@ -485,154 +384,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             return values;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to fetch chunk payload", e);
-        }
-    }
-
-    private static <T extends NativeType<T> & RealType<T>> void writeChunk(
-            RandomAccess<T> access,
-            ChunkBounds bounds,
-            double[] values) {
-
-        long[] start = toLongArray(bounds.getStartList());
-        long[] stop = toLongArray(bounds.getStopList());
-        long[] chunkShape = new long[start.length];
-        long expectedSize = 1L;
-        for (int axis = 0; axis < start.length; axis++) {
-            chunkShape[axis] = stop[axis] - start[axis];
-            expectedSize *= chunkShape[axis];
-        }
-        if (expectedSize != values.length) {
-            throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + values.length);
-        }
-
-        long[] localPosition = new long[chunkShape.length];
-        long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < values.length; index++) {
-            rowMajorPosition(index, chunkShape, localPosition);
-            for (int axis = 0; axis < chunkShape.length; axis++) {
-                globalPosition[axis] = start[axis] + localPosition[axis];
-            }
-            access.setPosition(globalPosition);
-            access.get().setReal(values[index]);
-        }
-    }
-
-    private static void rowMajorPosition(int index, long[] shape, long[] position) {
-        long remaining = index;
-        for (int axis = shape.length - 1; axis >= 0; axis--) {
-            position[axis] = remaining % shape[axis];
-            remaining /= shape[axis];
-        }
-    }
-
-    private static NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-                return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return new DoubleType();
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-            default:
-                return new FloatType();
-        }
-    }
-
-    private static long[] toLongArray(java.util.List<Long> values) {
-        long[] out = new long[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = values.get(i);
-        }
-        return out;
-    }
-
-    private static int[] toIntArray(java.util.List<Long> values) {
-        int[] out = new int[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = java.lang.Math.toIntExact(values.get(i));
-        }
-        return out;
-    }
-
-    private static long cellCount(long[] gridDimensions) {
-        long count = 1L;
-        for (long axisCount : gridDimensions) {
-            count *= axisCount;
-        }
-        return count;
-    }
-
-    private static long estimateChunkBytes(TensorDescriptor descriptor) {
-        long elements = 1L;
-        for (long dim : descriptor.getChunkShapeList()) {
-            elements *= java.lang.Math.max(dim, 1L);
-        }
-        return elements * bytesPerElement(descriptor.getDtype());
-    }
-
-    private static int bytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return 1;
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return 8;
-            default:
-                return 4;
-        }
-    }
-
-    private static TensorTicket parseTicket(byte[] bytes) {
-        try {
-            return TensorTicket.parseFrom(bytes);
-        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse TensorTicket", e);
-        }
-    }
-
-    private static ChunkBounds parseChunkBounds(byte[] bytes) {
-        try {
-            return ChunkBounds.parseFrom(bytes);
-        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse ChunkBounds", e);
         }
     }
 
@@ -716,33 +467,4 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         delegate.dimensions(dimensions);
     }
 
-    // EndpointIndex inner class (same as TensorFlightClient)
-
-    private static class EndpointIndex {
-        final CellGrid grid;
-        final int[] nominalCellDimensions;
-        final java.util.Map<Long, FlightEndpoint> endpoints;
-
-        EndpointIndex(
-                CellGrid grid,
-                int[] nominalCellDimensions,
-                java.util.Map<Long, FlightEndpoint> endpoints) {
-            this.grid = grid;
-            this.nominalCellDimensions = nominalCellDimensions.clone();
-            this.endpoints = endpoints;
-        }
-
-        long indexFor(Interval interval) {
-            long[] gridPosition = new long[interval.numDimensions()];
-            for (int axis = 0; axis < interval.numDimensions(); axis++) {
-                long min = interval.min(axis);
-                int nominalCellDimension = nominalCellDimensions[axis];
-                if (min % nominalCellDimension != 0) {
-                    throw new IllegalStateException("Cell minimum is not aligned to the logical chunk grid");
-                }
-                gridPosition[axis] = min / nominalCellDimension;
-            }
-            return grid.getCellGridIndexFlat(gridPosition);
-        }
-    }
 }

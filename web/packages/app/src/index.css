@@ -1,0 +1,427 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  background: #0f1117;
+  color: #e2e8f0;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+}
+
+.dev-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 9999;
+  background: #d97706;
+  color: #1a1200;
+  font-weight: 600;
+  font-size: 12px;
+  text-align: center;
+  padding: 4px 8px;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  grid-template-rows: 44px 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-topbar {
+  grid-column: 1 / -1;
+  background: #1a1f2e;
+  border-bottom: 1px solid #2d3748;
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+  gap: 1rem;
+}
+
+.app-topbar h1 { font-size: 1rem; font-weight: 600; color: #e2e8f0; }
+.topbar-logo { height: 22px; width: 22px; border-radius: 4px; flex-shrink: 0; }
+
+.app-sidebar {
+  background: #141820;
+  border-right: 1px solid #2d3748;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-main { overflow: hidden; display: flex; flex-direction: row; }
+
+.viewer-column { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+.control-column {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  background: #141820;
+  border-left: 1px solid #2d3748;
+  overflow-y: auto;
+}
+
+.source-tree { padding: 0; flex: 1; }
+
+.tree-item {
+  background: none;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 0.35rem 1rem;
+  transition: background 0.1s;
+}
+.tree-item:hover { background: #1e2435; color: #e2e8f0; }
+.tree-item.active { background: #2a3347; color: #60a5fa; }
+
+.tree-folder {
+  color: #e2e8f0;
+  font-weight: 500;
+}
+.tree-folder:hover { color: #60a5fa; }
+
+.tensor-item { color: #64748b; }
+.tensor-item:hover { color: #94a3b8; }
+.tensor-item.active { color: #60a5fa; }
+
+.tensor-pill {
+  font-size: 10px;
+  background: #2d3748;
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: #94a3b8;
+}
+
+.dim-badge {
+  font-size: 10px;
+  background: #1e293b;
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.status-pill { font-size: 11px; border-radius: 999px; padding: 2px 10px; font-weight: 500; }
+.status-pill.connected { background: #064e3b; color: #6ee7b7; }
+.status-pill.error { background: #450a0a; color: #fca5a5; }
+.status-pill.connecting { background: #1e3a5f; color: #93c5fd; }
+.status-pill.idle { background: #1e293b; color: #94a3b8; }
+.status-pill.restarting { background: #422006; color: #fcd34d; }
+.status-pill.scanning { background: #1e3a5f; color: #93c5fd; }
+
+/* --- Admin page (fixed settings layout: left nav + content panel) ---------- */
+.admin-shell { grid-template-columns: 1fr; }
+.admin-main {
+  display: flex; flex-direction: row; overflow: hidden; min-height: 0;
+}
+.topbar-spacer { flex: 1; }
+.topbar-save { width: auto; padding: 5px 16px; }
+.admin-hint { font-size: 12px; color: #94a3b8; }
+.admin-hint.error { color: #fca5a5; }
+
+/* Left navigation */
+.admin-nav {
+  width: 220px; flex-shrink: 0; overflow-y: auto;
+  background: #141820; border-right: 1px solid #2d3748;
+  padding: 0.75rem 0.6rem; display: flex; flex-direction: column; gap: 2px;
+}
+.admin-nav-item {
+  display: flex; align-items: center; gap: 0.5rem;
+  background: none; border: none; border-radius: 6px; cursor: pointer;
+  color: #94a3b8; font-size: 13px; text-align: left;
+  padding: 0.5rem 0.7rem; width: 100%;
+}
+.admin-nav-item:hover { background: #1e2435; color: #e2e8f0; }
+.admin-nav-item.active { background: #2a3347; color: #60a5fa; font-weight: 500; }
+.admin-nav-label { flex: 1; }
+.admin-nav-errdot {
+  width: 8px; height: 8px; border-radius: 999px; background: #dc2626; flex-shrink: 0;
+}
+
+/* Content column */
+.admin-content {
+  flex: 1; overflow-y: auto; min-width: 0;
+  padding: 1.25rem 1.5rem; display: flex; flex-direction: column; gap: 1rem;
+}
+.admin-panel { display: flex; flex-direction: column; gap: 1rem; max-width: 900px; }
+.admin-panel-head { display: flex; flex-direction: column; gap: 0.35rem; }
+.admin-panel-head h2 { font-size: 1.15rem; font-weight: 600; margin: 0; }
+.admin-panel-desc { font-size: 13px; color: #94a3b8; line-height: 1.5; margin: 0; max-width: 640px; }
+
+.admin-config-path { font-size: 12px; color: #64748b; margin-top: auto; padding-top: 0.5rem; }
+.admin-config-path code { color: #94a3b8; }
+
+.admin-banner {
+  border-radius: 8px; padding: 0.7rem 1rem; font-size: 13px;
+  display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+}
+.admin-banner.saved { background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }
+.admin-banner.error { background: #450a0a; color: #fca5a5; border: 1px solid #dc2626; }
+.admin-banner ul { margin: 0.25rem 0 0; padding-left: 1.1rem; }
+
+/* Add-bar (+ Add …) sits at the top of the Sources / Credentials list, with a
+ * divider beneath separating it from the entries. */
+.sources-editor-head, .creds-add-bar {
+  display: flex; align-items: center; gap: 0.5rem;
+  border-bottom: 1px solid #2d3748; padding-bottom: 0.85rem; margin-bottom: 0.85rem;
+}
+/* Name for a new credential profile, typed before the + Add profile button. */
+.creds-add-name {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 240px; max-width: 60%;
+}
+.creds-add-name:focus { border-color: #3b82f6; outline: none; }
+.sources-editor-head h2 { font-size: 14px; margin: 0; }
+.add-menu { position: relative; }
+.add-menu-list {
+  position: absolute; left: 0; top: 110%; z-index: 20;
+  background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px;
+  display: flex; flex-direction: column; min-width: 220px; overflow: hidden;
+}
+.add-menu-list button {
+  background: none; border: none; color: #e2e8f0; cursor: pointer;
+  font-size: 13px; padding: 0.55rem 0.85rem; text-align: left;
+}
+.add-menu-list button:hover { background: #1e2435; }
+
+.sources-empty {
+  border: 1px dashed #2d3748; border-radius: 8px; padding: 1.5rem;
+  text-align: center; color: #94a3b8; font-size: 13px;
+}
+.sources-empty .submit-btn { width: auto; margin-top: 0.5rem; padding: 0.5rem 1rem; }
+
+/* List-item entries (a source or a credential profile): no bounding box — a
+ * title + a text Delete button, with the entry's keys indented below. */
+.source-rows, .creds-rows {
+  list-style: none; margin: 0.25rem 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 1.25rem;
+}
+.entry-row { display: flex; flex-direction: column; gap: 0.6rem; }
+.entry-row + .entry-row { border-top: 1px solid #242b3b; padding-top: 1.25rem; }
+.entry-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.entry-title { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+.entry-row.has-error .entry-title { color: #fca5a5; }
+.entry-delete {
+  background: none; border: none; color: #94a3b8; cursor: pointer;
+  font-size: 12px; padding: 2px 6px; border-radius: 4px;
+}
+.entry-delete:hover:not(:disabled) { color: #fca5a5; text-decoration: underline; }
+.entry-delete:disabled { color: #475569; cursor: default; }
+.entry-fields { padding-left: 0.9rem; border-left: 2px solid #2d3748; }
+/* Source entry fields are SchemaField (.setting-field); this only stacks them. */
+.source-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
+.source-row-errors { margin: 0.5rem 0 0; padding-left: 1.1rem; color: #fca5a5; font-size: 12px; }
+
+.admin-banner.degraded { background: #422006; color: #fcd34d; border: 1px solid #b45309; }
+
+/* Structured "advanced" sections (schema-driven per-field editors). */
+.advanced-sections { display: flex; flex-direction: column; gap: 0.5rem; }
+.advanced-sections-head {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.advanced-sections-head h2 { font-size: 14px; margin: 0; }
+.adv-section { border: 1px solid #2d3748; border-radius: 8px; background: #141820; }
+.adv-section.has-error { border-color: #dc2626; }
+.adv-section-header {
+  display: flex; align-items: center; gap: 0.6rem; width: 100%;
+  background: none; border: none; cursor: pointer; color: #e2e8f0;
+  font-size: 13px; padding: 0.65rem 0.85rem; text-align: left;
+}
+.adv-caret { color: #64748b; width: 0.9em; }
+.adv-section-title { font-weight: 500; }
+.adv-section-hint { color: #64748b; font-size: 11px; flex: 1; }
+.adv-section-errdot {
+  width: 8px; height: 8px; border-radius: 999px; background: #dc2626;
+}
+.adv-section-body {
+  border-top: 1px solid #2d3748; padding: 0.85rem;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.85rem;
+}
+.adv-field { display: flex; flex-direction: column; gap: 0.25rem; }
+.adv-field-label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 11px; color: #94a3b8; }
+.adv-field-name { display: flex; align-items: center; gap: 0.4rem; }
+.adv-field-name code { color: #cbd5e1; font-size: 12px; }
+.adv-field-label input[type="text"], .adv-field-label input[type="number"], .adv-field-label select {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
+}
+.adv-field-label input.invalid, .adv-field-label select.invalid { border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626; }
+.adv-field-help { margin: 0; font-size: 11px; color: #64748b; }
+.adv-field-error { margin: 0; font-size: 11px; color: #fca5a5; }
+.deprecated-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
+  background: #422006; color: #fcd34d; border-radius: 4px; padding: 1px 5px;
+}
+/* Credentials editor (nested profiles array with masked secrets). */
+.creds-body { display: flex !important; flex-direction: column; gap: 0.85rem; }
+.creds-default { max-width: 260px; }
+.creds-default .adv-field-label select {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
+}
+/* Credential profile fields are SchemaField (.setting-field); this stacks them. */
+.creds-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
+.secret-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
+  background: #1e3a5f; color: #93c5fd; border-radius: 4px; padding: 1px 5px;
+}
+
+.admin-raw {
+  width: 100%; min-height: 320px; margin: 0 0 1rem; box-sizing: border-box;
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-family: ui-monospace, monospace; font-size: 12px; padding: 0.6rem;
+  resize: vertical;
+}
+.admin-raw.invalid { border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626; }
+
+/* Section field editor (common/advanced split). Fields stack vertically, one per
+ * row, with the control at a readable width (settings-page style). */
+.section-fields { display: flex; flex-direction: column; gap: 1.1rem; }
+.section-field-grid { display: flex; flex-direction: column; gap: 1.1rem; }
+.setting-field { display: flex; flex-direction: column; gap: 0.3rem; max-width: 520px; }
+.setting-field-label { display: flex; flex-direction: column; gap: 0.35rem; }
+.setting-field-name { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+.setting-field-title { font-size: 13px; font-weight: 500; color: #e2e8f0; }
+.setting-field-name code { font-size: 11px; color: #64748b; }
+.setting-field-label input[type="text"], .setting-field-label input[type="number"],
+.setting-field-label select {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
+}
+.setting-field-label input.invalid, .setting-field-label select.invalid {
+  border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626;
+}
+/* Booleans read as a labelled checkbox row, not a stacked field. */
+.setting-field-bool .setting-field-label { flex-direction: row; align-items: center; gap: 0.6rem; }
+.setting-field-bool .setting-field-name { order: 2; }
+.setting-field-bool input[type="checkbox"] { order: 1; width: 15px; height: 15px; accent-color: #4f8ef7; }
+.setting-field-help { margin: 0; font-size: 11px; color: #64748b; line-height: 1.45; }
+/* Validation-rule hint (min/max, accepted values) under the prose description. */
+.setting-field-constraint { margin: 0; font-size: 11px; color: #52607a; font-style: italic; }
+.setting-field-error { margin: 0; font-size: 11px; color: #fca5a5; }
+/* A control paired with an inline affordance (e.g. a path input + Browse…). */
+.setting-field-control-row { display: flex; gap: 0.4rem; align-items: stretch; }
+.setting-field-control-row > input { flex: 1; min-width: 0; }
+.setting-field-control-row > .icon-btn { flex-shrink: 0; white-space: nowrap; }
+/* Array fields: a fixed numeric vector (grid tile sizes) as a row of small number
+   inputs, and a variable string list (server / origin lists) as stacked rows. */
+.setting-field-vector { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+/* label-scoped so it out-specifies the generic .setting-field-label input rule. */
+.setting-field-label .setting-field-vector input { width: 6rem; }
+.setting-field-list { display: flex; flex-direction: column; gap: 0.35rem; align-items: flex-start; width: 100%; }
+.setting-field-list-row { display: flex; gap: 0.4rem; width: 100%; align-items: stretch; }
+.setting-field-label .setting-field-list-row input { flex: 1; min-width: 0; }
+.setting-field-list-row > .icon-btn { flex-shrink: 0; }
+.setting-field-list-add { align-self: flex-start; }
+
+.section-advanced { border-top: 1px solid #2d3748; padding-top: 0.85rem; }
+.section-advanced-toggle {
+  display: flex; align-items: center; gap: 0.5rem; width: 100%;
+  background: none; border: none; cursor: pointer; color: #cbd5e1;
+  font-size: 13px; padding: 0.15rem 0; text-align: left;
+}
+.section-advanced-hint { color: #64748b; font-size: 11px; flex: 1; }
+.section-advanced-body { margin-top: 0.85rem; }
+
+/* Raw JSON panel */
+.raw-json-panel { display: flex; flex-direction: column; }
+.raw-json-panel .admin-raw { min-height: 380px; }
+.raw-json-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.raw-json-actions .submit-btn, .raw-json-actions .icon-btn { width: auto; padding: 0.45rem 1.1rem; }
+
+/* Credentials panel */
+.creds-panel { display: flex; flex-direction: column; }
+
+/* File browser modal (server-side chooser, local mode only) */
+.file-browser { display: flex; flex-direction: column; gap: 0.75rem; }
+.file-browser-bar { display: flex; align-items: center; gap: 0.6rem; }
+.file-browser-path {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #cbd5e1; font-size: 12px; padding: 0.4rem 0.55rem;
+}
+.file-browser-list {
+  list-style: none; margin: 0; padding: 0; overflow-y: auto;
+  height: 46vh; border: 1px solid #2d3748; border-radius: 8px; background: #0f1117;
+}
+.file-browser-entry {
+  display: flex; align-items: center; gap: 0.55rem; width: 100%;
+  background: none; border: none; cursor: pointer; color: #94a3b8;
+  font-size: 13px; padding: 0.4rem 0.7rem; text-align: left;
+}
+.file-browser-entry:hover { background: #1e2435; color: #e2e8f0; }
+.file-browser-entry.is-dir { color: #cbd5e1; }
+.file-browser-icon { flex-shrink: 0; }
+.file-browser-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-browser-empty { padding: 0.6rem 0.7rem; color: #64748b; font-size: 13px; }
+.file-browser-note { margin: 0; font-size: 11px; color: #64748b; }
+
+.admin-modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 2000;
+}
+.admin-modal {
+  background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px;
+  padding: 1.5rem 1.75rem; max-width: 440px;
+}
+.admin-modal.wide { max-width: 760px; width: 90vw; }
+.admin-modal h2 { margin: 0 0 0.6rem; font-size: 1.1rem; }
+.admin-modal p { color: #94a3b8; font-size: 13px; line-height: 1.5; margin: 0 0 1.25rem; }
+.admin-modal-actions { display: flex; justify-content: flex-end; gap: 0.75rem; }
+.admin-modal-actions .submit-btn { width: auto; padding: 0.5rem 1.2rem; }
+
+.slice-controls {
+  background: #141820;
+  border-bottom: 1px solid #2d3748;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.slice-controls input[type="range"] {
+  accent-color: #4f8ef7;
+  height: 4px;
+}
+.slice-controls select {
+  background: #1e2435;
+  border: 1px solid #2d3748;
+  border-radius: 4px;
+  color: #e2e8f0;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.viewer-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: #000; }
+
+.meta-panel {
+  background: #141820;
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+  font-size: 12px;
+  color: #94a3b8;
+}
+.meta-panel pre { white-space: pre-wrap; word-break: break-all; color: #cbd5e1; }
+
+.icon-btn {
+  background: none; border: 1px solid #2d3748; border-radius: 6px;
+  color: #94a3b8; cursor: pointer; font-size: 12px; padding: 4px 10px;
+}
+.icon-btn:hover { background: #1e2435; color: #e2e8f0; }
+
+.error-toast {
+  position: fixed; bottom: 1rem; right: 1rem;
+  background: #450a0a; border: 1px solid #dc2626; border-radius: 8px;
+  color: #fca5a5; font-size: 13px; max-width: 360px; padding: 0.75rem 1rem; z-index: 1000;
+}
+
+.loading-overlay {
+  position: absolute; inset: 0; display: flex;
+  align-items: center; justify-content: center;
+  background: rgba(15, 17, 23, 0.7); color: #94a3b8; font-size: 14px; z-index: 10;
+}

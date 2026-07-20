@@ -22,15 +22,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb_tensor_server.base import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
 )
-from biopb_tensor_server.config import CacheConfig
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.base import pack_chunk_batch, unpack_chunk_array
+from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 def _zarr_available() -> bool:
@@ -49,7 +49,7 @@ def _zarr_available() -> bool:
 
 def _make_typed_batch(arr: np.ndarray) -> pa.RecordBatch:
     """Build a chunk batch in the unified binary [data: binary, shape, dtype]
-    schema a compute_fn now produces (mirrors BackendAdapter.resolve_chunk_data)."""
+    schema a compute_fn now produces (mirrors TensorAdapter.resolve_chunk_data)."""
     return pack_chunk_batch(arr)
 
 
@@ -121,7 +121,10 @@ class TestLocateEntry:
     def test_locate_survives_restart(self):
         """Offsets are recoverable after a restart (rebuild from segments)."""
         d = tempfile.mkdtemp()
-        cfg = dict(max_segment_bytes=8 * 1024 * 1024, max_total_bytes=256 * 1024 * 1024)
+        cfg = {
+            "max_segment_bytes": 8 * 1024 * 1024,
+            "max_total_bytes": 256 * 1024 * 1024,
+        }
         be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
         a = (np.arange(2000, dtype=np.uint16) % 500).astype(np.uint16)
         be.get_or_acquire(b"k0", (lambda: (_make_typed_batch(a), a.nbytes)))
@@ -136,6 +139,35 @@ class TestLocateEntry:
         finally:
             be2.close()
             shutil.rmtree(d, ignore_errors=True)
+
+    def test_locate_hit_counts_in_top_level_stats(self, file_backend):
+        """A locate/mmap fast-path hit bumps `stats().hits`, same as do_get.
+
+        Regression for biopb/biopb#514: on the single-machine deployment a
+        cached chunk is served via `locate_entry` (mmap handoff), which credited
+        only the per-pool counter and left top-level `self._hits` at 0 -- so the
+        reported hit-rate (surfaced by the sidecar) trended to ~0 even at a high
+        true hit rate, and `stats().hits` disagreed with the per-pool counters.
+        A fast-path hit and a do_get hit must move `stats().hits` identically.
+        """
+        a = (np.arange(1000, dtype=np.uint16) % 400).astype(np.uint16)
+        # Populate: the initial acquire is a miss (creates the pending entry).
+        file_backend.get_or_acquire(b"k", (lambda: (_make_typed_batch(a), a.nbytes)))
+        file_backend.release(b"k")
+        assert file_backend.stats().hits == 0
+
+        # A locate/mmap fast-path hit must be counted at the top level.
+        assert file_backend.locate_entry(b"k") is not None
+        assert file_backend.stats().hits == 1
+        # ...and stay internally consistent with the per-pool counters.
+        s = file_backend.stats()
+        assert sum(p.hits for p in s.pool_stats.values()) == s.hits
+
+        # A do_get hit (get_or_acquire on the ready entry) moves it identically.
+        before = file_backend.stats().hits
+        file_backend.get_or_acquire(b"k", (lambda: (_make_typed_batch(a), a.nbytes)))
+        file_backend.release(b"k")
+        assert file_backend.stats().hits == before + 1
 
     def test_generation_id_is_segment_inode(self, file_backend):
         a = (np.arange(100, dtype=np.uint16)).astype(np.uint16)
@@ -155,9 +187,10 @@ class TestLocateEntry:
         appending a truncated copy of a real message to the segment file.
         """
         d = tempfile.mkdtemp()
-        cfg = dict(
-            max_segment_bytes=64 * 1024 * 1024, max_total_bytes=256 * 1024 * 1024
-        )
+        cfg = {
+            "max_segment_bytes": 64 * 1024 * 1024,
+            "max_total_bytes": 256 * 1024 * 1024,
+        }
         be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
         try:
             arrs = {}
@@ -372,7 +405,7 @@ class TestCachefileIntegration:
         try:
             cmod._cachefile_support.clear()
             client = TensorFlightClient(loc, cache_bytes=0)
-            got = client.get_tensor("z", "z").compute(scheduler="threads")
+            got = client.get_tensor("z").compute(scheduler="threads")
             assert np.array_equal(got, src)
             if os.name == "posix":
                 # The fast path was actually used (chunk_locate succeeded).
@@ -399,7 +432,7 @@ class TestCachefileIntegration:
             cmod._cachefile_support.clear()
             with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
                 client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z", "z").compute(scheduler="threads")
+                got = client.get_tensor("z").compute(scheduler="threads")
                 assert np.array_equal(got, src)
                 # Never probed the fast path.
                 assert cmod._cachefile_support.get(loc) is None
@@ -419,7 +452,7 @@ class TestCachefileIntegration:
         try:
             cmod._cachefile_support.clear()
             client = TensorFlightClient(loc, cache_bytes=0)
-            got = client.get_tensor("z", "z").compute(scheduler="threads")
+            got = client.get_tensor("z").compute(scheduler="threads")
             assert np.array_equal(got, src)
             client.close()
         finally:
@@ -441,9 +474,11 @@ class TestCachefileIntegration:
         try:
             cmod._cachefile_support.clear()
             # Pretend this client can't parse the server's (>=1) segment format.
-            with patch.object(cmod, "_CACHEFILE_SUPPORTED_FORMAT", 0):
+            # The constant is read by _try_cachefile_transfer in biopb.tensor._pool
+            # (issue #278 item C), so patch it there, not on the client re-export.
+            with patch("biopb.tensor._pool._CACHEFILE_SUPPORTED_FORMAT", 0):
                 client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z", "z").compute(scheduler="threads")
+                got = client.get_tensor("z").compute(scheduler="threads")
                 assert np.array_equal(got, src)  # correct via do_get fallback
                 assert cmod._cachefile_support.get(loc) is False  # declined + memoized
                 client.close()

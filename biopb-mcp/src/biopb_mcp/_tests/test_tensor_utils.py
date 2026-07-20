@@ -29,7 +29,7 @@ def _recording_get_tensor(full_shape):
     real dask array shaped by the scale, so canonicalization runs for real."""
     calls = []
 
-    def _gt(source_id, tensor_id, scale_hint=None, reduction_method=None):
+    def _gt(array_id, scale_hint=None, reduction_method=None):
         hint = scale_hint or [1] * len(full_shape)
         calls.append((tuple(hint), reduction_method))
         new = [max(1, s // h) for s, h in zip(full_shape, hint, strict=False)]
@@ -69,7 +69,7 @@ def _scaling_side_effect(shape):
     this for tests that only inspect the ``scale_hint`` call args -- the
     canonicalizing transpose/expand at the end is a harmless no-op on mocks."""
 
-    def _get_tensor(source_id, tensor_id, scale_hint=None):
+    def _get_tensor(array_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
         return _arr_with_shape(
             [max(1, s // h) for s, h in zip(shape, hint, strict=False)]
@@ -83,7 +83,7 @@ def _dask_scaling_side_effect(shape):
     canonicalizing transpose/singleton-insert produce real output shapes and a
     real ``.ndim`` (needed wherever the test inspects the returned levels)."""
 
-    def _get_tensor(source_id, tensor_id, scale_hint=None):
+    def _get_tensor(array_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
         new = [max(1, s // h) for s, h in zip(shape, hint, strict=False)]
         return da.zeros(new, chunks=new)
@@ -145,7 +145,7 @@ class TestBuildPyramidLevels:
         # Canonical output always carries an explicit (here singleton) Z.
         assert levels[0].shape == (1, 256, 256)
         # Unified loop always passes a scale_hint, even for a single level.
-        client.get_tensor.assert_called_once_with("src", "t1", scale_hint=[1, 1])
+        client.get_tensor.assert_called_once_with("t1", scale_hint=[1, 1])
 
     def test_threshold_boundary_no_pyramid(self):
         desc = _make_tensor_desc([THRESHOLD, THRESHOLD])
@@ -165,7 +165,7 @@ class TestBuildPyramidLevels:
         assert len(levels) > 1
         # First call should be scale=1 (no scale_hint with all 1s)
         first_call = client.get_tensor.call_args_list[0]
-        assert first_call == call("src", "t1", scale_hint=[1, 1])
+        assert first_call == call("t1", scale_hint=[1, 1])
 
     def test_small_z_is_not_downsampled(self):
         # A thin z (10 < floor) stays full-res while x/y shrink.
@@ -267,30 +267,26 @@ class TestAdvertisedPyramid:
             ((1, 1, 1, 4, 4), "area"),
         ]
         # Descriptor already had a pyramid -> no extra open-time fetch.
-        client.get_source.assert_not_called()
+        client.get_descriptor.assert_not_called()
 
     def test_fetches_open_time_descriptor_when_catalog_is_lean(self):
         gt, calls = _recording_get_tensor(self._FULL)
         client = MagicMock()
         client.get_tensor.side_effect = gt
         # The lean list_sources descriptor carries no pyramid; the open-time
-        # descriptor (get_source) does.
-        client.get_source.return_value = SimpleNamespace(
-            tensors=[
-                SimpleNamespace(
-                    array_id="src/A2",
-                    pyramid=[
-                        _adv_level([1, 1, 1, 1, 1], "area"),
-                        _adv_level([1, 1, 1, 4, 4], "area"),
-                    ],
-                )
-            ]
+        # descriptor (get_descriptor) does.
+        client.get_descriptor.return_value = SimpleNamespace(
+            array_id="src/A2",
+            pyramid=[
+                _adv_level([1, 1, 1, 1, 1], "area"),
+                _adv_level([1, 1, 1, 4, 4], "area"),
+            ],
         )
         lean = SimpleNamespace(shape=self._FULL, dim_labels=self._LABELS)
 
         levels = build_pyramid_levels(client, "src", "src/A2", lean, config=_CFG)
 
-        client.get_source.assert_called_once_with("src", "src/A2")
+        client.get_descriptor.assert_called_once_with("src/A2")
         assert len(levels) == 2
         assert [c[1] for c in calls] == ["area", "area"]
 
@@ -317,23 +313,24 @@ class TestAdvertisedPyramidLevelsHelper:
         client = MagicMock()
         out = _advertised_pyramid_levels(client, "src", "src/A2", desc)
         assert len(out) == 1
-        client.get_source.assert_not_called()
+        client.get_descriptor.assert_not_called()
 
     def test_returns_empty_on_lookup_failure(self):
         client = MagicMock()
-        client.get_source.side_effect = RuntimeError("boom")
+        client.get_descriptor.side_effect = RuntimeError("boom")
         desc = SimpleNamespace()  # no pyramid attr
         assert _advertised_pyramid_levels(client, "src", "src/A2", desc) == []
 
-    def test_falls_back_to_single_tensor_when_id_mismatch(self):
-        # get_source returns one tensor whose array_id doesn't equal the
-        # requested id -> still use it (single-tensor source).
+    def test_uses_open_time_descriptor_pyramid(self):
+        # The passed descriptor carries no pyramid -> fetch the open-time
+        # descriptor by array_id and read its pyramid.
         client = MagicMock()
-        client.get_source.return_value = SimpleNamespace(
-            tensors=[SimpleNamespace(array_id="other", pyramid=[_adv_level([1], "x")])]
+        client.get_descriptor.return_value = SimpleNamespace(
+            array_id="src/A2", pyramid=[_adv_level([1], "x")]
         )
         out = _advertised_pyramid_levels(client, "src", "src/A2", SimpleNamespace())
         assert len(out) == 1
+        client.get_descriptor.assert_called_once_with("src/A2")
 
 
 class TestBuildPyramidCanonicalOrder:

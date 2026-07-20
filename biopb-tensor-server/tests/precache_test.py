@@ -5,14 +5,14 @@ import time
 
 import numpy as np
 import pytest
-from biopb_tensor_server.chunk import (
+from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     compute_precache_scale_hint,
     is_scaled_chunk,
 )
-from biopb_tensor_server.config import PrecacheConfig
-from biopb_tensor_server.precache import PrecacheWorker
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.config import PrecacheConfig
+from biopb_tensor_server.serving.precache import PrecacheWorker
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 def _zarr_available() -> bool:
@@ -123,7 +123,7 @@ class TestComputePrecacheScaleHint:
         assert ly <= 1024
 
     @pytest.mark.skipif(
-        True if _import_biopb_mcp() is None else False,
+        _import_biopb_mcp() is None,
         reason="biopb-mcp not importable for cross-check",
     )
     def test_matches_biopb_mcp_loop(self):
@@ -174,7 +174,7 @@ class TestFlightIdleProbe:
             release = threading.Event()
 
             def hold():
-                with server._serving_request():
+                with server.activity.serving_request():
                     entered.set()
                     release.wait(2.0)
 
@@ -193,7 +193,7 @@ class TestFlightIdleProbe:
     def test_debounce_window(self):
         server = TensorFlightServer("grpc://localhost:0")
         try:
-            with server._serving_request():
+            with server.activity.serving_request():
                 pass
             # Just finished: a 5s debounce is not yet satisfied.
             assert server.flight_idle_for(5.0) is False
@@ -230,7 +230,7 @@ class TestWarming:
 
     def test_warms_scaled_chunks_into_file_cache(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -251,7 +251,7 @@ class TestWarming:
 
             # Rebuild the same read plan and assert every chunk now locates on
             # disk -- i.e. a future do_get is a warm hit, no decode needed.
-            adapter = server._get_source_adapter("warm-src")
+            adapter = server.sources.get("warm-src")
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
             scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
@@ -287,7 +287,7 @@ class TestWarming:
         # a cloud root) must short-circuit before any chunk is read, so OneDrive
         # is never asked to recall the bytes.
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -300,13 +300,11 @@ class TestWarming:
 
             # Pin the ordering contract of #174: the gate must fire *before* any
             # adapter access, so a denied warm never touches the source at all.
-            # A spy on _get_source_adapter (and the cache stats) catches a future
+            # A spy on sources.get (and the cache stats) catches a future
             # re-ordering of the gate below adapter/list/compute.
             adapter_calls = []
-            real_get = server._get_source_adapter
-            server._get_source_adapter = lambda sid: (
-                adapter_calls.append(sid) or real_get(sid)
-            )
+            real_get = server.sources.get
+            server.sources.get = lambda sid: adapter_calls.append(sid) or real_get(sid)
 
             worker._process_source("warm-src")
 
@@ -326,7 +324,7 @@ class TestWarming:
         # across the network from the upstream, and the proxy does not implement
         # has_native_pyramid() so it would mis-warm a pyramidal upstream.
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -340,13 +338,13 @@ class TestWarming:
 
             class _RemoteAdapter:
                 # A caching-proxy source advertises a grpc:// source_url.
-                _source_url = "grpc://upstream:8815/img"
+                source_url = "grpc://upstream:8815/img"
 
                 def list_tensor_descriptors(self):
                     listed.append(True)  # must NOT be reached
                     return []
 
-            server._get_source_adapter = lambda sid: _RemoteAdapter()
+            server.sources.get = lambda sid: _RemoteAdapter()
 
             preempted = worker._process_source("remote-src")
 
@@ -362,7 +360,7 @@ class TestWarming:
 
     def test_memory_backend_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(backend="memory"))
@@ -387,8 +385,8 @@ class TestWarming:
 
 class TestRuntimePhaseGating:
     def _bare_source_manager(self):
-        from biopb_tensor_server.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.source_manager import SourceManager
+        from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
 
         server = TensorFlightServer("grpc://localhost:0")
         sm = SourceManager(
@@ -419,29 +417,33 @@ class TestRuntimePhaseGating:
         try:
             # Stub the heavy commit collaborators so we exercise only the gate.
             monkeypatch.setattr(
-                sm,
+                sm._reconciler,
                 "_register_source_claim",
                 lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
-                sm._state, "add_claim", lambda claim, notify=False: True
+                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
-            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
-            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+            monkeypatch.setattr(
+                sm._reconciler, "_build_claim_signatures", lambda claim: {}
+            )
+            monkeypatch.setattr(
+                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
+            )
 
             fired = []
-            sm._on_source_committed = fired.append
+            sm.set_source_committed_hook(fired.append)
             claim = SimpleNamespace(source_id="s1", primary_path="/x")
 
             # During the initial scan: startup sources go to the backlog, not the
             # prompt enqueue -- the hook must NOT fire.
             sm._initial_scan_done = False
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == []
 
             # After the initial scan: live additions fire the hook.
             sm._initial_scan_done = True
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == ["s1"]
         finally:
             server.shutdown()
@@ -458,30 +460,34 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(
-                sm,
+                sm._reconciler,
                 "_register_source_claim",
                 lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
-                sm._state, "add_claim", lambda claim, notify=False: True
+                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
-            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
-            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+            monkeypatch.setattr(
+                sm._reconciler, "_build_claim_signatures", lambda claim: {}
+            )
+            monkeypatch.setattr(
+                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
+            )
 
             fired = []
-            sm._on_source_committed = fired.append
+            sm.set_source_committed_hook(fired.append)
             sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
 
             # Suppressed: initial scan done, but this is the boot-tick upstream
             # re-list -> backlog, not prompt enqueue.
             sm._suppress_live_precache = True
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == []
 
             # Not suppressed (a later live delta): the hook fires as usual.
             sm._suppress_live_precache = False
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == ["up1"]
         finally:
             server.shutdown()
@@ -492,24 +498,28 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(
-                sm,
+                sm._reconciler,
                 "_register_source_claim",
                 lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
-                sm._state, "add_claim", lambda claim, notify=False: True
+                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
-            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
-            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+            monkeypatch.setattr(
+                sm._reconciler, "_build_claim_signatures", lambda claim: {}
+            )
+            monkeypatch.setattr(
+                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
+            )
 
             def boom(_sid):
                 raise RuntimeError("hook failure")
 
-            sm._on_source_committed = boom
+            sm.set_source_committed_hook(boom)
             sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="s2", primary_path="/y")
             # Commit still succeeds despite the hook raising.
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
         finally:
             server.shutdown()
 
@@ -525,7 +535,7 @@ class TestPreemptionAndLifecycle:
         import zarr
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -551,7 +561,7 @@ class TestPreemptionAndLifecycle:
             holding = threading.Event()
 
             def hold():
-                with server._serving_request():
+                with server.activity.serving_request():
                     holding.set()
                     release.wait(3.0)
 
@@ -624,7 +634,7 @@ def _located_all(server, cache_manager, source_ids):
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
     for sid in source_ids:
-        adapter = server._get_source_adapter(sid)
+        adapter = server.sources.get(sid)
         td = adapter.list_tensor_descriptors()[0]
         ta = adapter.get_tensor_adapter(td.array_id)
         scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
@@ -656,7 +666,7 @@ class _FakeBackend:
 
 class TestHeadroomProbe:
     def test_has_headroom_tracks_high_water(self, monkeypatch):
-        from biopb_tensor_server import precache as pc
+        from biopb_tensor_server.serving import precache as pc
 
         worker = PrecacheWorker(None, PrecacheConfig(backlog_high_water=0.8))
         backend = _FakeBackend(total=0, mx=1000)
@@ -672,7 +682,7 @@ class TestHeadroomProbe:
         assert worker._has_headroom() is False
 
     def test_no_headroom_when_unbounded_or_missing(self, monkeypatch):
-        from biopb_tensor_server import precache as pc
+        from biopb_tensor_server.serving import precache as pc
 
         worker = PrecacheWorker(None, PrecacheConfig())
         # max_bytes <= 0 -> can't reason about fill, treat as no headroom.
@@ -721,8 +731,8 @@ class TestBacklogSeeding:
 
 class TestIterLocalSourceMtimes:
     def _bare_sm(self):
-        from biopb_tensor_server.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.source_manager import SourceManager
+        from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
 
         server = TensorFlightServer("grpc://localhost:0")
         sm = SourceManager(
@@ -739,13 +749,13 @@ class TestIterLocalSourceMtimes:
         try:
             real = tmp_path / "f.zarr"
             real.mkdir()
-            sm._state.claims["local"] = SimpleNamespace(
+            sm._reconciler._state.claims["local"] = SimpleNamespace(
                 source_id="local", primary_path=str(real), is_remote=False
             )
-            sm._state.claims["remote"] = SimpleNamespace(
+            sm._reconciler._state.claims["remote"] = SimpleNamespace(
                 source_id="remote", primary_path="s3://bucket/x", is_remote=True
             )
-            sm._state.claims["gone"] = SimpleNamespace(
+            sm._reconciler._state.claims["gone"] = SimpleNamespace(
                 source_id="gone",
                 primary_path=str(tmp_path / "missing"),
                 is_remote=False,
@@ -766,7 +776,7 @@ class TestIterLocalSourceMtimes:
         server, sm = self._bare_sm()
         holder = None
         try:
-            sm._state.claims["a"] = SimpleNamespace(
+            sm._reconciler._state.claims["a"] = SimpleNamespace(
                 source_id="a", primary_path="/x", is_remote=True
             )
             held = threading.Event()
@@ -774,7 +784,7 @@ class TestIterLocalSourceMtimes:
             done = threading.Event()
 
             def hold_lock():
-                with sm._lock:
+                with sm._reconciler._lock:
                     held.set()
                     release.wait(2.0)
 
@@ -803,7 +813,7 @@ class TestIterLocalSourceMtimes:
 class TestBacklogWarming:
     def _init_file_cache(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -870,7 +880,7 @@ class TestBacklogWarming:
             # A live source is waiting -> a backlog tensor must yield immediately,
             # before warming any chunk.
             worker._queue.put("live")
-            adapter = server._get_source_adapter("src")
+            adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             preempted = worker._process_tensor(adapter, td, cm, backlog=True)
@@ -890,7 +900,7 @@ class TestBacklogWarming:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             monkeypatch.setattr(worker, "_has_headroom", lambda: False)
-            adapter = server._get_source_adapter("src")
+            adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             preempted = worker._process_tensor(adapter, td, cm, backlog=True)
@@ -909,7 +919,7 @@ class TestBacklogWarming:
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            adapter = server._get_source_adapter("src")
+            adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             # Empty live queue + plenty of headroom -> warms, no preempt.
@@ -984,7 +994,7 @@ class TestSkipNativePyramid:
 
     def test_precache_skips_native_multiscale_source(self, multires_ome_zarr, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -1014,7 +1024,7 @@ class TestBuildPyramidPlan:
     """The full computed plan generalizes the coarsest-only helper."""
 
     def test_level_zero_is_full_resolution(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan([20000, 20000], ["y", "x"])
         assert list(levels[0].scale_hint) == [1, 1]
@@ -1023,7 +1033,7 @@ class TestBuildPyramidPlan:
         assert levels[0].reduction_method == "area"
 
     def test_coarsest_matches_precache_helper(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         for shape, labels in [
             ([20000, 20000], ["y", "x"]),
@@ -1037,25 +1047,29 @@ class TestBuildPyramidPlan:
             )
 
     def test_each_level_shape_is_ceil_div(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
-        from biopb_tensor_server.downsample import ceil_div
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = [1000, 8000, 8000]
         levels = build_pyramid_plan(shape, ["z", "y", "x"])
         for level in levels:
-            expected = [ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)]
+            expected = [
+                ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint, strict=True)
+            ]
             assert list(level.shape) == expected
 
     def test_levels_strictly_coarsen(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan([20000, 20000], ["y", "x"])
         # Each successive level downsamples at least one axis further.
-        for prev, nxt in zip(levels, levels[1:]):
-            assert any(b > a for a, b in zip(prev.scale_hint, nxt.scale_hint))
+        for prev, nxt in zip(levels, levels[1:], strict=False):
+            assert any(
+                b > a for a, b in zip(prev.scale_hint, nxt.scale_hint, strict=True)
+            )
 
     def test_small_source_is_single_full_res_level(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan([512, 512], ["y", "x"])
         assert len(levels) == 1
@@ -1072,7 +1086,7 @@ class TestBuildPyramidPlan:
     def test_sub_2d_is_single_unscaled_level(self, shape, labels):
         # <2-D tensors have no Y/X plane: one full-resolution level, never a raise
         # (regression -- _precache_xy_indices used to raise, breaking GetFlightInfo).
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan(shape, labels)
         assert len(levels) == 1
@@ -1082,7 +1096,7 @@ class TestBuildPyramidPlan:
         assert compute_precache_scale_hint(shape, labels) == [1] * len(shape)
 
     def test_reduction_method_is_configurable(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan(
             [20000, 20000], ["y", "x"], reduction_method="nearest"
@@ -1263,7 +1277,7 @@ class TestPrecacheAdvertisedAlignment:
     def test_worker_coarsest_equals_advertised_coarsest(self, tmp_path):
         import zarr
         from biopb_tensor_server import ZarrAdapter
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         arr = zarr.open_array(
             str(tmp_path / "big.zarr"),
@@ -1277,7 +1291,7 @@ class TestPrecacheAdvertisedAlignment:
         try:
             server.register_source("big", adapter)
             base_desc = adapter.get_tensor_descriptor()
-            advertised = server._advertised_pyramid(adapter, base_desc)
+            advertised = adapter._advertised_pyramid(base_desc, server._pyramid_config)
             # The worker warms build_pyramid_plan(...)[-1]; the server advertises
             # the same plan -- so their coarsest scales are identical.
             worker_coarsest = build_pyramid_plan(

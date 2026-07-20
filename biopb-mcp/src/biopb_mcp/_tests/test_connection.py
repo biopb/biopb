@@ -6,6 +6,8 @@ the GUI stack via the package ``__init__``, which eagerly imports the widgets;
 the service module itself imports no Qt/napari.)
 """
 
+import contextlib
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +25,14 @@ from biopb_mcp._connection import (
 def _clear_env(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_control(monkeypatch):
+    """Default: no control plane answers, so ``auto_connect`` falls back to the
+    config/env URL and makes no real ``ensure`` POST from unit tests. Tests that
+    exercise a live control override this with their own monkeypatch."""
+    monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
 
 
 def _fake_client(sources):
@@ -56,6 +66,210 @@ class TestResolveFromConfig:
         url, token = TensorConnection.resolve_from_config({})
         assert url == DEFAULT_CONFIG["tensor_browser"]["server_url"]
         assert token is None
+
+
+# ---------------------------------------------------------------------------
+# auto_connect URL resolution (control first via ensure, config fallback -- #413)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoConnectResolution:
+    def test_targets_control_url(self, monkeypatch):
+        # Control answers: ensure both brings the plane up and reports its
+        # endpoint, so we connect straight there -- ignoring the (different)
+        # config fallback.
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(
+            _connection,
+            "ensure_data_plane",
+            lambda *a, **k: {"grpc_url": "grpc://control:9", "state": "serving"},
+        )
+        seen = []
+        monkeypatch.setattr(
+            _connection,
+            "TensorFlightClient",
+            lambda url, token=None: seen.append(url) or _fake_client({}),
+        )
+        conn.auto_connect()
+        assert conn.is_connected
+        assert conn.url == "grpc://control:9"
+        assert seen == ["grpc://control:9"]
+
+    def test_falls_back_to_config_when_no_control(self, monkeypatch):
+        # No control answers: connect to the config/env URL directly.
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
+        seen = []
+        monkeypatch.setattr(
+            _connection,
+            "TensorFlightClient",
+            lambda url, token=None: seen.append(url) or _fake_client({}),
+        )
+        conn.auto_connect()
+        assert conn.is_connected
+        assert conn.url == "grpc://cfg:2"
+        assert seen == ["grpc://cfg:2"]
+
+
+# ---------------------------------------------------------------------------
+# _control_client.data_plane_url (the control /health probe)
+# ---------------------------------------------------------------------------
+
+
+class TestControlDataPlaneUrl:
+    @staticmethod
+    def _fake_urlopen(status, body):
+        @contextlib.contextmanager
+        def _cm(*_a, **_k):
+            resp = MagicMock()
+            resp.status = status
+            resp.read.return_value = json.dumps(body).encode()
+            yield resp
+
+        return _cm
+
+    def test_returns_grpc_url_from_health(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(
+            _control_client.urllib.request,
+            "urlopen",
+            self._fake_urlopen(
+                200, {"control": "ok", "data_plane": {"grpc_url": "grpc://x:5"}}
+            ),
+        )
+        assert _control_client.data_plane_url() == "grpc://x:5"
+
+    def test_none_when_control_unreachable(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        def _boom(*_a, **_k):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(_control_client.urllib.request, "urlopen", _boom)
+        assert _control_client.data_plane_url() is None
+
+    def test_none_when_snapshot_lacks_grpc_url(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(
+            _control_client.urllib.request,
+            "urlopen",
+            self._fake_urlopen(200, {"control": "ok", "data_plane": {}}),
+        )
+        assert _control_client.data_plane_url() is None
+
+
+# ---------------------------------------------------------------------------
+# _control_client.start_control_detached (the shim's fire-and-forget bring-up)
+# ---------------------------------------------------------------------------
+
+
+class TestStartControlDetached:
+    def test_spawns_detached_no_data_plane_and_returns_true(self, monkeypatch):
+        import os
+
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(_control_client, "_biopb_executable", lambda: "/opt/biopb")
+        captured = {}
+
+        def _fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return MagicMock()
+
+        monkeypatch.setattr(_control_client.subprocess, "Popen", _fake_popen)
+
+        assert _control_client.start_control_detached() is True
+        # Starts the control WITHOUT the data plane (on-demand) and never blocks.
+        assert captured["argv"] == ["/opt/biopb", "control", "start", "--no-data-plane"]
+        # stdio is fully detached from this process.
+        assert captured["kwargs"]["stdin"] == _control_client.subprocess.DEVNULL
+        assert captured["kwargs"]["stdout"] == _control_client.subprocess.DEVNULL
+        assert captured["kwargs"]["stderr"] == _control_client.subprocess.DEVNULL
+        # Detached from the shim's process group so it outlives a disconnect.
+        if os.name == "nt":
+            assert "creationflags" in captured["kwargs"]
+        else:
+            assert captured["kwargs"]["start_new_session"] is True
+
+    def test_returns_false_and_does_not_spawn_when_cli_missing(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(_control_client, "_biopb_executable", lambda: None)
+
+        def _must_not_spawn(*_a, **_k):
+            raise AssertionError("Popen must not be called when the CLI is absent")
+
+        monkeypatch.setattr(_control_client.subprocess, "Popen", _must_not_spawn)
+        assert _control_client.start_control_detached() is False
+
+    def test_returns_false_on_spawn_oserror(self, monkeypatch):
+        from biopb_mcp import _control_client
+
+        monkeypatch.setattr(_control_client, "_biopb_executable", lambda: "/opt/biopb")
+
+        def _boom(*_a, **_k):
+            raise OSError("no exec")
+
+        monkeypatch.setattr(_control_client.subprocess, "Popen", _boom)
+        assert _control_client.start_control_detached() is False
+
+
+class TestBiopbExecutable:
+    def test_prefers_sibling_of_interpreter(self, tmp_path, monkeypatch):
+        import os
+
+        from biopb_mcp import _control_client
+
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        name = "biopb.exe" if os.name == "nt" else "biopb"
+        sibling = bindir / name
+        sibling.write_text("")
+        monkeypatch.setattr(_control_client.sys, "executable", str(bindir / "python"))
+        assert _control_client._biopb_executable() == str(sibling)
+
+    def test_prefers_sibling_when_interpreter_is_symlinked(self, tmp_path, monkeypatch):
+        # A real venv's `python` is a symlink to the base interpreter, while the
+        # `biopb` console script lives in the venv bin/ next to that symlink. The
+        # sibling lookup must resolve against the symlink's own dir, NOT the base
+        # it points to -- otherwise it misses biopb in exactly the symlinked-venv +
+        # no-PATH case this is for. (No PATH fallback here: which() returns None.)
+        import os
+        import shutil
+
+        from biopb_mcp import _control_client
+
+        base_bin = tmp_path / "base"
+        base_bin.mkdir()
+        (base_bin / "python3.10").write_text("")  # the real base interpreter
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        name = "biopb.exe" if os.name == "nt" else "biopb"
+        sibling = venv_bin / name
+        sibling.write_text("")
+        try:
+            os.symlink(base_bin / "python3.10", venv_bin / "python")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this platform/privilege")
+
+        monkeypatch.setattr(_control_client.sys, "executable", str(venv_bin / "python"))
+        monkeypatch.setattr(shutil, "which", lambda n: None)
+        assert _control_client._biopb_executable() == str(sibling)
+
+    def test_falls_back_to_path_when_no_sibling(self, tmp_path, monkeypatch):
+        import shutil
+
+        from biopb_mcp import _control_client
+
+        # An interpreter dir with no biopb sibling -> resolution falls to PATH.
+        monkeypatch.setattr(_control_client.sys, "executable", str(tmp_path / "python"))
+        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/biopb")
+        assert _control_client._biopb_executable() == "/usr/bin/biopb"
 
 
 # ---------------------------------------------------------------------------
@@ -678,14 +892,14 @@ class TestSourceWatch:
 class TestPersistUrl:
     def test_preserves_unowned_keys(self):
         # persist_url() writes via CONFIG.set, which preserves keys the service
-        # does not own (here mcp.services.process_image_servers) -- both in the
+        # does not own (here services.process_image_servers) -- both in the
         # cache and on disk.
         import json
 
         from biopb_mcp._config import CONFIG, get_config_path
 
         CONFIG.set(
-            "mcp.services.process_image_servers",
+            "services.process_image_servers",
             ["grpc://ops:5"],
             persist=False,
         )
@@ -696,11 +910,11 @@ class TestPersistUrl:
         conn.persist_url()
 
         assert CONFIG.get("tensor_browser.server_url") == "grpc://new:2"
-        assert CONFIG.get("mcp.services.process_image_servers") == ["grpc://ops:5"]
+        assert CONFIG.get("services.process_image_servers") == ["grpc://ops:5"]
         with get_config_path().open() as f:
             saved = json.load(f)
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
-        assert saved["mcp"]["services"]["process_image_servers"] == ["grpc://ops:5"]
+        assert saved["services"]["process_image_servers"] == ["grpc://ops:5"]
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +937,7 @@ def test_health_delegates(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# local-server autostart fallback
+# local-URL detection + control-ensure fallback
 # ---------------------------------------------------------------------------
 
 
@@ -748,169 +962,102 @@ class TestIsLocalUrl:
         assert _connection.is_local_url(url) is False
 
 
-class TestCanAutostart:
-    def test_true_when_local_and_cli_present(self, monkeypatch):
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
-        conn = TensorConnection(config={})  # default URL is localhost
-        assert conn.can_autostart_server() is True
-
-    def test_false_without_cli(self, monkeypatch):
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: False)
-        conn = TensorConnection(config={})
-        assert conn.can_autostart_server() is False
-
-    def test_false_for_remote(self, monkeypatch):
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
-        cfg = {"tensor_browser": {"server_url": "grpc://example.com:8815"}}
-        conn = TensorConnection(config=cfg)
-        assert conn.can_autostart_server() is False
-
-
-class TestLaunchLocalServer:
-    def test_launches_without_connecting(self, monkeypatch, tmp_path):
-        # launch_local_server only spawns the daemon; it must not connect.
-        client = _fake_client({"a": MagicMock()})
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
-        monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
-        )
-        monkeypatch.setattr(
-            _connection, "DEFAULT_SERVER_CONFIG", tmp_path / "missing.toml"
-        )
-        calls = {}
-
-        def fake_run(cmd, **kwargs):
-            calls["cmd"] = cmd
-            return MagicMock(returncode=0)
-
-        monkeypatch.setattr(_connection.subprocess, "run", fake_run)
-
-        conn = TensorConnection(config={})
-        assert conn.launch_local_server() is None
-        assert calls["cmd"][:3] == ["biopb", "server", "start"]
-        # No connection attempted by the launch step.
-        client.list_sources.assert_not_called()
-        assert conn.is_connected is False
-
-    def test_raises_without_cli(self, monkeypatch):
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: False)
-        conn = TensorConnection(config={})
-        with pytest.raises(RuntimeError, match="biopb CLI not found"):
-            conn.launch_local_server()
-
+class TestServerStartTimeout:
     def test_server_start_timeout_from_config(self):
         from biopb_mcp._config import CONFIG
 
-        CONFIG.set("mcp.server_start_timeout", 12.5, persist=False)
+        CONFIG.set("transport.server_start_timeout", 12.5, persist=False)
         conn = TensorConnection(config={})
         assert conn.server_start_timeout() == 12.5
-
-
-class TestStartLocalServer:
-    def test_starts_and_connects_without_token(self, monkeypatch, tmp_path):
-        sources = {"a": MagicMock()}
-        client = _fake_client(sources)
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
-        monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
-        )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
-        # No real config file -> --config omitted.
-        monkeypatch.setattr(
-            _connection, "DEFAULT_SERVER_CONFIG", tmp_path / "missing.toml"
-        )
-
-        calls = {}
-
-        def fake_run(cmd, **kwargs):
-            calls["cmd"] = cmd
-            return MagicMock(returncode=0)
-
-        monkeypatch.setattr(_connection.subprocess, "run", fake_run)
-
-        conn = TensorConnection(config={})
-        assert conn.token is None
-        result = conn.start_local_server()
-
-        assert result is sources
-        assert conn.is_connected is True
-        # Token logic is left to the CLI; we never fabricate one.
-        assert conn.token is None
-        assert calls["cmd"][:3] == ["biopb", "server", "start"]
-        assert "--token" not in calls["cmd"]
-        assert "--config" not in calls["cmd"]  # missing file
-
-    def test_passes_existing_config(self, monkeypatch, tmp_path):
-        cfg_file = tmp_path / "biopb.toml"
-        cfg_file.write_text("")
-        client = _fake_client({"a": MagicMock()})
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
-        monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
-        )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
-        monkeypatch.setattr(_connection, "DEFAULT_SERVER_CONFIG", cfg_file)
-
-        calls = {}
-
-        def fake_run(cmd, **kwargs):
-            calls["cmd"] = cmd
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(_connection.subprocess, "run", fake_run)
-
-        conn = TensorConnection(config={})
-        conn.start_local_server()
-        assert "--config" in calls["cmd"]
-        assert str(cfg_file) in calls["cmd"]
-
-    def test_raises_without_cli(self, monkeypatch):
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: False)
-        conn = TensorConnection(config={})
-        with pytest.raises(RuntimeError, match="biopb CLI not found"):
-            conn.start_local_server()
-
-    def test_raises_when_cli_fails(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
-        monkeypatch.setattr(
-            _connection, "DEFAULT_SERVER_CONFIG", tmp_path / "missing.toml"
-        )
-        monkeypatch.setattr(
-            _connection.subprocess,
-            "run",
-            lambda cmd, **kw: MagicMock(returncode=1),
-        )
-        conn = TensorConnection(config={})
-        with pytest.raises(RuntimeError, match="failed"):
-            conn.start_local_server()
 
 
 class TestAutoConnect:
     """The shared connect policy used by both the kernel and the widget.
 
-    Both callers drive this off their own worker thread (the MCP bootstrap on a
-    daemon thread, the widget on a connect worker); here we call it directly with
-    ``connect`` and friends mocked.
+    Since the de-daemonization, ``_connection`` is a pure
+    client: it asks the control plane **first** to ensure the data plane (single
+    source of truth, #413) and never spawns a server itself; only when no control
+    answers does it fall back to the config/env URL. Both callers drive this off
+    their own worker thread; here we call it directly with ``connect`` and friends
+    mocked.
     """
 
-    def test_connects_on_first_try(self, monkeypatch):
+    # --- control answers (the normal path) --------------------------------- #
+
+    def test_control_ensures_then_connects(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url, conn.token = "grpc://cfg:2", "tok"
+        ensure = MagicMock(
+            return_value={"grpc_url": "grpc://control:9", "state": "serving"}
+        )
+        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+        connect = MagicMock()
+        monkeypatch.setattr(conn, "connect", connect)
+
+        conn.auto_connect()
+
+        # One control call brings the plane up AND resolves the endpoint; we wait
+        # that endpoint through boot and never take the standalone connect path.
+        ensure.assert_called_once_with(timeout=30.0)
+        booted.assert_called_once_with("grpc://control:9", "tok", timeout=30.0)
+        assert conn.url == "grpc://control:9"
+        connect.assert_not_called()
+
+    def test_control_snapshot_without_url_uses_current(self, monkeypatch):
+        # A real supervisor snapshot always carries grpc_url; if one omits it, the
+        # control still answered, so we wait our current url through boot rather
+        # than falling to the no-control error path.
+        conn = TensorConnection(config={})
+        conn.url = "grpc://localhost:8815"
+        monkeypatch.setattr(
+            _connection, "ensure_data_plane", lambda timeout: {"state": "serving"}
+        )
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+
+        conn.auto_connect()
+
+        booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
+
+    def test_control_boot_failure_is_swallowed(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url = "grpc://localhost:8815"
+        monkeypatch.setattr(
+            _connection,
+            "ensure_data_plane",
+            lambda timeout: {"grpc_url": "grpc://localhost:8815", "state": "serving"},
+        )
+        monkeypatch.setattr(
+            conn,
+            "connect_when_booted",
+            MagicMock(side_effect=RuntimeError("boot failed")),
+        )
+        # A post-ensure boot failure must not propagate out of the policy.
+        conn.auto_connect()
+
+    # --- no control answers (standalone / pre-control fallback) ------------ #
+
+    def test_no_control_connects_to_config(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url, conn.token = "grpc://host:9", "tok"
         connect = MagicMock(return_value={"a": MagicMock()})
         monkeypatch.setattr(conn, "connect", connect)
         booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
-        started = MagicMock()
-        monkeypatch.setattr(conn, "start_local_server", started)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         conn.auto_connect()
 
+        # No control -> connect straight to the config/env URL; a clean connect
+        # needs no boot wait.
         connect.assert_called_once_with("grpc://host:9", "tok")
-        # A clean connect short-circuits — no boot wait, no autostart.
         booted.assert_not_called()
-        started.assert_not_called()
 
-    def test_starting_waits_through_boot(self, monkeypatch):
+    def test_no_control_starting_waits_through_boot(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url, conn.token = "grpc://host:9", None
         monkeypatch.setattr(
@@ -921,16 +1068,14 @@ class TestAutoConnect:
         booted = MagicMock(return_value={"a": MagicMock()})
         monkeypatch.setattr(conn, "connect_when_booted", booted)
         monkeypatch.setattr(conn, "server_start_timeout", lambda: 42.0)
-        started = MagicMock()
-        monkeypatch.setattr(conn, "start_local_server", started)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         conn.auto_connect()
 
-        # A STARTING server is waited through, not autostarted.
+        # A STARTING server is waited through, not handed back as an error.
         booted.assert_called_once_with("grpc://host:9", None, timeout=42.0)
-        started.assert_not_called()
 
-    def test_starting_then_boot_timeout_is_swallowed(self, monkeypatch):
+    def test_no_control_starting_boot_timeout_swallowed(self, monkeypatch):
         conn = TensorConnection(config={})
         monkeypatch.setattr(
             conn,
@@ -943,15 +1088,12 @@ class TestAutoConnect:
             MagicMock(side_effect=RuntimeError("did not become ready")),
         )
         monkeypatch.setattr(conn, "server_start_timeout", lambda: 1.0)
-        started = MagicMock()
-        monkeypatch.setattr(conn, "start_local_server", started)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         # Best-effort: a boot timeout must not raise out of auto_connect.
         conn.auto_connect()
-        # Already up (just slow), so we do NOT fall through to autostart.
-        started.assert_not_called()
 
-    def test_unreachable_autostarts_local(self, monkeypatch):
+    def test_no_control_unreachable_records_status(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url = "grpc://localhost:8815"
         monkeypatch.setattr(
@@ -959,45 +1101,15 @@ class TestAutoConnect:
             "connect",
             MagicMock(side_effect=RuntimeError("connection refused")),
         )
-        monkeypatch.setattr(conn, "can_autostart_server", lambda: True)
-        started = MagicMock()
-        monkeypatch.setattr(conn, "start_local_server", started)
-
-        conn.auto_connect()
-        started.assert_called_once_with()
-
-    def test_unreachable_no_autostart_is_swallowed(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url = "grpc://remote:9"
-        monkeypatch.setattr(
-            conn,
-            "connect",
-            MagicMock(side_effect=RuntimeError("connection refused")),
-        )
-        # Remote URL / no CLI -> cannot autostart; auto_connect just gives up.
-        monkeypatch.setattr(conn, "can_autostart_server", lambda: False)
-        started = MagicMock()
-        monkeypatch.setattr(conn, "start_local_server", started)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
+        booted = MagicMock()
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
 
         conn.auto_connect()  # must not raise
-        started.assert_not_called()
 
-    def test_autostart_failure_is_swallowed(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url = "grpc://localhost:8815"
-        monkeypatch.setattr(
-            conn,
-            "connect",
-            MagicMock(side_effect=RuntimeError("connection refused")),
-        )
-        monkeypatch.setattr(conn, "can_autostart_server", lambda: True)
-        monkeypatch.setattr(
-            conn,
-            "start_local_server",
-            MagicMock(side_effect=RuntimeError("boot failed")),
-        )
-        # A failed autostart must not propagate out of the best-effort policy.
-        conn.auto_connect()
+        booted.assert_not_called()
+        assert conn.last_status == "error"
+        assert "biopb control start" in conn.last_message
 
 
 # ---------------------------------------------------------------------------

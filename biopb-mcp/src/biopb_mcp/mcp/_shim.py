@@ -1,23 +1,46 @@
-"""stdio bridge ("shim") to the biopb-mcp http daemon.
+"""stdio bridge ("shim") to a private, shim-owned biopb-mcp http session.
 
 ``biopb-mcp --transport stdio`` no longer serves MCP over fd 0/1 from the
 heavy launcher process. Instead the launcher runs this module, which
 
-1. ensures the http daemon is listening on the configured loopback port,
-   spawning it detached if nothing is (``ensure_daemon``), then
-2. bridges stdio JSON-RPC <-> the daemon's streamable-http endpoint
-   (``run_bridge``) until the client closes stdin.
+1. spawns its **own** http session child — FastMCP/uvicorn + the kernel host —
+   on an OS-assigned port, inheriting this shim's live environment
+   (``spawn_session``), then
+2. bridges stdio JSON-RPC <-> that child's streamable-http endpoint
+   (``run_bridge``) until the client closes stdin, then
+3. reaps the child (and its kernel grandchild) on the way out (``_reap_session``).
 
-This is the daemon-migration Direction 1 shape (docs/daemon-migration.md):
-the process that owns fd 1 as a protocol channel imports nothing that could
-write to stdout (no Qt, dask, uvicorn, or kernel — only the mcp SDK), so the
-fd-1 corruption class is structurally impossible here. The heavy process
-serves http only, outlives any one client, and is shared by all of them.
+This is the de-daemonized, shim-owned session model (ARCHITECTURE.md, Lifecycle). It
+retains the shim/heavy *split* described there — the process that
+owns fd 1 as a protocol channel imports nothing that could write to stdout (no
+Qt, dask, uvicorn, or kernel — only the mcp SDK), so the fd-1 corruption class
+is structurally impossible here — but undoes the daemon's *detachment* and its
+role as a shared, client-outliving lifecycle root:
 
-The bridge is vendored rather than delegated to ``mcp-proxy`` per the vetting
-report (docs/mcp-proxy-vet.md): mcp-proxy drops the initialize
-``instructions`` field that carries biopb-mcp's operation guardrails, has no
-lifetime guard when the daemon dies, and floats its dependencies. Here the
+* **Ephemeral & owned.** Every shim spawns its own child and tears it down when
+  its client disconnects. No probe-and-reuse, no shared daemon, no fixed port —
+  two clients get two independent sessions (two viewers), by design.
+* **Env-inherited (the #98 fix).** The child inherits *this* shim's environment,
+  so ``DISPLAY`` / ``XAUTHORITY`` / ``WAYLAND_DISPLAY`` are always the user's
+  current session — never a value frozen into a long-lived daemon by whoever
+  happened to spawn it first.
+* **Reaped, cross-platform (the #403 fix, generalized).** POSIX: the child stays
+  in this shim's process group (no ``start_new_session``), so the MCP client's
+  process-group teardown takes it — and its kernel, via the kernel's own
+  parent-death pipe — down with the shim; the bridge-close path also reaps it
+  explicitly. Windows: this shim holds a kill-on-close Job Object the child is
+  assigned to, so a force-killed shim reaps the whole tree (see ``_winjob``);
+  and a client-death watchdog (``_install_client_death_watchdog``) reaps the
+  shim itself when its stdio *client* exits without the bridge seeing stdin EOF
+  -- e.g. when a multi-process client (Claude Code: a daemon + pty host) keeps a
+  duplicate of the shim's stdin write handle open in a surviving helper after
+  the launching process is gone, so the session would otherwise outlive every
+  real client (biopb#403, the client side).
+
+The bridge itself is vendored rather than delegated to ``mcp-proxy``: mcp-proxy
+drops the initialize ``instructions`` field that carries biopb-mcp's operation
+guardrails, has no lifetime guard when the server dies, and floats its
+dependencies. Here the
 remote's initialize result — capabilities, serverInfo, and ``instructions`` —
 is replayed to the stdio client verbatim, and any bridge failure exits the
 shim so the client sees EOF instead of a hung proxy.
@@ -25,12 +48,17 @@ shim so the client sees EOF instead of a hung proxy.
 
 import logging
 import os
+import signal
 import socket
-import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 import anyio
+from biopb import _sessions
+from biopb._lifecycle import winjob as _winjob
+from biopb._lifecycle.owned_child import OwnedChild, open_child_log
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -38,14 +66,30 @@ from mcp.server.lowlevel.server import Server, request_ctx
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 
+from .. import _control_client
+
 logger = logging.getLogger(__name__)
 
-# How long ensure_daemon waits for a spawned daemon to start listening.
-# Dominated by the http stack's import time (FastMCP + uvicorn + the tensor
-# client), not the kernel — the kernel starts later, on the first
+# How long spawn_session waits for a spawned child to report its port and start
+# listening. Dominated by the http stack's import time (FastMCP + uvicorn + the
+# tensor client), not the kernel — the kernel starts later, on the first
 # `start_kernel` tool call.
-DAEMON_START_TIMEOUT = 60.0
+SESSION_START_TIMEOUT = 60.0
 _PROBE_INTERVAL = 0.25
+# How long a reap waits for the child to exit at each escalation step.
+REAP_TIMEOUT = 10.0
+
+# Env var carrying the path of the file the child publishes its OS-assigned port
+# to; the child also keys "am I shim-owned?" off its presence. Kept in sync with
+# __main__.ENV_PORT_REPORT_FILE (a literal here, like the sentinel paths, to keep
+# this featherweight module from importing the heavy launcher).
+ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
+
+# Env var telling the child the path of its own session logfile, so it can report
+# it (server_status) and the agent's execute_code can read it from os.environ.
+# The child inherits it, and so does the kernel it spawns. Kept in sync with
+# __main__.ENV_SESSION_LOG.
+ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
 
 
 def _port_listening(port, timeout=0.5):
@@ -57,117 +101,377 @@ def _port_listening(port, timeout=0.5):
         return False
 
 
-def _daemon_command(port):
-    """The argv that launches the http daemon this shim fronts.
+def _session_command():
+    """The argv that launches the http session child this shim owns.
 
-    A frozen (PyInstaller) build has no importable module tree behind
-    ``sys.executable``, but its entry binary *is* the launcher, so plain args
-    suffice; a normal install re-enters via ``-m``.
+    Binds a dynamic port (``--port 0``); the child reports the OS-assigned port
+    back through the file named in ``BIOPB_PORT_REPORT_FILE``. A frozen
+    (PyInstaller) build has no importable module tree behind ``sys.executable``,
+    but its entry binary *is* the launcher, so plain args suffice; a normal
+    install re-enters via ``-m``.
     """
     if getattr(sys, "frozen", False):
         cmd = [sys.executable]
     else:
         cmd = [sys.executable, "-m", "biopb_mcp.mcp"]
-    return [*cmd, "--transport", "http", "--port", str(port)]
+    return [*cmd, "--transport", "http", "--port", "0"]
 
 
-def _open_daemon_log(config):
-    """Open the file the detached daemon's stdout/stderr is sent to.
+def _new_session_id():
+    """A sortable, unique id for this shim session: ``<timestamp>-<shim-pid>``."""
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
 
-    The canonical daemon log (``mcp.transport.kernel_log``, empty ->
-    <log dir>/mcp-server.log) shared with the ``biopb mcp`` CLI so `mcp logs` /
-    `status` read whatever this writes: the daemon's fds are inherited by its
-    child kernel, so this file carries the same native Qt/GL/dask/gRPC output
-    the key always named — plus the daemon's own logs. Binary, append,
-    unbuffered, for the same reason the kernel redirection always was: native
-    writers emit arbitrary bytes. On failure, falls back to the shim's stderr
-    buffer so the daemon still starts (its output then interleaves with the
-    shim's logging — harmless, stderr is not a protocol channel).
+
+def _session_log_path(config, session_id):
+    """Where this session's child logs. Per-session by default; a single shared
+    file when ``transport.kernel_log`` is set (opt back into the old behavior).
     """
-    from .._config import get_daemon_log_file
+    from .._config import get_session_log_dir, get_setting
 
-    path = str(get_daemon_log_file(config))
+    override = get_setting(config, "transport.kernel_log")
+    if override:
+        return str(override)
+    return str(get_session_log_dir() / f"{session_id}.log")
+
+
+def _prune_session_logs(keep):
+    """Keep only the newest ``keep`` per-session logs; best-effort.
+
+    Run after the current session's log is created (it is newest, so it always
+    survives). A prune failure never affects the session.
+    """
+    from .._config import get_session_log_dir
+
     try:
-        return open(path, "ab", buffering=0)
+        logs = sorted(
+            get_session_log_dir().glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
     except OSError:
-        logger.warning(
-            "Could not open daemon log %s; routing daemon output to stderr",
-            path,
-        )
-        return getattr(sys.stderr, "buffer", sys.stderr)
+        return
+    for old in logs[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
-def ensure_daemon(config, port, timeout=DAEMON_START_TIMEOUT):
-    """Make sure the http daemon is listening on ``port``; spawn it if not.
+def _read_port_file(path):
+    """The port the child published, or None if not yet written / unparseable.
 
-    Returns True if this call spawned the daemon, False if one was already
-    listening. Concurrent shims race benignly: each spawns a daemon, the
-    kernel's port bind picks one winner, every loser process exits on
-    EADDRINUSE, and all shims converge on whoever is listening — so this only
-    ever polls the port, never tracks the child it spawned.
-
-    Raises TimeoutError if nothing is listening after ``timeout`` seconds
-    (e.g. the daemon crashed on boot; its log has the trace).
+    The child writes atomically (temp + ``os.replace``), so a read never sees a
+    partial value; an empty/missing file just means "not reported yet".
     """
-    if _port_listening(port):
-        return False
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        port = int(text)
+    except ValueError:
+        return None
+    return port if port > 0 else None
 
-    log = _open_daemon_log(config)
-    daemon_log_name = getattr(log, "name", "stderr")
-    cmd = _daemon_command(port)
-    logger.info("No daemon on 127.0.0.1:%d; spawning: %s", port, cmd)
-    # Detach into its own session/process group with no inherited stdio, so the
-    # daemon reliably outlives this shim and its client (orphaned to init, the
-    # port stays bound across shim restarts) even if the client tears down the
-    # shim's *process group* on exit -- the point of the daemon model. setsid
-    # detaches it within the login session only: it is still session-bound and
-    # dies on logout. A daemon meant to survive logout must be made persistent
-    # at the wrapper level (see cli._detach_kwargs).
-    #
-    # Windows: CREATE_NO_WINDOW, NOT DETACHED_PROCESS. Both keep the shim from
-    # pinning a console, but DETACHED_PROCESS leaves the daemon with *no* console
-    # at all -- so when it later spawns the console-subsystem Jupyter kernel
-    # (python.exe, no creation flags of its own) Windows is forced to allocate a
-    # fresh *visible* console for it, and an empty shell window pops on the user's
-    # desktop. CREATE_NO_WINDOW instead gives the daemon a hidden console the
-    # kernel inherits silently. This mirrors cli._detach_kwargs, the convention
-    # for every other daemon spawn in the project ("so none pops").
-    popen_kwargs = {}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = (
-            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        popen_kwargs["start_new_session"] = True
-    subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=log,
-        close_fds=True,
-        **popen_kwargs,
+
+def _await_port(proc, port_file, timeout):
+    """Block until the child publishes its port, returning it.
+
+    Raises RuntimeError if the child exits first (its log has the trace) or
+    TimeoutError if nothing is reported within ``timeout`` seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        port = _read_port_file(port_file)
+        if port is not None:
+            return port
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"biopb-mcp session child exited (status {proc.returncode}) "
+                "before reporting its port; check the daemon log"
+            )
+        time.sleep(_PROBE_INTERVAL)
+    raise TimeoutError(
+        f"biopb-mcp session child did not report its port within {timeout:.0f}s; "
+        "check the daemon log"
     )
-    if log is not getattr(sys.stderr, "buffer", sys.stderr):
-        log.close()  # the child holds its own duplicate of the fd
 
+
+def _await_listening(proc, port, timeout):
+    """Block until the child accepts connections on ``port``.
+
+    The child publishes its port right after binding but before it listens, so
+    the bridge must wait for the listener to come up. Raises like ``_await_port``
+    on child death / timeout.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _port_listening(port):
-            return True
+            return
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"biopb-mcp session child exited (status {proc.returncode}) "
+                f"before listening on 127.0.0.1:{port}; check the daemon log"
+            )
         time.sleep(_PROBE_INTERVAL)
     raise TimeoutError(
-        f"biopb-mcp daemon did not start listening on 127.0.0.1:{port} "
-        f"within {timeout:.0f}s; check the daemon log ({daemon_log_name})"
+        f"biopb-mcp session child did not start listening on 127.0.0.1:{port} "
+        f"within {timeout:.0f}s; check the daemon log"
     )
+
+
+def spawn_session(config, timeout=SESSION_START_TIMEOUT):
+    """Spawn a private http child this shim owns; return (child, url, session_id).
+
+    ``child`` is an :class:`OwnedChild`. See the module docstring for the
+    ownership model. Inherits this shim's live environment (the #98 fix), binds a
+    dynamic port the child reports back, and ties the child's lifetime to this
+    shim (POSIX process group; Windows Job Object). On any startup failure the
+    child is reaped before the error propagates, so a failed bring-up never leaks
+    a process.
+
+    Raises TimeoutError / RuntimeError if the child never becomes reachable.
+    """
+    from .._config import get_setting
+
+    # Per-session logfile (not the shared mcp-server.log): concurrent sessions no
+    # longer interleave. Prune older ones to the configured cap after opening the
+    # new one (it is newest, so it survives).
+    session_id = _new_session_id()
+    log_path = _session_log_path(config, session_id)
+    log, logged_to_file = open_child_log(log_path)
+    if logged_to_file and not get_setting(config, "transport.kernel_log"):
+        _prune_session_logs(get_setting(config, "transport.session_log_keep", 5))
+
+    cmd = _session_command()
+    fd, port_file = tempfile.mkstemp(prefix="biopb-mcp-port-", suffix=".txt")
+    os.close(fd)  # the child writes it by path, not fd
+
+    # Inherit THIS shim's live environment (the #98 fix). Explicit copy so the
+    # intent is legible; we add the port-report channel and — so the child can
+    # report its own logfile (server_status) and the agent's execute_code can
+    # read it from os.environ — the session log path.
+    env = os.environ.copy()
+    env[ENV_PORT_REPORT_FILE] = port_file
+    if logged_to_file:
+        env[ENV_SESSION_LOG] = log_path
+
+    # OwnedChild applies the owned-child spawn conventions and the Windows Job
+    # Object bind (CREATE_NO_WINDOW, no new process group; POSIX shares this
+    # shim's group so the client's teardown reaps it — and its kernel, via the
+    # kernel's parent-death pipe). See biopb._lifecycle.owned_child.
+    logger.info("Spawning owned biopb-mcp session: %s", cmd)
+    child = OwnedChild(cmd, log=log, env=env)
+    try:
+        child.spawn()
+    finally:
+        if logged_to_file:
+            log.close()  # the child holds its own duplicate of the fd
+
+    try:
+        port = _await_port(child.proc, port_file, timeout)
+        _await_listening(child.proc, port, timeout)
+    except BaseException:
+        child.stop()
+        raise
+    finally:
+        try:
+            os.unlink(port_file)
+        except OSError:
+            pass
+
+    url = f"http://127.0.0.1:{port}/mcp"
+    # Publish the now-reachable session so the control can list it and proxy
+    # /session/<id>/* to it. Registered only after the child is fully up (a
+    # failed bring-up above reaps and never reaches here, so it leaves no
+    # record); the reap path unregisters. Best-effort — a registry write failure
+    # must not fail an otherwise-working session, only cost its discoverability.
+    # Catch broadly (not just OSError): a serialization TypeError/ValueError, or
+    # register()'s own unsafe-id ValueError, must not escape and break the session
+    # either (biopb/biopb#422).
+    try:
+        _sessions.register(session_id, port=port, pid=child.pid, mcp_url=url)
+    except Exception as e:
+        logger.warning("Could not register session %s: %s", session_id, e)
+
+    return child, url, session_id
+
+
+def _reap_session(child, session_id=None):
+    """Tear down the owned child (and its kernel grandchild).
+
+    The bridge-close / signal counterpart to the OS-level ties set at spawn.
+    Delegates the platform reap escalation to :meth:`OwnedChild.stop` (POSIX:
+    SIGTERM so the child's handler reaps the kernel gracefully, then SIGKILL;
+    Windows: TerminateJobObject force-reaps the whole tree, then releases the
+    handle). Idempotent and best-effort — safe to call more than once and on an
+    already-dead child.
+
+    ``session_id`` (when this reaps a registered session) is dropped from the
+    filesystem registry here so teardown and de-registration are one path — a
+    force-killed child leaves no routing ghost; the registry's own pid-liveness
+    prune (:func:`biopb._sessions.list_sessions`) is the backstop for the
+    case where even this reap is skipped.
+    """
+    if session_id is not None:
+        _sessions.unregister(session_id)
+    child.stop(timeout=REAP_TIMEOUT)
+
+
+def _install_shim_reaper(child, session_id=None):
+    """POSIX: reap the child if this shim is signalled to exit.
+
+    A SIGTERM/SIGHUP delivered to the shim *alone* (not its whole group) would
+    otherwise orphan the child, since Python's default handler exits without
+    running ``serve``'s ``finally``. SIGINT is left to its default: it raises
+    KeyboardInterrupt out of ``run_bridge`` and the ``finally`` reaps. On Windows
+    there are no such signals — the Job Object reaps on any shim *death*, and
+    ``_install_client_death_watchdog`` covers the shim being *orphaned* by its
+    client — so this is a no-op there.
+
+    ``session_id`` is passed through so the signal path de-registers too (it
+    ``os._exit``s past ``serve``'s ``finally``, so it must clean the registry
+    itself).
+    """
+    if os.name == "nt":
+        return
+
+    def _on_signal(signum, frame):
+        _reap_session(child, session_id)
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass
+
+
+# Substrings that mark a process in *our own* stdio launcher chain (the shim and
+# any interpreter-launcher stubs above it), as opposed to the MCP client that
+# spawned it. The whole chain shares the argv the client invoked us with
+# (``... biopb[-_]mcp ... --transport stdio``), and re-exec launchers (e.g. a
+# venv built on Microsoft Store Python inserts one) preserve it. The client's own
+# cmdline (claude.exe, an editor, a shell) matches neither.
+_OURS_MARKERS = ("biopb", "stdio")
+
+
+def _find_client_process():
+    """Walk up past our own launcher chain to the MCP client that owns us.
+
+    ``os.getppid()`` is NOT the client when an interpreter-launcher stub sits
+    between us and it — the case that made a naive parent-watch useless: on a
+    venv built on Store Python the stub *outlives* the client (it only waits on
+    us), so watching it never fires. We instead climb ancestors while their
+    cmdline looks like our chain (:data:`_OURS_MARKERS`) and return the first
+    foreign one — the real client. ``None`` if it can't be determined (psutil
+    missing, an unreadable/inaccessible ancestor, or the chain reaches the top),
+    in which case the watchdog simply does not arm.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        node = psutil.Process().parent()
+        while node is not None:
+            cl = " ".join(node.cmdline()).lower()
+            if not all(m in cl for m in _OURS_MARKERS):
+                return node  # first ancestor not in our chain == the client
+            node = node.parent()
+    except Exception:
+        # AccessDenied / NoSuchProcess / a gone ancestor mid-walk: give up rather
+        # than risk watching the wrong process. stdin EOF stays the backstop.
+        return None
+    return None
+
+
+def _is_windows() -> bool:
+    """Platform check, isolated as a seam the watchdog tests patch.
+
+    Tests must exercise the Windows-only branch below *without* forcing the global
+    ``os.name = "nt"`` — on a POSIX runner that makes ``pathlib.Path`` build a
+    ``WindowsPath``, which raises on Python < 3.12 and crashes pytest itself (its
+    coverage / cache / location machinery calls ``Path``). See the same note in
+    ``_tests/test_update.py``.
+    """
+    return os.name == "nt"
+
+
+def _install_client_death_watchdog(child, session_id=None):
+    """Windows: reap the owned child if the stdio *client* dies unseen by stdin.
+
+    Normal teardown runs when ``run_bridge`` returns on stdin EOF (client hung
+    up) or, on POSIX, when the client's process-group teardown / a SIGTERM fires
+    ``_install_shim_reaper``. Windows has neither group teardown nor those
+    signals, and a multi-process client can keep a duplicate of the shim's stdin
+    write handle open in a surviving helper after the launching process exits, so
+    EOF never arrives — the shim blocks forever in the bridge and the child +
+    kernel leak (they outlive every real client). This watchdog closes that gap:
+    it blocks on the client's process handle and, when the client exits for any
+    reason, reaps the owned tree (de-registering ``session_id``) and exits.
+
+    The client is found by :func:`_find_client_process` (walking past our own
+    launcher stubs — see its docstring for why ``os.getppid()`` is not enough).
+    We hold a handle to that exact process object, so the wait is immune to pid
+    reuse. If the client cannot be found or opened at arm time, we do not arm: a
+    live session is never reaped off an uncertain baseline; stdin EOF and the Job
+    Object remain the backstops. A no-op off Windows (POSIX is covered by the
+    process group + signal reaper).
+
+    Returns the watchdog thread (daemon), or ``None`` if not armed.
+    """
+    if not _is_windows():
+        return None
+    client = _find_client_process()
+    if client is None:
+        logger.debug("client-death watchdog not armed (client not identifiable)")
+        return None
+    handle = _winjob.open_for_wait(client.pid)
+    if not handle:
+        logger.debug(
+            "client-death watchdog not armed (client pid %s un-openable)", client.pid
+        )
+        return None
+    thread = threading.Thread(
+        target=_client_deathwatch,
+        args=(handle, client.pid, child, session_id),
+        name="biopb-client-deathwatch",
+        daemon=True,
+    )
+    thread.start()
+    logger.info("client-death watchdog armed on client pid %s", client.pid)
+    return thread
+
+
+def _client_deathwatch(handle, client_pid, child, session_id):
+    """Block on the client's ``handle``; on its exit, reap the tree and exit.
+
+    A wait error is treated as *undecided* — we do not reap, since a spurious
+    reap would tear down a live session. On a real exit this ``os._exit``s past
+    ``serve``'s ``finally`` (having already reaped), matching ``_on_signal``.
+    """
+    if not _winjob.wait_for_process(handle):
+        return  # undecided (wait errored) — leave teardown to the other paths
+    logger.info(
+        "stdio client (pid %s) exited; reaping owned session %s", client_pid, session_id
+    )
+    _reap_session(child, session_id)
+    os._exit(0)
 
 
 def build_proxy(remote):
     """Build the stdio-facing MCP server that forwards every request to
-    ``remote`` (a ClientSession connected to the daemon).
+    ``remote`` (a ClientSession connected to the session child).
 
     Handlers are registered unconditionally and the *remote's* capabilities
     are advertised verbatim (see ``run_bridge``), so the bridge never narrows
-    what the daemon offers; a client simply won't call what the capabilities
+    what the child offers; a client simply won't call what the capabilities
     don't advertise. Server->client traffic other than tool-call progress
     (sampling, elicitation, list_changed) is not forwarded — biopb-mcp emits
     none of it (the on-demand kernel design avoids dynamic tool lists on
@@ -268,11 +572,11 @@ def build_proxy(remote):
 
 
 def replay_init_options(init):
-    """Map the daemon's InitializeResult onto the options the bridge serves.
+    """Map the child's InitializeResult onto the options the bridge serves.
 
     Verbatim replay — most importantly ``instructions``, the handshake-time
     carrier for the operation guardrails and the headless notice (the field
-    mcp-proxy drops, per docs/mcp-proxy-vet.md), and the remote's capability
+    mcp-proxy drops), and the remote's capability
     set rather than one recomputed from the bridge's own handlers.
     """
     return InitializationOptions(
@@ -298,28 +602,45 @@ async def _bridge(url):
 
 
 def run_bridge(url):
-    """Bridge stdio <-> the daemon at ``url`` until the client closes stdin.
+    """Bridge stdio <-> the session child at ``url`` until the client closes
+    stdin.
 
-    Any failure (daemon death mid-session included) propagates out, so the
-    shim process exits and the client sees EOF — never a hung bridge.
+    Any failure (child death mid-session included) propagates out, so the shim
+    process exits and the client sees EOF — never a hung bridge.
     """
     anyio.run(_bridge, url)
 
 
-def serve(config, port):
-    """Launcher entry point for ``--transport stdio``: ensure + bridge."""
+def serve(config, port=None):
+    """Launcher entry point for ``--transport stdio``: spawn, bridge, reap.
+
+    ``port`` (the configured ``transport.port``) is vestigial here — the
+    owned child binds a dynamic port — and is accepted only for call-site
+    compatibility with the launcher's dispatch.
+    """
     logger.warning(
-        "stdio is served via a bridge to the local biopb-mcp http daemon "
-        "(spawned on demand, shared across clients, survives this client). "
-        "Native http is recommended where the client supports it: "
-        "`claude mcp add --transport http biopb http://127.0.0.1:%d/mcp`.",
-        port,
+        "stdio is served by bridging to a private biopb-mcp http session this "
+        "shim spawns and owns (torn down when this client disconnects). Native "
+        "http is recommended where the client supports it: run a persistent "
+        "`biopb-mcp --transport http` server and attach with "
+        "`claude mcp add --transport http biopb http://127.0.0.1:<port>/mcp`."
     )
-    url = f"http://127.0.0.1:{port}/mcp"
-    spawned = ensure_daemon(config, port)
-    logger.info(
-        "Bridging stdio to %s (%s)",
-        url,
-        "daemon spawned" if spawned else "daemon already running",
-    )
-    run_bridge(url)
+    # Best-effort, non-blocking: get the durable control plane (which owns the data
+    # plane the kernel will talk to) coming up -- WITHOUT waiting for or verifying
+    # it, since the bridge below must be ready within the MCP client's handshake
+    # timeout. It boots in parallel with spawn_session's import-dominated child
+    # startup; if it is still not up when the child first needs the data plane, the
+    # child surfaces the error (see _control_client.start_control_detached). Fully
+    # guarded -- a control-start hiccup must never abort the shim's bridge.
+    try:
+        _control_client.start_control_detached()
+    except Exception:  # noqa: BLE001 - best-effort; the child surfaces real errors
+        logger.info("control auto-start attempt failed", exc_info=True)
+    child, url, session_id = spawn_session(config)
+    _install_shim_reaper(child, session_id)
+    _install_client_death_watchdog(child, session_id)
+    logger.info("Bridging stdio to %s (owned session pid %s)", url, child.pid)
+    try:
+        run_bridge(url)
+    finally:
+        _reap_session(child, session_id)

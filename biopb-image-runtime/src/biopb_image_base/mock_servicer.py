@@ -53,11 +53,8 @@ class MockServicer(BiopbServicerBase):
                 if image_data is not None:
                     try:
                         img = decode_image_data(image_data)
-                        # Handle both numpy and dask arrays
-                        if hasattr(img, "shape"):
-                            shape = img.shape
-                        else:
-                            shape = (512, 512)  # fallback
+                        # Handle both numpy and dask arrays; fall back to (512, 512)
+                        shape = img.shape if hasattr(img, "shape") else (512, 512)
                         height = shape[0] if len(shape) > 0 else 512
                         width = shape[1] if len(shape) > 1 else 512
                     except Exception:

@@ -2,20 +2,20 @@
 
 import threading
 import time
-import warnings
 
 import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.base import (
-    BackendAdapter,
+from biopb_tensor_server.core.base import (
     DataSourceDescriptor,
+    TensorAdapter,
     TensorDescriptor,
+    strip_source_prefix,
 )
 
 
-class MockMultifieldAdapter(BackendAdapter):
+class MockMultifieldAdapter(TensorAdapter):
     """Mock adapter simulating a multifield source with different-shaped tensors."""
 
     @classmethod
@@ -76,7 +76,7 @@ class MockMultifieldAdapter(BackendAdapter):
             )
         return descriptors
 
-    def get_tensor_adapter(self, tensor_id: str) -> BackendAdapter:
+    def get_tensor_adapter(self, tensor_id: str) -> TensorAdapter:
         """Return adapter for specific tensor - multifield override."""
         if tensor_id in self._tensor_adapters:
             return self._tensor_adapters[tensor_id]
@@ -102,7 +102,7 @@ class MockMultifieldAdapter(BackendAdapter):
         )
 
 
-class MockSingleTensorAdapter(BackendAdapter):
+class MockSingleTensorAdapter(TensorAdapter):
     """Mock adapter for a single tensor within a multifield source."""
 
     @classmethod
@@ -145,7 +145,8 @@ class MockSingleTensorAdapter(BackendAdapter):
         """Return mock data within bounds."""
         super().get_data(bounds)
         shape = tuple(
-            int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
+            int(stop - start)
+            for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
         return np.full(shape, self.value, dtype=self.dtype)
 
@@ -261,13 +262,13 @@ class TestMultifieldServerClient:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             # Access first tensor
-            arr0 = client.get_tensor("multifield-access", "pos_0")
+            arr0 = client.get_tensor("multifield-access/pos_0")
             assert arr0.shape == (32, 32)
             data0 = arr0.compute()
             assert data0.mean() == 0  # Value based on tensor_id
 
             # Access second tensor (different shape)
-            arr1 = client.get_tensor("multifield-access", "pos_1")
+            arr1 = client.get_tensor("multifield-access/pos_1")
             assert arr1.shape == (64, 64)
             data1 = arr1.compute()
             assert data1.mean() == 1  # Value based on tensor_id
@@ -322,8 +323,8 @@ class TestMultifieldServerClient:
 
     def test_get_descriptor_enumeration_vs_probe(self):
         """Issue #75: enumeration is list_sources(); get_descriptor() is a single
-        tensor probe; the deprecated get_source() warns and never clobbers the
-        full enumeration."""
+        tensor probe that reaches any scene and never clobbers the full
+        enumeration."""
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
             ("pos_1", (64, 64), "uint8"),
@@ -352,27 +353,21 @@ class TestMultifieldServerClient:
 
             # Probe: get_descriptor(array_id) fetches exactly the addressed scene
             # -- including a non-default one (the #75 symptom: pos_1/pos_2 were
-            # unreachable through the old get_source path).
+            # unreachable through the old get_source path). It caches only the
+            # descriptor, so it must NOT clobber the full enumeration cached above.
             assert client.get_descriptor("multi/pos_1").shape == [64, 64]
             assert client.get_descriptor("multi/pos_2").shape == [16, 16]
-
-            # Deprecated get_source(): warns, returns a single-tensor wrapper, and
-            # must NOT clobber the full enumeration cached above.
-            with pytest.warns(DeprecationWarning):
-                legacy = client.get_source("multi")
-            assert len(legacy.tensors) == 1
-            # The full enumeration cached by list_sources() is untouched (read the
-            # cache directly -- re-calling list_sources() would just refetch).
+            # Read the _sources cache directly -- re-calling list_sources() would
+            # just refetch.
             assert len(client._sources["multi"].tensors) == 3
 
             client.close()
         finally:
             server.shutdown()
 
-    def test_get_tensor_accepts_qualified_and_bare_id(self):
-        """Identity policy: the wire array_id is the globally-unique
-        source_id/field, and a read resolves whether addressed by that qualified
-        array_id or (back-compat) the bare within-source field.
+    def test_get_tensor_accepts_qualified_id(self):
+        """Identity policy: a tensor is read by its globally-unique
+        source_id/field array_id.
         """
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
@@ -390,13 +385,10 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # Addressed by the full source-qualified array_id...
-            qualified = client.get_tensor("mf-liberal", "mf-liberal/pos_1")
+            # Addressed by the full source-qualified array_id.
+            qualified = client.get_tensor("mf-liberal/pos_1")
             assert qualified.shape == (64, 64)
-            # ...and by the bare within-source field (back-compat).
-            bare = client.get_tensor("mf-liberal", "pos_1")
-            assert bare.shape == (64, 64)
-            np.testing.assert_array_equal(qualified.compute(), bare.compute())
+            assert qualified.compute().mean() == 1  # value based on field index
 
             # The wire descriptor reports the qualified array_id.
             desc = client.get_descriptor("mf-liberal/pos_1")
@@ -406,9 +398,9 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
-    def test_get_tensor_array_id_first_form_and_deprecation(self):
-        """get_tensor/get_tensor_pb take a single array_id (identity policy);
-        the legacy (source_id, tensor_id) form still works but warns."""
+    def test_get_tensor_array_id_addressing(self):
+        """get_tensor/get_tensor_pb take a single array_id (identity policy); a
+        bare multi-tensor source id is ambiguous and must be qualified."""
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
             ("pos_1", (64, 64), "uint8"),
@@ -430,25 +422,9 @@ class TestMultifieldServerClient:
             assert client.get_tensor_pb("mf/pos_1") is not None
 
             # A bare multi-tensor source id is ambiguous -> must specify (never a
-            # silent default; the #75 lesson). No deprecation warning either.
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", DeprecationWarning)
-                with pytest.raises(ValueError, match="multiple tensors"):
-                    client.get_tensor("mf")
-
-            # Legacy two-arg form still works, but warns.
-            with pytest.warns(DeprecationWarning):
-                legacy = client.get_tensor("mf", "pos_1")
-            assert legacy.shape == (64, 64)
-
-            # Contradictory addressing: the positional array_id AND the deprecated
-            # source_id= keyword name the routing source two different ways ->
-            # ValueError, before any RPC (issue #75).
-            for read in (client.get_tensor, client.get_tensor_pb):
-                with pytest.raises(ValueError, match="both the array_id"):
-                    read("mf/pos_1", source_id="mf")
-            with pytest.raises(ValueError, match="both the array_id"):
-                client.get_physical_scale("mf/pos_1", source_id="mf")
+            # silent default; the #75 lesson).
+            with pytest.raises(ValueError, match="multiple tensors"):
+                client.get_tensor("mf")
 
             client.close()
         finally:
@@ -517,8 +493,8 @@ class TestMultifieldServerClient:
             sources = client.list_sources()
             assert len(sources["single-source"].tensors) == 1
 
-            # Access the single tensor
-            arr = client.get_tensor("single-source", "single-tensor")
+            # Access the single tensor -- a bare source id resolves the sole tensor.
+            arr = client.get_tensor("single-source")
             assert arr.shape == (50, 50)
 
             client.close()
@@ -545,7 +521,7 @@ class TestMultifieldDifferentDtypes:
         assert descriptors[2].dtype == "uint16"
 
 
-class MockImage0Adapter(BackendAdapter):
+class MockImage0Adapter(TensorAdapter):
     """Single-tensor source whose tensor is named "Image:0".
 
     Models a single-scene aicsimageio file: every such file names its one
@@ -568,8 +544,8 @@ class MockImage0Adapter(BackendAdapter):
         self.source_id = source_id
         self._tensor_name = "Image:0"  # array_id property -> source_id/Image:0
         self._shape = shape
-        self._physical_scale = physical_scale
-        self._physical_unit = physical_unit
+        self._phys_scale = physical_scale
+        self._phys_unit = physical_unit
         self._source_url = f"mock://{source_id}"
         self._source_type = "mock-aics"
 
@@ -598,13 +574,14 @@ class MockImage0Adapter(BackendAdapter):
     def get_metadata(self) -> dict:
         return {}
 
-    def get_physical_scale(self):
-        return list(self._physical_scale), list(self._physical_unit)
+    def _physical_scale(self):
+        return list(self._phys_scale), list(self._phys_unit)
 
     def get_data(self, bounds) -> np.ndarray:
         super().get_data(bounds)
         shape = tuple(
-            int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
+            int(stop - start)
+            for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
         return np.zeros(shape, dtype="uint8")
 
@@ -633,6 +610,36 @@ class TestFieldWithinSource:
 
     def test_empty_resolves_to_default(self):
         assert TensorFlightServer._field_within_source("src", "") is None
+
+    def test_field_equal_to_source_id_is_preserved_not_defaulted(self):
+        # Precedence edge: a real field that happens to equal the source_id
+        # (array_id "src/src" -> field "src") must survive, because the
+        # ==source_id -> default check runs BEFORE the prefix strip. If they were
+        # reordered, "src/src" would strip to "src" and then wrongly default.
+        assert TensorFlightServer._field_within_source("src", "src/src") == "src"
+
+
+class TestStripSourcePrefix:
+    """strip_source_prefix: the pure, policy-free reduction shared by the server
+    chokepoint and the adapters' _within_source_field (biopb/biopb#277 item F)."""
+
+    def test_strips_prefix(self):
+        assert strip_source_prefix("src", "src/Image:0") == "Image:0"
+
+    def test_splits_only_first_slash(self):
+        assert strip_source_prefix("plate", "plate/A01/0") == "A01/0"
+
+    def test_bare_field_unchanged(self):
+        assert strip_source_prefix("src", "Image:0") == "Image:0"
+
+    def test_source_id_itself_unchanged_no_default_policy(self):
+        # Unlike the server helper, the pure strip invents no None: a bare
+        # source_id is returned as-is (the "default tensor" call is the caller's).
+        assert strip_source_prefix("src", "src") == "src"
+
+    def test_none_and_empty_pass_through(self):
+        assert strip_source_prefix("src", None) is None
+        assert strip_source_prefix("src", "") == ""
 
 
 class TestDescriptorCacheCollision:
@@ -672,11 +679,11 @@ class TestDescriptorCacheCollision:
             # bare tensor id "Image:0" -- the exact collision in #45. Each must
             # return its OWN scale. With a bare-only key the second source reads
             # the first's cached entry and returns the wrong scale.
-            scale_a, unit_a = client.get_physical_scale("aics_aaa", "Image:0")
+            scale_a, unit_a = client.get_physical_scale("aics_aaa/Image:0")
             assert scale_a == [2.0, 0.5, 0.5]
             assert unit_a == ["um", "um", "um"]
 
-            scale_b, unit_b = client.get_physical_scale("aics_bbb", "Image:0")
+            scale_b, unit_b = client.get_physical_scale("aics_bbb/Image:0")
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 

@@ -5,6 +5,7 @@ Uses synthetic test fixtures from conftest.py - no external data required.
 
 import importlib.util
 import os
+import pathlib
 import tempfile
 
 import numpy as np
@@ -18,7 +19,7 @@ def _zarr_available() -> bool:
         import zarr
 
         # Try to actually use zarr to catch numcodecs compatibility issues
-        zarr.open_array
+        _ = zarr.open_array
         return True
     except ImportError:
         return False
@@ -60,26 +61,38 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
 
     def test_adapter_init_with_embedded_metadata(self, tiled_ome_tiff):
         """Test AicsImageIoAdapter initialization with embedded OME-XML."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from bioio import BioImage
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(path, "test-embedded")
+        adapter = AicsImageIoAdapter(
+            BioImage(path),
+            scene_index=None,
+            source_id="test-embedded",
+            source_url=path,
+        )
 
         assert adapter.source_id == "test-embedded"
         # AicsImageIoAdapter is multi-tensor, list descriptors to get shape
         descriptors = adapter.list_tensor_descriptors()
         assert len(descriptors) == 1
-        # aicsimageio uses TCZYX dimension order, so shape is (T=1, C=3, Z=1, Y=128, X=128)
+        # bioio uses TCZYX dimension order, so shape is (T=1, C=3, Z=1, Y=128, X=128)
         assert descriptors[0].shape == [1, 3, 1, 128, 128]
 
     def test_get_tensor_descriptor(self, tiled_ome_tiff):
         """Test descriptor with embedded metadata."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from bioio import BioImage
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(path, "test-embedded")
+        adapter = AicsImageIoAdapter(
+            BioImage(path),
+            scene_index=None,
+            source_id="test-embedded",
+            source_url=path,
+        )
 
         # For multi-scene AicsImageIoAdapter, use list_tensor_descriptors
         descriptors = adapter.list_tensor_descriptors()
@@ -88,18 +101,24 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
         # array_id is the globally-unique source_id/field (identity policy); the
         # scene id "Image:0" is the within-source field.
         assert desc.array_id == "test-embedded/Image:0"
-        # aicsimageio uses TCZYX dimension order
+        # bioio uses TCZYX dimension order
         assert list(desc.shape) == [1, 3, 1, 128, 128]
         # dtype is numpy dtype string format (e.g., '<u2' for little-endian uint16)
         assert desc.dtype in ("uint16", "<u2")
 
     def test_get_metadata_from_embedded_ome_xml(self, tiled_ome_tiff):
         """Test metadata extraction from embedded OME-XML."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from bioio import BioImage
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(path, "test-embedded")
+        adapter = AicsImageIoAdapter(
+            BioImage(path),
+            scene_index=None,
+            source_id="test-embedded",
+            source_url=path,
+        )
 
         metadata = adapter.get_metadata()
         assert isinstance(metadata, dict)
@@ -203,7 +222,7 @@ class TestOmeZarrAdapter:
         root = zarr.open_group(zarr_path, mode="r")
 
         # Level 0 should have value 0, level 1 should have value 1, etc.
-        for level_idx, level_path in enumerate(level_paths):
+        for level_idx, _level_path in enumerate(level_paths):
             level_name = str(level_idx)
             if level_name in root:
                 arr = root[level_name]
@@ -249,3 +268,31 @@ class TestHdf5Adapter:
             assert desc.array_id == "hdf5-test"
             assert tuple(desc.shape) == shape
             assert tuple(desc.chunk_shape) == chunks
+
+    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
+    def test_holds_no_handle_between_reads(self, hdf5_dataset):
+        """A catalogued HDF5 source pins no fd (biopb/biopb#71): the adapter
+        outlives the file it was built from, and reads reopen per call."""
+        import h5py
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+        h5_path, shape, chunks = hdf5_dataset
+
+        with h5py.File(h5_path, "r") as f:
+            adapter = Hdf5Adapter(f["data"], "hdf5-test")
+
+        # The constructing handle is gone, yet the read still serves.
+        data = adapter.get_data(ChunkBounds(start=[0] * len(shape), stop=list(shape)))
+        assert data.shape == shape
+
+        fd_dir = pathlib.Path("/proc/self/fd")
+        if not fd_dir.exists():  # non-Linux: no fd table to inspect
+            pytest.skip("/proc/self/fd unavailable")
+        open_files = set()
+        for fd in fd_dir.iterdir():
+            try:
+                open_files.add(os.path.realpath(fd))
+            except OSError:
+                pass
+        assert os.path.realpath(h5_path) not in open_files

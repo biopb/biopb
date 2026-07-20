@@ -10,7 +10,7 @@ import dataclasses
 
 import jsonschema
 import pytest
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
     CacheConfig,
     MetadataDbConfig,
@@ -21,13 +21,13 @@ from biopb_tensor_server.config import (
     _Enum,
     _Range,
 )
-from biopb_tensor_server.config_schema import (
+from biopb_tensor_server.core.config_schema import (
     build_config_schema,
     constrained_ondisk_keys,
     known_config_keys,
     ondisk_location,
 )
-from biopb_tensor_server.remote import CredentialProfile
+from biopb_tensor_server.core.remote import CredentialProfile
 from jsonschema import Draft202012Validator
 
 
@@ -116,9 +116,10 @@ def test_every_constraint_is_reflected(schema):
                     assert "maximum" not in prop
             elif isinstance(constraint, _Enum):
                 if constraint.case_insensitive:
-                    # Lenient: no hard enum, but the accepted set is documented.
+                    # Lenient: no hard enum, but the accepted set is documented in
+                    # the `constraint` hint (description is now pure prose).
                     assert "enum" not in prop
-                    assert prop.get("description")
+                    assert prop.get("constraint")
                 else:
                     assert set(prop["enum"]) == set(constraint._display)
 
@@ -264,12 +265,16 @@ def test_legacy_aliases_present_and_marked_deprecated(schema):
     # the back-compat pyramid knob keeps its bound under [precache] too
     assert precache["downscale_factor"]["minimum"] == 2
     assert schema["properties"]["sources"]["items"]["properties"]["path"]["deprecated"]
+    # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
+    assert schema["properties"]["sources"]["items"]["properties"]["source_id"][
+        "deprecated"
+    ]
     assert _section_props(schema, "metadata_db")["enabled"]["deprecated"] is True
 
 
 def test_runtime_warning_uses_schema_keys():
     """config._warn_unknown_config_keys derives its sets from the schema."""
-    from biopb_tensor_server.config import _known_config_keys
+    from biopb_tensor_server.core.config import _known_config_keys
 
     sections, section_keys, source_keys, profile_keys = _known_config_keys()
     assert (sections, section_keys, source_keys, profile_keys) == known_config_keys()

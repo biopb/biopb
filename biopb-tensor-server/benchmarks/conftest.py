@@ -15,8 +15,8 @@ from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 import numpy as np
 import pytest
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.config import CacheConfig
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 from benchmarks.utils import (
     generate_multiresolution_zarr,
@@ -216,7 +216,7 @@ class BaselineClient:
     def _open_reader(self, source_id: str) -> Any:
         """Open direct reader based on source config.
 
-        Uses specialized libraries for known formats, aicsimageio as catch-all.
+        Uses specialized libraries for known formats, bioio as catch-all.
         """
         import zarr
 
@@ -253,14 +253,14 @@ class BaselineClient:
 
             return h5py.File(path, "r")
 
-        # Catch-all: use aicsimageio for any unhandled format
+        # Catch-all: use bioio for any unhandled format
         # Supports: OME-TIFF, TIFF, CZI, ND2, LIF, DV, and many more
-        # aicsimageio can read from local path or S3 URL directly
-        import aicsimageio
+        # bioio can read from local path or S3 URL directly
+        import bioio
 
         target = url or path
         fs_kwargs = {"anon": True} if target.startswith("s3://") else {}
-        return aicsimageio.AICSImage(target, fs_kwargs=fs_kwargs)
+        return bioio.BioImage(target, fs_kwargs=fs_kwargs)
 
     def list_sources(self) -> Dict[str, Dict]:
         """List available data sources."""
@@ -317,12 +317,12 @@ class BaselineClient:
             arr = da.from_array(h5_ds, chunks=h5_ds.chunks)
 
         else:
-            # Catch-all via aicsimageio: use xarray_dask_data for lazy loading
-            # AICSImage handles OME-TIFF, TIFF, CZI, ND2, LIF, DV, etc.
+            # Catch-all via bioio: use xarray_dask_data for lazy loading
+            # BioImage handles OME-TIFF, TIFF, CZI, ND2, LIF, DV, etc.
             # xarray_dask_data returns dask-backed DataArray with proper dims
-            import aicsimageio
+            import bioio
 
-            if isinstance(reader, aicsimageio.AICSImage):
+            if isinstance(reader, bioio.BioImage):
                 # Handle scene selection - tensor_id may be scene name like "Image:0"
                 if tensor_id in reader.scenes:
                     reader.set_scene(tensor_id)
@@ -527,7 +527,7 @@ def _register_source_with_server(
     Returns source_id.
     """
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.core.config import SourceConfig
 
     source_id = spec["id"]
     source_type = spec.get("type")
@@ -626,7 +626,7 @@ def data_source(
         source_type = spec.get("type")
 
         # For public S3 buckets, use anonymous access
-        from biopb_tensor_server.remote import CredentialProfile, CredentialsConfig
+        from biopb_tensor_server.core.remote import CredentialProfile, CredentialsConfig
 
         # Create anon credentials profile (empty key/secret triggers anon=True)
         anon_profile = CredentialProfile(
@@ -641,7 +641,7 @@ def data_source(
         )
 
         # Map benchmark config type to adapter class
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
         from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 
         adapter_cls_map = {
@@ -654,7 +654,7 @@ def data_source(
             pytest.skip(f"No adapter for source type: {source_type}")
 
         # Create SourceConfig for S3 with anon credentials profile
-        from biopb_tensor_server.config import SourceConfig
+        from biopb_tensor_server.core.config import SourceConfig
 
         source_config = SourceConfig(
             url=url,
@@ -708,7 +708,7 @@ def bench_client_baseline(temp_cache_dir: str) -> BaselineClient:
     """Baseline client for direct library access.
 
     Includes all configured sources (synthetic, S3, NFS).
-    S3 sources are handled via aicsimageio catch-all.
+    S3 sources are handled via bioio catch-all.
     """
     configs = load_all_source_configs()
     return BaselineClient(configs, cache_dir=temp_cache_dir)

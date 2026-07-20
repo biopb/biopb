@@ -7,7 +7,7 @@ surprise a newcomer.
 
 ---
 
-## 1. Scope
+## Scope
 
 **biopb is an open protocol and toolchain for bioimage analysis** — moving large
 multidimensional microscopy images around and running analysis algorithms
@@ -28,12 +28,12 @@ live napari session.
 ### The repositories
 
 The `biopb` repo is a **monorepo**. `biopb-mcp` was a separate repository and has
-been folded in as the `biopb-mcp/` subdirectory (see
-`biopb-mcp/docs/monorepo-migration.md`); only `biopb-server` remains external.
+been folded in as the `biopb-mcp/` subdirectory; only `biopb-server` remains
+external.
 
 | Repo / component | Role |
 |------|------|
-| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the client, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), and the **client/agent** (`biopb-mcp/`, the napari plugin + MCP server). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`) so they resolve each other from the tree. Each still versions and releases independently off its own git-tag prefix: client `v*`, tensor server `server-v*`, mcp `mcp-v*`. |
+| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the clients, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), the **agent client** (`biopb-mcp/`, the napari plugin + MCP server), the **control plane** (`biopb-control/`, the single web origin that supervises the data plane and serves the browser UI), and the **browser front end** (`web/`, one Vite + React SPA — dataviewer, admin, dashboard, observe — served by the control). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`); `web/` is a separate **pnpm workspace**. Versioning is **three lines, three tags**: the **SDK** (`biopb` Python→PyPI + Java→Maven Central, and `biopb-image-base` Docker) is tagged `v*`; the **tensor-server Docker image** has its own line tagged `server-v*`; and the **product bundle** (tensor-server wheel, mcp, control, web bundle → the GitHub release) is tagged `release-v*`. Docker images ship on `v*`/`server-v*` (their own CI workflows), not from `release.yaml`. See `docs/release-model.md`. |
 | **`biopb-server`** | Concrete algorithm servers implementing the compute plane: `cellpose`, `cellpose-sam`, `lacss`, `samcell`, `ucell`. Each is a thin model wrapper on the shared image-runtime base, shipped as a container. |
 
 The intended deployment is **personal or small-lab** use, on localhost or a
@@ -41,11 +41,101 @@ trusted intranet. Hardening for untrusted networks (TLS, authn/z, k8s) is
 expected to be handled by a separately-documented reverse proxy in front of the
 services, so the services themselves stay simple.
 
+**Two deployment modes** (the deliberately-small security surface). `biopb
+control start` runs **local mode** by default: every listener (control 8813,
+tensor HTTP sidecar 8814, flight gRPC 8815) binds loopback — the single-machine
+90% case. Local mode is tokenless by default (no unlock step), but a token is
+**optional**: pass `--token` / `BIOPB_TENSOR_TOKEN` and it is enforced across the
+loopback listeners too (the browser then gates behind the unlock page, exactly as
+in remote). A local token is **provisional** — see the caveats below before
+relying on it. `biopb control start
+--remote` runs **remote mode**: the control's browser UI *and* the flight server
+bind publicly behind a **required** token (supplied via `--token` /
+`BIOPB_TENSOR_TOKEN`, else generated and printed), the sidecar stays on loopback
+(the control proxies it), and the browser UI gates itself behind an unlock page
+(driven by the control's public `GET /health` → `auth_required`). Token
+enforcement is thus **independent** of the network mode; what `--remote` fixes is
+the *bind address*. The one invariant is **fail-closed** — a public listener is
+never left unauthenticated: `--remote` refuses to run without a token, and local
+mode refuses to start if the config binds the flight server publicly *and* no
+token is supplied, so "public + unauthenticated" is unrepresentable. The one
+policy lives in the stdlib-only `biopb._web_auth` predicates that the control and
+the sidecar both bind to (so they cannot drift); there is no separate "dev-mode"
+token bypass.
+
+**Caveats on an optional local token** (biopb/biopb#470 tracks the fix). The token
+gates the listeners as described, but three places still read "a token is
+enforced" as a proxy for "this deployment is remote", because that was exact until
+the two were decoupled:
+
+- **biopb-mcp cannot reach a token-gated local plane on its own.** The control's
+  ensure reply carries the plane's endpoint but no credential, so biopb-mcp learns
+  the token only from its own `BIOPB_TENSOR_TOKEN`. An agent spawning it over
+  stdio does not pass one. Recover by exporting `BIOPB_TENSOR_TOKEN` into the
+  agent's environment, or by entering the token in the napari Tensor Browser.
+- **The admin UI's server-side file chooser disappears** (`/api/admin/browse`
+  404s): the sidecar reports `local: token is None`, so a loopback plane behind a
+  token looks remote to it. Fails closed.
+- **`POST /api/data_plane/ensure` stays unauthenticated** — it is biopb-mcp's only
+  tokenless way to bring the plane up. On a shared host, loopback is reachable by
+  every uid, so another local user can drive this one idempotent, non-destructive
+  route on a deployment you asked to gate.
+
+So an optional local token is real defense-in-depth against *other users reading
+your data*, but it is not yet a fully-supported mode: prefer it where the browser
+UI is the workload, and expect the agent path to need the env var.
+
 ---
 
-## 2. Architecture rationales
+## Environment
 
-### 2.1 Why split the data plane from the compute plane
+Two package managers, because the repo is polyglot.
+
+**Python — one `uv` workspace, one shared `.venv`.** The root `pyproject.toml`
+declares a [`tool.uv.workspace`] with four members (`biopb-image-runtime`,
+`biopb-tensor-server`, `biopb-mcp`, `biopb-control`); the root `biopb` package is
+the fifth. All resolve **in-tree** (`[tool.uv.sources]` … `workspace = true`),
+never from PyPI, so a checkout builds against sibling source, not a published
+release. Set the whole thing up — and restore it after adding a dependency — with
+a single **all-packages** sync from the repo root:
+
+```sh
+uv sync --all-packages --all-extras
+```
+
+Run everything (tests, CLIs, scripts) through that root `.venv`. **Do not**
+`uv sync --package <one>` against the shared venv — it *prunes* the venv down to
+that one package's deps; always sync `--all-packages`. Python is pinned to
+`>=3.10,<3.13`.
+
+**Browser front end — a separate `pnpm` workspace** under `web/` (`@biopb/web` +
+`@biopb/tensor-flight-client`): `pnpm -C web install`, then `pnpm -C web build` /
+`test` / `lint` / `dev`. It is *not* part of the uv workspace; the two toolchains
+are independent.
+
+**Protobuf / Flight stubs are generated, not committed.** `buf generate` (config
+in `buf.gen.yaml`, protos under `proto/`) writes the Python stubs into
+`src/main/python/` and the Java stubs under `target/`. Regenerating at build time
+keeps them from drifting in the tree — but a source checkout needs `buf` on PATH
+(end users installing from release wheels do not; the wheels ship the generated
+stubs).
+
+**Testing.** `pytest` per package — the data plane in `biopb-tensor-server/tests/`,
+the client in `src/test/python/`, and likewise `biopb-mcp` / `biopb-image-runtime`
+/ `biopb-control`. Java tests run under `mvn -B test`, web tests under
+`pnpm -C web test` (vitest). `src/test/python/README.md` has the map.
+
+**Lint & format run on commit, not by hand.** `pre-commit` drives `ruff check` +
+`ruff format` (v0.15.15) plus the end-of-file / trailing-whitespace / YAML /
+napari-plugin checks. The **root `[tool.ruff]` is the single source of truth** for
+all four Python packages (the per-package ruff/black blocks were removed), so
+don't run ruff as a separate step — committing formats and autofixes for you.
+
+---
+
+## Architecture rationales
+
+### Why split the data plane from the compute plane
 
 Bioimage analysis has two very different cost structures: **bulk data movement**
 (gigapixel images, multi-channel Z/T stacks) and **compute** (a GPU model run).
@@ -63,7 +153,7 @@ data store, and — crucially — lets an algorithm server **pull its input pixe
 directly from the data plane** instead of receiving them through the client (see
 the lazy-input framework below).
 
-### 2.2 The tensor plane: Arrow Flight, a catalog, and lazy dask
+### The tensor plane: Arrow Flight, a catalog, and lazy dask
 
 The data plane is an **Arrow Flight** server (`biopb-tensor-server`). Flight,
 rather than plain gRPC, because it is purpose-built for high-throughput,
@@ -73,7 +163,7 @@ tensors.
 Key design choices:
 
 - **Format-agnostic ingestion at the server.** Pluggable *adapters*
-  (`tiff`, `zarr`, `ome-zarr`, `aicsimageio`) read whatever microscopy format a
+  (`tiff`, `zarr`, `ome-zarr`, `bioio`) read whatever microscopy format a
   lab has; a *discovery* pass plus a directory *watcher* register files (local
   paths or remote URLs) as **sources** without anyone hand-importing them.
   Clients never deal with proprietary formats — they always see uniform tensors.
@@ -90,7 +180,7 @@ The net effect: **the data plane is a complete I/O layer.** "Read any format,
 cache it, and hand me a lazy array" is a solved problem the rest of the system
 builds on — it is not something clients or tools should re-implement.
 
-### 2.3 The compute plane: stateless algorithm servers with an eager/lazy duality
+### The compute plane: stateless algorithm servers with an eager/lazy duality
 
 The compute plane is a gRPC contract (`proto/biopb/image`) with two services:
 
@@ -122,7 +212,7 @@ backends subclass a shared `BiopbServicerBase` from the image runtime and only
 provide the model-specific inference, so adding a new algorithm is "wrap a model
 + point it at the protocol," not "build a server."
 
-### 2.4 The client: "trust the agent," with tools only where they help
+### The client: "trust the agent," with tools only where they help
 
 `biopb-mcp` is built on a specific bet: **bench scientists' analysis tasks are
 open-ended, so an AI agent with a general-purpose compute environment beats a
@@ -147,9 +237,17 @@ interface.
 
 The intended extension story is that different labs add their own
 domain-specific algorithm servers (compute plane) and tools (agent side) for
-their own problems.
+their own problems. On the agent side the low-friction path is a **user plugin**
+(`biopb/biopb-mcp#92`): drop a `*.py` file in `~/.config/biopb/kernel/` (or ship a
+`biopb_mcp.namespace` entry-point package) and its callables load straight into
+the kernel namespace, visible to the agent — capability is added by *putting
+objects in scope*, not by extending a protocol. biopb-mcp ships one such built-in
+as the reference example (`biopb_mcp/plugins/rolling_ball.py`, a fast ImageJ port
+of rolling-ball background subtraction); the installer seeds a copy into
+`~/.config/biopb/kernel/` so it is visible and editable there. See
+`biopb-mcp/ARCHITECTURE.md`.
 
-### 2.5 Polyglot by construction
+### Polyglot by construction
 
 There is one source of truth — the `.proto` files — and language stubs are
 generated with **buf**. This is why a Java (`pom.xml`), a JS/TS (pnpm), and a
@@ -157,7 +255,7 @@ Python toolchain all live in the `biopb` repo: the protocol is meant to be
 consumed from analysis ecosystems in any of those languages (napari/Python,
 ImageJ/Java, web/TS).
 
-### 2.6 The agentic coupling (biopb-mcp's main user-facing design)
+### The agentic coupling (biopb-mcp's main user-facing design)
 
 `biopb-mcp` is where a scientist actually meets the system, and its defining
 idea is *how* it couples an external AI agent to a live, shared analysis session
@@ -167,7 +265,7 @@ understanding in detail.
 ```
         AI agent (Claude)                              Scientist
               │  MCP tools + resources                      ▲
-              │  (streamable-http, 127.0.0.1:8765/mcp)      │ watches / prompts
+              │  (stdio shim → child's dynamic /mcp)        │ watches / prompts
               ▼                                             │
    ┌────────────────────────┐                               │
    │  MCP server process    │                               │
@@ -228,6 +326,21 @@ Key properties of the coupling:
   and saves it through napari. The agent orchestrates; the human stays in
   control of the canvas and of what becomes a durable artifact.
 
+- **The session is ephemeral and shim-owned; the planes are durable and
+  control-supervised.** Each MCP client's stdio shim spawns and owns *its own*
+  session child (kernel + viewer) on a dynamic port and reaps it when the client
+  disconnects; the child inherits the shim's live environment, so the viewer
+  always lands on the user's real display. The data/compute planes the session
+  uses are *not* part of it — a lean **control plane** supervises them as durable
+  subprocesses and is the single web origin. It **serves the whole browser UI
+  itself** — one Vite SPA (`web/`) with the dashboard at `/`, the dataviewer at
+  `/viewer`, and each session's observe page at `/session/<id>/observe` — while
+  proxying the data plane (`/data_plane/*`) and each session's API
+  (`/session/<id>/api/*`), so N dynamic-port sessions need no N bookmarks. The
+  agentless `biopb mcp view` is the exception: a self-contained foreground viewer
+  that stays off the control entirely. See
+  `biopb-mcp/ARCHITECTURE.md`.
+
 This coupling — *arbitrary agent code against a live, shared session* — is
 exactly why the kernel-isolation choices in §3 exist: the session must survive
 the agent doing something wrong, so the kernel is a separate, interruptible,
@@ -235,7 +348,7 @@ restartable process.
 
 ---
 
-## 3. Implementation notes (the notable choices)
+## Implementation notes (the notable choices)
 
 These are decisions a newcomer would not guess and that are worth knowing before
 editing the code.
@@ -247,7 +360,12 @@ editing the code.
   arbitrary and may hang or crash; isolating it in a child kernel means a runaway
   execution can be interrupted (`SIGINT`) or hard-restarted (process-group
   `SIGKILL` + respawn) without killing the MCP server. A single `RLock`
-  serializes access to the one kernel.
+  serializes access to the one kernel. **That MCP server process is itself an
+  ephemeral, shim-owned child:** the client's stdio shim spawns it per connection
+  on a dynamic port (inheriting the shim's live environment — the #98 display fix)
+  and reaps it — plus the kernel grandchild — on disconnect, so the whole
+  session tree is client-scoped, not a shared daemon (see the de-daemonization /
+  control-plane migration doc).
 
 - **The kernel is bootstrapped via `IPKernelApp.exec_lines`.** A startup line
   injected at launch runs `biopb_mcp.mcp._bootstrap`, which enables Qt, opens
@@ -313,7 +431,7 @@ editing the code.
   immediately and runs/streams its data-folder scan in the background, so
   `SERVING` no longer implies a complete catalog — `health` carries
   `full_scan_in_progress` / `last_full_scan_finished_at` as the freshness signal
-  (see `biopb-tensor-server/ARCHITECTURE.md` and `docs/progressive-discovery.md`).
+  (see `biopb-tensor-server/ARCHITECTURE.md` and `biopb-tensor-server/docs/progressive-discovery.md`).
 
 - **A tensor is identified by its `array_id` alone** — the policy every server,
   SDK (Python/Java/TS), and the CLI must follow. The authoritative spec lives in
@@ -345,11 +463,10 @@ editing the code.
   default construction (no `"0"` sentinel), and the CLI's `source_id/tensor_id`
   parsing was already conformant.*
 
-- **`biopb/ome/*.proto` is vestigial.** It is a comprehensive OME metadata model
-  from an early blueprint that was **not adopted**. In practice OME/microscopy
-  metadata travels as **JSON** (e.g. `metadata_json` on a tensor descriptor,
-  `ome_metadata` dicts), not as `biopb.ome` protobuf messages. Don't treat the
-  `ome` proto package as live API.
+- **OME/microscopy metadata travels as JSON, not protobuf.** It rides on
+  `metadata_json` on a tensor descriptor and `ome_metadata` dicts — there is no
+  `biopb.ome` protobuf package (an early, comprehensive OME-in-protobuf blueprint
+  under `proto/biopb/ome/` was never adopted and was removed; see git history).
 
 - **Generated protobuf/Flight stubs are not committed** — buf regenerates them
   at build time, which keeps the polyglot stubs from drifting in the tree.
@@ -360,9 +477,9 @@ editing the code.
 
 ---
 
-## 4. Where to look first
+## Where to look first
 
-- **Protocol:** `biopb/proto/biopb/{image,tensor}/` (ignore `ome/`).
+- **Protocol:** `biopb/proto/biopb/{image,tensor}/`.
 - **Data plane:** `biopb/biopb-tensor-server/biopb_tensor_server/` —
   `server.py`, `adapters/`, `discovery.py`, the metadata DB.
 - **Compute base:** `biopb/biopb-image-runtime/src/biopb_image_base/` —
@@ -371,5 +488,12 @@ editing the code.
   (the only remaining separate repo).
 - **Client / agent:** `biopb/biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
   service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
-  `_server.py`). See `biopb/biopb-mcp/docs/monorepo-migration.md` for how this
-  was merged in and how it is built/released.
+  `_server.py`). See `docs/release-model.md` for how the product is built and
+  released.
+- **Control plane / web origin:** `biopb/biopb-control/src/biopb_control/` —
+  `_control.py` (the ASGI app: serves the `web/` SPA + proxies the data plane and
+  sessions), `_supervisor.py` (data-plane subprocess lifecycle).
+- **Browser front end:** `biopb/web/` — one Vite + React SPA served by the
+  control. `packages/app/src/` (`main.tsx` routes; `pages/{HomePage,AdminPage,
+  DashboardPage,ObservePage}.tsx`) and `packages/tensor-flight-client/` (the TS
+  data-plane SDK). See `web/README.md` and `web/ARCHITECTURE.md`.

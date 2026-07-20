@@ -10,7 +10,7 @@ import tempfile
 
 import numpy as np
 import tifffile
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     SourceConfig,
     discover_sources,
     get_default_registry,
@@ -83,7 +83,7 @@ class TestDiscoverSourcesRegression:
         This verifies the API contract directly, ensuring adapters receive
         ClaimContext objects with the is_remote property.
         """
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a TIFF file
@@ -114,7 +114,7 @@ class TestDeleteSourceRegression:
         This verifies the internal mapping convention that caused the bug.
         get_source_for_path() and remove_claim() expect string keys.
         """
-        from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
+        from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
 
         state = DiscoveryState()
 
@@ -142,7 +142,7 @@ class TestDeleteSourceRegression:
 
         This verifies that remove_claim() properly handles string keys.
         """
-        from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
+        from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
 
         state = DiscoveryState()
 
@@ -171,7 +171,7 @@ class TestDeleteSourceRegression:
         """
         from pathlib import Path
 
-        from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
+        from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
 
         state = DiscoveryState()
 
@@ -215,7 +215,7 @@ class TestDeleteSourceRegression:
         """
         from pathlib import Path
 
-        from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+        from biopb_tensor_server.sources.watcher import WatcherEvent, WatcherEventType
 
         # Simulate what the watcher creates for a move event
         # The watcher stores: event_buffer[old_path] = (MOVED, time, new_path)
@@ -249,7 +249,7 @@ class TestCreatedSourceRegression:
         Before the fix, _handle_created was passing Path directly to
         get_claims_for_path(), causing 'PosixPath' object has no attribute 'is_remote'.
         """
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tiff_path = os.path.join(tmpdir, "test.tif")
@@ -281,7 +281,7 @@ class _RaisingOnBadPathAdapter:
 class _ClaimsGoodPathAdapter:
     @classmethod
     def claim(cls, ctx, state):
-        from biopb_tensor_server.discovery import SourceClaim
+        from biopb_tensor_server.core.discovery import SourceClaim
 
         if ctx.is_file() and ctx.name == "good.dat":
             if not state.try_claim_path(ctx.path_str):
@@ -294,7 +294,7 @@ class TestDiscoveryFailureIsolation:
     def test_discover_sources_continues_after_claim_exception_on_one_path(self):
         from pathlib import Path
 
-        from biopb_tensor_server.discovery import (
+        from biopb_tensor_server.core.discovery import (
             AdapterRegistry,
             discover_sources as discover_tree_sources,
         )
@@ -326,7 +326,7 @@ class TestTensorServerSourceType:
     """
 
     def test_is_remote_url_recognizes_grpc_schemes(self):
-        from biopb_tensor_server.discovery import is_remote_url
+        from biopb_tensor_server.core.discovery import is_remote_url
 
         assert is_remote_url("grpc://lab-store:8815") is True
         assert is_remote_url("grpc+tls://lab-store:8815") is True
@@ -337,13 +337,43 @@ class TestTensorServerSourceType:
         assert is_remote_url("s3://bucket/key") is True
 
     def test_detect_source_type_maps_grpc_to_tensor_server(self):
-        from biopb_tensor_server.config import detect_source_type
+        from biopb_tensor_server.core.config import detect_source_type
 
         assert detect_source_type("grpc://lab:8815") == "tensor-server"
         assert detect_source_type("grpc+tls://lab:8815") == "tensor-server"
         assert detect_source_type("grpcs://lab:8815") == "tensor-server"
         # other remote schemes remain non-auto-detectable
         assert detect_source_type("s3://bucket/key") is None
+
+    def test_detect_source_type_does_not_type_local_paths(self):
+        """Filesystem format detection belongs to the adapters (claim()), not here.
+
+        detect_source_type only routes remote schemes now (biopb/biopb#277 item
+        B); every local path -- whatever its extension or layout -- returns None
+        so the adapters remain the single source of truth for format typing.
+        """
+        from biopb_tensor_server.core.config import detect_source_type
+
+        for url in (
+            "/data/experiment.zarr",
+            "/data/image.ome.tif",
+            "/data/plain.tif",
+            "/data/scan.czi",
+            "/data/acquisition/",
+        ):
+            assert detect_source_type(url) is None, url
+
+    def test_unclaimed_file_raises_instead_of_guessing(self):
+        """A typeless file no adapter claims is a hard error, not a guessed type."""
+        import pytest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mystery = os.path.join(tmpdir, "mystery.xyz")
+            with open(mystery, "wb") as f:
+                f.write(b"\x00\x01\x02\x03")
+
+            with pytest.raises(ValueError, match="Could not detect type for file"):
+                discover_sources(SourceConfig(url=mystery), get_default_registry())
 
     def test_tensor_server_in_type_literal(self):
         # explicit type still round-trips through SourceConfig
@@ -380,7 +410,7 @@ class TestTensorServerSourceType:
         assert SourceConfig(url="grpc://lab:8815", alias="lab").alias == "lab"
 
     def test_alias_parsed_from_config_dict(self):
-        from biopb_tensor_server.config import parse_config
+        from biopb_tensor_server.core.config import parse_config
 
         cfg = parse_config(
             {
@@ -409,7 +439,7 @@ class TestTensorServerSourceType:
         assert out[0].source_id == "experiment1"
 
     def test_namespaced_source_id_helper(self):
-        from biopb_tensor_server.config import _namespaced_source_id
+        from biopb_tensor_server.core.config import _namespaced_source_id
 
         assert _namespaced_source_id("lab", "img") == "lab__img"
         assert _namespaced_source_id(None, "img") == "img"
@@ -417,7 +447,7 @@ class TestTensorServerSourceType:
     def test_alias_clash_collision_is_tolerated(self, caplog):
         import logging
 
-        from biopb_tensor_server.config import parse_config, resolve_all_sources
+        from biopb_tensor_server.core.config import parse_config, resolve_all_sources
 
         # Two upstreams sharing alias "lab", each mirroring a same-named source
         # -> both namespace to "lab__img": a flat-catalog collision. It must NOT
@@ -439,7 +469,7 @@ class TestTensorServerSourceType:
 
     def test_collision_does_not_drop_unrelated_sources(self):
         # a colliding pair must not take down the OTHER, valid sources
-        from biopb_tensor_server.config import parse_config, resolve_all_sources
+        from biopb_tensor_server.core.config import parse_config, resolve_all_sources
 
         cfg = parse_config(
             {
@@ -454,7 +484,7 @@ class TestTensorServerSourceType:
         assert ids == ["lab__img", "arc__other"]
 
     def test_distinct_aliases_do_not_collide(self):
-        from biopb_tensor_server.config import parse_config, resolve_all_sources
+        from biopb_tensor_server.core.config import parse_config, resolve_all_sources
 
         cfg = parse_config(
             {

@@ -163,7 +163,7 @@ def stitch_lazy_segmentation(
 
         if min_area > 0:
             labels = dynamics_local.remove_small_instances(labels, min_area)
-            present = set(int(v) for v in np.unique(labels) if v != 0)
+            present = {int(v) for v in np.unique(labels) if v != 0}
             info = {t: m for t, m in info.items() if t in present}
 
         # Resolve temp labels -> global IDs (inherit or assign fresh + register).

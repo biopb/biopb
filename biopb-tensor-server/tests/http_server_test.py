@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from biopb_tensor_server.http_server import _request_array_id, create_app
+from biopb_tensor_server.serving.http_server import _request_array_id, create_app
 from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
@@ -87,10 +87,10 @@ def auth_client():
     """TestClient backed by a mocked Flight client, token auth enabled."""
     mock_fc = _build_mock_client()
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
-        app = create_app(token=_TOKEN, dev_mode=False)
+        app = create_app(token=_TOKEN)
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, mock_fc
 
@@ -100,10 +100,10 @@ def dev_client():
     """TestClient in dev_mode (no auth required)."""
     mock_fc = _build_mock_client()
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
-        app = create_app(token=None, dev_mode=True)
+        app = create_app(token=None)
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, mock_fc
 
@@ -322,10 +322,10 @@ class TestSliceEndpoint:
         )
         mock_fc = _build_mock_client(qualified)
         with patch(
-            "biopb_tensor_server.http_server.TensorFlightClient",
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
             return_value=mock_fc,
         ):
-            app = create_app(token=_TOKEN, dev_mode=False)
+            app = create_app(token=_TOKEN)
             with TestClient(app, raise_server_exceptions=True) as tc:
                 r = tc.post(
                     "/api/slice",
@@ -434,7 +434,7 @@ class TestChunkEndpoint:
 
         # Mock do_get to return a table
         import pyarrow as pa
-        from biopb_tensor_server.base import pack_chunk_batch
+        from biopb_tensor_server.core.base import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -456,7 +456,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow as pa
-        from biopb_tensor_server.base import pack_chunk_batch
+        from biopb_tensor_server.core.base import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -479,7 +479,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow as pa
-        from biopb_tensor_server.base import pack_chunk_batch
+        from biopb_tensor_server.core.base import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -685,7 +685,6 @@ class TestIntegration:
         app = create_app(
             flight_location=self._flight_loc,
             token=_TOKEN,
-            dev_mode=False,
         )
         return TestClient(app, raise_server_exceptions=True)
 
@@ -840,24 +839,26 @@ class TestQuerySourcesEndpoint:
 
 
 class TestWindowsShutdownListener:
-    """The graceful-stop listener used by `biopb server stop` on Windows."""
+    """The graceful-stop listener the control supervisor drives on Windows."""
 
     def test_sentinel_path_matches_stop_side_contract(self):
-        from pathlib import Path
+        from biopb import _locations
+        from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
-        from biopb_tensor_server.http_server import shutdown_sentinel_path
-
-        # Must match biopb.cli._win_shutdown_sentinel (PID_FILE.parent / name).
-        # Fixed name (not pid-keyed) so stop and the daemon always agree.
-        expected = Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
-        assert shutdown_sentinel_path() == expected
+        # Both this watcher and DataPlaneSupervisor._win_stop_sentinel (the control
+        # writes it) bind to the one shared definition, so they cannot drift. Fixed
+        # name (not pid-keyed) under the biopb state dir so stop and the daemon agree.
+        assert shutdown_sentinel_path() == _locations.tensor_stop_sentinel()
+        assert shutdown_sentinel_path().name == "tensor-server.stop"
 
     def test_noop_off_windows(self):
-        from biopb_tensor_server.http_server import _install_windows_shutdown_listener
+        from biopb_tensor_server.serving.http_server import (
+            _install_windows_shutdown_listener,
+        )
 
         server = SimpleNamespace(should_exit=False)
         before = threading.active_count()
-        with patch("biopb_tensor_server.http_server.sys") as mock_sys:
+        with patch("biopb_tensor_server.serving.http_server.sys") as mock_sys:
             mock_sys.platform = "linux"
             _install_windows_shutdown_listener(server)  # must not raise
         assert threading.active_count() == before  # no watcher thread started
@@ -886,15 +887,34 @@ def admin_client(tmp_path):
         "last_full_scan_finished_at": None,
     }
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
         app = create_app(
             token=None,
-            dev_mode=True,
             config_path=str(config_path),
-            web_host="127.0.0.1",
-            web_port=8814,
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, config_path
+
+
+@pytest.fixture()
+def supervised_admin_client(tmp_path):
+    """Like ``admin_client`` but control-owned (supervised=True): the admin
+    self-restart must be refused so it can't race the control (biopb/biopb#418).
+    """
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text('{"server": {"host": "127.0.0.1", "port": 8815}}')
+    mock_fc = _build_mock_client()
+    mock_fc.health_check.return_value = {"status": "SERVING", "source_count": 1}
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(
+            token=None,
+            config_path=str(config_path),
+            supervised=True,
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, config_path
@@ -1041,15 +1061,12 @@ def admin_client_with_creds(tmp_path):
     )
     mock_fc = _build_mock_client()
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
         app = create_app(
             token=None,
-            dev_mode=True,
             config_path=str(config_path),
-            web_host="127.0.0.1",
-            web_port=8814,
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
             yield tc, config_path
@@ -1057,7 +1074,7 @@ def admin_client_with_creds(tmp_path):
 
 class TestAdminConfigSecretRedaction:
     def test_get_masks_credential_secrets(self, admin_client_with_creds):
-        from biopb_tensor_server.config import REDACTED_SENTINEL
+        from biopb_tensor_server.core.config import REDACTED_SENTINEL
 
         tc, _ = admin_client_with_creds
         prof = tc.get("/api/config").json()["config"]["credentials"]["profiles"][0]
@@ -1070,7 +1087,7 @@ class TestAdminConfigSecretRedaction:
     ):
         import json as _json
 
-        from biopb_tensor_server.config import REDACTED_SENTINEL
+        from biopb_tensor_server.core.config import REDACTED_SENTINEL
 
         tc, config_path = admin_client_with_creds
         # Round-trip the masked GET body back, editing only a non-secret field.
@@ -1099,61 +1116,125 @@ class TestAdminStatusRoute:
         assert body["config_path"] == str(config_path)
         assert isinstance(body["pid"], int)
         assert body["version"]
+        # No token enforced ⇒ local mode; the admin UI keys the file chooser off
+        # this (biopb/biopb#244).
+        assert body["local"] is True
 
-
-class TestAdminRestartRoute:
-    def test_restart_spawns_detached_child_and_returns_202(self, admin_client):
+    def test_status_reports_not_supervised_by_default(self, admin_client):
+        # A directly-launched `biopb server start` is not control-owned, so its
+        # admin UI keeps the self-restart path (biopb/biopb#418).
         tc, _ = admin_client
-        with patch("subprocess.Popen") as popen:
-            r = tc.post(
-                "/api/admin/restart",
-                headers={"Sec-Fetch-Site": "same-origin"},
-            )
-        assert r.status_code == 202
-        assert r.json() == {"restarting": True}
-        popen.assert_called_once()
-        cmd = popen.call_args.args[0]
-        assert cmd[1:5] == ["-m", "biopb.cli", "server", "restart"]
-        # The daemon echoes its own launch args so restart comes back identically.
-        assert cmd[cmd.index("--web-port") + 1] == "8814"
-        assert cmd[cmd.index("--web-host") + 1] == "127.0.0.1"
-        assert "--config" in cmd
-        # dev-bypass token rides the child env (never the command line).
-        assert popen.call_args.kwargs["env"].get("BIOPB_WEB_DEV_BYPASS") == "1"
-        assert not any(str(arg).startswith("BIOPB") for arg in cmd)
+        assert tc.get("/api/admin/status").json()["supervised"] is False
 
-    def test_restart_blocks_cross_origin(self, admin_client):
-        tc, _ = admin_client
-        with patch("subprocess.Popen") as popen:
-            r = tc.post(
-                "/api/admin/restart",
-                headers={"Sec-Fetch-Site": "cross-site"},
-            )
-        assert r.status_code == 403
-        popen.assert_not_called()
+    def test_status_reports_supervised_when_control_owned(
+        self, supervised_admin_client
+    ):
+        tc, _ = supervised_admin_client
+        assert tc.get("/api/admin/status").json()["supervised"] is True
 
-    def test_second_restart_while_one_in_progress_returns_409(self, admin_client):
-        tc, _ = admin_client
-        hdr = {"Sec-Fetch-Site": "same-origin"}
-        with patch("subprocess.Popen") as popen:
-            first = tc.post("/api/admin/restart", headers=hdr)
-            second = tc.post("/api/admin/restart", headers=hdr)
-        assert first.status_code == 202
-        assert second.status_code == 409
-        # The latch stops the second from spawning a competing restart child.
-        popen.assert_called_once()
+    def test_status_reports_not_local_when_token_enforced(self, tmp_path):
+        # A token means remote mode; the admin UI then hides the file chooser.
+        config_path = tmp_path / "biopb.json"
+        config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
+        mock_fc = _build_mock_client()
+        mock_fc.health_check.return_value = {"status": "SERVING", "source_count": 1}
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN, config_path=str(config_path))
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                assert (
+                    tc.get("/api/admin/status", headers=_bearer(_TOKEN)).json()["local"]
+                    is False
+                )
 
-    def test_latch_resets_when_spawn_fails_so_retry_is_possible(self, admin_client):
+
+class TestAdminBrowseRoute:
+    def test_browse_lists_dirs_first_then_files(self, admin_client, tmp_path):
         tc, _ = admin_client
-        hdr = {"Sec-Fetch-Site": "same-origin"}
-        with patch("subprocess.Popen", side_effect=OSError("boom")):
-            failed = tc.post("/api/admin/restart", headers=hdr)
-        assert failed.status_code == 500
-        # Latch was cleared on failure, so a later successful spawn returns 202.
-        with patch("subprocess.Popen") as popen:
-            retry = tc.post("/api/admin/restart", headers=hdr)
-        assert retry.status_code == 202
-        popen.assert_called_once()
+        base = tmp_path / "data"
+        (base / "sub_b").mkdir(parents=True)
+        (base / "sub_a").mkdir()
+        (base / "img.tif").write_text("x")
+        (base / "notes.txt").write_text("y")
+        r = tc.get("/api/admin/browse", params={"path": str(base)})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["path"] == str(base.resolve())
+        assert body["parent"] == str(base.resolve().parent)
+        assert body["truncated"] is False
+        names = [(e["name"], e["is_dir"]) for e in body["entries"]]
+        # Directories first (case-insensitive), then files.
+        assert names == [
+            ("sub_a", True),
+            ("sub_b", True),
+            ("img.tif", False),
+            ("notes.txt", False),
+        ]
+
+    def test_browse_file_path_resolves_to_parent_dir(self, admin_client, tmp_path):
+        tc, _ = admin_client
+        f = tmp_path / "experiment.zarr"
+        f.mkdir()
+        (tmp_path / "peer.txt").write_text("z")
+        # A typed *file* selection lists its containing directory so the chooser
+        # keeps navigating instead of erroring.
+        target = tmp_path / "peer.txt"
+        r = tc.get("/api/admin/browse", params={"path": str(target)})
+        assert r.status_code == 200
+        assert r.json()["path"] == str(tmp_path.resolve())
+        assert "experiment.zarr" in {e["name"] for e in r.json()["entries"]}
+
+    def test_browse_defaults_to_home_when_no_path(self, admin_client):
+        from pathlib import Path
+
+        tc, _ = admin_client
+        r = tc.get("/api/admin/browse")
+        assert r.status_code == 200
+        assert r.json()["path"] == str(Path.home().resolve())
+
+    def test_browse_missing_dir_404(self, admin_client, tmp_path):
+        tc, _ = admin_client
+        r = tc.get(
+            "/api/admin/browse",
+            params={"path": str(tmp_path / "does" / "not" / "exist")},
+        )
+        # A non-existent path resolves to a non-existent parent → not a directory.
+        assert r.status_code == 404
+
+    def test_browse_unavailable_in_remote_mode(self, tmp_path):
+        # Remote mode (token enforced): the FS-listing surface must not exist.
+        config_path = tmp_path / "biopb.json"
+        config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
+        mock_fc = _build_mock_client()
+        mock_fc.health_check.return_value = {"status": "SERVING"}
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN, config_path=str(config_path))
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.get(
+                    "/api/admin/browse",
+                    params={"path": str(tmp_path)},
+                    headers=_bearer(_TOKEN),
+                )
+                assert r.status_code == 404
+
+
+class TestCreateAppSupervisedFromEnv:
+    def test_reads_supervised_from_env(self, monkeypatch):
+        # The control marks the plane control-owned via BIOPB_DATA_PLANE_SUPERVISED
+        # in the child env; create_app picks it up when not passed explicitly.
+        monkeypatch.setenv("BIOPB_DATA_PLANE_SUPERVISED", "1")
+        app = create_app(token=None)
+        assert app.state.sidecar.supervised is True
+
+    def test_defaults_unsupervised_without_env(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_DATA_PLANE_SUPERVISED", raising=False)
+        app = create_app(token=None)
+        assert app.state.sidecar.supervised is False
 
 
 # ===========================================================================

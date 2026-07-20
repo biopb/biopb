@@ -126,6 +126,13 @@ message TensorDescriptor {
   // Per-dimension unit string for physical_scale (e.g. "micrometer", "µm"),
   // aligned 1:1 with physical_scale. "" means unknown.
   repeated string physical_unit = 12;
+
+  // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed
+  // when the chunk_id codec was made a strictly server-side concern (the client
+  // no longer regenerates chunk_ids). Reserved so the field number/name are never
+  // reused.
+  reserved 13;
+  reserved "chunk_array_id";
 }
 
 // One resolution level of a tensor's server-advertised pyramid.
@@ -202,6 +209,12 @@ message TensorReadOption {
   // If true, server populates metadata_json with wrapped metadata.
   // Wrapped structure: {"type": source_type, "dim_label": [...], "metadata": {...}}
   bool with_metadata = 5;
+
+  // 6 was compact_grid_ok, the opt-in to a compact-grid read plan
+  // (biopb/biopb#346); removed when the chunk_id codec was made a strictly
+  // server-side concern. Reserved so the field number/name are never reused.
+  reserved 6;
+  reserved "compact_grid_ok";
 }
 
 // Client command for GetFlightInfo requests.

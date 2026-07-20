@@ -30,7 +30,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 "tok",
-                {"mcp": {"dask": {"cache_budget": "1G"}}},
+                {"dask": {"cache_budget": "1G"}},
                 planned_workers=12,
             )
         # 1G // 12 planned workers, NOT // 5 live workers
@@ -47,7 +47,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 None,
-                {"mcp": {"dask": {"cache_budget": "1G"}}},
+                {"dask": {"cache_budget": "1G"}},
             )
         assert mk.call_args.args[2] == 1_000_000_000 // 4
 
@@ -59,7 +59,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 None,
-                {"mcp": {"dask": {"cache_budget": 800_000_000}}},
+                {"dask": {"cache_budget": 800_000_000}},
                 planned_workers=2,
             )
         assert mk.call_args.args[2] == 400_000_000
@@ -76,7 +76,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://localhost:8815",
                 None,
-                {"mcp": {"dask": {"cache_budget": "4G"}}},
+                {"dask": {"cache_budget": "4G"}},
                 planned_workers=8,
             )
         assert mk.call_args.args[2] == 4_000_000_000 // 8
@@ -185,3 +185,161 @@ class TestTokenReportHook:
         os.close(r)
         os.close(w)  # writing to a closed pipe raises -> must be swallowed
         hook("grpc://srv:8815", "tok")  # no exception
+
+
+class _FakeIP:
+    """A stand-in kernel with just the user namespace the loader touches."""
+
+    def __init__(self, ns):
+        self.user_ns = ns
+
+
+def _seeded_ns():
+    """A namespace shaped like the post-step-7 kernel (the load-bearing handles)."""
+    return {
+        "viewer": "REAL_VIEWER",
+        "client": None,
+        "np": "NP",
+        "da": "DA",
+        "ops": {},
+        "run_on_main": lambda f: f(),
+        "_conn": object(),
+        "_jobs": object(),
+        "_dask_client": None,
+        "_dask_attach_done": False,
+        "_viewer_window_alive": lambda: True,
+        "_resync_view": lambda: None,
+    }
+
+
+class TestLoadStartupFiles:
+    """`~/.config/biopb/kernel/*.py`, exec'd in the namespace (#92)."""
+
+    def test_top_level_defs_land_and_see_live_handles(self, tmp_path):
+        # A plugin function referencing `viewer`/`client` as globals resolves them
+        # against the kernel namespace at call time -- including a `client`
+        # refreshed after load (the per-job refresh), exactly like execute_code.
+        (tmp_path / "a.py").write_text(
+            '"""Lab tools."""\ndef my_tool():\n    return (viewer, client)\n',
+            encoding="utf-8",
+        )
+        ns = _seeded_ns()
+        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
+        assert "my_tool" in ns
+        ns["client"] = "CONNECTED"  # simulate the per-job client refresh
+        assert ns["my_tool"]() == ("REAL_VIEWER", "CONNECTED")
+
+    def test_failing_file_is_fail_open_and_next_still_loads(self, tmp_path):
+        (tmp_path / "a_boom.py").write_text(
+            'raise RuntimeError("boom at import")\n', encoding="utf-8"
+        )
+        (tmp_path / "b_ok.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        ns = _seeded_ns()
+        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
+        assert "ok" in ns  # the boom did not abort the sweep
+
+    def test_reserved_name_overwrite_is_restored(self, tmp_path):
+        (tmp_path / "c.py").write_text(
+            'viewer = "HIJACKED"\nclient = "HIJACKED"\n', encoding="utf-8"
+        )
+        ns = _seeded_ns()
+        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
+        assert ns["viewer"] == "REAL_VIEWER" and ns["client"] is None
+
+    def test_underscore_files_skipped_and_missing_dir_is_noop(self, tmp_path):
+        (tmp_path / "_priv.py").write_text("secret = 1\n", encoding="utf-8")
+        ns = _seeded_ns()
+        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
+        assert "secret" not in ns
+        # A non-existent dir must not raise.
+        _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path / "nope")
+
+
+class TestPublicNamesAndMerge:
+    def test_public_names_honors_all_and_drops_modules(self):
+        import numpy
+
+        assert _bootstrap._public_names(
+            {"__all__": ["keep"], "keep": 1, "skip": 2}
+        ) == {"keep": 1}
+        assert _bootstrap._public_names({"pub": 1, "_priv": 2, "mod": numpy}) == {
+            "pub": 1
+        }
+
+    def test_merge_skips_reserved_names(self):
+        ns = _seeded_ns()
+        _bootstrap._merge_names(
+            _FakeIP(ns), {"newname": 42, "viewer": "NO"}, source="ep:test"
+        )
+        assert ns["newname"] == 42 and ns["viewer"] == "REAL_VIEWER"
+
+
+class TestLoadEntryPointPlugins:
+    """The `biopb_mcp.namespace` entry-point dispatch (register / module / dict)."""
+
+    def _run(self, monkeypatch, eps):
+        import importlib.metadata as md
+
+        monkeypatch.setattr(md, "entry_points", lambda group=None: eps)
+        ns = _seeded_ns()
+        _bootstrap._load_entry_point_plugins(_FakeIP(ns))
+        return ns
+
+    def _ep(self, name, obj):
+        class _EP:
+            def load(self_inner):
+                return obj
+
+        ep = _EP()
+        ep.name = name
+        return ep
+
+    def test_register_hook_reads_handles_and_is_guarded(self, monkeypatch):
+        def register(namespace):
+            assert namespace["viewer"] == "REAL_VIEWER"  # read-through snapshot
+            namespace["reg_tool"] = "R"
+            namespace["viewer"] = "HIJACK"  # guarded on merge
+
+        ns = self._run(monkeypatch, [self._ep("reg", register)])
+        assert ns["reg_tool"] == "R" and ns["viewer"] == "REAL_VIEWER"
+
+    def test_module_and_mapping_filter_public_names(self, monkeypatch):
+        import types
+
+        mod = types.ModuleType("m")
+        mod.__all__ = ["mod_tool"]
+        mod.mod_tool = "M"
+        mod.hidden = "H"
+        ns = self._run(
+            monkeypatch,
+            [self._ep("mod", mod), self._ep("map", {"map_tool": "MP", "_skip": "no"})],
+        )
+        assert ns["mod_tool"] == "M" and "hidden" not in ns
+        assert ns["map_tool"] == "MP" and "_skip" not in ns
+
+    def test_junk_and_import_failure_are_fail_open(self, monkeypatch):
+        class _Boom:
+            def load(self_inner):
+                raise RuntimeError("import boom")
+
+        boom = _Boom()
+        boom.name = "boom"
+        ns = self._run(monkeypatch, [self._ep("junk", 12345), boom])
+        # Neither a non-register/module/mapping nor an import failure adds anything
+        # or raises.
+        assert "junk" not in ns
+
+
+class TestLoadNamespacePluginsGate:
+    def test_disabled_by_config_skips_everything(self, tmp_path, monkeypatch):
+        called = []
+        monkeypatch.setattr(
+            _bootstrap, "_load_startup_files", lambda *a: called.append("f")
+        )
+        monkeypatch.setattr(
+            _bootstrap, "_load_entry_point_plugins", lambda *a: called.append("e")
+        )
+        _bootstrap._load_namespace_plugins(
+            _FakeIP(_seeded_ns()), {"services": {"namespace_enabled": False}}
+        )
+        assert called == []

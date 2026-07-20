@@ -15,15 +15,17 @@ import os
 import tempfile
 
 import pytest
-from biopb_tensor_server import discovery, source_manager as sm_mod
 from biopb_tensor_server.adapters import tiff as tiff_mod
-from biopb_tensor_server.config import SourceConfig, parse_config
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core import discovery
+from biopb_tensor_server.core.config import SourceConfig, parse_config
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     DiscoveryState,
     SourceClaim,
     should_skip_walk_entry,
 )
+from biopb_tensor_server.sources import reconciler as rec_mod
+from biopb_tensor_server.sources.tree_scanner import build_entry_signature
 
 
 def _zarr_available():
@@ -46,7 +48,7 @@ def force_nonresident(monkeypatch):
     fake = lambda path, stat_result=None: True  # noqa: E731
     monkeypatch.setattr(discovery, "_is_offline_placeholder", fake)
     monkeypatch.setattr(tiff_mod, "_is_offline_placeholder", fake)
-    monkeypatch.setattr(sm_mod, "_is_offline_placeholder", fake)
+    monkeypatch.setattr(rec_mod, "_is_offline_placeholder", fake)
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +181,52 @@ class TestContentFreeClaimsDoNotRead:
         assert claim is not None
         assert claim.source_type == NdTiffAdapter.SOURCE_TYPE
 
+    def test_qptiff_claims_by_extension_without_opening_file(
+        self, tmp_path, monkeypatch
+    ):
+        # Suffix-only claim (biopb/biopb#135): a .qptiff is claimed recall-free --
+        # even under a cloud root, where a byte read recalls the whole placeholder.
+        # The dropped .tif vendor-XML sniff opened the file with tifffile.TiffFile
+        # (not ctx.read_text, so _RaisingReadCtx alone wouldn't catch it), so make
+        # TiffFile explode to prove claim() never reaches it. Deferring a
+        # non-resident file is the manager's job (_claim_is_unresolved), not
+        # claim()'s, so the claim itself is definite here -- like CZI/NIfTI.
+        import tifffile
+        from biopb_tensor_server.adapters.qptiff import QptiffAdapter
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("claim() must not open the file (recall under cloud)")
+
+        monkeypatch.setattr(tifffile, "TiffFile", _boom)
+
+        f = tmp_path / "slide.qptiff"
+        f.write_bytes(b"II*\x00not-a-real-qptiff")
+        claim = QptiffAdapter.claim(
+            _RaisingReadCtx(f, cloud_root=True), DiscoveryState()
+        )
+        assert claim is not None
+        assert claim.source_type == "qptiff"
+        assert claim.unresolved is False
+
+    def test_qptiff_declines_tif_recall_free_under_cloud(self, tmp_path, monkeypatch):
+        # The other half of the suffix-only policy: a .tif QPTIFF is NOT sniffed,
+        # so QptiffAdapter declines it without opening the file (it falls through
+        # to the generic bioio adapter). Guards that no sniff creeps back in.
+        import tifffile
+        from biopb_tensor_server.adapters.qptiff import QptiffAdapter
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("declining a .tif must not open the file")
+
+        monkeypatch.setattr(tifffile, "TiffFile", _boom)
+
+        f = tmp_path / "slide.tif"
+        f.write_bytes(b"II*\x00not-a-real-qptiff")
+        claim = QptiffAdapter.claim(
+            _RaisingReadCtx(f, cloud_root=True), DiscoveryState()
+        )
+        assert claim is None
+
 
 # --------------------------------------------------------------------------- #
 # Reader adapters: residency-guarded defer branch
@@ -253,10 +301,8 @@ class TestReaderDeferBranches:
     def test_ome_tiff_sniff_skipped_when_nonresident(self, tmp_path, force_nonresident):
         # A non-resident .tif: OmeTiffAdapter declines (skips the IFD sniff) so the
         # extension-only generic AICS adapter claims it instead as an image.
-        from biopb_tensor_server.adapters.aicsimageio import (
-            AicsImageIoAdapter,
-            OmeTiffAdapter,
-        )
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "img.tif"
         f.write_bytes(b"II*\x00not-a-real-tiff")
@@ -329,12 +375,36 @@ class TestUnresolvedProxy:
         assert desc.source_type == "ome-zarr"
         assert proxy.is_resolved is False
 
+    def test_close_forwards_to_the_resolved_adapter(self):
+        """The proxy must not swallow the inner adapter's close (biopb/biopb#71).
+
+        ``_close_adapter`` is duck-typed, so a proxy without ``close`` silently
+        skips cleanup for exactly the resolved cloud OME-TIFF / QPTIFF sources
+        whose ``close()`` is the one that matters.
+        """
+        proxy = self._make_proxy("/data/cloud/x.zarr")
+        closed = []
+
+        class _Inner:
+            def close(self):
+                closed.append(True)
+
+        proxy._resolved = _Inner()
+        proxy.close()
+        assert closed == [True]
+        assert proxy.is_resolved is False
+        proxy.close()  # idempotent
+        assert closed == [True]
+
+    def test_close_on_unresolved_proxy_is_a_noop(self):
+        self._make_proxy("/data/cloud/x.zarr").close()  # does not raise
+
     def test_serve_surface_refuses_until_resolved(self):
         # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
         # on its own -- it refuses with SourceUnresolvedError until resolve() has
         # run, so the only thing that downloads is the explicit resolve action.
         import zarr
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         with tempfile.TemporaryDirectory() as d:
             zpath = os.path.join(d, "img.zarr")
@@ -392,7 +462,7 @@ class TestUnresolvedProxy:
             assert calls == ["s1"]  # on_resolved fired exactly once
 
     def test_resolution_failure_raises_source_unresolved(self):
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         proxy = self._make_proxy("/nonexistent/path.zarr", source_type="ome-zarr")
         with pytest.raises(SourceUnresolvedError):
@@ -435,7 +505,7 @@ class _FakeServer:
 
 def _make_manager(server, cloud_roots=None, monitored=None):
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     return SourceManager(
         server=server,
@@ -452,14 +522,14 @@ class TestUnresolvedDecision:
     def test_flagged_claim_is_unresolved(self, tmp_path):
         mgr = _make_manager(_FakeServer())
         claim = SourceClaim("ome-zarr", str(tmp_path / "x.zarr"), unresolved=True)
-        assert mgr._claim_is_unresolved(claim) is True
+        assert mgr._reconciler._claim_is_unresolved(claim) is True
 
     def test_resident_claim_outside_cloud_root_is_not_unresolved(self, tmp_path):
         mgr = _make_manager(_FakeServer())
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
         claim = SourceClaim("nifti", str(f))
-        assert mgr._claim_is_unresolved(claim) is False
+        assert mgr._reconciler._claim_is_unresolved(claim) is False
 
     def test_nonresident_file_under_cloud_root_is_unresolved(
         self, tmp_path, force_nonresident
@@ -470,7 +540,7 @@ class TestUnresolvedDecision:
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
         claim = SourceClaim("nifti", str(f))
-        assert mgr._claim_is_unresolved(claim) is True
+        assert mgr._reconciler._claim_is_unresolved(claim) is True
 
     def test_directory_member_not_false_flagged(self, tmp_path, force_nonresident):
         # Even with every path looking non-resident, a directory primary_path is
@@ -480,7 +550,7 @@ class TestUnresolvedDecision:
         store = tmp_path / "img.zarr"
         store.mkdir()
         claim = SourceClaim("ome-zarr", str(store))  # no unresolved flag, dir member
-        assert mgr._claim_is_unresolved(claim) is False
+        assert mgr._reconciler._claim_is_unresolved(claim) is False
 
 
 class TestShouldWarm:
@@ -491,7 +561,7 @@ class TestShouldWarm:
     """
 
     def _register(self, mgr, claim):
-        mgr._state.claims[claim.source_id] = claim
+        mgr._reconciler._state.claims[claim.source_id] = claim
 
     def test_unknown_source_not_warmed(self, tmp_path):
         mgr = _make_manager(_FakeServer())
@@ -547,7 +617,7 @@ class TestCloudRegistrationEndToEnd:
 
         # Register an ome-zarr claim flagged unresolved (as the defer branch would).
         claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
-        assert mgr._register_source_claim(claim) is True
+        assert mgr._reconciler._register_source_claim(claim) is True
 
         # Registered as the proxy; catalog row carries NULL shape (empty tensors).
         adapter = server.registered["cloud1"]
@@ -595,8 +665,8 @@ class TestPrecacheSkipsUnresolved:
         # source is never hydrated by background warming.
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-        from biopb_tensor_server.config import PrecacheConfig
-        from biopb_tensor_server.precache import PrecacheWorker
+        from biopb_tensor_server.core.config import PrecacheConfig
+        from biopb_tensor_server.serving.precache import PrecacheWorker
 
         cfg = SourceConfig(url="/data/cloud/x.zarr", type="ome-zarr", source_id="s1")
         proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
@@ -606,9 +676,12 @@ class TestPrecacheSkipsUnresolved:
 
         monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
 
-        class _Srv:
-            def _get_source_adapter(self, sid):
+        class _Registry:
+            def get(self, sid):
                 return proxy if sid == "s1" else None
+
+        class _Srv:
+            sources = _Registry()
 
         worker = PrecacheWorker(_Srv(), PrecacheConfig())
         # Past the file-backend gate so the real source-processing logic runs.
@@ -735,7 +808,7 @@ class TestCloudRescanGating:
         self, tmp_path, force_nonresident, monkeypatch
     ):
         # After the startup force_full, cloud entries live in the cloud partition,
-        # NOT in _entry_state, and an incremental rescan touches none of them: the
+        # NOT in _entry_states, and an incremental rescan touches none of them: the
         # per-entry carry-forward must never run, and the partition is carried
         # forward by reference (unchanged), while the cloud source stays registered.
         root = tmp_path / "cloudroot"
@@ -747,26 +820,26 @@ class TestCloudRescanGating:
 
         mgr._handle_rescan()  # force_full
         sid = next(iter(server.registered))
-        assert mgr._cloud_entry_state  # cloud entries partitioned out
-        assert root_key in mgr._cloud_entry_state
-        # Nothing under the cloud root lingers in _entry_state.
+        assert mgr._cloud_entry_states  # cloud entries partitioned out
+        assert root_key in mgr._cloud_entry_states
+        # Nothing under the cloud root lingers in _entry_states.
         assert not any(
-            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_state
+            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_states
         )
-        assert sid in mgr._cloud_source_ids
+        assert sid in mgr._reconciler._cloud_source_ids
 
         # Incremental: the per-entry cloud carry-forward must never be invoked.
         def _boom(*a, **k):
             raise AssertionError("incremental must not iterate cloud entries")
 
-        monkeypatch.setattr(mgr, "_copy_cached_subtree_entries", _boom)
+        monkeypatch.setattr(mgr._scanner, "_copy_cached_subtree_entries", _boom)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
-        partition_before = dict(mgr._cloud_entry_state)
+        partition_before = dict(mgr._cloud_entry_states)
 
         mgr._handle_rescan()  # must not raise
 
         assert set(server.registered) == {sid}  # preserved
-        assert mgr._cloud_entry_state == partition_before  # carried, not rebuilt
+        assert mgr._cloud_entry_states == partition_before  # carried, not rebuilt
 
     def test_incremental_preserves_cloud_without_diff_or_churn(
         self, tmp_path, force_nonresident, monkeypatch
@@ -784,15 +857,15 @@ class TestCloudRescanGating:
         sid = next(iter(server.registered))
         added_before = len(server._metadata_db.added)
 
-        orig_sig = mgr._build_claim_signatures
+        orig_sig = mgr._reconciler._build_claim_signatures
 
         def guard(claim):
-            assert claim.source_id not in mgr._cloud_source_ids, (
+            assert claim.source_id not in mgr._reconciler._cloud_source_ids, (
                 "cloud source must not be signature-diffed on an incremental"
             )
             return orig_sig(claim)
 
-        monkeypatch.setattr(mgr, "_build_claim_signatures", guard)
+        monkeypatch.setattr(mgr._reconciler, "_build_claim_signatures", guard)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
 
         mgr._handle_rescan()
@@ -824,7 +897,9 @@ class TestCloudRescanGating:
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
         mgr._handle_rescan()  # force_full: re-walk surfaces it, partition rebuilt
         assert len(server.registered) == 2
-        assert all(sid in mgr._cloud_source_ids for sid in server.registered)
+        assert all(
+            sid in mgr._reconciler._cloud_source_ids for sid in server.registered
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -840,7 +915,7 @@ class TestResolveAction:
     ``result`` arm."""
 
     def _server(self, source_id, adapter):
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source(source_id, adapter)
@@ -872,7 +947,9 @@ class TestResolveAction:
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
             bodies = [bytes(r) for r in server.do_action(None, action)]
             msgs, kinds = self._parse(bodies)
-            results = [m.result for m, k in zip(msgs, kinds) if k == "result"]
+            results = [
+                m.result for m, k in zip(msgs, kinds, strict=True) if k == "result"
+            ]
             assert len(results) == 1  # exactly one terminal descriptor
             assert kinds[-1] == "result"
             desc = results[0]
@@ -882,34 +959,57 @@ class TestResolveAction:
             assert proxy.is_resolved is True
 
     def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
-        # With a tiny heartbeat interval and a slow resolve, the stream must carry
-        # progress keep-alives BEFORE the terminal descriptor -- this is what keeps
-        # a minutes-long recall under a proxy's idle read timeout, and the elapsed
-        # field lets a client show progress.
-        import time as _time
+        # The stream must carry progress keep-alives BEFORE the terminal descriptor
+        # -- this is what keeps a minutes-long recall under a proxy's idle read
+        # timeout, and the elapsed field lets a client show progress.
+        #
+        # Deterministic drive (no wall-clock race, see issue #177): the fake
+        # resolve() blocks on an Event we only set AFTER pulling the first stream
+        # item. Because the worker thread is parked in resolve() until then, the
+        # server's heartbeat loop is guaranteed to time out its join at least once
+        # and emit a progress message first -- independent of runner load. The old
+        # form raced a 0.06s sleep against a 0.01s interval and flaked on slow CI.
+        import threading
 
         import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-        from biopb_tensor_server import server as server_mod
+        from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
 
+        release = threading.Event()
+
         class _SlowAdapter:
+            source_url = None
+            capability_token = None
+
             def resolve(self):
-                _time.sleep(0.06)  # ~6 heartbeat intervals
+                # Park until the test has observed the first heartbeat, then finish.
+                # Bounded wait so a broken test can never hang the drain below.
+                release.wait(timeout=5.0)
                 return DataSourceDescriptor(source_id="slow")
 
         server = self._server("slow", _SlowAdapter())
         action = flight.Action("resolve", b"slow")
-        bodies = [bytes(r) for r in server.do_action(None, action)]
+
+        stream = server.do_action(None, action)
+        try:
+            # Worker is parked in resolve() -> the first item is a heartbeat.
+            first = bytes(next(stream))
+        finally:
+            release.set()  # let resolve() complete, then drain the rest
+        bodies = [first] + [bytes(r) for r in stream]
         msgs, kinds = self._parse(bodies)
 
+        assert kinds[0] == "progress"  # deterministically, a heartbeat leads
         assert kinds.count("progress") >= 1  # at least one heartbeat
         assert kinds[-1] == "result"  # terminal is the descriptor
         assert msgs[-1].result.source_id == "slow"
         # progress heartbeats carry a monotonically non-decreasing elapsed clock
         elapsed = [
-            m.progress.elapsed_seconds for m, k in zip(msgs, kinds) if k == "progress"
+            m.progress.elapsed_seconds
+            for m, k in zip(msgs, kinds, strict=True)
+            if k == "progress"
         ]
         assert elapsed == sorted(elapsed)
         assert elapsed[-1] >= 0.0
@@ -927,7 +1027,7 @@ class _SlowSentinel:
     """A registered placeholder so the server has a (different) source; the
     `resolve` test above targets a *missing* id to exercise the not-found path."""
 
-    token = None
+    capability_token = None
 
 
 # --------------------------------------------------------------------------- #
@@ -939,10 +1039,14 @@ class _DirAdapter:
     """Minimal registered adapter exposing only ``_source_url`` -- all `warm`
     needs (it walks that directory and reads files; format-agnostic)."""
 
-    token = None
+    capability_token = None
 
     def __init__(self, url):
         self._source_url = url
+
+    @property
+    def source_url(self):
+        return self._source_url
 
 
 class _Ctx:
@@ -966,7 +1070,7 @@ class TestWarmAction:
     emitting ``WarmStreamMessage`` progress, then one terminal ``done``."""
 
     def _server(self, source_id, adapter):
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source(source_id, adapter)
@@ -983,7 +1087,7 @@ class TestWarmAction:
     def _no_throttle(monkeypatch):
         # Force a progress message at every file/block boundary (the default
         # 0.5s throttle would suppress them for tiny fast files).
-        from biopb_tensor_server import server as server_mod
+        from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_WARM_PROGRESS_MIN_INTERVAL", -1.0)
 
@@ -1020,11 +1124,13 @@ class TestWarmAction:
         assert done.bytes_done == total  # every byte recalled
         # progress arms report a monotonically non-decreasing files_done
         prog_files = [
-            m.progress.files_done for m, k in zip(msgs, kinds) if k == "progress"
+            m.progress.files_done
+            for m, k in zip(msgs, kinds, strict=True)
+            if k == "progress"
         ]
         assert prog_files == sorted(prog_files)
         # guard cleaned up
-        assert server._warming == set()
+        assert server.activity.warming == set()
 
     def test_warm_orders_files_ascending_by_size(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
@@ -1043,10 +1149,13 @@ class TestWarmAction:
         # The current_name as each file finishes, in order (dedupe consecutive
         # repeats from per-block progress): smallest first.
         names = []
-        for m, k in zip(msgs, kinds):
-            if k == "progress" and m.progress.current_name:
-                if not names or names[-1] != m.progress.current_name:
-                    names.append(m.progress.current_name)
+        for m, k in zip(msgs, kinds, strict=True):
+            if (
+                k == "progress"
+                and m.progress.current_name
+                and (not names or names[-1] != m.progress.current_name)
+            ):
+                names.append(m.progress.current_name)
         assert names == ["small", "mid", "big"]
 
     def test_warm_walk_is_recursive(self, tmp_path, monkeypatch):
@@ -1098,7 +1207,7 @@ class TestWarmAction:
         assert kinds[-1] == "done"  # still emits a terminal snapshot
         done = msgs[-1].done
         assert done.files_done < done.files_total  # did not finish all 12
-        assert server._warming == set()  # guard released even on cancel
+        assert server.activity.warming == set()  # guard released even on cancel
 
     def test_warm_rejects_concurrent_warm_of_same_source(self, tmp_path):
         import pyarrow.flight as flight
@@ -1107,7 +1216,7 @@ class TestWarmAction:
         os.makedirs(root)
         self._make_files(root, {"a.bin": 8})
         server = self._server("s6", _DirAdapter(root))
-        server._warming.add("s6")  # simulate an in-flight warm
+        server.activity.begin_warm("s6")  # simulate an in-flight warm
         with pytest.raises(flight.FlightServerError, match="already in progress"):
             list(server.do_action(_Ctx(), flight.Action("warm", b"s6")))
 
@@ -1133,7 +1242,7 @@ class TestCloudRootFlag:
         # cloud_by_path carries the per-path cloud flag the walk computed once; it
         # must reach the adapter's claim() via its ClaimContext. A path absent from
         # the map defaults to False.
-        from biopb_tensor_server.discovery import (
+        from biopb_tensor_server.core.discovery import (
             AdapterRegistry,
             discover_sources_from_entries,
         )
@@ -1174,7 +1283,7 @@ class TestCloudMultiFileBan:
     def test_ome_tiff_does_not_group_under_cloud(self, tmp_path):
         # Even a *resident* .tif must not be sniffed/grouped under cloud -- the
         # raising ctx proves no content read happens.
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "img.tif"
         f.write_bytes(b"II*\x00real-bytes-but-cloud")
@@ -1184,7 +1293,7 @@ class TestCloudMultiFileBan:
         )
 
     def test_companion_ome_skipped_under_cloud(self, tmp_path):
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "set.companion.ome"
         f.write_text("<OME/>")
@@ -1247,7 +1356,7 @@ class TestCloudMultiFileBan:
         # multi-file ban fires there too, not only on the monitored rescan. Spy on
         # the series adapter to capture the cloud_root it is handed.
         from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
-        from biopb_tensor_server.config import discover_sources
+        from biopb_tensor_server.core.config import discover_sources
 
         d = tmp_path / "series"
         d.mkdir()
@@ -1330,12 +1439,11 @@ class TestDirClaimingMembership:
 
 class TestCloudSignatureInvariance:
     def test_cloud_file_signature_is_identity_only(self, tmp_path):
-        mgr = _make_manager(_FakeServer())
         f = tmp_path / "x.bin"
         f.write_bytes(b"abc")
         st = f.stat()
-        cloud_sig = mgr._build_entry_signature(st, is_directory=False, cloud=True)
-        plain_sig = mgr._build_entry_signature(st, is_directory=False, cloud=False)
+        cloud_sig = build_entry_signature(st, is_directory=False, cloud=True)
+        plain_sig = build_entry_signature(st, is_directory=False, cloud=False)
         assert cloud_sig == (st.st_dev, st.st_ino)
         assert plain_sig != cloud_sig  # plain carries size/mtime/ctime
 
@@ -1345,19 +1453,17 @@ class TestCloudSignatureInvariance:
         # will not put the just-resolved source in changed_ids.
         import os as _os
 
-        mgr = _make_manager(_FakeServer())
         f = tmp_path / "x.bin"
         f.write_bytes(b"placeholder-stub")
-        before = mgr._build_entry_signature(f.stat(), is_directory=False, cloud=True)
+        before = build_entry_signature(f.stat(), is_directory=False, cloud=True)
         # "Hydrate": grow the file and bump times.
         f.write_bytes(b"hydrated-full-content-now-much-larger")
         _os.utime(f, None)
-        after = mgr._build_entry_signature(f.stat(), is_directory=False, cloud=True)
+        after = build_entry_signature(f.stat(), is_directory=False, cloud=True)
         assert before == after
         # A non-cloud signature WOULD change on the same hydration.
         assert (
-            mgr._build_entry_signature(f.stat(), is_directory=False, cloud=False)
-            != before
+            build_entry_signature(f.stat(), is_directory=False, cloud=False) != before
         )
 
 
@@ -1378,7 +1484,7 @@ class TestResolveErrorSurfacing:
     def test_reclaim_oserror_surfaces_retriable(self, monkeypatch):
         # An OSError while re-claiming (recall/IO) must surface as retriable,
         # NOT silently degrade to the claim-time guessed type.
-        from biopb_tensor_server.errors import SourceResolveRetriableError
+        from biopb_tensor_server.core.errors import SourceResolveRetriableError
 
         proxy = self._make_proxy("/data/cloud/x.zarr")
 
@@ -1391,7 +1497,7 @@ class TestResolveErrorSurfacing:
 
     def test_create_from_config_oserror_is_retriable(self, monkeypatch, tmp_path):
         import zarr
-        from biopb_tensor_server.errors import SourceResolveRetriableError
+        from biopb_tensor_server.core.errors import SourceResolveRetriableError
 
         zpath = str(tmp_path / "img.zarr")
         zarr.open_array(zpath, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
@@ -1415,7 +1521,7 @@ class TestResolveErrorSurfacing:
         # A nonexistent path: re-claim yields nothing and create_from_config
         # fails permanently (no retriable cause) -> plain SourceUnresolvedError,
         # and NOT the retriable subclass.
-        from biopb_tensor_server.errors import (
+        from biopb_tensor_server.core.errors import (
             SourceResolveRetriableError,
             SourceUnresolvedError,
         )

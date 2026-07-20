@@ -1,0 +1,60 @@
+{
+  "catalog_version": 1,
+  "generated": "2026-07-10T15:08:23Z",
+  "skills": [
+    {
+      "id": "load-tensor-source",
+      "title": "Load a tensor source into napari",
+      "description": "Browse the tensor catalog, pick a source with the user, and load it as a napari image layer.",
+      "tags": [
+        "tensor",
+        "io",
+        "visualization"
+      ],
+      "version": "1.0.0",
+      "spec_version": 1,
+      "requires": [
+        "viewer",
+        "tensor"
+      ],
+      "updated": "2026-07-10",
+      "url": "https://biopb.org/skills/load-tensor-source.md",
+      "sha256": "981643efbdadc16c55748f2a9485576dd330c5cd9ffca021f3da2ebbecab572a"
+    },
+    {
+      "id": "measure-labels",
+      "title": "Measure a labels layer into a table",
+      "description": "Compute per-object region properties from a napari labels layer and return a tidy pandas table.",
+      "tags": [
+        "measurement",
+        "workflow"
+      ],
+      "version": "1.0.0",
+      "spec_version": 1,
+      "requires": [
+        "viewer"
+      ],
+      "updated": "2026-07-10",
+      "url": "https://biopb.org/skills/measure-labels.md",
+      "sha256": "f82907724c3b543a1a03689409b801e01c06f1b18e048aa973d1cd29fbd3cce8"
+    },
+    {
+      "id": "segment-nuclei",
+      "title": "Segment nuclei with a segmentation op",
+      "description": "Run a server-side segmentation op over the active image layer and load the instance labels for validation.",
+      "tags": [
+        "segmentation",
+        "ops"
+      ],
+      "version": "1.0.0",
+      "spec_version": 1,
+      "requires": [
+        "viewer",
+        "ops:segmentation"
+      ],
+      "updated": "2026-07-10",
+      "url": "https://biopb.org/skills/segment-nuclei.md",
+      "sha256": "aa94e7698bbc8cbde96307fe443beab8171874f6491613a9f700835612fc563b"
+    }
+  ]
+}

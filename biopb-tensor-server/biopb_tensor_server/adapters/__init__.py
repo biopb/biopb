@@ -9,10 +9,11 @@ Usage:
     claims = registry.get_claims_for_path(path, visited)
 """
 
-from biopb_tensor_server.base import BackendAdapter, SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import AdapterRegistry
+from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
+from .ome_tiff import OmeTiffAdapter
 from .ome_zarr import OmeZarrAdapter
 from .remote_tensor import RemoteTensorAdapter
 from .tiff import (
@@ -27,20 +28,39 @@ try:
 except ImportError:
     NdTiffAdapter = None  # type: ignore
 
-# Optional aicsimageio adapters (format-specific subclasses)
+# QPTIFF (Akoya PhenoImager) reads via tifffile (a core dep), but decoding its
+# compressed tiles (JPEG/LZW) needs imagecodecs -- gate on it so a slim install
+# without imagecodecs simply doesn't claim .qptiff rather than claim-then-error
+# at read (biopb/biopb#135).
 try:
-    from .aicsimageio import (
+    import imagecodecs  # noqa: F401
+
+    from .qptiff import QptiffAdapter
+except ImportError:
+    QptiffAdapter = None  # type: ignore
+# Optional electron-microscopy adapters (rosettasciio)
+try:
+    from .mrc import MrcAdapter
+except ImportError:
+    MrcAdapter = None  # type: ignore
+
+try:
+    from .emd import EmdAdapter
+except ImportError:
+    EmdAdapter = None  # type: ignore
+
+# Optional bioio adapters (format-specific subclasses)
+try:
+    from .bioio import (
         AicsImageIoAdapter,
         BioformatsAdapter,
         DvAdapter,
         LeicaAdapter,
         NikonAdapter,
         OlympusAdapter,
-        OmeTiffAdapter,
         ZeissAdapter,
     )
 except ImportError:
-    OmeTiffAdapter = None  # type: ignore
     ZeissAdapter = None  # type: ignore
     LeicaAdapter = None  # type: ignore
     NikonAdapter = None  # type: ignore
@@ -64,7 +84,6 @@ except ImportError:
 __all__ = [
     "get_default_registry",
     "AdapterRegistry",
-    "BackendAdapter",
     "SourceAdapter",
     "TensorAdapter",
     "ZarrAdapter",
@@ -75,6 +94,9 @@ __all__ = [
     "RemoteTensorAdapter",
     "NdTiffAdapter",
     "OmeTiffAdapter",
+    "QptiffAdapter",
+    "MrcAdapter",
+    "EmdAdapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",
@@ -93,6 +115,10 @@ def get_default_registry() -> AdapterRegistry:
 
     Adapter registration order (by priority/specificity, highest first):
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
+    - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
+      native pyramid)
+    - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
+    - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
     - ZeissAdapter - Zeiss microscopy (CZI, LSM)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
@@ -100,7 +126,7 @@ def get_default_registry() -> AdapterRegistry:
     - OlympusAdapter - Olympus OIF/OIB files
     - BioformatsAdapter - Legacy Bio-Formats-only formats (ZVI, ...; requires the
       optional bioformats component)
-    - AicsImageIoAdapter - Fallback for other aicsimageio-supported formats
+    - AicsImageIoAdapter - Fallback for other bioio-supported formats
     - OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
     - ZarrAdapter - Generic Zarr fallback
     - NdTiffAdapter - Micro-Manager NDTiff storage (NDTiff.index + NDTiffStack_*.tif)
@@ -116,9 +142,29 @@ def get_default_registry() -> AdapterRegistry:
     """
     registry = AdapterRegistry()
 
-    # Register aicsimageio-based adapters in priority order (most specific first)
-    if OmeTiffAdapter is not None:
-        registry.register_with_type("ome-tiff", OmeTiffAdapter)
+    # Pure-tifffile OME-TIFF adapter first (no bioio dependency, so always
+    # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
+    # declines falls through to the generic bioio adapter registered below.
+    registry.register_with_type("ome-tiff", OmeTiffAdapter)
+
+    # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
+    # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not
+    # sniffed (that read is unsafe under cloud and wasteful without caching), so
+    # it falls through to bioio unless configured with an explicit type: qptiff.
+    # Registration order is claim probe order; callers take claims[0]. See
+    # biopb/biopb#135.
+    if QptiffAdapter is not None:
+        registry.register_with_type("qptiff", QptiffAdapter)
+    # Electron-microscopy adapters (rosettasciio), before the bioio group so they
+    # own their extensions -- notably .mrc, which no bioio plugin can read
+    # (biopb/biopb#94). Registration order is claim probe order; callers take
+    # claims[0].
+    if MrcAdapter is not None:
+        registry.register_with_type("mrc", MrcAdapter)
+    if EmdAdapter is not None:
+        registry.register_with_type("emd", EmdAdapter)
+
+    # Register bioio-based adapters in priority order (most specific first)
     if ZeissAdapter is not None:
         registry.register_with_type("zeiss", ZeissAdapter)
     if LeicaAdapter is not None:

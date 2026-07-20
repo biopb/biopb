@@ -12,33 +12,37 @@ import os
 import secrets
 import signal
 import threading
-import time
 import webbrowser
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import typer
+from biopb import _web_auth
+from biopb._lifecycle import deathwatch as _deathwatch
 from rich.console import Console
 from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
-from biopb_tensor_server.adapters.aicsimageio import set_claim_generic_images
+from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     CacheConfig,
     ServerConfig,
     SourceConfig,
     load_config,
     resolve_all_sources,
 )
-from biopb_tensor_server.http_server import run as run_http_server
-from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
-from biopb_tensor_server.metadata_db import MetadataDatabase
-from biopb_tensor_server.precache import PrecacheWorker
-from biopb_tensor_server.server import TensorFlightServer
-from biopb_tensor_server.source_manager import create_source_manager
-from biopb_tensor_server.watcher import get_watcher
+from biopb_tensor_server.core.logging_config import (
+    get_log_level_from_env,
+    setup_logging,
+)
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.http_server import run as run_http_server
+from biopb_tensor_server.serving.precache import PrecacheWorker
+from biopb_tensor_server.serving.server import TensorFlightServer
+from biopb_tensor_server.sources.source_manager import create_source_manager
+from biopb_tensor_server.sources.watcher import get_watcher
 
 app = typer.Typer(
     name="biopb-tensor-server",
@@ -50,12 +54,75 @@ logger = logging.getLogger(__name__)
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
 
+# The bind address is the mode: a loopback bind is reachable same-machine only
+# (local mode); anything else is network-reachable. The wildcard binds
+# (``0.0.0.0`` / ``::`` / ``""``) and any real IP/hostname are public, so they are
+# *not* in this set and are treated as public — fail-closed.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_is_public(host: str) -> bool:
+    """True if ``host`` is a network-reachable bind address (not loopback)."""
+    return host not in _LOOPBACK_HOSTS
+
+
+def _resolve_launch_token(
+    server_host: str,
+    web_host: str,
+    token: Optional[str],
+    env_token: str,
+) -> Optional[str]:
+    """Decide the token ``launch`` enforces, fail-closed on every public listener.
+
+    The flight bind (config ``server.host``) is the single mode switch: a loopback
+    bind is **local mode** (tokenless); any public bind is **remote mode** and MUST
+    carry a token, so a public bind with none supplied auto-generates one rather
+    than serving data open.
+
+    The HTTP sidecar has its own, independent bind (``--web-host``). Because it
+    re-exposes the whole data API, a **public sidecar with no enforced token** is
+    exactly the "public + unauthenticated" combination the model makes
+    unrepresentable — so it is refused rather than served open. (This is the
+    ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the token would
+    otherwise resolve to ``None`` and the data API would bind public and open.)
+
+    Returns the effective token (``None`` = local mode). Raises ``typer.Exit(1)``
+    if the sidecar would bind public without a token.
+    """
+    if token and _web_auth.valid_token(token):
+        effective_token: Optional[str] = token.strip()
+    elif env_token and _web_auth.valid_token(env_token):
+        effective_token = env_token.strip()
+    elif _host_is_public(server_host):
+        effective_token = secrets.token_urlsafe(32)
+        console.print(
+            "[yellow]Auto-generated secure access token "
+            f"(server.host={server_host} is a public bind).[/yellow]"
+        )
+    else:
+        # Loopback flight bind, no token supplied: local mode. Every listener is
+        # same-machine only, so no token is enforced.
+        effective_token = None
+
+    if effective_token is None and _host_is_public(web_host):
+        console.print(
+            "[red]Refusing to bind the HTTP sidecar to a public address "
+            f"(--web-host {web_host}) with no access token.[/red]\n"
+            "The sidecar re-exposes the data API, so this would serve it "
+            "unauthenticated to the network. Either bind it to loopback "
+            "(--web-host 127.0.0.1), or make the flight server public "
+            "(server.host) so a token is enforced across both listeners."
+        )
+        raise typer.Exit(1)
+
+    return effective_token
+
 
 def _install_sigterm_handler() -> None:
     """Make SIGTERM behave like Ctrl+C (KeyboardInterrupt).
 
-    `biopb server stop`, `docker/singularity stop`, and SLURM all terminate the
-    server with SIGTERM, which Python ignores (default disposition) for a
+    The control supervisor (POSIX), `docker/singularity stop`, and SLURM all
+    terminate the server with SIGTERM, which Python ignores (default disposition) for a
     blocking call like the Flight server's serve(). Translating it into a
     KeyboardInterrupt lets the same graceful-shutdown path run, so the file
     cache process lock is released instead of being left behind as a stale lock.
@@ -73,43 +140,105 @@ def _install_sigterm_handler() -> None:
         pass
 
 
+# How long to wait for the Flight drain before proceeding without it. The
+# control supervisor force-kills after a ~10s graceful window; keep this well
+# under that so the bounded steps that follow (source-manager join) still fit.
+_FLIGHT_DRAIN_TIMEOUT_S = 3.0
+
+
 def _graceful_shutdown(
     source_manager, watcher, flight_server, precache_worker=None
 ) -> None:
-    """Best-effort orderly shutdown.
+    """Best-effort orderly shutdown -- release the cache lock first, never hang.
 
     Step ORDER is load-bearing for clean restarts (biopb/biopb#300). ``restart``
     force-kills the daemon after a bounded graceful window (``--timeout``, 10s by
-    default), so releasing the file-cache process lock must not sit behind the
-    slow teardown steps -- otherwise a mid-teardown SIGKILL leaves a stale lock
-    and the next boot pays the full crash-recovery scan (~110s on a large
-    caching-proxy cache):
+    default), so the file-cache process lock -- whose release is a local, instant,
+    upstream-independent operation -- must be dropped FIRST, before any step that
+    can block on an unresponsive upstream. Otherwise a mid-teardown SIGKILL leaves
+    a stale lock and the next boot pays a crash-recovery scan. On a caching proxy
+    the two slow steps are both upstream-coupled -- the Flight drain (in-flight
+    ``do_get`` streams gated on a possibly-dead upstream) and the source-manager
+    join (a blocking re-list RPC to that upstream) -- so they are sequenced
+    *after* the lock release and then individually bounded:
 
     1. Stop the precache worker -- no new warm writes.
-    2. Shut down the Flight server -- drains in-flight ``do_get`` streams, after
-       which nothing writes to the cache. On a caching proxy these streams are
-       upstream-latency-gated, so this is the step that can run long.
-    3. Close the cache immediately after -- clears the WAL and releases the
-       process lock while the state is quiescent, BEFORE the source manager's
-       up-to-5s thread join. So a SIGKILL during that join still finds the lock
-       released (no stale-lock recovery next boot).
-    4. Stop the source manager and watcher last -- neither touches the chunk
-       cache, so their teardown no longer gates the lock release.
+    2. Release the process lock + clear the WAL IMMEDIATELY. Cheap and
+       upstream-independent; leaves segment writers/mmaps OPEN (closing them here
+       would race the in-flight ``do_get`` reads the drain has not finished).
+       Clearing the WAL early is safe -- index rebuild tolerates a torn tail.
+       After this, even a SIGKILL during the steps below finds the lock released.
+    3. Drain the Flight server, BOUNDED. ``FlightServerBase.shutdown()`` takes no
+       timeout and can block unbounded on an upstream-gated stream, so run it in a
+       daemon thread and join with a short bound; on timeout, proceed (the process
+       is exiting; the OS reclaims the sockets). Never call ``flight_server.wait()``.
+    4. Full cache close ONLY on a clean drain -- closes writers/mmaps for proper
+       finalization (matters on Windows). Skipped if the drain timed out: a stuck
+       in-flight ``do_get`` may still touch an mmap, so closing it could segfault,
+       and the essential work (lock + WAL) already happened in step 2. ``close()``'s
+       own lock-release is then a harmless no-op (already released).
+    5. Stop the source manager (short join) and watcher last -- neither touches the
+       chunk cache and the lock is already gone, so a long join has no value; a
+       short bound keeps a blocked upstream re-list RPC from eating the budget.
 
     Each step is isolated so a failure in one still lets the others run.
     """
+    drain_ok = {"value": False}
 
-    def _close_cache() -> None:
-        # Clear the WAL + release the file-cache process lock (no-op for memory).
+    def _release_lock() -> None:
+        # Cheap, upstream-independent: clear the WAL + drop the process lock while
+        # leaving writers/mmaps open (no-op for the memory backend).
+        manager = CacheManager.get_instance()
+        if manager is not None:
+            manager.release_process_lock()
+
+    def _bounded_drain() -> None:
+        # FlightServerBase.shutdown() blocks until in-flight RPCs finish and takes
+        # no timeout, so on a caching proxy a do_get gated on a dead upstream can
+        # block forever. Bound it: run in a daemon thread, join briefly, and
+        # proceed on timeout. Do NOT call flight_server.wait().
+        if flight_server is None:
+            drain_ok["value"] = True
+            return
+        drain_thread = threading.Thread(
+            target=flight_server.shutdown,
+            name="flight-drain",
+            daemon=True,
+        )
+        drain_thread.start()
+        drain_thread.join(_FLIGHT_DRAIN_TIMEOUT_S)
+        if drain_thread.is_alive():
+            console.print(
+                "[yellow]Flight drain did not finish within "
+                f"{_FLIGHT_DRAIN_TIMEOUT_S:g}s (upstream unresponsive?); "
+                "proceeding -- the process is exiting and the cache lock is "
+                "already released.[/yellow]"
+            )
+        else:
+            drain_ok["value"] = True
+
+    def _close_cache_if_drained() -> None:
+        # Full close (writers/mmaps) only after a clean drain. If the drain timed
+        # out a stuck do_get could still touch an mmap, so closing mid-flight
+        # risks a segfault; the lock + WAL were already handled in step 2.
+        if not drain_ok["value"]:
+            return
         manager = CacheManager.get_instance()
         if manager is not None:
             manager.close()
 
     for label, action in (
         ("precache worker", lambda: precache_worker and precache_worker.stop()),
-        ("flight server", lambda: flight_server and flight_server.shutdown()),
-        ("cache", _close_cache),
-        ("source manager", lambda: source_manager and source_manager.stop()),
+        ("cache lock", _release_lock),
+        ("flight server", _bounded_drain),
+        ("cache", _close_cache_if_drained),
+        # Short join: the lock is already released and the thread is a daemon, so a
+        # long wait has no value and only risks burning the SIGKILL budget on a
+        # blocked upstream re-list.
+        (
+            "source manager",
+            lambda: source_manager and source_manager.stop(join_timeout=1),
+        ),
         ("watcher", lambda: watcher and watcher.stop()),
     ):
         try:
@@ -208,20 +337,26 @@ def _resolve_serve_sources(
             monitored_sources.append(s)  # directory (or not-yet-mounted dir)
             continue
 
+        # A bare-host tensor-server upstream ("mirror everything") is ALWAYS routed
+        # to the background seeded re-list, regardless of `monitor`. Inline
+        # expansion registers every mirrored source through a blocking per-source
+        # upstream get_descriptor RPC *before* mark_ready(), which both keeps the
+        # server STARTING until it finishes (observed ~1h / 900s+ stuck registering
+        # hundreds of hpc__* proxies -- each descriptor an expensive OME-TIFF open
+        # on the upstream) and bypasses the bulk-seed fast path. The re-list instead
+        # seeds the entire catalog in ONE upstream query_sources (no per-source RPC,
+        # biopb/biopb#266) and runs in the background, so the server reaches SERVING
+        # immediately and the mirror fills progressively -- exactly like a monitored
+        # local directory. `monitor=false` on a bare-host upstream is not "static":
+        # it just means the adaptive cadence reconciles once at the boot tick and
+        # then backs off toward full_rescan_interval, rather than never mirroring
+        # the upstream at all (biopb/biopb#178).
+        if _is_bare_host_upstream(s):
+            monitored_sources.append(s)
+            continue
         # Remote monitor entries are also handed to create_source_manager.
         if s.monitor:
             monitored_sources.append(s)
-        # A monitored bare-host tensor-server upstream ("mirror everything") must
-        # NOT be expanded inline here. Inline expansion runs one blocking upstream
-        # RPC per mirrored source *before* mark_ready(), so a large upstream keeps
-        # the server STARTING for minutes -- it never reaches SERVING (observed:
-        # 900s+ stuck registering hundreds of hpc__* proxies). Its sources are
-        # instead discovered and registered in the background by the SourceManager's
-        # periodic upstream re-list (biopb/biopb#178); the first rescan fires
-        # immediately, so the catalog populates progressively -- exactly like a
-        # monitored local directory. Skip the inline expansion.
-        if s.monitor and _is_bare_host_upstream(s):
-            continue
         to_expand.append(s)
 
     # Expand only the non-monitored-dir entries. tolerant=True so one missing or
@@ -359,8 +494,16 @@ def _setup_flight_server(
     static_sources, monitored_sources = _resolve_serve_sources(server_config, registry)
 
     if not static_sources and not monitored_sources:
-        console.print("[yellow]Warning: No data sources configured[/yellow]")
-        raise typer.Exit(1)
+        # An empty catalog is a valid state -- start and serve it (health SERVING,
+        # empty list_flights) rather than exiting. Sources can arrive after
+        # startup: runtime add_source (napari drag-drop), DoPut uploads, or a
+        # monitored dir that is currently empty but fills later. Refusing to boot
+        # would also make the control-plane data-plane supervisor read a healthy
+        # empty server as a crash -> backoff/restart loop (biopb/biopb#515).
+        console.print(
+            "[yellow]No data sources configured; serving an empty catalog "
+            "(sources can be added at runtime).[/yellow]"
+        )
 
     console.print(
         f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
@@ -432,10 +575,21 @@ def _setup_flight_server(
         full_rescan_interval=server_config.full_rescan_interval,
         stable_rescans_required=server_config.stable_rescans_required,
         aggressive_dir_pruning=server_config.aggressive_dir_pruning,
+        # An empty (or all-invalid) source set is a valid runtime state: build an
+        # empty manager and serve an empty catalog rather than refusing to boot
+        # (biopb/biopb#515).
+        allow_empty=True,
     )
 
+    # With allow_empty=True an empty/all-invalid source set yields an empty manager
+    # (served as an empty catalog), so a None here no longer means "no sources" --
+    # it can only be a genuine construction failure. Guard it: the startup code
+    # below dereferences source_manager unconditionally (unlike _graceful_shutdown,
+    # which tolerates None), so fail cleanly rather than with an opaque
+    # AttributeError. This exit is inside serve()/launch()'s try, so the finally
+    # still releases the cache lock (biopb/biopb#515).
     if source_manager is None:
-        console.print("[red]No sources loaded successfully[/red]")
+        console.print("[red]Failed to initialize the source manager[/red]")
         raise typer.Exit(1)
 
     # Wire the runtime add_source handler (tensor-browser drag-drop): the server
@@ -461,7 +615,7 @@ def _setup_flight_server(
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
-        source_manager._on_source_committed = precache_worker.enqueue
+        source_manager.set_source_committed_hook(precache_worker.enqueue)
         # Residency gate (#174): let the worker re-check, at warm time, that a
         # cloud-root source's files are still resident before reading them, so a
         # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
@@ -475,7 +629,7 @@ def _setup_flight_server(
         if precache_worker is not None and server_config.precache.backlog_enabled:
             precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
 
-    source_manager._on_initial_scan_complete = _seed_backlog_on_first_scan
+    source_manager.set_initial_scan_complete_hook(_seed_backlog_on_first_scan)
 
     # Report "a full scan is running" from the first SERVING moment. The
     # background scan sets this itself on entry, but pre-setting here closes the
@@ -510,16 +664,14 @@ def _setup_flight_server(
         # No event loop will drive the bootstrap scan. Two cases:
         #  - monitored dirs but the watcher failed to start: scan synchronously
         #    now so those sources are still registered (the pre-progressive
-        #    behavior for watcher-less setups); _handle_rescan also stamps
-        #    freshness, flips _initial_scan_done, and seeds the backlog.
-        #  - static-only config (no monitored dirs, nothing to scan): drive the
-        #    completion path directly so it still reports a timestamp and seeds.
+        #    behavior for watcher-less setups); run_initial_scan also stamps
+        #    freshness, flips the startup gate, and seeds the backlog.
+        #  - static-only config (no monitored dirs, nothing to scan): advance the
+        #    completion protocol directly so it still reports a timestamp and seeds.
         if monitored_dirs:
-            source_manager._handle_rescan()
+            source_manager.run_initial_scan()
         else:
-            source_manager._initial_scan_done = True
-            server.set_last_full_scan(time.time())
-            _seed_backlog_on_first_scan()
+            source_manager.complete_initial_scan()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 
@@ -537,7 +689,7 @@ def _create_source_adapter(source: SourceConfig, registry=None):
         registry: Optional adapter registry (uses default if None)
 
     Returns:
-        BackendAdapter instance
+        SourceAdapter instance
 
     Raises:
         ValueError: If source type is not registered
@@ -608,22 +760,34 @@ def serve(
     # Token from env var only (no auto-gen for serve - it's non-interactive)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
 
-    server, source_manager, watcher, precache_worker = _setup_flight_server(
-        server_config,
-        host=host,
-        port=port,
-        writable=writable,
-        token=token,
-    )
-
-    location = _grpc_location(host or server_config.host, port or server_config.port)
-    console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
-    console.print("Press Ctrl+C to stop\n")
-
-    # Treat SIGTERM (e.g. `biopb server stop`) like Ctrl+C so shutdown is clean.
-    _install_sigterm_handler()
-
+    # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
+    # cache process lock -- on EVERY exit path, not just a clean serve() return.
+    # _setup_flight_server acquires the lock during cache init and can still raise
+    # afterwards (e.g. a bad static source); keeping it inside the try means such
+    # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
+    server = source_manager = watcher = precache_worker = None
     try:
+        server, source_manager, watcher, precache_worker = _setup_flight_server(
+            server_config,
+            host=host,
+            port=port,
+            writable=writable,
+            token=token,
+        )
+
+        location = _grpc_location(
+            host or server_config.host, port or server_config.port
+        )
+        console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
+        console.print("Press Ctrl+C to stop\n")
+
+        # Treat SIGTERM (e.g. the control supervisor's graceful stop) like Ctrl+C
+        # so shutdown is clean.
+        _install_sigterm_handler()
+        # If launched under the control supervisor, self-terminate when it dies
+        # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
+        _deathwatch.install()
+
         server.serve()
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
@@ -772,7 +936,7 @@ def config_schema(
     """
     import json
 
-    from biopb_tensor_server.config_schema import build_config_schema
+    from biopb_tensor_server.core.config_schema import build_config_schema
 
     text = json.dumps(build_config_schema(), indent=2) + "\n"
     if output is not None:
@@ -816,13 +980,9 @@ def launch(
     token: Optional[str] = typer.Option(
         None,
         "--token",
-        help="Website access token (generated if blank)",
+        help="Access token (required when server.host is non-loopback; "
+        "auto-generated if blank on a public bind)",
         hide_input=True,
-    ),
-    dev_mode: bool = typer.Option(
-        False,
-        "--dev",
-        help="Enable dev mode (skips token check, localhost only)",
     ),
     open_browser: bool = typer.Option(
         False,
@@ -838,11 +998,6 @@ def launch(
         None,
         "--cors",
         help="Extra CORS origin to allow (repeatable). Defaults to --web-url variants.",
-    ),
-    static_dir: Optional[Path] = typer.Option(
-        None,
-        "--static-dir",
-        help="Directory containing static webapp files. If empty, serves API only.",
     ),
     log_file: Optional[str] = typer.Option(
         None,
@@ -861,11 +1016,9 @@ def launch(
 
     Example:
         biopb-tensor-server launch --config biopb-tensor.toml
-        biopb-tensor-server launch -c config.toml --web-port 9000 --dev
+        biopb-tensor-server launch -c config.toml --web-port 9000
         biopb-tensor-server launch -c config.toml --log-level DEBUG
     """
-    import re as _re
-
     # --- Load server config and setup logging ---
     server_config = load_config(config)
 
@@ -877,61 +1030,36 @@ def launch(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
 
-    # --- Determine dev mode ---
-    env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
-    effective_dev_mode = dev_mode or env_dev
-
-    # Enforce: bypass only on localhost
-    if effective_dev_mode and web_host not in ("127.0.0.1", "localhost", "::1"):
-        console.print(
-            "[bold red]SECURITY WARNING:[/bold red] "
-            "BIOPB_WEB_DEV_BYPASS ignored because host is non-local; "
-            "website token enforcement remains enabled."
-        )
-        effective_dev_mode = False
+    # Treat SIGTERM (the control supervisor's graceful stop, `docker/slurm stop`)
+    # like Ctrl+C so the post-uvicorn `finally` below actually runs. uvicorn does
+    # handle SIGTERM for its own HTTP shutdown, but when its event loop closes it
+    # reverts SIGTERM to the default (terminate) disposition -- so the process is
+    # signal-killed (exit 143) before control reaches `_graceful_shutdown`, and
+    # the file-cache process lock is left behind as a stale lock on every control
+    # stop/restart (biopb/biopb#516; #512's lock-release-first reorder is moot on
+    # this path until the finally actually runs). Owning the handler here routes
+    # SIGTERM through `except KeyboardInterrupt`/`finally` instead. Harmless no-op
+    # on Windows, which uses the sentinel-file path in
+    # http_server._install_windows_shutdown_listener.
+    _install_sigterm_handler()
+    # If launched under the control supervisor, self-terminate when it dies
+    # uncatchably so a crashed/killed control never orphans this plane into a
+    # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
+    _deathwatch.install()
 
     # --- Token management ---
-    def _valid_token(t: str) -> bool:
-        t = t.strip()
-        return bool(t) and 16 <= len(t) <= 128 and _re.fullmatch(r"[A-Za-z0-9_\-]+", t)
+    # The flight bind (server.host) is the mode switch; the sidecar's own bind
+    # (--web-host) must never be public-and-unauthenticated. _resolve_launch_token
+    # decides the enforced token fail-closed (and refuses a public sidecar with no
+    # token). There is no separate dev flag.
+    effective_token = _resolve_launch_token(
+        server_config.host,
+        web_host,
+        token,
+        os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+    )
 
-    if effective_dev_mode:
-        effective_token = None
-        console.print(
-            "[yellow]DEV MODE: Website token bypass is active (localhost only).[/yellow]"
-        )
-    else:
-        env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
-        if token and _valid_token(token):
-            effective_token = token.strip()
-        elif env_token and _valid_token(env_token):
-            effective_token = env_token.strip()
-        else:
-            # Prompt up to 3 times, then auto-generate
-            effective_token = None
-            for attempt in range(3):
-                try:
-                    entered = typer.prompt(
-                        "Enter website access token (leave blank to auto-generate)",
-                        default="",
-                        hide_input=True,
-                    )
-                except Exception:
-                    break
-                entered = entered.strip()
-                if not entered:
-                    break
-                if _valid_token(entered):
-                    effective_token = entered
-                    break
-                console.print(
-                    f"[red]Invalid token (attempt {attempt + 1}/3): "
-                    "must be 16-128 URL-safe characters [A-Za-z0-9_-][/red]"
-                )
-            if effective_token is None:
-                effective_token = secrets.token_urlsafe(32)
-                console.print("[yellow]Auto-generated secure access token.[/yellow]")
-
+    if effective_token is not None:
         console.print(
             "\n[bold green]Access URL (shown once — do not share):[/bold green]"
         )
@@ -945,83 +1073,92 @@ def launch(
             markup=False,
         )
         console.print()
-
-    # --- Start Flight server ---
-    flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
-        server_config, token=effective_token
-    )
-
-    # The HTTP sidecar is co-located with the Flight server and reaches it over
-    # the loopback interface. A wildcard bind address is a bind target, not a
-    # valid connect target, so dial the matching loopback explicitly — and match
-    # the address family: the IPv4 wildcard maps to 127.0.0.1, the IPv6 wildcard
-    # to ::1. (A `::`-bound server with IPV6_V6ONLY set — the default on some
-    # hosts — would refuse an IPv4 127.0.0.1 connection.)
-    _flight_connect_host = server_config.host
-    if _flight_connect_host in ("0.0.0.0", ""):
-        _flight_connect_host = "127.0.0.1"
-    elif _flight_connect_host == "::":
-        _flight_connect_host = "::1"
-    flight_location = _grpc_location(_flight_connect_host, server_config.port)
-    flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
-    flight_thread.start()
-
-    if open_browser:
-        url = web_url
-        threading.Timer(1.5, webbrowser.open, args=(url,)).start()
-
-    # --- Build effective CORS origins ---
-    if cors_origins:
-        effective_cors = list(cors_origins)
     else:
-        # Derive CORS origins, expanding loopback aliases for any local hostname
-        from urllib.parse import urlparse as _urlparse
+        console.print(
+            "[yellow]Local mode: no access token (loopback-only bind).[/yellow]"
+        )
 
-        _loopback_aliases: dict = {
-            "localhost": ["127.0.0.1", "[::1]"],
-            "127.0.0.1": ["localhost", "[::1]"],
-            "::1": ["localhost", "127.0.0.1"],
-            "[::1]": ["localhost", "127.0.0.1"],
-        }
+    # --- Start Flight server + HTTP sidecar ---
+    # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
+    # cache process lock -- on EVERY exit path after cache init, not just a clean
+    # uvicorn return. _setup_flight_server acquires the lock during cache init and
+    # can still raise afterwards (e.g. a bad static source, or a bind failure
+    # starting the flight thread below), so keeping the whole startup body inside
+    # the try means such an early exit no longer orphans the lock as a stale lock
+    # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
+    # returns normally on shutdown (it does not re-raise), so cleanup must run in
+    # `finally` rather than an except block regardless.
+    flight_server = source_manager = watcher = precache_worker = None
+    try:
+        flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
+            server_config, token=effective_token
+        )
 
-        def _expand_origin(url: str) -> list:
-            parsed = _urlparse(url)
-            p = parsed.port
-            port_suffix = f":{p}" if p else ""
-            scheme = parsed.scheme
-            hostname = parsed.hostname or "localhost"
-            origins = [f"{scheme}://{hostname}{port_suffix}"]
-            for alias in _loopback_aliases.get(hostname, []):
-                origins.append(f"{scheme}://{alias}{port_suffix}")
-            return origins
+        # The HTTP sidecar is co-located with the Flight server and reaches it over
+        # the loopback interface. A wildcard bind address is a bind target, not a
+        # valid connect target, so dial the matching loopback explicitly — and
+        # match the address family: the IPv4 wildcard maps to 127.0.0.1, the IPv6
+        # wildcard to ::1. (A `::`-bound server with IPV6_V6ONLY set — the default
+        # on some hosts — would refuse an IPv4 127.0.0.1 connection.)
+        _flight_connect_host = server_config.host
+        if _flight_connect_host in ("0.0.0.0", ""):
+            _flight_connect_host = "127.0.0.1"
+        elif _flight_connect_host == "::":
+            _flight_connect_host = "::1"
+        flight_location = _grpc_location(_flight_connect_host, server_config.port)
+        flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
+        flight_thread.start()
 
-        effective_cors = _expand_origin(web_url)
+        if open_browser:
+            url = web_url
+            threading.Timer(1.5, webbrowser.open, args=(url,)).start()
 
-        # When serving the webapp from this same server (--static-dir), also
-        # allow all loopback variants of the server's own address so users
-        # can reach it via localhost or 127.0.0.1 interchangeably.
-        if static_dir:
+        # --- Build effective CORS origins ---
+        if cors_origins:
+            effective_cors = list(cors_origins)
+        else:
+            # Derive CORS origins, expanding loopback aliases for any local
+            # hostname
+            from urllib.parse import urlparse as _urlparse
+
+            _loopback_aliases: dict = {
+                "localhost": ["127.0.0.1", "[::1]"],
+                "127.0.0.1": ["localhost", "[::1]"],
+                "::1": ["localhost", "127.0.0.1"],
+                "[::1]": ["localhost", "127.0.0.1"],
+            }
+
+            def _expand_origin(url: str) -> list:
+                parsed = _urlparse(url)
+                p = parsed.port
+                port_suffix = f":{p}" if p else ""
+                scheme = parsed.scheme
+                hostname = parsed.hostname or "localhost"
+                origins = [f"{scheme}://{hostname}{port_suffix}"]
+                for alias in _loopback_aliases.get(hostname, []):
+                    origins.append(f"{scheme}://{alias}{port_suffix}")
+                return origins
+
+            effective_cors = _expand_origin(web_url)
+
+            # The control front reaches this sidecar over loopback for the data API
+            # + /ws/render, so allow all loopback variants of the server's own
+            # address.
             for origin in _expand_origin(f"http://{web_host}:{web_port}"):
                 if origin not in effective_cors:
                     effective_cors.append(origin)
 
-    # --- Start HTTP sidecar (blocks) ---
-    console.print(
-        f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]"
-    )
-    console.print("Press Ctrl+C to stop\n")
-    # uvicorn installs its own SIGINT/SIGTERM handlers and returns normally on
-    # shutdown (it does not re-raise), so cleanup must run in `finally` rather
-    # than an except block - otherwise the cache lock is never released.
-    try:
+        # --- Start HTTP sidecar (blocks) ---
+        console.print(
+            f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]"
+        )
+        console.print("Press Ctrl+C to stop\n")
         run_http_server(
             flight_location=flight_location,
             token=effective_token,
-            dev_mode=effective_dev_mode,
             host=web_host,
             port=web_port,
             cors_origins=effective_cors,
-            static_dir=str(static_dir) if static_dir else None,
             config_path=str(config),
         )
     except KeyboardInterrupt:

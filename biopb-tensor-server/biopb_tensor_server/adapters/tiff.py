@@ -1,10 +1,11 @@
 """TIFF sequence adapters for tensor storage.
 
 Handles plain TIFF file sequences and legacy MicroManager datasets.
-OME-TIFF files are handled by the aicsimageio adapter.
+OME-TIFF files are handled by OmeTiffAdapter (pure-tifffile).
 """
 
 import json
+import logging
 import math
 import re
 import threading
@@ -15,16 +16,75 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.adapters._scale import (
+    MICRON,
+    mm_summary_scale,
+    scale_by_label,
+    unit_to_um,
+)
+from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
     _is_offline_placeholder,
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+
+logger = logging.getLogger(__name__)
+
+# TIFF ResolutionUnit code -> micrometres per unit (2 = inch, 3 = centimetre).
+# Code 1 ("no absolute unit") carries only an aspect ratio and is excluded.
+_RESUNIT_TO_UM = {2: 25400.0, 3: 10000.0}
+
+# Sentinel for "physical scale not computed yet" -- distinct from a computed
+# ``None`` (no usable calibration), so the memoized result is never recomputed.
+_SCALE_UNSET = object()
+
+
+def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
+    """One axis' pixel size in µm from a TIFF ``X``/``YResolution`` tag.
+
+    A resolution tag is a *density* (pixels per unit), so the pixel size is its
+    reciprocal times the unit's µm length. The unit is the ImageJ calibration
+    unit when the file carries one (``imagej_unit_um`` = its µm factor), else the
+    ``ResolutionUnit`` tag (inch / centimetre) -- but only when that tag is
+    actually present. Returns ``None`` when the resolution tag is absent or zero,
+    when the unit is unusable (e.g. ResolutionUnit 1, aspect-ratio only), and --
+    deliberately -- when ``ResolutionUnit`` is *missing*: the TIFF spec defaults
+    it to inch, but an omitted unit in practice means the density is an
+    uncalibrated aspect ratio as often as it means inches, so assuming inch just
+    fabricates a bogus micron size. Better no scale than a wrong one.
+    """
+    tag = page.tags.get(tag_name)
+    if tag is None:
+        return None
+    val = tag.value
+    if isinstance(val, tuple) and len(val) == 2:
+        num, den = val
+        if not num or not den:
+            return None
+        density = num / den  # pixels per unit
+    else:
+        try:
+            density = float(val)
+        except (TypeError, ValueError):
+            return None
+    if not density:
+        return None
+    per_pixel = 1.0 / density  # units per pixel, in the resolution's own unit
+
+    if imagej_unit_um is not None:
+        return per_pixel * imagej_unit_um
+    ru_tag = page.tags.get("ResolutionUnit")
+    if ru_tag is None:
+        return None  # no explicit unit -- don't assume inch (see docstring)
+    factor = _RESUNIT_TO_UM.get(int(ru_tag.value))
+    if factor is None:
+        return None
+    return per_pixel * factor
 
 
 # OME-TIFF naming patterns owned by the file-level OmeTiffAdapter. Excluded only
@@ -125,7 +185,7 @@ _MIN_PATTERN_FILES = 3
 
 def _common_prefix_len(a: str, b: str) -> int:
     n = 0
-    for ca, cb in zip(a, b):
+    for ca, cb in zip(a, b, strict=False):
         if ca != cb:
             break
         n += 1
@@ -246,12 +306,66 @@ def _resolve_aszarr_axes(axes: str, ndim: int) -> Tuple[int, int, Optional[int]]
     return y_ax, x_ax, page_ax
 
 
+def _read_aszarr_plane(
+    zarr_arr: Any,
+    y_ax: int,
+    x_ax: int,
+    page_ax: Optional[int],
+    page_idx: int,
+    y_slice: slice,
+    x_slice: slice,
+) -> np.ndarray:
+    """Read one (Y, X) plane from an aszarr zarr array at ``page_idx``.
+
+    Indexes via the resolved axis positions (biopb/biopb#220): Y/X take the
+    requested slices, a leading page axis takes ``page_idx``, and every other axis
+    (e.g. a trailing RGB samples axis) is fixed at 0 -- so a ``YXS``/``YXQ`` frame
+    is never read off the wrong axis. Transposes if tifffile ever emits X before Y.
+    Callers resolve axes once via :func:`_resolve_aszarr_axes`; the shared indexing
+    lives here so the sequence and MicroManager read paths cannot drift apart again.
+    """
+    index: List[Any] = [0] * zarr_arr.ndim
+    index[y_ax] = y_slice
+    index[x_ax] = x_slice
+    if page_ax is not None:
+        index[page_ax] = page_idx
+    plane = zarr_arr[tuple(index)]
+    if y_ax > x_ax:  # tifffile emits Y before X; transpose if ever not
+        plane = plane.T
+    return plane
+
+
+class _PerFileTiffLockMixin:
+    """Per-file read locks: serialize reads of the SAME file, parallelize others.
+
+    A single adapter-wide lock made one slow/stalled file read (a cloud/VM I/O
+    stall) freeze every other plane the async viewer and precache worker asked
+    for -- turning one hiccup into a multi-second freeze across unrelated planes.
+    Keyed per file, a stall holds only its own file's lock. The registry holds one
+    small ``Lock`` per distinct file and never needs pruning. Call
+    :meth:`_init_file_locks` from ``__init__`` before any read.
+    """
+
+    def _init_file_locks(self) -> None:
+        self._locks_guard = threading.Lock()
+        self._file_locks: Dict[Path, threading.Lock] = {}
+
+    def _lock_for(self, path: Path) -> threading.Lock:
+        """Return the per-file lock for ``path``, creating it on first use."""
+        with self._locks_guard:
+            lock = self._file_locks.get(path)
+            if lock is None:
+                lock = threading.Lock()
+                self._file_locks[path] = lock
+            return lock
+
+
 # =============================================================================
 # TiffSequenceAdapter - Plain TIFF sequences (no metadata)
 # =============================================================================
 
 
-class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
+class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for plain TIFF file sequences in a directory (no metadata).
 
     Handles datasets where multiple TIFF files form a single logical image:
@@ -413,15 +527,13 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         self.source_id = source_id
         self._source_url = str(directory)
         self._source_type = "tiff-sequence"
-        # Per-file locking (biopb): serialize concurrent reads of the *same* TIFF
-        # while reads of *different* files run in parallel. A single adapter-wide
-        # lock serialized every get_data, so one slow read (a cloud/VM I/O stall)
-        # blocked every other frame the async viewer and the precache worker asked
-        # for -- turning a single hiccup into a multi-second freeze across
-        # unrelated frames. Keyed per file, a stall holds only its own file's
-        # lock; the frame you scrub to takes a different lock and runs.
-        self._locks_guard = threading.Lock()
-        self._file_locks: Dict[Path, threading.Lock] = {}
+        # Per-file read locks (see _PerFileTiffLockMixin): reads of the same TIFF
+        # serialize while reads of different files run in parallel, so one slow
+        # read can't freeze every other frame.
+        self._init_file_locks()
+        # Memoized physical scale: computing it reopens members[0], so cache the
+        # result (incl. a None) after the first call -- see _physical_scale.
+        self._physical_scale_cache: Any = _SCALE_UNSET
 
         # Gather every TIFF in the claimed directory. Unlike claim(), read does
         # NOT exclude OME names: the OME exclusion is a claim-time ownership
@@ -582,22 +694,6 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
 
-    def _lock_for(self, path: Path) -> threading.Lock:
-        """Return the per-file lock for ``path``, creating it on first use.
-
-        Replaces the former adapter-wide ``_io_lock``: reads of different files
-        no longer serialize, so one slow/stalled file read can't freeze the
-        frames the async viewer or the precache worker ask for next. The registry
-        holds one small ``Lock`` per distinct file (185 for a 185-frame sequence
-        -- negligible) and never needs pruning.
-        """
-        with self._locks_guard:
-            lock = self._file_locks.get(path)
-            if lock is None:
-                lock = threading.Lock()
-                self._file_locks[path] = lock
-            return lock
-
     def _read_padded_plane(
         self,
         zarr_arr: Any,
@@ -615,12 +711,10 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         The buffer is sized to the requested ``y_slice`` / ``x_slice`` extent and
         typed as the descriptor dtype, so a frame smaller than the per-axis max
         (``fh`` x ``fw`` is *this* file's plane size) reads back zero-padded and a
-        narrower-dtype frame is cast up. Returns a ``(out_h, out_w)`` array.
-
-        ``y_ax`` / ``x_ax`` / ``page_ax`` are positions within ``zarr_arr`` as
-        resolved by :func:`_resolve_aszarr_axes` -- not assumed to be the last
-        two / leading axis -- so a trailing samples axis (``YXS``/``YXQ``) is
-        indexed at 0 instead of being mistaken for ``X`` (biopb/biopb#220).
+        narrower-dtype frame is cast up. Returns a ``(out_h, out_w)`` array. The
+        clamped inner read goes through the shared :func:`_read_aszarr_plane`
+        (axis resolution incl. the #220 samples-axis fix); this wrapper only adds
+        the pad/cast that a heterogeneous stack needs.
         """
         ys = y_slice.start or 0
         ye = y_slice.stop if y_slice.stop is not None else fh
@@ -629,14 +723,9 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         plane = np.zeros((ye - ys, xe - xs), dtype=self._dtype)
         ry, rx = min(ye, fh), min(xe, fw)
         if ry > ys and rx > xs:
-            index: List[Any] = [0] * zarr_arr.ndim
-            index[y_ax] = slice(ys, ry)
-            index[x_ax] = slice(xs, rx)
-            if page_ax is not None:
-                index[page_ax] = page_idx
-            data = zarr_arr[tuple(index)]
-            if y_ax > x_ax:  # tifffile emits Y before X; transpose if ever not
-                data = data.T
+            data = _read_aszarr_plane(
+                zarr_arr, y_ax, x_ax, page_ax, page_idx, slice(ys, ry), slice(xs, rx)
+            )
             plane[: ry - ys, : rx - xs] = data
         return plane
 
@@ -655,7 +744,10 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
         # Slice math (no I/O) needs no lock; only the per-file read below is
         # synchronized, and per file -- so a slow read of one frame no longer
@@ -746,6 +838,59 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
 
         return result
 
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (µm) from the first member's TIFF resolution tags.
+
+        Memoized: computing it reopens ``members[0]`` to read its page header, so
+        the result (a value *or* a ``None``) is cached after the first call and
+        every later open reuses it instead of reopening the TIFF. See
+        :meth:`_compute_physical_scale` for the projection itself.
+        """
+        if self._physical_scale_cache is _SCALE_UNSET:
+            self._physical_scale_cache = self._compute_physical_scale()
+        return self._physical_scale_cache
+
+    def _compute_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Read the physical scale off ``members[0]`` (see :meth:`_physical_scale`).
+
+        X/Y come from ``X``/``YResolution`` (+ ``ResolutionUnit``, or the ImageJ
+        calibration unit when present); Z, only for a multi-page stack, from the
+        ImageJ ``spacing`` field. The opaque file axis (``i``) and any axis
+        without a tag get ``0.0`` / ``""``. One page-header read of ``members[0]``
+        under its per-file lock. Returns ``None`` when no usable resolution is
+        present.
+        """
+        if not self._tiff_files:
+            return None
+        try:
+            import tifffile
+
+            path = self._tiff_files[0]
+            with self._lock_for(path):
+                with tifffile.TiffFile(str(path)) as tf:
+                    page = tf.pages[0]
+                    ij = tf.imagej_metadata or {}
+                    ij_unit_um = unit_to_um(ij.get("unit"))
+                    x_um = _tiff_pixel_size_um(page, "XResolution", ij_unit_um)
+                    y_um = _tiff_pixel_size_um(page, "YResolution", ij_unit_um)
+                    z_um = None
+                    spacing = ij.get("spacing")
+                    if spacing is not None and ij_unit_um is not None:
+                        try:
+                            z_um = float(spacing) * ij_unit_um
+                        except (TypeError, ValueError):
+                            z_um = None
+            return scale_by_label(
+                self.dim_labels, {"x": x_um, "y": y_um, "z": z_um}, MICRON
+            )
+        except Exception:
+            logger.debug(
+                "tiff-sequence: physical scale unavailable for %s",
+                self._source_url,
+                exc_info=True,
+            )
+            return None
+
     def get_metadata(self) -> dict:
         """Expose per-file provenance so the agent can interpret the file axis.
 
@@ -771,7 +916,7 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
 # =============================================================================
 
 
-class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
+class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for legacy MicroManager datasets with JSON metadata.
 
     Handles MicroManager v1 v2 datasets with metadata.txt containing:
@@ -831,6 +976,15 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         # recognized structurally (a metadata.txt plus img_* TIFFs, all recall-
         # free), so claim it provisionally and resolve on first access. The
         # authoritative Coords map is rebuilt then.
+        #
+        # Deferral is gated on the marker's *residency*, not on ctx.cloud_root --
+        # deliberately unlike TiffSequenceAdapter above (cloud_root-gated). The two
+        # are the codebase's two cloud-defer categories: MM recognizes the dataset
+        # from one cheap marker file (metadata.txt), so residency of that marker is
+        # the right signal and a resident MM dataset resolves eagerly (like OME-Zarr
+        # .zattrs / a single DICOM header); a plain sequence has no marker and its
+        # __init__ opens *every* file, so it must defer wholesale under cloud. See
+        # cloud_phase2_test.py, which patches _is_offline_placeholder in this module.
         if _is_offline_placeholder(v1_metadata):
             # Dir-claiming policy: claim the dir (+ metadata.txt marker) only.
             # The dir claim prunes its whole subtree, so the interior img_*
@@ -853,7 +1007,7 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
             data = json.loads(content)
 
             # Check for MicroManager v1 format markers
-            has_coords = any(k.startswith("Coords-") for k in data.keys())
+            has_coords = any(k.startswith("Coords-") for k in data)
             has_summary = "Summary" in data
 
             if not (has_coords or has_summary):
@@ -952,7 +1106,9 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         self.source_id = source_id
         self._source_url = str(directory)
         self._source_type = "micromanager-legacy"
-        self._io_lock = threading.Lock()
+        # Per-file read locks (see _PerFileTiffLockMixin): a stalled read of one
+        # plane holds only its own file's lock, not every plane's.
+        self._init_file_locks()
 
         # Find and parse metadata file
         metadata_file = self._find_metadata_file(self.directory)
@@ -976,7 +1132,7 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         self._coord_map: Dict[Tuple[int, int, int, int], Path] = {}
         self._file_list: List[Path] = []
 
-        for key in self._raw_metadata.keys():
+        for key in self._raw_metadata:
             if key.startswith("Coords-"):
                 coords = self._raw_metadata[key]
                 # Extract path from key (Coords-Default/<filename> or Coords-<filename>)
@@ -989,8 +1145,23 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
                 chan_idx = coords.get("ChannelIndex", 0)
                 slice_idx = coords.get("SliceIndex", 0)
 
-                # Look for file relative to directory (may be in subdirectory for v2)
+                # The Coords key path is written relative to the acquisition
+                # *parent*, so for a "separate image files" acquisition it carries
+                # a leading position-folder segment (e.g. "Default/img_...").
+                # Which directory this source was claimed at decides how that
+                # resolves: at the acquisition root (a DisplaySettings.json fired
+                # the v2 claim there) the leading segment is real, but with no
+                # DisplaySettings.json the root is invisible and the position
+                # folder's own metadata.txt claims it directly -- so self.directory
+                # *is* that folder and the segment doubles it (biopb/biopb#314).
+                # Try the path as-is, then retry after stripping a leading segment
+                # equal to this directory's own name, so both rootings land on the
+                # same file. (v1 keys carry no prefix and resolve as-is.)
                 file_path = self.directory / filepath_in_key
+                if not file_path.exists():
+                    parts = Path(filepath_in_key).parts
+                    if len(parts) > 1 and parts[0] == self.directory.name:
+                        file_path = self.directory.joinpath(*parts[1:])
                 if file_path.exists():
                     self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = (
                         file_path
@@ -1045,7 +1216,7 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         # Only remove from non-spatial dimensions (keep y, x)
         self.full_shape = []
         self._shape_axes = []
-        for i, (size, axis) in enumerate(zip(initial_shape, shape_axes)):
+        for i, (size, axis) in enumerate(zip(initial_shape, shape_axes, strict=False)):
             if i < len(shape_axes):  # Non-spatial axis
                 if size > 1:  # Keep non-singleton dimensions
                     self.full_shape.append(size)
@@ -1127,84 +1298,73 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slices = tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
-        with self._io_lock:
-            ndim = len(self.full_shape)
+        # Slice math (no I/O) needs no lock; all state read below is immutable
+        # after __init__. Only the per-file read is synchronized, and per file --
+        # so a slow read of one plane no longer blocks reads of other planes.
+        ndim = len(self.full_shape)
 
-            # Extract spatial slices (last 2 axes)
-            y_slice = slices[-2] if len(slices) >= 2 else slice(None)
-            x_slice = slices[-1] if len(slices) >= 1 else slice(None)
+        # Extract spatial slices (last 2 axes)
+        y_slice = slices[-2] if len(slices) >= 2 else slice(None)
+        x_slice = slices[-1] if len(slices) >= 1 else slice(None)
 
-            # Determine coordinate ranges based on shape
-            if ndim == 3:
-                # (channels, y, x)
+        # Determine coordinate ranges based on shape
+        if ndim == 3:
+            # (channels, y, x)
+            chan_slice = slices[0]
+            pos_range = [0]
+            time_range = [0]
+            chan_range = range(
+                chan_slice.start or 0, chan_slice.stop or self._n_channels
+            )
+            z_range = [0]
+        elif ndim == 4:
+            # (channels, z, y, x) or (time, channels, y, x) depending on axis_order
+            if "z" in self.dim_labels[:2]:
+                # (channels, z, y, x) format
                 chan_slice = slices[0]
+                z_slice = slices[1]
                 pos_range = [0]
                 time_range = [0]
                 chan_range = range(
                     chan_slice.start or 0, chan_slice.stop or self._n_channels
                 )
+                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+            else:
+                # (time, channels, y, x) format
+                time_slice = slices[0]
+                chan_slice = slices[1]
+                pos_range = [0]
+                time_range = range(
+                    time_slice.start or 0, time_slice.stop or self._n_times
+                )
+                chan_range = range(
+                    chan_slice.start or 0, chan_slice.stop or self._n_channels
+                )
                 z_range = [0]
-            elif ndim == 4:
-                # (channels, z, y, x) or (time, channels, y, x) depending on axis_order
-                if "z" in self.dim_labels[:2]:
-                    # (channels, z, y, x) format
-                    chan_slice = slices[0]
-                    z_slice = slices[1]
-                    pos_range = [0]
-                    time_range = [0]
-                    chan_range = range(
-                        chan_slice.start or 0, chan_slice.stop or self._n_channels
-                    )
-                    z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-                else:
-                    # (time, channels, y, x) format
-                    time_slice = slices[0]
-                    chan_slice = slices[1]
-                    pos_range = [0]
-                    time_range = range(
-                        time_slice.start or 0, time_slice.stop or self._n_times
-                    )
-                    chan_range = range(
-                        chan_slice.start or 0, chan_slice.stop or self._n_channels
-                    )
-                    z_range = [0]
-            elif ndim == 5:
-                # (time, channels, z, y, x) or (position, channels, z, y, x)
-                if "p" in self.dim_labels:
-                    pos_slice = slices[0]
-                    chan_slice = slices[1]
-                    z_slice = slices[2]
-                    pos_range = range(
-                        pos_slice.start or 0, pos_slice.stop or self._n_positions
-                    )
-                    time_range = [0]
-                    chan_range = range(
-                        chan_slice.start or 0, chan_slice.stop or self._n_channels
-                    )
-                    z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-                else:
-                    time_slice = slices[0]
-                    chan_slice = slices[1]
-                    z_slice = slices[2]
-                    pos_range = [0]
-                    time_range = range(
-                        time_slice.start or 0, time_slice.stop or self._n_times
-                    )
-                    chan_range = range(
-                        chan_slice.start or 0, chan_slice.stop or self._n_channels
-                    )
-                    z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-            elif ndim == 6:
-                # (position, time, channels, z, y, x)
+        elif ndim == 5:
+            # (time, channels, z, y, x) or (position, channels, z, y, x)
+            if "p" in self.dim_labels:
                 pos_slice = slices[0]
-                time_slice = slices[1]
-                chan_slice = slices[2]
-                z_slice = slices[3]
+                chan_slice = slices[1]
+                z_slice = slices[2]
                 pos_range = range(
                     pos_slice.start or 0, pos_slice.stop or self._n_positions
                 )
+                time_range = [0]
+                chan_range = range(
+                    chan_slice.start or 0, chan_slice.stop or self._n_channels
+                )
+                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+            else:
+                time_slice = slices[0]
+                chan_slice = slices[1]
+                z_slice = slices[2]
+                pos_range = [0]
                 time_range = range(
                     time_slice.start or 0, time_slice.stop or self._n_times
                 )
@@ -1212,91 +1372,122 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
                     chan_slice.start or 0, chan_slice.stop or self._n_channels
                 )
                 z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-            else:
-                # Fallback - assume all dimensions except last 2 are 1
-                pos_range = [0]
-                time_range = [0]
-                chan_range = [0]
-                z_range = [0]
+        elif ndim == 6:
+            # (position, time, channels, z, y, x)
+            pos_slice = slices[0]
+            time_slice = slices[1]
+            chan_slice = slices[2]
+            z_slice = slices[3]
+            pos_range = range(pos_slice.start or 0, pos_slice.stop or self._n_positions)
+            time_range = range(time_slice.start or 0, time_slice.stop or self._n_times)
+            chan_range = range(
+                chan_slice.start or 0, chan_slice.stop or self._n_channels
+            )
+            z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+        else:
+            # Fallback - assume all dimensions except last 2 are 1
+            pos_range = [0]
+            time_range = [0]
+            chan_range = [0]
+            z_range = [0]
 
-            # Collect data for each coordinate
-            result_pages = []
-            for pos_idx in pos_range:
-                for time_idx in time_range:
-                    for chan_idx in chan_range:
-                        for slice_idx in z_range:
-                            coord = (pos_idx, time_idx, chan_idx, slice_idx)
-                            file_path = self._coord_map.get(coord)
+        # Collect data for each coordinate
+        result_pages = []
+        for pos_idx in pos_range:
+            for time_idx in time_range:
+                for chan_idx in chan_range:
+                    for slice_idx in z_range:
+                        coord = (pos_idx, time_idx, chan_idx, slice_idx)
+                        file_path = self._coord_map.get(coord)
 
-                            if file_path is None:
-                                # Create empty array for missing data
-                                h = (
-                                    y_slice.stop - (y_slice.start or 0)
-                                    if y_slice.stop
-                                    else self._height
-                                )
-                                w = (
-                                    x_slice.stop - (x_slice.start or 0)
-                                    if x_slice.stop
-                                    else self._width
-                                )
-                                result_pages.append(np.zeros((h, w), dtype=self._dtype))
-                                continue
+                        if file_path is None:
+                            # Create empty array for missing data
+                            h = (
+                                y_slice.stop - (y_slice.start or 0)
+                                if y_slice.stop
+                                else self._height
+                            )
+                            w = (
+                                x_slice.stop - (x_slice.start or 0)
+                                if x_slice.stop
+                                else self._width
+                            )
+                            result_pages.append(np.zeros((h, w), dtype=self._dtype))
+                            continue
 
+                        # Per-file lock (not adapter-wide): a stalled read holds
+                        # only this file's lock, not every plane's.
+                        with self._lock_for(file_path):
                             with tifffile.TiffFile(str(file_path)) as tf:
-                                zarr_arr = zarr.open_array(
-                                    tf.series[0].aszarr(), mode="r"
+                                series = tf.series[0]
+                                zarr_arr = zarr.open_array(series.aszarr(), mode="r")
+                                # Each MM file holds one plane (page 0); resolve Y/X
+                                # from the axes string so an RGB (YXS) frame reads the
+                                # plane, not row 0 (biopb/biopb#220). Shared read path
+                                # with TiffSequenceAdapter.
+                                y_ax, x_ax, page_ax = _resolve_aszarr_axes(
+                                    series.axes, zarr_arr.ndim
                                 )
-                                zarr_ndim = len(zarr_arr.shape)
-                                if zarr_ndim == 2:
-                                    page_data = zarr_arr[y_slice, x_slice]
-                                else:
-                                    page_data = (
-                                        zarr_arr[0, y_slice, x_slice]
-                                        if zarr_ndim >= 3
-                                        else zarr_arr[y_slice, x_slice]
+                                result_pages.append(
+                                    _read_aszarr_plane(
+                                        zarr_arr,
+                                        y_ax,
+                                        x_ax,
+                                        page_ax,
+                                        0,
+                                        y_slice,
+                                        x_slice,
                                     )
-                                result_pages.append(page_data)
+                                )
 
-            # Build output array with proper shape
-            if not result_pages:
-                return np.array([])
+        # Build output array with proper shape
+        if not result_pages:
+            return np.array([])
 
-            # Stack pages and reshape to match the expected shape
-            n_pos = len(pos_range)
-            n_time = len(time_range)
-            n_chan = len(chan_range)
-            n_z = len(z_range)
+        # Stack pages and reshape to match the expected shape
+        n_pos = len(pos_range)
+        n_time = len(time_range)
+        n_chan = len(chan_range)
+        n_z = len(z_range)
 
-            h = result_pages[0].shape[0] if result_pages else 0
-            w = result_pages[0].shape[1] if result_pages else 0
+        h = result_pages[0].shape[0] if result_pages else 0
+        w = result_pages[0].shape[1] if result_pages else 0
 
-            # Stack all pages and reshape
-            result = np.stack(result_pages, axis=0)
+        # Stack all pages and reshape
+        result = np.stack(result_pages, axis=0)
 
-            # Reshape to (pos, time, chan, z, h, w) based on actual ranges
-            if ndim == 2:
-                # Genuine 2-D [y, x] dataset (all non-spatial axes singleton and
-                # dropped from full_shape). result_pages holds exactly one page,
-                # so drop the leading stack axis to match the descriptor rank.
-                result = result.reshape(h, w)
-            elif ndim == 3:
-                result = result.reshape(n_chan, h, w)
-            elif ndim == 4:
-                result = result.reshape(n_chan * n_z, h, w)
-                if "z" in self.dim_labels[:2]:
-                    result = result.reshape(n_chan, n_z, h, w)
-                else:
-                    result = result.reshape(n_time, n_chan, h, w)
-            elif ndim == 5:
-                if "p" in self.dim_labels:
-                    result = result.reshape(n_pos, n_chan, n_z, h, w)
-                else:
-                    result = result.reshape(n_time, n_chan, n_z, h, w)
-            elif ndim == 6:
-                result = result.reshape(n_pos, n_time, n_chan, n_z, h, w)
+        # Reshape to (pos, time, chan, z, h, w) based on actual ranges
+        if ndim == 2:
+            # Genuine 2-D [y, x] dataset (all non-spatial axes singleton and
+            # dropped from full_shape). result_pages holds exactly one page,
+            # so drop the leading stack axis to match the descriptor rank.
+            result = result.reshape(h, w)
+        elif ndim == 3:
+            result = result.reshape(n_chan, h, w)
+        elif ndim == 4:
+            result = result.reshape(n_chan * n_z, h, w)
+            if "z" in self.dim_labels[:2]:
+                result = result.reshape(n_chan, n_z, h, w)
+            else:
+                result = result.reshape(n_time, n_chan, h, w)
+        elif ndim == 5:
+            if "p" in self.dim_labels:
+                result = result.reshape(n_pos, n_chan, n_z, h, w)
+            else:
+                result = result.reshape(n_time, n_chan, n_z, h, w)
+        elif ndim == 6:
+            result = result.reshape(n_pos, n_time, n_chan, n_z, h, w)
 
-            return result
+        return result
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dim pixel size (µm) from the MicroManager ``Summary`` metadata.
+
+        ``PixelSize_um`` (isotropic X/Y) and the z-step onto the ``x`` / ``y`` /
+        ``z`` axes; position / time / channel axes get ``0.0`` / ``""``.
+        """
+        summary = self._raw_metadata.get("Summary", {})
+        return mm_summary_scale(summary, self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Return parsed MicroManager metadata."""

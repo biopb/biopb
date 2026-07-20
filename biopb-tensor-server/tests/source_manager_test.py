@@ -2,16 +2,38 @@
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
     generate_source_id,
 )
-from biopb_tensor_server.source_manager import SourceManager
-from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+from biopb_tensor_server.sources.source_manager import SourceManager
+from biopb_tensor_server.sources.tree_scanner import (
+    EntryState,
+    ScanSnapshot,
+    _WalkContext,
+)
+from biopb_tensor_server.sources.watcher import WatcherEvent, WatcherEventType
+
+
+def _walk_ctx(*, prev_entry_states=None, prev_cloud_entry_states=None, next_state=None):
+    """Build a _WalkContext for unit-testing scanner methods in isolation."""
+    return _WalkContext(
+        now=time.time(),
+        prev_entry_states=prev_entry_states if prev_entry_states is not None else {},
+        prev_cloud_entry_states=(
+            prev_cloud_entry_states if prev_cloud_entry_states is not None else {}
+        ),
+        next_state=next_state if next_state is not None else {},
+        next_cloud={},
+        skipped_dirs=set(),
+        force_full=True,
+        visited_identities=set(),
+    )
 
 
 class _FakeAdapter:
@@ -232,7 +254,7 @@ class TestSourceManagerRegressions:
             source_id=generate_source_id(str(data_path.resolve()), "fake"),
             member_paths={str(data_path.resolve())},
         )
-        assert manager._commit_add_claim(claim) is True
+        assert manager._reconciler._commit_add_claim(claim) is True
 
         server.registered.clear()
         server.unregistered.clear()
@@ -271,7 +293,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -346,30 +368,31 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
         source_id = next(iter(state.claims))
         data_path.unlink()
 
-        original_refresh = manager._refresh_entry_state
-        refresh_calls = {"count": 0}
+        original_scan = manager._scanner.scan
+        scan_calls = {"count": 0}
 
-        def fake_refresh(force_full=False, publish=True):
-            refresh_calls["count"] += 1
-            if refresh_calls["count"] == 1:
-                manager._skipped_stable_dirs = {str(monitored_dir.resolve())}
-                return (
-                    manager._entry_state,
-                    manager._entry_stable_observations,
-                    manager._entry_pending_scan,
-                    manager._skipped_stable_dirs,
-                    {},  # next_cloud (empty: no cloud roots in this test)
+        def fake_scan(**kwargs):
+            scan_calls["count"] += 1
+            if scan_calls["count"] == 1:
+                # First rescan after the change: pretend the monitored subtree was
+                # pruned as stable (entries unchanged, root recorded skipped), so
+                # the claim phase preserves the existing source instead of dropping
+                # it. The next rescan runs the real walk and reaps the deletion.
+                return ScanSnapshot(
+                    entry_states=manager._entry_states,
+                    skipped_dirs={str(monitored_dir.resolve())},
+                    cloud_by_path={},  # no cloud roots in this test
                 )
-            return original_refresh(force_full=force_full, publish=publish)
+            return original_scan(**kwargs)
 
-        monkeypatch.setattr(manager, "_refresh_entry_state", fake_refresh)
+        monkeypatch.setattr(manager._scanner, "scan", fake_scan)
 
         clock["now"] = 101.0
         manager._handle_rescan()
@@ -400,14 +423,18 @@ class TestSourceManagerRegressions:
         )
 
         manager._handle_rescan()
-        previous_entry_state = dict(manager._entry_state)
-        previous_stable_observations = dict(manager._entry_stable_observations)
-        previous_pending_scan = dict(manager._entry_pending_scan)
+        # Value-level snapshot: EntryState is mutable (pending_scan is cleared in
+        # place), so a shallow dict() copy would share objects with the live cache
+        # and a leaked mutation could silently mutate the snapshot too, making the
+        # rollback assertion vacuous. Copy each record so the guarantee is real.
+        previous_entry_states = {
+            k: replace(v) for k, v in manager._entry_states.items()
+        }
         previous_skipped_dirs = set(manager._skipped_stable_dirs)
 
         data_path.write_text("changed")
         monkeypatch.setattr(
-            manager,
+            manager._reconciler,
             "_reconcile_discovered_state",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reconcile failed")),
         )
@@ -415,9 +442,7 @@ class TestSourceManagerRegressions:
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()
 
-        assert manager._entry_state == previous_entry_state
-        assert manager._entry_stable_observations == previous_stable_observations
-        assert manager._entry_pending_scan == previous_pending_scan
+        assert manager._entry_states == previous_entry_states
         assert manager._skipped_stable_dirs == previous_skipped_dirs
 
     def test_process_event_dispatches_rescan(self, tmp_path, monkeypatch):
@@ -467,7 +492,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -505,7 +530,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -553,7 +578,7 @@ class TestSourceManagerRegressions:
         base_time = time.time()
         clock = {"now": base_time}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -615,7 +640,7 @@ class TestSourceManagerRegressions:
         base_time = time.time()
         clock = {"now": base_time}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         # Settle and prune the (empty) root.
@@ -700,7 +725,7 @@ class TestSourceManagerRegressions:
         base_time = time.time()
         clock = {"now": base_time}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         # Settle and prune the (empty) nested subdirectory.
@@ -769,11 +794,11 @@ class TestSourceManagerRegressions:
             source_id=generate_source_id(str(data_path.resolve()), "fake"),
             member_paths={str(data_path.resolve())},
         )
-        assert manager._commit_add_claim(claim) is True
+        assert manager._reconciler._commit_add_claim(claim) is True
         server.unregistered.clear()
         server._metadata_db.removed.clear()
 
-        manager._reconcile_discovered_state(
+        manager._reconciler._reconcile_discovered_state(
             DiscoveryState(),
             unstable_paths=[data_path.resolve()],
         )
@@ -802,7 +827,7 @@ class TestSourceManagerRegressions:
 
         claim = SourceClaim(source_type="fake", primary_path=str(data_path.resolve()))
 
-        assert manager._commit_add_claim(claim) is False
+        assert manager._reconciler._commit_add_claim(claim) is False
         assert state.claims == {}
         assert server.registered == []
         assert server.unregistered == []
@@ -833,7 +858,7 @@ class TestSourceManagerRegressions:
             source_id=generate_source_id(str(first_path.resolve()), "fake"),
             member_paths={str(first_path.resolve())},
         )
-        assert manager._commit_add_claim(first_claim) is True
+        assert manager._reconciler._commit_add_claim(first_claim) is True
 
         conflicting_claim = SourceClaim(
             source_type="fake",
@@ -847,7 +872,7 @@ class TestSourceManagerRegressions:
         server._metadata_db.added.clear()
         server._metadata_db.removed.clear()
 
-        assert manager._commit_add_claim(conflicting_claim) is False
+        assert manager._reconciler._commit_add_claim(conflicting_claim) is False
         assert state.claims == {first_claim.source_id: first_claim}
         assert server.registered == ["different_source_id"]
         assert server.unregistered == ["different_source_id"]
@@ -874,7 +899,7 @@ class TestSourceManagerRegressions:
 
         claim = SourceClaim(source_type="fake", primary_path=str(data_path.resolve()))
 
-        assert manager._commit_add_claim(claim) is False
+        assert manager._reconciler._commit_add_claim(claim) is False
         assert state.claims == {}
         assert len(server.registered) == 1
         assert len(server.unregistered) == 1
@@ -905,7 +930,7 @@ class TestSourceManagerRegressions:
         )
         state.add_claim(claim, notify=False)
 
-        assert manager._commit_remove_source(claim.source_id) is False
+        assert manager._reconciler._commit_remove_source(claim.source_id) is False
         assert claim.source_id in state.claims
 
     def test_unregister_source_claim_completes_when_metadata_remove_fails(
@@ -939,14 +964,14 @@ class TestSourceManagerRegressions:
             source_id=generate_source_id(str(data_path.resolve()), "fake"),
             member_paths={str(data_path.resolve())},
         )
-        assert manager._commit_add_claim(claim) is True
-        assert claim.primary_path in manager._path_to_source_id
+        assert manager._reconciler._commit_add_claim(claim) is True
+        assert claim.primary_path in manager._reconciler._path_to_source_id
 
         # The catalog DELETE raises, but the removal still completes.
-        assert manager._commit_remove_source(claim.source_id) is True
+        assert manager._reconciler._commit_remove_source(claim.source_id) is True
         assert server.unregistered == [claim.source_id]
         # Path map cleaned -- no stale entry to mislead a later re-add/reconcile.
-        assert claim.primary_path not in manager._path_to_source_id
+        assert claim.primary_path not in manager._reconciler._path_to_source_id
         assert claim.source_id not in state.claims
 
     def test_reconcile_changed_source_removes_old_source_when_readd_fails(
@@ -977,7 +1002,7 @@ class TestSourceManagerRegressions:
         server._metadata_db.added.clear()
         server._metadata_db.removed.clear()
 
-        manager._registry = _RegistryWithFailingAdapter()
+        manager._reconciler._registry = _RegistryWithFailingAdapter()
         data_path.write_text("hello world")
 
         manager._handle_rescan()
@@ -987,7 +1012,7 @@ class TestSourceManagerRegressions:
         assert server.unregistered == [source_id]
         assert server._metadata_db.added == []
         assert server._metadata_db.removed == [source_id]
-        assert source_id not in manager._source_signatures
+        assert source_id not in manager._reconciler._source_signatures
 
     def test_rollback_source_registration_survives_rollback_errors(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
@@ -1004,11 +1029,11 @@ class TestSourceManagerRegressions:
             stability_window=0.0,
             probe_open_files=False,
         )
-        manager._path_to_source_id[str(monitored_dir)] = "source-1"
+        manager._reconciler._path_to_source_id[str(monitored_dir)] = "source-1"
 
-        manager._rollback_source_registration("source-1")
+        manager._reconciler._rollback_source_registration("source-1")
 
-        assert manager._path_to_source_id == {}
+        assert manager._reconciler._path_to_source_id == {}
 
     def test_failed_dataset_retries_with_backoff(self, tmp_path, monkeypatch):
         monitored_dir = tmp_path / "monitored"
@@ -1029,27 +1054,29 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
         source_id = generate_source_id(str(data_path.resolve()), "fake")
 
         assert _FlakyAdapter.calls == 1
-        assert manager._failed_sources[source_id].attempts == 1
+        assert manager._reconciler._failed_sources[source_id].attempts == 1
 
         clock["now"] = 100.5
         manager._handle_rescan()
 
         assert _FlakyAdapter.calls == 1
-        assert manager._failed_sources[source_id].attempts == 1
+        assert manager._reconciler._failed_sources[source_id].attempts == 1
 
         clock["now"] = 101.1
         manager._handle_rescan()
 
         assert _FlakyAdapter.calls == 2
-        assert manager._failed_sources[source_id].attempts == 2
-        assert manager._failed_sources[source_id].next_retry_at == pytest.approx(103.1)
+        assert manager._reconciler._failed_sources[source_id].attempts == 2
+        assert manager._reconciler._failed_sources[
+            source_id
+        ].next_retry_at == pytest.approx(103.1)
 
     def test_failed_dataset_logs_are_rate_limited(self, tmp_path, monkeypatch, caplog):
         monitored_dir = tmp_path / "monitored"
@@ -1070,7 +1097,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         caplog.set_level("ERROR")
@@ -1113,15 +1140,19 @@ def _make_signature_manager(monitored_dirs):
 
 
 def _scan(manager):
-    """Run one signature refresh and return its {resolved_path_str: ...} map."""
-    next_state, _obs, _pending, _skipped, _cloud = manager._refresh_entry_state(
-        force_full=True, publish=False
+    """Run one signature refresh and return its {resolved_path_str: EntryState} map."""
+    snapshot = manager._scanner.scan(
+        monitored_dirs=manager._monitored_dirs,
+        cloud_roots=manager._cloud_roots,
+        force_full=True,
+        prev_entry_states=manager._entry_states,
+        prev_cloud_entry_states=manager._cloud_entry_states,
     )
-    return next_state
+    return snapshot.entry_states
 
 
 class TestSignatureScanLoopAndSkip:
-    """The signature/stability scan (_scan_tree_state) must share the claim
+    """The signature/stability scan (TreeScanner._scan_tree_state) must share the claim
     walk's skip policy and never wedge on a directory loop. Symlink-correctness
     alone is not enough: junctions / hardlinks / bind mounts don't present as
     symlinks, so the real guard is filesystem-identity dedup.
@@ -1134,7 +1165,7 @@ class TestSignatureScanLoopAndSkip:
             pytest.skip("symlinks not supported on this platform/filesystem")
 
     def test_terminates_on_symlink_cycle(self, tmp_path):
-        # root/loop -> root is a self-cycle. Before the fix, _scan_tree_state
+        # root/loop -> root is a self-cycle. Before the fix, TreeScanner._scan_tree_state
         # checked is_symlink() on the *resolved* path (always False), so the
         # symlink guard never fired and the cycle recursed to RecursionError.
         root = tmp_path / "monitored"
@@ -1212,13 +1243,13 @@ class TestSignatureScanLoopAndSkip:
         # descents share an identity). Without the depth cap this recurses forever.
         import itertools
 
-        from biopb_tensor_server import source_manager as sm_module
+        from biopb_tensor_server.sources import tree_scanner as ts_module
 
         counter = itertools.count()
         monkeypatch.setattr(
-            sm_module, "get_file_identity", lambda *a, **k: f"id-{next(counter)}"
+            ts_module, "get_file_identity", lambda *a, **k: f"id-{next(counter)}"
         )
-        return sm_module
+        return ts_module
 
     def test_depth_cap_breaks_loop_when_identity_dedup_fails(
         self, tmp_path, monkeypatch
@@ -1226,8 +1257,8 @@ class TestSignatureScanLoopAndSkip:
         # With identity dedup defeated, a tree deeper than the cap must still
         # terminate (no RecursionError that the os.scandir except OSError can't catch
         # and that would kill the refresh thread) and must stop descending at the cap.
-        sm_module = self._defeat_identity_dedup(monkeypatch)
-        monkeypatch.setattr(sm_module, "_MAX_WALK_DEPTH", 4)
+        ts_module = self._defeat_identity_dedup(monkeypatch)
+        monkeypatch.setattr(ts_module, "_MAX_WALK_DEPTH", 4)
 
         root = tmp_path / "monitored"
         deep = root
@@ -1244,8 +1275,8 @@ class TestSignatureScanLoopAndSkip:
         assert str((root / "d0").resolve()) in next_state
 
     def test_depth_cap_logs_warning(self, tmp_path, monkeypatch, caplog):
-        sm_module = self._defeat_identity_dedup(monkeypatch)
-        monkeypatch.setattr(sm_module, "_MAX_WALK_DEPTH", 3)
+        ts_module = self._defeat_identity_dedup(monkeypatch)
+        monkeypatch.setattr(ts_module, "_MAX_WALK_DEPTH", 3)
 
         root = tmp_path / "monitored"
         deep = root
@@ -1291,7 +1322,7 @@ class _FakeStat:
 
 
 class _FakeDirEntry:
-    """``os.DirEntry`` stand-in exposing only what ``_scan_tree_state`` reads."""
+    """``os.DirEntry`` stand-in exposing only what ``TreeScanner._scan_tree_state`` reads."""
 
     def __init__(self, path, stat_result):
         self.path = str(path)
@@ -1305,7 +1336,7 @@ class _FakeDirEntry:
 
 
 class TestCloudInodeBackfillSkip:
-    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``_scan_tree_state``
+    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``TreeScanner._scan_tree_state``
     backfills it with a real ``os.stat``. Under a cloud root that backfill is an
     extra whole network round-trip per entry, so it is skipped (biopb/biopb#190,
     Finding 1). This is correct ONLY because the cloud signature is identity-only
@@ -1325,23 +1356,15 @@ class TestCloudInodeBackfillSkip:
 
         monkeypatch.setattr(os, "stat", _counting_stat)
 
-        next_state, next_cloud = {}, {}
-        manager._scan_tree_state(
-            path=f,
-            now=time.time(),
-            next_state=next_state,
-            next_stable_observations={},
-            next_pending_scan={},
-            next_cloud=next_cloud,
-            skipped_dirs=set(),
-            force_full=True,
-            allow_prune=True,
-            visited_identities=set(),
+        ctx = _walk_ctx()
+        manager._scanner._scan_tree_state(
+            f,
+            ctx,
             is_root=False,
             dir_entry=entry,
             cloud=cloud,
         )
-        return str(f), next_state, next_cloud, backfill_calls
+        return str(f), ctx.next_state, ctx.next_cloud, backfill_calls
 
     def test_cloud_skips_backfill_and_degrades_signature(self, tmp_path, monkeypatch):
         manager = _make_signature_manager({tmp_path})
@@ -1354,8 +1377,7 @@ class TestCloudInodeBackfillSkip:
         # The entry is still recorded, with the signature degraded to the
         # identity-only (0, 0) (residency-invariant, never flaps on hydrate).
         assert path_str in next_state
-        _is_dir, signature, _changed = next_state[path_str]
-        assert signature == (0, 0)
+        assert next_state[path_str].signature == (0, 0)
         assert next_cloud[path_str] is True
 
     def test_non_cloud_still_backfills_inode(self, tmp_path, monkeypatch):
@@ -1368,8 +1390,7 @@ class TestCloudInodeBackfillSkip:
         # load-bearing for the full mtime/size signature and NTFS identity (#56).
         assert backfill_calls == [path_str]
         assert path_str in next_state
-        _is_dir, signature, _changed = next_state[path_str]
-        assert signature[:2] == (7, 4242)  # backfilled (st_dev, st_ino)
+        assert next_state[path_str].signature[:2] == (7, 4242)  # backfilled dev,ino
         assert next_cloud[path_str] is False
 
     def test_get_file_identity_path_hash_fallback_distinguishes_zero_inode(
@@ -1379,7 +1400,7 @@ class TestCloudInodeBackfillSkip:
         # back to hashing the resolved path, so distinct cloud entries still get
         # distinct identities and visited_identities dedup does not collapse the
         # walk into a single (0, 0) bucket.
-        from biopb_tensor_server.discovery import get_file_identity
+        from biopb_tensor_server.core.discovery import get_file_identity
 
         a, b = tmp_path / "a", tmp_path / "b"
         a.mkdir()
@@ -1413,7 +1434,7 @@ class TestProgressiveDiscoveryFreshness:
     def test_first_full_rescan_pushes_freshness_and_fires_callback(self, tmp_path):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
-        manager._on_initial_scan_complete = lambda: fired.append(True)
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
         manager._handle_rescan()
 
@@ -1427,7 +1448,7 @@ class TestProgressiveDiscoveryFreshness:
     def test_incremental_rescan_leaves_freshness_untouched(self, tmp_path):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
-        manager._on_initial_scan_complete = lambda: fired.append(True)
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
         manager._handle_rescan()  # first: force-full
         first_ts = server.last_full_scan_at
@@ -1444,13 +1465,13 @@ class TestProgressiveDiscoveryFreshness:
     def test_failed_first_scan_resets_progress_and_retries(self, tmp_path, monkeypatch):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
-        manager._on_initial_scan_complete = lambda: fired.append(True)
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
         # Fail the reconcile of the first (force-full) scan.
         def boom(*a, **k):
             raise RuntimeError("reconcile failed")
 
-        monkeypatch.setattr(manager, "_reconcile_discovered_state", boom)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", boom)
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()
 
@@ -1467,6 +1488,40 @@ class TestProgressiveDiscoveryFreshness:
         manager._handle_rescan()
         assert manager._initial_scan_done is True
         assert server.last_full_scan_at is not None
+        assert fired == [True]
+
+    def test_run_initial_scan_drives_the_bootstrap_scan(self, tmp_path):
+        # The launcher's public seam for the watcher-less path (biopb/biopb#277 C)
+        # runs one full rescan: same effect as the internal _handle_rescan.
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
+
+        manager.run_initial_scan()
+
+        assert server.scan_in_progress_history == [True, False]
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done is True
+        assert fired == [True]
+
+    def test_complete_initial_scan_advances_protocol_without_walking(self, tmp_path):
+        # The static-only launcher path (biopb/biopb#277 C): no bootstrap scan,
+        # but the startup protocol still stamps freshness, flips the gate, and
+        # fires the one-shot completion hook.
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
+
+        manager.complete_initial_scan()
+
+        # No force-full pass ran, so in_progress was never toggled.
+        assert server.scan_in_progress_history == []
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done is True
+        assert fired == [True]
+
+        # Idempotent: a second call re-stamps freshness but never re-fires.
+        manager.complete_initial_scan()
         assert fired == [True]
 
 
@@ -1499,7 +1554,7 @@ class TestProgressiveStreaming:
         # Under Option B every first-scan add is streamed *during* the walk, so
         # the catalog is already full before the end-of-walk reconcile runs.
         seen_at_reconcile = []
-        orig_reconcile = manager._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_discovered_state
 
         def spy(discovered_state, unstable_paths, force_full=False):
             seen_at_reconcile.append(len(server.registered))
@@ -1507,7 +1562,7 @@ class TestProgressiveStreaming:
                 discovered_state, unstable_paths, force_full=force_full
             )
 
-        monkeypatch.setattr(manager, "_reconcile_discovered_state", spy)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
 
         manager._handle_rescan()
 
@@ -1527,7 +1582,7 @@ class TestProgressiveStreaming:
         (tmp_path / "monitored" / "s2.dat").write_text("data2")
 
         seen_at_reconcile = []
-        orig_reconcile = manager._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_discovered_state
 
         def spy(discovered_state, unstable_paths, force_full=False):
             # The new source is NOT yet registered when reconcile starts: it is
@@ -1537,7 +1592,7 @@ class TestProgressiveStreaming:
                 discovered_state, unstable_paths, force_full=force_full
             )
 
-        monkeypatch.setattr(manager, "_reconcile_discovered_state", spy)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
         manager._handle_rescan()
 
         assert seen_at_reconcile == [2]  # only the original two before reconcile
@@ -1552,7 +1607,7 @@ class TestProgressiveStreaming:
         server, manager = self._manager(tmp_path, n_sources=2)
 
         calls = {"n": 0}
-        orig_reconcile = manager._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_discovered_state
 
         def flaky(discovered_state, unstable_paths, force_full=False):
             calls["n"] += 1
@@ -1562,7 +1617,7 @@ class TestProgressiveStreaming:
                 discovered_state, unstable_paths, force_full=force_full
             )
 
-        monkeypatch.setattr(manager, "_reconcile_discovered_state", flaky)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", flaky)
 
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()
@@ -1648,9 +1703,9 @@ class TestStaticCatalogSeeding:
     """
 
     def test_static_sources_populate_catalog_without_initial_sync(self, tmp_path):
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.metadata_db import MetadataDatabase
-        from biopb_tensor_server.source_manager import create_source_manager
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.sources.source_manager import create_source_manager
 
         db = MetadataDatabase()
         server = _FakeServer()
@@ -1701,42 +1756,51 @@ class TestRescanCarryForwardPrefix:
         # case a bare startswith(root) (no separator) would wrongly include.
         decoy = str(tmp_path / "data_backup" / "x.tif")
         unrelated = str(tmp_path / "other" / "y.tif")
-        sig = (False, (0, 0), 0.0)
-        mgr._entry_state = {
-            root: (True, (0, 0), 0.0),
-            child: sig,
-            deep: sig,
-            decoy: sig,
-            unrelated: sig,
+        prev = {
+            root: EntryState(True, (0, 0), 0.0),
+            child: EntryState(
+                False, (0, 0), 0.0, stable_observations=3, pending_scan=True
+            ),
+            deep: EntryState(False, (0, 0), 0.0, stable_observations=2),
+            decoy: EntryState(False, (0, 0), 0.0),
+            unrelated: EntryState(False, (0, 0), 0.0),
         }
-        mgr._entry_stable_observations = {child: 3, deep: 2}
-        mgr._entry_pending_scan = {child: True}
+        # root already recorded by the walk
+        ctx = _walk_ctx(
+            prev_entry_states=prev, next_state={root: EntryState(True, (0, 0), 0.0)}
+        )
+        mgr._scanner._copy_cached_subtree_entries(root, ctx)
 
-        next_state = {root: (True, (0, 0), 0.0)}  # root already recorded by the walk
-        nso: dict = {}
-        nps: dict = {}
-        mgr._copy_cached_subtree_entries(root, next_state, nso, nps)
-
-        assert set(next_state) - {root} == {child, deep}
-        assert decoy not in next_state  # exact-prefix guard (root + os.sep)
-        assert unrelated not in next_state
-        assert nso == {child: 3, deep: 2}
-        assert nps[child] is True
-        assert nps[deep] is False  # default when no pending record exists
+        assert set(ctx.next_state) - {root} == {child, deep}
+        assert decoy not in ctx.next_state  # exact-prefix guard (root + os.sep)
+        assert unrelated not in ctx.next_state
+        # The whole EntryState is carried, stability fields intact.
+        assert ctx.next_state[child].stable_observations == 3
+        assert ctx.next_state[child].pending_scan is True
+        assert ctx.next_state[deep].stable_observations == 2
+        assert ctx.next_state[deep].pending_scan is False
 
     def test_subtree_has_pending_scan_matches_exact_prefix(self, tmp_path):
         mgr = self._manager(tmp_path)
         root = str(tmp_path / "data")
 
+        def _ctx(path_str, pending):
+            return _walk_ctx(
+                prev_entry_states={
+                    path_str: EntryState(False, (0, 0), 0.0, pending_scan=pending)
+                }
+            )
+
+        scanner = mgr._scanner
         # bare-prefix sibling must not count
-        mgr._entry_pending_scan = {str(tmp_path / "data_backup" / "x.tif"): True}
-        assert mgr._subtree_has_pending_scan(root) is False
+        ctx = _ctx(str(tmp_path / "data_backup" / "x.tif"), True)
+        assert scanner._subtree_has_pending_scan(root, ctx) is False
         # a real pending descendant counts
-        mgr._entry_pending_scan = {str(tmp_path / "data" / "sub" / "f.tif"): True}
-        assert mgr._subtree_has_pending_scan(root) is True
+        ctx = _ctx(str(tmp_path / "data" / "sub" / "f.tif"), True)
+        assert scanner._subtree_has_pending_scan(root, ctx) is True
         # the root's own pending flag does not count (the prune gate handles it)
-        mgr._entry_pending_scan = {root: True}
-        assert mgr._subtree_has_pending_scan(root) is False
+        ctx = _ctx(root, True)
+        assert scanner._subtree_has_pending_scan(root, ctx) is False
         # a non-pending descendant does not count
-        mgr._entry_pending_scan = {str(tmp_path / "data" / "sub" / "f.tif"): False}
-        assert mgr._subtree_has_pending_scan(root) is False
+        ctx = _ctx(str(tmp_path / "data" / "sub" / "f.tif"), False)
+        assert scanner._subtree_has_pending_scan(root, ctx) is False

@@ -18,7 +18,7 @@ import threading
 import time
 from typing import List, Optional
 
-from . import _deathwatch
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -62,24 +62,19 @@ _TENSOR_URL_ENV = "BIOPB_TENSOR_URL"
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines=import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
 # Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no
-# standalone caller).  ``_dask_client`` / ``_dask_cluster`` are set by the
-# bootstrap (both None for the in-process scheduler; for an auto-spun
-# LocalCluster the cluster is closed after the client so workers don't orphan).
+# standalone caller).  ``_dask_client`` is set by the bootstrap (None for the
+# in-process scheduler; a real Client when attached to the session child's
+# distributed cluster). The kernel never owns the cluster, so closing the
+# client is all there is to release here.
 _DASK_RELEASE_SNIPPET = (
     "try:\n"
     "    _dc = globals().get('_dask_client')\n"
     "    if _dc is not None:\n"
     "        _dc.close()\n"
-    "except Exception:\n"
-    "    pass\n"
-    "try:\n"
-    "    _dk = globals().get('_dask_cluster')\n"
-    "    if _dk is not None:\n"
-    "        _dk.close()\n"
     "except Exception:\n"
     "    pass\n"
 )
@@ -182,6 +177,14 @@ class KernelHost:
         # pgid captured at launch so the group-kill never re-derives it from a
         # possibly-dead / pid-recycled kernel pid.
         self._pgid = None
+        # Windows counterpart to the pgid + parent-death pair below: a Job Object
+        # (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) the daemon holds and the kernel is
+        # assigned to at launch. os.killpg does not exist on Windows, so both
+        # POSIX reapers are inert there; the job ties the kernel's whole process
+        # tree to the daemon's handle, so even a force-killed or crashed daemon
+        # reaps the kernel -- GIL state and all (biopb/biopb#403). None off
+        # Windows, or if job creation is unavailable (degrades to the old path).
+        self._winjob = None
         # Launcher-held write end of the parent-death pipe; its closure (on
         # launcher death) makes the kernel self-terminate (failure mode 1).
         self._parent_death_pipe = parent_death_pipe and os.name == "posix"
@@ -229,10 +232,11 @@ class KernelHost:
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
 
-        # Daemon-owned dask cluster (or None). _launch calls ensure() and injects
-        # the scheduler address so the kernel attaches to it instead of spinning
-        # its own; the daemon owns its lifetime, so a kernel restart/reap here
-        # leaves the cluster (and its warm workers) untouched. See _cluster.py.
+        # Session-child-owned dask cluster (or None). _launch calls ensure() and
+        # injects the scheduler address so the kernel attaches to it instead of
+        # spinning its own; the session child owns its lifetime, so a kernel
+        # restart/reap here leaves the cluster (and its warm workers) untouched.
+        # See _cluster.py.
         self._cluster_host = cluster_host
 
     # -- lifecycle ------------------------------------------------------
@@ -314,11 +318,11 @@ class KernelHost:
             if self._tensor_url:
                 env[_TENSOR_URL_ENV] = self._tensor_url
 
-        # Attach this kernel to the daemon-owned dask cluster. ensure() spins it
-        # on the first launch (returning as soon as the scheduler is bound, so
-        # workers register while the kernel imports napari) and returns the cached
-        # address on later launches. None -> the daemon owns no cluster (owner
-        # "kernel", a non-distributed scheduler, an external address, or a spin
+        # Attach this kernel to the session-child-owned dask cluster. ensure()
+        # spins it on the first launch (returning as soon as the scheduler is
+        # bound, so workers register while the kernel imports napari) and returns
+        # the cached address on later launches. None -> the session child owns no
+        # cluster (a non-distributed scheduler, an external address, or a spin
         # failure); the kernel then resolves dask from its own config.
         if self._cluster_host is not None:
             from ._cluster import DASK_ADDRESS_ENV
@@ -382,10 +386,9 @@ class KernelHost:
                     cwd=self._cwd,
                     # Own session/process group so a hard restart — or the
                     # kernel's own parent-death watcher — can group-kill the
-                    # kernel and any subprocess it spawned (arbitrary agent code;
-                    # and, under the `owner="kernel"` escape hatch, a kernel-local
-                    # dask cluster). The daemon-owned cluster lives in the
-                    # *daemon's* group, so this group-kill never touches it.
+                    # kernel and any subprocess it spawned (arbitrary agent
+                    # code). The session child owns the dask cluster in *its*
+                    # group, so this group-kill never touches it.
                     start_new_session=True,
                     **popen_kwargs,
                 )
@@ -402,6 +405,7 @@ class KernelHost:
                         except OSError:
                             pass
             self._pgid = self._capture_pgid()
+            self._assign_kernel_to_job()
             self._kc = self._km.client()
             self._kc.start_channels()
             self._kc.wait_for_ready(timeout=self._startup_timeout)
@@ -410,6 +414,20 @@ class KernelHost:
         except Exception:
             self._shutdown_current()
             raise
+
+    def _assign_kernel_to_job(self):
+        """Windows: put the freshly-launched kernel in the daemon's kill-on-close
+        Job Object, so it (and everything it spawns) dies with the daemon even on
+        an uncatchable force-kill (biopb/biopb#403). No-op on POSIX (the pgid +
+        parent-death pipe cover it) and best-effort -- a failure just leaves the
+        pre-#403 behavior. The job is created once and reused across restarts."""
+        if os.name != "nt":
+            return
+        if self._winjob is None:
+            self._winjob = _winjob.create_kill_on_close_job()
+        pid = self._kernel_pid()
+        if self._winjob is not None and pid is not None:
+            _winjob.assign_process(self._winjob, pid)
 
     def _capture_pgid(self):
         """The kernel's process-group id, read once at launch time."""
@@ -704,6 +722,12 @@ class KernelHost:
                 except Exception:
                     logger.debug("graceful close on shutdown failed", exc_info=True)
             self._shutdown_current()
+            # Terminal path only (restart() drives _shutdown_current directly and
+            # must keep the job): drop the job handle so it doesn't leak and its
+            # closure fires kill-on-close as a final backstop (biopb/biopb#403).
+            if self._winjob is not None:
+                _winjob.close_job(self._winjob)
+                self._winjob = None
 
     def _shutdown_current(self):
         # The kernel is going away: tools must wait for the next successful
@@ -724,6 +748,14 @@ class KernelHost:
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 logger.debug("killpg failed", exc_info=True)
+
+        # Windows has no killpg; TerminateJobObject is the from-outside tree-kill
+        # equivalent -- it reaps the kernel and everything it spawned, and works
+        # even if km.shutdown_kernel below is wedged or raises (biopb/biopb#403).
+        # The handle is kept open (closed only in shutdown()) so a restart reuses
+        # it and it stays the kill-on-close backstop for daemon death.
+        if os.name == "nt" and self._winjob is not None:
+            _winjob.terminate_job(self._winjob)
 
         try:
             if self._km is not None:
