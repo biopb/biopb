@@ -57,13 +57,11 @@ def reset_server_state():
     old_host = _server._kernel_host
     old_promote = _server._promote_after
     old_headless = _server._headless
-    old_skills = _server._skills_enabled
     old_instructions = _server.mcp._mcp_server.instructions
     yield
     _server._kernel_host = old_host
     _server._promote_after = old_promote
     _server._headless = old_headless
-    _server._skills_enabled = old_skills
     _server.mcp._mcp_server.instructions = old_instructions
 
 
@@ -191,37 +189,9 @@ class TestSetHeadless:
         # resource -- see also execute_code's docstring.
         assert 'format="pandas"' in base
         assert "source_url" in base
-        # Skills are opt-in: the base guidance must not point the agent at
-        # find_skills, which returns nothing unless the catalog is enabled.
-        assert "find_skills" not in base
-        # And they are advertised when visible (no headless / skills directive).
+        # And they are advertised when visible (no headless directive).
         _server.set_headless(False)
-        _server.set_skills_enabled(False)
         assert _server.mcp._mcp_server.instructions == base
-
-    def test_skills_directive_gated_on_enable(self):
-        # Off (default): no find_skills mention in the handshake.
-        _server.set_headless(False)
-        _server.set_skills_enabled(False)
-        assert "find_skills" not in _server.mcp._mcp_server.instructions
-        # On: the skills fragment is appended to the base guidance.
-        _server.set_skills_enabled(True)
-        instr = _server.mcp._mcp_server.instructions
-        assert instr.startswith(_server._BASE_INSTRUCTIONS)
-        assert "find_skills" in instr
-        assert "skill://" in instr
-        # Back off: no stale fragment left behind.
-        _server.set_skills_enabled(False)
-        assert _server.mcp._mcp_server.instructions == _server._BASE_INSTRUCTIONS
-
-    def test_skills_and_headless_compose(self):
-        _server.set_headless(True)
-        _server.set_skills_enabled(True)
-        instr = _server.mcp._mcp_server.instructions
-        # Base first, then the skills fragment, then the headless directive.
-        assert instr.startswith(_server._BASE_INSTRUCTIONS)
-        assert "find_skills" in instr
-        assert instr.index("find_skills") < instr.index("HEADLESS")
 
     def test_headless_appends_directive_to_base_instructions(self):
         _server.set_headless(True)

@@ -190,18 +190,9 @@ def _config():
     return CONFIG.as_dict()
 
 
-# Sentinel: "no default supplied" -> defer to get_setting's DEFAULT_CONFIG
-# fallback, so a skills default is declared once (in _config.py) and never
-# restated here (a restated literal is how skills_enabled's default silently
-# diverged once already).
-_UNSET = object()
-
-
-def _setting(path: str, default=_UNSET):
+def _setting(path: str, default=None):
     from .._config import get_setting
 
-    if default is _UNSET:
-        return get_setting(_config(), path)
     return get_setting(_config(), path, default)
 
 
@@ -213,10 +204,10 @@ def load_catalog(*, force: bool = False) -> list[dict]:
     cache beats nothing), then the bundled snapshot. Returns ``[]`` when the
     feature is disabled or every source fails.
     """
-    if not _setting("services.skills_enabled"):
+    if not _setting("services.skills_enabled", True):
         return []
-    ttl = _setting("services.skills_cache_ttl")
-    url = _setting("services.skills_catalog_url")
+    ttl = _setting("services.skills_cache_ttl", 3600)
+    url = _setting("services.skills_catalog_url", "")
 
     with _lock:
         if (
