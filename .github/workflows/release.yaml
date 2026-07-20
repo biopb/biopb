@@ -421,25 +421,13 @@ jobs:
       # opts into candidates on demand). The guard job already blocks an off-main
       # final tag, so no on-main recheck is needed here. Served from a reserved
       # /install/ subtree that biopb-site's deploy excludes from its --delete
-      # (mirrors api-docs.yaml's /docs/api/). `bash -n` first: a broken install.sh
-      # would break every `curl | bash`, so refuse to publish it (the release is
-      # already out and installable; only the live URL is held back, and the run
-      # reddens to alert).
+      # (mirrors api-docs.yaml's /docs/api/). The scripts were already pinned and
+      # parse-checked by "Pin installers to this release" above (same job, same
+      # tree, nothing touches install/ in between), so this step just mirrors them.
       - name: Publish install scripts to biopb.org
         if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
         run: |
           set -euo pipefail
-          # The scripts were already pinned to this tag by "Pin installers to this
-          # release" above; this step only mirrors them to the canonical URL, gated
-          # to STABLE (the URL tracks the latest stable release). Re-verify the pin
-          # and re-parse so a logic slip upstream can never publish an unpinned or
-          # broken installer to the URL every `curl | bash` hits.
-          grep -qE '^BIOPB_PINNED_RELEASE="release-v[0-9]' install/install.sh \
-            || { echo "::error::install.sh is not pinned; refusing to publish"; exit 1; }
-          bash -n install/install.sh
-          test -s install/install.ps1
-          test -s install/biopb-engine.ps1
-
           # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
           # renamed/removed upstream) -- mirrors api-docs.yaml.
