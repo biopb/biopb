@@ -908,9 +908,15 @@ function Invoke-BiopbInstall {
     $ReleaseRepo  = "biopb/biopb"
     $ReleaseTagPrefix = "release-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
-    $DataDir     = Get-BiopbTree "XDG_DATA_HOME" ".local\share"
-    $WebappDir   = Join-Path $DataDir "webapp"
-    $SamplesDir  = Join-Path $DataDir "samples"
+    # Data TREE root (webapp/ and samples/ live under it) -- deliberately NOT named
+    # $DataDir: that is the -DataDir parameter carrying the user's chosen source
+    # folder (BIOPB_DATA_DIR). #484 reused the $DataDir name here, silently
+    # clobbering the parameter -- which forced $effectiveDataDir to the data root,
+    # so $seedSamples was always false (samples never seeded) and BIOPB_DATA_DIR was
+    # ignored. Keep the two distinct.
+    $DataRoot    = Get-BiopbTree "XDG_DATA_HOME" ".local\share"
+    $WebappDir   = Join-Path $DataRoot "webapp"
+    $SamplesDir  = Join-Path $DataRoot "samples"
     $ConfigDir   = Get-BiopbTree "XDG_CONFIG_HOME" ".config"
     $LocalBin    = Join-Path $BiopbHome ".local\bin"
 
