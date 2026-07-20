@@ -151,7 +151,17 @@ single source of truth.
 |---|---|---|
 | `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb`) + Maven Central (`biopb` Java) + Docker `biopb-image-base:A` |
 | `server-v*` | `tensor-server-ci` | Docker `biopb-tensor-server:S` |
-| `release-v*` | `release.yaml` | GitHub release (wheel set + sdist + webapp + samples + installers) |
+| `release-v*` | `release.yaml` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag, the canonical `biopb.org/{install.sh,install.ps1,biopb-engine.ps1}` |
+
+The canonical install scripts are published by a **step inside `release.yaml`**,
+after the GitHub release is created (formerly a standalone push-to-main
+`install-scripts.yaml`). Folding it in means the live installer publishes *only*
+if the release succeeds — a failed release can never leave a `biopb.org`
+installer newer than any release it can install. The step is gated to a **stable**
+tag: the `guard` job already blocks an off-main final tag, and prereleases
+(`…rc/a/b`) are skipped so the canonical URL keeps tracking the latest stable
+release (`install.sh` defaults to stable; `BIOPB_INSTALL_RC=1` opts into
+candidates on demand).
 
 `mcp-ci` and `control-ci` keep their PR test/build jobs but **do not publish**.
 `tensor-server-ci` and `image-runtime-ci` keep their PR test/verify-build jobs and

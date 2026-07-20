@@ -614,6 +614,71 @@ _seed_samples() {
     rm -rf "$tmpdir"
 }
 
+# Whether `pid` is alive AND is a biopb process (not a reused PID). We only
+# force-kill PIDs whose command line still mentions biopb, so a stale pidfile
+# pointing at a since-recycled PID never takes out an unrelated process.
+_pid_is_biopb() {
+    local pid="$1" cmd=""
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    else
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null)   # macOS / no procfs
+    fi
+    case "$cmd" in
+        *biopb*) return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Stop every biopb service this machine might be running, robustly across release
+# lines. `biopb control stop` alone is NOT enough on two paths that matter here:
+#   - Pre-upgrade, `biopb` on PATH is still the OLD binary. v0.10 and earlier had
+#     no `control` subcommand at all -- the services were `biopb server` and
+#     `biopb mcp` -- so `control stop` just errors and their daemons keep holding
+#     the gRPC/http ports; the freshly installed control plane then refuses to
+#     bind (port conflict) and the upgrade appears to "not start".
+#   - A daemon started out-of-band, or one whose control plane is wedged, isn't
+#     reachable through any CLI verb we can call.
+# So try every known stop verb (an absent subcommand is a harmless nonzero exit),
+# then fall back to killing whatever the recorded pidfiles still point at. The
+# pidfile locations are version-independent constants, so this works without
+# knowing which release wrote them. Best-effort throughout.
+_stop_all_biopb_services() {
+    if command -v biopb >/dev/null 2>&1; then
+        biopb control stop >/dev/null 2>&1 || true   # v0.11+ control plane
+        biopb server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
+        biopb mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
+    fi
+
+    # Fallback: SIGTERM (then SIGKILL) any biopb PID still recorded in a known
+    # pidfile, then drop the file. control.pid is XDG-state aware; the legacy
+    # daemons hard-coded ~/.local/share (not XDG), so probe both.
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local share_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local pidfile pid tries
+    for pidfile in \
+        "$state_dir/control.pid" \
+        "$HOME/.local/share/biopb/tensor-server.pid" \
+        "$share_dir/biopb/tensor-server.pid" \
+        "$HOME/.local/share/biopb-mcp/mcp-server.pid" \
+        "$share_dir/biopb-mcp/mcp-server.pid"; do
+        [ -f "$pidfile" ] || continue
+        IFS= read -r pid < "$pidfile" 2>/dev/null || pid=""
+        pid=${pid//[!0-9]/}   # first line may be "pid<newline>token"; keep digits
+        if [ -n "$pid" ] && _pid_is_biopb "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            tries=0
+            while [ "$tries" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 0.2
+                tries=$((tries + 1))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile" 2>/dev/null || true
+    done
+}
+
 # Print the tail of the server log, indented, for diagnosing a bad startup.
 _tail_log() {
     local log="$1"
@@ -649,9 +714,9 @@ _start_control_plane() {
     # Belt-and-suspenders: the real upgrade stop already ran before uv tool
     # install (above), so this is a no-op on a clean upgrade path. Kept for the
     # first-install case where a pre-existing plane was started out-of-band and
-    # the pre-install stop missed it, and the "standalone biopb server" legacy
-    # case noted below. Best-effort.
-    biopb control stop >/dev/null 2>&1 || true
+    # the pre-install stop missed it, and the legacy <=v0.10 server/mcp daemon
+    # case. Best-effort.
+    _stop_all_biopb_services
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
@@ -1166,15 +1231,15 @@ install_biopb() {
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so
     # the next agent reconnect already brings up the just-installed code.
     #
-    # Stop the control plane (and the data plane it owns) BEFORE swapping the
-    # binary. The old binary reads control.pid from the old path it was written
-    # to; stopping before uv tool install means reader+writer agree on the
-    # location, and the new binary's control start binds clean ports. Best-effort;
-    # a no-op on a first install (no biopb on PATH).
-    if command -v biopb >/dev/null 2>&1; then
-        _info "Stopping any running biopb control plane before upgrade..."
-        biopb control stop >/dev/null 2>&1 || true
-    fi
+    # Stop every running biopb service (and the data plane it owns) BEFORE
+    # swapping the binary, so the new control start binds clean ports. This must
+    # be robust across release lines: on an upgrade `biopb` on PATH is still the
+    # OLD binary, and v0.10-and-earlier has no `control` subcommand, so a bare
+    # `biopb control stop` would leave its `server`/`mcp` daemons holding the
+    # ports. _stop_all_biopb_services covers both eras (CLI verbs + pidfile kill).
+    # No-op on a first install (no biopb on PATH, no pidfiles).
+    _info "Stopping any running biopb services before upgrade..."
+    _stop_all_biopb_services
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -1571,15 +1636,12 @@ uninstall_biopb() {
     # 1. Stop the daemons first. On some platforms a live process keeps its files
     #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
     #    engine hits exactly this — os error 5), so stopping precedes removal.
-    #    The control plane goes first: it owns the data plane, so `control stop` is a
-    #    complete teardown of that pair and stops it respawning what follows.
+    #    _stop_all_biopb_services tears down the control plane AND the legacy
+    #    <=v0.10 server/mcp daemons (an old install being uninstalled by a newer
+    #    script), falling back to pidfile kills for anything the CLI can't reach.
     _step "[1/3] Stopping biopb services..."
-    if command -v biopb &>/dev/null; then
-        biopb control stop &>/dev/null || true
-        _ok "biopb services stopped (if they were running)"
-    else
-        _info "biopb command not on PATH; nothing to stop"
-    fi
+    _stop_all_biopb_services
+    _ok "biopb services stopped (if they were running)"
 
     # 2. Unregister from agents BEFORE removing the package, while `claude` and
     #    the config paths are still meaningful.
