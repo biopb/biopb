@@ -233,7 +233,9 @@ class TestDefaultConfig:
     def test_skills_are_flat_scalars(self):
         """The former services.skills object is flattened to scalar leaves."""
         services = DEFAULT_CONFIG["services"]
-        assert services["skills_enabled"] is True
+        # Skills are opt-in: off by default (biopb/biopb-mcp), but the catalog
+        # URL/TTL leaves are still present for anyone who flips the switch on.
+        assert services["skills_enabled"] is False
         assert services["skills_catalog_url"].startswith("https://")
         assert services["skills_cache_ttl"] == 3600
         # No nested object survives.
