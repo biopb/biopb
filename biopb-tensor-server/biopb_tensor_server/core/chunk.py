@@ -8,6 +8,7 @@ This module contains:
 """
 
 import logging
+import os
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
@@ -39,8 +40,174 @@ logger = logging.getLogger(__name__)
 # - 2 bytes: ndim (uint16, big-endian)
 # - 8*ndim bytes: bounds.start (int64, big-endian)
 # - 8*ndim bytes: bounds.stop (int64, big-endian)
-# - [scaled only] 8*ndim bytes: scale_hint (int64) + 2 bytes method len + method
+# - [scaled only] 8*ndim bytes: scale_hint (int64)
+#
+# The chunk_id is pure IDENTITY (array_id + bounds + scale_hint). The scaled form
+# used to carry a trailing reduction_method (uint16 len + bytes), but the cache
+# key always stripped it (advisory, biopb/biopb#76) and the compute path is the
+# only consumer -- so the method left the wire format entirely (biopb/biopb#178).
+# A cold downsample uses the server default; see core.base.resolve_chunk_data.
+# (An older chunk_id that still carries a method suffix stays readable: decode /
+# is_scaled / cache_key all ignore the trailing bytes, so no cache wipe is needed.)
+#
+# content_version wrapper (biopb/biopb#178)
+# -----------------------------------------
+# An OPTIONAL content-version header may be prepended, folding a source's
+# content_version into the chunk_id (and hence the cache key) so a re-registered
+# source with new bytes can't be masked by a stale cached chunk. A legacy
+# chunk_id always begins with ``struct.pack(">I", array_id_len)`` whose high byte
+# is 0x00 (array_id is far under 16 MB), so a leading 0xFF sentinel is an
+# unambiguous, backward-compatible discriminator: an UNVERSIONED chunk_id is byte
+# -identical to the pre-#178 format (existing cache entries stay valid), and the
+# version, when present, is a constant header the read-plan mint precomputes once
+# and prepends to every chunk_id (so the per-chunk cost is one concat, not a
+# re-encode). The whole codec strips this header first, so decode / scale / rewrite
+# operate on the inner legacy chunk_id and only cache_key_for_chunk_id keeps the
+# version (that is the point -- a different version -> a different key -> the old
+# entry is un-lookupable, not mis-served). Clients treat the whole thing as opaque.
 # =============================================================================
+
+_CV_SENTINEL = 0xFF  # leading byte marking a version-wrapped chunk_id
+_CV_FORMAT = 1  # wrapper layout version (after the sentinel byte)
+
+
+def _version_header(content_version: bytes) -> bytes:
+    """The constant prefix that wraps a chunk_id with a content_version.
+
+    ``[0xFF sentinel][uint8 fmt][uint32 cv_len][cv bytes]``. Precompute once per
+    read plan (content_version is constant across a source's chunks) and prepend.
+    """
+    return (
+        struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT, len(content_version))
+        + content_version
+    )
+
+
+def wrap_content_version(inner_chunk_id: bytes, content_version: bytes) -> bytes:
+    """Prepend a content_version header to a legacy (inner) chunk_id."""
+    return _version_header(content_version) + inner_chunk_id
+
+
+def _split_version(chunk_id: bytes) -> Tuple[Optional[bytes], bytes]:
+    """Split a chunk_id into ``(content_version | None, inner_legacy_chunk_id)``.
+
+    Unversioned chunk_ids (no 0xFF sentinel) pass through unchanged, so every
+    codec function below can strip first and reuse the pre-#178 logic verbatim.
+    """
+    if not chunk_id or chunk_id[0] != _CV_SENTINEL:
+        return None, chunk_id
+    cv_len = struct.unpack(">I", chunk_id[2:6])[0]
+    inner_offset = 6 + cv_len
+    return chunk_id[6:inner_offset], chunk_id[inner_offset:]
+
+
+def content_version_of(chunk_id: bytes) -> Optional[bytes]:
+    """The chunk_id's content_version, or None if it carries no version header."""
+    return _split_version(chunk_id)[0]
+
+
+# =============================================================================
+# Proxy envelope (biopb/biopb#178 W1)
+# -----------------------------------------------------------------------------
+# A remote-tensor proxy wraps the UPSTREAM's chunk_id in an envelope instead of
+# decoding/rewriting it (the old opacity violation). The inner upstream chunk_id
+# is carried VERBATIM -- the proxy never parses it -- alongside a proxy-owned
+# ``route`` (the local array_id, used to dispatch to the proxy adapter without
+# decoding the inner) and the upstream's ``content_version`` (may be empty).
+#
+# Layout: ``[0xFE sentinel][uint8 fmt][uint32 route_len][route][uint32 cv_len][cv]
+#          [inner: opaque upstream chunk_id]``
+#
+# 0xFE is a third discriminator, mutually exclusive with the 0x00 legacy high byte
+# and the 0xFF content_version sentinel, so any codec entry point can tell the
+# three apart from byte 0. Because the inner is method-free (#178 made chunk_ids
+# identity-only), the whole envelope is an injective, reduction_method-independent
+# cache key -- see cache_key_for_chunk_id.
+# =============================================================================
+
+_ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
+_ENV_FORMAT = 1  # envelope layout version (after the sentinel byte)
+
+
+def is_proxy_envelope(chunk_id: bytes) -> bool:
+    """True if ``chunk_id`` is a proxy envelope (leading 0xFE sentinel)."""
+    return bool(chunk_id) and chunk_id[0] == _ENV_SENTINEL
+
+
+def encode_proxy_envelope(
+    inner_chunk_id: bytes, route: str, content_version: Optional[bytes]
+) -> bytes:
+    """Wrap an opaque upstream ``inner_chunk_id`` in a proxy envelope.
+
+    ``route`` is the proxy's LOCAL array_id (how the server dispatches the chunk
+    back to this adapter); ``content_version`` is the upstream source's version
+    (``None``/empty when the upstream is unversioned). The inner is stored and
+    later forwarded byte-for-byte -- the proxy never interprets it.
+    """
+    route_bytes = route.encode("utf-8")
+    cv = content_version or b""
+    return (
+        struct.pack(">BBI", _ENV_SENTINEL, _ENV_FORMAT, len(route_bytes))
+        + route_bytes
+        + struct.pack(">I", len(cv))
+        + cv
+        + inner_chunk_id
+    )
+
+
+def peel_proxy_envelope(chunk_id: bytes) -> Tuple[str, Optional[bytes], bytes]:
+    """Split a proxy envelope into ``(route, content_version | None, inner)``.
+
+    Inverse of :func:`encode_proxy_envelope`. A zero-length content_version field
+    decodes back to ``None``. ``inner`` is the verbatim upstream chunk_id.
+    """
+    route_len = struct.unpack(">I", chunk_id[2:6])[0]
+    offset = 6 + route_len
+    route = chunk_id[6:offset].decode("utf-8")
+    cv_len = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
+    offset += 4
+    cv = chunk_id[offset : offset + cv_len]
+    offset += cv_len
+    inner = chunk_id[offset:]
+    return route, (cv if cv_len > 0 else None), inner
+
+
+def routing_array_id(chunk_id: bytes) -> str:
+    """The local array_id used to dispatch ``chunk_id`` to its adapter.
+
+    For a proxy envelope the ``route`` token IS the local array_id (the inner is
+    opaque and never decoded); otherwise decode it from the (possibly
+    version-wrapped) chunk_id. This is the one entry point the server routing uses
+    so an envelope never reaches :func:`decode_chunk_id`, which would misparse it.
+    """
+    if is_proxy_envelope(chunk_id):
+        return peel_proxy_envelope(chunk_id)[0]
+    return decode_chunk_id(chunk_id)[0]
+
+
+def content_version_from_path(path: object) -> Optional[bytes]:
+    """Best-effort content_version for a local file/dir source (biopb/biopb#178).
+
+    The stat signature ``mtime_ns:size`` -- O(1), no read, already the cheap
+    change signal ``build_entry_signature`` uses. For a directory source this is
+    the directory's own mtime, which flips on member add/remove/rename (the right
+    O(1) signal for multi-file sources). Returns None when the path can't be
+    stat'd (e.g. a remote URL / cloud store), leaving the source unversioned.
+
+    Blind spots (documented, best-effort per #178):
+    - an in-place edit that preserves mtime+size is undetectable;
+    - two changes closer together than the filesystem's mtime resolution coalesce
+      into one signal (observed ~sub-20ms on Windows dir mtimes).
+    Since content_version is sampled once at (re-)registration -- events that are
+    seconds apart -- neither blind spot bites the cache-invalidation use case.
+    A source needing byte-exact freshness wants an explicit ``volatile`` /
+    content-hash mode, not this signal.
+    """
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError, TypeError):
+        return None
+    return f"{st.st_mtime_ns}:{st.st_size}".encode()
 
 
 def encode_chunk_id(
@@ -79,15 +246,18 @@ def rewrite_chunk_id_array_id(chunk_id: bytes, new_array_id: str) -> bytes:
     / ``decode_scale_info`` all recompute their offsets from the (new) length
     prefix.
     """
-    old_len = struct.unpack(">I", chunk_id[:4])[0]
-    tail = chunk_id[4 + old_len :]
+    cv, inner = _split_version(chunk_id)
+    old_len = struct.unpack(">I", inner[:4])[0]
+    tail = inner[4 + old_len :]
     new_bytes = new_array_id.encode("utf-8")
-    return struct.pack(">I", len(new_bytes)) + new_bytes + tail
+    rewritten = struct.pack(">I", len(new_bytes)) + new_bytes + tail
+    return wrap_content_version(rewritten, cv) if cv is not None else rewritten
 
 
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
     """Decode array_id and bounds from chunk_id. Works for both regular
-    and virtual chunk_ids (ignores virtual payload)."""
+    and virtual chunk_ids (ignores virtual payload) and version-wrapped ones."""
+    _, chunk_id = _split_version(chunk_id)
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
@@ -120,35 +290,26 @@ def encode_chunk_id_with_scale(
     array_id: str,
     bounds: ChunkBounds,
     scale_hint: Tuple[int, ...],
-    reduction_method: str,
 ) -> bytes:
-    """Encode chunk_id with bounds and scale info appended.
+    """Encode an identity scaled chunk_id: bounds encoding + scale_hint.
 
-    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64), then
-    2 bytes method length (uint16) + method string. Detection: if
-    ``len(chunk_id) > bounds_end``, it's a scaled chunk.
+    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64).
+    Detection: if ``len(chunk_id) > bounds_end``, it's a scaled chunk. The
+    reduction_method is NOT encoded -- it is advisory and sourced server-side at
+    compute time (biopb/biopb#178, #76).
     """
     base = encode_chunk_id(array_id, bounds)
-
-    method_bytes = reduction_method.encode("utf-8")
-
-    scale_payload = b"".join(
-        [
-            b"".join(struct.pack(">q", s) for s in scale_hint),
-            struct.pack(">H", len(method_bytes)),
-            method_bytes,
-        ]
-    )
-
+    scale_payload = b"".join(struct.pack(">q", s) for s in scale_hint)
     return base + scale_payload
 
 
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
-    """``(ndim, bounds_end)`` for a chunk_id.
+    """``(ndim, bounds_end)`` for an INNER (legacy, version-stripped) chunk_id.
 
     ``bounds_end`` is where the standard encoding (array_id + ndim + start +
     stop) ends; any bytes past it are the scale payload of a scaled chunk_id
-    (see :func:`encode_chunk_id_with_scale`).
+    (see :func:`encode_chunk_id_with_scale`). Callers must pass a version-stripped
+    chunk_id (offsets and the length comparison are relative to the inner bytes).
     """
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     offset = 4 + array_id_len
@@ -158,33 +319,52 @@ def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
 
 def is_scaled_chunk(chunk_id: bytes) -> bool:
     """Check if chunk_id has scale info appended after bounds."""
-    _, bounds_end = _bounds_end(chunk_id)
-    return len(chunk_id) > bounds_end
+    _, inner = _split_version(chunk_id)
+    _, bounds_end = _bounds_end(inner)
+    return len(inner) > bounds_end
 
 
 def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
-    """Canonical cache key for a chunk_id: the reduction method is advisory.
+    """Canonical cache key for a chunk_id.
 
-    For a scaled chunk_id, returns array_id + bounds + scale_hint with the
-    trailing ``(uint16 method_len + method bytes)`` suffix dropped, so requests
-    that differ only in reduction_method share one cache entry -- the method
-    only decides how a true miss is computed (biopb/biopb#76). Non-scaled
+    A current chunk_id is already pure identity (array_id + bounds [+ scale_hint]),
+    so the key equals the inner bytes. The projection to ``bounds_end + ndim*8`` is
+    retained only to stay byte-compatible with an OLDER chunk_id that still carried
+    a trailing reduction_method suffix (biopb/biopb#76): dropping it means a cache
+    entry warmed under the old format is still hit under the new one. Non-scaled
     chunk_ids are returned unchanged.
 
     The result is an opaque cache key: it is NOT a valid chunk_id and must not
     be fed to :func:`decode_scale_info` or forwarded on the wire.
+
+    A content_version (biopb/biopb#178) is kept in the key -- so a version bump
+    yields a distinct key and the stale entry becomes un-lookupable -- while the
+    inner projection stays byte-identical to the pre-#178 key, so an UNVERSIONED
+    chunk_id maps to exactly its old cache entry (no forced invalidation).
+
+    A proxy envelope is returned as-is: it already frames (route, content_version,
+    inner) with lengths, so it is an injective key, and since its inner is
+    method-free it is reduction_method-independent -- keying by it verbatim keeps
+    #76 dedup WITHOUT the proxy ever parsing the opaque inner.
     """
-    ndim, bounds_end = _bounds_end(chunk_id)
-    if len(chunk_id) <= bounds_end:
+    if is_proxy_envelope(chunk_id):
         return chunk_id
-    return chunk_id[: bounds_end + ndim * 8]
+    cv, inner = _split_version(chunk_id)
+    ndim, bounds_end = _bounds_end(inner)
+    base = inner if len(inner) <= bounds_end else inner[: bounds_end + ndim * 8]
+    return wrap_content_version(base, cv) if cv is not None else base
 
 
-def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
-    """Decode scale_hint and reduction_method from scaled chunk_id."""
+def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
+    """Decode the scale_hint from a scaled chunk_id.
+
+    Reads only the ndim int64 scale_hint after the bounds encoding. The
+    reduction_method is no longer part of the chunk_id (biopb/biopb#178); any
+    trailing bytes from an older method-carrying chunk_id are ignored.
+    """
+    _, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
-    # Decode scale_hint
     scale_hint = []
     for ax in range(ndim):
         scale_hint.append(
@@ -193,14 +373,7 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
             )[0]
         )
 
-    # Decode method
-    method_offset = bounds_end + ndim * 8
-    method_len = struct.unpack(">H", chunk_id[method_offset : method_offset + 2])[0]
-    method = chunk_id[method_offset + 2 : method_offset + 2 + method_len].decode(
-        "utf-8"
-    )
-
-    return tuple(scale_hint), method
+    return tuple(scale_hint)
 
 
 # Constants

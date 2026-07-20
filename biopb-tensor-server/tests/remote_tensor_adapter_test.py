@@ -53,14 +53,13 @@ class TestArrayIdByteSplice:
         )
 
         bounds = ChunkBounds(start=[0, 0], stop=[128, 128])
-        scaled = encode_chunk_id_with_scale("lab__img", bounds, [2, 2], "stride")
+        scaled = encode_chunk_id_with_scale("lab__img", bounds, [2, 2])
         assert is_scaled_chunk(scaled)
 
         out = rewrite_chunk_id_array_id(scaled, "img")
-        assert is_scaled_chunk(out)  # suffix preserved
-        scale_hint, method = decode_scale_info(out)
-        assert list(scale_hint) == [2, 2]
-        assert method == "stride"
+        assert is_scaled_chunk(out)  # scale suffix preserved
+        # decode_scale_info returns the scale_hint only (method left the chunk_id, #178).
+        assert list(decode_scale_info(out)) == [2, 2]
 
 
 class TestSplitGrpcUrl:
@@ -382,7 +381,11 @@ class TestRemoteTensorProxy:
         from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
-        from biopb_tensor_server.core.chunk import decode_chunk_id
+        from biopb_tensor_server.core.chunk import (
+            is_proxy_envelope,
+            peel_proxy_envelope,
+            routing_array_id,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             zpath = f"{tmp}/vol.zarr"
@@ -415,6 +418,7 @@ class TestRemoteTensorProxy:
                     ],
                     metadata={},
                     data_resident=True,
+                    indexed_at="2026-07-19 00:00:00",
                 )
                 plan = adapter.forward_flight_info(
                     TensorReadOption(tensor_id="hpc__aics")
@@ -428,10 +432,15 @@ class TestRemoteTensorProxy:
                 # The upstream's server-advertised pyramid rode through the forward
                 # (the lean catalog localizer would have stripped it).
                 assert len(plan.descriptor.pyramid) >= 1
-                # Endpoints carry LOCAL chunk_ids (upstream 'aics' rewritten).
+                # Endpoints carry LOCAL-routed proxy envelopes wrapping the
+                # upstream chunk_id verbatim (upstream 'aics' -> route 'hpc__aics'),
+                # and the seeded indexed_at rides as the envelope's content_version.
                 for ce in plan.chunk_endpoints:
-                    aid, _ = decode_chunk_id(ce.chunk_id)
-                    assert aid == "hpc__aics"
+                    assert is_proxy_envelope(ce.chunk_id)
+                    route, cv, _inner = peel_proxy_envelope(ce.chunk_id)
+                    assert route == "hpc__aics"
+                    assert cv == b"iat:2026-07-19 00:00:00"
+                    assert routing_array_id(ce.chunk_id) == "hpc__aics"
             finally:
                 upstream.shutdown()
 
@@ -1481,7 +1490,7 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.core.chunk import encode_chunk_id
+    from biopb_tensor_server.core.chunk import encode_chunk_id, encode_proxy_envelope
     from biopb_tensor_server.core.config import CacheConfig
 
     zarr_path, shape, chunks = simple_zarr_array
@@ -1500,9 +1509,11 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
             CacheConfig(backend="file", file_cache_dir=str(tmp_path / "cache"))
         )
 
-        # one chunk (top-left 64x64) addressed by the LOCAL array_id
+        # The client's chunk_id is a proxy envelope wrapping the UPSTREAM chunk_id
+        # (routed to the local source); resolve peels it and forwards inner verbatim.
         bounds = ChunkBounds(start=[0, 0], stop=[chunks[0], chunks[1]])
-        chunk_id = encode_chunk_id("lab__img", bounds)
+        inner = encode_chunk_id("img", bounds)  # upstream array_id
+        chunk_id = encode_proxy_envelope(inner, "lab__img", adapter.content_version)
 
         calls = {"n": 0}
         real = adapter._upstream_record_batch
@@ -1524,6 +1535,68 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
         cache_manager.close()
     finally:
         upstream.shutdown()
+
+
+def test_resolve_forwards_inner_verbatim():
+    """The proxy forwards the envelope's opaque inner to the upstream byte-for-byte
+    -- no rewrite, no proxy sentinel -- proving it never couples to the upstream
+    codec (biopb/biopb#178 W1)."""
+    import numpy as np
+    from biopb.tensor.ticket_pb2 import ChunkBounds
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.core.base import pack_chunk_batch
+    from biopb_tensor_server.core.chunk import (
+        encode_chunk_id,
+        encode_proxy_envelope,
+        wrap_content_version,
+    )
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+    # An upstream-versioned inner exercises the opacity: the proxy must forward it
+    # (0xFF version wrapper included) untouched, never peeling or re-wrapping it.
+    inner = wrap_content_version(encode_chunk_id("img", bounds), b"iat:42")
+    env = encode_proxy_envelope(inner, "lab__img", b"iat:99")
+
+    captured = {}
+
+    def fake(upstream_chunk_id):
+        captured["id"] = upstream_chunk_id
+        return pack_chunk_batch(np.zeros((4, 4), dtype=np.uint8))
+
+    adapter._upstream_record_batch = fake
+    adapter.resolve_chunk_data(env, cache_manager=None)
+
+    assert captured["id"] == inner  # forwarded byte-for-byte
+    assert captured["id"][0] != 0xFE  # no proxy envelope sentinel leaked upstream
+
+
+def test_seed_catalog_sets_content_version_from_indexed_at():
+    """The upstream's register timestamp becomes the mirror's content_version, so a
+    re-register re-namespaces the proxy chunk cache (biopb/biopb#178 W1)."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    assert adapter.content_version is None  # unseeded -> unversioned
+
+    adapter.seed_catalog([], {}, True, None, "2026-07-19 12:00:00")
+    assert adapter.content_version == b"iat:2026-07-19 12:00:00"
+
+    # A re-register (a new indexed_at) moves the version.
+    adapter.seed_catalog([], {}, True, None, "2026-07-19 13:30:00")
+    assert adapter.content_version == b"iat:2026-07-19 13:30:00"
+
+    # An upstream with no indexed_at leaves the proxy unversioned.
+    adapter.seed_catalog([], {}, True, None, None)
+    assert adapter.content_version is None
 
 
 # --- bulk-seed the mirror catalog (biopb/biopb#266-A) ------------------------

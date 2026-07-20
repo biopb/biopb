@@ -34,6 +34,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -247,6 +248,11 @@ class _BioioAdapterBase(TensorAdapter):
             self._source_url = str(bio_image.source.path)
         else:
             self._source_url = ""
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. Detached-header formats (.mhd/.hdr) stat only the master --
+        # a documented blind spot. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
 
         self._dask_data = None  # scene-level dask array, bound below

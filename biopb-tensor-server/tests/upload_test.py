@@ -16,7 +16,12 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.chunk import encode_chunk_id, get_bounds_from_chunk_id
+from biopb_tensor_server.core.chunk import (
+    content_version_of,
+    encode_chunk_id,
+    get_bounds_from_chunk_id,
+    wrap_content_version,
+)
 from biopb_tensor_server.core.config import CacheConfig
 
 
@@ -888,7 +893,12 @@ class TestChunkUpload:
 
         server.uploads.write_chunk(upload, MockReader())
 
+        # create_source assigns a per-upload content_version (#178), so the chunk
+        # is stored under the version-wrapped id the read plan also mints.
+        adapter = server.sources.get(source_id)
         chunk_id = encode_chunk_id(source_id, bounds)
+        if adapter.content_version is not None:
+            chunk_id = wrap_content_version(chunk_id, adapter.content_version)
         cache_manager = CacheManager.get_instance()
         entry, is_owner = cache_manager.start_compute(chunk_id)
         assert entry.state.name == "READY"
@@ -1065,3 +1075,137 @@ class TestBuildMinimalOmeMetadata:
         assert axes[1]["type"] == "space"  # 'z' detected as space
         assert axes[2]["type"] == "space"  # 'y' detected as space
         assert axes[3]["type"] == "space"  # 'x' detected as space
+
+
+class TestCachedSourceContentVersion:
+    """Per-upload generation token folded into cache keys (biopb/biopb#178).
+
+    cache: sources have deterministic ids, so a re-upload reuses the id. The
+    generation token gives each upload a fresh cache namespace; without it
+    ``CacheManager.start_compute`` would refuse to overwrite the prior upload's
+    chunk and serve stale data.
+    """
+
+    def _adapter(self, cv):
+        return CachedSourceAdapter(
+            source_id="cache_v",
+            shape=[4, 4],
+            dtype="uint8",
+            chunk_shape=[4, 4],
+            content_version=cv,
+        )
+
+    def test_versioned_write_read_roundtrip(self):
+        from biopb_tensor_server.core.base import unpack_chunk_array
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        try:
+            cv = b"gen:1"
+            adapter = self._adapter(cv)
+            data = np.arange(16, dtype=np.uint8).reshape(4, 4)
+            bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+            adapter.write_chunk(bounds, data)
+
+            # The base read plan mints version-wrapped chunk_ids; the client echoes
+            # one back on read -> it must resolve to the written data.
+            wrapped = wrap_content_version(encode_chunk_id("cache_v", bounds), cv)
+            assert content_version_of(wrapped) == cv
+            batch = adapter.resolve_chunk_data(wrapped, CacheManager.get_instance())
+            np.testing.assert_array_equal(unpack_chunk_array(batch), data)
+
+            # A legacy unwrapped id for the same bounds is a different namespace and
+            # must NOT resolve on a versioned source.
+            with pytest.raises(flight.FlightServerError):
+                adapter.resolve_chunk_data(
+                    encode_chunk_id("cache_v", bounds), CacheManager.get_instance()
+                )
+        finally:
+            CacheManager.reset()
+
+    def test_reupload_new_generation_serves_fresh_data(self):
+        from biopb_tensor_server.core.base import unpack_chunk_array
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=50))
+        try:
+            bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+            old = np.zeros((4, 4), dtype=np.uint8)
+            new = np.full((4, 4), 7, dtype=np.uint8)
+
+            a1 = self._adapter(b"gen:1")
+            a1.write_chunk(bounds, old)
+
+            # Re-upload: same deterministic source_id, new generation, new bytes.
+            a2 = self._adapter(b"gen:2")
+            a2.write_chunk(bounds, new)
+
+            # Without the version namespace, a2's start_compute would find gen:1's
+            # entry and keep the STALE bytes. The fresh namespace serves the new data.
+            id2 = wrap_content_version(encode_chunk_id("cache_v", bounds), b"gen:2")
+            batch2 = a2.resolve_chunk_data(id2, CacheManager.get_instance())
+            np.testing.assert_array_equal(unpack_chunk_array(batch2), new)
+
+            # The prior generation's chunk is a distinct entry, still intact.
+            id1 = wrap_content_version(encode_chunk_id("cache_v", bounds), b"gen:1")
+            batch1 = a1.resolve_chunk_data(id1, CacheManager.get_instance())
+            np.testing.assert_array_equal(unpack_chunk_array(batch1), old)
+        finally:
+            CacheManager.reset()
+
+    def test_unversioned_adapter_is_legacy(self):
+        from biopb_tensor_server.core.base import unpack_chunk_array
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        try:
+            adapter = CachedSourceAdapter(
+                source_id="cache_legacy",
+                shape=[4, 4],
+                dtype="uint8",
+                chunk_shape=[4, 4],
+            )
+            assert adapter.content_version is None
+            data = np.ones((4, 4), dtype=np.uint8)
+            bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+            adapter.write_chunk(bounds, data)
+            # Unversioned -> legacy unwrapped id resolves, byte-identical to pre-#178.
+            batch = adapter.resolve_chunk_data(
+                encode_chunk_id("cache_legacy", bounds), CacheManager.get_instance()
+            )
+            np.testing.assert_array_equal(unpack_chunk_array(batch), data)
+        finally:
+            CacheManager.reset()
+
+    def test_upload_manager_generation_monotonic_and_distinct(self):
+        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.serving.upload_manager import UploadManager
+
+        mgr = UploadManager(SourceRegistry(), None, None)
+        tokens = [mgr._next_content_version() for _ in range(5)]
+        assert all(t.startswith(b"gen:") for t in tokens)
+        assert len(set(tokens)) == 5  # all distinct
+        gens = [int(t.split(b":")[1]) for t in tokens]
+        assert gens == sorted(gens)  # strictly increasing even under a rapid loop
+
+    def test_create_source_reupload_bumps_generation(self):
+        """Re-creating the same-named cache source reuses the id but bumps the gen."""
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer(location="grpc://localhost:0", writable=True)
+        req = TensorDescriptor(
+            array_id="cache:reupload",
+            shape=[8, 8],
+            dtype="uint8",
+            chunk_shape=[8, 8],
+            dim_labels=["y", "x"],
+        )
+        r1 = server.uploads.create_source(req)
+        cv1 = server.sources.get(r1.array_id).content_version
+        r2 = server.uploads.create_source(req)
+        cv2 = server.sources.get(r2.array_id).content_version
+
+        assert r1.array_id == r2.array_id  # deterministic id -> same source
+        assert cv1 is not None and cv2 is not None
+        assert cv1.startswith(b"gen:") and cv2.startswith(b"gen:")
+        assert cv1 != cv2  # a fresh namespace per upload session

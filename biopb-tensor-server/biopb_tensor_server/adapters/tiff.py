@@ -23,6 +23,7 @@ from biopb_tensor_server.adapters._scale import (
     unit_to_um,
 )
 from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -526,6 +527,10 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self.directory = Path(directory)
         self.source_id = source_id
         self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file sequence. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "tiff-sequence"
         # Per-file read locks (see _PerFileTiffLockMixin): reads of the same TIFF
         # serialize while reads of different files run in parallel, so one slow
@@ -1105,6 +1110,10 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self.directory = Path(directory)
         self.source_id = source_id
         self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file dataset. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "micromanager-legacy"
         # Per-file read locks (see _PerFileTiffLockMixin): a stalled read of one
         # plane holds only its own file's lock, not every plane's.
