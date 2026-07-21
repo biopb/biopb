@@ -10,6 +10,7 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
   do_get fallback when the fast path is disabled or unavailable.
 """
 
+import dataclasses
 import os
 import shutil
 import tempfile
@@ -659,3 +660,89 @@ class TestCachefileIntegration:
             server.shutdown()
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ==============================================================================
+# Backend: direct-seek segment reads
+# ==============================================================================
+
+
+class TestDirectSeekRead:
+    """A do_get cache hit decodes the one message at the entry's recorded byte
+    range instead of walking the segment to reach it."""
+
+    def _seal_segment(self, backend, n=12):
+        """Write n entries and seal their segment so it is mmap-readable."""
+        arrs = {}
+        for i in range(n):
+            a = ((np.arange(600, dtype=np.uint16) + i * 7) % 401).astype(np.uint16)
+            arrs[i] = a
+            key = f"seek-{i}".encode()
+            backend.get_or_acquire(key, (lambda a=a: (_make_typed_batch(a), a.nbytes)))
+            backend.release(key)
+        segment_id = backend._metadata[f"seek-{n - 1}".encode()].segment_id
+        backend._close_segment(segment_id)
+        return arrs, segment_id
+
+    def test_seek_and_walk_agree_for_every_entry(self, file_backend):
+        """The seek path and the sequential walk return identical batches.
+
+        Pins the fallback as a true equivalent, not an approximation: reading
+        entry i by byte range must equal reading it by stream position.
+        """
+        arrs, segment_id = self._seal_segment(file_backend)
+        mmap = file_backend._segment_mmaps[segment_id]
+
+        for i in range(len(arrs)):
+            info = file_backend._metadata[f"seek-{i}".encode()]
+            assert info.byte_offset > 0 and info.byte_length > 0
+
+            seeked = file_backend._read_batch_at(segment_id, mmap, info)
+            # Same entry with its range stripped -> forced down the walk.
+            walked = file_backend._read_batch_at(
+                segment_id,
+                mmap,
+                dataclasses.replace(info, byte_offset=0, byte_length=0),
+            )
+            assert seeked.equals(walked)
+            assert np.array_equal(unpack_chunk_array(seeked), arrs[i])
+
+    def test_entry_without_range_still_reads(self, file_backend):
+        """An entry whose byte range was never derived falls back to the walk
+        rather than failing -- do_get is the designed floor of this path."""
+        arrs, segment_id = self._seal_segment(file_backend, n=4)
+        key = b"seek-2"
+        info = file_backend._metadata[key]
+        file_backend._metadata[key] = dataclasses.replace(
+            info, byte_offset=0, byte_length=0
+        )
+        # Drop the in-memory mirror so the read must come off the segment.
+        file_backend._entries.pop(key, None)
+
+        entry = file_backend.get_or_acquire(key, (lambda: (None, 0)))
+        try:
+            assert np.array_equal(unpack_chunk_array(entry.data), arrs[2])
+        finally:
+            file_backend.release(key)
+
+    def test_schema_cache_does_not_outlive_its_mapping(self, file_backend):
+        """Dropping a segment's mmap drops its cached schema, so a segment id
+        reused after clear() can never decode against a stale schema."""
+        _arrs, segment_id = self._seal_segment(file_backend, n=4)
+        mmap = file_backend._segment_mmaps[segment_id]
+        assert file_backend._segment_schema(segment_id, mmap) is not None
+        assert segment_id in file_backend._segment_schemas
+
+        file_backend._forget_segment_mmap(segment_id)
+        assert segment_id not in file_backend._segment_schemas
+        assert segment_id not in file_backend._segment_mmaps
+
+    def test_clear_drops_all_cached_schemas(self, file_backend):
+        _arrs, segment_id = self._seal_segment(file_backend, n=4)
+        mmap = file_backend._segment_mmaps[segment_id]
+        file_backend._segment_schema(segment_id, mmap)
+        assert file_backend._segment_schemas
+
+        file_backend.clear()
+        assert not file_backend._segment_schemas
+        assert not file_backend._segment_mmaps
