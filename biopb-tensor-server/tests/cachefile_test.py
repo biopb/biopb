@@ -22,6 +22,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
+from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
     CACHE_FILE_FORMAT_VERSION,
@@ -31,6 +32,7 @@ from biopb_tensor_server.cache.file_backend import (
     ChunkLocation,
 )
 from biopb_tensor_server.core.base import pack_chunk_batch, unpack_chunk_array
+from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -555,6 +557,58 @@ class TestChunkLocateAction:
             assert "chunk_locate" in actions
             assert "shm_transfer" not in actions
         finally:
+            server.shutdown()
+
+    def test_locate_counts_as_flight_activity(self):
+        """A locate is in-flight *while it runs*, so precache parks (#548).
+
+        The fast path replaces do_get, so if the handler is untracked the server
+        looks idle for the whole of a localhost read and the precache worker
+        warms straight through it.
+        """
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            observed = []
+
+            class _Probe:
+                source_id = "z"
+
+                def resolve_chunk_data(self, chunk_id, cache_manager):
+                    # Called on a cold miss -- the heaviest work in the handler.
+                    observed.append(server.flight_idle_for(0.0))
+                    raise ValueError("no data")
+
+            chunk_id = encode_chunk_id("z", ChunkBounds(start=[0, 0], stop=[8, 8]))
+            with patch.object(server, "_get_adapter_for_chunk", return_value=_Probe()):
+                with pytest.raises(flight.FlightError):
+                    server._handle_chunk_locate(chunk_id)
+
+            assert observed == [False], "server reported idle mid-locate"
+            # ...and the stamp advances on the way out, so the debounce window
+            # starts from the end of the read rather than from process start.
+            assert server.activity._last_active > 0.0
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
+    def test_locate_releases_the_activity_slot_on_error(self):
+        """A failing locate must not leak an in-flight count (precache would
+        then never run again)."""
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            with patch.object(
+                server, "_get_adapter_for_chunk", side_effect=ValueError("boom")
+            ):
+                with pytest.raises(flight.FlightError):
+                    server._handle_chunk_locate(b"z/whatever")
+            assert server.activity._inflight == 0
+            assert server.flight_idle_for(0.0) is True
+        finally:
+            CacheManager.reset()
             server.shutdown()
 
 

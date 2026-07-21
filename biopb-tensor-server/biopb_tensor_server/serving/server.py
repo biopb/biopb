@@ -1404,66 +1404,76 @@ class TensorFlightServer(flight.FlightServerBase):
         ``{"available": false}`` when the chunk can't be located (memory backend,
         oversized/uncached chunk, or any resolve/locate failure) so the client
         falls back to do_get. (issue #9)
+
+        **Counts as Flight activity** (``activity.serving_request``) so the
+        background precache worker parks while a localhost client is reading.
+        This path *replaces* ``do_get`` rather than accompanying it, so without
+        the wrapper the server observes nothing for the whole of such a read
+        (biopb/biopb#548). It is also where a cold miss decodes the chunk. A warm
+        locate is cheap and gets counted anyway -- over-reporting a read is the
+        safe direction for a debounce, and the client's mmap read that follows is
+        real I/O the server cannot see at all.
         """
         cache_manager = CacheManager.get_instance()
         if cache_manager is None:
             return json.dumps({"available": False})
 
-        try:
-            adapter = self._get_adapter_for_chunk(chunk_id)
-        except (
-            SourceUnresolvedError,
-            TensorResolutionError,
-            ValueError,
-            KeyError,
-            AttributeError,
-            TypeError,
-        ) as e:
-            # Same resolution mapping as get_flight_info / do_get (issue #378).
-            raise _adapter_lookup_error(
-                e, f"Tensor not found for chunk {chunk_id[:16]!r}"
-            ) from e
-        if adapter is None:
-            # Same taxonomy as get_flight_info / do_get: an unregistered source ->
-            # terminal NOT_FOUND with a code, not a bare FlightServerError (#378).
-            raise to_flight_error(
-                TensorNotFound(
-                    f"Adapter not found for chunk_id: {chunk_id[:16]!r}",
-                    reason="unknown_source",
+        with self.activity.serving_request():
+            try:
+                adapter = self._get_adapter_for_chunk(chunk_id)
+            except (
+                SourceUnresolvedError,
+                TensorResolutionError,
+                ValueError,
+                KeyError,
+                AttributeError,
+                TypeError,
+            ) as e:
+                # Same resolution mapping as get_flight_info / do_get (issue #378).
+                raise _adapter_lookup_error(
+                    e, f"Tensor not found for chunk {chunk_id[:16]!r}"
+                ) from e
+            if adapter is None:
+                # Same taxonomy as get_flight_info / do_get: an unregistered source ->
+                # terminal NOT_FOUND with a code, not a bare FlightServerError (#378).
+                raise to_flight_error(
+                    TensorNotFound(
+                        f"Adapter not found for chunk_id: {chunk_id[:16]!r}",
+                        reason="unknown_source",
+                    )
                 )
-            )
 
-        # Entries are stored under the method-stripped canonical key
-        # (biopb/biopb#76); locate with the same key or a warm chunk cached
-        # under a different reduction_method is never found.
-        cache_key = cache_key_for_chunk_id(chunk_id)
-        try:
-            # If the chunk is already cached, just locate it. Resolving first
-            # would, on a chunk whose in-RAM entry has been trimmed, re-read the
-            # whole chunk from its segment server-side for nothing. Only
-            # materialize (same path as do_get) on a genuine cold miss.
-            location = cache_manager.locate_entry(cache_key)
-            if location is None:
-                adapter.resolve_chunk_data(chunk_id, cache_manager)
+            # Entries are stored under the method-stripped canonical key
+            # (biopb/biopb#76); locate with the same key or a warm chunk cached
+            # under a different reduction_method is never found.
+            cache_key = cache_key_for_chunk_id(chunk_id)
+            try:
+                # If the chunk is already cached, just locate it. Resolving first
+                # would, on a chunk whose in-RAM entry has been trimmed, re-read the
+                # whole chunk from its segment server-side for nothing. Only
+                # materialize (same path as do_get) on a genuine cold miss.
                 location = cache_manager.locate_entry(cache_key)
-        except (OSError, ValueError) as e:
-            raise flight.FlightInternalError(
-                f"I/O error locating chunk data: {e}"
-            ) from e
+                if location is None:
+                    adapter.resolve_chunk_data(chunk_id, cache_manager)
+                    location = cache_manager.locate_entry(cache_key)
+            except (OSError, ValueError) as e:
+                raise flight.FlightInternalError(
+                    f"I/O error locating chunk data: {e}"
+                ) from e
 
-        if location is None:
-            return json.dumps({"available": False})
+            if location is None:
+                return json.dumps({"available": False})
 
-        return json.dumps(
-            {
-                "available": True,
-                "format_version": CACHE_FILE_FORMAT_VERSION,
-                "segment_path": location.segment_path,
-                "byte_offset": location.byte_offset,
-                "byte_length": location.byte_length,
-                "generation_id": location.generation_id,
-            }
-        )
+            return json.dumps(
+                {
+                    "available": True,
+                    "format_version": CACHE_FILE_FORMAT_VERSION,
+                    "segment_path": location.segment_path,
+                    "byte_offset": location.byte_offset,
+                    "byte_length": location.byte_length,
+                    "generation_id": location.generation_id,
+                }
+            )
 
     def do_put(
         self,
