@@ -1016,12 +1016,10 @@ class TestArrowFileBackendRecovery:
         backend1.complete_entry(b"key1", data, 24)
         backend1.release(b"key1")
 
-        # Simulate crash - don't call close(), just remove lock
-        # (this simulates process dying without clean shutdown)
+        # Crash: the OS drops the lock descriptor and leaves both the lock file
+        # and its owner record behind. The next instance reclaims the freed lock
+        # and the leftover record drives recovery -- no unlink, which no crash does.
         _simulate_crash(backend1)
-        lock_path = cache_dir / "lock"
-        if lock_path.exists():
-            lock_path.unlink()
 
         # Second instance should recover and still have the entry
         backend2 = ArrowFileBackend(config)
@@ -1086,12 +1084,10 @@ class TestArrowFileBackendRecovery:
         # log_committed).
         backend1._wal.log_pending(b"key_bad")
 
-        # Crash without clean shutdown, then drop the lock so a fresh instance
-        # can claim it; recovery is then driven by the pending WAL entry.
+        # Crash without clean shutdown: the OS frees the lock descriptor so a
+        # fresh instance can reclaim it, and recovery is driven by the pending
+        # WAL entry (the lock file and owner record stay -- no crash unlinks them).
         _simulate_crash(backend1)
-        lock_path = cache_dir / "lock"
-        if lock_path.exists():
-            lock_path.unlink()
 
         backend2 = ArrowFileBackend(config)
         # Recovery ran (driven by the pending WAL entry) and purged the in-flight
