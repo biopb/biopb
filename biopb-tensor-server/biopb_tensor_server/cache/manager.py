@@ -96,7 +96,6 @@ class CacheManager:
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-        metadata: Optional[dict] = None,
     ) -> CacheEntry:
         """Get or compute entry with future/promise pattern.
 
@@ -106,19 +105,17 @@ class CacheManager:
         Args:
             key: Cache key bytes
             compute_fn: Returns (RecordBatch, size_bytes)
-            metadata: Optional metadata
 
         Returns:
             CacheEntry with state READY, ref_count >= 1
         """
-        return self._backend.get_or_acquire(key, compute_fn, metadata)
+        return self._backend.get_or_acquire(key, compute_fn)
 
     def put(
         self,
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
-        metadata: Optional[dict] = None,
     ) -> bool:
         """Store an already-computed batch. Returns True if this call stored it.
 
@@ -144,9 +141,8 @@ class CacheManager:
             key: Cache key bytes
             data: The batch to store
             size_bytes: Size of data in bytes
-            metadata: Optional metadata for the entry
         """
-        _entry, is_owner = self._backend.start_compute(key, metadata)
+        _entry, is_owner = self._backend.start_compute(key)
         try:
             if is_owner:
                 self._backend.complete_entry(key, data, size_bytes)

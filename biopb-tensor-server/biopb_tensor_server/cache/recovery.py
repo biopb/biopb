@@ -28,7 +28,6 @@ class SegmentEntryInfo:
     segment_id: int
     offset: int  # Entry index within segment (used by the sequential reader)
     size_bytes: int
-    metadata: dict = field(default_factory=dict)
     created_at: float = 0.0
     last_access_time: float = 0.0  # Updated on each read
     # Byte location of the entry's encapsulated Arrow IPC message within the

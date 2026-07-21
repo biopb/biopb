@@ -822,9 +822,7 @@ class RemoteTensorAdapter(TensorAdapter):
             # The envelope is itself the canonical cache key (route + content_version
             # + opaque inner); the inner is never parsed here.
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(
-                cache_key, compute_fn, metadata={"array_id": route}
-            )
+            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
             data = entry.data
             cache_manager.release(cache_key)
             return data

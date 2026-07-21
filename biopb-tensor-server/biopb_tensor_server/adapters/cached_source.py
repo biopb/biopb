@@ -256,12 +256,7 @@ class CachedSourceAdapter(TensorAdapter):
             schema=CHUNK_WIRE_SCHEMA,
         )
 
-        cache_manager.put(
-            chunk_id,
-            batch,
-            size_bytes,
-            metadata={"bounds": bounds.SerializeToString()},
-        )
+        cache_manager.put(chunk_id, batch, size_bytes)
 
         # Recorded even when put() declined (the chunk is already cached under
         # this id): resolve_chunk_data gates reads on this map, so a re-upload of
@@ -308,7 +303,6 @@ class CachedSourceAdapter(TensorAdapter):
         entry = cache_manager.get_or_acquire(
             chunk_id,
             lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
-            metadata={"array_id": self.source_id},
         )
         data = entry.data
         cache_manager.release(chunk_id)

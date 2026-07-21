@@ -357,7 +357,7 @@ class TestCacheManager:
         CacheManager.reset()
         manager = CacheManager.initialize(CacheConfig(backend="memory"))
 
-        assert manager.put(b"key1", self._batch(), 24, metadata={"test": True}) is True
+        assert manager.put(b"key1", self._batch(), 24) is True
 
         entry = manager.get_or_acquire(b"key1", lambda: (None, 0))
         assert entry.state == EntryState.READY

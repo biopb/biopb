@@ -765,9 +765,7 @@ class TensorAdapter(SourceAdapter):
             # method share one entry, so precache-warmed chunks serve any
             # method at the same bounds/scale (biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(
-                cache_key, compute_fn, metadata={"array_id": array_id}
-            )
+            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
             data = entry.data
             cache_manager.release(cache_key)
         else:

@@ -42,7 +42,6 @@ class CacheEntry:
         ref_count: Number of active references (prevents eviction)
         created_at: Creation timestamp
         size_bytes: Data size in bytes
-        metadata: Additional metadata
     """
 
     data: Optional[pa.RecordBatch] = None
@@ -52,7 +51,6 @@ class CacheEntry:
     ref_count: int = 0
     created_at: float = 0.0
     size_bytes: int = 0
-    metadata: dict = field(default_factory=dict)
 
     def acquire(self) -> None:
         """Increment reference count to prevent eviction."""
@@ -129,7 +127,7 @@ class CacheBackend(ABC):
     - Reference counting to prevent eviction of active entries
     - Thread-safe operations
 
-    The key method is get_or_compute() which implements the future/promise
+    The key method is get_or_acquire() which implements the future/promise
     pattern for safe concurrent access.
     """
 
@@ -138,7 +136,6 @@ class CacheBackend(ABC):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-        metadata: Optional[dict] = None,
     ) -> CacheEntry:
         """Get existing entry or create pending entry for computation.
 
@@ -153,10 +150,25 @@ class CacheBackend(ABC):
         Args:
             key: Cache key bytes
             compute_fn: Function to compute data, returns (RecordBatch, size_bytes)
-            metadata: Optional metadata for new entries
 
         Returns:
             CacheEntry with ref_count >= 1, state READY
+        """
+
+    @abstractmethod
+    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
+        """Reserve the key without computing: returns (entry, is_owner).
+
+        The check-cache half of get_or_acquire, split out for a caller that
+        already holds the data (CacheManager.put) rather than a compute_fn. The
+        returned entry is acquired either way; is_owner=True means it is PENDING
+        and this caller must complete_entry() or fail_entry() it.
+
+        Args:
+            key: Cache key bytes
+
+        Returns:
+            (CacheEntry with ref_count >= 1, is_owner)
         """
 
     @abstractmethod
@@ -228,27 +240,3 @@ class CacheBackend(ABC):
         stay open for any still-draining reads. Backends with no process lock
         (memory) inherit this no-op default; the file backend overrides it.
         """
-
-
-def get_or_compute_with_context(
-    backend: CacheBackend,
-    key: bytes,
-    compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-    metadata: Optional[dict] = None,
-) -> Tuple[CacheEntry, bool]:
-    """Helper for get-or-compute that returns entry and owns_compute flag.
-
-    This allows the caller to know whether they should call complete_entry()
-    or fail_entry() if computation fails.
-
-    Args:
-        backend: Cache backend
-        key: Cache key bytes
-        compute_fn: Compute function
-        metadata: Optional metadata
-
-    Returns:
-        (CacheEntry, is_owner) where is_owner indicates if caller should
-        call complete_entry/fail_entry
-    """
-    # Implementation in concrete backend
