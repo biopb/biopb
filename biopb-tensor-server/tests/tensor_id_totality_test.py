@@ -231,10 +231,9 @@ class TestAdapterLookupFallback:
 
     def test_do_get_unregistered_source_ticket_is_terminal_with_code(self):
         # Finding #3: a stale ticket whose source is no longer registered ->
-        # _get_adapter_for_chunk returns None -> the adapter-is-None fallthrough now
-        # rides the taxonomy (terminal NOT_FOUND *with a code*), matching
-        # get_flight_info's tensor_adapter-is-None sibling, rather than a bare
-        # FlightServerError carrying no extra_info code (issue #378).
+        # _get_adapter_for_chunk raises the mapped NOT_FOUND itself (terminal, *with
+        # a code*), matching get_flight_info's tensor_adapter-is-None sibling, rather
+        # than a bare FlightServerError carrying no extra_info code (issue #378).
         from biopb.tensor.ticket_pb2 import TensorTicket
         from biopb_tensor_server.core.base import encode_chunk_id
 
