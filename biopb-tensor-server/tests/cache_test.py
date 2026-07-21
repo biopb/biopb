@@ -825,6 +825,29 @@ class TestArrowFileBackend:
         shutil.rmtree(cache_dir)
 
 
+def _simulate_crash(backend):
+    """Release a backend's OS file handles the way a dying process would.
+
+    A real crash makes the OS reclaim every open handle -- writers, sinks, mmaps,
+    and the cache lock's descriptor -- while leaving the on-disk owner record and
+    WAL behind (no clean shutdown). The test process stays alive, so we drop those
+    handles explicitly; on Windows a lingering handle also blocks the segment files
+    from being deleted (issue #5). Deliberately does NOT call backend.close() or
+    ProcessLock.release(), either of which would clean up and thus erase the crash
+    state -- and does NOT unlink the lock file, which no crash does either
+    (biopb/biopb#544).
+    """
+    for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
+        backend._close_writer(seg_id)
+    for mmap in backend._segment_mmaps.values():
+        mmap.close()
+    backend._segment_mmaps.clear()
+    # Drop the lock descriptor only -- the kernel does this for a dying process.
+    # The `.owner` record survives, which is the crash signal the next owner reads.
+    if backend._process_lock is not None:
+        backend._process_lock._lock.release()
+
+
 class TestArrowFileBackendRecovery:
     """Tests for crash recovery."""
 
@@ -836,28 +859,6 @@ class TestArrowFileBackendRecovery:
 
     def _make_temp_cache_dir(self):
         return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
-
-    def _simulate_crash(self, backend):
-        """Release a backend's OS file handles the way a dying process would.
-
-        A real crash makes the OS reclaim every open handle -- writers, sinks,
-        mmaps, and the cache lock's descriptor -- while leaving the on-disk
-        owner record and WAL behind (no clean shutdown). The test process stays
-        alive, so we drop those handles explicitly; on Windows a lingering
-        handle also blocks the segment files from being deleted (issue #5).
-        Deliberately does NOT call backend.close() or ProcessLock.release(),
-        either of which would clean up and thus erase the crash state.
-        """
-        for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
-            backend._close_writer(seg_id)
-        for mmap in backend._segment_mmaps.values():
-            mmap.close()
-        backend._segment_mmaps.clear()
-        # Drop the lock descriptor only -- the kernel does this for a dying
-        # process. The `.owner` record survives, which is the crash signal the
-        # next owner reads (biopb/biopb#544).
-        if backend._process_lock is not None:
-            backend._process_lock._lock.release()
 
     def test_second_holder_is_refused(self):
         """Two owners of one cache dir are impossible, not merely unlikely.
@@ -1017,7 +1018,7 @@ class TestArrowFileBackendRecovery:
 
         # Simulate crash - don't call close(), just remove lock
         # (this simulates process dying without clean shutdown)
-        self._simulate_crash(backend1)
+        _simulate_crash(backend1)
         lock_path = cache_dir / "lock"
         if lock_path.exists():
             lock_path.unlink()
@@ -1048,7 +1049,7 @@ class TestArrowFileBackendRecovery:
         backend1.release(b"key1")
 
         # Crash: the lock's descriptor goes, its owner record stays behind.
-        self._simulate_crash(backend1)
+        _simulate_crash(backend1)
 
         # Verify WAL has no pending entries (so recovery must be triggered by
         # the leftover owner record alone)
@@ -1087,7 +1088,7 @@ class TestArrowFileBackendRecovery:
 
         # Crash without clean shutdown, then drop the lock so a fresh instance
         # can claim it; recovery is then driven by the pending WAL entry.
-        self._simulate_crash(backend1)
+        _simulate_crash(backend1)
         lock_path = cache_dir / "lock"
         if lock_path.exists():
             lock_path.unlink()
@@ -1126,7 +1127,7 @@ class TestArrowFileBackendRecovery:
             backend1.release(key)
 
         # Crash: the leftover owner record is what triggers recovery.
-        self._simulate_crash(backend1)
+        _simulate_crash(backend1)
 
         segments_dir = cache_dir / "segments"
         expected_bytes = sum(f.stat().st_size for f in segments_dir.glob("seg_*.arrow"))
@@ -1896,17 +1897,6 @@ class TestSegmentSidecarIndex:
     def _seg_files(self, cache_dir):
         return sorted((cache_dir / "segments").glob("seg_*.arrow"))
 
-    def _simulate_crash(self, backend, cache_dir):
-        """Drop OS handles the way a dying process would, without the sidecar/WAL
-        housekeeping a clean close() does; then remove the lock so a fresh backend
-        can claim the dir."""
-        for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
-            backend._close_writer(seg_id)
-        for mm in backend._segment_mmaps.values():
-            mm.close()
-        backend._segment_mmaps.clear()
-        (cache_dir / "lock").unlink(missing_ok=True)
-
     def _tamper_sidecar_size(self, idx_path, wrong_size):
         with pa.OSFile(str(idx_path), "rb") as f:
             table = pa.ipc.open_file(f).read_all()
@@ -2132,7 +2122,7 @@ class TestSegmentSidecarIndex:
         assert len(sealed) == 3  # two sealed + one open on disk
         assert len(sidecars) == 2  # only the two sealed ones have sidecars
 
-        self._simulate_crash(b1, cache_dir)
+        _simulate_crash(b1)
 
         counting = _ScanCountingBackend(config)
         assert counting.scan_calls == 1, "only the open (sidecar-less) segment walks"
