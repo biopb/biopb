@@ -2,7 +2,7 @@
 
 Provides:
 - WriteAheadLog: Detect incomplete writes after crash
-- ProcessLock: File-based lock for crash detection
+- ProcessLock: Single-owner lock on the cache dir + unclean-exit detection
 - SegmentEntryInfo: Metadata for entries stored in segments
 - SegmentInfo: Metadata for segment files
 - RecoveryStatus: Result of crash recovery
@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from biopb._lifecycle.proc import is_process_running, process_create_time
+from biopb._lifecycle.file_lock import ExclusiveFileLock
 
 
 @dataclass
@@ -167,111 +167,110 @@ class WriteAheadLog:
 
 
 class ProcessLock:
-    """File-based lock for crash detection.
+    """Single-owner lock on a cache directory, plus an unclean-exit signal.
 
-    Creates a lock file containing the owner's PID and a process create-time
-    token. On startup, a lock naming a process that is dead -- or whose PID was
-    *reused* by an unrelated process (alive, but a different create time) -- is
-    stale and reclaimable. This is an *identity* check, not just liveness: a
-    crashed cache owner whose PID gets recycled (worst on Windows, which
-    hard-kills at logout and reuses PIDs aggressively) would otherwise look
-    "alive" forever and wedge recovery. Same fix as the daemon PID file
-    (biopb/biopb#138 item 8), reusing the shared ``biopb._lifecycle.proc`` primitive --
-    which also avoids ``os.kill(pid, 0)``, a real Ctrl+C on Windows.
+    Two jobs, and they are now carried by two different files:
 
-    Legacy lock files with no ``create_time`` (or platforms with no cheap
-    create-time source, e.g. macOS -> token ``None``) degrade to liveness-only,
-    never a false "held".
+    * **Exclusion** is an OS advisory lock on ``<path>`` held for the life of the
+      process (``biopb._lifecycle.file_lock.ExclusiveFileLock``). It lives on an
+      open descriptor, so the OS releases it when the owner exits *however* it
+      exits.
+    * **Crash detection** is a sibling ``<path>.owner`` record, written after the
+      lock is taken and removed on a clean release. Finding one while acquiring
+      means the previous owner never released -- it crashed -- which is what
+      drives WAL recovery.
+
+    Splitting them is what removes the pid bookkeeping this class used to carry
+    (biopb/biopb#544). Exclusion by a *record* cannot be atomic: reading a pid
+    file, judging its owner dead, and writing your own is a check-then-act, so
+    several starters racing on one cache dir could all conclude they owned it --
+    and judging "dead" needed liveness plus a create-time token to survive pid
+    reuse. A descriptor-held lock has no window to race and no owner to
+    identify: acquire either wins or loses. The ``.owner`` record is left purely
+    informational -- who held it, since when -- and is never consulted to decide
+    ownership, so a torn or stale one can mislead nobody.
+
+    Not thread-safe; one instance per cache directory.
     """
 
     def __init__(self, path: Path):
         self._path = path
-        self._pid: Optional[int] = None
-        self._acquired = False
+        self._owner_path = path.with_name(path.name + ".owner")
+        self._lock = ExclusiveFileLock(path)
+        self._prior_owner: Optional[dict] = None
 
     def acquire(self) -> bool:
-        """Acquire lock, detect stale lock from crashed process.
+        """Take exclusive ownership of the cache directory.
 
-        Returns True if lock acquired (new or stale lock removed).
-        Returns False if lock held by another running process.
+        Returns True on success (or if this instance already holds it), False if
+        another live process owns it. Records the previous owner's leftover
+        marker, if any, for :meth:`is_stale` -- so unlike the old lock-file
+        scheme there is nothing to capture *before* acquiring.
         """
-        if self._acquired:
+        if self._lock.is_held():
             return True
+        if not self._lock.acquire():
+            return False
 
-        # Check for existing lock
-        if self._path.exists():
-            try:
-                with open(self._path) as f:
-                    data = json.load(f)
-
-                if self._is_owner_alive(data):
-                    # Lock held by another running process
-                    return False
-
-                # Stale lock - process is dead (or PID reused) - remove it
-                self._path.unlink()
-            except (OSError, json.JSONDecodeError):
-                # Corrupted lock file - remove it
-                self._path.unlink()
-
-        # Create new lock
-        self._pid = os.getpid()
-        self._acquired = True
-        data = {
-            "pid": self._pid,
-            "create_time": process_create_time(self._pid),
-            "acquired_at": time.time(),
-        }
-        with open(self._path, "w") as f:
-            json.dump(data, f)
-
+        # We are now the sole owner, so the previous owner's record (if it got
+        # one) can only be leftovers: a clean release removes it.
+        self._prior_owner = self._read_owner_record()
+        self._write_owner_record()
         return True
 
     def release(self) -> None:
-        """Release lock."""
-        if self._acquired and self._path.exists():
-            self._path.unlink()
-        self._acquired = False
-        self._pid = None
+        """Release ownership. Idempotent.
+
+        Removes the owner record *before* dropping the lock, so the next owner
+        can never see a released lock alongside a record that outlived it and
+        mistake a clean shutdown for a crash.
+        """
+        if not self._lock.is_held():
+            return
+        try:
+            self._owner_path.unlink(missing_ok=True)
+        except OSError:
+            pass  # A record we can't remove costs a spurious recovery, no more.
+        self._lock.release()
 
     def is_stale(self) -> bool:
-        """Check if existing lock is from a dead (or reused-PID) process.
+        """Whether the previous owner exited without releasing (i.e. crashed).
 
-        Returns True if lock file exists but its owner is gone.
-        Returns False if no lock file or the owner is still running.
+        Meaningful once :meth:`acquire` has succeeded; False before that. A
+        corrupt/unparseable record still counts as a crash -- it exists, which
+        is the whole signal, and its contents are only ever diagnostic.
         """
-        if not self._path.exists():
-            return False
+        return self._prior_owner is not None
 
-        try:
-            with open(self._path) as f:
-                data = json.load(f)
-            return not self._is_owner_alive(data)
-        except (OSError, json.JSONDecodeError):
-            return True  # Corrupted lock is stale
-
-    def _is_owner_alive(self, data: dict) -> bool:
-        """Whether the lock's recorded owner is the same process, still running.
-
-        Identity check: the PID must be alive *and* its live create-time token
-        must match the recorded one. A missing recorded token (legacy file) or
-        an unavailable live token degrades to liveness-only -- the pre-identity
-        behavior -- so an owner is never falsely declared gone.
-        """
-        pid = data.get("pid")
-        if not pid or not is_process_running(pid):
-            return False
-
-        recorded = data.get("create_time")
-        if recorded is None:
-            return True  # Legacy/tokenless lock: liveness is all we have.
-
-        live = process_create_time(pid)
-        if live is None:
-            return True  # Can't compute a token here: fall back to liveness.
-
-        return live == recorded
+    def prior_owner(self) -> Optional[dict]:
+        """The crashed owner's record (``pid`` / ``acquired_at``), for logging."""
+        return self._prior_owner
 
     def is_acquired(self) -> bool:
         """Check if this instance holds the lock."""
-        return self._acquired
+        return self._lock.is_held()
+
+    def _read_owner_record(self) -> Optional[dict]:
+        """The leftover owner record, or None if there is none.
+
+        Returns a dict for *any* file that is present -- an empty one when it
+        can't be parsed -- because presence, not content, is the signal.
+        """
+        if not self._owner_path.exists():
+            return None
+        try:
+            with open(self._owner_path) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_owner_record(self) -> None:
+        """Stamp our ownership. Best effort: the lock is what confers ownership,
+        so failing to write the record must not fail the acquire -- it only
+        costs the next owner its crash signal."""
+        try:
+            with open(self._owner_path, "w") as f:
+                json.dump({"pid": os.getpid(), "acquired_at": time.time()}, f)
+        except OSError:
+            pass

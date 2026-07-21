@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 
 class LockTimeout(TimeoutError):
@@ -79,6 +79,82 @@ else:
             fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+class ExclusiveFileLock:
+    """An exclusive cross-process lock held for as long as the holder wants it.
+
+    The object form of :func:`file_lock`, for a lock whose scope is a *process
+    lifetime* rather than a block — acquired during startup, released at
+    shutdown, with ordinary work happening in between. The tensor server's cache
+    directory is the motivating case: only one server may own a cache dir, and
+    it owns it from init until close.
+
+    Same guarantees as :func:`file_lock`, which is now a thin wrapper over this:
+    exclusion lives on the open descriptor, so the OS drops the lock when the fd
+    is closed *or the holder dies*. A crashed holder therefore leaves nothing to
+    reap, and no liveness or pid-identity check is needed to tell a dead owner
+    from a live one — the acquire either succeeds or it doesn't.
+
+    Not thread-safe; one owner per instance. Acquiring twice is a no-op that
+    reports success, and releasing an unheld lock is a no-op, so shutdown paths
+    may release idempotently.
+
+    Caveat: advisory locking depends on the filesystem. On one that does not
+    implement it (some network mounts), an acquire can succeed for two holders
+    at once — the same exposure as any advisory-lock scheme, and no worse than a
+    lock file whose exclusion is a pid record.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._fd: Optional[int] = None
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def is_held(self) -> bool:
+        """Whether *this* instance currently holds the lock."""
+        return self._fd is not None
+
+    def acquire(self, timeout: float = 0.0, poll: float = 0.1) -> bool:
+        """Try to take the lock, waiting up to ``timeout`` seconds.
+
+        Returns True if held (including when this instance already held it),
+        False if another holder has it and the timeout expired. Defaults to a
+        single non-blocking attempt — a caller that wants to *queue* for the
+        lock passes a timeout; a caller for whom a second holder is an error
+        (the cache dir) wants the immediate answer.
+        """
+        if self._fd is not None:
+            return True
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o644)
+        deadline = time.monotonic() + timeout
+        try:
+            while not _try_acquire(fd):
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return False
+                time.sleep(poll)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        """Release the lock and close the descriptor. Idempotent.
+
+        The lock file itself is never unlinked: exclusion is the descriptor, so
+        removing the file would let a racing acquirer create a *different* file
+        and lock that instead — the two would then hold "the lock" at once.
+        """
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            _release(fd)
+            os.close(fd)
+
+
 @contextlib.contextmanager
 def file_lock(path: Path, timeout: float = 30.0, poll: float = 0.1) -> Iterator[None]:
     """Hold an exclusive cross-process lock on ``path`` for the block's duration.
@@ -89,17 +165,10 @@ def file_lock(path: Path, timeout: float = 30.0, poll: float = 0.1) -> Iterator[
     removed — the lock lives on the open descriptor and the OS drops it when the
     fd is closed or the process dies.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+    lock = ExclusiveFileLock(path)
+    if not lock.acquire(timeout=timeout, poll=poll):
+        raise LockTimeout(f"could not acquire {path} within {timeout}s")
     try:
-        deadline = time.monotonic() + timeout
-        while not _try_acquire(fd):
-            if time.monotonic() >= deadline:
-                raise LockTimeout(f"could not acquire {path} within {timeout}s")
-            time.sleep(poll)
-        try:
-            yield
-        finally:
-            _release(fd)
+        yield
     finally:
-        os.close(fd)
+        lock.release()

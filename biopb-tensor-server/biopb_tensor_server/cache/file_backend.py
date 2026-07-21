@@ -326,17 +326,26 @@ class ArrowFileBackend(CacheBackend):
         except OSError:
             pass
 
-        # Acquire process lock (detect stale lock for crash recovery)
+        # Take exclusive ownership of the cache dir. The lock is held on an open
+        # descriptor for the life of this process, so it is the acquire itself
+        # that answers "is someone else using this?" -- staleness is read after,
+        # from the leftover owner record (biopb/biopb#544).
         lock_path = self._config.cache_dir / "lock"
         self._process_lock = ProcessLock(lock_path)
-
-        # Capture staleness BEFORE acquire() removes the stale lock file
-        was_stale = self._process_lock.is_stale()
 
         if not self._process_lock.acquire():
             raise RuntimeError(
                 f"Cannot acquire cache lock at {lock_path}. "
                 "Another process is using the cache."
+            )
+
+        was_stale = self._process_lock.is_stale()
+        if was_stale:
+            prior = self._process_lock.prior_owner() or {}
+            logger.warning(
+                "Cache directory was not released cleanly (previous owner pid=%s); "
+                "running recovery",
+                prior.get("pid", "unknown"),
             )
 
         # Enforce the segment format-version contract now that we are the

@@ -1,6 +1,7 @@
 """Thread-safety tests for cache module."""
 
 import errno
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -35,6 +36,24 @@ from biopb_tensor_server.cache.recovery import (
     WriteAheadLog,
 )
 from biopb_tensor_server.core.config import CacheConfig
+
+
+def _hold_cache_lock(lock_path: str, started) -> None:
+    """Child entry point: take a cache lock, then idle until killed.
+
+    Module level and argument-driven so it survives pickling under the ``spawn``
+    start method (the default on Windows/macOS). It waits in ``time.sleep``
+    rather than on a shared primitive: the test kills this process mid-wait, and
+    a killed waiter leaves a multiprocessing Event's internal semaphores in a
+    state that hangs the parent's ``set()``.
+    """
+    from biopb_tensor_server.cache.recovery import ProcessLock
+
+    lock = ProcessLock(Path(lock_path))
+    if not lock.acquire():
+        return
+    started.set()
+    time.sleep(120)  # killed long before this; never released cleanly
 
 
 class TestCacheEntry:
@@ -847,6 +866,29 @@ class TestArrowFileBackend:
         shutil.rmtree(cache_dir)
 
 
+def _simulate_crash(backend):
+    """Release a backend's OS file handles the way a dying process would.
+
+    A real crash makes the OS reclaim every open handle -- writers, sinks, mmaps,
+    and the cache lock's descriptor -- while leaving the on-disk owner record and
+    WAL behind (no clean shutdown). The test process stays alive, so we drop those
+    handles explicitly; on Windows a lingering handle also blocks the segment files
+    from being deleted (issue #5). Deliberately does NOT call backend.close() or
+    ProcessLock.release(), either of which would clean up and thus erase the crash
+    state -- and does NOT unlink the lock file, which no crash does either
+    (biopb/biopb#544).
+    """
+    for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
+        backend._close_writer(seg_id)
+    for mmap in backend._segment_mmaps.values():
+        mmap.close()
+    backend._segment_mmaps.clear()
+    # Drop the lock descriptor only -- the kernel does this for a dying process.
+    # The `.owner` record survives, which is the crash signal the next owner reads.
+    if backend._process_lock is not None:
+        backend._process_lock._lock.release()
+
+
 class TestArrowFileBackendRecovery:
     """Tests for crash recovery."""
 
@@ -859,121 +901,128 @@ class TestArrowFileBackendRecovery:
     def _make_temp_cache_dir(self):
         return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
 
-    def _simulate_crash(self, backend):
-        """Release a backend's OS file handles the way a dying process would.
+    def test_second_holder_is_refused(self):
+        """Two owners of one cache dir are impossible, not merely unlikely.
 
-        A real crash makes the OS reclaim every open writer/sink/mmap handle,
-        but leaves the lock file and WAL on disk (no clean shutdown). The test
-        process stays alive, so we must drop those handles explicitly -- on
-        Windows a lingering handle blocks the segment files from being deleted
-        (issue #5). Deliberately does NOT call backend.close(), which would
-        release the lock and clear the WAL and thus erase the crash state.
+        Regression for biopb/biopb#544: exclusion used to be a pid record, and
+        deciding it was a check-then-act (read the file, judge the owner dead,
+        write your own), so racing starters could all conclude they owned the
+        cache. The lock is a held descriptor now -- a second acquire loses even
+        with no contention window to exploit. flock is per open-file-description
+        and Windows byte-range locks are per handle, so a second lock object in
+        *this* process is excluded exactly as another process would be.
         """
-        for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
-            backend._close_writer(seg_id)
-        for mmap in backend._segment_mmaps.values():
-            mmap.close()
-        backend._segment_mmaps.clear()
-
-    def test_stale_lock_detection(self):
-        """Stale lock from dead process is detected."""
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"
 
-        # Create a stale lock with fake PID
-        import json
+        first = ProcessLock(lock_path)
+        assert first.acquire() is True
+        try:
+            second = ProcessLock(lock_path)
+            assert second.acquire() is False
+            assert second.is_acquired() is False
+        finally:
+            first.release()
 
-        fake_data = {"pid": 99999, "acquired_at": time.time()}
-        with open(lock_path, "w") as f:
-            json.dump(fake_data, f)
-
-        # ProcessLock should detect it as stale
-        lock = ProcessLock(lock_path)
-        assert lock.is_stale() is True
-        assert lock.acquire() is True  # Should acquire after removing stale lock
-        lock.release()
+        # Released -> the next owner gets it.
+        third = ProcessLock(lock_path)
+        assert third.acquire() is True
+        third.release()
 
         shutil.rmtree(cache_dir)
 
-    def test_stale_lock_pid_reuse_identity(self):
-        """A lock whose PID was reused (alive, different create time) is stale.
+    def test_clean_release_is_not_stale(self):
+        """A cache dir released cleanly does not look like a crash."""
+        cache_dir = self._make_temp_cache_dir()
+        lock_path = cache_dir / "lock"
 
-        The regression from biopb/biopb#138 item 8: a liveness-only check saw
-        our own alive PID and refused to reclaim; the identity check compares
-        the recorded create-time token and treats a mismatch as stale.
+        first = ProcessLock(lock_path)
+        assert first.acquire() is True
+        assert first.is_stale() is False  # nothing ran here before
+        first.release()
+
+        second = ProcessLock(lock_path)
+        assert second.acquire() is True
+        assert second.is_stale() is False, "clean release must not trigger recovery"
+        second.release()
+
+        shutil.rmtree(cache_dir)
+
+    def test_unreleased_owner_record_signals_a_crash(self):
+        """An owner record left behind is the crash signal.
+
+        A dying process releases the OS lock (the kernel closes its fd) but
+        cannot remove its record, so the next owner acquires successfully *and*
+        finds the marker -- which is precisely the case WAL recovery is for.
         """
-        from biopb._lifecycle.proc import process_create_time
-
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"
 
-        import json
+        crashed = ProcessLock(lock_path)
+        assert crashed.acquire() is True
+        # Drop the descriptor the way process death would, leaving the record.
+        crashed._lock.release()
 
-        # Alive PID (our own), but a create-time token that cannot match the
-        # live one -- as if a crashed owner's PID had been recycled onto us.
-        live_token = process_create_time(os.getpid())
-        if live_token is None:
-            pytest.skip("no create-time token on this platform (liveness-only)")
-        stale_data = {
-            "pid": os.getpid(),
-            "create_time": live_token + 1,
-            "acquired_at": time.time(),
-        }
-        with open(lock_path, "w") as f:
-            json.dump(stale_data, f)
+        survivor = ProcessLock(lock_path)
+        assert survivor.acquire() is True
+        assert survivor.is_stale() is True
+        assert (survivor.prior_owner() or {}).get("pid") == os.getpid()
+        survivor.release()
 
-        lock = ProcessLock(lock_path)
-        assert lock.is_stale() is True
-        assert lock.acquire() is True  # Reclaims despite the PID being alive
-        lock.release()
+        # The recovery signal is consumed: the next owner starts clean.
+        after = ProcessLock(lock_path)
+        assert after.acquire() is True
+        assert after.is_stale() is False
+        after.release()
 
         shutil.rmtree(cache_dir)
 
-    def test_live_lock_matching_identity_is_held(self):
-        """A lock with our alive PID and matching create time is NOT stale."""
-        from biopb._lifecycle.proc import process_create_time
+    def test_corrupt_owner_record_still_signals_a_crash(self):
+        """Presence is the signal, so an unparseable record still means crash.
 
+        It must also not raise -- the record's contents are only ever
+        diagnostic, never consulted to decide ownership.
+        """
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"
-
-        import json
-
-        live_token = process_create_time(os.getpid())
-        held_data = {
-            "pid": os.getpid(),
-            "create_time": live_token,
-            "acquired_at": time.time(),
-        }
-        with open(lock_path, "w") as f:
-            json.dump(held_data, f)
+        (cache_dir / "lock.owner").write_text("{not valid json")
 
         lock = ProcessLock(lock_path)
-        assert lock.is_stale() is False
-        assert lock.acquire() is False  # Owner still alive -> not reclaimable
-
-        shutil.rmtree(cache_dir)
-
-    def test_legacy_lock_no_token_falls_back_to_liveness(self):
-        """A tokenless (pre-identity) lock degrades to a liveness-only check."""
-        cache_dir = self._make_temp_cache_dir()
-        lock_path = cache_dir / "lock"
-
-        import json
-
-        # Legacy bare-PID file, alive PID -> treated as held (liveness fallback).
-        with open(lock_path, "w") as f:
-            json.dump({"pid": os.getpid(), "acquired_at": time.time()}, f)
-        lock = ProcessLock(lock_path)
-        assert lock.is_stale() is False
-        assert lock.acquire() is False
-
-        # Legacy bare-PID file, dead PID -> stale.
-        with open(lock_path, "w") as f:
-            json.dump({"pid": 99999, "acquired_at": time.time()}, f)
-        lock = ProcessLock(lock_path)
-        assert lock.is_stale() is True
         assert lock.acquire() is True
+        assert lock.is_stale() is True
+        assert lock.prior_owner() == {}
         lock.release()
+
+        shutil.rmtree(cache_dir)
+
+    def test_lock_survives_holder_death_without_pid_bookkeeping(self):
+        """A killed holder's lock is released by the OS, not reclaimed by us.
+
+        This is the property that made the pid/create-time identity check
+        unnecessary: the old scheme had to prove the recorded owner was dead
+        (and survive pid reuse) because nothing else would ever free the lock.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        lock_path = cache_dir / "lock"
+
+        ctx = multiprocessing.get_context("spawn")
+        started = ctx.Event()
+        holder = ctx.Process(target=_hold_cache_lock, args=(str(lock_path), started))
+        holder.start()
+        try:
+            assert started.wait(60), "child never acquired the lock"
+            contender = ProcessLock(lock_path)
+            assert contender.acquire() is False, "a live holder must exclude us"
+        finally:
+            holder.kill()  # uncatchable: no chance to release or clean up
+            holder.join(30)
+
+        reclaimed = ProcessLock(lock_path)
+        assert reclaimed.acquire() is True, (
+            "OS should have dropped the dead holder's lock"
+        )
+        assert reclaimed.is_stale() is True, "a killed holder left its record"
+        reclaimed.release()
 
         shutil.rmtree(cache_dir)
 
@@ -1008,12 +1057,10 @@ class TestArrowFileBackendRecovery:
         backend1.complete_entry(b"key1", data, 24)
         backend1.release(b"key1")
 
-        # Simulate crash - don't call close(), just remove lock
-        # (this simulates process dying without clean shutdown)
-        self._simulate_crash(backend1)
-        lock_path = cache_dir / "lock"
-        if lock_path.exists():
-            lock_path.unlink()
+        # Crash: the OS drops the lock descriptor and leaves both the lock file
+        # and its owner record behind. The next instance reclaims the freed lock
+        # and the leftover record drives recovery -- no unlink, which no crash does.
+        _simulate_crash(backend1)
 
         # Second instance should recover and still have the entry
         backend2 = ArrowFileBackend(config)
@@ -1029,9 +1076,7 @@ class TestArrowFileBackendRecovery:
         shutil.rmtree(cache_dir)
 
     def test_stale_lock_triggers_recovery_without_wal_entries(self):
-        """Stale lock alone (no WAL entries) triggers recovery on restart."""
-        import json
-
+        """An unclean exit alone (no WAL entries) triggers recovery on restart."""
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
 
@@ -1042,14 +1087,11 @@ class TestArrowFileBackendRecovery:
         backend1.complete_entry(b"key1", data, 24)
         backend1.release(b"key1")
 
-        # Simulate crash: overwrite lock with a dead PID (no pending WAL entries)
-        self._simulate_crash(backend1)
-        lock_path = cache_dir / "lock"
-        fake_data = {"pid": 99999, "acquired_at": time.time()}
-        with open(lock_path, "w") as f:
-            json.dump(fake_data, f)
+        # Crash: the lock's descriptor goes, its owner record stays behind.
+        _simulate_crash(backend1)
 
-        # Verify WAL has no pending entries (so recovery must be triggered by stale lock)
+        # Verify WAL has no pending entries (so recovery must be triggered by
+        # the leftover owner record alone)
         from biopb_tensor_server.cache.recovery import WriteAheadLog
 
         wal = WriteAheadLog(cache_dir / "wal.json")
@@ -1083,12 +1125,10 @@ class TestArrowFileBackendRecovery:
         # log_committed).
         backend1._wal.log_pending(b"key_bad")
 
-        # Crash without clean shutdown, then drop the lock so a fresh instance
-        # can claim it; recovery is then driven by the pending WAL entry.
-        self._simulate_crash(backend1)
-        lock_path = cache_dir / "lock"
-        if lock_path.exists():
-            lock_path.unlink()
+        # Crash without clean shutdown: the OS frees the lock descriptor so a
+        # fresh instance can reclaim it, and recovery is driven by the pending
+        # WAL entry (the lock file and owner record stay -- no crash unlinks them).
+        _simulate_crash(backend1)
 
         backend2 = ArrowFileBackend(config)
         # Recovery ran (driven by the pending WAL entry) and purged the in-flight
@@ -1112,8 +1152,6 @@ class TestArrowFileBackendRecovery:
         total from segment file sizes -- it must NOT scan segment bodies just for
         the status line (biopb/biopb#300).
         """
-        import json
-
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
 
@@ -1125,10 +1163,8 @@ class TestArrowFileBackendRecovery:
             backend1.complete_entry(key, self._make_data([i, i + 1]), 16)
             backend1.release(key)
 
-        # Crash, then leave a stale (dead-PID) lock so recovery is triggered.
-        self._simulate_crash(backend1)
-        with open(cache_dir / "lock", "w") as f:
-            json.dump({"pid": 99999, "acquired_at": time.time()}, f)
+        # Crash: the leftover owner record is what triggers recovery.
+        _simulate_crash(backend1)
 
         segments_dir = cache_dir / "segments"
         expected_bytes = sum(f.stat().st_size for f in segments_dir.glob("seg_*.arrow"))
@@ -1898,17 +1934,6 @@ class TestSegmentSidecarIndex:
     def _seg_files(self, cache_dir):
         return sorted((cache_dir / "segments").glob("seg_*.arrow"))
 
-    def _simulate_crash(self, backend, cache_dir):
-        """Drop OS handles the way a dying process would, without the sidecar/WAL
-        housekeeping a clean close() does; then remove the lock so a fresh backend
-        can claim the dir."""
-        for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
-            backend._close_writer(seg_id)
-        for mm in backend._segment_mmaps.values():
-            mm.close()
-        backend._segment_mmaps.clear()
-        (cache_dir / "lock").unlink(missing_ok=True)
-
     def _tamper_sidecar_size(self, idx_path, wrong_size):
         with pa.OSFile(str(idx_path), "rb") as f:
             table = pa.ipc.open_file(f).read_all()
@@ -2134,7 +2159,7 @@ class TestSegmentSidecarIndex:
         assert len(sealed) == 3  # two sealed + one open on disk
         assert len(sidecars) == 2  # only the two sealed ones have sidecars
 
-        self._simulate_crash(b1, cache_dir)
+        _simulate_crash(b1)
 
         counting = _ScanCountingBackend(config)
         assert counting.scan_calls == 1, "only the open (sidecar-less) segment walks"
