@@ -120,6 +120,104 @@ class TestLocateEntry:
     def test_unknown_key_returns_none(self, file_backend):
         assert file_backend.locate_entry(b"does-not-exist") is None
 
+    def test_offsets_captured_at_write_time(self, file_backend):
+        """A freshly written entry is already indexed -- no locate-time walk.
+
+        Regression for biopb/biopb#541: offsets used to be derived lazily, so
+        every cache *miss* left an unindexed entry and the next locate re-walked
+        the whole active segment (O(segment size), ~9 ms at 256 MB) -- a cost
+        paid only by the localhost fast path that walk was meant to accelerate.
+        The walk must not run at all on this path, including for the first entry
+        in a segment (the one that shares its append with the schema message).
+        """
+        for i in range(3):
+            a = ((np.arange(1200, dtype=np.uint16) + i * 7) % 401).astype(np.uint16)
+            key = f"w{i}".encode()
+            file_backend.get_or_acquire(
+                key, (lambda a=a: (_make_typed_batch(a), a.nbytes))
+            )
+            file_backend.release(key)
+            info = file_backend._metadata[key]
+            assert info.byte_offset > 0 and info.byte_length > 0, (
+                f"entry {i} left unindexed by the write path"
+            )
+
+        def _boom(_segment_id):
+            raise AssertionError("locate_entry fell back to the segment walk")
+
+        with patch.object(file_backend, "_fill_byte_offsets_for_segment", _boom):
+            for i in range(3):
+                assert file_backend.locate_entry(f"w{i}".encode()) is not None
+
+    def test_write_time_offsets_match_segment_walk(self, file_backend):
+        """Write-time ranges are byte-identical to what a boot walk derives.
+
+        The sidecar / boot index (`_scan_segment_records`) and the write path
+        must agree, or a chunk would locate to one range now and another after a
+        restart.
+        """
+        arrs = {}
+        for i in range(4):
+            a = ((np.arange(900, dtype=np.uint16) + i * 31) % 307).astype(np.uint16)
+            arrs[f"m{i}".encode()] = a
+            key = f"m{i}".encode()
+            file_backend.get_or_acquire(
+                key, (lambda a=a: (_make_typed_batch(a), a.nbytes))
+            )
+            file_backend.release(key)
+
+        segment_id = file_backend._metadata[b"m0"].segment_id
+        seg_file = Path(file_backend.locate_entry(b"m0").segment_path)
+        walked = {
+            key: (byte_offset, byte_length)
+            for key, byte_offset, byte_length, _, _ in file_backend._scan_segment_records(
+                seg_file
+            )
+        }
+        for key in arrs:
+            info = file_backend._metadata[key]
+            assert info.segment_id == segment_id
+            assert walked[key] == (info.byte_offset, info.byte_length)
+
+    def test_offsets_captured_across_segment_rotation(self):
+        """Every segment's first entry is indexed too, not just later appends.
+
+        The first append in a segment also flushes the writer's buffered schema
+        message, so its bracket covers both; the write path has to subtract the
+        schema length rather than leave the entry unindexed.
+        """
+        d = tempfile.mkdtemp()
+        be = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=Path(d),
+                max_segment_bytes=64 * 1024,  # rotate every few chunks
+                max_total_bytes=256 * 1024 * 1024,
+            )
+        )
+        try:
+            arrs = {}
+            for i in range(12):
+                a = ((np.arange(8000, dtype=np.uint16) + i) % 509).astype(np.uint16)
+                key = f"r{i}".encode()
+                arrs[key] = a
+                be.get_or_acquire(key, (lambda a=a: (_make_typed_batch(a), a.nbytes)))
+                be.release(key)
+
+            segments = {be._metadata[k].segment_id for k in arrs}
+            assert len(segments) > 1, "test needs at least one rotation"
+
+            def _boom(_segment_id):
+                raise AssertionError("locate_entry fell back to the segment walk")
+
+            with patch.object(be, "_fill_byte_offsets_for_segment", _boom):
+                for key, a in arrs.items():
+                    loc = be.locate_entry(key)
+                    assert loc is not None and loc.byte_offset > 0
+                    assert np.array_equal(_read_via_location(loc), a)
+        finally:
+            be.close()
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_locate_survives_restart(self):
         """Offsets are recoverable after a restart (rebuild from segments)."""
         d = tempfile.mkdtemp()

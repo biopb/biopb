@@ -392,9 +392,14 @@ editing the code.
   falls back to `do_get` whenever a chunk can't be located (memory backend, old
   server, evicted segment). Replaces the old `/dev/shm` `shm_transfer` path,
   which was *slower* than the socket because it allocated a fresh POSIX segment
-  per chunk. Byte offsets are derived by walking the flushed segment lazily in
-  `locate_entry` (the stream writer buffers the schema, so the live sink cursor
-  can't bracket the first message).
+  per chunk. Byte offsets are captured **at write time** from the sink cursor
+  (`biopb/biopb#541`) — the first append in a segment also flushes the writer's
+  buffered schema message, so that one entry's start is recovered by reading the
+  schema message's length off the file. Deriving them lazily instead made every
+  cache *miss* re-walk the whole active segment (O(entry count), ~9 ms at a full
+  256 MB segment, worse for small chunks), a cost paid only by the fast path it
+  was meant to accelerate. Walking survives only as a fallback for an entry the
+  write path couldn't bracket; boot restores ranges from the `.idx` sidecar.
 
 - **Localhost read amplification — chunk size is conflated with access
   granularity.** The server sizes chunks to a fixed transfer cap

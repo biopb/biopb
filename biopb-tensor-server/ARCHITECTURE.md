@@ -252,6 +252,17 @@ sidecar, so the first boot after upgrading an old cache pays the walk once). The
 sidecar is purely additive — an older server ignores `.idx` (it globs `.arrow`)
 — and its tiny bytes are not counted toward the eviction budget.
 
+**Byte ranges are recorded at write time (biopb/biopb#541).** `complete_entry`
+brackets each appended message with the sink cursor, so the localhost
+`chunk_locate` fast path finds every entry already indexed. The one special case
+is a segment's first append, which also flushes the writer's buffered schema
+message: its start is recovered by reading that message's length off the file.
+Together with the sidecar above, nothing on a normal path leaves an entry
+unindexed — the lazy `_fill_byte_offsets_for_segment` walk survives only as a
+fallback, because it costs O(entries in the segment) per call (measured ~5 ms at
+145 MB with 0.87 MB chunks; it scales with entry *count*, so a 128 KB-chunk
+source pays ~12 ms at the same 128 MB) and used to be paid on **every miss**.
+
 ---
 
 ## FastAPI HTTP Server

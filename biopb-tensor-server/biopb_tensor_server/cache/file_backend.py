@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import struct
 import sys
 import threading
 import time
@@ -132,6 +133,31 @@ _SIDECAR_SCHEMA = pa.schema(
         pa.field("offset", pa.int64()),
     ]
 )
+
+
+def _schema_message_length(path: Path) -> Optional[int]:
+    """Byte length of the leading IPC schema message in a segment file.
+
+    The stream writer buffers the schema until the first batch is written, so a
+    segment's *first* append advances the sink cursor across schema + batch
+    together; splitting them needs the schema message's own length. Read it off
+    the encapsulated-message header rather than re-serializing the schema, so it
+    is exactly what the writer emitted: ``[continuation 0xFFFFFFFF][uint32
+    metadata length][metadata, padded]`` with an empty body. Returns None if the
+    header can't be read, leaving the entry unindexed for the lazy walk.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if len(head) < 8:
+        return None
+    first, metadata_len = struct.unpack("<II", head)
+    if first == 0xFFFFFFFF:
+        return 8 + metadata_len
+    # Pre-V5 stream framing: a bare length prefix, no continuation marker.
+    return 4 + first
 
 
 def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -1150,12 +1176,48 @@ class ArrowFileBackend(CacheBackend):
 
         return None
 
+    def _bracket_written_message(
+        self,
+        segment_id: int,
+        write_start: Optional[int],
+        write_end: Optional[int],
+    ) -> Tuple[int, int]:
+        """Byte range of the message just appended, from the sink cursor.
+
+        Capturing the range at write time is what keeps a cache *miss* off the
+        lazy walk: before this, an entry landed unindexed and the next
+        ``locate_entry`` on it re-walked the whole active segment (up to
+        ``max_segment_bytes``) to find where it went -- O(entries in the
+        segment), measured at ~5 ms on a 145 MB segment of 0.87 MB chunks and
+        several times that for small-chunk sources, and paid only by the
+        localhost fast path it was meant to accelerate (biopb/biopb#541).
+
+        ``write_start == 0`` is the segment's first append, where the writer
+        also emitted the schema message it had buffered; the batch starts after
+        it, so its length is read back off the file. Returns ``(0, 0)`` --
+        "unknown", handled by the lazy walk -- if the range can't be derived.
+        Caller holds ``_write_lock`` (which keeps the segment's writer/sink
+        state stable), not ``_lock``.
+        """
+        if write_start is None or write_end is None or write_end <= write_start:
+            return 0, 0
+        if write_start > 0:
+            return write_start, write_end - write_start
+
+        path = self._pool_paths.get(segment_id)
+        if path is None:
+            return 0, 0
+        schema_len = _schema_message_length(path)
+        if schema_len is None or not 0 < schema_len < write_end:
+            return 0, 0
+        return schema_len, write_end - schema_len
+
     def _fill_byte_offsets_for_segment(self, segment_id: int) -> None:
         """Walk a segment file once and record each entry's IPC message range.
 
-        Offsets aren't captured at write time (the stream writer buffers the
-        schema until the first batch, so the live sink cursor can't bracket the
-        first message). Instead we derive them by walking the flushed file,
+        The fallback for an entry whose range wasn't captured at write time by
+        ``_bracket_written_message`` (an unreadable schema header, or a segment
+        written by an older build). Derive them by walking the flushed file,
         matching messages to keys via the per-batch cache_key column, and fill
         ``byte_offset`` / ``byte_length`` on the existing metadata entries. The
         caller (``locate_entry``) holds both ``self._write_lock`` and
@@ -1233,8 +1295,9 @@ class ArrowFileBackend(CacheBackend):
         # be able to read N bytes for message body"). The lock order here is
         # ``_write_lock`` -> ``_lock``, matching ``complete_entry``, so there is
         # no ABBA deadlock; ``_write_lock`` blocks at most concurrent writes,
-        # never the cached-read path. (Only the *first* locate of an unindexed
-        # entry pays this; the fast path above takes neither write lock.)
+        # never the cached-read path. Reaching here at all is now the exception
+        # (#541): ranges are captured at write time and restored at boot from
+        # the ``.idx`` sidecar, so nothing routine leaves an entry unindexed.
         with self._write_lock:
             with self._lock:
                 entry_info = self._metadata.get(key)
@@ -1520,18 +1583,24 @@ class ArrowFileBackend(CacheBackend):
                 sink = self._pool_sinks.get(segment_id)
 
             # ---- PHASE 2: blocking disk write, self._lock RELEASED ----
-            # Flush so the bytes are durable in the page cache; the localhost
-            # cache-file handoff (issue #9) derives byte offsets lazily by walking
-            # the flushed file in locate_entry(). A failure here (e.g. ENOSPC)
-            # propagates out: get_or_acquire's owner branch turns it into
+            # Flush so the bytes are durable in the page cache, and bracket the
+            # message with the sink cursor so the localhost cache-file handoff
+            # (issue #9) gets its byte range for free. A failure here (e.g.
+            # ENOSPC) propagates out: get_or_acquire's owner branch turns it into
             # fail_entry() + re-raise. That is now safe -- the `with` blocks
             # release both locks on the way out, so a failed (or stalled) write
             # can no longer leave a lock held across the read path.
             if self._wal:
                 self._wal.log_pending(key)
+            write_start = sink.tell() if sink is not None else None
             writer.write_batch(batch_with_key)
+            write_end = None
             if sink is not None:
                 sink.flush()
+                write_end = sink.tell()
+            byte_offset, byte_length = self._bracket_written_message(
+                segment_id, write_start, write_end
+            )
 
             # ---- PHASE 3: in-memory commit ----
             need_close = False
@@ -1555,6 +1624,8 @@ class ArrowFileBackend(CacheBackend):
                     metadata=entry.metadata,
                     created_at=time.time(),
                     last_access_time=time.time(),
+                    byte_offset=byte_offset,
+                    byte_length=byte_length,
                 )
                 entry.set_ready(data, size_bytes)
                 need_close = bool(
