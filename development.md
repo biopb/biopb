@@ -400,9 +400,10 @@ editing the code.
   with 0.87 MB chunks and worse for small ones), a cost paid only by the fast
   path it was meant to accelerate — and that walk was the only place the read
   path took the cache's write lock, so a stalled write blocked locates. Between
-  the write path and the boot `.idx` sidecar restore, every index entry now
-  carries its range from birth, so `locate_entry` derives nothing and the walk
-  is gone rather than kept as a fallback.
+  the write path and the boot `.idx` sidecar restore, an index entry now carries
+  its range from birth, so `locate_entry` derives nothing and the walk is gone
+  rather than kept as a fallback — an entry that somehow lacks a range simply
+  falls back to `do_get`, the designed floor of this path.
 
 - **Localhost read amplification — chunk size is conflated with access
   granularity.** The server sizes chunks to a fixed transfer cap

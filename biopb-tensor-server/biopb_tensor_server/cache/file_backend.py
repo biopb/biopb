@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import struct
 import sys
 import threading
 import time
@@ -140,24 +139,26 @@ def _schema_message_length(path: Path) -> Optional[int]:
 
     The stream writer buffers the schema until the first batch is written, so a
     segment's *first* append advances the sink cursor across schema + batch
-    together; splitting them needs the schema message's own length. Read it off
-    the encapsulated-message header rather than re-serializing the schema, so it
-    is exactly what the writer emitted: ``[continuation 0xFFFFFFFF][uint32
-    metadata length][metadata, padded]`` with an empty body. Returns None if the
-    header can't be read, leaving the entry unindexed for the lazy walk.
+    together; splitting them needs the schema message's own length. Let pyarrow
+    read its own framing (rather than decoding the encapsulated-message header
+    here) so this can't drift from what the writer emits -- it is the same
+    ``read_message`` call the boot walk opens a segment with, on the ~160 bytes
+    at the head of the file.
+
+    Returns None if that read fails, which costs the *first* entry of this one
+    segment its byte range: ``locate_entry`` reports it unavailable and the
+    client transfers that chunk over do_get instead of mmap. Later entries in
+    the segment bracket directly off the sink cursor and are unaffected, and the
+    seal-time ``.idx`` sidecar re-derives the range from the segment body, so a
+    restart restores the fast path for it.
     """
     try:
-        with open(path, "rb") as f:
-            head = f.read(8)
-    except OSError:
+        with pa.OSFile(str(path), "rb") as f:
+            pa.ipc.read_message(f)  # the leading schema message
+            length = f.tell()
+    except (OSError, pa.ArrowInvalid, EOFError, StopIteration):
         return None
-    if len(head) < 8:
-        return None
-    first, metadata_len = struct.unpack("<II", head)
-    if first == 0xFFFFFFFF:
-        return 8 + metadata_len
-    # Pre-V5 stream framing: a bare length prefix, no continuation marker.
-    return 4 + first
+    return length or None
 
 
 def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:

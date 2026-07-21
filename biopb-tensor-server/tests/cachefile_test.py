@@ -143,6 +143,65 @@ class TestLocateEntry:
             )
             assert file_backend.locate_entry(key) is not None
 
+    def test_underivable_schema_length_degrades_to_do_get(self):
+        """If the schema length can't be read, only that one entry loses mmap.
+
+        With no lazy walk behind it, `_schema_message_length` returning None is
+        the sole way an entry can end up without a byte range. The blast radius
+        must stay at the segment's *first* entry (the only append that shares
+        its bracket with the schema message): it reports unavailable so the
+        client falls back to do_get, while later entries locate normally, the
+        data is still readable, and a restart repairs it from the segment body.
+        """
+        d = tempfile.mkdtemp()
+        cfg = {
+            "max_segment_bytes": 64 * 1024 * 1024,
+            "max_total_bytes": 256 * 1024 * 1024,
+        }
+        be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
+        arrs = {}
+        try:
+            with patch(
+                "biopb_tensor_server.cache.file_backend._schema_message_length",
+                return_value=None,
+            ):
+                for i in range(3):
+                    a = ((np.arange(1100, dtype=np.uint16) + i) % 397).astype(np.uint16)
+                    key = f"d{i}".encode()
+                    arrs[key] = a
+                    be.get_or_acquire(
+                        key, (lambda a=a: (_make_typed_batch(a), a.nbytes))
+                    )
+                    be.release(key)
+
+            # Only the first entry is un-ranged, and it degrades to "unavailable"
+            # (-> do_get) rather than to a bogus location.
+            assert be.locate_entry(b"d0") is None
+            for i in (1, 2):
+                loc = be.locate_entry(f"d{i}".encode())
+                assert loc is not None
+                assert np.array_equal(_read_via_location(loc), arrs[f"d{i}".encode()])
+
+            # The chunk itself is intact -- it is the do_get path that serves it.
+            entry = be.get_or_acquire(
+                b"d0", (lambda: pytest.fail("d0 should still be cached"))
+            )
+            assert np.array_equal(unpack_chunk_array(entry.data), arrs[b"d0"])
+            be.release(b"d0")
+        finally:
+            be.close()
+
+        # Self-heals: the sidecar/boot walk derives ranges from the segment body,
+        # independent of the write-time bracket.
+        be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
+        try:
+            loc = be2.locate_entry(b"d0")
+            assert loc is not None, "restart should restore the range"
+            assert np.array_equal(_read_via_location(loc), arrs[b"d0"])
+        finally:
+            be2.close()
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_locate_never_takes_the_write_lock(self, file_backend):
         """A stalled write must not block a locate.
 
