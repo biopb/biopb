@@ -266,8 +266,15 @@ class ArrowFileBackend(CacheBackend):
         # Maps segment_id -> SegmentInfo for segments not yet in pool queues
         self._segments_legacy: Dict[int, SegmentInfo] = {}
 
-        # Mmap handles for fast reads
+        # Mmap handles for fast reads, and each mapped segment's IPC schema.
+        # The schema is what lets a read decode the single message at an entry's
+        # recorded byte offset; it is cached because re-reading it per chunk
+        # would cost back what the offset saves. Both are maintained only via
+        # ``_open_segment_mmap`` / ``_forget_segment_mmap``, so a stale schema
+        # can never outlive the mapping it describes (segment ids are reused
+        # after ``clear()`` resets the counter).
         self._segment_mmaps: Dict[int, pa.MemoryMappedFile] = {}
+        self._segment_schemas: Dict[int, pa.Schema] = {}
 
         # Multiple active writers for pooling: segment_id -> writer
         # This allows keeping multiple segments open for different (schema, size_class) pools
@@ -549,8 +556,7 @@ class ArrowFileBackend(CacheBackend):
                     )
                     self._drop_segment_files(segment_id)
                     continue
-                mmap = pa.memory_map(str(seg_file), "r")
-                self._segment_mmaps[segment_id] = mmap
+                self._open_segment_mmap(segment_id, seg_file)
                 self._install_segment_records(segment_id, seg_file, records)
                 walked += 1
                 # Backfill a sidecar from the records we just read -- no second
@@ -580,12 +586,39 @@ class ArrowFileBackend(CacheBackend):
         except OSError:
             pass
 
-    def _drop_segment_files(self, segment_id: int) -> None:
-        """Discard a bad segment: close its mmap and unlink both ``.arrow`` and
-        ``.idx``. Used for a legacy/corrupt segment on the boot fallback path."""
+    def _open_segment_mmap(self, segment_id: int, path) -> None:
+        """Map a sealed segment read-only so its entries can be served."""
+        self._segment_mmaps[segment_id] = pa.memory_map(str(path), "r")
+        self._segment_schemas.pop(segment_id, None)
+
+    def _forget_segment_mmap(self, segment_id: int) -> None:
+        """Close and drop a segment's read mapping, and its cached schema."""
         mmap = self._segment_mmaps.pop(segment_id, None)
         if mmap is not None:
             mmap.close()
+        self._segment_schemas.pop(segment_id, None)
+
+    def _segment_schema(self, segment_id: int, mmap) -> Optional[pa.Schema]:
+        """Schema of a mapped segment, read from its leading message once.
+
+        Returns None if that message can't be read, which sends the caller down
+        the sequential fallback.
+        """
+        schema = self._segment_schemas.get(segment_id)
+        if schema is not None:
+            return schema
+        try:
+            mmap.seek(0)
+            schema = pa.ipc.open_stream(mmap).schema
+        except (pa.ArrowInvalid, OSError, EOFError, StopIteration):
+            return None
+        self._segment_schemas[segment_id] = schema
+        return schema
+
+    def _drop_segment_files(self, segment_id: int) -> None:
+        """Discard a bad segment: close its mmap and unlink both ``.arrow`` and
+        ``.idx``. Used for a legacy/corrupt segment on the boot fallback path."""
+        self._forget_segment_mmap(segment_id)
         seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
         try:
             seg_file.unlink()
@@ -735,8 +768,7 @@ class ArrowFileBackend(CacheBackend):
                 strict=True,  # columns of one table -> equal length
             )
         )
-        mmap = pa.memory_map(str(seg_file), "r")
-        self._segment_mmaps[segment_id] = mmap
+        self._open_segment_mmap(segment_id, seg_file)
         self._install_segment_records(segment_id, seg_file, records)
         return True
 
@@ -896,8 +928,7 @@ class ArrowFileBackend(CacheBackend):
         # in-memory copies, under the lock.
         with self._lock:
             if path and path.exists():
-                mmap = pa.memory_map(str(path), "r")
-                self._segment_mmaps[segment_id] = mmap
+                self._open_segment_mmap(segment_id, path)
 
                 # The segment is now re-readable, so the in-memory RecordBatch
                 # copies of its entries are redundant. Drop those no longer
@@ -978,9 +1009,7 @@ class ArrowFileBackend(CacheBackend):
         }
 
         # Close and remove mmap
-        mmap = self._segment_mmaps.pop(segment_id, None)
-        if mmap:
-            mmap.close()
+        self._forget_segment_mmap(segment_id)
 
         # Delete segment file and its sidecar index (whole-segment eviction).
         segments_dir = self._config.cache_dir / "segments"
@@ -1098,8 +1127,7 @@ class ArrowFileBackend(CacheBackend):
         """Reopen mmap for cold segment that was accessed."""
         path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
         if path.exists():
-            mmap = pa.memory_map(str(path), "r")
-            self._segment_mmaps[segment_id] = mmap
+            self._open_segment_mmap(segment_id, path)
             seg_info.mmap_released = False
             # On access: increment counter
             seg_info.frequency = min(K, seg_info.frequency + 1)
@@ -1120,9 +1148,7 @@ class ArrowFileBackend(CacheBackend):
                     seg_info.frequency <= COLD_FREQUENCY_THRESHOLD
                     and age > COLD_THRESHOLD_SECONDS
                 ):
-                    mmap = self._segment_mmaps.pop(seg_id, None)
-                    if mmap:
-                        mmap.close()
+                    self._forget_segment_mmap(seg_id)
                     seg_info.mmap_released = True
 
     def _read_batch_from_segment(self, key: bytes) -> Optional[pa.RecordBatch]:
@@ -1153,36 +1179,59 @@ class ArrowFileBackend(CacheBackend):
         if mmap is None:
             return None
 
-        # Seek back to beginning since reader exhausts the mmap
-        mmap.seek(0)
-
         # Periodic mmap cleanup check
         self._access_counter += 1
         if self._access_counter % 100 == 0:
             self._maybe_release_cold_mmaps()
 
-        # Read all batches and find the right one by index
-        # (Arrow IPC stream doesn't support direct offset access easily)
-        reader = pa.RecordBatchStreamReader(mmap)
-        for i, batch in enumerate(reader):
-            if i == entry_info.offset:
-                # Detach from the segment mmap on Windows so the file can be
-                # unlinked during eviction even while a caller holds the batch
-                # (issue #5). POSIX keeps the zero-copy mmap read.
-                if self._copy_on_read:
-                    batch = _copy_batch_off_mmap(batch)
-                # Serve the unified binary schema as-is (biopb/biopb#293); just
-                # strip the internal cache-key column so the wire batch is the
-                # clean [data, shape, dtype]. No binary->typed conversion.
-                return pa.RecordBatch.from_arrays(
-                    [
-                        batch.column("data"),
-                        batch.column("shape"),
-                        batch.column("dtype"),
-                    ],
-                    names=["data", "shape", "dtype"],
-                )
+        batch = self._read_batch_at(entry_info.segment_id, mmap, entry_info)
+        if batch is None:
+            return None
 
+        # Detach from the segment mmap on Windows so the file can be unlinked
+        # during eviction even while a caller holds the batch (issue #5).
+        # POSIX keeps the zero-copy mmap read.
+        if self._copy_on_read:
+            batch = _copy_batch_off_mmap(batch)
+        # Serve the unified binary schema as-is (biopb/biopb#293); just strip
+        # the internal cache-key column so the wire batch is the clean
+        # [data, shape, dtype]. No binary->typed conversion.
+        return pa.RecordBatch.from_arrays(
+            [batch.column("data"), batch.column("shape"), batch.column("dtype")],
+            names=["data", "shape", "dtype"],
+        )
+
+    def _read_batch_at(
+        self, segment_id: int, mmap, entry_info: SegmentEntryInfo
+    ) -> Optional[pa.RecordBatch]:
+        """Decode the single record batch this entry points at.
+
+        Seeks straight to the entry's recorded byte range instead of walking the
+        IPC stream to reach it. Since biopb/biopb#541 an entry carries that range
+        from birth -- recorded at write time, restored at boot from the ``.idx``
+        sidecar or the segment walk -- and it is the same range ``locate_entry``
+        already hands to a localhost client. Walking cost O(entries before the
+        target) on *every* do_get hit, and hits really do re-read: ``release``
+        drops the redundant in-RAM mirror once a segment is mmap-readable.
+
+        Falls back to the walk when the entry has no range (the one case
+        ``_bracket_written_message`` can't derive: a failed schema-length read on
+        a segment's first append) or the segment's schema can't be read.
+        """
+        if entry_info.byte_offset and entry_info.byte_length:
+            schema = self._segment_schema(segment_id, mmap)
+            if schema is not None:
+                try:
+                    mmap.seek(entry_info.byte_offset)
+                    return pa.ipc.read_record_batch(pa.ipc.read_message(mmap), schema)
+                except (pa.ArrowInvalid, OSError, EOFError, StopIteration):
+                    pass  # fall through to the sequential walk
+
+        # No usable range: walk the stream to the entry's index.
+        mmap.seek(0)
+        for i, batch in enumerate(pa.RecordBatchStreamReader(mmap)):
+            if i == entry_info.offset:
+                return batch
         return None
 
     def _bracket_written_message(
@@ -1650,9 +1699,8 @@ class ArrowFileBackend(CacheBackend):
             self._next_segment_map.clear()
 
             # Close all mmaps
-            for mmap in self._segment_mmaps.values():
-                mmap.close()
-            self._segment_mmaps.clear()
+            for segment_id in list(self._segment_mmaps):
+                self._forget_segment_mmap(segment_id)
 
             # Delete all segment files and their sidecar indexes
             segments_dir = self._config.cache_dir / "segments"
@@ -1760,9 +1808,8 @@ class ArrowFileBackend(CacheBackend):
             self._next_segment_map.clear()
 
             # Close all mmap handles
-            for mmap in self._segment_mmaps.values():
-                mmap.close()
-            self._segment_mmaps.clear()
+            for segment_id in list(self._segment_mmaps):
+                self._forget_segment_mmap(segment_id)
 
             # Clear WAL (writes complete)
             if self._wal:
