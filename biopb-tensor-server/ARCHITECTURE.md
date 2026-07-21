@@ -252,6 +252,31 @@ sidecar, so the first boot after upgrading an old cache pays the walk once). The
 sidecar is purely additive — an older server ignores `.idx` (it globs `.arrow`)
 — and its tiny bytes are not counted toward the eviction budget.
 
+**Byte ranges are recorded at write time (biopb/biopb#541).** `complete_entry`
+brackets each appended message with the sink cursor, so the localhost
+`chunk_locate` fast path finds every entry already indexed. The one special case
+is a segment's first append, which also flushes the writer's buffered schema
+message: its start is recovered by reading that message's length off the file.
+Between this and the sidecar above, index entries are created with their range
+already known — the two constructors are the write path and the boot restore,
+and there is no third. So `locate_entry` derives nothing: it is a dict lookup
+under `_lock`. The single way an entry can still lack a range is a failed
+schema-length read on a segment's *first* append; that entry reports unavailable
+and the client transfers it over `do_get`, later entries in the segment are
+unaffected (they bracket straight off the sink cursor), and a restart repairs it
+from the segment body. Degrading to the socket is the designed floor of this
+whole path, so there is nothing to recover beyond it.
+
+The lazy `_fill_byte_offsets_for_segment` walk it replaced is **deleted**, not
+kept as a fallback, for two reasons. It cost O(entries in the segment) per call
+(measured ~5 ms at 145 MB with 0.87 MB chunks; it scales with entry *count*, so
+a 128 KB-chunk source pays ~12 ms at the same 128 MB) and was paid on **every
+cache miss**. And it was the only place the read path took `_write_lock` — so a
+write stalled on a full filesystem blocked locates behind it, the coupling that
+makes a wedged cache non-self-healing. Torn-tail tolerance (a partial write's
+slack) still matters, but on the walk that actually meets it: the boot-time
+`_scan_segment_records`.
+
 ---
 
 ## FastAPI HTTP Server
