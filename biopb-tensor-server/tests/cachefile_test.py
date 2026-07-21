@@ -600,11 +600,11 @@ class TestChunkLocateAction:
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(backend="memory"))
         try:
-            with patch.object(
-                server, "_get_adapter_for_chunk", side_effect=ValueError("boom")
-            ):
-                with pytest.raises(flight.FlightError):
-                    server._handle_chunk_locate(b"z/whatever")
+            # No source registered -> the adapter lookup raises straight out of
+            # the tracked block.
+            ghost = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[8, 8]))
+            with pytest.raises(flight.FlightError):
+                server._handle_chunk_locate(ghost)
             assert server.activity._inflight == 0
             assert server.flight_idle_for(0.0) is True
         finally:
