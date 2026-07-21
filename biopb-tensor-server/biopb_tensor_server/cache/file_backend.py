@@ -667,7 +667,6 @@ class ArrowFileBackend(CacheBackend):
                 segment_id=segment_id,
                 offset=offset,  # entry index for the sequential reader
                 size_bytes=size_bytes,
-                metadata={},
                 created_at=segment_created,
                 last_access_time=segment_created,
                 byte_offset=byte_offset,
@@ -1293,7 +1292,6 @@ class ArrowFileBackend(CacheBackend):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-        metadata: Optional[dict] = None,
     ) -> CacheEntry:
         """Get existing entry or create pending and compute."""
         is_owner = False
@@ -1327,7 +1325,6 @@ class ArrowFileBackend(CacheBackend):
                             state=EntryState.READY,
                             created_at=time.time(),
                             size_bytes=size_bytes,
-                            metadata=metadata or {},
                         )
                         entry.acquire()
                         self._entries[key] = entry
@@ -1338,7 +1335,6 @@ class ArrowFileBackend(CacheBackend):
                 entry = CacheEntry(
                     state=EntryState.PENDING,
                     created_at=time.time(),
-                    metadata=metadata or {},
                 )
                 self._entries[key] = entry
                 self._misses += 1
@@ -1377,11 +1373,7 @@ class ArrowFileBackend(CacheBackend):
                     seg_info.last_access_time = time.time()
                     pool_queue.hits += 1
 
-    def start_compute(
-        self,
-        key: bytes,
-        metadata: Optional[dict] = None,
-    ) -> Tuple[CacheEntry, bool]:
+    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
         """Start compute phase - returns (entry, is_owner)."""
         with self._lock:
             entry = self._entries.get(key)
@@ -1412,7 +1404,6 @@ class ArrowFileBackend(CacheBackend):
                         state=EntryState.READY,
                         created_at=time.time(),
                         size_bytes=size_bytes,
-                        metadata=metadata or {},
                     )
                     entry.acquire()
                     self._entries[key] = entry
@@ -1423,7 +1414,6 @@ class ArrowFileBackend(CacheBackend):
             entry = CacheEntry(
                 state=EntryState.PENDING,
                 created_at=time.time(),
-                metadata=metadata or {},
             )
             entry.acquire()
             self._entries[key] = entry
@@ -1556,7 +1546,6 @@ class ArrowFileBackend(CacheBackend):
                     segment_id=segment_id,
                     offset=seg_info.entry_count - 1 if seg_info else 0,
                     size_bytes=size_bytes,
-                    metadata=entry.metadata,
                     created_at=time.time(),
                     last_access_time=time.time(),
                     byte_offset=byte_offset,
