@@ -94,7 +94,7 @@ class CachedSourceAdapter(TensorAdapter):
                 cache: sources have deterministic ids, so a re-upload reuses the id;
                 wrapping every written chunk_id with this token gives the new upload a
                 fresh cache namespace instead of colliding with the prior upload's
-                chunks (which ``CacheManager.start_compute`` would refuse to overwrite,
+                chunks (which ``CacheManager.put`` would decline to overwrite,
                 serving stale data). None leaves the source unversioned (legacy bytes).
         """
         self.source_id = source_id
@@ -256,13 +256,16 @@ class CachedSourceAdapter(TensorAdapter):
             schema=CHUNK_WIRE_SCHEMA,
         )
 
-        entry, is_owner = cache_manager.start_compute(
+        cache_manager.put(
             chunk_id,
+            batch,
+            size_bytes,
             metadata={"bounds": bounds.SerializeToString()},
         )
-        if is_owner:
-            cache_manager.complete_entry(chunk_id, batch, size_bytes)
 
+        # Recorded even when put() declined (the chunk is already cached under
+        # this id): resolve_chunk_data gates reads on this map, so a re-upload of
+        # an existing chunk must still be readable.
         self._written_chunks[chunk_id] = bounds
 
         logger.debug(

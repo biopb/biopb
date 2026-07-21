@@ -25,6 +25,26 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.config import CacheConfig
 
 
+def _read_cached_batch(cache_manager: CacheManager, chunk_id: bytes) -> pa.RecordBatch:
+    """The batch stored under ``chunk_id``, or fail if it is not cached.
+
+    Reads it the way production does (``CachedSourceAdapter.resolve_chunk_data``):
+    ``get_or_acquire`` with a compute_fn that must never fire, then release. Do
+    not peek with ``backend.start_compute`` -- that hands back a *referenced*
+    entry, and forgetting to release it is the leak this pattern replaces
+    (biopb/biopb#545).
+    """
+
+    def _must_not_compute():
+        raise AssertionError(f"chunk {chunk_id!r} was not in the cache")
+
+    entry = cache_manager.get_or_acquire(chunk_id, _must_not_compute)
+    try:
+        return entry.data
+    finally:
+        cache_manager.release(chunk_id)
+
+
 class TestCachedSourceAdapter:
     """Tests for CachedSourceAdapter."""
 
@@ -146,18 +166,43 @@ class TestCachedSourceAdapter:
         # Verify chunk is in cache
         chunk_id = encode_chunk_id("test", bounds)
 
-        entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
-        assert entry.state.name == "READY"
+        batch = _read_cached_batch(CacheManager.get_instance(), chunk_id)
 
         # Verify batch schema: [data: list<dtype>, shape: list<int64>, dtype: string]
-        batch = entry.data
         assert batch.schema.names == ["data", "shape", "dtype"]
 
         # Verify data shape via the list array
         flat_data = batch.column("data").to_pylist()[0]
         assert len(flat_data) == 50 * 50
 
-        CacheManager.get_instance().release(chunk_id)
+        CacheManager.reset()
+
+    def test_write_chunk_leaves_no_cache_reference(self):
+        """An uploaded chunk is not pinned in memory (biopb/biopb#545).
+
+        write_chunk_arrow used to drive start_compute/complete_entry itself and
+        keep the reservation's reference, so every chunk ever uploaded stayed
+        mirrored in RAM for the life of the process -- unevictable, and not
+        bounded by the *disk* cache budget.
+        """
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+
+        adapter = CachedSourceAdapter(
+            source_id="test",
+            shape=[100, 100],
+            dtype="uint8",
+            chunk_shape=[50, 50],
+        )
+        bounds = ChunkBounds(start=[0, 0], stop=[50, 50])
+        adapter.write_chunk(bounds, np.ones((50, 50), dtype=np.uint8))
+
+        chunk_id = encode_chunk_id("test", bounds)
+        entry = CacheManager.get_instance().backend._entries[chunk_id]
+        assert entry.ref_count == 0
+        assert entry.is_evictable()
+        assert CacheManager.get_instance().remove(chunk_id) is True
+
         CacheManager.reset()
 
     def test_resolve_chunk_data_memory_backend(self):
@@ -219,9 +264,7 @@ class TestCachedSourceAdapter:
         # Verify chunk is stored
         chunk_id = encode_chunk_id("test", bounds)
 
-        entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
-        assert entry.state.name == "READY"
-        CacheManager.get_instance().release(chunk_id)
+        _read_cached_batch(CacheManager.get_instance(), chunk_id)
         CacheManager.reset()
 
     def test_write_chunk_arrow_rejects_list_wrapper(self):
@@ -900,11 +943,7 @@ class TestChunkUpload:
         if adapter.content_version is not None:
             chunk_id = wrap_content_version(chunk_id, adapter.content_version)
         cache_manager = CacheManager.get_instance()
-        entry, is_owner = cache_manager.start_compute(chunk_id)
-        assert entry.state.name == "READY"
-        assert not is_owner
-
-        stored_batch = entry.data
+        stored_batch = _read_cached_batch(cache_manager, chunk_id)
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
@@ -914,7 +953,6 @@ class TestChunkUpload:
         assert reconstructed.shape == data.shape
         assert np.array_equal(reconstructed, data)
 
-        cache_manager.release(chunk_id)
         CacheManager.reset()
 
     def test_upload_chunk_missing_source(self):
@@ -1082,7 +1120,7 @@ class TestCachedSourceContentVersion:
 
     cache: sources have deterministic ids, so a re-upload reuses the id. The
     generation token gives each upload a fresh cache namespace; without it
-    ``CacheManager.start_compute`` would refuse to overwrite the prior upload's
+    ``CacheManager.put`` would decline to overwrite the prior upload's
     chunk and serve stale data.
     """
 

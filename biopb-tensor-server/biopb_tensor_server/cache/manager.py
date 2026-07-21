@@ -113,37 +113,53 @@ class CacheManager:
         """
         return self._backend.get_or_acquire(key, compute_fn, metadata)
 
-    def start_compute(
-        self,
-        key: bytes,
-        metadata: Optional[dict] = None,
-    ) -> Tuple[CacheEntry, bool]:
-        """Start compute - returns (entry, is_owner).
-
-        Use this when you want to separate the "check cache" from "compute"
-        phases. If is_owner=True, you must call complete_entry() or fail_entry().
-
-        Args:
-            key: Cache key bytes
-            metadata: Optional metadata
-
-        Returns:
-            (CacheEntry, is_owner) - if is_owner, you must complete/fail
-        """
-        return self._backend.start_compute(key, metadata)
-
-    def complete_entry(
+    def put(
         self,
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
-    ) -> None:
-        """Complete a pending entry (you were the compute owner)."""
-        self._backend.complete_entry(key, data, size_bytes)
+        metadata: Optional[dict] = None,
+    ) -> bool:
+        """Store an already-computed batch. Returns True if this call stored it.
 
-    def fail_entry(self, key: bytes, error: Exception) -> None:
-        """Fail a pending entry."""
-        self._backend.fail_entry(key, error)
+        The write-side counterpart of :meth:`get_or_acquire`, for a caller that
+        holds the batch already and has nothing to compute -- an upload. It
+        reserves the entry, commits it, and drops the reference the reservation
+        took, all in one call.
+
+        That last step is why this exists rather than a caller driving the
+        backend's reserve/commit pair itself (biopb/biopb#545). The reservation's
+        reference belongs to the promise protocol, not to the caller: it is what
+        stops the entry being evicted mid-write. Leaving it held pins the batch in
+        memory for the life of the process and makes the entry permanently
+        un-removable, which is exactly what ``ArrowFileBackend.release()`` exists
+        to prevent.
+
+        A False return means the key was already present or another writer is
+        mid-flight, so this batch is dropped rather than overwriting -- an upload
+        that must not collide with a previous one gets a fresh cache namespace
+        from its ``content_version`` (biopb/biopb#178), not from an overwrite.
+
+        Args:
+            key: Cache key bytes
+            data: The batch to store
+            size_bytes: Size of data in bytes
+            metadata: Optional metadata for the entry
+        """
+        _entry, is_owner = self._backend.start_compute(key, metadata)
+        try:
+            if is_owner:
+                self._backend.complete_entry(key, data, size_bytes)
+        except BaseException as e:
+            # A failed commit must not strand a PENDING entry: readers of this
+            # key would block on it until pending_timeout.
+            if is_owner:
+                err = e if isinstance(e, Exception) else RuntimeError(repr(e))
+                self._backend.fail_entry(key, err)
+            raise
+        finally:
+            self._backend.release(key)
+        return is_owner
 
     def release(self, key: bytes) -> int:
         """Release reference to entry after use."""
