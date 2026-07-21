@@ -326,38 +326,79 @@ class TestCacheManager:
         assert all(m is results[0] for m in results)
         CacheManager.reset()
 
-    def test_start_compute_and_complete(self):
-        """Full compute cycle."""
-        CacheManager.reset()
-        config = CacheConfig(backend="memory")
-        manager = CacheManager.initialize(config)
-
-        entry, is_owner = manager.start_compute(b"key1", metadata={"test": True})
-        assert is_owner is True
-
-        data = pa.RecordBatch.from_arrays(
+    @staticmethod
+    def _batch():
+        return pa.RecordBatch.from_arrays(
             [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(["int64"])],
             ["data", "shape", "dtype"],
         )
-        manager.complete_entry(b"key1", data, 24)
 
+    def test_put_stores_the_batch(self):
+        """put() commits an already-computed batch and reports that it stored it."""
+        CacheManager.reset()
+        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+
+        assert manager.put(b"key1", self._batch(), 24, metadata={"test": True}) is True
+
+        entry = manager.get_or_acquire(b"key1", lambda: (None, 0))
         assert entry.state == EntryState.READY
+        assert entry.data.column("data").to_pylist()[0] == [1, 2, 3]
         manager.release(b"key1")
         CacheManager.reset()
 
-    def test_fail_entry(self):
-        """Failed computation is removed."""
+    def test_put_holds_no_reference(self):
+        """put() leaves the entry unreferenced, so the cache can reclaim it.
+
+        The leak this API replaced (biopb/biopb#545): the caller drove
+        start_compute/complete_entry by hand and kept the reservation's
+        reference, pinning the batch in memory for the life of the process and
+        making the entry permanently un-removable.
+        """
         CacheManager.reset()
-        config = CacheConfig(backend="memory")
-        manager = CacheManager.initialize(config)
+        manager = CacheManager.initialize(CacheConfig(backend="memory"))
 
-        entry, is_owner = manager.start_compute(b"key1")
-        manager.fail_entry(b"key1", ValueError("failed"))
+        manager.put(b"key1", self._batch(), 24)
 
-        assert entry.state == EntryState.ERROR
-        # Entry should be removed from cache
-        entry2, is_owner2 = manager.start_compute(b"key1")
-        assert is_owner2 is True  # New computation needed
+        entry = manager.backend._entries[b"key1"]
+        assert entry.ref_count == 0
+        assert entry.is_evictable()
+        assert manager.remove(b"key1") is True
+        CacheManager.reset()
+
+    def test_put_declines_an_existing_key(self):
+        """A second put() does not overwrite -- the incumbent batch survives."""
+        CacheManager.reset()
+        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+
+        assert manager.put(b"key1", self._batch(), 24) is True
+
+        other = pa.RecordBatch.from_arrays(
+            [pa.array([[9, 9, 9]]), pa.array([[3]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
+        )
+        assert manager.put(b"key1", other, 24) is False
+
+        entry = manager.get_or_acquire(b"key1", lambda: (None, 0))
+        assert entry.data.column("data").to_pylist()[0] == [1, 2, 3]
+        manager.release(b"key1")
+        CacheManager.reset()
+
+    def test_put_failure_leaves_no_pending_entry(self):
+        """A commit that raises must not strand a PENDING entry.
+
+        Readers of that key would otherwise block on it until pending_timeout.
+        """
+        CacheManager.reset()
+        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+
+        def boom(*args, **kwargs):
+            raise OSError("no space left on device")
+
+        manager.backend.complete_entry = boom
+        with pytest.raises(OSError):
+            manager.put(b"key1", self._batch(), 24)
+
+        assert b"key1" not in manager.backend._entries
         CacheManager.reset()
 
 

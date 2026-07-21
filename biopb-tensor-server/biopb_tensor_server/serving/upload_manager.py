@@ -162,8 +162,8 @@ class UploadManager:
 
         cache: sources have deterministic ids (``cache:<name>`` -> a fixed
         ``source_id``), so a re-upload reuses the id. Without a fresh namespace,
-        ``CacheManager.start_compute`` finds the prior upload's chunk already present
-        and refuses to overwrite it -- serving stale data (biopb/biopb#178). Folding a
+        ``CacheManager.put`` finds the prior upload's chunk already present and
+        declines to overwrite it -- serving stale data (biopb/biopb#178). Folding a
         distinct token into each upload's chunk_ids sidesteps that.
 
         Wall-clock ns keeps the token distinct across a restart, where a persisted
