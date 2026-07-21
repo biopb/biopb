@@ -9,6 +9,7 @@ Exports:
     - CacheBackend: Abstract interface for cache storage
     - CacheEntry: Cached data with state and ref_count
     - CacheStats: Cache statistics for monitoring
+    - ChunkLocation: On-disk byte range of a cached chunk (localhost handoff)
     - EntryState: PENDING, READY, or ERROR states
     - MemoryCacheBackend: In-memory LRU cache backend
     - MemoryCacheConfig: Configuration for memory backend
@@ -23,6 +24,7 @@ from biopb_tensor_server.cache.base import (
     CacheBackend,
     CacheEntry,
     CacheStats,
+    ChunkLocation,
     EntryState,
     PoolStats,
 )
@@ -43,6 +45,7 @@ __all__ = [
     "CacheEntry",
     "CacheManager",
     "CacheStats",
+    "ChunkLocation",
     "EntryState",
     "MemoryCacheBackend",
     "MemoryCacheConfig",

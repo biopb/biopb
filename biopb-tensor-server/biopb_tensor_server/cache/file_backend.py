@@ -22,22 +22,24 @@ from typing import Callable, Dict, Literal, Optional, Tuple
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
-    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
     CacheStats,
+    ChunkLocation,
     EntryState,
     PoolStats,
+    estimate_batch_bytes,
 )
 from biopb_tensor_server.cache.recovery import (
     PoolQueueInfo,
     ProcessLock,
     RecoveryStatus,
     SegmentEntryInfo,
-    SegmentInfo,
     SieveKSegmentInfo,
     WriteAheadLog,
 )
+
+__all__ = ["ArrowFileBackend", "ArrowFileConfig", "ChunkLocation"]
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +72,6 @@ def _get_size_class(size_bytes: int) -> SizeClass:
     else:
         return "large"
 
-
-# =============================================================================
-# Buffer-based casting helpers (bypass validation for performance)
-# =============================================================================
-
-# Unified schema for all dtypes - enables single cache pool per size_class
-UNIFIED_SCHEMA = pa.schema(
-    [
-        pa.field("data", pa.binary()),
-        pa.field("shape", pa.list_(pa.int64())),
-        pa.field("dtype", pa.string()),
-    ]
-)
 
 # Name of the per-batch column carrying the entry's cache key. The key MUST
 # travel as a column value, not as schema metadata: an Arrow IPC stream
@@ -199,23 +188,6 @@ class ArrowFileConfig:
             self.cache_dir = Path(self.cache_dir)
 
 
-@dataclass
-class ChunkLocation:
-    """On-disk location of a cached chunk's Arrow IPC message.
-
-    Returned by ``locate_entry`` for the localhost cache-file handoff (issue
-    #9): a client on the same host mmaps ``segment_path`` and reads the single
-    record-batch message at ``[byte_offset, byte_offset + byte_length)``.
-    ``generation_id`` is the segment file's inode at locate time, so a client
-    can detect a segment that was evicted and recreated at the same path.
-    """
-
-    segment_path: str
-    byte_offset: int
-    byte_length: int
-    generation_id: int
-
-
 class ArrowFileBackend(CacheBackend):
     """Thread-safe persistent file cache with future/promise pattern.
 
@@ -255,16 +227,19 @@ class ArrowFileBackend(CacheBackend):
         # Only stores small metadata; actual data is in segment files
         self._entries: Dict[bytes, CacheEntry] = {}
 
-        # Metadata index: key -> SegmentEntryInfo (location in segment)
+        # Metadata index: key -> SegmentEntryInfo (location in segment), plus the
+        # segment_id -> keys inverse. Both are maintained together by
+        # ``_index_entry`` / ``_unindex_entry`` -- the only writers -- so no
+        # caller has to keep them in step. The inverse exists because every
+        # segment-scoped operation (evictability, eviction, seal) needs "the
+        # entries in this segment", which otherwise means scanning all of
+        # ``_metadata``: ~2.5 ms at 110k entries, paid under ``_lock`` (so it
+        # stalls readers) once per Sieve-K hand step.
         self._metadata: Dict[bytes, SegmentEntryInfo] = {}
+        self._segment_keys: Dict[int, set] = {}
 
         # Sieve-K: Per-pool queues with frequency counters
-        # Replaces old `_segments: OrderedDict[int, SegmentInfo]`
         self._pool_queues: Dict[Tuple[str, SizeClass], PoolQueueInfo] = {}
-
-        # Legacy segment tracking for backward compatibility during migration
-        # Maps segment_id -> SegmentInfo for segments not yet in pool queues
-        self._segments_legacy: Dict[int, SegmentInfo] = {}
 
         # Mmap handles for fast reads, and each mapped segment's IPC schema.
         # The schema is what lets a read decode the single message at an entry's
@@ -285,13 +260,9 @@ class ArrowFileBackend(CacheBackend):
         # Windows) blocks segment unlink during eviction/cleanup. See issue #5.
         self._pool_sinks: Dict[int, pa.OSFile] = {}
         self._pool_paths: Dict[int, Path] = {}
-        self._pool_schemas: Dict[int, pa.Schema] = {}
 
         # Pool tracking: (schema_key, size_class) -> segment_id for open segments
         self._open_pools: Dict[Tuple[str, SizeClass], int] = {}
-
-        # Double-buffered rotation: pre-created next segment for each pool
-        self._next_segment_map: Dict[Tuple[str, SizeClass], int] = {}
 
         # Statistics
         self._hits: int = 0
@@ -326,7 +297,7 @@ class ArrowFileBackend(CacheBackend):
         # to localhost clients (issue #9), so other users on a shared host must
         # not be able to read them. (mode is masked by umask; re-assert with
         # chmod. No-op hardening on Windows, which ignores POSIX modes.)
-        segments_dir = self._config.cache_dir / "segments"
+        segments_dir = self._segments_dir
         segments_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self._config.cache_dir, 0o700)
@@ -355,15 +326,25 @@ class ArrowFileBackend(CacheBackend):
                 prior.get("pid", "unknown"),
             )
 
+        # Everything past the acquire releases the lock if it raises: a failed
+        # init must not leave the cache dir locked until a later boot reclaims
+        # it as stale. Several steps can fail (an ENOSPC marker write, an
+        # unreadable segment), so the guarantee belongs here rather than in each.
+        try:
+            self._initialize_locked(was_stale)
+        except Exception:
+            self._process_lock.release()
+            raise
+
+    def _initialize_locked(self, was_stale: bool) -> None:
+        """Init steps that require the process lock; see :meth:`_initialize`."""
         # Enforce the segment format-version contract now that we are the
         # exclusive owner and before anything reads the segments: a missing or
         # mismatched marker wipes the on-disk cache (segments + WAL). Must run
         # ahead of WAL init and the index rebuild.
         wiped = self._enforce_format_version()
 
-        # Initialize WAL
-        wal_path = self._config.cache_dir / "wal.json"
-        self._wal = WriteAheadLog(wal_path)
+        self._wal = WriteAheadLog(self._wal_path)
 
         # Check for crash recovery. A version wipe already dropped the segments
         # and WAL, so there is nothing to recover from.
@@ -384,7 +365,6 @@ class ArrowFileBackend(CacheBackend):
         all_segment_ids = set()
         for pool in self._pool_queues.values():
             all_segment_ids.update(pool.queue)
-        all_segment_ids.update(self._segments_legacy.keys())
         self._next_segment_id = max(all_segment_ids, default=0) + 1
 
     def _enforce_format_version(self) -> bool:
@@ -394,15 +374,12 @@ class ArrowFileBackend(CacheBackend):
         encoding contract (see the constant). Segments written under one version
         cannot be safely reused after a layout or key-composition change: the
         boot rebuild would index them and the server would then serve mis-decoded
-        or mis-keyed (stale) chunks. The constant existed but was inert -- only
-        reported in ``cache_stats``, never checked at startup -- so any such
-        change silently reused incompatible segments. This makes it enforced: a
-        marker file records the version the on-disk segments were written under,
-        and a missing or mismatched marker drops them before the index rebuild.
+        or mis-keyed (stale) chunks. A marker file records the version the
+        on-disk segments were written under, and a missing or mismatched marker
+        drops them before the index rebuild.
 
-        A pre-enforcement cache dir has segments but no marker; that counts as a
-        mismatch, so the first boot after this ships wipes it. Discarding a
-        layout-compatible cache once is a safe, one-time re-fetch cost, whereas
+        A cache dir with segments but no marker counts as a mismatch. Discarding
+        a layout-compatible cache once is a safe, one-time re-fetch cost, whereas
         serving incompatible bytes is a silent correctness bug -- so we err
         toward wiping. Idempotent on a matching cache (returns False, no I/O
         beyond the marker read).
@@ -451,8 +428,8 @@ class ArrowFileBackend(CacheBackend):
         (A stray ``.idx`` sidecar is harmless -- the rebuild globs ``.arrow`` --
         so the check targets bodies only.)
         """
-        segments_dir = self._config.cache_dir / "segments"
-        wal_path = self._config.cache_dir / "wal.json"
+        segments_dir = self._segments_dir
+        wal_path = self._wal_path
         had_data = (segments_dir.exists() and any(segments_dir.iterdir())) or (
             wal_path.exists()
         )
@@ -474,10 +451,8 @@ class ArrowFileBackend(CacheBackend):
 
         leftover = sorted(segments_dir.glob("seg_*.arrow"))
         if leftover:
-            # Release the lock we hold so a same-process retry (or a stale-lock
-            # reclaim on the next start) isn't wedged by this aborted init.
-            if self._process_lock is not None:
-                self._process_lock.release()
+            # _initialize releases the process lock on the way out, so an
+            # aborted init doesn't wedge a retry or the next start.
             raise RuntimeError(
                 f"Failed to clear the incompatible cache at {segments_dir}: "
                 f"{len(leftover)} segment file(s) survived the wipe "
@@ -508,7 +483,7 @@ class ArrowFileBackend(CacheBackend):
         # Recovered byte total from file sizes -- no segment read (issue #300).
         # (This is the on-disk footprint; corrupt segments are dropped, and any
         # read errors are surfaced, by the rebuild pass that follows.)
-        segments_dir = self._config.cache_dir / "segments"
+        segments_dir = self._segments_dir
         recovered_bytes = 0
         for seg_file in segments_dir.glob("seg_*.arrow"):
             try:
@@ -536,7 +511,7 @@ class ArrowFileBackend(CacheBackend):
         sidecar falls back to the pre-#300 body walk, which also backfills a
         fresh sidecar so the next boot is fast.
         """
-        segments_dir = self._config.cache_dir / "segments"
+        segments_dir = self._segments_dir
         seg_files = sorted(segments_dir.glob("seg_*.arrow"))
         walked = 0
         for seg_file in seg_files:
@@ -547,9 +522,12 @@ class ArrowFileBackend(CacheBackend):
             try:
                 if self._load_segment_from_sidecar(segment_id, seg_file):
                     continue
-                # No usable sidecar: walk the body once (the pre-#300 path).
+                # No usable sidecar: walk the body once (the pre-#300 path). An
+                # empty walk means the segment holds no recoverable entry (a
+                # torn first batch), so it is dropped rather than tracked -- it
+                # occupies disk against max_total_bytes and can serve nothing.
                 records = self._scan_segment_records(seg_file)
-                if records is None:
+                if not records:
                     logger.warning(
                         f"Discarding legacy/corrupt cache segment (unreadable or "
                         f"without per-batch key column): {seg_file}"
@@ -575,9 +553,74 @@ class ArrowFileBackend(CacheBackend):
                 len(seg_files),
             )
 
+    @property
+    def _segments_dir(self) -> Path:
+        """Directory holding the segment bodies and their sidecar indexes."""
+        return self._config.cache_dir / "segments"
+
+    @property
+    def _wal_path(self) -> Path:
+        return self._config.cache_dir / "wal.json"
+
+    def _segment_path(self, segment_id: int) -> Path:
+        """Path of a segment's body file (``seg_NNNN.arrow``)."""
+        return self._segments_dir / f"seg_{segment_id:04d}.arrow"
+
     def _sidecar_path(self, segment_id: int) -> Path:
         """Path of a segment's sidecar index file (``seg_NNNN.idx``)."""
-        return self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.idx"
+        return self._segments_dir / f"seg_{segment_id:04d}.idx"
+
+    def _index_records_for_segment(self, segment_id: int) -> Optional[list]:
+        """Index records for a sealed segment, taken from the live index.
+
+        A sidecar records exactly what ``_metadata`` already holds, so sealing
+        can write it without re-reading the body it just finished. Returns None
+        if any entry lacks a byte range, so the caller falls back to the body
+        walk, which can still derive one. Caller holds ``_lock``.
+        """
+        records = []
+        for key in self._segment_keys.get(segment_id, ()):
+            info = self._metadata.get(key)
+            if info is None:
+                continue
+            if not info.byte_offset or not info.byte_length:
+                return None
+            records.append(
+                (
+                    key,
+                    info.byte_offset,
+                    info.byte_length,
+                    info.size_bytes,
+                    info.offset,
+                )
+            )
+        records.sort(key=lambda r: r[1])
+        return records
+
+    def _index_entry(self, key: bytes, info: SegmentEntryInfo) -> None:
+        """Record an entry in the metadata index and its segment's key set.
+
+        With ``_unindex_entry``, the only writer of ``_metadata`` /
+        ``_segment_keys``, so the two cannot drift. Caller holds ``_lock``.
+        """
+        old = self._metadata.get(key)
+        if old is not None and old.segment_id != info.segment_id:
+            self._segment_keys.get(old.segment_id, set()).discard(key)
+        self._metadata[key] = info
+        self._segment_keys.setdefault(info.segment_id, set()).add(key)
+
+    def _unindex_entry(self, key: bytes) -> None:
+        """Drop an entry from the metadata index and its segment's key set.
+
+        Caller holds ``_lock``.
+        """
+        info = self._metadata.pop(key, None)
+        if info is not None:
+            keys = self._segment_keys.get(info.segment_id)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    self._segment_keys.pop(info.segment_id, None)
 
     def _remove_segment_sidecar(self, segment_id: int) -> None:
         """Best-effort unlink of a segment's sidecar (safe if absent)."""
@@ -619,7 +662,7 @@ class ArrowFileBackend(CacheBackend):
         """Discard a bad segment: close its mmap and unlink both ``.arrow`` and
         ``.idx``. Used for a legacy/corrupt segment on the boot fallback path."""
         self._forget_segment_mmap(segment_id)
-        seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        seg_file = self._segment_path(segment_id)
         try:
             seg_file.unlink()
         except OSError:
@@ -631,8 +674,8 @@ class ArrowFileBackend(CacheBackend):
         entry: ``(key, byte_offset, byte_length, size_bytes, offset)``.
 
         The single source of truth for how a segment body maps to index entries,
-        reused by the boot fallback walk and the seal-time sidecar write so every
-        index path agrees byte-for-byte. Reads message-by-message off a private
+        reused by the boot fallback walk and the seal-time sidecar fallback so
+        every index path agrees byte-for-byte. Reads message-by-message off a private
         mmap to bracket each record batch (issue #9 needs the byte range) and
         stops at the first unreadable/torn trailing message -- a prior partial
         write's slack. Returns None for a legacy/corrupt segment (no per-batch key
@@ -689,49 +732,37 @@ class ArrowFileBackend(CacheBackend):
         records. Shared by the sidecar fast path and the body-walk fallback so
         both produce an identical index. Entries in a segment share a size class
         (the pool key), so the last one's class keys the segment's pool -- same as
-        the pre-#300 walk. An empty segment falls back to legacy tracking.
+        the pre-#300 walk. Caller has already rejected an empty record list.
         """
         st = seg_file.stat()
-        segment_size = st.st_size
         segment_created = st.st_mtime  # file mtime, matching the pre-#300 walk
-        size_class: Optional[SizeClass] = None
         for key, byte_offset, byte_length, size_bytes, offset in records:
-            self._metadata[key] = SegmentEntryInfo(
-                segment_id=segment_id,
-                offset=offset,  # entry index for the sequential reader
-                size_bytes=size_bytes,
-                created_at=segment_created,
-                last_access_time=segment_created,
-                byte_offset=byte_offset,
-                byte_length=byte_length,
+            self._index_entry(
+                key,
+                SegmentEntryInfo(
+                    segment_id=segment_id,
+                    offset=offset,  # entry index for the sequential reader
+                    size_bytes=size_bytes,
+                    created_at=segment_created,
+                    last_access_time=segment_created,
+                    byte_offset=byte_offset,
+                    byte_length=byte_length,
+                ),
             )
-            size_class = _get_size_class(size_bytes)
 
-        entry_count = len(records)
-        if entry_count > 0 and size_class is not None:
-            pool_key = ("unified", size_class)
-            pool_queue = self._pool_queues.get(pool_key)
-            if pool_queue is None:
-                pool_queue = PoolQueueInfo(pool_key=pool_key)
-                self._pool_queues[pool_key] = pool_queue
-            # Oldest at the tail: a rebuilt segment predates this session's writes.
-            pool_queue.queue.append(segment_id)
-            pool_queue.segments[segment_id] = SieveKSegmentInfo(
-                segment_id=segment_id,
-                size_bytes=segment_size,
-                created_at=segment_created,
-                last_access_time=segment_created,
-                entry_count=entry_count,
-                frequency=0,
-                mmap_released=False,
-            )
-        else:
-            self._segments_legacy[segment_id] = SegmentInfo(
-                size_bytes=segment_size,
-                created_at=segment_created,
-                last_access_time=segment_created,
-                entry_count=entry_count,
-            )
+        pool_key = ("unified", _get_size_class(records[-1][3]))
+        pool_queue = self._get_or_create_pool_queue(pool_key)
+        # Oldest at the tail: a rebuilt segment predates this session's writes.
+        pool_queue.queue.append(segment_id)
+        pool_queue.segments[segment_id] = SieveKSegmentInfo(
+            segment_id=segment_id,
+            size_bytes=st.st_size,
+            created_at=segment_created,
+            last_access_time=segment_created,
+            entry_count=len(records),
+            frequency=0,
+            mmap_released=False,
+        )
 
     def _load_segment_from_sidecar(self, segment_id: int, seg_file: Path) -> bool:
         """Restore a segment's index from its ``.idx`` sidecar without reading the
@@ -768,24 +799,31 @@ class ArrowFileBackend(CacheBackend):
                 strict=True,  # columns of one table -> equal length
             )
         )
+        if not records:
+            return False  # nothing to install; let the body walk decide
         self._open_segment_mmap(segment_id, seg_file)
         self._install_segment_records(segment_id, seg_file, records)
         return True
 
-    def _write_segment_sidecar(self, segment_id: int) -> None:
+    def _write_segment_sidecar(
+        self, segment_id: int, records: Optional[list] = None
+    ) -> None:
         """Persist a sealed segment's key -> byte-range index to ``seg_NNNN.idx``.
 
-        The seal-time entry point (natural rotation and graceful close): derives
-        the records from the immutable segment file via ``_scan_segment_records``
-        -- so it needs no lock and no live ``_metadata``, and the sidecar is
-        guaranteed to match what a boot walk would produce. (The boot backfill
-        path already holds the records and calls ``_write_sidecar_from_records``
-        directly, avoiding a second body read.)
+        The seal-time entry point (natural rotation and graceful close). Since
+        #541 the caller can pass the records straight from the live index
+        (``_index_records_for_segment``), which is the same data the body holds
+        -- re-reading the segment it just finished cost 2-83 ms per rotation
+        under ``_write_lock``, and ``close()`` paid it per open segment on the
+        shutdown deadline #300 exists to protect. Falls back to walking the body
+        when the caller has no records (an entry missing its byte range), since
+        the walk can still derive one.
         """
-        seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        seg_file = self._segment_path(segment_id)
         if not seg_file.exists():
             return  # segment already gone (evicted); nothing to index
-        records = self._scan_segment_records(seg_file)
+        if records is None:
+            records = self._scan_segment_records(seg_file)
         if records:
             self._write_sidecar_from_records(segment_id, records)
 
@@ -799,7 +837,7 @@ class ArrowFileBackend(CacheBackend):
         if not records:
             # Empty sealed segment: no sidecar. Boot walks/no-ops it -- harmless.
             return
-        seg_file = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        seg_file = self._segment_path(segment_id)
         try:
             st = seg_file.stat()
         except OSError:
@@ -836,11 +874,6 @@ class ArrowFileBackend(CacheBackend):
             except OSError:
                 pass
 
-    def _get_schema_key(self, schema: pa.Schema) -> str:
-        """Get hashable key from schema (types, not metadata)."""
-        # Schema equality ignores metadata values, so use types
-        return repr(schema.types)
-
     def _create_segment_for_pool(
         self,
         pool_key: Tuple[str, SizeClass],
@@ -850,19 +883,14 @@ class ArrowFileBackend(CacheBackend):
         segment_id = self._next_segment_id
         self._next_segment_id += 1
 
-        segments_dir = self._config.cache_dir / "segments"
-        segments_dir.mkdir(parents=True, exist_ok=True)
-        segment_path = segments_dir / f"seg_{segment_id:04d}.arrow"
+        self._segments_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = self._segment_path(segment_id)
 
         # Create writer
         sink = pa.OSFile(str(segment_path), "wb")
         writer = pa.RecordBatchStreamWriter(sink, schema)
 
-        # Get or create pool queue
-        pool_queue = self._pool_queues.get(pool_key)
-        if pool_queue is None:
-            pool_queue = PoolQueueInfo(pool_key=pool_key)
-            self._pool_queues[pool_key] = pool_queue
+        pool_queue = self._get_or_create_pool_queue(pool_key)
 
         # Track segment in pool queue (at head since newest)
         pool_queue.queue.appendleft(segment_id)
@@ -880,10 +908,19 @@ class ArrowFileBackend(CacheBackend):
         self._pool_writers[segment_id] = writer
         self._pool_sinks[segment_id] = sink
         self._pool_paths[segment_id] = segment_path
-        self._pool_schemas[segment_id] = schema
         self._open_pools[pool_key] = segment_id
 
         return segment_id
+
+    def _get_or_create_pool_queue(
+        self, pool_key: Tuple[str, SizeClass]
+    ) -> PoolQueueInfo:
+        """Return the pool's queue, creating it on first use."""
+        pool_queue = self._pool_queues.get(pool_key)
+        if pool_queue is None:
+            pool_queue = PoolQueueInfo(pool_key=pool_key)
+            self._pool_queues[pool_key] = pool_queue
+        return pool_queue
 
     def _close_writer(self, segment_id: int) -> None:
         """Close and forget a segment's stream writer and its backing sink.
@@ -892,12 +929,32 @@ class ArrowFileBackend(CacheBackend):
         stream but leaves the OSFile sink open, so the write handle would linger
         and block unlink on Windows (issue #5).
         """
-        writer = self._pool_writers.pop(segment_id, None)
+        writer, sink, _path = self._detach_open_segment(segment_id)
         if writer is not None:
             writer.close()
-        sink = self._pool_sinks.pop(segment_id, None)
         if sink is not None:
             sink.close()
+
+    def _detach_open_segment(self, segment_id: int):
+        """Pop every open-segment structure for ``segment_id`` and return its
+        ``(writer, sink, path)`` for the caller to close.
+
+        The one place that knows which maps track an open segment, so adding or
+        retiring one is a single edit rather than four. Purely in-memory --
+        closing the handles is the caller's job, deliberately, so it can happen
+        outside ``_lock``.
+        """
+        writer = self._pool_writers.pop(segment_id, None)
+        sink = self._pool_sinks.pop(segment_id, None)
+        path = self._pool_paths.pop(segment_id, None)
+        self._open_pools = {
+            k: v for k, v in self._open_pools.items() if v != segment_id
+        }
+        return writer, sink, path
+
+    def _open_segment_ids(self) -> list:
+        """Segment ids with an open writer (the still-unsealed segments)."""
+        return list(self._pool_writers)
 
     def _close_segment(self, segment_id: int) -> None:
         """Close a full segment's writer and reopen it read-only as an mmap.
@@ -909,13 +966,7 @@ class ArrowFileBackend(CacheBackend):
         """
         # Detach writer/sink/path from the index under the lock (in-memory only).
         with self._lock:
-            writer = self._pool_writers.pop(segment_id, None)
-            sink = self._pool_sinks.pop(segment_id, None)
-            path = self._pool_paths.pop(segment_id, None)
-            self._pool_schemas.pop(segment_id, None)
-            self._open_pools = {
-                k: v for k, v in self._open_pools.items() if v != segment_id
-            }
+            writer, sink, path = self._detach_open_segment(segment_id)
 
         # Flush + close the handles WITHOUT self._lock (this is the blocking I/O;
         # both must close -- close() leaves the OSFile sink open, issue #5).
@@ -926,6 +977,7 @@ class ArrowFileBackend(CacheBackend):
 
         # Reopen read-only (mmap is a non-blocking read map) and drop redundant
         # in-memory copies, under the lock.
+        records = None
         with self._lock:
             if path and path.exists():
                 self._open_segment_mmap(segment_id, path)
@@ -938,38 +990,31 @@ class ArrowFileBackend(CacheBackend):
                 # the segment is readable. This bounds resident decoded data to
                 # the open write segments plus what callers currently hold,
                 # instead of every chunk ever cached.
-                for k, info in list(self._metadata.items()):
-                    if info.segment_id == segment_id:
-                        entry = self._entries.get(k)
-                        if entry is not None and entry.is_evictable():
-                            self._entries.pop(k, None)
+                for k in list(self._segment_keys.get(segment_id, ())):
+                    entry = self._entries.get(k)
+                    if entry is not None and entry.is_evictable():
+                        self._entries.pop(k, None)
+
+                records = self._index_records_for_segment(segment_id)
 
         # The segment is now sealed and immutable: persist its sidecar index so
         # the next boot restores it without a body walk (biopb/biopb#300). Runs
-        # outside self._lock (it re-reads the file and writes a small one) so a
-        # stalled sidecar write can never wedge the read path; still under the
-        # caller's self._write_lock, so no append can race it.
-        self._write_segment_sidecar(segment_id)
+        # outside self._lock (it writes a small file) so a stalled sidecar write
+        # can never wedge the read path; still under the caller's
+        # self._write_lock, so no append can race it.
+        self._write_segment_sidecar(segment_id, records)
 
     def _get_total_size(self) -> int:
         """Get total size across all segments."""
-        total = 0
-        # Pool queues
-        for pool in self._pool_queues.values():
-            for seg_info in pool.segments.values():
-                total += seg_info.size_bytes
-        # Legacy segments
-        for seg_info in self._segments_legacy.values():
-            total += seg_info.size_bytes
-        return total
+        return sum(
+            seg_info.size_bytes
+            for pool in self._pool_queues.values()
+            for seg_info in pool.segments.values()
+        )
 
     def _get_total_segment_count(self) -> int:
         """Count total segments across all pools."""
-        total = 0
-        for pool in self._pool_queues.values():
-            total += len(pool.queue)
-        total += len(self._segments_legacy)
-        return total
+        return sum(len(pool.queue) for pool in self._pool_queues.values())
 
     def _get_pool_key_for_segment(
         self, segment_id: int
@@ -981,45 +1026,31 @@ class ArrowFileBackend(CacheBackend):
         return None
 
     def _segment_is_evictable(self, segment_id: int) -> bool:
-        """Check if segment has no entries holding references."""
-        for key, entry_info in self._metadata.items():
-            if entry_info.segment_id == segment_id:
-                entry = self._entries.get(key)
-                if entry and entry.ref_count > 0:
-                    return False
+        """True if no entry in this segment is currently referenced."""
+        for key in self._segment_keys.get(segment_id, ()):
+            entry = self._entries.get(key)
+            if entry and entry.ref_count > 0:
+                return False
         return True
 
     def _do_evict_segment(self, segment_id: int) -> None:
         """Actually evict a segment: remove files, metadata, and mmap."""
-        # Remove all entries in this segment from metadata
-        keys_to_remove = [
-            k for k, e in self._metadata.items() if e.segment_id == segment_id
-        ]
-        for key in keys_to_remove:
-            self._metadata.pop(key, None)
+        for key in list(self._segment_keys.get(segment_id, ())):
+            self._unindex_entry(key)
             # Also remove from in-memory entries if present
             self._entries.pop(key, None)
+        self._segment_keys.pop(segment_id, None)
 
         # Close any open writer (and its sink) for this segment
         self._close_writer(segment_id)
-        self._pool_paths.pop(segment_id, None)
-        self._pool_schemas.pop(segment_id, None)
-        self._open_pools = {
-            k: v for k, v in self._open_pools.items() if v != segment_id
-        }
 
-        # Close and remove mmap
         self._forget_segment_mmap(segment_id)
 
         # Delete segment file and its sidecar index (whole-segment eviction).
-        segments_dir = self._config.cache_dir / "segments"
-        seg_file = segments_dir / f"seg_{segment_id:04d}.arrow"
+        seg_file = self._segment_path(segment_id)
         if seg_file.exists():
             seg_file.unlink()
         self._remove_segment_sidecar(segment_id)
-
-        # Remove from legacy tracking if present
-        self._segments_legacy.pop(segment_id, None)
 
         self._evictions += 1
 
@@ -1049,72 +1080,42 @@ class ArrowFileBackend(CacheBackend):
 
         Returns True if evicted, False if nothing evictable.
         """
-        # Try pool queues first (Sieve-K)
         target_pool = self._select_pool_for_eviction()
         if target_pool is not None:
             pool_queue = self._pool_queues[target_pool]
 
-            # Sieve-K eviction loop
-            max_iterations = len(pool_queue.queue) * 2  # Safety limit
-            iterations = 0
-            while iterations < max_iterations:
-                iterations += 1
-
+            # One sweep of the hand per candidate, twice around at most: a
+            # segment whose counter is still hot after a full pass has had it
+            # decremented, so a second pass can reach zero.
+            for _ in range(len(pool_queue.queue) * 2):
                 # Wrap hand if it exceeds queue length
                 if pool_queue.hand >= len(pool_queue.queue):
                     pool_queue.hand = 0
-
-                if len(pool_queue.queue) == 0:
-                    return False
 
                 # Get segment at hand offset from tail
                 # deque: newest at left (index 0), oldest at right (index -1 is tail)
                 # -1 - hand: tail is index -1, hand=0 → -1, hand=1 → -2, etc.
                 idx = -1 - pool_queue.hand
-
-                if idx < -len(pool_queue.queue):
-                    # Wrapped around, all segments have counter > 0
-                    return False
-
                 seg_id = pool_queue.queue[idx]
                 seg_info = pool_queue.segments.get(seg_id)
 
-                if seg_info is None:
-                    # Segment info missing, skip
+                # Skip a segment with no info, or one still being served.
+                if seg_info is None or not self._segment_is_evictable(seg_id):
                     pool_queue.hand += 1
                     continue
 
-                # Check if segment is evictable (no ref_count entries)
-                if not self._segment_is_evictable(seg_id):
-                    pool_queue.hand += 1
-                    continue
-
-                # Sieve-K logic
                 if seg_info.frequency > 0:
                     # Hot segment: decrement counter, advance hand
                     seg_info.frequency -= 1
                     pool_queue.hand += 1
-                else:
-                    # Cold segment (frequency == 0): evict
-                    self._do_evict_segment(seg_id)
-                    pool_queue.segments.pop(seg_id, None)
-                    # O(n) deletion from deque, acceptable for <1000 segments
-                    del pool_queue.queue[idx]
-                    # Hand stays at this position for next eviction
-                    return True
+                    continue
 
-        # Fall back to legacy segments (simple LRU)
-        if self._segments_legacy:
-            # Find oldest evictable legacy segment
-            evictable_legacy = []
-            for seg_id, seg_info in self._segments_legacy.items():
-                if self._segment_is_evictable(seg_id):
-                    evictable_legacy.append((seg_id, seg_info.last_access_time))
-
-            if evictable_legacy:
-                oldest_seg = min(evictable_legacy, key=lambda x: x[1])
-                seg_id = oldest_seg[0]
+                # Cold segment (frequency == 0): evict
                 self._do_evict_segment(seg_id)
+                pool_queue.segments.pop(seg_id, None)
+                # O(n) deletion from deque, acceptable for <1000 segments
+                del pool_queue.queue[idx]
+                # Hand stays at this position for next eviction
                 return True
 
         # Nothing to evict
@@ -1124,13 +1125,15 @@ class ArrowFileBackend(CacheBackend):
     def _reopen_segment_mmap(
         self, segment_id: int, seg_info: SieveKSegmentInfo
     ) -> None:
-        """Reopen mmap for cold segment that was accessed."""
-        path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        """Reopen mmap for cold segment that was accessed.
+
+        Accounting for the access belongs to the caller
+        (``_update_segment_frequency``), so this only restores the mapping.
+        """
+        path = self._segment_path(segment_id)
         if path.exists():
             self._open_segment_mmap(segment_id, path)
             seg_info.mmap_released = False
-            # On access: increment counter
-            seg_info.frequency = min(K, seg_info.frequency + 1)
 
     def _maybe_release_cold_mmaps(self) -> None:
         """Release mmap handles for cold segments.
@@ -1152,30 +1155,27 @@ class ArrowFileBackend(CacheBackend):
                     seg_info.mmap_released = True
 
     def _read_batch_from_segment(self, key: bytes) -> Optional[pa.RecordBatch]:
-        """Read a batch from segment file using mmap and cast back to typed schema."""
+        """Read one cached chunk back out of its segment file.
+
+        Seeks straight to the entry's recorded byte range rather than walking
+        the IPC stream to reach it: an entry carries its range from birth since
+        #541, and the walk cost O(entries before it) per hit -- 0.3 ms into a
+        76-entry segment, 8.9 ms into a 3000-entry one, on every do_get hit
+        (``release`` drops the in-RAM mirror, so hits really do re-read). An
+        entry without a range, or a segment whose schema can't be read, falls
+        back to that walk.
+        """
         entry_info = self._metadata.get(key)
         if entry_info is None:
             return None
 
-        # Get pool info for this segment
-        pool_key = self._get_pool_key_for_segment(entry_info.segment_id)
+        segment_id = entry_info.segment_id
+        seg_info = self._segment_info(segment_id)
+        if seg_info is not None and seg_info.mmap_released:
+            self._reopen_segment_mmap(segment_id, seg_info)
+        self._update_segment_frequency(segment_id)
 
-        # Track pool hit if we have pool info
-        if pool_key:
-            pool_queue = self._pool_queues.get(pool_key)
-            if pool_queue:
-                seg_info = pool_queue.segments.get(entry_info.segment_id)
-                if seg_info:
-                    # Reopen mmap if cold segment was released
-                    if seg_info.mmap_released:
-                        self._reopen_segment_mmap(entry_info.segment_id, seg_info)
-
-                    # Sieve-K: increment counter on hit, saturating at K=2
-                    seg_info.frequency = min(K, seg_info.frequency + 1)
-                    seg_info.last_access_time = time.time()
-                    pool_queue.hits += 1
-
-        mmap = self._segment_mmaps.get(entry_info.segment_id)
+        mmap = self._segment_mmaps.get(segment_id)
         if mmap is None:
             return None
 
@@ -1184,13 +1184,13 @@ class ArrowFileBackend(CacheBackend):
         if self._access_counter % 100 == 0:
             self._maybe_release_cold_mmaps()
 
-        batch = self._read_batch_at(entry_info.segment_id, mmap, entry_info)
+        batch = self._read_batch_at(segment_id, mmap, entry_info)
         if batch is None:
             return None
 
         # Detach from the segment mmap on Windows so the file can be unlinked
-        # during eviction even while a caller holds the batch (issue #5).
-        # POSIX keeps the zero-copy mmap read.
+        # during eviction even while a caller holds the batch (issue #5). POSIX
+        # keeps the zero-copy mmap read.
         if self._copy_on_read:
             batch = _copy_batch_off_mmap(batch)
         # Serve the unified binary schema as-is (biopb/biopb#293); just strip
@@ -1234,31 +1234,36 @@ class ArrowFileBackend(CacheBackend):
                 return batch
         return None
 
+    def _segment_info(self, segment_id: int) -> Optional[SieveKSegmentInfo]:
+        """Sieve-K bookkeeping for a segment, or None if it has none."""
+        pool_key = self._get_pool_key_for_segment(segment_id)
+        if pool_key is None:
+            return None
+        pool_queue = self._pool_queues.get(pool_key)
+        if pool_queue is None:
+            return None
+        return pool_queue.segments.get(segment_id)
+
     def _bracket_written_message(
         self,
         segment_id: int,
-        write_start: Optional[int],
-        write_end: Optional[int],
+        write_start: int,
+        write_end: int,
     ) -> Tuple[int, int]:
         """Byte range of the message just appended, from the sink cursor.
 
-        Recording the range here is what keeps a cache *miss* off a segment
-        walk: entries used to land unindexed, so the next ``locate_entry``
-        re-walked the whole active segment (up to ``max_segment_bytes``) to find
-        where it went -- O(entries in the segment), measured at ~5 ms on a
-        145 MB segment of 0.87 MB chunks and several times that for small-chunk
-        sources, and paid only by the localhost fast path it was meant to
-        accelerate (biopb/biopb#541).
+        Recording the range at write time is what lets every later read and
+        locate go straight to the entry instead of walking the segment for it
+        (biopb/biopb#541).
 
         ``write_start == 0`` is the segment's first append, where the writer
         also emitted the schema message it had buffered; the batch starts after
         it, so its length is read back off the file. Returns ``(0, 0)`` for a
-        range that can't be derived: ``locate_entry`` then reports the chunk
-        unavailable and the client transfers it over do_get. Caller holds
-        ``_write_lock`` (which keeps the segment's writer/sink state stable),
-        not ``_lock``.
+        range that can't be derived -- the entry is then served over do_get, the
+        designed floor of this path. Caller holds ``_write_lock`` (which keeps
+        the segment's writer/sink state stable), not ``_lock``.
         """
-        if write_start is None or write_end is None or write_end <= write_start:
+        if write_end <= write_start:
             return 0, 0
         if write_start > 0:
             return write_start, write_end - write_start
@@ -1274,61 +1279,46 @@ class ArrowFileBackend(CacheBackend):
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk location of a cached chunk, or None.
 
-        Backs the localhost cache-file handoff (issue #9). Returns None when the
-        key isn't cached or has no recorded byte range, signalling the caller to
-        fall back to do_get.
-
-        Read-only and ``_lock``-only by construction: byte ranges are recorded
-        when the entry is written (``_bracket_written_message``) and restored at
-        boot from the ``.idx`` sidecar or the segment walk, so there is nothing
-        left to derive here. The former lazy-derivation branch was both the
-        O(entries-in-segment) cost on every cache miss (biopb/biopb#541) and the
-        only place the read path took ``_write_lock`` -- so a write stalled on a
-        full filesystem could block locates. Neither is possible now.
+        Backs the localhost cache-file handoff (issue #9). Byte ranges are
+        recorded when the entry is written and restored at boot from the ``.idx``
+        sidecar or the segment walk, so this derives nothing -- it is a dict
+        lookup under ``_lock``. Returns None when the key isn't cached, has no
+        recorded range, or its segment is gone, signalling the caller to fall
+        back to do_get.
         """
         with self._lock:
             entry_info = self._metadata.get(key)
             if entry_info is None:
                 return None
             # byte_offset == 0 is never a real entry -- the schema message always
-            # occupies the start of the segment -- so 0 means "no range known",
-            # and the client transfers the chunk over do_get instead.
+            # occupies the start of the segment -- so 0 means "no range known".
             if not entry_info.byte_offset or not entry_info.byte_length:
                 return None
-            return self._build_chunk_location(entry_info)
+            location = self._build_chunk_location(entry_info)
+            if location is None:
+                return None
+
+            # A served locate is a genuine cache hit: the client is about to map
+            # the segment. Counting it keeps `stats().hits` meaningful on the
+            # single-machine deployment, where hits take this path while misses
+            # fall back to do_get and are counted there (biopb/biopb#514).
+            self._hits += 1
+            self._update_segment_frequency(entry_info.segment_id)
+            return location
 
     def _build_chunk_location(
         self, entry_info: SegmentEntryInfo
     ) -> Optional[ChunkLocation]:
-        """Build a ``ChunkLocation`` for an already-indexed entry.
+        """Project an already-indexed entry onto its on-disk location.
 
-        Caller must hold ``self._lock``. Returns None if the segment file has
-        gone away (evicted/unlinked) since indexing.
+        Pure -- the caller owns hit accounting. Returns None if the segment file
+        has gone away (evicted/unlinked) since indexing. Caller holds ``_lock``.
         """
-        segment_path = (
-            self._config.cache_dir
-            / "segments"
-            / f"seg_{entry_info.segment_id:04d}.arrow"
-        )
+        segment_path = self._segment_path(entry_info.segment_id)
         try:
             generation_id = os.stat(segment_path).st_ino
         except OSError:
             return None
-
-        # The client is about to map this segment; treat the locate as a hit.
-        # A localhost mmap handoff is a genuine cache hit, so count it in the
-        # top-level counter too -- otherwise `stats().hits` (which the sidecar
-        # surfaces as the cache hit-rate) trends to ~0 on the single-machine
-        # deployment, where hits take this fast path but misses fall back to
-        # do_get and are counted there (biopb/biopb#514). Bump `self._hits`
-        # here, next to the per-pool bump, rather than inside
-        # `_update_segment_frequency` -- that helper is also called from the
-        # do_get accounting paths, which increment `self._hits` separately, so
-        # bumping it in the helper would double-count. `_build_chunk_location`
-        # is the sole owner of the locate-hit path, so this fires exactly once
-        # per served locate. Caller holds `self._lock`.
-        self._hits += 1
-        self._update_segment_frequency(entry_info.segment_id)
 
         return ChunkLocation(
             segment_path=str(segment_path),
@@ -1363,22 +1353,9 @@ class ArrowFileBackend(CacheBackend):
                     self._pending_waits += 1
 
             else:
-                # Check if data exists in segment files
-                if key in self._metadata:
-                    # Data exists in file - create ready entry
-                    batch = self._read_batch_from_segment(key)
-                    if batch is not None:
-                        size_bytes = sum(col.nbytes for col in batch.columns)
-                        entry = CacheEntry(
-                            data=batch,
-                            state=EntryState.READY,
-                            created_at=time.time(),
-                            size_bytes=size_bytes,
-                        )
-                        entry.acquire()
-                        self._entries[key] = entry
-                        self._hits += 1
-                        return entry
+                hydrated = self._hydrate_from_segment(key)
+                if hydrated is not None:
+                    return hydrated
 
                 # No entry - create pending, we own the computation
                 entry = CacheEntry(
@@ -1409,18 +1386,40 @@ class ArrowFileBackend(CacheBackend):
             entry.acquire()
             return entry
 
+    def _hydrate_from_segment(self, key: bytes) -> Optional[CacheEntry]:
+        """Rebuild an acquired READY entry from its persisted segment, or None.
+
+        The path taken when a key is on disk but has no live in-memory entry --
+        either it was never in this session or ``release`` dropped the redundant
+        mirror. Caller holds ``_lock``.
+        """
+        if key not in self._metadata:
+            return None
+        batch = self._read_batch_from_segment(key)
+        if batch is None:
+            return None
+        entry = CacheEntry(
+            data=batch,
+            state=EntryState.READY,
+            created_at=time.time(),
+            size_bytes=estimate_batch_bytes(batch),
+        )
+        entry.acquire()
+        self._entries[key] = entry
+        self._hits += 1
+        return entry
+
     def _update_segment_frequency(self, segment_id: int) -> None:
-        """Update frequency counter for a segment when accessed."""
+        """Count an access against a segment (Sieve-K counter + pool hit)."""
         pool_key = self._get_pool_key_for_segment(segment_id)
-        if pool_key:
-            pool_queue = self._pool_queues.get(pool_key)
-            if pool_queue:
-                seg_info = pool_queue.segments.get(segment_id)
-                if seg_info:
-                    # Sieve-K: increment counter on hit, saturating at K=2
-                    seg_info.frequency = min(K, seg_info.frequency + 1)
-                    seg_info.last_access_time = time.time()
-                    pool_queue.hits += 1
+        pool_queue = self._pool_queues.get(pool_key) if pool_key else None
+        seg_info = pool_queue.segments.get(segment_id) if pool_queue else None
+        if seg_info is None:
+            return
+        # Sieve-K: increment counter on hit, saturating at K=2
+        seg_info.frequency = min(K, seg_info.frequency + 1)
+        seg_info.last_access_time = time.time()
+        pool_queue.hits += 1
 
     def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
         """Start compute phase - returns (entry, is_owner)."""
@@ -1443,21 +1442,9 @@ class ArrowFileBackend(CacheBackend):
                     self._pending_waits += 1
                     return entry, False
 
-            # Check if data exists in segment files
-            if key in self._metadata:
-                batch = self._read_batch_from_segment(key)
-                if batch is not None:
-                    size_bytes = sum(col.nbytes for col in batch.columns)
-                    entry = CacheEntry(
-                        data=batch,
-                        state=EntryState.READY,
-                        created_at=time.time(),
-                        size_bytes=size_bytes,
-                    )
-                    entry.acquire()
-                    self._entries[key] = entry
-                    self._hits += 1
-                    return entry, False
+            hydrated = self._hydrate_from_segment(key)
+            if hydrated is not None:
+                return hydrated, False
 
             # No entry - create pending, we own computation
             entry = CacheEntry(
@@ -1483,18 +1470,7 @@ class ArrowFileBackend(CacheBackend):
         (e.g. a full filesystem) blocks only future writes, never the read path;
         ``self._lock`` is taken only for short in-memory index mutations.
         """
-        # Check for oversized chunks
-        if size_bytes > MAX_ARROW_BATCH_BYTES:
-            self._oversized_skips += 1
-            logger.warning(
-                f"Skipping cache for oversized chunk: {size_bytes} bytes > {MAX_ARROW_BATCH_BYTES}"
-            )
-            # Mark entry as ready in memory but don't persist
-            with self._lock:
-                entry = self._entries.get(key)
-                if entry is None or entry.state != EntryState.PENDING:
-                    return
-                entry.set_ready(data, size_bytes)
+        if self._skip_if_oversized(key, data, size_bytes):
             return
 
         # Serialize the whole write/evict/close critical section. complete_entry
@@ -1534,27 +1510,20 @@ class ArrowFileBackend(CacheBackend):
                     names=list(unified_batch.schema.names) + [CACHE_KEY_FIELD],
                 )
 
-                schema_key = "unified"
-                pool_key = (schema_key, size_class)
-                pool_queue = self._pool_queues.get(pool_key)
-                if pool_queue is None:
-                    pool_queue = PoolQueueInfo(pool_key=pool_key)
-                    self._pool_queues[pool_key] = pool_queue
+                pool_key = ("unified", size_class)
+                pool_queue = self._get_or_create_pool_queue(pool_key)
                 pool_queue.misses += 1
 
-                # Find or create the open segment for this pool
+                # Find or create the open segment for this pool.
+                # _create_segment_for_pool registers writer and sink together,
+                # so both lookups below are total.
                 segment_id = self._open_pools.get(pool_key)
-                if segment_id is None or segment_id not in self._pool_writers:
+                if segment_id not in self._pool_writers:
                     segment_id = self._create_segment_for_pool(
                         pool_key, batch_with_key.schema
                     )
-                writer = self._pool_writers.get(segment_id)
-                if writer is None:
-                    segment_id = self._create_segment_for_pool(
-                        pool_key, batch_with_key.schema
-                    )
-                    writer = self._pool_writers[segment_id]
-                sink = self._pool_sinks.get(segment_id)
+                writer = self._pool_writers[segment_id]
+                sink = self._pool_sinks[segment_id]
 
             # ---- PHASE 2: blocking disk write, self._lock RELEASED ----
             # Flush so the bytes are durable in the page cache, and bracket the
@@ -1566,14 +1535,11 @@ class ArrowFileBackend(CacheBackend):
             # can no longer leave a lock held across the read path.
             if self._wal:
                 self._wal.log_pending(key)
-            write_start = sink.tell() if sink is not None else None
+            write_start = sink.tell()
             writer.write_batch(batch_with_key)
-            write_end = None
-            if sink is not None:
-                sink.flush()
-                write_end = sink.tell()
+            sink.flush()
             byte_offset, byte_length = self._bracket_written_message(
-                segment_id, write_start, write_end
+                segment_id, write_start, sink.tell()
             )
 
             # ---- PHASE 3: in-memory commit ----
@@ -1591,14 +1557,24 @@ class ArrowFileBackend(CacheBackend):
                     seg_info.entry_count += 1
                     seg_info.last_access_time = time.time()
 
-                self._metadata[key] = SegmentEntryInfo(
-                    segment_id=segment_id,
-                    offset=seg_info.entry_count - 1 if seg_info else 0,
-                    size_bytes=size_bytes,
-                    created_at=time.time(),
-                    last_access_time=time.time(),
-                    byte_offset=byte_offset,
-                    byte_length=byte_length,
+                self._index_entry(
+                    key,
+                    SegmentEntryInfo(
+                        segment_id=segment_id,
+                        offset=seg_info.entry_count - 1 if seg_info else 0,
+                        # The index records the batch's buffer size, not the
+                        # caller's `size_bytes`: a boot that has to walk the
+                        # segment body can only measure buffers, so this is the
+                        # one definition all three index producers (write,
+                        # sidecar, walk) can agree on. `size_bytes` still drives
+                        # the eviction budget and size class below, which is
+                        # in-session state a walk never reconstructs.
+                        size_bytes=estimate_batch_bytes(data),
+                        created_at=time.time(),
+                        last_access_time=time.time(),
+                        byte_offset=byte_offset,
+                        byte_length=byte_length,
+                    ),
                 )
                 entry.set_ready(data, size_bytes)
                 need_close = bool(
@@ -1684,26 +1660,22 @@ class ArrowFileBackend(CacheBackend):
                 return False
 
             self._entries.pop(key, None)
-            self._metadata.pop(key, None)
+            self._unindex_entry(key)
             return True
 
     def clear(self) -> None:
         """Clear all evictable entries and delete all segments."""
         with self._lock:
             # Close all pool writers (and their sinks)
-            for segment_id in list(self._pool_writers.keys() | self._pool_sinks.keys()):
+            for segment_id in self._open_segment_ids():
                 self._close_writer(segment_id)
-            self._pool_paths.clear()
-            self._pool_schemas.clear()
-            self._open_pools.clear()
-            self._next_segment_map.clear()
 
             # Close all mmaps
             for segment_id in list(self._segment_mmaps):
                 self._forget_segment_mmap(segment_id)
 
             # Delete all segment files and their sidecar indexes
-            segments_dir = self._config.cache_dir / "segments"
+            segments_dir = self._segments_dir
             for seg_file in segments_dir.glob("seg_*.arrow"):
                 seg_file.unlink()
             for idx_file in segments_dir.glob("seg_*.idx"):
@@ -1711,8 +1683,8 @@ class ArrowFileBackend(CacheBackend):
 
             # Clear tracking
             self._pool_queues.clear()
-            self._segments_legacy.clear()
             self._metadata.clear()
+            self._segment_keys.clear()
             self._entries.clear()
 
             # Clear WAL
@@ -1788,24 +1760,25 @@ class ArrowFileBackend(CacheBackend):
         Only releases locks and closes handles.
         """
         # Seal the still-open write segments (flush their streams), capturing
-        # which they are so we can persist their sidecars below. Rotation-sealed
-        # segments already have a sidecar and are not in the writer maps.
+        # their index records so we can persist their sidecars below.
+        # Rotation-sealed segments already have a sidecar and are not open.
         with self._lock:
-            open_segment_ids = list(self._pool_writers.keys() | self._pool_sinks.keys())
+            open_segment_ids = self._open_segment_ids()
+            pending_sidecars = {
+                segment_id: self._index_records_for_segment(segment_id)
+                for segment_id in open_segment_ids
+            }
             for segment_id in open_segment_ids:
                 self._close_writer(segment_id)
 
         # Persist a sidecar for each just-sealed segment so the next boot skips
         # its body walk (biopb/biopb#300). Outside self._lock: writes one small
         # file per segment, and a stalled write must not wedge the read path.
-        for segment_id in open_segment_ids:
-            self._write_segment_sidecar(segment_id)
+        for segment_id, records in pending_sidecars.items():
+            self._write_segment_sidecar(segment_id, records)
 
         with self._lock:
-            self._pool_paths.clear()
-            self._pool_schemas.clear()
             self._open_pools.clear()
-            self._next_segment_map.clear()
 
             # Close all mmap handles
             for segment_id in list(self._segment_mmaps):
@@ -1822,5 +1795,5 @@ class ArrowFileBackend(CacheBackend):
             # Clear in-memory tracking (data persists in files)
             self._entries.clear()
             self._metadata.clear()
+            self._segment_keys.clear()
             self._pool_queues.clear()
-            self._segments_legacy.clear()

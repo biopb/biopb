@@ -17,11 +17,11 @@ from typing import Callable, Tuple
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
-    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
     CacheStats,
     EntryState,
+    estimate_batch_bytes,
 )
 
 
@@ -63,7 +63,7 @@ class MemoryCacheBackend(CacheBackend):
 
     def _estimate_size(self, data: pa.RecordBatch) -> int:
         """Estimate size in bytes."""
-        return sum(col.nbytes for col in data.columns)
+        return estimate_batch_bytes(data)
 
     def _evict_if_needed(self, needed_bytes: int) -> None:
         """Evict entries if adding needed_bytes would exceed limits.
@@ -236,22 +236,7 @@ class MemoryCacheBackend(CacheBackend):
         size_bytes: int,
     ) -> None:
         """Mark pending entry as ready."""
-        # Check for oversized chunks
-        if size_bytes > MAX_ARROW_BATCH_BYTES:
-            self._oversized_skips += 1
-            # Log warning (import at top level to avoid circular import issues)
-            import logging
-
-            logger = logging.getLogger(__name__)
-            logger.warning(
-                f"Skipping cache for oversized chunk: {size_bytes} bytes > {MAX_ARROW_BATCH_BYTES}"
-            )
-            # Still mark as ready so waiting threads get data
-            with self._lock:
-                entry = self._entries.get(key)
-                if entry is None or entry.state != EntryState.PENDING:
-                    return
-                entry.set_ready(data, size_bytes)
+        if self._skip_if_oversized(key, data, size_bytes):
             return
 
         with self._lock:
