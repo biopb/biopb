@@ -85,8 +85,9 @@ if TYPE_CHECKING:
 # preserves the exact dtype (endianness included) and is zero-copy on both ends:
 # the server wraps the numpy buffer with no per-element copy, and the cache
 # stores/serves this same schema with no typed<->binary conversion. It is the ONE
-# schema for the do_get wire, the file cache (``UNIFIED_SCHEMA``), and the memory
-# cache. (Cross-language clients decode the binary column per the dtype string;
+# schema for the do_get wire, the file cache, and the memory cache. (The file
+# cache appends a per-batch cache-key column; the schema is otherwise identical.)
+# (Cross-language clients decode the binary column per the dtype string;
 # see the Java client's ``SerializableTensorImg``.)
 CHUNK_WIRE_SCHEMA = pa.schema(
     [
