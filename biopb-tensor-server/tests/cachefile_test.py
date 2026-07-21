@@ -121,14 +121,14 @@ class TestLocateEntry:
         assert file_backend.locate_entry(b"does-not-exist") is None
 
     def test_offsets_captured_at_write_time(self, file_backend):
-        """A freshly written entry is already indexed -- no locate-time walk.
+        """The write path indexes every entry, including a segment's first.
 
-        Regression for biopb/biopb#541: offsets used to be derived lazily, so
+        Regression for biopb/biopb#541: ranges used to be derived lazily, so
         every cache *miss* left an unindexed entry and the next locate re-walked
-        the whole active segment (O(segment size), ~9 ms at 256 MB) -- a cost
-        paid only by the localhost fast path that walk was meant to accelerate.
-        The walk must not run at all on this path, including for the first entry
-        in a segment (the one that shares its append with the schema message).
+        the whole active segment -- a cost paid only by the localhost fast path
+        that walk was meant to accelerate. With the walk gone, an unindexed
+        entry no longer locates at all, so `locate_entry` returning None is the
+        regression signal.
         """
         for i in range(3):
             a = ((np.arange(1200, dtype=np.uint16) + i * 7) % 401).astype(np.uint16)
@@ -141,13 +141,29 @@ class TestLocateEntry:
             assert info.byte_offset > 0 and info.byte_length > 0, (
                 f"entry {i} left unindexed by the write path"
             )
+            assert file_backend.locate_entry(key) is not None
 
-        def _boom(_segment_id):
-            raise AssertionError("locate_entry fell back to the segment walk")
+    def test_locate_never_takes_the_write_lock(self, file_backend):
+        """A stalled write must not block a locate.
 
-        with patch.object(file_backend, "_fill_byte_offsets_for_segment", _boom):
-            for i in range(3):
-                assert file_backend.locate_entry(f"w{i}".encode()) is not None
+        The lazy-fill branch was the one place the read path took
+        ``_write_lock``, so a write blocked on a full filesystem also blocked
+        every locate behind it. Nothing is derived at locate time now, so a held
+        write lock is irrelevant to it (biopb/biopb#541).
+        """
+        a = (np.arange(600, dtype=np.uint16) % 251).astype(np.uint16)
+        file_backend.get_or_acquire(b"L", (lambda: (_make_typed_batch(a), a.nbytes)))
+        file_backend.release(b"L")
+
+        located = []
+        with file_backend._write_lock:  # stand in for a write stalled on I/O
+            t = threading.Thread(
+                target=lambda: located.append(file_backend.locate_entry(b"L"))
+            )
+            t.start()
+            t.join(timeout=5)
+            assert not t.is_alive(), "locate blocked on the write lock"
+        assert located and located[0] is not None
 
     def test_write_time_offsets_match_segment_walk(self, file_backend):
         """Write-time ranges are byte-identical to what a boot walk derives.
@@ -206,14 +222,10 @@ class TestLocateEntry:
             segments = {be._metadata[k].segment_id for k in arrs}
             assert len(segments) > 1, "test needs at least one rotation"
 
-            def _boom(_segment_id):
-                raise AssertionError("locate_entry fell back to the segment walk")
-
-            with patch.object(be, "_fill_byte_offsets_for_segment", _boom):
-                for key, a in arrs.items():
-                    loc = be.locate_entry(key)
-                    assert loc is not None and loc.byte_offset > 0
-                    assert np.array_equal(_read_via_location(loc), a)
+            for key, a in arrs.items():
+                loc = be.locate_entry(key)
+                assert loc is not None and loc.byte_offset > 0
+                assert np.array_equal(_read_via_location(loc), a)
         finally:
             be.close()
             shutil.rmtree(d, ignore_errors=True)
@@ -276,15 +288,19 @@ class TestLocateEntry:
         loc = file_backend.locate_entry(b"g")
         assert loc.generation_id == os.stat(loc.segment_path).st_ino
 
-    def test_torn_trailing_message_does_not_crash_locate(self):
-        """A torn trailing message must not crash the offset walk.
+    def test_torn_trailing_message_does_not_crash_boot_walk(self):
+        """A torn trailing message must not crash the boot index walk.
 
         Regression for the Windows-only CI failure ``OSError: Expected to be
-        able to read N bytes for message body`` raised from
-        ``_fill_byte_offsets_for_segment``: a prior partial/failed write can
-        leave slack at the segment tail, and the lazy offset walk must treat it
-        as end-of-region rather than propagate. Reproduced cross-platform by
-        appending a truncated copy of a real message to the segment file.
+        able to read N bytes for message body``: a partial/failed write leaves
+        slack at the segment tail, and the walk must treat it as
+        end-of-readable-region rather than propagate. That slack outlives the
+        process that wrote it, so the walk that has to survive it is the one at
+        boot (``_scan_segment_records``) -- which is also the only walk left
+        since ranges became write-time (biopb/biopb#541). Reproduced
+        cross-platform by appending a truncated copy of a real message, which
+        also invalidates the ``.idx`` sidecar (recorded size != file size) and
+        so forces the body walk rather than the sidecar fast path.
         """
         d = tempfile.mkdtemp()
         cfg = {
@@ -292,8 +308,8 @@ class TestLocateEntry:
             "max_total_bytes": 256 * 1024 * 1024,
         }
         be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
+        arrs = {}
         try:
-            arrs = {}
             for i in range(3):
                 a = ((np.arange(1500, dtype=np.uint16) + i) % 509).astype(np.uint16)
                 arrs[i] = a
@@ -308,21 +324,21 @@ class TestLocateEntry:
             seg_path = Path(loc0.segment_path)
             raw = seg_path.read_bytes()
             full = raw[loc0.byte_offset : loc0.byte_offset + loc0.byte_length]
-            with open(seg_path, "ab") as f:
-                f.write(full[: len(full) // 2])
+        finally:
+            be.close()
+        with open(seg_path, "ab") as f:
+            f.write(full[: len(full) // 2])
 
-            # Drop cached offsets so locate re-walks the now-torn segment.
-            for info in be._metadata.values():
-                info.byte_offset = 0
-                info.byte_length = 0
-
-            # Must not raise; every good entry ahead of the torn tail resolves.
+        # Boot on the torn segment: must not raise, and every good entry ahead
+        # of the torn tail must still index and read back.
+        be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
+        try:
             for i in range(3):
-                loc = be.locate_entry(f"good-{i}".encode())
+                loc = be2.locate_entry(f"good-{i}".encode())
                 assert loc is not None, f"good-{i} should still locate"
                 assert np.array_equal(_read_via_location(loc), arrs[i])
         finally:
-            be.close()
+            be2.close()
             shutil.rmtree(d, ignore_errors=True)
 
 

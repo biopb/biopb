@@ -396,10 +396,13 @@ editing the code.
   (`biopb/biopb#541`) — the first append in a segment also flushes the writer's
   buffered schema message, so that one entry's start is recovered by reading the
   schema message's length off the file. Deriving them lazily instead made every
-  cache *miss* re-walk the whole active segment (O(entry count), ~9 ms at a full
-  256 MB segment, worse for small chunks), a cost paid only by the fast path it
-  was meant to accelerate. Walking survives only as a fallback for an entry the
-  write path couldn't bracket; boot restores ranges from the `.idx` sidecar.
+  cache *miss* re-walk the whole active segment (O(entry count), ~5 ms at 145 MB
+  with 0.87 MB chunks and worse for small ones), a cost paid only by the fast
+  path it was meant to accelerate — and that walk was the only place the read
+  path took the cache's write lock, so a stalled write blocked locates. Between
+  the write path and the boot `.idx` sidecar restore, every index entry now
+  carries its range from birth, so `locate_entry` derives nothing and the walk
+  is gone rather than kept as a fallback.
 
 - **Localhost read amplification — chunk size is conflated with access
   granularity.** The server sizes chunks to a fixed transfer cap
