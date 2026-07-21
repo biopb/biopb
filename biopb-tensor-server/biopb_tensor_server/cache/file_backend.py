@@ -134,6 +134,33 @@ _SIDECAR_SCHEMA = pa.schema(
 )
 
 
+def _schema_message_length(path: Path) -> Optional[int]:
+    """Byte length of the leading IPC schema message in a segment file.
+
+    The stream writer buffers the schema until the first batch is written, so a
+    segment's *first* append advances the sink cursor across schema + batch
+    together; splitting them needs the schema message's own length. Let pyarrow
+    read its own framing (rather than decoding the encapsulated-message header
+    here) so this can't drift from what the writer emits -- it is the same
+    ``read_message`` call the boot walk opens a segment with, on the ~160 bytes
+    at the head of the file.
+
+    Returns None if that read fails, which costs the *first* entry of this one
+    segment its byte range: ``locate_entry`` reports it unavailable and the
+    client transfers that chunk over do_get instead of mmap. Later entries in
+    the segment bracket directly off the sink cursor and are unaffected, and the
+    seal-time ``.idx`` sidecar re-derives the range from the segment body, so a
+    restart restores the fast path for it.
+    """
+    try:
+        with pa.OSFile(str(path), "rb") as f:
+            pa.ipc.read_message(f)  # the leading schema message
+            length = f.tell()
+    except (OSError, pa.ArrowInvalid, EOFError, StopIteration):
+        return None
+    return length or None
+
+
 def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Return a copy of `batch` whose buffers are owned in RAM, not a file mmap.
 
@@ -1150,106 +1177,68 @@ class ArrowFileBackend(CacheBackend):
 
         return None
 
-    def _fill_byte_offsets_for_segment(self, segment_id: int) -> None:
-        """Walk a segment file once and record each entry's IPC message range.
+    def _bracket_written_message(
+        self,
+        segment_id: int,
+        write_start: Optional[int],
+        write_end: Optional[int],
+    ) -> Tuple[int, int]:
+        """Byte range of the message just appended, from the sink cursor.
 
-        Offsets aren't captured at write time (the stream writer buffers the
-        schema until the first batch, so the live sink cursor can't bracket the
-        first message). Instead we derive them by walking the flushed file,
-        matching messages to keys via the per-batch cache_key column, and fill
-        ``byte_offset`` / ``byte_length`` on the existing metadata entries. The
-        caller (``locate_entry``) holds both ``self._write_lock`` and
-        ``self._lock``: ``_write_lock`` excludes concurrent appends by
-        ``complete_entry`` so the walk never races a torn append (since #119 the
-        write critical section no longer holds ``_lock``), and ``_lock`` guards
-        the ``_metadata`` mutations below. A trailing message can still be torn
-        by a *prior* failed/partial write (its slack persists in the segment),
-        so the read loop stops on any unreadable message rather than raising.
+        Recording the range here is what keeps a cache *miss* off a segment
+        walk: entries used to land unindexed, so the next ``locate_entry``
+        re-walked the whole active segment (up to ``max_segment_bytes``) to find
+        where it went -- O(entries in the segment), measured at ~5 ms on a
+        145 MB segment of 0.87 MB chunks and several times that for small-chunk
+        sources, and paid only by the localhost fast path it was meant to
+        accelerate (biopb/biopb#541).
+
+        ``write_start == 0`` is the segment's first append, where the writer
+        also emitted the schema message it had buffered; the batch starts after
+        it, so its length is read back off the file. Returns ``(0, 0)`` for a
+        range that can't be derived: ``locate_entry`` then reports the chunk
+        unavailable and the client transfers it over do_get. Caller holds
+        ``_write_lock`` (which keeps the segment's writer/sink state stable),
+        not ``_lock``.
         """
-        path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
-        try:
-            mm = pa.memory_map(str(path), "r")
-        except (OSError, pa.ArrowInvalid):
-            return
-        # Always close the mapping: an open handle blocks segment deletion on
-        # Windows (biopb/biopb#5) and leaks fds elsewhere.
-        try:
-            try:
-                schema = pa.ipc.open_stream(mm).schema
-            except Exception:
-                return
-            if CACHE_KEY_FIELD not in schema.names:
-                return
-            mm.seek(0)
-            pa.ipc.read_message(mm)  # consume the leading schema message
-            while True:
-                pos = mm.tell()
-                try:
-                    msg = pa.ipc.read_message(mm)
-                except (pa.ArrowInvalid, EOFError, StopIteration, OSError):
-                    # OSError "Expected to be able to read N bytes for message
-                    # body" = a torn trailing message (a prior partial write's
-                    # slack). Treat it as end-of-readable-region.
-                    break
-                if msg is None:
-                    break
-                msg_len = mm.tell() - pos
-                try:
-                    batch = pa.ipc.read_record_batch(msg, schema)
-                except Exception:
-                    break
-                entry_key = batch.column(CACHE_KEY_FIELD)[0].as_py()
-                if entry_key is None:
-                    continue
-                info = self._metadata.get(entry_key)
-                if info is not None and info.segment_id == segment_id:
-                    info.byte_offset = pos
-                    info.byte_length = msg_len
-        finally:
-            mm.close()
+        if write_start is None or write_end is None or write_end <= write_start:
+            return 0, 0
+        if write_start > 0:
+            return write_start, write_end - write_start
+
+        path = self._pool_paths.get(segment_id)
+        if path is None:
+            return 0, 0
+        schema_len = _schema_message_length(path)
+        if schema_len is None or not 0 < schema_len < write_end:
+            return 0, 0
+        return schema_len, write_end - schema_len
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk location of a cached chunk, or None.
 
         Backs the localhost cache-file handoff (issue #9). Returns None when the
-        key isn't cached or its byte offset can't be resolved, signalling the
-        caller to fall back to do_get.
+        key isn't cached or has no recorded byte range, signalling the caller to
+        fall back to do_get.
+
+        Read-only and ``_lock``-only by construction: byte ranges are recorded
+        when the entry is written (``_bracket_written_message``) and restored at
+        boot from the ``.idx`` sidecar or the segment walk, so there is nothing
+        left to derive here. The former lazy-derivation branch was both the
+        O(entries-in-segment) cost on every cache miss (biopb/biopb#541) and the
+        only place the read path took ``_write_lock`` -- so a write stalled on a
+        full filesystem could block locates. Neither is possible now.
         """
-        # Fast path: an already-indexed entry needs only the read lock.
         with self._lock:
             entry_info = self._metadata.get(key)
             if entry_info is None:
                 return None
-            # byte_offset == 0 is never a real entry — the schema message always
-            # occupies the start of the segment — so 0 means "not yet indexed".
-            if entry_info.byte_offset and entry_info.byte_length:
-                return self._build_chunk_location(entry_info)
-
-        # Slow path: derive offsets by walking the flushed segment file. This
-        # must hold ``_write_lock`` so the walk cannot race a concurrent append
-        # by ``complete_entry`` -- a torn append leaves a trailing message whose
-        # header advertises a body the file doesn't yet contain, and
-        # ``pa.ipc.read_message`` then raises (on Windows: OSError "Expected to
-        # be able to read N bytes for message body"). The lock order here is
-        # ``_write_lock`` -> ``_lock``, matching ``complete_entry``, so there is
-        # no ABBA deadlock; ``_write_lock`` blocks at most concurrent writes,
-        # never the cached-read path. (Only the *first* locate of an unindexed
-        # entry pays this; the fast path above takes neither write lock.)
-        with self._write_lock:
-            with self._lock:
-                entry_info = self._metadata.get(key)
-                if entry_info is None:
-                    return None
-                if not entry_info.byte_offset:
-                    self._fill_byte_offsets_for_segment(entry_info.segment_id)
-                    entry_info = self._metadata.get(key)
-                if (
-                    entry_info is None
-                    or not entry_info.byte_offset
-                    or not entry_info.byte_length
-                ):
-                    return None
-                return self._build_chunk_location(entry_info)
+            # byte_offset == 0 is never a real entry -- the schema message always
+            # occupies the start of the segment -- so 0 means "no range known",
+            # and the client transfers the chunk over do_get instead.
+            if not entry_info.byte_offset or not entry_info.byte_length:
+                return None
+            return self._build_chunk_location(entry_info)
 
     def _build_chunk_location(
         self, entry_info: SegmentEntryInfo
@@ -1520,18 +1509,24 @@ class ArrowFileBackend(CacheBackend):
                 sink = self._pool_sinks.get(segment_id)
 
             # ---- PHASE 2: blocking disk write, self._lock RELEASED ----
-            # Flush so the bytes are durable in the page cache; the localhost
-            # cache-file handoff (issue #9) derives byte offsets lazily by walking
-            # the flushed file in locate_entry(). A failure here (e.g. ENOSPC)
-            # propagates out: get_or_acquire's owner branch turns it into
+            # Flush so the bytes are durable in the page cache, and bracket the
+            # message with the sink cursor so the localhost cache-file handoff
+            # (issue #9) gets its byte range for free. A failure here (e.g.
+            # ENOSPC) propagates out: get_or_acquire's owner branch turns it into
             # fail_entry() + re-raise. That is now safe -- the `with` blocks
             # release both locks on the way out, so a failed (or stalled) write
             # can no longer leave a lock held across the read path.
             if self._wal:
                 self._wal.log_pending(key)
+            write_start = sink.tell() if sink is not None else None
             writer.write_batch(batch_with_key)
+            write_end = None
             if sink is not None:
                 sink.flush()
+                write_end = sink.tell()
+            byte_offset, byte_length = self._bracket_written_message(
+                segment_id, write_start, write_end
+            )
 
             # ---- PHASE 3: in-memory commit ----
             need_close = False
@@ -1555,6 +1550,8 @@ class ArrowFileBackend(CacheBackend):
                     metadata=entry.metadata,
                     created_at=time.time(),
                     last_access_time=time.time(),
+                    byte_offset=byte_offset,
+                    byte_length=byte_length,
                 )
                 entry.set_ready(data, size_bytes)
                 need_close = bool(
