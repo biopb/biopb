@@ -326,7 +326,7 @@ class TestTensorServerSourceType:
     """
 
     def test_is_remote_url_recognizes_grpc_schemes(self):
-        from biopb_tensor_server.core.discovery import is_remote_url
+        from biopb_tensor_server.core.remote import is_remote_url
 
         assert is_remote_url("grpc://lab-store:8815") is True
         assert is_remote_url("grpc+tls://lab-store:8815") is True

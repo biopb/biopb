@@ -556,16 +556,25 @@ class RemoteStore:
 
 
 def is_remote_url(url: str) -> bool:
-    """Check if URL is a remote (non-local) URL.
+    """Whether ``url`` is a remote (non-local) URL.
 
-    Args:
-        url: URL string to check
-
-    Returns:
-        True if URL is remote (s3://, gs://, etc.), False if local path
+    The single canonical scheme predicate for the server: it decides whether a
+    URL needs remote-storage handling (a :class:`RemoteStore`) or is a plain
+    local filesystem path. Recognizes object-store, HTTP(S)/FTP, and the
+    ``grpc*`` remote-tensor-cache schemes; everything else — including bare paths
+    and ``file://`` — is treated as local.
     """
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-
-    remote_schemes = {"s3", "gs", "gcs", "http", "https", "ftp", "az", "azure"}
-    return scheme in remote_schemes
+    remote_prefixes = (
+        "s3://",
+        "gs://",
+        "gcs://",
+        "http://",
+        "https://",
+        "ftp://",
+        "az://",
+        "azure://",
+        "grpc://",
+        "grpc+tls://",
+        "grpcs://",
+    )
+    return url.lower().startswith(remote_prefixes)
