@@ -26,7 +26,7 @@ import pytest
 from biopb.tensor.descriptor_pb2 import FlightCmd, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.errors import (
     InvalidTensorId,
     SourceResolveRetriableError,
@@ -215,7 +215,7 @@ class TestAdapterLookupFallback:
         # legacy adapter (bare ValueError) must NOT read as a server bug -- do_get
         # coerces it the same way get_flight_info does (issue #378).
         from biopb.tensor.ticket_pb2 import TensorTicket
-        from biopb_tensor_server.core.base import encode_chunk_id
+        from biopb_tensor_server.core.adapter_base import encode_chunk_id
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("legacy", _LegacyMissAdapter("legacy"))
@@ -235,7 +235,7 @@ class TestAdapterLookupFallback:
         # a code*), matching get_flight_info's tensor_adapter-is-None sibling, rather
         # than a bare FlightServerError carrying no extra_info code (issue #378).
         from biopb.tensor.ticket_pb2 import TensorTicket
-        from biopb_tensor_server.core.base import encode_chunk_id
+        from biopb_tensor_server.core.adapter_base import encode_chunk_id
 
         server = TensorFlightServer("grpc://localhost:0")
         chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
@@ -251,7 +251,7 @@ class TestAdapterLookupFallback:
     def test_chunk_locate_unregistered_source_is_terminal_with_code(self):
         # Same fallthrough on the cache-file locate path (finding #3).
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.core.base import encode_chunk_id
+        from biopb_tensor_server.core.adapter_base import encode_chunk_id
         from biopb_tensor_server.core.config import CacheConfig
 
         # _handle_chunk_locate short-circuits to {"available": False} when no cache

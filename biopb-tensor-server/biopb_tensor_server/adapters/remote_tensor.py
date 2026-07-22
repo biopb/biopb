@@ -45,7 +45,7 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorReadPlan,
     unpack_chunk_array,

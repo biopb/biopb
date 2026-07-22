@@ -1,11 +1,11 @@
 """Enforce the source-level vs tensor-level adapter interface split.
 
-``base.py`` declares two role interfaces -- ``SourceAdapter`` (discover tensors,
+``adapter_base.py`` declares two role interfaces -- ``SourceAdapter`` (discover tensors,
 read source metadata, hand out tensor adapters) and ``TensorAdapter`` (read a
 specific tensor's data / descriptor / chunks / pyramid / physical scale). Their
 *declarations* must stay disjoint so a tensor-scoped method can never silently
 land on ``SourceAdapter`` again (the scramble these tests guard against).
-``base.py`` already asserts the invariant at import time; these tests re-check it
+``adapter_base.py`` already asserts the invariant at import time; these tests re-check it
 from the test surface and extend it to the concrete adapter registry.
 
 ``TensorAdapter`` **subclasses** ``SourceAdapter`` (biopb/biopb#380): a tensor
@@ -16,7 +16,7 @@ exactly that, so an override of a source-scoped method onto ``TensorAdapter``
 still fails.
 """
 
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     _SOURCE_SCOPED_API,
     _TENSOR_SCOPED_API,
     SourceAdapter,

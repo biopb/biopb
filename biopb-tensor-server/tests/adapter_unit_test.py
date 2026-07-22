@@ -319,7 +319,7 @@ class TestEmptyChunkShapeFallback:
     the full-rank shape, so every read of such a source raised IndexError.
     """
 
-    from biopb_tensor_server.core.base import TensorAdapter
+    from biopb_tensor_server.core.adapter_base import TensorAdapter
 
     class _StubTensorAdapter(TensorAdapter):
         """Minimal tensor adapter whose descriptor carries no chunk_shape."""
@@ -1406,7 +1406,7 @@ class TestSliceConversion:
 
     def test_convert_slice_to_level(self):
         """Base->level slice conversion is a pure transform (needs no adapter)."""
-        from biopb_tensor_server.core.base import _convert_slice_to_level
+        from biopb_tensor_server.core.adapter_base import _convert_slice_to_level
 
         level_slice = _convert_slice_to_level(
             SliceHint(start=[10, 20], stop=[50, 60]), [4, 2]
@@ -1416,7 +1416,7 @@ class TestSliceConversion:
         assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
 
     def test_convert_slice_to_level_none_passthrough(self):
-        from biopb_tensor_server.core.base import _convert_slice_to_level
+        from biopb_tensor_server.core.adapter_base import _convert_slice_to_level
 
         assert _convert_slice_to_level(None, [4, 2]) is None
 

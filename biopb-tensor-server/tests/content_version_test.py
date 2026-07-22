@@ -17,7 +17,7 @@ import time
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb_tensor_server.core.base import _get_read_plan
+from biopb_tensor_server.core.adapter_base import _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
     cache_key_for_chunk_id,

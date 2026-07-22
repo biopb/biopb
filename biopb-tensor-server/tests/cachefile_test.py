@@ -32,7 +32,7 @@ from biopb_tensor_server.cache.file_backend import (
     ArrowFileConfig,
     ChunkLocation,
 )
-from biopb_tensor_server.core.base import pack_chunk_batch, unpack_chunk_array
+from biopb_tensor_server.core.adapter_base import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.serving.server import TensorFlightServer

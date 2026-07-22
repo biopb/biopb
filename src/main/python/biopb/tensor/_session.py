@@ -1085,7 +1085,12 @@ class ChunkFetcher:
                 f"Source '{source_id}' not in list_sources() result, fetching directly"
             )
             try:
-                td = self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
+                # Structural probe only (shape for slice validation); the OME tree
+                # is discarded here, so never demand it -- keeps this fetch off the
+                # metadata path (and independent of the server having a catalog).
+                td = self._catalog._fetch_tensor_descriptor(
+                    source_id, tensor_id, with_metadata=False
+                )
                 self._state.sources[source_id] = DataSourceDescriptor(
                     source_id=source_id, tensors=[td]
                 )
@@ -1122,7 +1127,11 @@ class ChunkFetcher:
                 f"fetching descriptor from server"
             )
             try:
-                self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
+                # Structural probe only (caches the descriptor for shape lookup);
+                # the OME tree is unused, so keep this off the metadata path.
+                self._catalog._fetch_tensor_descriptor(
+                    source_id, tensor_id, with_metadata=False
+                )
             except Exception:
                 pass  # let the ValueError below surface the clean message
             tensor_desc = self._state.descriptors.get(

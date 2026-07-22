@@ -25,7 +25,7 @@ happen to be `tensor-server` entries. Two user-facing wins fall out:
 ### The load-bearing finding — the segment cache already wraps every adapter
 
 The proxy needs almost no new caching code. `TensorAdapter.resolve_chunk_data`
-(`core/base.py`) is a base-class method shared by every adapter that already wraps
+(`core/adapter_base.py`) is a base-class method shared by every adapter that already wraps
 `get_data(bounds)` in the cache: it caches when the chunk is scaled or the backend
 is an `ArrowFileBackend`, keying on the `chunk_id` via `get_or_acquire`. `do_get`
 (`serving/server.py`) calls `adapter.resolve_chunk_data(chunk_id,

@@ -40,7 +40,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import SourceAdapter
+    from biopb_tensor_server.core.adapter_base import SourceAdapter
 
 logger = logging.getLogger(__name__)
 

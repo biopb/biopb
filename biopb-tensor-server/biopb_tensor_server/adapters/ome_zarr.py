@@ -17,7 +17,7 @@ from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import TensorAdapter
+    from biopb_tensor_server.core.adapter_base import TensorAdapter
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 

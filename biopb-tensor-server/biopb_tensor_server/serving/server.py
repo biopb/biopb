@@ -39,7 +39,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.activity import ActivityTracker
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
     strip_source_prefix,

@@ -18,7 +18,7 @@ import logging
 import threading
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from biopb_tensor_server.core.base import SourceAdapter
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 
 logger = logging.getLogger(__name__)
 

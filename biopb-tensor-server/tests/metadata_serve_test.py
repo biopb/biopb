@@ -143,7 +143,7 @@ def test_get_tensor_metadata_default_is_none():
     """The base tensor adapter defers to the source-level catalog row (returns
     None); only a per-tensor format (HCS field, EMD signal) overrides it."""
     from biopb_tensor_server import ZarrAdapter
-    from biopb_tensor_server.core.base import TensorAdapter
+    from biopb_tensor_server.core.adapter_base import TensorAdapter
 
     # class-level: the default is inherited straight from TensorAdapter
     assert ZarrAdapter.get_tensor_metadata is TensorAdapter.get_tensor_metadata

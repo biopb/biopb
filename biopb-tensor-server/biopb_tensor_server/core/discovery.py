@@ -42,7 +42,7 @@ from typing import (
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import SourceAdapter
+    from biopb_tensor_server.core.adapter_base import SourceAdapter
     from biopb_tensor_server.core.remote import RemoteStore
 
 logger = logging.getLogger(__name__)

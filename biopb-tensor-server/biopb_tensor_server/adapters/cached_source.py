@@ -28,7 +28,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     CHUNK_WIRE_SCHEMA,
     TensorAdapter,
 )

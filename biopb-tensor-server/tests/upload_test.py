@@ -235,7 +235,7 @@ class TestCachedSourceAdapter:
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
         # Verify data matches - the chunk is the unified binary schema now.
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         arr = unpack_chunk_array(batch)
         np.testing.assert_array_equal(arr, test_data)
@@ -334,7 +334,7 @@ class TestCachedSourceAdapter:
             assert pa.types.is_binary(batch.column("data").type)
 
             # Verify data can be reconstructed
-            from biopb_tensor_server.core.base import unpack_chunk_array
+            from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
             reconstructed = unpack_chunk_array(batch)
             assert reconstructed.shape == data.shape
@@ -947,7 +947,7 @@ class TestChunkUpload:
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         reconstructed = unpack_chunk_array(stored_batch)
         assert reconstructed.shape == data.shape
@@ -1134,7 +1134,7 @@ class TestCachedSourceContentVersion:
         )
 
     def test_versioned_write_read_roundtrip(self):
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
@@ -1162,7 +1162,7 @@ class TestCachedSourceContentVersion:
             CacheManager.reset()
 
     def test_reupload_new_generation_serves_fresh_data(self):
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=50))
@@ -1192,7 +1192,7 @@ class TestCachedSourceContentVersion:
             CacheManager.reset()
 
     def test_unversioned_adapter_is_legacy(self):
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
