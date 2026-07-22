@@ -316,6 +316,52 @@ class TestDiscoveryFailureIsolation:
             assert str(root / "bad.dat") not in state.path_to_source
 
 
+class TestRegistryTypeMap:
+    """`_type_to_adapter` is filled at register() time and `get_claims_for_path`
+    is a pure query -- not a per-path mutation that back-fills the map as a side
+    effect (biopb/biopb#555)."""
+
+    def _registry(self):
+        from biopb_tensor_server.core.discovery import AdapterRegistry
+
+        return AdapterRegistry()
+
+    def test_type_resolvable_before_any_claim(self):
+        # A typed registration resolves immediately, with no claim first -- the
+        # property the lazy-resolve / cloud phase-2 flow relies on.
+        registry = self._registry()
+        registry.register(_ClaimsGoodPathAdapter, "good")
+        assert registry.get_adapter_for_type("good") is _ClaimsGoodPathAdapter
+
+    def test_register_multiple_types_maps_all_to_one_class(self):
+        registry = self._registry()
+        registry.register(_ClaimsGoodPathAdapter, ["good", "good-alias"])
+        assert registry.get_adapter_for_type("good") is _ClaimsGoodPathAdapter
+        assert registry.get_adapter_for_type("good-alias") is _ClaimsGoodPathAdapter
+        # Registered once, so it occupies a single probe slot (no duplicate claim).
+        assert registry._adapters.count(_ClaimsGoodPathAdapter) == 1
+
+    def test_untyped_registration_is_not_resolvable_by_type(self):
+        registry = self._registry()
+        registry.register(_ClaimsGoodPathAdapter)  # claim-only, no type
+        assert registry.get_adapter_for_type("good") is None
+
+    def test_get_claims_for_path_does_not_mutate_type_map(self, tmp_path):
+        # The query must not back-fill the type map: an untyped adapter stays
+        # unresolvable by type even after it wins a claim.
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+
+        registry = self._registry()
+        registry.register(_ClaimsGoodPathAdapter)  # no type
+
+        good = tmp_path / "good.dat"
+        good.write_text("good")
+        claims = registry.get_claims_for_path(ClaimContext(good), DiscoveryState())
+
+        assert claims and claims[0].source_type == "good"
+        assert registry.get_adapter_for_type("good") is None
+
+
 class TestTensorServerSourceType:
     """The ``tensor-server`` source type: a grpc:// upstream fronted as a proxy.
 

@@ -81,7 +81,7 @@ require an explicit `type`). `SourceConfig.type`'s `Literal` gained
 ## The adapter — a passthrough that understands nothing
 
 `RemoteTensorAdapter(SourceAdapter, TensorAdapter)` (`adapters/remote_tensor.py`),
-registered `register_with_type("tensor-server", RemoteTensorAdapter)`. **One
+registered `register(RemoteTensorAdapter, "tensor-server")`. **One
 instance per mirrored upstream source**, bound to its `(upstream_endpoint,
 upstream_source_id, alias)`, holding a lazy `TensorFlightClient(location,
 cache_bytes=0, token)`. It is format- and chunking-agnostic; the only thing it

@@ -608,8 +608,8 @@ class AdapterRegistry:
 
     Usage:
         registry = AdapterRegistry()
-        registry.register(ZarrAdapter)
-        registry.register(OmeZarrAdapter)
+        registry.register(ZarrAdapter, "zarr")
+        registry.register(OmeZarrAdapter, ["ome-zarr", "ome-zarr-hcs"])
         ctx = ClaimContext(path)  # or ClaimContext("", store) for remote
         claims = registry.get_claims_for_path(ctx, state)
     """
@@ -618,23 +618,31 @@ class AdapterRegistry:
         self._adapters: List[Type[SourceAdapter]] = []
         self._type_to_adapter: Dict[str, Type[SourceAdapter]] = {}
 
-    def register(self, cls: Type[SourceAdapter]) -> None:
-        """Register an adapter class.
+    def register(
+        self,
+        cls: Type[SourceAdapter],
+        source_type: Optional[str | Iterable[str]] = None,
+    ) -> None:
+        """Register an adapter class, mapping its source type(s) to it.
 
         Args:
-            cls: SourceAdapter subclass with claim(ctx, state) method
+            cls: SourceAdapter subclass with a claim(ctx, state) method.
+            source_type: The type string this adapter serves, or an iterable of
+                them when one class serves several (OME-Zarr serves both
+                ``ome-zarr`` and ``ome-zarr-hcs``). Recorded here, at
+                registration, so ``get_adapter_for_type`` resolves a type
+                *before* any path of that type has been claimed -- the
+                lazy-resolve / cloud phase-2 flow (``UnresolvedSourceAdapter``)
+                depends on that. ``None`` registers a claim-only adapter: it
+                participates in discovery probing but is not resolvable by type
+                (test doubles that only exercise ``claim()``).
         """
         self._adapters.append(cls)
-
-    def register_with_type(self, source_type: str, cls: Type[SourceAdapter]) -> None:
-        """Register an adapter class with explicit source type mapping.
-
-        Args:
-            source_type: Source type string (e.g., "zarr", "ome-tiff")
-            cls: SourceAdapter subclass
-        """
-        self.register(cls)
-        self._type_to_adapter[source_type] = cls
+        if source_type is None:
+            return
+        types = [source_type] if isinstance(source_type, str) else source_type
+        for t in types:
+            self._type_to_adapter[t] = cls
 
     def get_claims_for_path(
         self, ctx: ClaimContext, state: DiscoveryState
@@ -670,7 +678,6 @@ class AdapterRegistry:
                     logger.debug(
                         f"Adapter {adapter_cls.__name__} claimed {ctx.path_str} as {claim.source_type}"
                     )
-                    self._type_to_adapter[claim.source_type] = adapter_cls
                     # First claim wins: callers take claims[0] and the registry
                     # order is load-bearing priority, so stop probing the
                     # remaining adapters. On cloud roots their claim() probes are

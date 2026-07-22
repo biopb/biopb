@@ -145,7 +145,7 @@ def get_default_registry() -> AdapterRegistry:
     # Pure-tifffile OME-TIFF adapter first (no bioio dependency, so always
     # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
     # declines falls through to the generic bioio adapter registered below.
-    registry.register_with_type("ome-tiff", OmeTiffAdapter)
+    registry.register(OmeTiffAdapter, "ome-tiff")
 
     # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
     # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not
@@ -154,31 +154,31 @@ def get_default_registry() -> AdapterRegistry:
     # Registration order is claim probe order; callers take claims[0]. See
     # biopb/biopb#135.
     if QptiffAdapter is not None:
-        registry.register_with_type("qptiff", QptiffAdapter)
+        registry.register(QptiffAdapter, "qptiff")
     # Electron-microscopy adapters (rosettasciio), before the bioio group so they
     # own their extensions -- notably .mrc, which no bioio plugin can read
     # (biopb/biopb#94). Registration order is claim probe order; callers take
     # claims[0].
     if MrcAdapter is not None:
-        registry.register_with_type("mrc", MrcAdapter)
+        registry.register(MrcAdapter, "mrc")
     if EmdAdapter is not None:
-        registry.register_with_type("emd", EmdAdapter)
+        registry.register(EmdAdapter, "emd")
 
     # Register bioio-based adapters in priority order (most specific first)
     if ZeissAdapter is not None:
-        registry.register_with_type("zeiss", ZeissAdapter)
+        registry.register(ZeissAdapter, "zeiss")
     if LeicaAdapter is not None:
-        registry.register_with_type("leica", LeicaAdapter)
+        registry.register(LeicaAdapter, "leica")
     if NikonAdapter is not None:
-        registry.register_with_type("nikon", NikonAdapter)
+        registry.register(NikonAdapter, "nikon")
     if DvAdapter is not None:
-        registry.register_with_type("dv", DvAdapter)
+        registry.register(DvAdapter, "dv")
     if OlympusAdapter is not None:
-        registry.register_with_type("olympus", OlympusAdapter)
+        registry.register(OlympusAdapter, "olympus")
     if BioformatsAdapter is not None:
-        registry.register_with_type("bioformats", BioformatsAdapter)
+        registry.register(BioformatsAdapter, "bioformats")
     if AicsImageIoAdapter is not None:
-        registry.register_with_type("aics", AicsImageIoAdapter)
+        registry.register(AicsImageIoAdapter, "aics")
 
     # OME-Zarr (specific) before plain Zarr (generic fallback). Order is
     # load-bearing: get_claims_for_path returns claims in registration order and
@@ -186,31 +186,30 @@ def get_default_registry() -> AdapterRegistry:
     # OmeZarrAdapter must win. OmeZarrAdapter declines a real plain zarr (no
     # multiscales) and ZarrAdapter declines a real OME-Zarr, so claims[0] lands on
     # the right adapter once the store is resident (e.g. at cloud resolve).
-    registry.register_with_type("ome-zarr", OmeZarrAdapter)
-    registry.register_with_type(
-        "ome-zarr-hcs", OmeZarrAdapter
-    )  # HCS plates use same adapter
-    registry.register_with_type("zarr", ZarrAdapter)
+    # One adapter class, two subtypes (plain multiscales + HCS plates); a single
+    # registration slot keeps its claim probed once.
+    registry.register(OmeZarrAdapter, ["ome-zarr", "ome-zarr-hcs"])
+    registry.register(ZarrAdapter, "zarr")
 
     # TIFF/MicroManager - NDTiff before Legacy (newer format)
     if NdTiffAdapter is not None:
-        registry.register_with_type("ndtiff", NdTiffAdapter)
-    registry.register_with_type("micromanager-legacy", MicroManagerLegacyAdapter)
-    registry.register_with_type("tiff-sequence", TiffSequenceAdapter)
+        registry.register(NdTiffAdapter, "ndtiff")
+    registry.register(MicroManagerLegacyAdapter, "micromanager-legacy")
+    registry.register(TiffSequenceAdapter, "tiff-sequence")
 
     # Medical imaging adapters
     if DicomSeriesAdapter is not None:
-        registry.register_with_type("dicom-series", DicomSeriesAdapter)
+        registry.register(DicomSeriesAdapter, "dicom-series")
     if DicomAdapter is not None:
-        registry.register_with_type("dicom", DicomAdapter)
+        registry.register(DicomAdapter, "dicom")
     if NiftiAdapter is not None:
-        registry.register_with_type("nifti", NiftiAdapter)
+        registry.register(NiftiAdapter, "nifti")
 
-    registry.register_with_type("hdf5", Hdf5Adapter)
+    registry.register(Hdf5Adapter, "hdf5")
 
     # Remote tensor server -- a caching passthrough proxy (biopb/biopb#178).
     # Config-only (grpc:// url, like hdf5 it never claims a filesystem path), so
     # its claim() default returns None and it only registers by explicit type.
-    registry.register_with_type("tensor-server", RemoteTensorAdapter)
+    registry.register(RemoteTensorAdapter, "tensor-server")
 
     return registry
