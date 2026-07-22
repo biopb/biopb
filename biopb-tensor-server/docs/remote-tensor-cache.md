@@ -106,13 +106,14 @@ own upstream. Multi-upstream + local sources coexist in the one flat
   `array_id`. `get_physical_scale()` is overridden to read `physical_scale` /
   `physical_unit` from the upstream `get_descriptor` (the server clears+refills
   these per `GetFlightInfo`, so the base default of `None` would silently drop them).
-- **Chunk layer** — `resolve_chunk_data(chunk_id)` (chunk_id is local): the miss
-  handler rewrites the local `chunk_id` to the upstream's via
-  `chunk.rewrite_chunk_id_array_id` (a **pure byte splice** on the length-prefixed
-  `array_id` field — bounds/ndim/scale tail untouched), forwards it to the upstream
-  `do_get` (`_upstream_record_batch`), and caches the returned `RecordBatch` under
-  the local `cache_key_for_chunk_id(chunk_id)`. Forwarding the *scaled* chunk_id
-  means the **upstream** downsamples and only the small chunk crosses the WAN.
+- **Chunk layer** — `resolve_chunk_data(chunk_id)` (chunk_id is a **proxy
+  envelope**, biopb/biopb#178 W1): the miss handler peels it
+  (`chunk.peel_proxy_envelope`) and forwards the opaque **inner** — the upstream's
+  chunk_id, carried VERBATIM, never decoded or rewritten — to the upstream `do_get`
+  (`_upstream_record_batch`), then caches the returned `RecordBatch` under the
+  envelope's own canonical key (`cache_key_for_chunk_id(chunk_id)`). Forwarding the
+  *scaled* inner means the **upstream** downsamples and only the small chunk crosses
+  the WAN.
 
 For this slice `get_read_plan` is the **inherited uniform-grid planner** — correct
 because a scaled chunk_id forwarded upstream is downsampled there regardless of what

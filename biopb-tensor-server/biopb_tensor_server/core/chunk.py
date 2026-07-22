@@ -11,12 +11,13 @@ import logging
 import os
 import struct
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.downsample import ceil_div
 
 logger = logging.getLogger(__name__)
@@ -212,49 +213,24 @@ def content_version_from_path(path: object) -> Optional[bytes]:
 
 def encode_chunk_id(
     array_id: str,
-    bounds: "ChunkBounds",
+    bounds: ChunkBounds,
 ) -> bytes:
     """Encode array_id and bounds into chunk_id."""
     array_id_bytes = array_id.encode("utf-8")
     ndim = len(bounds.start)
 
-    parts = [
-        struct.pack(">I", len(array_id_bytes)),
-        array_id_bytes,
-        struct.pack(">H", ndim),
-    ]
-
-    for val in bounds.start:
-        parts.append(struct.pack(">q", int(val)))
-    for val in bounds.stop:
-        parts.append(struct.pack(">q", int(val)))
-
-    return b"".join(parts)
+    return b"".join(
+        [
+            struct.pack(">I", len(array_id_bytes)),
+            array_id_bytes,
+            struct.pack(">H", ndim),
+            struct.pack(f">{ndim}q", *map(int, bounds.start)),
+            struct.pack(f">{ndim}q", *map(int, bounds.stop)),
+        ]
+    )
 
 
-def rewrite_chunk_id_array_id(chunk_id: bytes, new_array_id: str) -> bytes:
-    """Replace only the array_id field of a chunk_id, preserving everything else.
-
-    The array_id is a self-describing length-prefixed field at the very front of
-    the chunk_id (``[uint32 len][array_id utf-8]``); every byte after it -- ndim,
-    the start/stop bounds, and any scale suffix on a scaled chunk_id -- is
-    independent of the array_id string. So a remote-tensor *proxy* can map a
-    chunk_id between its local (possibly alias-namespaced) array_id and the
-    upstream's array_id with a pure byte splice, without understanding bounds or
-    scale encoding ("understands nothing"). The splice round-trips for both
-    regular and scaled chunk_ids because ``decode_chunk_id`` / ``is_scaled_chunk``
-    / ``decode_scale_info`` all recompute their offsets from the (new) length
-    prefix.
-    """
-    cv, inner = _split_version(chunk_id)
-    old_len = struct.unpack(">I", inner[:4])[0]
-    tail = inner[4 + old_len :]
-    new_bytes = new_array_id.encode("utf-8")
-    rewritten = struct.pack(">I", len(new_bytes)) + new_bytes + tail
-    return wrap_content_version(rewritten, cv) if cv is not None else rewritten
-
-
-def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
+def decode_chunk_id(chunk_id: bytes) -> Tuple[str, ChunkBounds]:
     """Decode array_id and bounds from chunk_id. Works for both regular
     and virtual chunk_ids (ignores virtual payload) and version-wrapped ones."""
     _, chunk_id = _split_version(chunk_id)
@@ -265,22 +241,16 @@ def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
     ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
     offset += 2
 
-    start = []
-    for _ in range(ndim):
-        start.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
-        offset += 8
-
-    stop = []
-    for _ in range(ndim):
-        stop.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
-        offset += 8
+    start = struct.unpack_from(f">{ndim}q", chunk_id, offset)
+    offset += ndim * 8
+    stop = struct.unpack_from(f">{ndim}q", chunk_id, offset)
 
     bounds = ChunkBounds(start=start, stop=stop)
 
     return array_id, bounds
 
 
-def get_bounds_from_chunk_id(chunk_id: bytes) -> "ChunkBounds":
+def get_bounds_from_chunk_id(chunk_id: bytes) -> ChunkBounds:
     """Extract bounds from chunk_id."""
     _, bounds = decode_chunk_id(chunk_id)
     return bounds
@@ -299,7 +269,7 @@ def encode_chunk_id_with_scale(
     compute time (biopb/biopb#178, #76).
     """
     base = encode_chunk_id(array_id, bounds)
-    scale_payload = b"".join(struct.pack(">q", s) for s in scale_hint)
+    scale_payload = struct.pack(f">{len(scale_hint)}q", *scale_hint)
     return base + scale_payload
 
 
@@ -365,26 +335,15 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
     _, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
-    scale_hint = []
-    for ax in range(ndim):
-        scale_hint.append(
-            struct.unpack(
-                ">q", chunk_id[bounds_end + ax * 8 : bounds_end + ax * 8 + 8]
-            )[0]
-        )
-
-    return tuple(scale_hint)
+    return struct.unpack_from(f">{ndim}q", chunk_id, bounds_end)
 
 
 # Constants
 # 64MB threshold for chunk splitting - enables parallel Flight transfers
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
-if TYPE_CHECKING:
-    pass
 
-
-@dataclass
+@dataclass(slots=True)
 class ChunkEndpoint:
     """A chunk with its metadata for Flight endpoint creation.
 
@@ -522,16 +481,16 @@ PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 512
 def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
     """(y_idx, x_idx), matching biopb-mcp's get_xy_dim_indices.
 
-    Prefers 'y'/'x' dim_labels; falls back to the ``[..., Y, X]`` convention
-    (X last, Y second-to-last).
+    Prefers a y/x-labeled axis (by synonym, via :func:`core.axes.labeled_axis_index`);
+    falls back to the ``[..., Y, X]`` convention (X last, Y second-to-last) when
+    either is unlabeled.
     """
     ndim = len(shape)
     if dim_labels:
-        labels_lower = [str(label).lower() for label in dim_labels]
-        try:
-            return labels_lower.index("y"), labels_lower.index("x")
-        except ValueError:
-            pass
+        y = labeled_axis_index(dim_labels, "y")
+        x = labeled_axis_index(dim_labels, "x")
+        if y is not None and x is not None:
+            return y, x
     if ndim < 2:
         raise ValueError(f"Cannot identify x/y dimensions: tensor is {ndim}-D")
     return ndim - 2, ndim - 1
@@ -540,13 +499,14 @@ def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
 def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
     """Index of the z axis or None, matching biopb-mcp's get_z_dim_index.
 
-    Prefers a 'z' dim_label (absent label => no depth axis); else the positional
-    ``[..., Z, Y, X]`` convention (third-from-last) for 3-D+ tensors.
+    Prefers a z-labeled axis (by synonym; absent label => no depth axis, never a
+    positional guess -- an unlabeled leading axis may be T/C and must not be
+    downsampled); else the positional ``[..., Z, Y, X]`` convention (third-from-
+    last) for 3-D+ tensors.
     """
     ndim = len(shape)
     if dim_labels:
-        labels_lower = [str(label).lower() for label in dim_labels]
-        return labels_lower.index("z") if "z" in labels_lower else None
+        return labeled_axis_index(dim_labels, "z")
     return ndim - 3 if ndim >= 3 else None
 
 
@@ -621,23 +581,15 @@ def compute_pyramid_scale_hints(
 def compute_precache_scale_hint(
     shape: Sequence[int],
     dim_labels=None,
-    threshold: int = PRECACHE_THRESHOLD,
-    downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
-    pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+    **kwargs: int,
 ) -> List[int]:
     """Per-axis scale_hint for the *coarsest* pyramid level a client requests.
 
-    The coarsest level the precache worker warms -- the last entry of
-    :func:`compute_pyramid_scale_hints`, kept as a thin wrapper so there is one
-    pyramid loop, not two.
+    The last entry of :func:`compute_pyramid_scale_hints` (``threshold`` /
+    ``downscale_factor`` / ``pixel_budget_cubic_root`` forwarded through) -- a
+    named thin wrapper so there is one pyramid loop, not two.
     """
-    return compute_pyramid_scale_hints(
-        shape,
-        dim_labels,
-        threshold=threshold,
-        downscale_factor=downscale_factor,
-        pixel_budget_cubic_root=pixel_budget_cubic_root,
-    )[-1]
+    return compute_pyramid_scale_hints(shape, dim_labels, **kwargs)[-1]
 
 
 def build_pyramid_plan(
@@ -701,8 +653,7 @@ def compute_safe_chunk_size(
     Returns:
         Chunk size tuple guaranteed to fit within MAX_ARROW_BATCH_BYTES
     """
-    item_size = np.dtype(dtype).itemsize
-    chunk_bytes = int(np.prod(chunk_size)) * item_size
+    chunk_bytes = estimate_chunk_bytes(chunk_size, dtype)
 
     if chunk_bytes <= MAX_ARROW_BATCH_BYTES:
         return chunk_size
@@ -738,7 +689,7 @@ def compute_safe_chunk_size(
         axes_already_split.add(split_axis)
 
         # Recalculate bytes
-        chunk_bytes = int(np.prod(safe_size)) * item_size
+        chunk_bytes = estimate_chunk_bytes(tuple(safe_size), dtype)
 
     return tuple(safe_size)
 
@@ -801,8 +752,10 @@ def _choose_split_axis_excluding(
     # Priority 4: Larger of 'y' or 'x'
     y_ax = label_to_axis.get("y")
     x_ax = label_to_axis.get("x")
-    y_eligible = y_ax in eligible if y_ax else False
-    x_eligible = x_ax in eligible if x_ax else False
+    # ``None in eligible`` is safely False, so no guard is needed -- and testing
+    # ``y_ax`` directly would wrongly reject axis 0 (a falsy but valid index).
+    y_eligible = y_ax in eligible
+    x_eligible = x_ax in eligible
 
     if y_eligible and x_eligible:
         return y_ax if shape[y_ax] >= shape[x_ax] else x_ax
