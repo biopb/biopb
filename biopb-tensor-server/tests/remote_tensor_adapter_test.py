@@ -421,7 +421,7 @@ class TestRemoteTensorProxy:
                     indexed_at="2026-07-19 00:00:00",
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(tensor_id="hpc__aics")
+                    TensorReadOption(tensor_id="hpc__aics", with_pyramid=True)
                 )
 
                 assert plan is not None
@@ -488,7 +488,7 @@ class TestRemoteTensorProxy:
                     data_resident=True,
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(tensor_id="hpc__ome")
+                    TensorReadOption(tensor_id="hpc__ome", with_pyramid=True)
                 )
 
                 assert plan is not None
@@ -499,6 +499,60 @@ class TestRemoteTensorProxy:
                     lvl.reduction_method == "precompute"
                     for lvl in plan.descriptor.pyramid
                 )
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_forward_flight_info_forwards_response_field_masks(self):
+        """The proxy relays with_read_plan / with_pyramid to the upstream, so a
+        describe-only, no-pyramid forward comes back as the descriptor alone --
+        no endpoints, no pyramid (biopb/biopb#563). The proxy re-derives neither,
+        so whatever the client masks out must be masked out upstream too.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb_tensor_server import OmeZarrAdapter, TensorFlightServer
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath, _, _ = create_multiresolution_ome_zarr(
+                tmp, n_levels=4, base_shape=(256, 256), chunk_size=(64, 64)
+            )
+            root = zarr.open_group(zpath, mode="r")
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__ome",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="ome",
+                )
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "ome",
+                            "dim_labels": ["y", "x"],
+                            "shape": [256, 256],
+                            "chunk_shape": [64, 64],
+                            "dtype": "uint8",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+                plan = adapter.forward_flight_info(
+                    TensorReadOption(tensor_id="hpc__ome", with_read_plan=False)
+                )
+
+                assert plan is not None
+                assert list(plan.descriptor.shape) == [256, 256]
+                assert len(plan.chunk_endpoints) == 0  # describe-only: no plan
+                assert len(plan.descriptor.pyramid) == 0  # pyramid not requested
             finally:
                 upstream.shutdown()
 
@@ -970,7 +1024,9 @@ def test_server_get_flight_info_uses_proxy_forward():
             try:
                 cmd = FlightCmd(
                     source_id="hpc__ome",
-                    tensor_read=TensorReadOption(tensor_id="hpc__ome"),
+                    tensor_read=TensorReadOption(
+                        tensor_id="hpc__ome", with_pyramid=True
+                    ),
                 )
                 fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
                 # Direct server-method call (no client): the proxy source carries no

@@ -746,18 +746,25 @@ class RemoteTensorAdapter(TensorAdapter):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.
 
         Re-targets the incoming ``read_opt`` at the upstream array_id and forwards
-        its slice/scale/reduction hints verbatim. ``with_metadata`` is forced
+        its slice/scale/reduction hints verbatim, plus the two response field
+        masks (biopb/biopb#563): ``with_pyramid`` and ``with_read_plan`` ride
+        through so the upstream advertises the pyramid / skips the plan exactly as
+        the original client asked -- the proxy re-derives neither, so whatever the
+        original request masked out must be masked out upstream too. ``physical_scale``
+        rides the upstream descriptor unconditionally. ``with_metadata`` is forced
         False: the local server fills the response ``metadata_json`` itself from
-        the mirror catalog (biopb/biopb#253), and ``pyramid``/``physical_scale``
-        ride the upstream descriptor unconditionally (the upstream fills them at
-        open time regardless of ``with_metadata``), so the forwarded call needs
-        only the descriptor + endpoints.
+        the mirror catalog (biopb/biopb#253).
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
         up_read_opt = TensorReadOption(
             tensor_id=upstream_array_id,
             with_metadata=False,
+            with_pyramid=read_opt.with_pyramid,
         )
+        # with_read_plan is an optional bool: forward it only when the caller set
+        # it, so an unset field keeps defaulting true at the upstream as well.
+        if read_opt.HasField("with_read_plan"):
+            up_read_opt.with_read_plan = read_opt.with_read_plan
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
         if read_opt.scale_hint:

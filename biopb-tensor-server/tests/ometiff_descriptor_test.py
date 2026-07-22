@@ -711,9 +711,11 @@ class TestReadPathTifffileAuthoritative:
         _, scene = self._scene(path, "pure")
         assert not hasattr(scene, "_bio_image")
 
-        plan = scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        plan = scene.plan_flight_info(
+            TensorReadOption(with_pyramid=True), PyramidConfig()
+        )
         assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]
-        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid
+        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid (opt-in)
 
         bounds = ChunkBounds(start=[0, 1, 0, 0, 0], stop=[1, 2, 1, 64, 64])
         arr = np.asarray(scene.get_data(bounds))

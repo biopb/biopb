@@ -914,35 +914,66 @@ class TensorAdapter(SourceAdapter):
         stays lean). ``metadata_json`` itself is still filled by the server from
         the catalog, not here.
 
-        The default plans locally: it applies the request's slice/scale/reduction
-        hints to this tensor's descriptor, runs ``get_read_plan``, then advertises
-        the pyramid and physical scale. A remote-proxy adapter overrides this to
+        ``read_opt`` carries two field masks over this response (biopb/biopb#563):
+
+        - ``with_read_plan`` (default true, an *unset* ``optional`` bool) gates the
+          per-request chunk endpoints. When false this is a **describe-only** call:
+          the request's slice/scale/reduction hints do not apply (describe is the
+          stable per-tensor fact, not a per-request read), so the descriptor is
+          this tensor's base descriptor and the endpoint list is empty --
+          ``get_read_plan`` (the O(chunks) enumeration) is skipped entirely.
+        - ``with_pyramid`` (default false) gates the pyramid advertisement, whose
+          native-level sizing is the expensive part; ``physical_scale`` is the
+          cheap describe fact and is filled unconditionally.
+
+        The default plans locally. A remote-proxy adapter overrides this to
         forward the upstream's authoritative plan instead (biopb/biopb#295).
         """
         base_desc = self.get_tensor_descriptor()
-        request_desc = TensorDescriptor(
-            array_id=base_desc.array_id,
-            dim_labels=base_desc.dim_labels,
-            shape=base_desc.shape,
-            chunk_shape=base_desc.chunk_shape,
-            dtype=base_desc.dtype,
+
+        # with_read_plan is an optional bool defaulting true: an unset field (an
+        # old client, or a plain read) still gets the full plan, as before.
+        with_read_plan = (
+            read_opt.with_read_plan if read_opt.HasField("with_read_plan") else True
         )
-        if read_opt.HasField("slice_hint"):
-            request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-        # scale_hint / reduction_method route the read to a downsampled level.
-        if read_opt.scale_hint:
-            request_desc.scale_hint[:] = list(read_opt.scale_hint)
-        if read_opt.reduction_method:
-            request_desc.reduction_method = read_opt.reduction_method
 
-        read_plan = self.get_read_plan(request_desc)
+        if with_read_plan:
+            request_desc = TensorDescriptor(
+                array_id=base_desc.array_id,
+                dim_labels=base_desc.dim_labels,
+                shape=base_desc.shape,
+                chunk_shape=base_desc.chunk_shape,
+                dtype=base_desc.dtype,
+            )
+            if read_opt.HasField("slice_hint"):
+                request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
+            # scale_hint / reduction_method route the read to a downsampled level.
+            if read_opt.scale_hint:
+                request_desc.scale_hint[:] = list(read_opt.scale_hint)
+            if read_opt.reduction_method:
+                request_desc.reduction_method = read_opt.reduction_method
+            read_plan = self.get_read_plan(request_desc)
+        else:
+            # Describe-only: the base per-tensor descriptor, no chunk enumeration.
+            read_plan = TensorReadPlan(
+                descriptor=TensorDescriptor(
+                    array_id=base_desc.array_id,
+                    dim_labels=base_desc.dim_labels,
+                    shape=base_desc.shape,
+                    chunk_shape=base_desc.chunk_shape,
+                    dtype=base_desc.dtype,
+                ),
+                chunk_endpoints=[],
+            )
 
-        # Advertise the server-decided resolution pyramid, then the compact
-        # physical scale -- both open-time only (never in list_flights).
+        # Advertise the server-decided resolution pyramid (opt-in -- native-level
+        # sizing is the costly part), then the compact physical scale (cheap,
+        # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
-        read_plan.descriptor.pyramid.extend(
-            self._advertised_pyramid(base_desc, pyramid_config)
-        )
+        if read_opt.with_pyramid:
+            read_plan.descriptor.pyramid.extend(
+                self._advertised_pyramid(base_desc, pyramid_config)
+            )
         self._fill_physical_scale(read_plan.descriptor)
         return read_plan
 
