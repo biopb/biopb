@@ -399,6 +399,29 @@ class TestUnresolvedProxy:
     def test_close_on_unresolved_proxy_is_a_noop(self):
         self._make_proxy("/data/cloud/x.zarr").close()  # does not raise
 
+    def test_get_level_adapter_forwards_to_the_resolved_adapter(self):
+        """The proxy forwards native-level lookup, like ``close`` (biopb/biopb#557).
+
+        A resolved cloud native-pyramid source serves its ``precompute`` chunks
+        through the level adapter; without this forward the server's chunk
+        dispatch would mis-route a level chunk to ``get_tensor_adapter``.
+        """
+        proxy = self._make_proxy("/data/cloud/x.zarr")
+        # Unresolved: no tensors yet, so no level -- None falls back to the
+        # tensor path (which raises the "resolve first" error).
+        assert proxy.get_level_adapter("1") is None
+
+        calls = []
+
+        class _Inner:
+            def get_level_adapter(self, path):
+                calls.append(path)
+                return "level-adapter"
+
+        proxy._resolved = _Inner()
+        assert proxy.get_level_adapter("1") == "level-adapter"
+        assert calls == ["1"]
+
     def test_serve_surface_refuses_until_resolved(self):
         # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
         # on its own -- it refuses with SourceUnresolvedError until resolve() has

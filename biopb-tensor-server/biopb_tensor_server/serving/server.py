@@ -523,11 +523,15 @@ class TensorFlightServer(flight.FlightServerBase):
             adapter = None
             source_adapter = self.sources.get(source_id)
             if source_adapter is not None:
-                if rest is not None and hasattr(source_adapter, "get_level_adapter"):
-                    # An explicit level path (OME-Zarr, QPTIFF).
+                # A within-source suffix names either a native pyramid level
+                # (OME-Zarr / QPTIFF precompute) or a tensor field (an HCS
+                # well/field, a multi-scene file). Ask through the contract, not
+                # by sniffing for the method (biopb/biopb#557): a native-pyramid
+                # adapter returns the level's backend; every other adapter (and a
+                # bare suffix) returns None and the read routes to the tensor field.
+                if rest is not None:
                     adapter = source_adapter.get_level_adapter(rest)
-                else:
-                    # Virtual scaling or a single-tensor source.
+                if adapter is None:
                     adapter = source_adapter.get_tensor_adapter(rest)
         except (
             SourceUnresolvedError,

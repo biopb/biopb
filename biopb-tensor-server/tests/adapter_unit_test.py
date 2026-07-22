@@ -1404,54 +1404,89 @@ class TestOmeZarrPrecompute:
 class TestSliceConversion:
     """Tests for slice coordinate conversion."""
 
-    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_convert_slice_to_level(self):
-        """Test slice conversion from base to level coordinates."""
-        import json
+        """Base->level slice conversion is a pure transform (needs no adapter)."""
+        from biopb_tensor_server.core.base import _convert_slice_to_level
 
+        level_slice = _convert_slice_to_level(
+            SliceHint(start=[10, 20], stop=[50, 60]), [4, 2]
+        )
+
+        assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
+        assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
+
+    def test_convert_slice_to_level_none_passthrough(self):
+        from biopb_tensor_server.core.base import _convert_slice_to_level
+
+        assert _convert_slice_to_level(None, [4, 2]) is None
+
+
+class TestGetLevelAdapterContract:
+    """``get_level_adapter`` is a TensorAdapter contract, not a sniffed method.
+
+    The server's chunk dispatch asks every source adapter for a native pyramid
+    level; a non-native adapter answers ``None`` and the read falls back to the
+    tensor field. This replaces the old ``hasattr(adapter, "get_level_adapter")``
+    duck-typing, whose mere-presence test mis-routed an HCS ``well/field`` chunk
+    to a (non-existent) level store (biopb/biopb#557).
+    """
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_plain_tensor_adapter_returns_none(self):
+        """A format with no native pyramid uses the base default (None)."""
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            arr = zarr.open_array(
+                os.path.join(tmpdir, "plain.zarr"),
+                mode="w",
+                shape=(8, 8),
+                chunks=(4, 4),
+                dtype="uint8",
+            )
+            adapter = ZarrAdapter(arr, "plain", ["y", "x"])
+            assert adapter.get_level_adapter("1") is None
 
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(25, 50), chunks=(12, 25), dtype="uint8")
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_plate_returns_none(self):
+        """An HCS plate has no native pyramid: a suffix is a field id, not a level."""
+        from biopb_tensor_server.core.config import SourceConfig
 
-            zattrs = {
-                "multiscales": [
-                    {
-                        "datasets": [
-                            {
-                                "path": "0",
-                                "coordinateTransformations": [
-                                    {"type": "scale", "scale": [1, 1]}
-                                ],
-                            },
-                            {
-                                "path": "1",
-                                "coordinateTransformations": [
-                                    {"type": "scale", "scale": [4, 2]}
-                                ],
-                            },
-                        ]
-                    }
-                ]
-            }
-            with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
-                json.dump(zattrs, f)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = TestGetPhysicalScale._make_hcs_plate(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            assert plate._is_hcs_plate
+            assert plate.get_level_adapter("A/1/0") is None
 
-            root = zarr.open_group(zarr_path, mode="r")
-            base_arr = root["0"]
-            adapter = OmeZarrAdapter(base_arr, "test")
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_field_chunk_routes_to_field_adapter(self):
+        """An HCS field chunk resolves to the field adapter, not a level store.
 
-            # Test slice conversion
-            level_slice = adapter._convert_slice_to_level(
-                SliceHint(start=[10, 20], stop=[50, 60]), (4, 2)
+        Regression: under the old ``hasattr`` dispatch this landed on
+        ``get_level_adapter("well/field")`` and failed to open a level.
+        """
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = TestGetPhysicalScale._make_hcs_plate(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            field_id = plate.list_tensor_descriptors()[0].array_id
+            field = plate.get_tensor_adapter(field_id)
+            chunk_id = (
+                field.get_read_plan(field.get_tensor_descriptor())
+                .chunk_endpoints[0]
+                .chunk_id
             )
 
-            assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
-            assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
+            server = TensorFlightServer("grpc://localhost:0")
+            server.register_source("plate", plate)
+            resolved = server._get_adapter_for_chunk(chunk_id)
+            assert resolved.get_tensor_descriptor().array_id == field_id
 
 
 class TestGetData:

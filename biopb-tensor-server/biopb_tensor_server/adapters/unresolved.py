@@ -149,6 +149,23 @@ class UnresolvedSourceAdapter(SourceAdapter):
                 tensor_id = descriptors[0].array_id
         return self._resolved.get_tensor_adapter(tensor_id)
 
+    def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
+        """Forward a native-pyramid level lookup to the resolved adapter.
+
+        A resolved cloud native-pyramid source (single-image OME-Zarr / QPTIFF)
+        serves its ``precompute`` chunks through the level adapter, so this proxy
+        must forward the lookup -- else the server's chunk dispatch would send the
+        level chunk to ``get_tensor_adapter`` and mis-resolve it. Declared on
+        ``TensorAdapter``, this was the forward a duck-typed ``hasattr`` dispatch
+        silently skipped (biopb/biopb#557), the same shape as the missing
+        ``close`` forward (biopb/biopb#71). Returns ``None`` while unresolved (no
+        tensors yet) and for a resolved adapter with no native levels, so the
+        caller falls back to ``get_tensor_adapter`` -- never a recall.
+        """
+        if self._resolved is None:
+            return None
+        return self._resolved.get_level_adapter(path)
+
     # --- lifecycle -----------------------------------------------------------
 
     def close(self) -> None:
