@@ -381,24 +381,16 @@ class SourceAdapter(ABC):
 
     @abstractmethod
     def get_metadata(self) -> dict:
-        """Return metadata as dict. In most cases this is OME metadata.
+        """Return the source-level metadata as a dict. Usually OME metadata.
 
-        Used by the metadata engine to create database.
-        Will be serialized to metadata_json in TensorDescriptor.
+        Called **once at registration** to populate the catalog's
+        ``sources.metadata_json`` row (:meth:`MetadataDatabase.sync_source_added`);
+        the serve path reads it back from the catalog, never by recomputing here
+        (biopb/biopb#253). It must therefore be a pure producer -- do not memoize
+        the result across calls (the catalog is the cache). Genuinely per-tensor
+        metadata that the source row cannot represent is exposed on the tensor
+        adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
         """
-
-    def metadata_covers_all_tensors(self) -> bool:
-        """Whether ``get_metadata()`` applies to *every* tensor of this source.
-
-        When True (the default), the catalog's source-level ``metadata_json`` is a
-        valid serve answer for any tensor, so ``GetFlightInfo(with_metadata)`` may
-        read it from the catalog instead of recomputing on the adapter
-        (biopb/biopb#253). Override to False when metadata is genuinely per-tensor
-        (OME-Zarr HCS plates: the source row holds the *plate* ``.zattrs``, which
-        is not any individual field's OME metadata) so the serve path falls back
-        to the per-tensor ``get_metadata()`` for correctness.
-        """
-        return True
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
@@ -569,10 +561,10 @@ class TensorAdapter(SourceAdapter):
     from ``get_tensor_adapter``, the multi-tensor ones (bioio / OME-TIFF / EMD)
     return a clone of their own class with tensor context set, and the OME-Zarr /
     QPTIFF level and HCS-field adapters are plain ``ZarrAdapter`` instances. The
-    serve path relies on it -- ``get_flight_info`` calls the source-scoped
-    ``get_metadata()`` on the tensor adapter to get an HCS field's per-field
-    metadata (biopb/biopb#253). Nesting types that reality instead of contradicting
-    it (biopb/biopb#380).
+    serve path relies on it -- an HCS field's per-field metadata comes from the
+    tensor adapter's :meth:`get_tensor_metadata`, which the plate's source-level
+    catalog row cannot represent (biopb/biopb#253). Nesting types that reality
+    instead of contradicting it (biopb/biopb#380).
 
     The converse does not hold: ``UnresolvedSourceAdapter`` is a source that has no
     tensors until it resolves, and stays a plain ``SourceAdapter``. So "source" is
@@ -1012,6 +1004,25 @@ class TensorAdapter(SourceAdapter):
             )
         return levels
 
+    def get_tensor_metadata(self) -> Optional[dict]:
+        """Per-tensor metadata fields the source-level catalog row does not carry.
+
+        The serve path (``GetFlightInfo(with_metadata)``) reads a source's
+        metadata from the catalog row that :meth:`SourceAdapter.get_metadata`
+        produced once at registration -- the cache -- and **merges** this method's
+        return over it (``row.update(get_tensor_metadata())``). So a tensor
+        adapter returns only the *delta*: the cheap, per-tensor fields the
+        source-level row cannot represent -- an OME-Zarr HCS field's own OME
+        metadata over the plate ``.zattrs`` row, or an EMD signal's
+        ``original_metadata`` over the source's ``{"format": "emd"}`` row.
+
+        Keeping the shared bulk in the catalog and overlaying only the per-tensor
+        delta here is the point (biopb/biopb#253): per-tensor metadata never needs
+        a catalog row of its own. ``None`` (the default) means no delta -- the
+        source-level row fully describes this tensor.
+        """
+        return None
+
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dimension physical pixel size + unit for this tensor, axis order.
 
@@ -1076,7 +1087,6 @@ _SOURCE_SCOPED_API = frozenset(
         "create_from_config",
         "list_tensor_descriptors",
         "get_metadata",
-        "metadata_covers_all_tensors",
         "get_source_descriptor",
         "resolve",
         "is_resident",
@@ -1096,6 +1106,7 @@ _TENSOR_SCOPED_API = frozenset(
         "get_level_adapter",
         "get_native_pyramid_levels",
         "has_native_pyramid",
+        "get_tensor_metadata",
         "plan_flight_info",
     }
 )

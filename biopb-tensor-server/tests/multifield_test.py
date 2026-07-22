@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     DataSourceDescriptor,
     TensorAdapter,
     TensorDescriptor,
@@ -305,7 +305,9 @@ class TestMultifieldServerClient:
 
             # Bare source_id -> must not raise "Unknown tensor: " and must come
             # back anchored on the first tensor (server-side default resolution).
-            desc = client.get_descriptor("multifield-default")
+            # Structural probe (checks shape/array_id, not metadata), so this bare
+            # server needs no metadata catalog.
+            desc = client.get_descriptor("multifield-default", with_metadata=False)
             # Shape unambiguously identifies the default (first) tensor; the
             # descriptor reports the globally-unique source_id/field array_id
             # (identity policy).
@@ -354,8 +356,15 @@ class TestMultifieldServerClient:
             # -- including a non-default one (the #75 symptom: pos_1/pos_2 were
             # unreachable through the old get_source path). It caches only the
             # descriptor, so it must NOT clobber the full enumeration cached above.
-            assert client.get_descriptor("multi/pos_1").shape == [64, 64]
-            assert client.get_descriptor("multi/pos_2").shape == [16, 16]
+            # Structural probes (shape only) -> no metadata catalog needed.
+            assert client.get_descriptor("multi/pos_1", with_metadata=False).shape == [
+                64,
+                64,
+            ]
+            assert client.get_descriptor("multi/pos_2", with_metadata=False).shape == [
+                16,
+                16,
+            ]
             # Read the _sources cache directly -- re-calling list_sources() would
             # just refetch.
             assert len(client._sources["multi"].tensors) == 3
@@ -389,8 +398,8 @@ class TestMultifieldServerClient:
             assert qualified.shape == (64, 64)
             assert qualified.compute().mean() == 1  # value based on field index
 
-            # The wire descriptor reports the qualified array_id.
-            desc = client.get_descriptor("mf-liberal/pos_1")
+            # The wire descriptor reports the qualified array_id (structural probe).
+            desc = client.get_descriptor("mf-liberal/pos_1", with_metadata=False)
             assert desc.array_id == "mf-liberal/pos_1"
 
             client.close()
@@ -670,9 +679,18 @@ class TestDescriptorCacheCollision:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # get_descriptor returns each source's own shape, never the other's.
-            assert client.get_descriptor("aics_aaa").shape == [10, 256, 256]
-            assert client.get_descriptor("aics_bbb").shape == [181, 1024, 1024]
+            # get_descriptor returns each source's own shape, never the other's
+            # (structural probe -> no metadata catalog needed on this bare server).
+            assert client.get_descriptor("aics_aaa", with_metadata=False).shape == [
+                10,
+                256,
+                256,
+            ]
+            assert client.get_descriptor("aics_bbb", with_metadata=False).shape == [
+                181,
+                1024,
+                1024,
+            ]
 
             # get_physical_scale reads from the descriptor cache keyed on the
             # bare tensor id "Image:0" -- the exact collision in #45. Each must

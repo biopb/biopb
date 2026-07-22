@@ -33,7 +33,11 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter, to_catalog_url
+from biopb_tensor_server.core.adapter_base import (
+    SourceAdapter,
+    TensorAdapter,
+    to_catalog_url,
+)
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,

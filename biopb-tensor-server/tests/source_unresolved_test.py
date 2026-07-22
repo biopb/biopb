@@ -10,7 +10,7 @@ import tempfile
 
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb_tensor_server.core.base import _get_read_plan, require_resolved
+from biopb_tensor_server.core.adapter_base import _get_read_plan, require_resolved
 from biopb_tensor_server.core.errors import SourceUnresolvedError
 
 

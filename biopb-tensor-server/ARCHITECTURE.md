@@ -172,14 +172,14 @@ level 0 is full resolution. The client reads each advertised level via the norma
 
 ### Adapter interface
 
-Two role ABCs in `core/base.py`, and they **nest**: `TensorAdapter` subclasses
+Two role ABCs in `core/adapter_base.py`, and they **nest**: `TensorAdapter` subclasses
 `SourceAdapter`, so a tensor adapter is a source that can also serve pixels
 (biopb/biopb#380). Every concrete format adapter subclasses `TensorAdapter` and
 fills both roles in one object — `get_tensor_adapter()` returns `self` for a
 single-tensor format, and a clone of the same class (or a plain `ZarrAdapter`,
 for OME-Zarr / QPTIFF levels and HCS fields) for a multi-tensor one. The lone
 source-only adapter is `UnresolvedSourceAdapter`, which has no tensors until it
-resolves. The role *scopes* stay disjoint where they are declared — `base.py`
+resolves. The role *scopes* stay disjoint where they are declared — `adapter_base.py`
 asserts that at import time (`_SOURCE_SCOPED_API` / `_TENSOR_SCOPED_API`), so a
 tensor-scoped method can never be written onto `SourceAdapter`.
 

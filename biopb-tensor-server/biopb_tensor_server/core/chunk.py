@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # used to carry a trailing reduction_method (uint16 len + bytes), but the cache
 # key always stripped it (advisory, biopb/biopb#76) and the compute path is the
 # only consumer -- so the method left the wire format entirely (biopb/biopb#178).
-# A cold downsample uses the server default; see core.base.resolve_chunk_data.
+# A cold downsample uses the server default; see core.adapter_base.resolve_chunk_data.
 # (An older chunk_id that still carries a method suffix stays readable: decode /
 # is_scaled / cache_key all ignore the trailing bytes, so no cache wipe is needed.)
 #
@@ -565,7 +565,7 @@ def compute_pyramid_scale_hints(
     at 1), each stopping at ``axis_floor = min(pixel_budget_cubic_root,
     threshold)``, until the level satisfies ``Lx*Ly*Lz <=
     pixel_budget_cubic_root**3`` and ``Lx, Ly <= threshold``. ``ceil_div(L, s)``
-    is the server's own ``logical_shape`` (base.py), so each scale matches the
+    is the server's own ``logical_shape`` (adapter_base.py), so each scale matches the
     client's level and the warmed chunk_ids line up exactly.
 
     A tensor with no z axis is treated as ``Lz = 1`` and never gets a z factor.

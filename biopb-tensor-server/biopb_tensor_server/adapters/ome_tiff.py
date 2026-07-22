@@ -34,7 +34,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
@@ -586,6 +586,14 @@ class OmeTiffAdapter(TensorAdapter):
             io_lock=self._io_lock,
         )
         adapter._tensor_name = field
+        # Hand the scene the source's already-parsed OME-XML (list_tensor_descriptors
+        # above populated it) so the scene's metadata / physical-scale paths read
+        # the cached string instead of re-opening the master file once per scene --
+        # the source parses the OME-XML once, every scene inherits it (mirrors how
+        # bioio threads its shared _bio_image into scene adapters).
+        if self._raw_ome_xml_probed:
+            adapter._raw_ome_xml = self._raw_ome_xml
+            adapter._raw_ome_xml_probed = True
         self._tensor_adapters[field] = adapter
         return adapter
 

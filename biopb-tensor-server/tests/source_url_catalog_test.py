@@ -7,7 +7,7 @@ suite runs on every platform; a small stub adapter checks the descriptor build
 sites actually apply it.
 """
 
-from biopb_tensor_server.core.base import SourceAdapter, to_catalog_url
+from biopb_tensor_server.core.adapter_base import SourceAdapter, to_catalog_url
 
 
 class TestToCatalogUrl:

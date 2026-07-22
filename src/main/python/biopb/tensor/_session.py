@@ -610,8 +610,13 @@ class CatalogClient:
             # tensor_id None -> the source's default (first) tensor. A real fetch
             # error (server unreachable, source not found) propagates to the
             # caller -- it must stay distinguishable from "no physical scale
-            # recorded", which is the only case that yields None.
-            desc = self._fetch_tensor_descriptor(source_id, tensor_id)
+            # recorded", which is the only case that yields None. physical_scale
+            # is filled on every GetFlightInfo, so never request the opt-in OME
+            # tree here (per this method's contract) -- and so a compact
+            # scale probe never depends on the server having a metadata catalog.
+            desc = self._fetch_tensor_descriptor(
+                source_id, tensor_id, with_metadata=False
+            )
         if not desc.physical_scale:
             return None
         return list(desc.physical_scale), list(desc.physical_unit)
@@ -620,6 +625,7 @@ class CatalogClient:
         self,
         source_id: str,
         tensor_id: Optional[str] = None,
+        with_metadata: bool = True,
     ) -> "TensorDescriptor":
         """Fetch one tensor's descriptor directly from the server (internal).
 
@@ -632,12 +638,19 @@ class CatalogClient:
         ``_unresolved_source_error`` steering the caller to :meth:`resolve`,
         rather than triggering a download.
 
+        ``with_metadata`` fills the descriptor's ``metadata_json`` (the full OME
+        tree). Default ``True``. Pass ``False`` when only the structural
+        descriptor (shape/chunk/dtype/dim_labels, plus the always-filled pyramid
+        and physical scale) is needed -- a caching proxy mirroring an upstream's
+        structure, which serves metadata from its own catalog, does this so it
+        never depends on the upstream having a metadata catalog.
+
         The descriptor is cached in ``self._state.descriptors`` (keyed by the
         echoed-back array_id). ``self._state.sources`` is intentionally NOT touched, so
         a single-tensor probe never clobbers a full enumeration cached by
         ``list_sources()`` (issue #75).
         """
-        read_opt = TensorReadOption(with_metadata=True)
+        read_opt = TensorReadOption(with_metadata=with_metadata)
         # Anchor on the source's default tensor via the EMPTY-tensor_id path
         # (server resolves it to the first descriptor's qualified array_id, #44)
         # for both the unset case and a bare source_id. Sending the source_id as
@@ -668,7 +681,9 @@ class CatalogClient:
         )
         return tensor_desc
 
-    def get_descriptor(self, array_id: str) -> "TensorDescriptor":
+    def get_descriptor(
+        self, array_id: str, with_metadata: bool = True
+    ) -> "TensorDescriptor":
         """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
 
         A tensor is identified by its ``array_id`` alone (see the tensor identity
@@ -688,13 +703,18 @@ class CatalogClient:
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
                 tensor source) or ``"aics_7f3/Image:0"`` (multi-tensor source).
+            with_metadata: fill ``metadata_json`` (default ``True``); pass
+                ``False`` for the structural descriptor only (a proxy mirroring
+                upstream structure that serves metadata from its own catalog).
 
         Returns:
             The ``TensorDescriptor`` for that tensor.
         """
         # source_id is the slash-free prefix; the full array_id is the tensor_id.
         source_id = array_id.split("/", 1)[0]
-        return self._fetch_tensor_descriptor(source_id, array_id)
+        return self._fetch_tensor_descriptor(
+            source_id, array_id, with_metadata=with_metadata
+        )
 
     def _iter_action_messages(self, action, msg_cls, *, unknown_action_msg=None):
         """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
@@ -1065,7 +1085,12 @@ class ChunkFetcher:
                 f"Source '{source_id}' not in list_sources() result, fetching directly"
             )
             try:
-                td = self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
+                # Structural probe only (shape for slice validation); the OME tree
+                # is discarded here, so never demand it -- keeps this fetch off the
+                # metadata path (and independent of the server having a catalog).
+                td = self._catalog._fetch_tensor_descriptor(
+                    source_id, tensor_id, with_metadata=False
+                )
                 self._state.sources[source_id] = DataSourceDescriptor(
                     source_id=source_id, tensors=[td]
                 )
@@ -1102,7 +1127,11 @@ class ChunkFetcher:
                 f"fetching descriptor from server"
             )
             try:
-                self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
+                # Structural probe only (caches the descriptor for shape lookup);
+                # the OME tree is unused, so keep this off the metadata path.
+                self._catalog._fetch_tensor_descriptor(
+                    source_id, tensor_id, with_metadata=False
+                )
             except Exception:
                 pass  # let the ValueError below surface the clean message
             tensor_desc = self._state.descriptors.get(

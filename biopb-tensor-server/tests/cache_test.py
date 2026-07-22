@@ -1324,7 +1324,7 @@ class TestSchemaPooling:
 
         # Different dtypes now all serialize to the ONE unified binary chunk
         # schema (raw bytes + dtype string), so they share a pool.
-        from biopb_tensor_server.core.base import pack_chunk_batch
+        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
 
         int_data = pack_chunk_batch(np.array([1, 2, 3], dtype=np.int32))
         float_data = pack_chunk_batch(np.array([1.0, 2.0, 3.0], dtype=np.float32))
