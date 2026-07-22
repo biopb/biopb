@@ -1256,7 +1256,7 @@ class TestCloudRootFlag:
                 return None
 
         registry = AdapterRegistry()
-        registry.register_with_type("recorder", _Recorder)
+        registry.register(_Recorder, "recorder")
 
         cloud_dir = str(tmp_path / "cloud")
         plain_dir = str(tmp_path / "plain")
