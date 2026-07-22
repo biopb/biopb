@@ -298,25 +298,18 @@ class OmeZarrAdapter(ZarrAdapter):
         zarr_path = str(source.url)
         ctx, zarr_store = cls._source_context_and_store(source, credentials_config)
 
-        # Local reads can fail (missing/corrupt .zattrs, or a bare array where a
-        # group was expected); the historical local path degraded to opening the
-        # root as a plain array. Preserve that floor.
-        try:
-            zattrs = cls._read_json_sidecar(ctx, ".zattrs") or {}
-            if "plate" in zattrs:
-                field_relpath = cls._first_field_relpath(ctx, zattrs)
-                arr = cls._open_field_array(
-                    source, zarr_store, zarr_path, field_relpath
-                )
-            else:
-                res = _first_dataset_path(zattrs.get("multiscales", [])) or "0"
-                root = zarr.open_group(zarr_store, mode="r")
-                arr = (
-                    root[res] if res in root else zarr.open_array(zarr_store, mode="r")
-                )
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
-            zattrs = {}
-            arr = zarr.open_array(zarr_store, mode="r")
+        # A missing/corrupt sidecar already decodes to None in _read_json_sidecar,
+        # so zattrs is always a dict here. The zarr opens raise typed
+        # Group/ArrayNotFound errors we let propagate (fail fast on a source whose
+        # .zattrs the claim vetted but whose arrays are gone).
+        zattrs = cls._read_json_sidecar(ctx, ".zattrs") or {}
+        if "plate" in zattrs:
+            field_relpath = cls._first_field_relpath(ctx, zattrs)
+            arr = cls._open_field_array(source, zarr_store, zarr_path, field_relpath)
+        else:
+            res = _first_dataset_path(zattrs.get("multiscales", [])) or "0"
+            root = zarr.open_group(zarr_store, mode="r")
+            arr = root[res] if res in root else zarr.open_array(zarr_store, mode="r")
 
         # Thread the parsed root .zattrs + local root so __init__ skips the store
         # re-walk. Remote passes no local root -> __init__ falls back to its walk,
