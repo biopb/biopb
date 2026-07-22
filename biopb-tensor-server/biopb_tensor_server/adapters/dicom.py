@@ -243,6 +243,36 @@ def _dicom_common_metadata(ds) -> dict:
     return metadata
 
 
+# Image/Instance-level attributes that vary slice-to-slice within a series
+# (DICOM PS3.3 assigns them to the Image IE, not Patient/Study/Series). Reading
+# them off the first slice and reporting them as the series' value is misleading,
+# so ``DicomSeriesAdapter.get_metadata`` drops them from the shared first-slice
+# metadata. Surfacing the real per-slice values is tracked in #560.
+_SERIES_NONINVARIANT_TAGS = frozenset(
+    {
+        # per-instance identity / ordinal
+        "SOPInstanceUID",
+        "InstanceNumber",
+        # per-slice geometry (position along the stack)
+        "ImagePositionPatient",
+        "SliceLocation",
+        # per-instance frame count
+        "NumberOfFrames",
+        # image-level display params (not guaranteed constant across the series)
+        "WindowCenter",
+        "WindowWidth",
+        "RescaleSlope",
+        "RescaleIntercept",
+        # acquisition params subject to per-slice (dose) modulation
+        "KVP",
+        "ExposureTime",
+        "XRayTubeCurrent",
+    }
+)
+# Derived ``spatial`` keys computed from the per-slice geometry tags above.
+_SERIES_NONINVARIANT_SPATIAL = frozenset({"origin_mm", "slice_location_mm"})
+
+
 # =============================================================================
 # DicomAdapter - Single file
 # =============================================================================
@@ -761,9 +791,20 @@ class DicomSeriesAdapter(TensorAdapter):
         return _dicom_physical_scale(self._first_ds, self.dim_labels)
 
     def get_metadata(self) -> dict:
-        """Extract DICOM series metadata: the first slice's full per-file metadata
-        plus a series-level block."""
+        """Extract DICOM series metadata: the first slice's *series-invariant*
+        per-file metadata plus a series-level block.
+
+        The shared extractor pulls every field from the first slice; the
+        Image-level fields that vary slice-to-slice (see
+        ``_SERIES_NONINVARIANT_TAGS``) are dropped here rather than advertised as
+        series-wide. Full per-slice metadata is tracked in #560.
+        """
         metadata = _dicom_common_metadata(self._first_ds)
+        for section in ("tags", "patient"):
+            for name in _SERIES_NONINVARIANT_TAGS:
+                metadata[section].pop(name, None)
+        for name in _SERIES_NONINVARIANT_SPATIAL:
+            metadata["spatial"].pop(name, None)
         metadata["series"] = {
             "num_slices": self._num_slices,
             "directory": str(self.directory),
