@@ -265,9 +265,11 @@ class TensorFlightClient:
         """See :meth:`CatalogClient._fetch_tensor_descriptor`."""
         return self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
 
-    def get_descriptor(self, array_id: str) -> TensorDescriptor:
+    def get_descriptor(
+        self, array_id: str, with_metadata: bool = True
+    ) -> TensorDescriptor:
         """Fetch one tensor's descriptor by array_id. See :meth:`CatalogClient.get_descriptor`."""
-        return self._catalog.get_descriptor(array_id)
+        return self._catalog.get_descriptor(array_id, with_metadata=with_metadata)
 
     def resolve(
         self,

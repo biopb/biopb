@@ -436,7 +436,7 @@ class MetadataDatabase:
         logger.debug(f"Synced source to metadata database: {source_id}")
 
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
-        """Return a source's stored metadata as a dict, or ``None`` to fall back.
+        """Return a source's stored metadata as a dict, or ``None`` when empty.
 
         The catalog stores ``json.dumps(adapter.get_metadata())`` -- the **raw**
         dict, no envelope -- so the serve path can read metadata back with a
@@ -445,15 +445,17 @@ class MetadataDatabase:
         the local mirror row directly, never ``adapter.get_metadata()``). The
         stored JSON is parsed here so callers get a ready dict.
 
-        Returns ``None`` in every "no usable catalog metadata" case -- so the
-        caller uniformly falls back to ``adapter.get_metadata()``:
+        Returns ``None`` when the source has no usable stored metadata -- which is
+        a legitimate answer, not a failure, so the serve path leaves
+        ``metadata_json`` empty:
         - the source is absent, or its metadata is SQL NULL (empty is stored as
           NULL),
-        - the stored value is not valid JSON / not a JSON object,
-        - the DuckDB read itself fails.
+        - the stored value is not valid JSON / not a JSON object.
 
-        Never raises: a catalog read error degrades to the adapter path rather
-        than failing the serve. Uses ``cursor()`` for a thread-safe read.
+        **Raises** on a genuine DuckDB read error. The catalog is the mandatory,
+        authoritative source of serve-path metadata (there is no adapter
+        fallback), so a read failure must surface as a failed request rather than
+        be masked as "no metadata". Uses ``cursor()`` for a thread-safe read.
         """
         try:
             cursor = self._get_cursor()
@@ -464,7 +466,7 @@ class MetadataDatabase:
             logger.warning(
                 "metadata_json read failed for source %s: %s", source_id, exc
             )
-            return None
+            raise
 
         if row is None or not row[0]:
             return None

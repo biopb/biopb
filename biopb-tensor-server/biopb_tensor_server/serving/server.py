@@ -1277,30 +1277,26 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
-                # Prefer the catalog's stored metadata_json (biopb/biopb#253):
-                # computed once at registration, read back with a cheap local
-                # SELECT -- no adapter recompute, and for a remote proxy no
-                # upstream RPC (read the local mirror row directly, never
-                # adapter.get_metadata()). Fall back to the adapter only when
-                # there is no DB, or get_metadata_json returns None -- an absent/
-                # NULL row (empty metadata, or an unresolved source whose real row
-                # isn't written yet), unparseable JSON, or a catalog read error
-                # (it parses and degrades internally, never raising).
-                #
-                # Escape hatch: the catalog row is source-level, so read it only
-                # when the source's metadata covers every tensor. HCS plates hold
-                # per-field metadata (the row is the plate .zattrs, not a field's
-                # OME metadata), so they fall through to the per-tensor adapter --
-                # preserving the field-level answer (biopb/biopb#253).
-                raw_metadata = None
-                if (
-                    self._metadata_db is not None
-                    and source_adapter is not None
-                    and source_adapter.metadata_covers_all_tensors()
-                ):
-                    raw_metadata = self._metadata_db.get_metadata_json(source_id)
-                if raw_metadata is None:
-                    raw_metadata = tensor_adapter.get_metadata()
+                # One scheme (biopb/biopb#253): the source-level metadata is
+                # computed once at registration and read back from the catalog --
+                # the cache -- never recomputed on the adapter. The catalog is
+                # mandatory: a DB-less server (the embedded image-base cache) has
+                # no metadata to serve, so a metadata request fails closed. A DB
+                # read error propagates (no fallback); a NULL row is a legitimate
+                # "no metadata" (empty base).
+                if self._metadata_db is None:
+                    raise flight.FlightInternalError(
+                        f"Metadata requested for {source_id} but this server "
+                        "has no metadata catalog"
+                    )
+                raw_metadata = self._metadata_db.get_metadata_json(source_id) or {}
+                # Overlay the tensor adapter's cheap per-tensor delta -- fields the
+                # source-level row cannot carry (an OME-Zarr HCS field's own OME
+                # metadata; an EMD signal's original_metadata). Merged over the
+                # cached row so per-tensor metadata needs no catalog row of its own.
+                tensor_extra = tensor_adapter.get_tensor_metadata()
+                if tensor_extra:
+                    raw_metadata = {**raw_metadata, **tensor_extra}
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter.source_type,

@@ -154,12 +154,25 @@ class _HcsFieldAdapter(ZarrAdapter):
     field is where the calibration actually lives.
     """
 
-    def __init__(self, *args, physical_scale=None, **kwargs):
+    def __init__(self, *args, physical_scale=None, field_metadata=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._field_physical_scale = physical_scale
+        self._field_metadata = field_metadata
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         return self._field_physical_scale
+
+    def get_tensor_metadata(self) -> Optional[dict]:
+        """This field's own ``.zattrs`` (its OME-NGFF metadata) as the delta.
+
+        The plate's source-level catalog row is the *plate* ``.zattrs`` (the
+        rows/columns/wells layout); the serve path merges this field's own
+        ``.zattrs`` (``multiscales`` / ``omero`` -- disjoint from the plate keys)
+        over it, so a field advertises both its plate context and its own metadata
+        (biopb/biopb#253). ``None`` when the field ``.zattrs`` is unreadable -- the
+        field then carries just the plate row.
+        """
+        return self._field_metadata
 
 
 class OmeZarrAdapter(ZarrAdapter):
@@ -705,16 +718,14 @@ class OmeZarrAdapter(ZarrAdapter):
         return result
 
     def get_metadata(self) -> dict:
-        """Return OME-Zarr .zattrs content directly."""
-        return self.ome_metadata
+        """Return OME-Zarr .zattrs content directly.
 
-    def metadata_covers_all_tensors(self) -> bool:
-        """False for an HCS plate: the source row's metadata is the *plate*
-        ``.zattrs`` (rows/columns/wells layout), not any individual field's OME
-        metadata, so the serve path must read per-field metadata from the adapter
-        rather than the catalog (biopb/biopb#253). A regular multiscale image's
-        metadata does cover its (single) tensor."""
-        return not self._is_hcs_plate
+        For an HCS plate this is the *plate* ``.zattrs`` (rows/columns/wells
+        layout), which is the source-level catalog row -- a field's own OME
+        metadata is served per-tensor via
+        :meth:`_HcsFieldAdapter.get_tensor_metadata` (biopb/biopb#253).
+        """
+        return self.ome_metadata
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the multiscales transforms.
@@ -904,10 +915,11 @@ class OmeZarrAdapter(ZarrAdapter):
         resolution_path = "0"
         dim_labels = None
         physical_scale = None
+        # The field's own .zattrs -- its OME-NGFF metadata, served per-field via
+        # _HcsFieldAdapter.get_tensor_metadata (the plate row cannot carry it, #253).
+        field_metadata = self._read_zattrs_at(well_path, field_path)
         try:
-            multiscales = (self._read_zattrs_at(well_path, field_path) or {}).get(
-                "multiscales", []
-            )
+            multiscales = (field_metadata or {}).get("multiscales", [])
             if multiscales:
                 resolution_path = _first_dataset_path(multiscales) or "0"
                 dim_labels = _axes_to_dim_labels(multiscales[0].get("axes", []))
@@ -939,6 +951,7 @@ class OmeZarrAdapter(ZarrAdapter):
             source_id=self.source_id,
             dim_labels=dim_labels or self.dim_labels,
             physical_scale=physical_scale,
+            field_metadata=field_metadata,
         )
 
         # Set tensor name for array_id computation

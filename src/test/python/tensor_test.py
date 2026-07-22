@@ -794,7 +794,11 @@ class TestGetPhysicalScale:
         scale, unit = client.get_physical_scale("src")  # bare source id -> default
         assert scale == [1.0, 0.5, 0.5]
         assert unit == ["", "micrometer", "micrometer"]
-        client._catalog._fetch_tensor_descriptor.assert_called_once_with("src", None)
+        # physical scale is a compact probe: it fetches the structural descriptor
+        # only, never the opt-in OME tree (so it needs no metadata catalog).
+        client._catalog._fetch_tensor_descriptor.assert_called_once_with(
+            "src", None, with_metadata=False
+        )
 
     def test_fetch_error_propagates(self):
         # A real fetch failure (server unreachable, source not found) must NOT be

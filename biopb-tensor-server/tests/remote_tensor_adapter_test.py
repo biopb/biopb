@@ -789,25 +789,31 @@ def test_get_metadata_reads_from_upstream_metadata_db(simple_zarr_array):
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
     """End-to-end: a client GetFlightInfo through the proxy carries the upstream's
-    metadata, wrapped exactly once (not empty, not double-wrapped)."""
+    metadata, wrapped exactly once (not empty, not double-wrapped).
+
+    The proxy serves metadata from its own catalog, populated at registration
+    from the mirrored ``get_metadata()`` -- the serve path never recomputes on
+    the adapter (biopb/biopb#253), so a real proxy carries a metadata DB.
+    """
     import json
 
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     upstream = _upstream_with_metadata(zarr_path)
     try:
-        proxy = TensorFlightServer("grpc://localhost:0")
-        proxy.register_source(
-            "lab__img",
-            RemoteTensorAdapter(
-                source_id="lab__img",
-                upstream_location=f"grpc://localhost:{upstream.port}",
-                upstream_source_id="img",
-            ),
+        proxy_db = MetadataDatabase()
+        proxy = TensorFlightServer("grpc://localhost:0", metadata_db=proxy_db)
+        proxy_adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{upstream.port}",
+            upstream_source_id="img",
         )
+        proxy.register_source("lab__img", proxy_adapter)
+        proxy_db.sync_source_added("lab__img", proxy_adapter)  # mirror -> catalog
         _serve(proxy)
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
@@ -908,7 +914,10 @@ def test_physical_scale_surfaced_through_proxy(simple_zarr_array):
         _serve(proxy)
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-            desc = client.get_descriptor("lab__img")
+            # physical_scale is filled independent of with_metadata; fetch the
+            # structural descriptor so this DB-less proxy is not asked for a
+            # metadata catalog it does not have.
+            desc = client.get_descriptor("lab__img", with_metadata=False)
             assert list(desc.physical_scale) == list(_PHYS_SCALE)
             assert list(desc.physical_unit) == list(_PHYS_UNIT)
             client.close()

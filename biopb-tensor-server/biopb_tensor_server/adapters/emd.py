@@ -235,10 +235,6 @@ class EmdAdapter(TensorAdapter):
         with self._io_lock:
             return self._data[slices].compute()
 
-    def metadata_covers_all_tensors(self) -> bool:
-        """EMD metadata is per-signal, not one tree for the whole source."""
-        return False
-
     def _physical_scale(self) -> Optional[tuple]:
         """Voxel size + unit per dimension, from this signal's axis scales."""
         if self._axes is None:
@@ -246,7 +242,25 @@ class EmdAdapter(TensorAdapter):
         return axes_scale(self._axes, self.dim_labels or [])
 
     def get_metadata(self) -> dict:
-        """Signal-level EMD metadata (original_metadata), JSON-safe."""
+        """Source-level EMD metadata, JSON-safe.
+
+        EMD metadata is genuinely per-signal, and the source-level adapter
+        (``signal_index is None``) has no bound signal, so this is the bare
+        ``{"format": "emd"}`` header stored in the catalog row. Each signal's
+        own ``original_metadata`` is served per-tensor via
+        :meth:`get_tensor_metadata` (biopb/biopb#253).
+        """
         if self._original_metadata is None:
             return {"format": "emd"}
         return {"format": "emd", "original_metadata": self._original_metadata}
+
+    def get_tensor_metadata(self) -> Optional[dict]:
+        """This signal's ``original_metadata`` as the delta over the source row.
+
+        Per-signal, merged over the source-level ``{"format": "emd"}`` catalog row
+        (so ``"format"`` is not repeated here). ``None`` when this signal carries
+        no ``original_metadata``, or on the source-level adapter (no bound signal).
+        """
+        if self.signal_index is None or self._original_metadata is None:
+            return None
+        return {"original_metadata": self._original_metadata}

@@ -569,7 +569,12 @@ class RemoteTensorAdapter(TensorAdapter):
             return self._descriptors_cache
 
         try:
-            desc = self.client.get_descriptor(self._to_upstream_array_id(self.array_id))
+            # Structural mirror only -- metadata is served from this proxy's own
+            # catalog (#253), so do not demand the upstream carry a metadata
+            # catalog (a DB-less upstream would otherwise fail this probe).
+            desc = self.client.get_descriptor(
+                self._to_upstream_array_id(self.array_id), with_metadata=False
+            )
         except Exception as exc:
             self._mark_unreachable(exc)
             return []  # unreachable / unresolved upstream -> placeholder row
@@ -649,7 +654,9 @@ class RemoteTensorAdapter(TensorAdapter):
                     return out
 
         upstream_array_id = self._to_upstream_array_id(self.array_id)
-        desc = self.client.get_descriptor(upstream_array_id)
+        # Structural mirror only (metadata comes from the local catalog, #253), so
+        # this serve-path probe does not require the upstream to have a catalog.
+        desc = self.client.get_descriptor(upstream_array_id, with_metadata=False)
         return self._localize_descriptor(desc)
 
     def forward_flight_info(
