@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # -identical to the pre-#178 format (existing cache entries stay valid), and the
 # version, when present, is a constant header the read-plan mint precomputes once
 # and prepends to every chunk_id (so the per-chunk cost is one concat, not a
-# re-encode). The whole codec strips this header first, so decode / scale / rewrite
+# re-encode). The whole codec strips this header first, so decode / scale / cache_key
 # operate on the inner legacy chunk_id and only cache_key_for_chunk_id keeps the
 # version (that is the point -- a different version -> a different key -> the old
 # entry is un-lookupable, not mis-served). Clients treat the whole thing as opaque.
