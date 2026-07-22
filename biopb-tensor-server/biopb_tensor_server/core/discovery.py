@@ -37,9 +37,8 @@ from typing import (
 )
 
 # is_remote_url's canonical home is core.remote (it decides whether a URL needs
-# a RemoteStore). Imported here for generate_source_id / resolve_local_path and
-# re-exported for callers. Safe at module load: core.remote imports only stdlib
-# at module level, so there is no import cycle.
+# a RemoteStore). Imported here for generate_source_id. Safe at module load:
+# core.remote imports only stdlib at module level, so there is no import cycle.
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -1107,7 +1106,9 @@ def discover_sources_from_entries(
             # children); files carry no listing.
             child_listing=children_by_dir.get(path_str) if is_dir else None,
         )
-        claim = _record_claim(state, registry.get_claims_for_path(ctx, state), dim_labels)
+        claim = _record_claim(
+            state, registry.get_claims_for_path(ctx, state), dim_labels
+        )
         if claim is not None and is_dir:
             prune_stack.append(path_str)
 
