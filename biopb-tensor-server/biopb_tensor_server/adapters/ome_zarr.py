@@ -10,12 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.base import TensorReadPlan
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
-from biopb_tensor_server.core.downsample import normalize_reduction_method
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 if TYPE_CHECKING:
@@ -1013,46 +1011,6 @@ class OmeZarrAdapter(ZarrAdapter):
 
         return field_adapter
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
-        """Return read plan for requested scale.
-
-        Supports "precompute" method to use precomputed pyramid levels.
-        Falls back to virtual scaling for other methods.
-        """
-        # Extract parameters from request_desc (scale_hint/reduction_method are now direct fields)
-        slice_hint = (
-            request_desc.slice_hint if request_desc.HasField("slice_hint") else None
-        )
-
-        # Compute scale_hint directly from TensorDescriptor
-        base_desc = self.get_tensor_descriptor()
-        base_shape = tuple(int(dim) for dim in base_desc.shape)
-        from biopb_tensor_server.core.chunk import normalized_scale_hint
-
-        scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
-
-        reduction_method = normalize_reduction_method(request_desc.reduction_method)
-
-        # "precompute" method: use precomputed level if exact match
-        if reduction_method == "precompute" and scale_hint is not None:
-            level_path = self._find_level_for_scale(scale_hint)
-
-            if level_path is None:
-                raise ValueError(
-                    f"No precomputed level matching scale_hint {tuple(scale_hint)}."
-                )
-
-            # Get scale for slice conversion
-            level_scale = self._get_level_scale(level_path)
-
-            # Convert slice from base coords to level coords
-            level_slice = self._convert_slice_to_level(slice_hint, level_scale)
-
-            return self._plan_from_precomputed(level_path, level_slice)
-
-        # Other methods: use default virtual scaling
-        return super().get_read_plan(request_desc)
-
     def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[str]:
         """Find precomputed level with exact scale match."""
         multiscales = self.ome_metadata.get("multiscales", [])
@@ -1082,66 +1040,33 @@ class OmeZarrAdapter(ZarrAdapter):
 
         return ()
 
-    def _convert_slice_to_level(
-        self,
-        slice_hint: Optional[SliceHint],
-        level_scale: Tuple[int, ...],
-    ) -> Optional[SliceHint]:
-        """Convert slice from base coordinates to level coordinates."""
-        if slice_hint is None:
-            return None
+    def _level_downsample_factors(self, level: str) -> List[int]:
+        """Downsample factors for level ``level`` -- its NGFF ``scale`` transform.
 
-        level_start = [
-            s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)
-        ]
-        level_stop = [
-            s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)
-        ]
-        return SliceHint(start=level_start, stop=level_stop)
-
-    def _plan_from_precomputed(
-        self,
-        level_path: str,
-        level_slice: Optional[SliceHint],
-    ) -> TensorReadPlan:
-        """Create read plan from precomputed level.
-
-        Delegates to base class get_read_plan() with no scale_hint.
+        The base precompute routing (biopb/biopb#557) uses these to translate a
+        base-coordinate slice into the level's grid.
         """
-        level_adapter = self.get_level_adapter(level_path)
+        return list(self._get_level_scale(level))
 
-        # Create request descriptor with slice_hint but NO scale_hint (no downsampling)
-        level_desc = level_adapter.get_tensor_descriptor()
-        request_desc = TensorDescriptor(
-            array_id=self.array_id,  # Use original array_id, not level's
-            dim_labels=level_desc.dim_labels,
-            shape=list(level_desc.shape),
-            chunk_shape=list(level_desc.chunk_shape),
-            dtype=level_desc.dtype,
-        )
+    def get_level_adapter(self, path: str) -> Optional[ZarrAdapter]:
+        """Get adapter for a specific precomputed level (single-image only).
 
-        # Set slice_hint if provided
-        if level_slice is not None:
-            request_desc.slice_hint.start[:] = level_slice.start
-            request_desc.slice_hint.stop[:] = level_slice.stop
-
-        # Delegate to base class get_read_plan (no scale_hint means no downsampling)
-        read_plan = level_adapter.get_read_plan(request_desc)
-
-        # Override array_id in the returned descriptor to match original request
-        read_plan.descriptor.array_id = self.array_id
-
-        return read_plan
-
-    def get_level_adapter(self, path: str) -> ZarrAdapter:
-        """Get adapter for a specific precomputed level.
+        Returns ``None`` for an HCS plate: a plate has no native pyramid, so a
+        within-source suffix on one of its chunks is a ``well/field`` tensor id,
+        not a level path. Returning ``None`` routes the server's chunk dispatch
+        back to :meth:`get_tensor_adapter` (the field adapter) instead of trying
+        to open a non-existent level store (biopb/biopb#557).
 
         Args:
             path: Level path (e.g., "0", "1", "2" for OME-Zarr)
 
         Returns:
-            ZarrAdapter for the level array with tensor context set
+            ZarrAdapter for the level array with tensor context set, or ``None``
+            for an HCS plate.
         """
+        if self._is_hcs_plate:
+            return None
+
         if path in self._level_adapters:
             return self._level_adapters[path]
 

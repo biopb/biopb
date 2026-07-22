@@ -30,6 +30,7 @@ import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
+    SliceHint,
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -788,7 +789,10 @@ class TensorAdapter(SourceAdapter):
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
         """Generate a read plan for the requested tensor descriptor.
 
-        Default implementation uses uniform chunk grid planning.
+        A native-pyramid adapter routes a ``precompute`` + ``scale_hint`` read to
+        its matching on-disk level (see :meth:`_plan_precomputed_read`); every
+        other read plans on the default uniform chunk grid, downsampling on the fly
+        for a computed scale.
 
         Args:
             request_desc: TensorDescriptor from the client's read request, which may
@@ -797,6 +801,12 @@ class TensorAdapter(SourceAdapter):
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
         """
         base_desc = self.get_tensor_descriptor()
+        base_shape = tuple(int(dim) for dim in base_desc.shape)
+        scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
+        reduction_method = normalize_reduction_method(request_desc.reduction_method)
+        if reduction_method == "precompute" and scale_hint is not None:
+            return self._plan_precomputed_read(request_desc, scale_hint)
+
         chunk_size = self.get_chunk_size()
         # content_version is a SourceAdapter property; every TensorAdapter is a
         # SourceAdapter, so it is always present -- an unversioned source returns
@@ -807,6 +817,97 @@ class TensorAdapter(SourceAdapter):
             chunk_size,
             content_version=self.content_version,
         )
+
+    # ---- native-pyramid precompute routing ---------------------------------
+    # Turning a ``precompute`` read into a read against one on-disk level's store
+    # is shared here, so the native-pyramid adapters (OME-Zarr multiscales,
+    # QPTIFF) stop duplicating it near-verbatim (biopb/biopb#557). A leaf adapter
+    # supplies only the per-format level lookup + scale extraction:
+    # :meth:`_find_level_for_scale`, :meth:`_level_downsample_factors`, and
+    # :meth:`get_level_adapter`.
+
+    def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
+        """Backend adapter for native pyramid level ``path``, or ``None``.
+
+        Declared here -- rather than sniffed with ``hasattr`` in the server's
+        chunk dispatch -- for the same reason :meth:`close` and :meth:`put_chunk`
+        are: an optional capability the registry drives on every adapter belongs
+        in the interface, where a delegating wrapper's author can see it
+        (biopb/biopb#557). The default ``None`` means "this tensor exposes no
+        native levels," so the chunk dispatcher falls back to
+        :meth:`get_tensor_adapter`. A native-pyramid adapter overrides this to
+        return the level's own backend adapter, whose ``array_id`` is
+        ``source_id/{level}`` -- the value a precompute chunk_id carries, so
+        ``DoGet`` routes the level's chunks straight back here.
+        """
+        return None
+
+    def _plan_precomputed_read(
+        self, request_desc: TensorDescriptor, scale_hint: Tuple[int, ...]
+    ) -> TensorReadPlan:
+        """Plan a ``precompute`` read against the level matching ``scale_hint``.
+
+        Find the native level whose downsample factors equal ``scale_hint``,
+        translate the request's slice into that level's coordinates, and plan the
+        read against the level's own store.
+        """
+        level = self._find_level_for_scale(scale_hint)
+        if level is None:
+            raise ValueError(
+                f"No precomputed level matching scale_hint {tuple(scale_hint)}."
+            )
+        slice_hint = (
+            request_desc.slice_hint if request_desc.HasField("slice_hint") else None
+        )
+        level_slice = _convert_slice_to_level(
+            slice_hint, self._level_downsample_factors(level)
+        )
+        return self._plan_from_precomputed(level, level_slice)
+
+    def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[Any]:
+        """Native level key whose downsample factors equal ``scale_hint``, else None.
+
+        Overridden by native-pyramid adapters. The key is opaque to the shared
+        routing -- an OME-Zarr dataset path, a QPTIFF integer index -- and only
+        round-trips through :meth:`_level_downsample_factors` and
+        :meth:`get_level_adapter`. The default advertises no native levels.
+        """
+        return None
+
+    def _level_downsample_factors(self, level: Any) -> List[int]:
+        """Per-axis integer downsample factors of ``level`` vs level 0.
+
+        The counterpart to :meth:`_find_level_for_scale`: for the level key it
+        returned, the factors that translate a base-coordinate slice into that
+        level's grid. Overridden by native-pyramid adapters.
+        """
+        raise NotImplementedError
+
+    def _plan_from_precomputed(
+        self, level: Any, level_slice: Optional[SliceHint]
+    ) -> TensorReadPlan:
+        """Build a read plan whose chunks target one native level's store.
+
+        The level adapter's descriptor carries ``array_id = source_id/{level}``, so
+        the base planner encodes that into every chunk_id and ``DoGet`` dispatches
+        back through :meth:`get_level_adapter`. The returned descriptor's
+        ``array_id`` is reset to this tensor's, so the client still sees one tensor.
+        """
+        level_adapter = self.get_level_adapter(str(level))
+        level_desc = level_adapter.get_tensor_descriptor()
+        request = TensorDescriptor(
+            array_id=level_desc.array_id,
+            dim_labels=level_desc.dim_labels,
+            shape=list(level_desc.shape),
+            chunk_shape=list(level_desc.chunk_shape),
+            dtype=level_desc.dtype,
+        )
+        if level_slice is not None:
+            request.slice_hint.start[:] = level_slice.start
+            request.slice_hint.stop[:] = level_slice.stop
+        read_plan = level_adapter.get_read_plan(request)
+        read_plan.descriptor.array_id = self.array_id
+        return read_plan
 
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
@@ -992,6 +1093,7 @@ _TENSOR_SCOPED_API = frozenset(
         "get_arrow_schema",
         "resolve_chunk_data",
         "get_read_plan",
+        "get_level_adapter",
         "get_native_pyramid_levels",
         "has_native_pyramid",
         "plan_flight_info",
@@ -1018,6 +1120,23 @@ assert _SOURCE_SCOPED_API.isdisjoint(_TENSOR_SCOPED_API), (
     "source/tensor adapter scopes overlap: "
     f"{sorted(_SOURCE_SCOPED_API & _TENSOR_SCOPED_API)}"
 )
+
+
+def _convert_slice_to_level(
+    slice_hint: Optional[SliceHint], level_scale: List[int]
+) -> Optional[SliceHint]:
+    """Translate a base-coordinate slice into a level's downsampled grid.
+
+    A pure transform in the precompute read path (like :func:`_get_read_plan`),
+    so it is a module function, not a method: it reads no adapter state, and
+    ``TensorAdapter._plan_precomputed_read`` supplies the level's downsample
+    factors from the per-format hook.
+    """
+    if slice_hint is None:
+        return None
+    level_start = [s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)]
+    level_stop = [s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)]
+    return SliceHint(start=level_start, stop=level_stop)
 
 
 def _get_read_plan(
