@@ -148,7 +148,6 @@ class OmeZarrAdapter(ZarrAdapter):
     For HCS (High-Content Screening) plates:
     - Plate as source, wells/fields as tensors
     - array_id = '{source_id}/{well_name}/{field_index}'
-    - _single_tensor_source = False (multi-tensor)
 
     Chunk ID format: Same as ZarrAdapter
     - array_id prefix
@@ -161,10 +160,6 @@ class OmeZarrAdapter(ZarrAdapter):
        ZarrAdapter instances for specific levels
     3. Level-specific: Created with a specific level array, acts as single-tensor
     """
-
-    # Default: single-tensor (level-specific usage)
-    # Set to False for HCS plates in __init__
-    _single_tensor_source = True
 
     # HCS-specific state (populated if _is_hcs_plate is True)
     _is_hcs_plate: bool = False
@@ -539,7 +534,6 @@ class OmeZarrAdapter(ZarrAdapter):
             # Check for HCS plate metadata first
             if "plate" in zattrs:
                 self._is_hcs_plate = True
-                self._single_tensor_source = False  # Multi-tensor!
                 self._source_type = "ome-zarr-hcs"
                 self._plate_root_path = plate_root_path  # Save for field adapters
                 self._parse_hcs_plate_structure(plate_root_path)
@@ -918,8 +912,7 @@ class OmeZarrAdapter(ZarrAdapter):
         # Create ZarrAdapter for the field's resolution array
         field_adapter = self._create_field_adapter(well_name, field_idx)
 
-        # Set tensor context directly on the field adapter
-        field_adapter._tensor_context = True
+        # Set tensor name on the field adapter
         field_adapter._tensor_name = f"{well_name}/{field_idx}"
 
         self._field_adapters[field_key] = field_adapter
@@ -1163,7 +1156,6 @@ class OmeZarrAdapter(ZarrAdapter):
         )
         # Set tensor name for multi-tensor context
         level_adapter._tensor_name = path
-        level_adapter._tensor_context = True
 
         self._level_adapters[path] = level_adapter
         return level_adapter

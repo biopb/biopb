@@ -651,6 +651,19 @@ class TensorAdapter(SourceAdapter):
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
 
+    @staticmethod
+    def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
+        """Per-axis ``slice`` tuple for indexing a backend array with ``bounds``.
+
+        The bounds->slices idiom every ``get_data`` needs to turn chunk bounds
+        into a numpy/zarr/h5py index; shared here so each adapter slices its
+        store the same way.
+        """
+        return tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
+
     def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
         """Validate that bounds are within array shape.
 

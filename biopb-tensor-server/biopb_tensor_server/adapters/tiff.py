@@ -395,8 +395,6 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     - (num_files, pages, Y, X) for multi-page files -> ['i', 'z', 'y', 'x']
     """
 
-    _single_tensor_source = True
-
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim directories holding several plain TIFFs (stack-all, #215).
@@ -749,10 +747,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; only the per-file read below is
         # synchronized, and per file -- so a slow read of one frame no longer
@@ -933,8 +928,6 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
 
     Uses TiffFile().aszarr() for true tile-level lazy reading.
     """
-
-    _single_tensor_source = True
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -1307,10 +1300,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; all state read below is immutable
         # after __init__. Only the per-file read is synchronized, and per file --

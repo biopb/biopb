@@ -51,8 +51,6 @@ class CachedSourceAdapter(TensorAdapter):
     Cache-backed sources allow arbitrary chunk bounds (no uniformity enforcement).
     """
 
-    _single_tensor_source = True
-
     @classmethod
     def create_from_config(
         cls, source: SourceConfig, credentials_config: Optional[Any] = None

@@ -109,11 +109,9 @@ MICROSCOPY_EXTENSIONS = frozenset(
     ]
 )
 
-# Full curated set (microscopy + generic). Retained for back-compat with callers
-# that reference the union; the actual claim scope is decided per-call by
-# :func:`_claim_extensions`, which honors the generic-images opt-in.
+# Full curated set (microscopy + generic). The actual claim scope is decided
+# per-call by :func:`_claim_extensions`, which honors the generic-images opt-in.
 CORE_IMAGE_EXTENSIONS = MICROSCOPY_EXTENSIONS | GENERIC_IMAGE_EXTENSIONS
-AICS_EXTENSIONS = CORE_IMAGE_EXTENSIONS
 
 
 # Whether recursive directory discovery may claim GENERIC_IMAGE_EXTENSIONS. Off
@@ -165,9 +163,6 @@ class _BioioAdapterBase(TensorAdapter):
 
     # Class-level source type (override in subclasses)
     SOURCE_TYPE: str = "aics"
-
-    # Multi-tensor source: has multiple scenes
-    _single_tensor_source = False
 
     @classmethod
     def create_from_config(
@@ -289,10 +284,7 @@ class _BioioAdapterBase(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._dask_data[slices].compute()
 

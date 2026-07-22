@@ -139,7 +139,6 @@ class NdTiffAdapter(TensorAdapter):
     for missing coordinates.
     """
 
-    _single_tensor_source = True
     SOURCE_TYPE = "ndtiff"
 
     @classmethod
@@ -313,10 +312,7 @@ class NdTiffAdapter(TensorAdapter):
             Numpy array with data within the requested bounds
         """
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         with self._io_lock:
             if self._dask_arr is None:

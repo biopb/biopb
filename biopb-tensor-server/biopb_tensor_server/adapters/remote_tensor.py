@@ -229,8 +229,6 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
 class RemoteTensorAdapter(TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
-    _single_tensor_source = False  # an upstream source may carry several tensors
-
     def __init__(
         self,
         source_id: str,

@@ -157,10 +157,7 @@ class Hdf5Adapter(TensorAdapter):
         import h5py
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         # Each read gets its own handle, so concurrent do_get chunk reads need no
         # lock and the file is pinned only for the duration of the read.
         with h5py.File(self._path, "r") as f:

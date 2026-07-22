@@ -30,6 +30,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
@@ -49,8 +50,6 @@ class EmdAdapter(TensorAdapter):
     - source-level (``signal_index=None``): lists all signals as tensors.
     - tensor-level (``signal_index=int``): reads one signal's data.
     """
-
-    _single_tensor_source = False
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -232,10 +231,7 @@ class EmdAdapter(TensorAdapter):
         if self.signal_index is None:
             raise ValueError("Cannot get data from source-level EMD adapter")
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._data[slices].compute()
 
@@ -247,22 +243,7 @@ class EmdAdapter(TensorAdapter):
         """Voxel size + unit per dimension, from this signal's axis scales."""
         if self._axes is None:
             return None
-        scale: List[float] = []
-        unit: List[str] = []
-        for ax in self._axes:
-            try:
-                v = float(ax.get("scale") or 0.0)
-            except (TypeError, ValueError):
-                v = 0.0
-            if v > 0:
-                scale.append(v)
-                unit.append(str(ax.get("units")) if ax.get("units") else "")
-            else:
-                scale.append(0.0)
-                unit.append("")
-        if len(scale) != len(self.dim_labels or []) or not any(scale):
-            return None
-        return scale, unit
+        return axes_scale(self._axes, self.dim_labels or [])
 
     def get_metadata(self) -> dict:
         """Signal-level EMD metadata (original_metadata), JSON-safe."""

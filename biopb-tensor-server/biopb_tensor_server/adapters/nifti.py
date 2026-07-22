@@ -258,10 +258,7 @@ class NiftiAdapter(TensorAdapter):
             RuntimeError: If the source has been closed.
         """
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Take the image reference once, then check it: close() races a read only
         # by nulling this attribute, and the read of a reference is atomic under
@@ -401,11 +398,7 @@ class NiftiAdapter(TensorAdapter):
         # pixdim[0] is qfac, pixdim[1-7] are actual dimensions
         pixdim = self.header.get("pixdim", None)
         if pixdim is not None:
-            # Convert to list if it's a numpy array
-            if isinstance(pixdim, np.ndarray):
-                pixdim_list = list(pixdim)
-            else:
-                pixdim_list = list(pixdim)
+            pixdim_list = list(pixdim)
             if len(pixdim_list) >= 4:
                 metadata["spatial"]["voxel_size_mm"] = pixdim_list[1:4]
                 if len(pixdim_list) >= 5 and pixdim_list[4] > 0:

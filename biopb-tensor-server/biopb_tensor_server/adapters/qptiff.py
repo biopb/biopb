@@ -43,6 +43,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.base import TensorAdapter, TensorReadPlan
 from biopb_tensor_server.core.chunk import (
@@ -95,7 +96,6 @@ class QptiffAdapter(TensorAdapter):
     """
 
     SOURCE_TYPE = "qptiff"
-    _single_tensor_source = True
 
     # ---- claim --------------------------------------------------------------
 
@@ -206,10 +206,7 @@ class QptiffAdapter(TensorAdapter):
             return tuple(int(x) for x in self._open().levels[level].shape)
 
     def _read_level(self, level: int, bounds: ChunkBounds) -> np.ndarray:
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         # _level_store takes the lock only for the lazy open + cache; the read
         # itself runs WITHOUT our lock so parallel do_get chunk reads decode
         # concurrently. tifffile already makes this safe: its aszarr store
@@ -476,22 +473,15 @@ class QptiffAdapter(TensorAdapter):
                 return None
 
             labels = self.get_tensor_descriptor().dim_labels
-            per_um = {
-                "x": _density("XResolution"),
-                "y": _density("YResolution"),
+            sizes = {
+                axis: d * um_per_unit
+                for axis, d in (
+                    ("x", _density("XResolution")),
+                    ("y", _density("YResolution")),
+                )
+                if d and d > 0
             }
-            scale, unit = [], []
-            for lab in labels:
-                d = per_um.get(str(lab).lower())
-                if d and d > 0:
-                    scale.append(d * um_per_unit)
-                    unit.append("µm")
-                else:
-                    scale.append(0.0)
-                    unit.append("")
-            if not any(scale):
-                return None
-            return scale, unit
+            return scale_by_label(labels, sizes, MICRON)
         except Exception:
             logger.debug("qptiff: physical scale unavailable", exc_info=True)
             return None
