@@ -258,17 +258,16 @@ _SERIES_NONINVARIANT_TAGS = frozenset(
         "SliceLocation",
         # per-instance frame count
         "NumberOfFrames",
-        # image-level display params (not guaranteed constant across the series)
-        "WindowCenter",
-        "WindowWidth",
-        "RescaleSlope",
-        "RescaleIntercept",
         # acquisition params subject to per-slice (dose) modulation
         "KVP",
         "ExposureTime",
         "XRayTubeCurrent",
     }
 )
+# Image-level display/calibration params (WindowCenter/WindowWidth, RescaleSlope/
+# RescaleIntercept) are technically per-instance but in practice near-constant
+# across a series and useful as series-level display defaults, so they are kept
+# from the first slice until #560 surfaces real per-slice metadata.
 # Derived ``spatial`` keys computed from the per-slice geometry tags above.
 _SERIES_NONINVARIANT_SPATIAL = frozenset({"origin_mm", "slice_location_mm"})
 
