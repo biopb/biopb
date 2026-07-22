@@ -406,9 +406,6 @@ class OmeTiffAdapter(TensorAdapter):
 
     SOURCE_TYPE = "ome-tiff"
 
-    # Multi-tensor source: one OME-TIFF may expose several scenes as tensors.
-    _single_tensor_source = False
-
     def __init__(
         self,
         url: str,
@@ -509,10 +506,7 @@ class OmeTiffAdapter(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)  # validate bounds against the descriptor
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         if not _parallel_read_enabled():
             # Default: read+decode under _io_lock (concurrent reads serialized).

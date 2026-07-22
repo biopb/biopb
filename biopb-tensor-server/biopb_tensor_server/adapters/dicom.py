@@ -49,6 +49,22 @@ def _dicom_value_to_json(value) -> any:
         return str(value)
 
 
+def _dicom_dtype(bits_stored: int, pixel_repr: int) -> str:
+    """NumPy dtype string for a DICOM image from its ``BitsStored`` /
+    ``PixelRepresentation`` (0 = unsigned, 1 = two's-complement signed).
+
+    Widths above 32 bits have no integer DICOM encoding and fall back to
+    ``float32``. Shared by the single-file and series adapters.
+    """
+    if bits_stored <= 8:
+        return "uint8" if pixel_repr == 0 else "int8"
+    if bits_stored <= 16:
+        return "uint16" if pixel_repr == 0 else "int16"
+    if bits_stored <= 32:
+        return "uint32" if pixel_repr == 0 else "int32"
+    return "float32"
+
+
 def _derive_orientation_from_iop(iop: List[float]) -> str:
     """Derive slice orientation from ImageOrientationPatient.
 
@@ -114,6 +130,117 @@ def _dicom_physical_scale(ds, dim_labels) -> Optional[Tuple[List[float], List[st
         {"y": row_sp, "x": col_sp, "z": z_sp, "frame": z_sp},
         "mm",
     )
+
+
+def _dicom_common_metadata(ds) -> dict:
+    """Full per-file DICOM metadata (format / tags / spatial / patient) from ``ds``.
+
+    Shared by the single-file and series adapters -- both read the same tags off
+    one dataset (the sole file, or the series' first slice). The series adapter
+    layers a ``series`` block on top.
+    """
+    metadata: dict = {
+        "format": "dicom",
+        "tags": {},
+        "spatial": {},
+        "patient": {},
+    }
+
+    # Key pixel data tags
+    pixel_tags = [
+        "PixelSpacing",
+        "SliceThickness",
+        "ImageOrientationPatient",
+        "ImagePositionPatient",
+        "SliceLocation",
+        "InstanceNumber",
+        "WindowCenter",
+        "WindowWidth",
+        "RescaleSlope",
+        "RescaleIntercept",
+        "BitsStored",
+        "BitsAllocated",
+        "PixelRepresentation",
+        "PhotometricInterpretation",
+        "Rows",
+        "Columns",
+        "NumberOfFrames",
+        "SamplesPerPixel",
+        "KVP",
+        "ExposureTime",
+        "XRayTubeCurrent",
+    ]
+    for tag_name in pixel_tags:
+        if hasattr(ds, tag_name):
+            metadata["tags"][tag_name] = _dicom_value_to_json(getattr(ds, tag_name))
+
+    # Derived spatial info
+    if hasattr(ds, "PixelSpacing"):
+        ps = ds.PixelSpacing
+        if len(ps) >= 2:
+            metadata["spatial"]["pixel_spacing_mm"] = [float(ps[0]), float(ps[1])]
+
+    if hasattr(ds, "SliceThickness"):
+        metadata["spatial"]["slice_spacing_mm"] = float(ds.SliceThickness)
+
+    if hasattr(ds, "ImageOrientationPatient"):
+        iop = ds.ImageOrientationPatient
+        metadata["spatial"]["orientation"] = _derive_orientation_from_iop(list(iop))
+
+    if hasattr(ds, "ImagePositionPatient"):
+        ipp = ds.ImagePositionPatient
+        metadata["spatial"]["origin_mm"] = [
+            float(ipp[0]),
+            float(ipp[1]),
+            float(ipp[2]),
+        ]
+
+    if hasattr(ds, "SliceLocation"):
+        metadata["spatial"]["slice_location_mm"] = float(ds.SliceLocation)
+
+    # Patient/study info
+    patient_tags = [
+        "PatientName",
+        "PatientID",
+        "PatientBirthDate",
+        "PatientSex",
+        "PatientAge",
+        "PatientWeight",
+        "PatientSize",
+        "StudyInstanceUID",
+        "SeriesInstanceUID",
+        "SOPInstanceUID",
+        "StudyDate",
+        "SeriesDate",
+        "AcquisitionDate",
+        "StudyDescription",
+        "SeriesDescription",
+        "Modality",
+        "Manufacturer",
+        "InstitutionName",
+    ]
+    for tag_name in patient_tags:
+        if hasattr(ds, tag_name):
+            metadata["patient"][tag_name] = _dicom_value_to_json(getattr(ds, tag_name))
+
+    # Windowing parameters (for visualization)
+    if hasattr(ds, "WindowCenter") and hasattr(ds, "WindowWidth"):
+        try:
+            wc = ds.WindowCenter
+            ww = ds.WindowWidth
+            # Handle multi-value window settings
+            if hasattr(wc, "__iter__") and not isinstance(wc, str):
+                metadata["tags"]["WindowCenter"] = [float(v) for v in wc]
+            else:
+                metadata["tags"]["WindowCenter"] = float(wc)
+            if hasattr(ww, "__iter__") and not isinstance(ww, str):
+                metadata["tags"]["WindowWidth"] = [float(v) for v in ww]
+            else:
+                metadata["tags"]["WindowWidth"] = float(ww)
+        except Exception:
+            pass
+
+    return metadata
 
 
 # =============================================================================
@@ -277,15 +404,7 @@ class DicomAdapter(TensorAdapter):
         # Get dtype from pixel representation
         bits_stored = int(self.ds.get("BitsStored", 16))
         pixel_repr = int(self.ds.get("PixelRepresentation", 0))
-
-        if bits_stored <= 8:
-            self._dtype = "uint8" if pixel_repr == 0 else "int8"
-        elif bits_stored <= 16:
-            self._dtype = "uint16" if pixel_repr == 0 else "int16"
-        elif bits_stored <= 32:
-            self._dtype = "uint32" if pixel_repr == 0 else "int32"
-        else:
-            self._dtype = "float32"
+        self._dtype = _dicom_dtype(bits_stored, pixel_repr)
 
         # Dimension labels
         if dim_labels:
@@ -321,10 +440,7 @@ class DicomAdapter(TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Serialize IO for thread safety
         with self._io_lock:
@@ -336,118 +452,9 @@ class DicomAdapter(TensorAdapter):
         return _dicom_physical_scale(self.ds, self.dim_labels)
 
     def get_metadata(self) -> dict:
-        """Extract DICOM metadata.
-
-        Returns:
-            Dictionary with format identifier, DICOM tags, and derived spatial info
-        """
-        metadata = {
-            "format": "dicom",
-            "tags": {},
-            "spatial": {},
-            "patient": {},
-        }
-
-        # Key pixel data tags
-        pixel_tags = [
-            "PixelSpacing",
-            "SliceThickness",
-            "ImageOrientationPatient",
-            "ImagePositionPatient",
-            "SliceLocation",
-            "InstanceNumber",
-            "WindowCenter",
-            "WindowWidth",
-            "RescaleSlope",
-            "RescaleIntercept",
-            "BitsStored",
-            "BitsAllocated",
-            "PixelRepresentation",
-            "PhotometricInterpretation",
-            "Rows",
-            "Columns",
-            "NumberOfFrames",
-            "SamplesPerPixel",
-            "KVP",
-            "ExposureTime",
-            "XRayTubeCurrent",
-            "SliceLocation",
-        ]
-
-        for tag_name in pixel_tags:
-            if hasattr(self.ds, tag_name):
-                value = getattr(self.ds, tag_name)
-                metadata["tags"][tag_name] = _dicom_value_to_json(value)
-
-        # Derived spatial info
-        if hasattr(self.ds, "PixelSpacing"):
-            ps = self.ds.PixelSpacing
-            if len(ps) >= 2:
-                metadata["spatial"]["pixel_spacing_mm"] = [float(ps[0]), float(ps[1])]
-
-        if hasattr(self.ds, "SliceThickness"):
-            metadata["spatial"]["slice_spacing_mm"] = float(self.ds.SliceThickness)
-
-        if hasattr(self.ds, "ImageOrientationPatient"):
-            iop = self.ds.ImageOrientationPatient
-            metadata["spatial"]["orientation"] = _derive_orientation_from_iop(list(iop))
-
-        if hasattr(self.ds, "ImagePositionPatient"):
-            ipp = self.ds.ImagePositionPatient
-            metadata["spatial"]["origin_mm"] = [
-                float(ipp[0]),
-                float(ipp[1]),
-                float(ipp[2]),
-            ]
-
-        if hasattr(self.ds, "SliceLocation"):
-            metadata["spatial"]["slice_location_mm"] = float(self.ds.SliceLocation)
-
-        # Patient/study info (including all patient fields per user request)
-        patient_tags = [
-            "PatientName",
-            "PatientID",
-            "PatientBirthDate",
-            "PatientSex",
-            "PatientAge",
-            "PatientWeight",
-            "PatientSize",
-            "StudyInstanceUID",
-            "SeriesInstanceUID",
-            "SOPInstanceUID",
-            "StudyDate",
-            "SeriesDate",
-            "AcquisitionDate",
-            "StudyDescription",
-            "SeriesDescription",
-            "Modality",
-            "Manufacturer",
-            "InstitutionName",
-        ]
-
-        for tag_name in patient_tags:
-            if hasattr(self.ds, tag_name):
-                value = getattr(self.ds, tag_name)
-                metadata["patient"][tag_name] = _dicom_value_to_json(value)
-
-        # Windowing parameters (for visualization)
-        if hasattr(self.ds, "WindowCenter") and hasattr(self.ds, "WindowWidth"):
-            try:
-                wc = self.ds.WindowCenter
-                ww = self.ds.WindowWidth
-                # Handle multi-value window settings
-                if hasattr(wc, "__iter__") and not isinstance(wc, str):
-                    metadata["tags"]["WindowCenter"] = [float(v) for v in wc]
-                else:
-                    metadata["tags"]["WindowCenter"] = float(wc)
-                if hasattr(ww, "__iter__") and not isinstance(ww, str):
-                    metadata["tags"]["WindowWidth"] = [float(v) for v in ww]
-                else:
-                    metadata["tags"]["WindowWidth"] = float(ww)
-            except Exception:
-                pass
-
-        return metadata
+        """Extract DICOM metadata: format identifier, tags, derived spatial info,
+        and patient/study info."""
+        return _dicom_common_metadata(self.ds)
 
 
 # =============================================================================
@@ -661,21 +668,16 @@ class DicomSeriesAdapter(TensorAdapter):
         if self._num_slices == 0:
             raise ValueError(f"No valid DICOM files found in series: {directory}")
 
-        # Read first file to get shape and dtype info
-        first_full = pydicom.dcmread(str(self.dicom_files[0]))
+        # Read the first slice's header (shape/dtype + the tags get_metadata and
+        # _physical_scale later report). Header-only -- everything read from
+        # _first_ds lives in the header, so stop_before_pixels avoids loading and
+        # retaining a whole slice's pixel data for the source's lifetime.
+        first_full = pydicom.dcmread(str(self.dicom_files[0]), stop_before_pixels=True)
         rows = int(first_full.Rows)
         cols = int(first_full.Columns)
         bits_stored = int(first_full.get("BitsStored", 16))
         pixel_repr = int(first_full.get("PixelRepresentation", 0))
-
-        if bits_stored <= 8:
-            self._dtype = "uint8" if pixel_repr == 0 else "int8"
-        elif bits_stored <= 16:
-            self._dtype = "uint16" if pixel_repr == 0 else "int16"
-        elif bits_stored <= 32:
-            self._dtype = "uint32" if pixel_repr == 0 else "int32"
-        else:
-            self._dtype = "float32"
+        self._dtype = _dicom_dtype(bits_stored, pixel_repr)
 
         self._shape = (self._num_slices, rows, cols)
         self._rows = rows
@@ -719,10 +721,7 @@ class DicomSeriesAdapter(TensorAdapter):
         import pydicom
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])
 
@@ -762,97 +761,11 @@ class DicomSeriesAdapter(TensorAdapter):
         return _dicom_physical_scale(self._first_ds, self.dim_labels)
 
     def get_metadata(self) -> dict:
-        """Extract DICOM series metadata.
-
-        Returns metadata from first file plus series-level info.
-        """
-        metadata = {
-            "format": "dicom",
-            "tags": {},
-            "spatial": {},
-            "patient": {},
-            "series": {},
+        """Extract DICOM series metadata: the first slice's full per-file metadata
+        plus a series-level block."""
+        metadata = _dicom_common_metadata(self._first_ds)
+        metadata["series"] = {
+            "num_slices": self._num_slices,
+            "directory": str(self.directory),
         }
-
-        # Key pixel data tags
-        pixel_tags = [
-            "PixelSpacing",
-            "SliceThickness",
-            "ImageOrientationPatient",
-            "ImagePositionPatient",
-            "SliceLocation",
-            "WindowCenter",
-            "WindowWidth",
-            "RescaleSlope",
-            "RescaleIntercept",
-            "BitsStored",
-            "BitsAllocated",
-            "PixelRepresentation",
-            "PhotometricInterpretation",
-            "Rows",
-            "Columns",
-            "SamplesPerPixel",
-            "KVP",
-            "ExposureTime",
-            "XRayTubeCurrent",
-        ]
-
-        for tag_name in pixel_tags:
-            if hasattr(self._first_ds, tag_name):
-                value = getattr(self._first_ds, tag_name)
-                metadata["tags"][tag_name] = _dicom_value_to_json(value)
-
-        # Derived spatial info
-        if hasattr(self._first_ds, "PixelSpacing"):
-            ps = self._first_ds.PixelSpacing
-            if len(ps) >= 2:
-                metadata["spatial"]["pixel_spacing_mm"] = [float(ps[0]), float(ps[1])]
-
-        if hasattr(self._first_ds, "SliceThickness"):
-            metadata["spatial"]["slice_spacing_mm"] = float(
-                self._first_ds.SliceThickness
-            )
-
-        if hasattr(self._first_ds, "ImageOrientationPatient"):
-            iop = self._first_ds.ImageOrientationPatient
-            metadata["spatial"]["orientation"] = _derive_orientation_from_iop(list(iop))
-
-        if hasattr(self._first_ds, "ImagePositionPatient"):
-            ipp = self._first_ds.ImagePositionPatient
-            metadata["spatial"]["origin_mm"] = [
-                float(ipp[0]),
-                float(ipp[1]),
-                float(ipp[2]),
-            ]
-
-        # Patient/study info
-        patient_tags = [
-            "PatientName",
-            "PatientID",
-            "PatientBirthDate",
-            "PatientSex",
-            "PatientAge",
-            "PatientWeight",
-            "PatientSize",
-            "StudyInstanceUID",
-            "SeriesInstanceUID",
-            "StudyDate",
-            "SeriesDate",
-            "AcquisitionDate",
-            "StudyDescription",
-            "SeriesDescription",
-            "Modality",
-            "Manufacturer",
-            "InstitutionName",
-        ]
-
-        for tag_name in patient_tags:
-            if hasattr(self._first_ds, tag_name):
-                value = getattr(self._first_ds, tag_name)
-                metadata["patient"][tag_name] = _dicom_value_to_json(value)
-
-        # Series-level info
-        metadata["series"]["num_slices"] = self._num_slices
-        metadata["series"]["directory"] = str(self.directory)
-
         return metadata

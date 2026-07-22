@@ -128,7 +128,6 @@ class MockSingleTensorAdapter(TensorAdapter):
         self.value = value
         self._source_url = ""
         self._source_type = "mock-single"
-        self._tensor_context = True  # Always in tensor context for mocks
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(

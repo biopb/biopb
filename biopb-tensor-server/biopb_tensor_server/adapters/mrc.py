@@ -37,6 +37,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.base import TensorAdapter
 from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
@@ -60,8 +61,6 @@ class MrcAdapter(TensorAdapter):
     Uses rosettasciio to parse the header and an own ``np.memmap`` for lazy,
     arbitrary-sub-region reads. Single-tensor source.
     """
-
-    _single_tensor_source = True
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -192,10 +191,7 @@ class MrcAdapter(TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through a fresh memmap."""
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         # No lock: each read owns its own mapping, and a read-only np.memmap has
         # no shared cursor (unlike a seekable file handle) -- indexing computes
         # byte offsets directly and the copy lands in a fresh buffer. So parallel
@@ -213,22 +209,7 @@ class MrcAdapter(TensorAdapter):
         rsciio's MRC axes carry ``scale`` (voxel size, typically nm) and
         ``units`` in dim order, 1:1 with ``dim_labels``.
         """
-        scale: List[float] = []
-        unit: List[str] = []
-        for ax in self._axes:
-            try:
-                v = float(ax.get("scale") or 0.0)
-            except (TypeError, ValueError):
-                v = 0.0
-            if v > 0:
-                scale.append(v)
-                unit.append(str(ax.get("units")) if ax.get("units") else "")
-            else:
-                scale.append(0.0)
-                unit.append("")
-        if len(scale) != len(self.dim_labels) or not any(scale):
-            return None
-        return scale, unit
+        return axes_scale(self._axes, self.dim_labels)
 
     def get_metadata(self) -> dict:
         """MRC header as a JSON-safe dict (rsciio hex-encodes byte/void fields)."""

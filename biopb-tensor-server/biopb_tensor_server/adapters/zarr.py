@@ -188,10 +188,7 @@ class ZarrAdapter(TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
     def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
