@@ -4,7 +4,6 @@ Provides:
 - WriteAheadLog: Detect incomplete writes after crash
 - ProcessLock: Single-owner lock on the cache dir + unclean-exit detection
 - SegmentEntryInfo: Metadata for entries stored in segments
-- SegmentInfo: Metadata for segment files
 - RecoveryStatus: Result of crash recovery
 """
 
@@ -36,16 +35,6 @@ class SegmentEntryInfo:
     # locate_entry() returns unavailable in that case so the client uses do_get.
     byte_offset: int = 0
     byte_length: int = 0
-
-
-@dataclass
-class SegmentInfo:
-    """Metadata for a segment file."""
-
-    size_bytes: int
-    created_at: float
-    last_access_time: float  # Updated on each read from segment
-    entry_count: int
 
 
 @dataclass

@@ -9,6 +9,7 @@ Reference counting prevents eviction of entries being actively served.
 
 from __future__ import annotations
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -17,9 +18,38 @@ from typing import Callable, Dict, Optional, Tuple
 
 import pyarrow as pa
 
+logger = logging.getLogger(__name__)
+
 # Chunk splitting threshold - 64MB for parallel Flight transfers
 # (Arrow IPC can handle larger, but we split for throughput optimization)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
+
+
+def estimate_batch_bytes(batch: pa.RecordBatch) -> int:
+    """In-memory size of a cached batch: the sum of its columns' buffers.
+
+    One definition shared by every backend and every index path, so a chunk's
+    recorded size cannot depend on which code path recorded it.
+    """
+    return sum(col.nbytes for col in batch.columns)
+
+
+@dataclass
+class ChunkLocation:
+    """On-disk location of a cached chunk's Arrow IPC message.
+
+    Returned by :meth:`CacheBackend.locate_entry` for the localhost cache-file
+    handoff (issue #9): a client on the same host mmaps ``segment_path`` and
+    reads the single record-batch message at
+    ``[byte_offset, byte_offset + byte_length)``. ``generation_id`` is the
+    segment file's inode at locate time, so a client can detect a segment that
+    was evicted and recreated at the same path.
+    """
+
+    segment_path: str
+    byte_offset: int
+    byte_length: int
+    generation_id: int
 
 
 class EntryState(Enum):
@@ -240,3 +270,40 @@ class CacheBackend(ABC):
         stay open for any still-draining reads. Backends with no process lock
         (memory) inherit this no-op default; the file backend overrides it.
         """
+
+    def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
+        """Return the on-disk location of a cached chunk, or None.
+
+        Backs the localhost cache-file handoff (issue #9), where a same-host
+        client mmaps the segment instead of streaming the chunk over do_get.
+        Declared here -- rather than sniffed with ``getattr`` -- because the
+        manager drives it on *every* backend, so a backend that cannot locate
+        (the memory backend has no segment files) should say so through the
+        interface. None means "fall back to do_get", the designed floor of the
+        whole path.
+        """
+        return None
+
+    def _skip_if_oversized(
+        self, key: bytes, data: pa.RecordBatch, size_bytes: int
+    ) -> bool:
+        """Handle a chunk too large to cache; True if the caller should stop.
+
+        An oversized chunk is still handed to the threads waiting on it -- the
+        entry goes READY in memory -- it just is not stored. Shared by both
+        backends, which supply the ``_lock`` / ``_entries`` / ``_oversized_skips``
+        state this reads.
+        """
+        if size_bytes <= MAX_ARROW_BATCH_BYTES:
+            return False
+        self._oversized_skips += 1
+        logger.warning(
+            "Skipping cache for oversized chunk: %d bytes > %d",
+            size_bytes,
+            MAX_ARROW_BATCH_BYTES,
+        )
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry.state == EntryState.PENDING:
+                entry.set_ready(data, size_bytes)
+        return True

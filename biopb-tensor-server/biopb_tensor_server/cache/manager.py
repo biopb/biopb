@@ -12,7 +12,12 @@ from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
 
-from biopb_tensor_server.cache.base import CacheBackend, CacheEntry, CacheStats
+from biopb_tensor_server.cache.base import (
+    CacheBackend,
+    CacheEntry,
+    CacheStats,
+    ChunkLocation,
+)
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
 from biopb_tensor_server.cache.memory_backend import (
     MemoryCacheBackend,
@@ -165,17 +170,14 @@ class CacheManager:
         """Remove entry (only if evictable)."""
         return self._backend.remove(key)
 
-    def locate_entry(self, key: bytes):
+    def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk ChunkLocation for a cached chunk, or None.
 
         Only the file backend can locate entries on disk (issue #9); the memory
-        backend has no segment files, so this returns None there and the caller
-        falls back to do_get.
+        backend inherits the interface's None default and the caller falls back
+        to do_get.
         """
-        locate = getattr(self._backend, "locate_entry", None)
-        if locate is None:
-            return None
-        return locate(key)
+        return self._backend.locate_entry(key)
 
     def clear(self) -> None:
         """Clear all evictable entries."""
