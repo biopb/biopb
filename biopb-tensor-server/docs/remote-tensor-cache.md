@@ -70,7 +70,7 @@ one segment cache.
   `storage_type="biopb-tensor"` profile carrying `token` — one token per upstream,
   no bespoke `SourceConfig.token`.
 
-**Scheme/type plumbing.** `core.discovery.is_remote_url` accepts the `grpc*`
+**Scheme/type plumbing.** `core.remote.is_remote_url` accepts the `grpc*`
 schemes (else `Path("grpc://…").resolve()` mangles the url);
 `config.detect_source_type` maps `grpc*` → `"tensor-server"` before the remote-bail;
 `config.discover_sources` Case 0 auto-detects the type for a bare `grpc://` source

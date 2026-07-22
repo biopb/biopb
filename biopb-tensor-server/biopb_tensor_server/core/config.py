@@ -107,11 +107,11 @@ from biopb_tensor_server.core.discovery import (
     discover_sources as claim_based_discover,
     generate_source_id,
     get_file_identity,
-    is_remote_url,
 )
 from biopb_tensor_server.core.remote import (
     CredentialProfile,
     CredentialsConfig,
+    is_remote_url,
 )
 
 # Alias for backward compatibility with internal usage

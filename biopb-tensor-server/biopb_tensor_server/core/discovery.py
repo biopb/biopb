@@ -36,6 +36,12 @@ from typing import (
     Type,
 )
 
+# is_remote_url's canonical home is core.remote (it decides whether a URL needs
+# a RemoteStore). Imported here for generate_source_id / resolve_local_path and
+# re-exported for callers. Safe at module load: core.remote imports only stdlib
+# at module level, so there is no import cycle.
+from biopb_tensor_server.core.remote import is_remote_url
+
 if TYPE_CHECKING:
     from biopb_tensor_server.core.base import SourceAdapter
     from biopb_tensor_server.core.remote import RemoteStore
@@ -1165,28 +1171,3 @@ def discover_remote_source(
         logger.info(f"discover_remote_source: {url} claimed as {claim.source_type}")
 
     return state
-
-
-def is_remote_url(url: str) -> bool:
-    """Check if URL is a remote (non-local) URL.
-
-    Args:
-        url: URL string to check
-
-    Returns:
-        True if URL is remote (s3://, http://, etc.), False if local path
-    """
-    remote_prefixes = (
-        "s3://",
-        "gs://",
-        "gcs://",
-        "http://",
-        "https://",
-        "ftp://",
-        "az://",
-        "azure://",
-        "grpc://",
-        "grpc+tls://",
-        "grpcs://",
-    )
-    return url.lower().startswith(remote_prefixes)

@@ -445,10 +445,8 @@ class SourceAdapter(ABC):
         # so importing these at module scope would be circular.
         from pathlib import Path
 
-        from biopb_tensor_server.core.discovery import (
-            _is_offline_placeholder,
-            is_remote_url,
-        )
+        from biopb_tensor_server.core.discovery import _is_offline_placeholder
+        from biopb_tensor_server.core.remote import is_remote_url
 
         if is_remote_url(self._source_url):
             return False

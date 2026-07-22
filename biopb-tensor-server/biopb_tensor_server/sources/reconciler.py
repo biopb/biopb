@@ -49,9 +49,9 @@ from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
     _is_offline_placeholder,
-    is_remote_url,
     resolve_local_path,
 )
+from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
 if TYPE_CHECKING:
