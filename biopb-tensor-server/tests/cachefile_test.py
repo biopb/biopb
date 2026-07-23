@@ -538,6 +538,50 @@ class TestArrayFromUnifiedBatch:
         assert got.dtype == np.uint16 and got.shape == (8, 15)
         assert np.array_equal(got, a)
 
+    def test_view_decode_matches_source(self):
+        from biopb.tensor.client import _array_from_unified_batch
+
+        a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
+        got = _array_from_unified_batch(_make_typed_batch(a), copy=False)
+        assert got.dtype == np.uint16 and got.shape == (8, 15)
+        assert np.array_equal(got, a)
+
+    def test_both_paths_return_readonly(self):
+        # The mutability contract is uniform across the do_get view path
+        # (copy=False) and the mmap fast path (copy=True) -- biopb/biopb#571.
+        from biopb.tensor.client import _array_from_unified_batch
+
+        a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
+        for copy in (True, False):
+            got = _array_from_unified_batch(_make_typed_batch(a), copy=copy)
+            assert not got.flags.writeable
+            with pytest.raises(ValueError):
+                got[0, 0] = 1
+
+    def test_copy_owns_its_bytes(self):
+        # copy=True must not alias the batch's Arrow buffer: the mmap fast path
+        # closes its segment mapping the instant the helper returns.
+        from biopb.tensor.client import _array_from_unified_batch
+
+        a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
+        got = _array_from_unified_batch(_make_typed_batch(a), copy=True)
+        assert got.flags.owndata
+
+    def test_view_shares_and_survives_source(self):
+        # copy=False is a zero-copy view kept alive through the buffer protocol:
+        # it must stay valid after every intermediate Arrow ref is dropped.
+        import gc
+
+        from biopb.tensor.client import _array_from_unified_batch
+
+        a = (np.arange(4000, dtype=np.uint32) % 251).astype(np.uint32).reshape(40, 100)
+        batch = _make_typed_batch(a)
+        got = _array_from_unified_batch(batch, copy=False)
+        assert not got.flags.owndata  # a view, not an owned copy
+        del batch
+        gc.collect()
+        assert np.array_equal(got, a)
+
 
 # ==============================================================================
 # Integration: file-backed server <-> client

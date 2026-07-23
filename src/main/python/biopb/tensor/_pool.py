@@ -186,21 +186,45 @@ def _should_try_cachefile(location: str) -> bool:
     return _cachefile_supported(location) is not False
 
 
-def _array_from_unified_batch(batch: pa.RecordBatch) -> np.ndarray:
+def _array_from_unified_batch(
+    batch: pa.RecordBatch, *, copy: bool = True
+) -> np.ndarray:
     """Reconstruct a numpy array from the server's unified cache schema.
 
     The file cache stores each chunk as ``[data: binary, shape: list<int64>,
     dtype: string, ...]`` where ``data`` is the raw C-contiguous bytes of the
-    raveled array. Returns an owned copy so it stays valid after the segment
-    mmap is closed.
+    raveled array.
+
+    The result is **read-only** (``writeable=False``) on both paths, so the
+    contract a consumer sees is uniform whether a chunk arrived over ``do_get``
+    or the localhost mmap fast path -- otherwise the same user code would succeed
+    or raise depending on platform and deployment (biopb/biopb#571). A chunk is a
+    shared, cached view of server-owned bytes; mutating one in place is never
+    safe, so callers must copy before writing.
+
+    ``copy`` selects ownership, *not* mutability:
+
+    - ``copy=True`` (default, the mmap fast path) -- own the bytes with a
+      ``.copy()``. The segment mapping is closed the instant this returns, so a
+      view onto it would dangle. The owned buffer is then frozen read-only to
+      match the other path.
+    - ``copy=False`` (``do_get``) -- a zero-copy view onto the in-memory Arrow
+      buffer, which numpy keeps alive through the buffer protocol (``arr.base``
+      -> ``pyarrow.Buffer``). Arrow buffers are immutable, so the view is
+      read-only already; the former ``.copy()`` here was pure overhead over
+      loopback and, for a 64 MB chunk, fell off glibc's 32 MiB mmap-threshold
+      cliff (biopb/biopb#571).
     """
     dtype = np.dtype(batch.column("dtype")[0].as_py())
     shape = tuple(batch.column("shape").to_pylist()[0])
     count = int(np.prod(shape)) if shape else 0
     # binary array buffers = [validity, offsets, data]; data holds the blob.
     data_buf = batch.column("data").buffers()[2]
-    arr = np.frombuffer(data_buf, dtype=dtype, count=count)
-    return arr.reshape(shape).copy()
+    arr = np.frombuffer(data_buf, dtype=dtype, count=count).reshape(shape)
+    if copy:
+        arr = arr.copy()
+    arr.flags.writeable = False
+    return arr
 
 
 def _try_cachefile_transfer(
@@ -603,7 +627,11 @@ def _fetch_chunk_distributed(
         # do_get returns a single-row unified binary batch [data, shape, dtype];
         # decode it exactly like the cache-file fast path (raw bytes reinterpreted
         # via the dtype string, so endianness round-trips -- biopb/biopb#293).
-        arr = _array_from_unified_batch(reader.read_all().to_batches()[0])
+        # copy=False: the batch's Arrow buffer is in-memory and numpy keeps it
+        # alive, so a view is safe here and skips a needless whole-chunk copy
+        # (biopb/biopb#571). The mmap fast path above must copy (its mapping is
+        # released on return); both return a read-only array.
+        arr = _array_from_unified_batch(reader.read_all().to_batches()[0], copy=False)
 
     # Cache the result (skipped when caching is disabled)
     if cache is not None:
