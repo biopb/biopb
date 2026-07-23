@@ -103,9 +103,13 @@ class TestLinuxNetworkType:
 
     def _classify(self, target: str):
         # _linux_network_type opens /proc/self/mountinfo and realpath()s target;
-        # feed a fixed table and keep realpath a no-op so absolute paths pass through.
+        # feed a fixed table and normalize realpath to forward slashes so this
+        # Linux-only parser sees a POSIX path even when the test host is Windows
+        # (str(Path("/mnt/lab")) yields backslashes there).
         with patch("builtins.open", return_value=io.StringIO(self._MOUNTINFO)):
-            with patch("os.path.realpath", side_effect=lambda p: str(p)):
+            with patch(
+                "os.path.realpath", side_effect=lambda p: str(p).replace(os.sep, "/")
+            ):
                 return _linux_network_type(Path(target))
 
     def test_nfs_export_detected(self):
