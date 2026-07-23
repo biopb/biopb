@@ -227,6 +227,10 @@ def test_validate_config_dict_uses_ondisk_paths():
     # endpoint.
     problems = validate_config_dict({"cache": {"max_entries": 0}})
     assert [p["path"] for p in problems] == [["cache", "max_entries"]]
+    # The message names the on-disk key too, matching the path -- not the internal
+    # `memory_max_entries` field the form has no name for.
+    assert problems[0]["message"].startswith("max_entries=")
+    assert "memory_max_entries" not in problems[0]["message"]
 
 
 def test_validate_config_dict_ignores_removed_compute_section():

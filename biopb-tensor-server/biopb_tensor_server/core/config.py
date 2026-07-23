@@ -1334,16 +1334,20 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     # The checker reports dataclass-field paths; the endpoint needs the on-disk
     # ones (CacheConfig.memory_max_entries lives at [cache] max_entries), so the
-    # section/key is remapped before it leaves.
+    # section/key is remapped before it leaves -- in the message too, whose
+    # `field=...` lead-in would otherwise name the internal field the on-disk path
+    # doesn't (e.g. path [cache] max_entries with "memory_max_entries=...").
     problems: List[Dict[str, Any]] = []
     for problem in _config_problems(cfg):
         section, key = problem.path
         class_name = type(
             cfg if section == "server" else getattr(cfg, section)
         ).__name__
-        problems.append(
-            {"path": list(ondisk_location(class_name, key)), "message": problem.message}
-        )
+        on_section, on_key = ondisk_location(class_name, key)
+        message = problem.message
+        if on_key != key and message.startswith(f"{key}="):
+            message = f"{on_key}=" + message[len(key) + 1 :]
+        problems.append({"path": [on_section, on_key], "message": message})
     return problems
 
 

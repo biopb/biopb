@@ -716,13 +716,26 @@ def _validate_and_clamp(config: dict) -> dict:
     not reach the runtime, but must not take the session down either -- a raise
     here is a dead MCP client and no viewer. A leaf absent from the merged dict
     is skipped (nothing to check). Returns *config*.
+
+    Clamped to a fixpoint: resetting a per-field leaf to its default can *create*
+    a cross-field violation the first pass didn't see (a negative
+    ``health_poll_min_interval`` clamped to a default above a small but valid
+    ``max``), so re-check until clean. Converges because the defaults are
+    mutually consistent (``test_shipped_defaults_pass_the_whole_check``); the
+    bound is a belt-and-braces guard against a cycle.
     """
-    warn_and_clamp(
-        config_problems(config),
-        lambda path: _walk_path(DEFAULT_CONFIG, path),
-        lambda path, value: config[path[0]].__setitem__(path[1], copy.deepcopy(value)),
-        logger,
-    )
+    for _ in range(len(_CONSTRAINTS) + len(CROSS_FIELD_RULES) + 1):
+        problems = config_problems(config)
+        if not problems:
+            break
+        warn_and_clamp(
+            problems,
+            lambda path: _walk_path(DEFAULT_CONFIG, path),
+            lambda path, value: config[path[0]].__setitem__(
+                path[1], copy.deepcopy(value)
+            ),
+            logger,
+        )
     return config
 
 
