@@ -311,6 +311,97 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
             mgr.close()
 
 
+def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
+    """A file cache configured on network/cloud storage demotes to memory.
+
+    The Arrow file backend mmaps its segments and assumes local-POSIX semantics;
+    on NFS/CIFS an evicted-but-mapped segment can SIGBUS/ESTALE, and a cloud
+    Files-On-Demand folder recalls a dehydrated segment on mmap read
+    (biopb/biopb#571 follow-up). The launcher classifies the cache dir at startup
+    and, on a positive network/cloud signal, initializes the memory backend
+    instead -- which also disables the localhost fast path (a memory backend
+    never locates a chunk).
+    """
+    import json
+
+    from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.cache.file_backend import ArrowFileBackend
+
+    cache_dir = tmp_path / "cache"  # a real local dir...
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "sources": [],
+            }
+        )
+    )
+    # ...that we make the classifier report as network storage.
+    monkeypatch.setattr(
+        cli, "unsafe_cache_dir_reason", lambda _p: "a network filesystem (nfs4)"
+    )
+
+    config = cli.load_config(config_path)
+    CacheManager.reset()
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        mgr = CacheManager.get_instance()
+        assert not isinstance(mgr.backend, ArrowFileBackend)  # demoted to memory
+        # The file cache dir was never created (backend never touched disk).
+        assert not cache_dir.exists()
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        if source_manager is not None:
+            source_manager.stop(join_timeout=1)
+        server.shutdown()
+        CacheManager.reset()
+
+
+def test_file_cache_on_local_dir_stays_file(tmp_path):
+    """The control case: a local cache dir keeps the Arrow file backend."""
+    import json
+
+    from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.cache.file_backend import ArrowFileBackend
+
+    cache_dir = tmp_path / "cache"
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "sources": [],
+            }
+        )
+    )
+
+    config = cli.load_config(config_path)
+    CacheManager.reset()
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        mgr = CacheManager.get_instance()
+        assert isinstance(mgr.backend, ArrowFileBackend)  # tmp_path is local disk
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        if source_manager is not None:
+            source_manager.stop(join_timeout=1)
+        server.shutdown()
+        CacheManager.reset()
+
+
 def test_setup_empty_sources_serves_empty_catalog(tmp_path):
     """An empty source set reaches SERVING with an empty catalog, not exit(1).
 
