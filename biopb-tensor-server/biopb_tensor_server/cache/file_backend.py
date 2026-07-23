@@ -886,7 +886,19 @@ class ArrowFileBackend(CacheBackend):
         self._segments_dir.mkdir(parents=True, exist_ok=True)
         segment_path = self._segment_path(segment_id)
 
-        # Create writer
+        # Create writer.
+        #
+        # INVARIANT (load-bearing for the localhost mmap fast path, Option C in
+        # biopb/biopb#571): no segment inode is ever truncated or shrunk while a
+        # client may have it mapped. A remote client hands out a zero-copy view
+        # onto this file's mapping, so it can fault (SIGBUS) at *any* point in
+        # that array's life if the bytes under the mapping vanish. This truncating
+        # "wb" open is safe only because `segment_id` is strictly monotonic
+        # (`_next_segment_id`, boot-initialized to max+1 and only incremented), so
+        # `segment_path` is always freshly allocated -- never an id a live mapping
+        # holds. Eviction *unlinks* segments (the inode survives to last close);
+        # nothing ever truncates one in place. Do not add a "reuse a segment file"
+        # or "truncate on repair" path without breaking that view contract first.
         sink = pa.OSFile(str(segment_path), "wb")
         writer = pa.RecordBatchStreamWriter(sink, schema)
 

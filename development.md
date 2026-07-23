@@ -383,10 +383,20 @@ editing the code.
   already holds every decoded chunk as an Arrow IPC message in a segment file,
   so instead of re-sending those bytes through the loopback `do_get` socket the
   client asks for the chunk's on-disk byte range (`locate_entry`), `mmap`s the
-  segment, reads just that message, copies it out, and releases the mapping.
+  segment, reads just that message, and hands out a **zero-copy view** onto the
+  mapping (Option C, `biopb/biopb#571`): the client closes its own
+  `MemoryMappedFile` handle at once, but Arrow refcounts the mapping so the
+  returned array keeps it alive (`ndarray → pyarrow.Buffer → MemoryMappedFile`),
+  and untouched chunk pages are never faulted in (a partial read is nearly free).
   This beats the socket because the bytes are already warm in the page cache
   (the server wrote them for caching anyway) and it skips the loopback gRPC
-  overhead. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
+  overhead — and it now also skips the whole-chunk copy the socket cannot
+  (`.copy()` there fell off glibc's 32 MiB `mmap`-threshold cliff at a 64 MB
+  chunk; both paths now return a **read-only** view, the uniform mutability
+  contract). The view's safety rests on the server never truncating a mapped
+  segment inode: segment ids are strictly monotonic and eviction only `unlink`s,
+  so the one truncating `"wb"` open always targets a fresh path — an NFS
+  `cache_dir` would break that and wants an explicit gate. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
   segment `unlink` — `biopb/biopb#5` — so Windows clients use `do_get`); the
   client honors `BIOPB_CACHEFILE_TRANSFER_DISABLED=1` to force the socket, and
   falls back to `do_get` whenever a chunk can't be located (memory backend, old

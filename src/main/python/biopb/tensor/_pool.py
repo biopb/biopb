@@ -50,9 +50,15 @@ logger = logging.getLogger(__name__)
 # as an Arrow IPC message in a segment file. Instead of re-sending those bytes
 # through the loopback gRPC socket (do_get), the client asks the server to
 # locate the chunk (chunk_locate action), then mmaps the segment file and reads
-# just that message -- copying it out and releasing the mapping immediately so
-# it never holds a file lock across a server-side eviction. Gated to POSIX
-# (Windows file-mmap blocks segment unlink -- see biopb/biopb#5).
+# just that message -- handing out a zero-copy view onto the mapping (Option C,
+# biopb/biopb#571). The client closes its own MemoryMappedFile handle at once,
+# but Arrow refcounts the mapping so the returned array keeps it alive (the
+# munmap waits for the last Buffer); untouched chunk pages are never faulted, so
+# a partial read is nearly free. Gated to POSIX (Windows file-mmap blocks
+# segment unlink -- see biopb/biopb#5). Safety rests on the server never
+# truncating a mapped segment inode (see file_backend `_create_segment`); an
+# NFS cache_dir would violate that and wants an explicit gate before this path
+# runs there.
 
 # Highest on-disk segment format version this client can parse. The client
 # reads server-written segment bytes directly, so the layout is a cross-process
@@ -195,25 +201,30 @@ def _array_from_unified_batch(
     dtype: string, ...]`` where ``data`` is the raw C-contiguous bytes of the
     raveled array.
 
-    The result is **read-only** (``writeable=False``) on both paths, so the
-    contract a consumer sees is uniform whether a chunk arrived over ``do_get``
-    or the localhost mmap fast path -- otherwise the same user code would succeed
-    or raise depending on platform and deployment (biopb/biopb#571). A chunk is a
-    shared, cached view of server-owned bytes; mutating one in place is never
-    safe, so callers must copy before writing.
+    The result is **read-only** (``writeable=False``) regardless of ``copy``, so
+    the contract a consumer sees is uniform whether a chunk arrived over
+    ``do_get`` or the localhost mmap fast path -- otherwise the same user code
+    would succeed or raise depending on platform and deployment
+    (biopb/biopb#571). A chunk is a shared, cached view of server-owned bytes;
+    mutating one in place is never safe, so callers must copy before writing.
 
-    ``copy`` selects ownership, *not* mutability:
+    Both production read paths pass ``copy=False`` (Option C, biopb/biopb#571):
 
-    - ``copy=True`` (default, the mmap fast path) -- own the bytes with a
-      ``.copy()``. The segment mapping is closed the instant this returns, so a
-      view onto it would dangle. The owned buffer is then frozen read-only to
-      match the other path.
-    - ``copy=False`` (``do_get``) -- a zero-copy view onto the in-memory Arrow
-      buffer, which numpy keeps alive through the buffer protocol (``arr.base``
-      -> ``pyarrow.Buffer``). Arrow buffers are immutable, so the view is
-      read-only already; the former ``.copy()`` here was pure overhead over
-      loopback and, for a 64 MB chunk, fell off glibc's 32 MiB mmap-threshold
-      cliff (biopb/biopb#571).
+    - ``do_get`` -- a view onto the in-memory Arrow buffer, which numpy keeps
+      alive through the buffer protocol.
+    - the mmap fast path -- a view onto the server's segment *mapping*; the
+      caller closes its ``MemoryMappedFile`` handle immediately, but Arrow
+      refcounts the mapping so it survives as long as this array references it
+      (``ndarray -> pyarrow.Buffer -> MemoryMappedFile``).
+
+    Either way the underlying buffer is already immutable, so the former
+    ``.copy()`` was pure overhead -- and for a 64 MB chunk it fell off glibc's
+    32 MiB mmap-threshold cliff.
+
+    ``copy=True`` (the default) is retained as the owned-copy fallback for
+    callers that must *not* alias server memory -- e.g. a cache backing that can
+    be truncated under the reader (NFS), where handing out the mapping view is
+    unsafe. It allocates a fresh buffer and freezes it read-only to match.
     """
     dtype = np.dtype(batch.column("dtype")[0].as_py())
     shape = tuple(batch.column("shape").to_pylist()[0])
@@ -292,7 +303,16 @@ def _try_cachefile_transfer(
             mm.seek(byte_offset)
             msg = pa.ipc.read_message(mm)
             batch = pa.ipc.read_record_batch(msg, schema)
-            arr = _array_from_unified_batch(batch)
+            # Option C (biopb/biopb#571): hand out a zero-copy view onto the
+            # mapping instead of copying out of it. The IPC-decoded data buffer
+            # aliases the mmap, and Arrow refcounts the mapping -- ``mm.close()``
+            # below drops *this* handle but the munmap waits for the last Buffer,
+            # which the returned array keeps alive through
+            #   ndarray -> pyarrow.Buffer -> MemoryMappedFile -> fd + mapping.
+            # So closing here is still correct and no ownership machinery (pool,
+            # finalizer, mapping LRU) is needed. This makes partial reads nearly
+            # free: untouched chunk pages are never faulted in.
+            arr = _array_from_unified_batch(batch, copy=False)
         finally:
             mm.close()
         logger.debug(f"_try_cachefile_transfer: read {arr.nbytes} bytes via mmap")
