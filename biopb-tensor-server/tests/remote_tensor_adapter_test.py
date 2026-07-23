@@ -1,7 +1,6 @@
 """Tests for the RemoteTensorAdapter caching passthrough proxy (biopb/biopb#178).
 
 Covers the §2 adapter slice of docs/remote-tensor-cache.md:
-- the pure array_id byte-splice on a chunk_id (chunk.rewrite_chunk_id_array_id),
 - the grpc:// url split,
 - end-to-end proxying: a local server fronting an in-process *upstream* server
   mirrors its catalog and serves identical pixels through the proxy,
@@ -21,45 +20,6 @@ def _zarr_available() -> bool:
 
 
 # --------------------------------------------------------------------------- unit
-
-
-class TestArrayIdByteSplice:
-    def test_rewrite_preserves_bounds_tail(self):
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.core.chunk import (
-            decode_chunk_id,
-            encode_chunk_id,
-            rewrite_chunk_id_array_id,
-        )
-
-        bounds = ChunkBounds(start=[0, 64], stop=[64, 128])
-        cid = encode_chunk_id("lab__img/Image:0", bounds)
-        out = rewrite_chunk_id_array_id(cid, "img/Image:0")
-
-        array_id, decoded = decode_chunk_id(out)
-        assert array_id == "img/Image:0"
-        assert list(decoded.start) == [0, 64]
-        assert list(decoded.stop) == [64, 128]
-        # round-trips back
-        assert rewrite_chunk_id_array_id(out, "lab__img/Image:0") == cid
-
-    def test_rewrite_preserves_scale_suffix(self):
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.core.chunk import (
-            decode_scale_info,
-            encode_chunk_id_with_scale,
-            is_scaled_chunk,
-            rewrite_chunk_id_array_id,
-        )
-
-        bounds = ChunkBounds(start=[0, 0], stop=[128, 128])
-        scaled = encode_chunk_id_with_scale("lab__img", bounds, [2, 2])
-        assert is_scaled_chunk(scaled)
-
-        out = rewrite_chunk_id_array_id(scaled, "img")
-        assert is_scaled_chunk(out)  # scale suffix preserved
-        # decode_scale_info returns the scale_hint only (method left the chunk_id, #178).
-        assert list(decode_scale_info(out)) == [2, 2]
 
 
 class TestSplitGrpcUrl:

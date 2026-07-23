@@ -32,7 +32,6 @@ from biopb_tensor_server.core.chunk import (
     is_proxy_envelope,
     is_scaled_chunk,
     peel_proxy_envelope,
-    rewrite_chunk_id_array_id,
     routing_array_id,
     wrap_content_version,
 )
@@ -80,17 +79,6 @@ class TestCodecWrapper:
         assert is_scaled_chunk(wrap_content_version(scaled, CV)) is True
         # decode_scale_info returns the scale_hint only (method left the chunk_id).
         assert decode_scale_info(wrap_content_version(scaled, CV)) == (2, 2)
-
-    def test_rewrite_array_id_preserves_version(self):
-        wrapped = wrap_content_version(encode_chunk_id("src/t", _bounds()), CV)
-        rewritten = rewrite_chunk_id_array_id(wrapped, "other/t")
-        assert content_version_of(rewritten) == CV
-        assert decode_chunk_id(rewritten)[0] == "other/t"
-        assert list(get_bounds_from_chunk_id(rewritten).start) == [0, 10]
-
-    def test_rewrite_unversioned_unchanged(self):
-        legacy = encode_chunk_id("src/t", _bounds())
-        assert rewrite_chunk_id_array_id(legacy, "src/t") == legacy
 
 
 # ==============================================================================
