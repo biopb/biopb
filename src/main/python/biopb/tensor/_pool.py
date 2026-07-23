@@ -649,8 +649,10 @@ def _fetch_chunk_distributed(
         # via the dtype string, so endianness round-trips -- biopb/biopb#293).
         # copy=False: the batch's Arrow buffer is in-memory and numpy keeps it
         # alive, so a view is safe here and skips a needless whole-chunk copy
-        # (biopb/biopb#571). The mmap fast path above must copy (its mapping is
-        # released on return); both return a read-only array.
+        # (biopb/biopb#571). The mmap fast path above hands out a view too, but
+        # for a different reason: there the buffer aliases the segment *mapping*,
+        # which Arrow refcounts so it outlives that path's local ``mm.close()``.
+        # Both paths return a read-only array.
         arr = _array_from_unified_batch(reader.read_all().to_batches()[0], copy=False)
 
     # Cache the result (skipped when caching is disabled)
