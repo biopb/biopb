@@ -619,8 +619,9 @@ class RemoteTensorAdapter(TensorAdapter):
         A caching proxy mirrors its upstream 1:1 and re-derives no chunk grid,
         pyramid, or physical scale of its own, so consult the upstream once
         (``forward_flight_info``) and use its localized plan verbatim -- the
-        forwarded descriptor already carries the upstream's native grid, its
-        server-advertised pyramid, and its physical scale (kept by
+        forwarded descriptor already carries the upstream's native grid, the
+        server-advertised pyramid *when the request opted in* (``with_pyramid``,
+        relayed to the upstream, biopb/biopb#563), and its physical scale (kept by
         ``_localize_forwarded_descriptor``; only ``metadata_json`` is stripped and
         refilled locally from the mirror catalog). On an upstream failure the
         forward returns ``None`` and we fall back to the base local planner --
@@ -681,9 +682,11 @@ class RemoteTensorAdapter(TensorAdapter):
         OME-TIFF family), fall through to the 64 MB default grid, and
         over-amplify a single-plane read ~125x. Instead, consult the upstream
         once for its **authoritative** ``GetFlightInfo`` -- carrying the native
-        grid, the server-advertised pyramid (a pyramidal OME-Zarr upstream's
-        precompute levels included), the physical scale, and scaled ``chunk_id``s
-        for a downsampled read -- and return it localized, with each
+        grid, the server-advertised pyramid when the request opted in via
+        ``with_pyramid`` (a pyramidal OME-Zarr upstream's precompute levels
+        included; the mask is relayed upstream, biopb/biopb#563), the physical
+        scale, and scaled ``chunk_id``s for a downsampled read -- and return it
+        localized, with each
         ``chunk_id``'s ``array_id`` rewritten upstream->local. Nothing is
         re-implemented, and the rewritten ``chunk_id``s round-trip: a later
         ``do_get`` on one forwards straight back upstream via

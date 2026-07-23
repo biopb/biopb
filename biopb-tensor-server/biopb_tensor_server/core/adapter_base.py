@@ -901,6 +901,24 @@ class TensorAdapter(SourceAdapter):
         read_plan.descriptor.array_id = self.array_id
         return read_plan
 
+    @staticmethod
+    def _base_structural_descriptor(base_desc: TensorDescriptor) -> TensorDescriptor:
+        """The stable per-tensor facts alone: shape/dtype/dim_labels/chunk_shape.
+
+        Copies only the structural fields off ``base_desc``, deliberately dropping
+        any pyramid / physical_scale / metadata_json the adapter's own
+        ``get_tensor_descriptor`` may already carry -- ``plan_flight_info`` re-fills
+        those under the response field masks (biopb/biopb#563), so a straight
+        ``CopyFrom`` would leak an unmasked pyramid or scale into the response.
+        """
+        return TensorDescriptor(
+            array_id=base_desc.array_id,
+            dim_labels=base_desc.dim_labels,
+            shape=base_desc.shape,
+            chunk_shape=base_desc.chunk_shape,
+            dtype=base_desc.dtype,
+        )
+
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
     ) -> TensorReadPlan:
@@ -938,13 +956,7 @@ class TensorAdapter(SourceAdapter):
         )
 
         if with_read_plan:
-            request_desc = TensorDescriptor(
-                array_id=base_desc.array_id,
-                dim_labels=base_desc.dim_labels,
-                shape=base_desc.shape,
-                chunk_shape=base_desc.chunk_shape,
-                dtype=base_desc.dtype,
-            )
+            request_desc = self._base_structural_descriptor(base_desc)
             if read_opt.HasField("slice_hint"):
                 request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
             # scale_hint / reduction_method route the read to a downsampled level.
@@ -956,13 +968,7 @@ class TensorAdapter(SourceAdapter):
         else:
             # Describe-only: the base per-tensor descriptor, no chunk enumeration.
             read_plan = TensorReadPlan(
-                descriptor=TensorDescriptor(
-                    array_id=base_desc.array_id,
-                    dim_labels=base_desc.dim_labels,
-                    shape=base_desc.shape,
-                    chunk_shape=base_desc.chunk_shape,
-                    dtype=base_desc.dtype,
-                ),
+                descriptor=self._base_structural_descriptor(base_desc),
                 chunk_endpoints=[],
             )
 
