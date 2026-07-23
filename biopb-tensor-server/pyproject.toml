@@ -15,6 +15,13 @@ dependencies = [
   # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
   # tree, so this floor is documentation for any non-workspace install path.
   "biopb >= 0.7.0",
+  # Floor verified for the file cache's Windows zero-copy segment read (#572):
+  # the cache hands out batches that alias the segment mmap and unlinks the file
+  # (on eviction) while a caller still holds one. That is safe only if
+  # MemoryMappedFile.close() releases the OS handle while the mapped view stays
+  # alive for outstanding buffers -- which holds on pyarrow >= 14 (measured 14
+  # through 24). Below it, the batch could pin the handle and unlink would fail
+  # with WinError 32. Do not lower without re-running the version sweep.
   "pyarrow >= 14.0.0",
   "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port. See docs/aicsimageio-to-bioio-migration.md
   "dask[array] >= 2024.0.0",

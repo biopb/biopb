@@ -1300,3 +1300,82 @@ class TestDirectSeekRead:
         file_backend.clear()
         assert not file_backend._segment_schemas
         assert not file_backend._segment_mmaps
+
+
+class TestZeroCopySurvivesUnlink:
+    """A cache hit hands out a batch that aliases the segment mmap, and that
+    batch stays valid after the segment file is unlinked while the caller still
+    holds it -- the POSIX delete-on-last-close guarantee that #572 dropped the
+    Windows per-hit copy to rely on.
+
+    This is the guardrail for that decision. The copy was removed on the basis
+    that (a) every unlink path closes the server's own pa.memory_map before
+    deleting, and (b) MemoryMappedFile.close() releases the OS handle while the
+    mapped view stays alive for outstanding buffers -- true on pyarrow >= 14,
+    the pinned floor. On a pyarrow where the batch instead pinned the file
+    handle, the unlink below would raise WinError 32 on Windows; on any platform
+    a decode-time copy would show up as an allocation. Both are asserted, so a
+    pyarrow bump that regresses either fails here rather than in production.
+    """
+
+    def _seal_segment_with(self, backend, n=6):
+        """Write n ~64 KiB chunks into one segment and seal it mmap-readable."""
+        arrs = {}
+        for i in range(n):
+            a = ((np.arange(32768, dtype=np.uint16) + i * 11) % 509).astype(np.uint16)
+            key = f"z{i}".encode()
+            arrs[key] = a
+            backend.get_or_acquire(key, (lambda a=a: (_make_typed_batch(a), a.nbytes)))
+            backend.release(key)
+        segment_id = backend._metadata[b"z0"].segment_id
+        backend._close_segment(segment_id)
+        # Drop any in-RAM mirror so the read must come off the mmap, not a copy.
+        for key in arrs:
+            backend._entries.pop(key, None)
+        return arrs, segment_id
+
+    def test_read_is_zero_copy(self, file_backend):
+        """Decoding a ~64 KiB chunk off the segment allocates ~nothing."""
+        arrs, _ = self._seal_segment_with(file_backend)
+        # pa.total_allocated_bytes() is the process-wide default-pool counter, so
+        # this before/after delta only isolates this call's allocation while the
+        # suite runs serially. Keep tensor-server tests single-process (no
+        # pytest-xdist ``-n``) or a concurrent test's allocation would leak in
+        # and make this flaky.
+        before = pa.total_allocated_bytes()
+        batch = file_backend._read_batch_from_segment(b"z0")
+        allocated = pa.total_allocated_bytes() - before
+        assert batch is not None
+        # A full copy would allocate the whole ~64 KiB payload; a zero-copy
+        # alias allocates only tiny bookkeeping, well under a quarter of it.
+        assert allocated < arrs[b"z0"].nbytes // 4
+        assert np.array_equal(unpack_chunk_array(batch), arrs[b"z0"])
+
+    def test_batch_survives_segment_eviction(self, file_backend):
+        """Evicting a segment out from under a live batch unlinks the file and
+        leaves the batch's bytes intact -- the core #572 guarantee."""
+        arrs, segment_id = self._seal_segment_with(file_backend)
+        batch = file_backend._read_batch_from_segment(b"z0")
+        assert batch is not None
+
+        seg_path = file_backend._segment_path(segment_id)
+        assert seg_path.exists()
+
+        # Eviction closes the server mmap, then unlinks. Must not raise (a
+        # regressed pyarrow would raise WinError 32 on Windows) ...
+        with file_backend._lock:
+            file_backend._do_evict_segment(segment_id)
+        assert not seg_path.exists()  # ... and must actually remove the file.
+
+        # The batch the caller is still holding reads correctly after the delete.
+        assert np.array_equal(unpack_chunk_array(batch), arrs[b"z0"])
+
+    def test_batch_survives_clear(self, file_backend):
+        """clear() unlinks every segment; a batch held across it stays valid."""
+        arrs, _ = self._seal_segment_with(file_backend)
+        batch = file_backend._read_batch_from_segment(b"z1")
+        assert batch is not None
+
+        file_backend.clear()  # unlinks all segments while `batch` is live
+
+        assert np.array_equal(unpack_chunk_array(batch), arrs[b"z1"])

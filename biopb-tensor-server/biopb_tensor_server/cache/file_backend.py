@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -150,30 +149,6 @@ def _schema_message_length(path: Path) -> Optional[int]:
     return length or None
 
 
-def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
-    """Return a copy of `batch` whose buffers are owned in RAM, not a file mmap.
-
-    Reads from a segment are zero-copy: the returned batch's buffers (data,
-    shape and dtype columns alike) point straight into the segment file's
-    memory mapping. On POSIX that is harmless -- unlink() removes the directory
-    entry and the inode survives to last close, so a segment can be evicted
-    while a caller still holds the batch. On Windows an active mapping blocks
-    deletion (WinError 32), so eviction and cleanup fail as long as any caller
-    keeps the batch alive.
-
-    This materializes the batch into pyarrow-owned memory via an IPC round-trip
-    (which copies every column, not just the data buffer), severing the tie to
-    the mmap so the segment file can be unlinked. Used only where that matters;
-    see issue #5.
-    """
-    sink = pa.BufferOutputStream()
-    writer = pa.RecordBatchStreamWriter(sink, batch.schema)
-    writer.write_batch(batch)
-    writer.close()
-    reader = pa.RecordBatchStreamReader(pa.BufferReader(sink.getvalue()))
-    return reader.read_next_batch()
-
-
 @dataclass
 class ArrowFileConfig:
     """Configuration for Arrow file cache backend."""
@@ -281,11 +256,6 @@ class ArrowFileBackend(CacheBackend):
 
         # Recovery status (if recovered from crash)
         self._recovery_status: Optional[RecoveryStatus] = None
-
-        # Copy batches off the segment mmap before returning them to callers.
-        # Only needed on Windows, where a live mapping blocks segment unlink
-        # during eviction/cleanup; POSIX keeps zero-copy reads (issue #5).
-        self._copy_on_read = sys.platform == "win32"
 
         # Initialize
         self._initialize()
@@ -1200,11 +1170,20 @@ class ArrowFileBackend(CacheBackend):
         if batch is None:
             return None
 
-        # Detach from the segment mmap on Windows so the file can be unlinked
-        # during eviction even while a caller holds the batch (issue #5). POSIX
-        # keeps the zero-copy mmap read.
-        if self._copy_on_read:
-            batch = _copy_batch_off_mmap(batch)
+        # The read is zero-copy on every platform now, Windows included: the
+        # returned batch's buffers point straight into the segment mapping, and
+        # a caller can keep it alive across eviction of that segment. Windows
+        # used to copy the whole batch off the mmap here (issue #5) because a
+        # live mapping blocks unlink with WinError 32 -- but that is only true
+        # while a *handle* is open. Every unlink path first closes the server's
+        # own pa.memory_map (``_forget_segment_mmap`` in ``_do_evict_segment`` /
+        # ``_drop_segment_files`` / ``clear``, all serialized with reads under
+        # ``_lock``); once no handle remains, DeleteFile removes the name at once
+        # and the still-mapped view keeps this batch's bytes valid -- POSIX
+        # delete-on-last-close semantics. The one dependency is that
+        # ``MemoryMappedFile.close()`` releases the handle while buffers retain
+        # the view, which holds on pyarrow >= 14 (the pinned floor); see #572
+        # and ``cachefile_test.TestZeroCopySurvivesUnlink``.
         # Serve the unified binary schema as-is (biopb/biopb#293); just strip
         # the internal cache-key column so the wire batch is the clean
         # [data, shape, dtype]. No binary->typed conversion.
