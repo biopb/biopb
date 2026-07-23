@@ -220,7 +220,9 @@ be justified by open cost.
 | Open cost | Policy | Adapters |
 |---|---|---|
 | O(1) in file size (~0.05–0.1 ms, <0.3% of a 64 MB chunk read) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
-| O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`; `ome-tiff` additionally reaps an idle store (`BIOPB_TIFF_STORE_TTL`) | `ome-tiff`, `qptiff`, `ndtiff` |
+| O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`, and a shared idle reaper closes the handle between reads so the pin is *bounded*, not lifetime-long (TTL from `[server] handle_reaper_ttl`, default 150 s) | `ome-tiff`, `qptiff`, `ndtiff` |
+
+The reaper is one small opt-in utility, `adapters/_handle_reaper.py` (`IdleHandleReaper`): the second-row adapters register the handle on open and expose the `ReapableHandle` contract (`_io_lock`, `_active_reads`, `_persistent_last_access`, `_release_persistent_handle`); a per-pool daemon thread closes any handle idle past its TTL, fenced against an in-flight read, and the next read reopens transparently. `close()` (teardown) and the reaper (steady state) share the one release hook. (`qptiff` keeps a persistent handle + `close()` but is not yet wired to the reaper — its multi-level store pool would register per level.)
 
 `close()` is **declared on `SourceAdapter`** with a concrete no-op default (and
 classified in `_SOURCE_SCOPED_API`, so adding it had to be a deliberate interface
@@ -556,7 +558,8 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_OMETIFF_PARALLEL_READ` | `OmeTiffAdapter.get_data` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**: reads decode under the lock, as before. |
-| `BIOPB_TIFF_STORE_TTL` | OME-TIFF store reaper | Seconds an idle OME-TIFF `aszarr` store handle is kept warm before the reaper closes it (default `300`). |
+
+The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handle_reaper_ttl` (seconds, default `150`, `<= 0` disables). It applies to every opt-in adapter (OME-TIFF, NDTiff), set once at startup via `set_handle_reaper_ttl`.
 
 ---
 
