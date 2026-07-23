@@ -34,6 +34,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The in-tree biopb regenerates its protobuf bindings with buf at build
+      # time (pyproject build_py hook), so buf must be on PATH before pip runs.
+      # setup_only just puts the CLI there; mirrors tensor-server-ci.
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
       - name: Install biopb + biopb-tensor-server
         run: |
           python -m pip install --upgrade pip setuptools
