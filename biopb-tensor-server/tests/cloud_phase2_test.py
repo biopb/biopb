@@ -134,6 +134,9 @@ class _RaisingReadCtx(LiveLocalContext):
     def read_text(self, subpath: str = "") -> str:
         raise AssertionError("claim() must not read content for this adapter")
 
+    def open(self, mode: str = "rb") -> object:
+        raise AssertionError("claim() must not read content for this adapter")
+
 
 class TestContentFreeClaimsDoNotRead:
     """Extension/structure-only adapters recognize a source without any byte read.

@@ -17,12 +17,14 @@ Key components:
 
 from __future__ import annotations
 
+import abc
 import fnmatch
 import hashlib
 import logging
 import os
 from pathlib import Path
 from typing import (
+    IO,
     TYPE_CHECKING,
     Any,
     Callable,
@@ -229,7 +231,7 @@ def should_skip_walk_entry(
     return _is_offline_placeholder(path, stat_result)
 
 
-class ClaimContext:
+class ClaimContext(abc.ABC):
     """Unified path access for the claim protocol.
 
     ``claim()`` implementations probe the filesystem through this seam so they
@@ -304,46 +306,62 @@ class ClaimContext:
         return None
 
     # --- path operations (each concrete shape implements these) ---
+    #
+    # Abstract, so the base cannot be instantiated and a concrete shape that
+    # forgets an override is rejected at construction (and flagged by type
+    # checkers) rather than at first call. ``_LocalContext`` supplies the shared
+    # ones and stays abstract on the four structural probes its leaves differ on.
 
+    @abc.abstractmethod
     def is_dir(self) -> bool:
         """Check if path is directory."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def is_file(self) -> bool:
         """Check if path is file."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def exists(self) -> bool:
         """Check if path exists."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def read_text(self, subpath: str = "") -> str:
         """Read file contents as text (``subpath`` empty for the current path)."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
+    def open(self, mode: str = "rb") -> IO:
+        """Open this path as a stream (``rb`` by default).
+
+        The shape-agnostic read seam: a local shape opens the ``Path``, a remote
+        shape opens through its ``RemoteStore``, so an adapter that needs a
+        file-like handle (``pydicom.dcmread`` on a header) stays blind to which
+        concrete context it got. The returned object is a context manager.
+        """
+
+    @abc.abstractmethod
     def join(self, subpath: str) -> ClaimContext:
         """Create a (live) context for ``subpath`` under this one."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def glob(self, pattern: str) -> List[ClaimContext]:
         """Find entries matching ``pattern`` in this directory (maxdepth 1)."""
-        raise NotImplementedError
 
     @property
+    @abc.abstractmethod
     def path_str(self) -> str:
         """Get path as string (for SourceClaim)."""
-        raise NotImplementedError
 
     @property
+    @abc.abstractmethod
     def name(self) -> str:
         """Get filename/directory name."""
-        raise NotImplementedError
 
     @property
+    @abc.abstractmethod
     def parent(self) -> ClaimContext:
         """Get parent directory context."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def is_resident(self) -> bool:
         """Recall-free: is this path's content local and cheap to read right now?
 
@@ -352,7 +370,6 @@ class ClaimContext:
         trigger a whole-file cloud recall (or block offline), so the adapter
         defers and emits an *unresolved* claim instead (cloud-storage phase 2).
         """
-        raise NotImplementedError
 
 
 class RemoteContext(ClaimContext):
@@ -392,6 +409,9 @@ class RemoteContext(ClaimContext):
             else self._remote_path
         )
         return self._store.read_text(target)
+
+    def open(self, mode: str = "rb") -> IO:
+        return self._store.open(self._remote_path, mode=mode)
 
     def join(self, subpath: str) -> ClaimContext:
         new_path = (
@@ -453,6 +473,9 @@ class _LocalContext(ClaimContext):
     def read_text(self, subpath: str = "") -> str:
         target = self._path / subpath if subpath else self._path
         return target.read_text()
+
+    def open(self, mode: str = "rb") -> IO:
+        return self._path.open(mode)
 
     @property
     def path_str(self) -> str:
