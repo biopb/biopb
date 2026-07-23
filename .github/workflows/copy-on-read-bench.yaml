@@ -1,0 +1,63 @@
+# Cross-platform per-hit copy-off-mmap benchmark for biopb/biopb#572.
+#
+# On Windows the file cache copies every cached chunk out of its mmap on every
+# read hit (a live mapping would otherwise block segment unlink during eviction,
+# issue #5); POSIX keeps the read zero-copy. This measures that copy term on
+# each platform by driving ArrowFileBackend._read_batch_from_segment with
+# _copy_on_read forced off vs on, so the delta is the copy alone.
+#
+# Not part of the normal CI set: benchmarks are timing-sensitive and would be
+# flaky as a gate. Run it on demand. Windows is the platform of interest, but
+# the POSIX runners give the zero-copy baseline the fix should converge on.
+name: copy-on-read-bench
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench/**']
+
+jobs:
+  bench:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install biopb-tensor-server
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install -e "./biopb-tensor-server"
+
+      - name: Report host memory (context for the numbers)
+        run: |
+          python - <<'PY'
+          import shutil, platform
+          print("platform:", platform.platform())
+          try:
+              import os
+              if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names:
+                  tot = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                  print(f"total RAM: {tot/1e9:.1f} GB")
+          except Exception as e:
+              print("RAM probe failed:", e)
+          print("free disk:", shutil.disk_usage(".").free // 10**9, "GB")
+          PY
+
+      - name: Run copy-on-read benchmark
+        run: python biopb-tensor-server/benchmarks/bench_copy_on_read.py --json "copy-on-read-${{ matrix.os }}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copy-on-read-${{ matrix.os }}
+          path: copy-on-read-${{ matrix.os }}.json
