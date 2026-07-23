@@ -298,12 +298,6 @@ class TestTensorFlightClientRoundTrip:
             finally:
                 server.shutdown()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="biopb/biopb#578: the server ignores the requested reduction_method "
-        "and downsamples with the default 'area' (mean-pool) instead of 'nearest', "
-        "returning wrong pixels. Remove this marker when #578 is fixed.",
-    )
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_non_divisible_scaled_nearest_view(self):
         """Test nearest downsampling returns ceil-sized output for edge chunks."""

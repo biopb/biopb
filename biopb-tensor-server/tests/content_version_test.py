@@ -6,7 +6,9 @@ new bytes gets a fresh cache key instead of serving a stale cached chunk. Covers
 - the codec is backward-compatible (unversioned chunk_ids / cache keys are
   byte-identical to pre-#178) and every codec function is wrapper-aware;
 - cache_key_for_chunk_id keeps the version (version-sensitive) while the inner
-  projection is unchanged and the reduction method stays advisory;
+  projection is unchanged and an area (default) read stays byte-identical;
+- the compact reduction_method suffix (biopb/biopb#578): a non-default method
+  rides in the scaled chunk_id and keys distinctly, area adds no byte;
 - _get_read_plan wraps all minted chunk_ids with a source's content_version;
 - content_version_from_path yields a cheap stat signal and OmeTiffAdapter adopts it.
 """
@@ -24,6 +26,7 @@ from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     content_version_of,
     decode_chunk_id,
+    decode_reduction_method,
     decode_scale_info,
     encode_chunk_id,
     encode_chunk_id_with_scale,
@@ -117,6 +120,63 @@ class TestCacheKey:
         assert cache_key_for_chunk_id(
             wrap_content_version(legacy_with_method, CV)
         ) == cache_key_for_chunk_id(wrap_content_version(identity, CV))
+
+
+# ==============================================================================
+# Compact reduction_method suffix on a scaled chunk_id (biopb/biopb#578)
+# ==============================================================================
+
+
+class TestReductionMethodSuffix:
+    def test_area_is_byte_identical_to_method_free(self):
+        # The default (area) adds no byte, so an area scaled chunk_id equals the
+        # pre-#578 method-free form -- its cache entries are NOT invalidated.
+        method_free = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
+        assert area == method_free
+        assert decode_reduction_method(area) == "area"
+
+    def test_nearest_carries_one_byte_and_decodes_back(self):
+        area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
+        nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
+        assert len(nearest) == len(area) + 1  # exactly one method byte
+        assert decode_reduction_method(nearest) == "nearest"
+        # The suffix does not disturb scale/bounds/scaled detection.
+        assert decode_scale_info(nearest) == (2, 2)
+        assert is_scaled_chunk(nearest)
+        assert decode_chunk_id(nearest)[0] == "src/t"
+
+    def test_aliases_normalize_before_encoding(self):
+        # stride -> nearest (adds the byte); mean -> area (no byte).
+        stride = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "stride")
+        mean = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "mean")
+        assert decode_reduction_method(stride) == "nearest"
+        assert mean == encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+
+    def test_cache_key_distinguishes_method_but_area_survives(self):
+        method_free = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
+        nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
+        # area keys identically to the old method-free entry (no invalidation)...
+        assert cache_key_for_chunk_id(area) == cache_key_for_chunk_id(method_free)
+        # ...while nearest keys distinctly (reverses the #76 collision).
+        assert cache_key_for_chunk_id(nearest) != cache_key_for_chunk_id(area)
+        assert cache_key_for_chunk_id(nearest) == nearest  # method byte kept
+
+    def test_method_survives_content_version_wrapping(self):
+        nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
+        wrapped = wrap_content_version(nearest, CV)
+        assert decode_reduction_method(wrapped) == "nearest"
+        assert decode_scale_info(wrapped) == (2, 2)
+        assert content_version_of(wrapped) == CV
+
+    def test_method_free_and_nonscaled_decode_to_default(self):
+        assert decode_reduction_method(encode_chunk_id("src/t", _bounds())) == "area"
+        method_free = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        assert decode_reduction_method(method_free) == "area"
+        # A legacy uint16-len method suffix is not the compact byte -> default.
+        legacy = method_free + b"\x00\x03max"
+        assert decode_reduction_method(legacy) == "area"
 
 
 # ==============================================================================

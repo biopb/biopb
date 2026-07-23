@@ -18,7 +18,11 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.axes import labeled_axis_index
-from biopb_tensor_server.core.downsample import ceil_div
+from biopb_tensor_server.core.downsample import (
+    DEFAULT_REDUCTION_METHOD,
+    ceil_div,
+    normalize_reduction_method,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +46,21 @@ logger = logging.getLogger(__name__)
 # - 8*ndim bytes: bounds.start (int64, big-endian)
 # - 8*ndim bytes: bounds.stop (int64, big-endian)
 # - [scaled only] 8*ndim bytes: scale_hint (int64)
+# - [scaled + non-default method only] 1 byte: reduction_method code
 #
-# The chunk_id is pure IDENTITY (array_id + bounds + scale_hint). The scaled form
-# used to carry a trailing reduction_method (uint16 len + bytes), but the cache
-# key always stripped it (advisory, biopb/biopb#76) and the compute path is the
-# only consumer -- so the method left the wire format entirely (biopb/biopb#178).
+# The chunk_id is IDENTITY (array_id + bounds + scale_hint [+ method]). #178 had
+# dropped reduction_method from the wire -- it was advisory and the compute path
+# hard-coded the default, which silently served a client's requested method with
+# the wrong one (biopb/biopb#578). It is back, but compact and default-free: the
+# computed downsample space is binary ("nearest" | "area", area = the default),
+# so a non-default method appends ONE code byte and "area"/default appends
+# nothing. So an area (default) scaled chunk_id -- and its cache key -- stays
+# byte-identical to the pre-#178 form (its cache entries survive), and only a
+# genuinely-distinct "nearest" read gets a longer id and its own entry. A
+# method-free scaled chunk_id (old server / old cache) decodes to the default,
+# exactly as before. This reverses the #76 cache-sharing (nearest and area no
+# longer collide) -- the deliberate cost of serving the method the client asked
+# for.
 # A cold downsample uses the server default; see core.adapter_base.resolve_chunk_data.
 # (An older chunk_id that still carries a method suffix stays readable: decode /
 # is_scaled / cache_key all ignore the trailing bytes, so no cache wipe is needed.)
@@ -121,9 +135,11 @@ def content_version_of(chunk_id: bytes) -> Optional[bytes]:
 #
 # 0xFE is a third discriminator, mutually exclusive with the 0x00 legacy high byte
 # and the 0xFF content_version sentinel, so any codec entry point can tell the
-# three apart from byte 0. Because the inner is method-free (#178 made chunk_ids
-# identity-only), the whole envelope is an injective, reduction_method-independent
-# cache key -- see cache_key_for_chunk_id.
+# three apart from byte 0. The envelope frames (route, cv, inner) with lengths, so
+# it is an injective cache key regardless of what the inner carries -- and since
+# the inner now carries the reduction_method byte when it is a non-default scaled
+# read (biopb/biopb#578), the envelope key distinguishes methods too, for free,
+# without ever parsing the opaque inner -- see cache_key_for_chunk_id.
 # =============================================================================
 
 _ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
@@ -256,21 +272,37 @@ def get_bounds_from_chunk_id(chunk_id: bytes) -> ChunkBounds:
     return bounds
 
 
+# Compact reduction_method suffix on a scaled chunk_id (biopb/biopb#578). Only a
+# NON-default method is carried, as a single code byte, so an "area"/default
+# scaled chunk_id stays byte-identical to the method-free #178 form. The computed
+# downsample space is binary ("nearest" | "area"), so one code covers it; the
+# reverse map decodes it, and an absent byte means the default.
+_SCALED_METHOD_BYTE = {"nearest": b"\x01"}
+_SCALED_METHOD_BY_BYTE = {1: "nearest"}
+
+
 def encode_chunk_id_with_scale(
     array_id: str,
     bounds: ChunkBounds,
     scale_hint: Tuple[int, ...],
+    reduction_method: str = DEFAULT_REDUCTION_METHOD,
 ) -> bytes:
-    """Encode an identity scaled chunk_id: bounds encoding + scale_hint.
+    """Encode a scaled chunk_id: bounds encoding + scale_hint [+ method byte].
 
-    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64).
-    Detection: if ``len(chunk_id) > bounds_end``, it's a scaled chunk. The
-    reduction_method is NOT encoded -- it is advisory and sourced server-side at
-    compute time (biopb/biopb#178, #76).
+    Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64), then
+    -- only for a NON-default reduction_method -- one method-code byte. The default
+    ("area") appends nothing, so an area scaled chunk_id is byte-identical to the
+    pre-#178 identity form (biopb/biopb#578, #178, #76). The method is normalized
+    (stride->nearest, mean->area), so in practice only "nearest" adds a byte.
+    Detection stays ``len(chunk_id) > bounds_end`` (a scaled chunk always carries
+    at least the scale_hint); :func:`decode_reduction_method` reads the byte back.
     """
     base = encode_chunk_id(array_id, bounds)
     scale_payload = struct.pack(f">{len(scale_hint)}q", *scale_hint)
-    return base + scale_payload
+    method_suffix = _SCALED_METHOD_BYTE.get(
+        normalize_reduction_method(reduction_method), b""
+    )
+    return base + scale_payload + method_suffix
 
 
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
@@ -297,31 +329,39 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
 def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     """Canonical cache key for a chunk_id.
 
-    A current chunk_id is already pure identity (array_id + bounds [+ scale_hint]),
-    so the key equals the inner bytes. The projection to ``bounds_end + ndim*8`` is
-    retained only to stay byte-compatible with an OLDER chunk_id that still carried
-    a trailing reduction_method suffix (biopb/biopb#76): dropping it means a cache
-    entry warmed under the old format is still hit under the new one. Non-scaled
-    chunk_ids are returned unchanged.
+    A current chunk_id is identity (array_id + bounds [+ scale_hint [+ method
+    byte]]), so the key equals the inner bytes -- INCLUDING the compact one-byte
+    reduction_method suffix, so a "nearest" read keys distinctly from "area"
+    (biopb/biopb#578). Only a LEGACY trailing method suffix (the pre-#178
+    ``uint16 len + bytes`` form, which is more than one byte past the scale) is
+    stripped, so a cache entry warmed under that old format still maps to today's
+    area identity (biopb/biopb#76). Non-scaled chunk_ids are returned unchanged.
+
+    Because an "area"/default scaled chunk_id carries no method byte, its key is
+    byte-identical to the pre-#578 key -- so area entries are NOT invalidated;
+    only genuinely-distinct "nearest" reads get a new key.
 
     The result is an opaque cache key: it is NOT a valid chunk_id and must not
     be fed to :func:`decode_scale_info` or forwarded on the wire.
 
     A content_version (biopb/biopb#178) is kept in the key -- so a version bump
     yields a distinct key and the stale entry becomes un-lookupable -- while the
-    inner projection stays byte-identical to the pre-#178 key, so an UNVERSIONED
-    chunk_id maps to exactly its old cache entry (no forced invalidation).
+    inner projection stays byte-identical to the pre-#178 key for an area read, so
+    an UNVERSIONED area chunk_id maps to exactly its old cache entry.
 
     A proxy envelope is returned as-is: it already frames (route, content_version,
-    inner) with lengths, so it is an injective key, and since its inner is
-    method-free it is reduction_method-independent -- keying by it verbatim keeps
-    #76 dedup WITHOUT the proxy ever parsing the opaque inner.
+    inner) with lengths, so it is an injective key, and since the inner now carries
+    the method byte for a non-default scaled read, the envelope key distinguishes
+    methods too -- WITHOUT the proxy ever parsing the opaque inner.
     """
     if is_proxy_envelope(chunk_id):
         return chunk_id
     cv, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
-    base = inner if len(inner) <= bounds_end else inner[: bounds_end + ndim * 8]
+    scale_end = bounds_end + ndim * 8
+    # Keep array_id+bounds+scale_hint and at most the one-byte method suffix; a
+    # longer trailing run is the legacy uint16 method form, stripped for #76.
+    base = inner if len(inner) <= scale_end + 1 else inner[:scale_end]
     return wrap_content_version(base, cv) if cv is not None else base
 
 
@@ -329,13 +369,31 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
     """Decode the scale_hint from a scaled chunk_id.
 
     Reads only the ndim int64 scale_hint after the bounds encoding. The
-    reduction_method is no longer part of the chunk_id (biopb/biopb#178); any
-    trailing bytes from an older method-carrying chunk_id are ignored.
+    reduction_method (a trailing byte, biopb/biopb#578) is read separately by
+    :func:`decode_reduction_method`; any trailing bytes here are ignored, so a
+    legacy method-carrying chunk_id still decodes its scale correctly.
     """
     _, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
     return struct.unpack_from(f">{ndim}q", chunk_id, bounds_end)
+
+
+def decode_reduction_method(chunk_id: bytes) -> str:
+    """Decode the reduction_method carried by a scaled chunk_id (biopb/biopb#578).
+
+    Only the compact one-byte code minted by :func:`encode_chunk_id_with_scale`
+    (exactly one byte past the scale_hint) is honored. A non-scaled chunk_id, a
+    method-free scaled chunk_id (old server / pre-#178 cache), or a legacy
+    ``uint16 len + bytes`` method suffix all decode to the default -- so an old
+    scaled read is served exactly as before (``area``), never rejected.
+    """
+    _, inner = _split_version(chunk_id)
+    ndim, bounds_end = _bounds_end(inner)
+    scale_end = bounds_end + ndim * 8
+    if len(inner) == scale_end + 1:
+        return _SCALED_METHOD_BY_BYTE.get(inner[scale_end], DEFAULT_REDUCTION_METHOD)
+    return DEFAULT_REDUCTION_METHOD
 
 
 # Constants
