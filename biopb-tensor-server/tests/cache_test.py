@@ -1212,7 +1212,12 @@ class TestBackendSelection:
         shutil.rmtree(cache_dir)
 
     def test_unknown_backend_raises(self):
-        """Unknown backend raises ValueError."""
+        """Unknown backend raises ValueError.
+
+        Config *files* never get here -- the read step clamps a bad backend to
+        the default (biopb/biopb#34) -- so this guards the in-process caller that
+        builds a CacheConfig directly.
+        """
         CacheManager.reset()
         config = CacheConfig(backend="unknown")
         with pytest.raises(ValueError, match="Unknown cache backend"):

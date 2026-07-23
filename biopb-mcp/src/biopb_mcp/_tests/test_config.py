@@ -571,6 +571,14 @@ class TestValidation:
         CONFIG.reload()
         assert load_config() == get_default_config()
 
+    def test_shipped_defaults_pass_the_whole_check(self):
+        """The clamp target must itself be valid, cross-field rules included --
+        otherwise a bad leaf would be replaced by an equally invalid default and
+        the config would never converge."""
+        from biopb_mcp._config import config_problems
+
+        assert config_problems(DEFAULT_CONFIG) == []
+
     def test_shipped_defaults_satisfy_every_constraint(self):
         """DEFAULT_CONFIG must itself pass validation -- otherwise a bad leaf
         would clamp to a default that is *also* invalid. Iterates the class-keyed

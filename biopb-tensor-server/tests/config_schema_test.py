@@ -159,6 +159,7 @@ def test_installer_default_config_validates(validator):
         {"precache": {"backlog_high_water": 0.0}},  # boundary (min)
         {"precache": {"backlog_high_water": 1.0}},  # boundary (max)
         {"server": {"port": 65535}},  # boundary (max)
+        {"server": {"port": 0}},  # ephemeral-port sentinel, not a typo
         {"server": {"log_level": "info"}},  # case-insensitive enum stays lenient
         {"cache": {"backend": "memory"}},
         {"sources": [{"url": "/d", "type": "ome-zarr"}]},
@@ -175,7 +176,7 @@ def test_accepts_valid(validator, cfg):
 @pytest.mark.parametrize(
     "cfg",
     [
-        {"server": {"port": 0}},
+        {"server": {"port": -1}},
         {"server": {"port": 70000}},
         {"cache": {"backend": "bogus"}},
         {"pyramid": {"downscale_factor": 1}},  # silently single-level before

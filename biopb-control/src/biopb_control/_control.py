@@ -680,14 +680,17 @@ def build_app(
         )
 
     async def api_mcp_config_save(request: Request) -> JSONResponse:
-        # Validate + write the biopb-mcp config. Validation reuses biopb-mcp's own
-        # _CONSTRAINTS table (the exact rules it clamps to at load time), so "the
-        # form accepted it" == "biopb-mcp will accept it" with no jsonschema
-        # dependency in the lean control. Changes apply to the NEXT session (each
-        # session reads config fresh at bootstrap), so there is no server to
-        # restart -- unlike the data plane.
+        # Validate + write the biopb-mcp config. Validation calls biopb-mcp's own
+        # config_problems -- the exact check its load path runs, cross-field rules
+        # included -- so "the form accepted it" == "biopb-mcp will accept it", with
+        # no jsonschema dependency in the lean control and nothing for this handler
+        # to restate. The difference is only what happens next: biopb-mcp clamps to
+        # defaults at load, this endpoint rejects, because a human is here to fix
+        # it (biopb/biopb#34). Changes apply to the NEXT session (each session
+        # reads config fresh at bootstrap), so there is no server to restart --
+        # unlike the data plane.
         try:
-            from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, save_config
+            from biopb_mcp._config import config_problems, save_config
         except Exception as exc:  # noqa: BLE001 - biopb-mcp not installed here
             return JSONResponse(
                 {"error": f"biopb-mcp is not installed: {exc}"}, status_code=501
@@ -705,37 +708,7 @@ def build_app(
                 {"detail": "Config body must be a JSON object"}, status_code=422
             )
 
-        errors: list[dict] = []
-        for section, cls in _SECTION_CLASSES.items():
-            sec = body.get(section)
-            if not isinstance(sec, dict):
-                continue
-            for field, constraint in _CONSTRAINTS.get(cls.__name__, {}).items():
-                if field in sec and not constraint.ok(sec[field]):
-                    errors.append(
-                        {
-                            "path": [section, field],
-                            "message": f"expected {constraint.describe()}",
-                        }
-                    )
-        # Cross-field: the health-poll backoff must not invert (min > max).
-        tensor = body.get("tensor")
-        if isinstance(tensor, dict):
-            lo, hi = (
-                tensor.get("health_poll_min_interval"),
-                tensor.get("health_poll_max_interval"),
-            )
-            if (
-                isinstance(lo, (int, float))
-                and isinstance(hi, (int, float))
-                and lo > hi
-            ):
-                errors.append(
-                    {
-                        "path": ["tensor", "health_poll_min_interval"],
-                        "message": "must be <= health_poll_max_interval",
-                    }
-                )
+        errors = [p.as_dict() for p in config_problems(body)]
         if errors:
             errors.sort(key=lambda d: d["path"])
             return JSONResponse(

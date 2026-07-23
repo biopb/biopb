@@ -85,7 +85,7 @@ are produced.
 ## Config & data locations
 
 - Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
-  legacy `biopb.toml` still loads and is migrated to JSON on rerun — via
+  legacy `biopb.toml` is no longer read and must be migrated to JSON — via
   `biopb server migrate-config`, or automatically when you pick a new data
   folder)
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`

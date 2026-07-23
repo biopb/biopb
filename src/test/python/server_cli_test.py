@@ -288,6 +288,34 @@ class TestControlStatus:
             assert cmd in res.output
 
 
+class TestRejectLegacyToml:
+    """`control start` / `run` refuse a pre-#34 `biopb.toml` up front.
+
+    Every config probe further in is best-effort (`_read_flight_host` fails
+    *closed* to a public bind on an unreadable config), so without this gate a
+    legacy config surfaces as an unrelated "public bind needs a token" refusal
+    -- or as a plane serving defaults instead of the user's data.
+    """
+
+    def test_legacy_toml_exits_with_the_migration_command(self, tmp_path, capsys):
+        legacy = tmp_path / "biopb.toml"
+        legacy.write_text("[server]\nport = 8815\n")
+        with pytest.raises(typer.Exit) as exc:
+            cli._reject_legacy_toml(legacy)
+        assert exc.value.exit_code == 1
+        assert "migrate-config" in capsys.readouterr().out
+
+    def test_json_config_passes(self, tmp_path):
+        config = tmp_path / "biopb.json"
+        config.write_text('{"server": {"port": 8815}}')
+        cli._reject_legacy_toml(config)  # no raise
+
+    def test_absent_toml_passes(self, tmp_path):
+        # find_config hands back the canonical name when nothing exists; a
+        # never-created .toml path must not be mistaken for a legacy install.
+        cli._reject_legacy_toml(tmp_path / "biopb.toml")
+
+
 class TestControlRunArgv:
     """`_control_run_argv` must never put the access token on the child command
     line -- a process command line is world-readable via `ps` / Task Manager,
@@ -451,7 +479,7 @@ class TestMigrateConfig:
 
     def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
         # The actual migration reuses biopb_tensor_server.core.config (save_config /
-        # _read_config_file). That package ships only with the full installer,
+        # read_legacy_toml). That package ships only with the full installer,
         # not on PyPI, so it is absent from the lightweight `biopb[test,tensor]`
         # CI env -- skip there; the command's own "unavailable" fallback is what
         # runs in that case.
