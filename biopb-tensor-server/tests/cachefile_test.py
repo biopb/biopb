@@ -14,6 +14,8 @@ import dataclasses
 import hashlib
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -766,17 +768,48 @@ class TestShouldTryCachefile:
         assert c._should_try_cachefile("grpc://localhost:8815") is False
 
 
-class TestClientViewSurvivesServerUnlink:
-    """The cross-process guarantee the #582 gate removal rests on: a client that
-    holds a fast-path mmap *view* (having closed its MemoryMappedFile handle, as
-    _try_cachefile_transfer does) does not block the server unlinking that
-    segment, and its data stays valid across the delete.
+# Worker run in a SEPARATE process: maps a segment, decodes the fast path's
+# zero-copy *view*, closes its MemoryMappedFile handle (as _try_cachefile_transfer
+# does), signals READY, then -- after the parent has unlinked the file -- reads
+# the view for the first time and reports its sha256. Kept as a `-c` payload so
+# the cross-process case needs no on-disk helper file.
+_VIEW_WORKER = r"""
+import sys, hashlib
+import pyarrow as pa
+import biopb.tensor._pool as pool
 
-    On Windows this is the delete-on-last-close / delete-pending behaviour: an
-    open handle would block the unlink (WinError 32), but a view does not -- the
-    name is removed at once, the pages stay valid, and the freed name is even
-    reusable. A pyarrow that pinned the handle through the view (or a platform
-    that blocked the unlink) would fail here rather than in production.
+def emit(s):
+    sys.stdout.write(s + "\n"); sys.stdout.flush()
+
+try:
+    seg = sys.argv[1]
+    mm = pa.memory_map(seg, "r")
+    batch = pa.ipc.open_stream(mm).read_next_batch()
+    arr, buf = pool._decode_unified_batch(batch)  # a view onto the mapping
+    del batch
+    mm.close()                                    # release the file HANDLE
+    assert not arr.flags.owndata                  # a view, not a copy
+    emit("READY")
+    sys.stdin.readline()                          # block; parent unlinks meanwhile
+    # First full read of the view happens HERE, after the parent's unlink:
+    emit("SHA " + hashlib.sha256(arr.tobytes()).hexdigest())
+except Exception as e:  # noqa: BLE001
+    emit("ERR " + repr(e)); sys.exit(1)
+"""
+
+
+class TestClientViewSurvivesServerUnlink:
+    """The genuinely cross-process guarantee the #582 gate removal rests on: a
+    fast-path mmap *view* held in ONE process does not block ANOTHER process
+    unlinking that segment, and stays valid across the delete.
+
+    A child process maps the segment, decodes the view, and closes its handle
+    (mirroring _try_cachefile_transfer); the parent -- a stand-in for the server
+    -- then unlinks it. On Windows an open *handle* would block that with
+    WinError 32, but a *view* does not: the name is removed at once, a new file
+    can take the freed name, and the child's view still reads the original bytes
+    (delete-on-last-close, like POSIX). A pyarrow that pinned the handle through
+    the view, or a platform that blocked the cross-process unlink, fails here.
     """
 
     def _write_segment(self, path: Path) -> tuple[np.ndarray, str]:
@@ -788,42 +821,44 @@ class TestClientViewSurvivesServerUnlink:
             w.close()
         return arr, hashlib.sha256(arr.tobytes()).hexdigest()
 
-    def _client_view(self, path: Path) -> np.ndarray:
-        """Mirror _try_cachefile_transfer: map, decode zero-copy, close mm, keep view."""
-        import biopb.tensor._pool as pool
-
-        mm = pa.memory_map(str(path), "r")
-        try:
-            batch = pa.ipc.open_stream(mm).read_next_batch()
-            # The real fast path's decoder: arr is a frombuffer *view* aliasing
-            # the mapping, not a copy (Option C, biopb/biopb#571).
-            arr, _buf = pool._decode_unified_batch(batch)
-        finally:
-            mm.close()  # drop the handle; the view lives on via `arr`
-        assert not arr.flags.owndata, "test must hold a real mmap view, not a copy"
-        return arr
-
-    def test_view_survives_unlink_and_name_is_reusable(self):
+    def test_view_in_subprocess_survives_parent_unlink(self):
         d = Path(tempfile.mkdtemp())
+        proc = None
         try:
             seg = d / "seg_0001.arrow"
             _src, want = self._write_segment(seg)
-            arr = self._client_view(seg)  # client holds a view, handle closed
 
-            # Server evicts: unlink must succeed even with the client view live.
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _VIEW_WORKER, str(seg)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            ready = proc.stdout.readline().strip()
+            assert ready == "READY", f"worker failed to map+hold the view: {ready!r}"
+
+            # The PARENT (stand-in server) unlinks the segment the CHILD is
+            # viewing -- the real cross-process case, not a same-process sim.
             os.unlink(seg)
-            assert not seg.exists()  # name gone at once
+            assert not seg.exists()  # name removed at once, across processes
 
-            # The client's view still reads the right bytes after the delete.
-            assert hashlib.sha256(arr.tobytes()).hexdigest() == want
-
-            # Windows-specific: the freed name is reusable (no ACCESS_DENIED
-            # delete-pending block) -- the server can lay down a new segment here.
-            # Trivially true on POSIX; the real assertion is on Windows.
+            # The freed name is reusable while another process holds the view;
+            # write DIFFERENT bytes so a view bound to the new file would mismatch.
             with open(seg, "wb") as f:
-                f.write(b"new-segment")
+                f.write(b"a-different-new-segment")
             assert seg.exists()
+
+            proc.stdin.write("go\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline().strip()
+            assert line.startswith("SHA "), f"worker view read failed: {line!r}"
+            # The child's view is bound to the unlinked inode, not the name: it
+            # still reads the ORIGINAL bytes though a new file now owns the name.
+            assert line.split(" ", 1)[1] == want
+            assert proc.wait(timeout=30) == 0
         finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
             shutil.rmtree(d, ignore_errors=True)
 
 
