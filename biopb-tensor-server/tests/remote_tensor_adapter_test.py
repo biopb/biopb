@@ -871,7 +871,9 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
         _serve(proxy)
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-            desc = client.get_descriptor("lab__img")  # GetFlightInfo(with_metadata)
+            desc = client.get_descriptor(
+                "lab__img", with_metadata=True
+            )  # GetFlightInfo(with_metadata)
             assert desc.metadata_json  # was empty under the bug
             wrapped = json.loads(desc.metadata_json)
             assert wrapped["metadata"] == {"ome": {"channel": "DAPI"}}

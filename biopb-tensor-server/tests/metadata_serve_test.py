@@ -66,7 +66,7 @@ def test_serve_reads_metadata_from_catalog_without_recompute(simple_zarr_array):
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        desc = client.get_descriptor("img")  # GetFlightInfo(with_metadata)
+        desc = client.get_descriptor("img", with_metadata=True)
         wrapped = json.loads(desc.metadata_json)
         assert wrapped["metadata"] == {"ome": {"channel": "DAPI"}}
         # single-wrapped (the raw dict, not another envelope)
@@ -102,7 +102,7 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        desc = client.get_descriptor("img")
+        desc = client.get_descriptor("img", with_metadata=True)
         assert not desc.metadata_json  # empty row -> empty, NOT the adapter's late meta
         assert adapter.get_metadata_calls == 0  # never recomputed on the serve path
         client.close()
@@ -131,7 +131,7 @@ def test_serve_without_metadata_db_raises(simple_zarr_array):
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
         # GetFlightInfo(with_metadata) fails closed -> FlightInternalError
         with pytest.raises(flight.FlightInternalError, match="no metadata catalog"):
-            client.get_descriptor("img")
+            client.get_descriptor("img", with_metadata=True)
         assert adapter.get_metadata_calls == 0  # never recomputed
         client.close()
     finally:
@@ -182,7 +182,7 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        desc = client.get_descriptor("plate")
+        desc = client.get_descriptor("plate", with_metadata=True)
         wrapped = json.loads(desc.metadata_json)
         # cached plate row + per-tensor delta, merged
         assert wrapped["metadata"] == {"plate": {"rows": ["A"]}, "ome": "field"}
@@ -218,7 +218,7 @@ def test_serve_no_delta_serves_catalog_row(simple_zarr_array):
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        desc = client.get_descriptor("plate")
+        desc = client.get_descriptor("plate", with_metadata=True)
         wrapped = json.loads(desc.metadata_json)
         assert wrapped["metadata"] == {"plate": {"rows": ["A"]}}  # row, no delta
         client.close()

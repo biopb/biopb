@@ -266,10 +266,19 @@ class TensorFlightClient:
         return self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
 
     def get_descriptor(
-        self, array_id: str, with_metadata: bool = True
+        self,
+        array_id: str,
+        with_metadata: bool = False,
+        with_pyramid: bool = True,
+        with_read_plan: bool = False,
     ) -> TensorDescriptor:
         """Fetch one tensor's descriptor by array_id. See :meth:`CatalogClient.get_descriptor`."""
-        return self._catalog.get_descriptor(array_id, with_metadata=with_metadata)
+        return self._catalog.get_descriptor(
+            array_id,
+            with_metadata=with_metadata,
+            with_pyramid=with_pyramid,
+            with_read_plan=with_read_plan,
+        )
 
     def resolve(
         self,
