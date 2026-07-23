@@ -55,11 +55,14 @@ logger = logging.getLogger(__name__)
 # biopb/biopb#571). The client closes its own MemoryMappedFile handle at once,
 # but Arrow refcounts the mapping so the returned array keeps it alive (the
 # munmap waits for the last Buffer); untouched chunk pages are never faulted, so
-# a partial read is nearly free. Gated to POSIX (Windows file-mmap blocks
-# segment unlink -- see biopb/biopb#5). Safety rests on the server never
-# truncating a mapped segment inode (see file_backend `_create_segment`); an
-# NFS cache_dir would violate that and wants an explicit gate before this path
-# runs there.
+# a partial read is nearly free. Runs on Windows as well as POSIX (#582): the
+# client holds only a mapped *view*, not a handle, so the server can still
+# unlink an evicted segment (the name goes at once; the view keeps the pages
+# valid until munmap -- delete-on-last-close, like POSIX). Safety rests on the
+# server never truncating a mapped segment inode (see file_backend
+# `_create_segment`); a network cache_dir would violate that, but the server
+# already demotes a network/cloud cache_dir to the memory backend (#571), so no
+# segment file exists to locate and the client falls back to do_get.
 #
 # A held view also *pins* its segment's disk on the server (an evicted/unlinked
 # segment's blocks survive to the last close), so the process caps the total
@@ -185,13 +188,17 @@ def _is_localhost_location(location: str) -> bool:
 def _should_try_cachefile(location: str) -> bool:
     """Whether to attempt the localhost cache-file fast path for this location.
 
-    Requires: not disabled by env, a POSIX host (Windows file-mmap blocks the
-    server's segment unlink -- biopb/biopb#5), a loopback server (shared
-    filesystem), and a server not already known to lack chunk_locate.
+    Requires: not disabled by env, a loopback server (shared filesystem), and a
+    server not already known to lack chunk_locate.
+
+    Runs on Windows too (biopb/biopb#582). The old POSIX-only gate assumed a
+    client mmap blocks the server's segment unlink; it doesn't -- an open
+    *handle* does, but the client closes its ``MemoryMappedFile`` and keeps only
+    the mapped *view*, and Windows removes the name at once while the view keeps
+    the pages valid (delete-on-last-close, same as POSIX). The disk the view
+    pins is bounded by the pinned-segment budget below, on every platform.
     """
     if _is_cachefile_disabled_by_env():
-        return False
-    if os.name != "posix":
         return False
     if not _is_localhost_location(location):
         return False

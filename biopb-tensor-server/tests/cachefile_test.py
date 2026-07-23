@@ -11,6 +11,7 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
 """
 
 import dataclasses
+import hashlib
 import os
 import shutil
 import tempfile
@@ -732,11 +733,10 @@ class TestShouldTryCachefile:
 
         c._cachefile_support.clear()
 
-    def test_enabled_on_posix_localhost(self):
+    def test_enabled_on_localhost(self):
         from biopb.tensor.client import _should_try_cachefile
 
-        if os.name != "posix":
-            pytest.skip("POSIX-only path")
+        # Enabled on every platform now, Windows included (biopb/biopb#582).
         assert _should_try_cachefile("grpc://localhost:8815") is True
 
     def test_disabled_by_env(self):
@@ -750,17 +750,81 @@ class TestShouldTryCachefile:
 
         assert _should_try_cachefile("grpc://192.168.1.100:8815") is False
 
-    def test_disabled_on_non_posix(self):
+    def test_not_gated_by_os_name(self):
+        """The fast path is no longer gated on os.name (biopb/biopb#582): a
+        Windows host still takes the localhost path, so the copy on read the
+        POSIX gate used to protect is not needed."""
         import biopb.tensor.client as c
 
         with patch.object(os, "name", "nt"):
-            assert c._should_try_cachefile("grpc://localhost:8815") is False
+            assert c._should_try_cachefile("grpc://localhost:8815") is True
 
     def test_skips_after_unsupported_memoized(self):
         import biopb.tensor.client as c
 
         c._set_cachefile_supported("grpc://localhost:8815", False)
         assert c._should_try_cachefile("grpc://localhost:8815") is False
+
+
+class TestClientViewSurvivesServerUnlink:
+    """The cross-process guarantee the #582 gate removal rests on: a client that
+    holds a fast-path mmap *view* (having closed its MemoryMappedFile handle, as
+    _try_cachefile_transfer does) does not block the server unlinking that
+    segment, and its data stays valid across the delete.
+
+    On Windows this is the delete-on-last-close / delete-pending behaviour: an
+    open handle would block the unlink (WinError 32), but a view does not -- the
+    name is removed at once, the pages stay valid, and the freed name is even
+    reusable. A pyarrow that pinned the handle through the view (or a platform
+    that blocked the unlink) would fail here rather than in production.
+    """
+
+    def _write_segment(self, path: Path) -> tuple[np.ndarray, str]:
+        arr = (np.arange(4 * 1024 * 1024, dtype=np.int64) & 0xFF).astype(np.uint8)
+        batch = _make_typed_batch(arr.reshape(2048, 2048))
+        with pa.OSFile(str(path), "wb") as sink:
+            w = pa.RecordBatchStreamWriter(sink, batch.schema)
+            w.write_batch(batch)
+            w.close()
+        return arr, hashlib.sha256(arr.tobytes()).hexdigest()
+
+    def _client_view(self, path: Path) -> np.ndarray:
+        """Mirror _try_cachefile_transfer: map, decode zero-copy, close mm, keep view."""
+        import biopb.tensor._pool as pool
+
+        mm = pa.memory_map(str(path), "r")
+        try:
+            batch = pa.ipc.open_stream(mm).read_next_batch()
+            # The real fast path's decoder: arr is a frombuffer *view* aliasing
+            # the mapping, not a copy (Option C, biopb/biopb#571).
+            arr, _buf = pool._decode_unified_batch(batch)
+        finally:
+            mm.close()  # drop the handle; the view lives on via `arr`
+        assert not arr.flags.owndata, "test must hold a real mmap view, not a copy"
+        return arr
+
+    def test_view_survives_unlink_and_name_is_reusable(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            seg = d / "seg_0001.arrow"
+            _src, want = self._write_segment(seg)
+            arr = self._client_view(seg)  # client holds a view, handle closed
+
+            # Server evicts: unlink must succeed even with the client view live.
+            os.unlink(seg)
+            assert not seg.exists()  # name gone at once
+
+            # The client's view still reads the right bytes after the delete.
+            assert hashlib.sha256(arr.tobytes()).hexdigest() == want
+
+            # Windows-specific: the freed name is reusable (no ACCESS_DENIED
+            # delete-pending block) -- the server can lay down a new segment here.
+            # Trivially true on POSIX; the real assertion is on Windows.
+            with open(seg, "wb") as f:
+                f.write(b"new-segment")
+            assert seg.exists()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestArrayFromUnifiedBatch:
@@ -941,13 +1005,9 @@ class TestCachefileIntegration:
             client = TensorFlightClient(loc, cache_bytes=0)
             got = client.get_tensor("z").compute(scheduler="threads")
             assert np.array_equal(got, src)
-            if os.name == "posix":
-                # The fast path was actually used (chunk_locate succeeded).
-                assert cmod._cachefile_support.get(loc) is True
-            else:
-                # Windows: the cache-file path is gated off (biopb/biopb#5),
-                # so do_get is used and the probe cache stays untouched.
-                assert cmod._cachefile_support.get(loc) is None
+            # The fast path was actually used (chunk_locate succeeded), on every
+            # platform now including Windows (biopb/biopb#582).
+            assert cmod._cachefile_support.get(loc) is True
             client.close()
         finally:
             server.shutdown()
@@ -994,7 +1054,6 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
     def test_newer_segment_format_falls_back(self):
         """A server segment format newer than the client understands declines
         the fast path (and is memoized off), but data is still correct via do_get."""
@@ -1027,7 +1086,6 @@ class TestCachefileIntegration:
         chunk_id, bounds = ctx.endpoints[0]
         return chunk_id, tuple(bounds.start), tuple(bounds.stop)
 
-    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
     def test_fetched_block_is_read_only_fast_path(self):
         """End-to-end read contract: a chunk pulled through the real fetch leaf
         via the localhost mmap fast path is read-only, and mutating it raises."""
@@ -1057,7 +1115,6 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
     def test_fast_path_hands_out_mmap_view_that_outlives_close(self):
         """Option C (biopb/biopb#571): the fast path returns a zero-copy *view*
         onto the segment mapping, not an owned copy. The leaf closes its
@@ -1095,7 +1152,6 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
     def test_fast_path_view_pins_segment_and_unpins_on_gc(self):
         """A fast-path view charges its segment against the pinned-disk budget
         and releases the charge when the block (and its backing buffer) is gc'd
@@ -1140,7 +1196,6 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
     def test_fast_path_copies_when_over_pin_budget(self):
         """Over the pinned-segment budget the fast path copies the chunk out and
         releases the mapping instead of handing out another view -- so it pins no
