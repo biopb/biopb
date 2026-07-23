@@ -2,7 +2,7 @@
 set -e
 
 # Configuration via environment variables:
-# CONFIG_FILE    - Path to JSON (or legacy TOML) config file (if set and exists,
+# CONFIG_FILE    - Path to a JSON config file (if set and exists,
 #                  uses this file). Otherwise generates JSON config from env vars below
 # DATA_DIR       - Directory to monitor (default: /data)
 # MONITOR        - Enable live fs monitoring (default: true)

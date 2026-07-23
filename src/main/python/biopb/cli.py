@@ -337,6 +337,26 @@ def _tail_and_follow(
     raise typer.Exit(0)
 
 
+def _reject_legacy_toml(config: Path) -> None:
+    """Refuse to start on a pre-#34 ``biopb.toml``, naming the migration command.
+
+    The server no longer reads TOML (biopb/biopb#34), and every config probe on
+    the start path is best-effort (an unreadable config silently falls back to
+    defaults -- ``_read_flight_host`` even fails *closed* to a public bind). So a
+    legacy config would otherwise surface as an unrelated "public bind needs a
+    token" refusal, or as a plane that starts on defaults and serves none of the
+    user's data. Check it once, up front, where the user can act on it.
+    """
+    if config and config.suffix.lower() == ".toml" and config.exists():
+        console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
+        console.print(
+            "JSON is the only supported format. Convert it with "
+            "[bold]biopb server migrate-config[/bold] (settings are preserved "
+            "and the old file is backed up), then retry."
+        )
+        raise typer.Exit(1)
+
+
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
     """Loopback-reachable gRPC host/port from the config (default
     127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
@@ -547,7 +567,7 @@ def _render_cache_stats(stats: dict) -> None:
 @server_app.command("cache-stats")
 def cache_stats(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
+        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (biopb.json)"
     ),
     token: Optional[str] = typer.Option(
         None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"
@@ -593,12 +613,12 @@ def migrate_config(
 ):
     """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
 
-    JSON is the canonical on-disk format (biopb/biopb#34); TOML stays readable
-    through a deprecation window. This converts a legacy TOML config in place --
-    reading the raw table (so advanced/unknown keys survive) and writing the
-    sibling ``biopb.json`` (plus its schema sidecar), then backing the old TOML
-    up to ``biopb.toml.bak``. Settings are preserved verbatim, so a running
-    server need not be restarted.
+    JSON is the only format the server reads (biopb/biopb#34), so this command
+    is the upgrade path for a pre-#34 install. It converts a legacy TOML config
+    in place -- reading the raw table (so advanced/unknown keys survive) and
+    writing the sibling ``biopb.json`` (plus its schema sidecar), then backing
+    the old TOML up to ``biopb.toml.bak``. Settings are preserved verbatim, so a
+    running server need not be restarted.
     """
     from ._locations import (
         CANONICAL_CONFIG_NAME,
@@ -648,8 +668,10 @@ def migrate_config(
         raise typer.Exit(0)
 
     # The migration case: TOML only. Read the raw table and write canonical JSON.
+    # `read_legacy_toml` is the last TOML reader in the tree -- the server's own
+    # load path no longer parses TOML at all (biopb/biopb#34).
     try:
-        from biopb_tensor_server.core.config import _read_config_file, save_config
+        from biopb_tensor_server.core.config import read_legacy_toml, save_config
     except Exception as exc:  # noqa: BLE001 - optional dependency
         console.print(
             "[red]Config migration is unavailable:[/red] "
@@ -659,7 +681,7 @@ def migrate_config(
         raise typer.Exit(1)
 
     try:
-        data = _read_config_file(toml_path)
+        data = read_legacy_toml(toml_path)
     except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
         console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
         raise typer.Exit(1)
@@ -1043,7 +1065,7 @@ def _control_run_argv(
 @control_app.command("start")
 def control_start(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -1100,6 +1122,7 @@ def control_start(
     """
     _require_biopb_control()
     _ensure_dirs()
+    _reject_legacy_toml(config)
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
     # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
@@ -1340,7 +1363,7 @@ def control_logs(
 @control_app.command("run")
 def control_run(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -1382,6 +1405,7 @@ def control_run(
     """
     _require_biopb_control()
     _ensure_dirs()
+    _reject_legacy_toml(config)
     from biopb_control import run_control
     from biopb_control._supervisor import DataPlaneSpec
 

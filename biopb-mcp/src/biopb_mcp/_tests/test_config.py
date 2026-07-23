@@ -555,6 +555,30 @@ class TestValidation:
             == defaults["tensor"]["health_poll_max_interval"]
         )
 
+    def test_clamping_a_leaf_cannot_leave_a_residual_inversion(self, mock_config_dir):
+        """Per-field clamping must not *introduce* a cross-field violation.
+
+        A negative min clamps to its default (2.0), which is above a small but
+        valid max (1.0) -- an inversion the first pass didn't see, since the raw
+        -1 <= 1. The load path re-checks to a fixpoint, so the loaded config is
+        clean rather than inverted the other way.
+        """
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "tensor": {
+                    "health_poll_min_interval": -1.0,
+                    "health_poll_max_interval": 1.0,
+                }
+            },
+        )
+        from biopb_mcp._config import config_problems
+
+        assert config_problems(config) == []
+        assert get_setting(config, "tensor.health_poll_min_interval") <= get_setting(
+            config, "tensor.health_poll_max_interval"
+        )
+
     def test_warns_naming_key_value_and_range(self, mock_config_dir, caplog):
         with caplog.at_level("WARNING"):
             _write_and_load(mock_config_dir, {"pyramid": {"downscale_factor": 1}})
@@ -570,6 +594,14 @@ class TestValidation:
         config_path.write_text("not json {{{")
         CONFIG.reload()
         assert load_config() == get_default_config()
+
+    def test_shipped_defaults_pass_the_whole_check(self):
+        """The clamp target must itself be valid, cross-field rules included --
+        otherwise a bad leaf would be replaced by an equally invalid default and
+        the config would never converge."""
+        from biopb_mcp._config import config_problems
+
+        assert config_problems(DEFAULT_CONFIG) == []
 
     def test_shipped_defaults_satisfy_every_constraint(self):
         """DEFAULT_CONFIG must itself pass validation -- otherwise a bad leaf

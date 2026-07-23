@@ -1132,10 +1132,16 @@ def test_mcp_config_put_rejects_unhashable_enum_value_as_422_not_500(control, mc
 
 
 def test_mcp_config_put_rejects_inverted_health_poll(control, mcp_home):
+    # The cross-field rule is declared once, in biopb-mcp, and reaches this
+    # endpoint through the shared checker -- this handler restates nothing, so a
+    # rule added there cannot silently pass here (biopb/biopb#34).
     status, payload = _put(
         f"{control}/api/mcp_config",
         {"tensor": {"health_poll_min_interval": 90, "health_poll_max_interval": 10}},
     )
     assert status == 422, payload
     paths = {tuple(e["path"]) for e in payload["errors"]}
+    # Both ends of the range are flagged, so the form can highlight the pair the
+    # user has to reconcile (and the load path clamps both).
     assert ("tensor", "health_poll_min_interval") in paths
+    assert ("tensor", "health_poll_max_interval") in paths

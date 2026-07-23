@@ -165,7 +165,7 @@ pnpm -C web dev   # runs on :5173, proxies to a live control on :8813
 ```
 biopb-tensor-server serve    Start the gRPC Flight server only
 biopb-tensor-server launch   Start Flight server + HTTP sidecar for web
-biopb-tensor-server validate Check a config file (JSON; legacy TOML)
+biopb-tensor-server validate Check a config file (biopb.json)
 biopb-tensor-server list-tensors  List all data sources and tensors in a config
 biopb-tensor-server version  Show version information
 ```
@@ -174,7 +174,7 @@ biopb-tensor-server version  Show version information
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
+| `--config, -c` | (required) | Path to config file (`biopb.json`) |
 | `--web-port` | 8814 | HTTP server port |
 | `--web-host` | 127.0.0.1 | HTTP server bind address |
 | `--token` | (auto) | Website access token (remote mode; auto-generated if omitted) |
@@ -187,7 +187,7 @@ biopb-tensor-server version  Show version information
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
+| `--config, -c` | (required) | Path to config file (`biopb.json`) |
 | `--host, -h` | (from config) | gRPC server host |
 | `--port, -p` | (from config) | gRPC server port |
 | `--writable` | false | Enable write mode for data upload |

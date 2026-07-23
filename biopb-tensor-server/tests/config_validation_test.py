@@ -1,15 +1,18 @@
-"""Declarative config value validation (biopb/biopb#34).
+"""Config value validation: clamp at the read step, report at the strict
+surfaces (biopb/biopb#34).
 
-Out-of-range / bad-enum knobs are flagged at construction (warn during the TOML
-deprecation window, raise under ``_STRICT_VALIDATION``) instead of blowing up
-later on the request path. Enforcement lives in each dataclass's
-``__post_init__``, so it covers both file formats and direct construction.
+Out-of-range / bad-enum knobs are caught where a config is *read* -- the shared
+``biopb._config_validate`` checker biopb-mcp and the control use too -- and
+replaced with their defaults, with a warning naming the key. They never reach the
+request path (the actual bug: ``downscale_factor=0`` -> ZeroDivisionError in
+GetFlightInfo), and they never stop a supervised server from starting either.
+``validate_config_dict`` is the strict half: same rules, reported per field, for
+the admin form and ``biopb-tensor-server validate``.
 """
 
 import logging
 
 import pytest
-from biopb_tensor_server.core import config as cfg
 from biopb_tensor_server.core.config import (
     CacheConfig,
     MetadataDbConfig,
@@ -25,126 +28,158 @@ def _violations(caplog):
     return [m for m in caplog.messages if "Invalid config value" in m]
 
 
+def _section_of(config, section):
+    """The dataclass holding *section*'s fields (``server`` is the root)."""
+    return config if section == "server" else getattr(config, section)
+
+
+def _default_of(section, field):
+    defaults = {
+        "server": ServerConfig,
+        "cache": CacheConfig,
+        "pyramid": PyramidConfig,
+        "precache": PrecacheConfig,
+        "metadata_db": MetadataDbConfig,
+    }
+    return getattr(defaults[section](), field)
+
+
 # --- the concrete failure modes named in the issue ---------------------------
+# Raw on-disk configs, so the on-disk key (`cache.max_bytes`) and the dataclass
+# field it feeds (`memory_max_bytes`) are both exercised.
 
 
 @pytest.mark.parametrize(
-    "factory, section, key",
+    "raw, section, field",
     [
-        (lambda: PyramidConfig(downscale_factor=0), "pyramid", "downscale_factor"),
-        (lambda: PyramidConfig(downscale_factor=1), "pyramid", "downscale_factor"),
+        ({"pyramid": {"downscale_factor": 0}}, "pyramid", "downscale_factor"),
+        ({"pyramid": {"downscale_factor": 1}}, "pyramid", "downscale_factor"),
         (
-            lambda: PyramidConfig(pixel_budget_cubic_root=0),
+            {"pyramid": {"pixel_budget_cubic_root": 0}},
             "pyramid",
             "pixel_budget_cubic_root",
         ),
-        (lambda: PyramidConfig(threshold=0), "pyramid", "threshold"),
-        (
-            lambda: PyramidConfig(reduction_method="bogus"),
-            "pyramid",
-            "reduction_method",
-        ),
+        ({"pyramid": {"threshold": 0}}, "pyramid", "threshold"),
+        ({"pyramid": {"reduction_method": "bogus"}}, "pyramid", "reduction_method"),
         # "precompute" is protocol vocabulary (request a native on-disk level),
         # not a way to compute a pyramid level -- invalid as config.
         (
-            lambda: PyramidConfig(reduction_method="precompute"),
+            {"pyramid": {"reduction_method": "precompute"}},
             "pyramid",
             "reduction_method",
         ),
         (
-            lambda: PyramidConfig(reduction_method="PRECOMPUTED"),
+            {"pyramid": {"reduction_method": "PRECOMPUTED"}},
             "pyramid",
             "reduction_method",
         ),
-        (lambda: CacheConfig(backend="bogus"), "cache", "backend"),
-        (lambda: CacheConfig(memory_max_bytes=0), "cache", "memory_max_bytes"),
-        (lambda: CacheConfig(file_max_total_bytes=-1), "cache", "file_max_total_bytes"),
+        ({"cache": {"backend": "bogus"}}, "cache", "backend"),
+        ({"cache": {"max_bytes": 0}}, "cache", "memory_max_bytes"),
+        ({"cache": {"file_max_total_gb": -1}}, "cache", "file_max_total_bytes"),
+        ({"precache": {"backlog_high_water": 1.5}}, "precache", "backlog_high_water"),
+        ({"precache": {"backlog_high_water": -0.1}}, "precache", "backlog_high_water"),
         (
-            lambda: PrecacheConfig(backlog_high_water=1.5),
-            "precache",
-            "backlog_high_water",
-        ),
-        (
-            lambda: PrecacheConfig(backlog_high_water=-0.1),
-            "precache",
-            "backlog_high_water",
-        ),
-        (
-            lambda: MetadataDbConfig(max_query_results=0),
+            {"metadata_db": {"max_query_results": 0}},
             "metadata_db",
             "max_query_results",
         ),
-        (
-            lambda: MetadataDbConfig(query_timeout_ms=0),
-            "metadata_db",
-            "query_timeout_ms",
-        ),
-        (lambda: ServerConfig(port=0), "server", "port"),
-        (lambda: ServerConfig(port=99999), "server", "port"),
-        (lambda: ServerConfig(rescan_interval=-1.0), "server", "rescan_interval"),
+        ({"metadata_db": {"query_timeout_ms": 0}}, "metadata_db", "query_timeout_ms"),
+        ({"server": {"port": -1}}, "server", "port"),
+        ({"server": {"port": 99999}}, "server", "port"),
+        ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
 )
-def test_bad_value_warns_naming_section_and_key(factory, section, key, caplog):
+def test_bad_value_is_clamped_with_a_warning(raw, section, field, caplog):
     with caplog.at_level(logging.WARNING):
-        obj = factory()  # must NOT raise (warn-only window)
+        config = parse_config(raw)  # must NOT raise: the server still starts
     msgs = _violations(caplog)
     assert msgs, "expected a validation warning"
-    assert f"[{section}]" in msgs[0]
-    assert key in msgs[0]
-    # The offending value is left untouched (we only warn).
-    assert getattr(obj, key) is not None
+    # The log line carries the full dotted path, so the key is findable in the file.
+    assert f"{section}.{field}" in msgs[0]
+    # ...and the value in force is the default, not the rejected one.
+    assert getattr(_section_of(config, section), field) == _default_of(section, field)
 
 
-def test_warning_describes_accepted_range_and_enum(caplog):
+def test_warning_describes_accepted_range_and_enum_and_the_default_used(caplog):
     with caplog.at_level(logging.WARNING):
-        PyramidConfig(downscale_factor=0)
-        CacheConfig(backend="bogus")
+        parse_config({"pyramid": {"downscale_factor": 0}, "cache": {"backend": "bad"}})
     joined = "\n".join(_violations(caplog))
     assert ">= 2" in joined  # range
     assert "file" in joined and "memory" in joined  # enum members
+    assert "using the default" in joined  # what actually ran
 
 
-# --- legitimate values that must NOT warn ------------------------------------
+# --- legitimate values that must pass through untouched ----------------------
 
 
 def test_valid_defaults_do_not_warn(caplog):
     with caplog.at_level(logging.WARNING):
-        ServerConfig()  # constructs every nested config at its defaults
+        parse_config({})
     assert not _violations(caplog)
 
 
 @pytest.mark.parametrize(
-    "factory",
+    "raw, section, field, expected",
     [
         # full_rescan_interval <= 0 disables the periodic full scan (sentinel).
-        lambda: ServerConfig(full_rescan_interval=0.0),
-        lambda: ServerConfig(full_rescan_interval=-1.0),
-        # reduction_method aliases + case-insensitivity (mirrors normalize_*'s
-        # computable subset -- "precompute" is protocol-only, tested above).
-        lambda: PyramidConfig(reduction_method="mean"),
-        lambda: PyramidConfig(reduction_method="STRIDE"),
+        (
+            {"server": {"full_rescan_interval": 0.0}},
+            "server",
+            "full_rescan_interval",
+            0.0,
+        ),
+        # port 0 = bind an OS-assigned ephemeral port (a sentinel, not a typo).
+        ({"server": {"port": 0}}, "server", "port", 0),
+        ({"server": {"port": 65535}}, "server", "port", 65535),
+        ({"server": {"log_level": "debug"}}, "server", "log_level", "debug"),
+        # reduction_method aliases + case-insensitivity (the computable subset;
+        # "precompute" is protocol-only, tested above).
+        (
+            {"pyramid": {"reduction_method": "mean"}},
+            "pyramid",
+            "reduction_method",
+            "mean",
+        ),
+        (
+            {"pyramid": {"reduction_method": "STRIDE"}},
+            "pyramid",
+            "reduction_method",
+            "STRIDE",
+        ),
         # "linear" is a tolerated deprecated alias (folds to "area" at read time).
-        lambda: PyramidConfig(reduction_method="linear"),
-        # log_level accepted forms.
-        lambda: ServerConfig(log_level="debug"),
+        (
+            {"pyramid": {"reduction_method": "linear"}},
+            "pyramid",
+            "reduction_method",
+            "linear",
+        ),
         # boundaries are inclusive.
-        lambda: PrecacheConfig(backlog_high_water=0.0),
-        lambda: PrecacheConfig(backlog_high_water=1.0),
-        lambda: ServerConfig(port=65535),
+        (
+            {"precache": {"backlog_high_water": 0.0}},
+            "precache",
+            "backlog_high_water",
+            0.0,
+        ),
+        (
+            {"precache": {"backlog_high_water": 1.0}},
+            "precache",
+            "backlog_high_water",
+            1.0,
+        ),
     ],
 )
-def test_legitimate_values_are_silent(factory, caplog):
+def test_legitimate_values_survive_silently(raw, section, field, expected, caplog):
     with caplog.at_level(logging.WARNING):
-        factory()
+        config = parse_config(raw)
     assert not _violations(caplog)
+    assert getattr(_section_of(config, section), field) == expected
 
 
-# --- it flows through the file-load path -------------------------------------
-
-
-def test_parse_config_warns_on_bad_value(caplog):
+def test_every_bad_section_is_reported_not_just_the_first(caplog):
+    # The load path reports all of them in one pass -- fixing one and rediscovering
+    # the next on the following start would be a miserable loop.
     with caplog.at_level(logging.WARNING):
-        parse_config(
+        config = parse_config(
             {
                 "server": {"port": 70000},
                 "pyramid": {"downscale_factor": 0},
@@ -152,29 +187,20 @@ def test_parse_config_warns_on_bad_value(caplog):
             }
         )
     joined = "\n".join(_violations(caplog))
-    assert "[server]" in joined and "port" in joined
-    assert "[pyramid]" in joined and "downscale_factor" in joined
-    assert "[cache]" in joined and "backend" in joined
-
-
-# --- strict mode raises (the post-migration end state) -----------------------
-
-
-def test_strict_mode_raises(monkeypatch):
-    monkeypatch.setattr(cfg, "_STRICT_VALIDATION", True)
-    with pytest.raises(ValueError, match="downscale_factor"):
-        PyramidConfig(downscale_factor=0)
-
-
-def test_strict_mode_allows_valid(monkeypatch):
-    monkeypatch.setattr(cfg, "_STRICT_VALIDATION", True)
-    ServerConfig()  # no raise
+    assert "server.port" in joined
+    assert "pyramid.downscale_factor" in joined
+    assert "cache.backend" in joined
+    assert (config.port, config.pyramid.downscale_factor, config.cache.backend) == (
+        ServerConfig().port,
+        PyramidConfig().downscale_factor,
+        CacheConfig().backend,
+    )
 
 
 # --- validate_config_dict: the endpoint's semantic gate ----------------------
 # Same _CONSTRAINTS rules the server enforces at load, returned as structured
-# {path, message} problems and independent of the warn/raise policy, so the
-# admin config-save endpoint accepts exactly what the server will load.
+# {path, message} problems rather than raised, so the admin config-save endpoint
+# can report every problem at once and accepts exactly what the server loads.
 
 
 def test_validate_config_dict_valid_is_empty():
@@ -201,6 +227,10 @@ def test_validate_config_dict_uses_ondisk_paths():
     # endpoint.
     problems = validate_config_dict({"cache": {"max_entries": 0}})
     assert [p["path"] for p in problems] == [["cache", "max_entries"]]
+    # The message names the on-disk key too, matching the path -- not the internal
+    # `memory_max_entries` field the form has no name for.
+    assert problems[0]["message"].startswith("max_entries=")
+    assert "memory_max_entries" not in problems[0]["message"]
 
 
 def test_validate_config_dict_ignores_removed_compute_section():
@@ -209,11 +239,10 @@ def test_validate_config_dict_ignores_removed_compute_section():
     assert validate_config_dict({"compute": {"backend": "quantum"}}) == []
 
 
-def test_validate_config_dict_independent_of_warn_policy(monkeypatch):
-    # Warn-only mode (the default deprecation window) must NOT suppress the
-    # returned problems -- the endpoint needs to reject regardless.
-    monkeypatch.setattr(cfg, "_STRICT_VALIDATION", False)
-    assert validate_config_dict({"server": {"port": 0}})
+def test_validate_config_dict_reports_instead_of_raising():
+    # The endpoint's surface returns problems where the load path raises, so a
+    # bad form submission is a 422 listing them, not a 500.
+    assert validate_config_dict({"server": {"port": 70000}})
 
 
 def test_validate_config_dict_structural_error_is_reported():

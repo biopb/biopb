@@ -20,6 +20,7 @@ import typer
 from biopb import _web_auth
 from biopb._lifecycle import deathwatch as _deathwatch
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
@@ -31,8 +32,10 @@ from biopb_tensor_server.core.config import (
     CacheConfig,
     ServerConfig,
     SourceConfig,
+    _read_config_file,
     load_config,
     resolve_all_sources,
+    validate_config_dict,
 )
 from biopb_tensor_server.core.logging_config import (
     get_log_level_from_env,
@@ -709,6 +712,24 @@ def _create_source_adapter(source: SourceConfig, registry=None):
     return adapter_cls.create_from_config(source)
 
 
+def _load_config_or_exit(config: Path) -> ServerConfig:
+    """Load *config*, turning a bad file into a one-line refusal, not a traceback.
+
+    Config errors are the user's to fix -- a bad knob, an unmigrated TOML, a
+    JSON typo -- and this is where the server fails fast on them
+    (biopb/biopb#34). A traceback buries that message, and under the control
+    plane it lands in ``tensor-server.log`` where it reads as a crash rather
+    than as "your config says downscale_factor=0".
+    """
+    try:
+        return load_config(config)
+    except (ValueError, FileNotFoundError) as e:
+        # Escaped: a validation message names its section as "[pyramid]", which
+        # rich would otherwise eat as a style tag and print as nothing.
+        console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def serve(
     config: Path = typer.Option(
@@ -716,7 +737,7 @@ def serve(
         "--config",
         "-c",
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -750,11 +771,11 @@ def serve(
     """Start the TensorFlight server.
 
     Example:
-        biopb-tensor-server serve --config biopb-tensor.toml
-        biopb-tensor-server serve -c config.toml --port 9000
-        biopb-tensor-server serve -c config.toml --log-level DEBUG
+        biopb-tensor-server serve --config biopb.json
+        biopb-tensor-server serve -c config.json --port 9000
+        biopb-tensor-server serve -c config.json --log-level DEBUG
     """
-    server_config = load_config(config)
+    server_config = _load_config_or_exit(config)
 
     # Setup logging with priority: CLI > env > config > default
     effective_log_level = (
@@ -805,14 +826,31 @@ def validate(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
 ):
     """Validate a config file.
 
     Example:
-        biopb-tensor-server validate biopb-tensor.toml
+        biopb-tensor-server validate biopb.json
     """
+    # The strict end of the validation scheme (biopb/biopb#34): loading would
+    # clamp a bad knob to its default and carry on -- right for a supervised
+    # start, wrong here, where a human is explicitly asking whether the file is
+    # good. Report every problem and fail. Kept out of the try below so the exit
+    # isn't swallowed by its catch-all and re-reported as an error.
+    try:
+        problems = validate_config_dict(_read_config_file(config))
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
+        raise typer.Exit(1)
+    if problems:
+        console.print("[red]✗ Config invalid[/red]")
+        for problem in problems:
+            where = ".".join(problem["path"]) or "config"
+            console.print(f"  {where}: {_rich_escape(problem['message'])}")
+        raise typer.Exit(1)
+
     try:
         server_config = load_config(config)
         sources = resolve_all_sources(server_config)
@@ -837,7 +875,9 @@ def validate(
             console.print(f"    - {source.source_id} ({source.type}: {source.url})")
 
     except Exception as e:
-        console.print(f"[red]✗ Config invalid: {e}[/red]")
+        # Escaped: a validation message names its section as "[pyramid]", which
+        # rich would otherwise eat as a style tag and print as nothing.
+        console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
 
 
@@ -846,13 +886,13 @@ def list_tensors(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
 ):
     """List data sources and tensors defined in a config file.
 
     Example:
-        biopb-tensor-server list biopb-tensor.toml
+        biopb-tensor-server list biopb.json
     """
     try:
         server_config = load_config(config)
@@ -899,7 +939,7 @@ def list_tensors(
         console.print(table)
 
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        console.print(f"[red]Error: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
 
 
@@ -959,7 +999,7 @@ def launch(
         "--config",
         "-c",
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -1020,12 +1060,12 @@ def launch(
     or point --web-url to a production deployment.
 
     Example:
-        biopb-tensor-server launch --config biopb-tensor.toml
-        biopb-tensor-server launch -c config.toml --web-port 9000
-        biopb-tensor-server launch -c config.toml --log-level DEBUG
+        biopb-tensor-server launch --config biopb.json
+        biopb-tensor-server launch -c config.json --web-port 9000
+        biopb-tensor-server launch -c config.json --log-level DEBUG
     """
     # --- Load server config and setup logging ---
-    server_config = load_config(config)
+    server_config = _load_config_or_exit(config)
 
     # Setup logging with priority: CLI > env > config > default
     effective_log_level = (

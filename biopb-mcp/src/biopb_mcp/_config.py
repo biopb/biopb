@@ -43,6 +43,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 # analogous one; biopb/biopb#182, #34) and the config-file location.
 from biopb import _locations
 from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
+from biopb._config_io import atomic_write_json
+from biopb._config_validate import MISSING, Problem, check_sections, warn_and_clamp
 from biopb._locations import mcp_config_path
 
 if TYPE_CHECKING:
@@ -541,7 +543,11 @@ def get_default_config() -> dict:
     return copy.deepcopy(DEFAULT_CONFIG)
 
 
-_MISSING = object()
+# The shared "key is not present" sentinel, not a second local one: `_walk_path`
+# is handed to the shared clamping policy as its default lookup, which tests the
+# result against this exact object -- two sentinels would make "no default" look
+# like a value and write the sentinel into the config.
+_MISSING = MISSING
 
 
 def get_setting(config: dict, path: str, default=_MISSING):
@@ -661,50 +667,74 @@ def _walk_path(node: dict, keys):
     return node
 
 
+def _health_poll_not_inverted(get) -> List[Problem]:
+    """The health-poll backoff must not invert (min > max).
+
+    A cross-field rule: no per-field ``Range`` can express it, so it is declared
+    here as data and applied by the shared walker -- which is what makes the
+    control's ``PUT /api/mcp_config`` enforce it too, instead of restating the
+    comparison in its own handler. Both ends are reported, so the load path
+    resets the whole range to its defaults rather than half of it.
+    """
+    lo = get("tensor", "health_poll_min_interval")
+    hi = get("tensor", "health_poll_max_interval")
+    if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
+        return []  # absent or wrong-typed: the per-field pass owns that
+    if lo <= hi:
+        return []
+    message = (
+        f"health_poll_min_interval={lo!r} must be <= health_poll_max_interval={hi!r}"
+    )
+    return [
+        Problem(("tensor", "health_poll_min_interval"), message),
+        Problem(("tensor", "health_poll_max_interval"), message),
+    ]
+
+
+CROSS_FIELD_RULES = (_health_poll_not_inverted,)
+
+
+def config_problems(config: dict) -> List[Problem]:
+    """Every constraint violation in *config* (empty when valid).
+
+    The shared checker, applied to biopb-mcp's sections -- the same call the
+    tensor server's load path and the control's admin endpoints make, so a knob
+    is judged identically wherever it is met (biopb/biopb#34, #182).
+    """
+    return check_sections(
+        ((section, config.get(section, {})) for section in _SECTION_CLASSES),
+        _CONSTRAINTS,
+        class_names={s: cls.__name__ for s, cls in _SECTION_CLASSES.items()},
+        cross_field=CROSS_FIELD_RULES,
+    )
+
+
 def _validate_and_clamp(config: dict) -> dict:
     """Warn on each out-of-range leaf and reset it to its default, in place.
 
-    A leaf absent from the merged dict is skipped (nothing to check); a
-    present-but-invalid leaf is logged and replaced with its ``DEFAULT_CONFIG``
-    value so the config stays usable (biopb/biopb#182). Returns *config*.
-    """
-    for section, cls in _SECTION_CLASSES.items():
-        for field_name, constraint in _CONSTRAINTS.get(cls.__name__, {}).items():
-            keys = (section, field_name)
-            value = _walk_path(config, keys)
-            if value is _MISSING or constraint.ok(value):
-                continue
-            default = _walk_path(DEFAULT_CONFIG, keys)
-            logger.warning(
-                "Invalid config value %s=%r (expected %s); using default %r. "
-                "See biopb/biopb#182.",
-                ".".join(keys),
-                value,
-                constraint.describe(),
-                default,
-            )
-            if default is _MISSING:
-                continue
-            config[section][field_name] = copy.deepcopy(default)
+    The load-path policy (see :mod:`biopb._config_validate`): a bad value must
+    not reach the runtime, but must not take the session down either -- a raise
+    here is a dead MCP client and no viewer. A leaf absent from the merged dict
+    is skipped (nothing to check). Returns *config*.
 
-    # Cross-field: the health-poll interval must not invert (min > max), which
-    # would break the exponential backoff. Reset both to defaults if it does.
-    lo_path = ("tensor", "health_poll_min_interval")
-    hi_path = ("tensor", "health_poll_max_interval")
-    lo, hi = _walk_path(config, lo_path), _walk_path(config, hi_path)
-    if lo is not _MISSING and hi is not _MISSING and lo > hi:
-        logger.warning(
-            "Invalid config: tensor.health_poll_min_interval=%r > "
-            "health_poll_max_interval=%r; using defaults. See biopb/biopb#182.",
-            lo,
-            hi,
-        )
-        tensor = config["tensor"]
-        tensor["health_poll_min_interval"] = copy.deepcopy(
-            _walk_path(DEFAULT_CONFIG, lo_path)
-        )
-        tensor["health_poll_max_interval"] = copy.deepcopy(
-            _walk_path(DEFAULT_CONFIG, hi_path)
+    Clamped to a fixpoint: resetting a per-field leaf to its default can *create*
+    a cross-field violation the first pass didn't see (a negative
+    ``health_poll_min_interval`` clamped to a default above a small but valid
+    ``max``), so re-check until clean. Converges because the defaults are
+    mutually consistent (``test_shipped_defaults_pass_the_whole_check``); the
+    bound is a belt-and-braces guard against a cycle.
+    """
+    for _ in range(len(_CONSTRAINTS) + len(CROSS_FIELD_RULES) + 1):
+        problems = config_problems(config)
+        if not problems:
+            break
+        warn_and_clamp(
+            problems,
+            lambda path: _walk_path(DEFAULT_CONFIG, path),
+            lambda path, value: config[path[0]].__setitem__(
+                path[1], copy.deepcopy(value)
+            ),
+            logger,
         )
     return config
 
@@ -743,29 +773,6 @@ def _read_and_merge_from_disk() -> dict:
     except Exception as e:
         logger.warning("Failed to load config, using defaults: %s", e)
         return get_default_config()
-
-
-def _atomic_write_json(path: Path, data: dict) -> None:
-    """Write *data* as JSON to *path* atomically (temp file + ``os.replace``).
-
-    Writing to a sibling temp file and renaming over the target means a reader
-    never sees a half-written config: the rename is atomic on POSIX and Windows.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Unique per process *and* thread so two concurrent writers never collide on
-    # the temp file.
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        with tmp.open("w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-        logger.debug("Saved config to %s", path)
-    except Exception as e:
-        logger.warning("Failed to save config: %s", e)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
 
 
 class _Config:
@@ -844,7 +851,7 @@ class _Config:
         return self._data
 
     def _save(self) -> None:
-        _atomic_write_json(get_config_path(), self._data)
+        atomic_write_json(get_config_path(), self._data, raise_on_error=False)
 
 
 # The one config instance in the process. All reads/writes route through it.
@@ -868,7 +875,7 @@ def save_config(config: dict) -> None:
     so the next read re-merges it from disk. Prefer ``CONFIG.set(path, value)``
     for targeted writes.
     """
-    _atomic_write_json(get_config_path(), config)
+    atomic_write_json(get_config_path(), config, raise_on_error=False)
     CONFIG.reload()
 
 

@@ -66,7 +66,7 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
         lambda *args, **kwargs: (server, source_manager, watcher, None),
     )
 
-    cli.serve(config=Path("unused.toml"))
+    cli.serve(config=Path("unused.json"))
 
     assert source_manager.stop_calls == 1
     assert watcher.stop_calls == 1
@@ -269,7 +269,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
         lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable(), None),
     )
 
-    cli.serve(config=Path("unused.toml"))
+    cli.serve(config=Path("unused.json"))
 
     assert _cache_lock_is_free(lock_path)
 
@@ -470,3 +470,68 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
         if precache_worker is not None:
             precache_worker.stop()
         server.shutdown()
+
+
+# --- config errors are a refusal, not a traceback (biopb/biopb#34) ------------
+
+
+def test_validate_reports_a_bad_knob_and_exits_1(tmp_path, capsys):
+    """`validate` is the strict surface: a human asked, so report and fail.
+
+    The load path clamps the same value (a supervised server must still come up),
+    which is exactly why this command validates the *raw* file rather than
+    inspecting a loaded config -- otherwise it would report a clean bill on a
+    config whose bad value had just been defaulted away.
+    """
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps({"server": {"port": 8815}, "pyramid": {"downscale_factor": 0}})
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+    assert exc.value.exit_code == 1
+    out = capsys.readouterr().out
+    assert "downscale_factor" in out
+    # The section name survives rich's markup parser ("[pyramid]" is not a tag).
+    assert "pyramid" in out
+
+
+def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypatch):
+    """A bad knob must not stop the server: the plane is supervised, so refusing
+    to load would be restarted straight back into the same failure with the cause
+    buried in a log (biopb/biopb#34). The value is defaulted instead, so nothing
+    invalid reaches GetFlightInfo either."""
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps({"server": {"port": 8815}, "pyramid": {"downscale_factor": 0}})
+    )
+
+    loaded = {}
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+
+    def _capture(config, port=None, **kwargs):
+        loaded["config"] = config
+        return _FakeServer(), _FakeStoppable(), _FakeStoppable(), None
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture)
+    cli.serve(config=config_path)
+
+    from biopb_tensor_server.core.config import PyramidConfig
+
+    assert loaded["config"].pyramid.downscale_factor == PyramidConfig().downscale_factor
+
+
+def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys):
+    config_path = tmp_path / "biopb.toml"
+    config_path.write_text("[server]\nport = 8815\n")
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.serve(config=config_path)
+    assert exc.value.exit_code == 1
+    assert "migrate-config" in capsys.readouterr().out

@@ -88,7 +88,7 @@ docker run -d --init \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored. Its `[server].port` **must equal gRPC=`BIOPB_BASE_PORT`+5** and `[server].host` must be loopback-reachable (`0.0.0.0`/`127.0.0.1`), or the control plane's liveness probe won't see the data plane as serving |
+| `CONFIG_FILE` | (unset) | Path to a JSON config file. If set, all other variables below are ignored. Its `[server].port` **must equal gRPC=`BIOPB_BASE_PORT`+5** and `[server].host` must be loopback-reachable (`0.0.0.0`/`127.0.0.1`), or the control plane's liveness probe won't see the data plane as serving |
 | `DATA_DIR` | `/data` | Container path of microscopy files; mount the host dir onto it with `-v /host/data:/data` (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port in container. Derived: **control web origin=BASE+3** (publish this), HTTP sidecar=BASE+4 (loopback-internal), gRPC Flight=BASE+5 (publish for SDK clients) |
@@ -182,7 +182,7 @@ singularity run \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file (if set and exists, uses this file; otherwise config is generated from env vars) |
+| `CONFIG_FILE` | (unset) | Path to a JSON config file (if set and exists, uses this file; otherwise config is generated from env vars) |
 | `DATA_DIR` | `/data` | Path of microscopy files. Singularity auto-mounts `$HOME`, `/tmp`, `$PWD` (and usually `/scratch`, `/project`). Use `--bind /host:/container` for locations the site doesn't auto-mount. |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
@@ -313,8 +313,8 @@ docker logs biopb-tensor
 ```
 
 Common causes:
-- A mounted `CONFIG_FILE` that is malformed (JSON/TOML parse or validation error) — check `docker logs` for the traceback
-- A `CONFIG_FILE` with no `sources` (JSON) / `[[sources]]` (TOML) → "No data sources configured" (exit 1)
+- A mounted `CONFIG_FILE` that is malformed (JSON parse or value-validation error — a legacy TOML is rejected outright; convert it with `biopb server migrate-config`) — check `docker logs` for the traceback
+- A `CONFIG_FILE` with no `sources` → "No data sources configured" (exit 1)
 - A custom config whose sources are all invalid/unreachable (bad paths, or remote sources that all fail auth) → "No sources loaded successfully" (exit 1)
 - A port already in use inside the container (e.g. `--network host` colliding with a host process on 8814/8815)
 

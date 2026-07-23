@@ -1,64 +1,67 @@
 """Configuration management for TensorFlight server.
 
-Supports TOML config files with:
+Reads JSON config files (``biopb.json``) carrying:
 - Server settings (host, port)
 - Data source definitions (explicit files or directory auto-discovery)
 - Credential profiles for remote storage (S3, GCS, etc.)
 
+JSON is the only supported format; a pre-#34 ``biopb.toml`` is converted with
+``biopb server migrate-config`` (see biopb/biopb#34).
+
 Example config (explicit):
-```toml
-[server]
-host = "0.0.0.0"
-port = 8815
-
-[[sources]]
-type = "zarr"
-url = "/data/images.zarr"
-alias = "my-image"  # friendly display name (source_id is derived from the URL)
-dim_labels = ["z", "y", "x"]
-
-[[sources]]
-type = "hdf5"
-url = "/data/sample.h5"
-dataset = "/images/channel0"
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 8815 },
+  "sources": [
+    {
+      "type": "zarr",
+      "url": "/data/images.zarr",
+      "alias": "my-image",
+      "dim_labels": ["z", "y", "x"]
+    },
+    { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images/channel0" }
+  ]
+}
 ```
+(``alias`` is a friendly display name; ``source_id`` is derived from the URL.)
 
 Example config (relaxed auto-discovery):
-```toml
-[server]
-host = "0.0.0.0"
-port = 8815
-
-[[sources]]
-url = "/data/"  # No type, no source_id - recursive auto-discovery
-
-# HDF5 requires explicit 'type' and 'dataset' - not auto-detected
-[[sources]]
-type = "hdf5"
-url = "/data/sample.h5"
-dataset = "/images"
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 8815 },
+  "sources": [
+    { "url": "/data/" },
+    { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images" }
+  ]
+}
 ```
+A bare ``url`` with no ``type`` triggers recursive auto-discovery; HDF5 always
+needs an explicit ``type`` + ``dataset`` (it is not auto-detected).
 
 Example config (remote storage):
-```toml
-[server]
-host = "0.0.0.0"
-port = 8815
-
-[credentials]
-default_profile = "aws-prod"
-
-[[credentials.profiles]]
-name = "aws-prod"
-storage_type = "s3"
-key = "AKIAIOSFODNN7EXAMPLE"
-secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-region = "us-east-1"
-
-[[sources]]
-type = "ome-zarr"
-url = "s3://bucket/experiment.ome.zarr"
-credentials_profile = "aws-prod"
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 8815 },
+  "credentials": {
+    "default_profile": "aws-prod",
+    "profiles": [
+      {
+        "name": "aws-prod",
+        "storage_type": "s3",
+        "key": "AKIAIOSFODNN7EXAMPLE",
+        "secret": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "region": "us-east-1"
+      }
+    ]
+  },
+  "sources": [
+    {
+      "type": "ome-zarr",
+      "url": "s3://bucket/experiment.ome.zarr",
+      "credentials_profile": "aws-prod"
+    }
+  ]
+}
 ```
 """
 
@@ -69,9 +72,8 @@ import getpass
 import json
 import logging
 import os
-import sys
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -86,11 +88,22 @@ from biopb._config_constraints import (
     Range as _Range,
 )
 
+# The one validation scheme, shared with biopb-mcp and the control's admin
+# endpoints: check at the read step, warn and fall back to the default, stay
+# strict only where a human submitted the value (biopb/biopb#34).
+from biopb._config_io import atomic_write_json
+from biopb._config_validate import (
+    MISSING,
+    Problem,
+    check_sections,
+    warn_and_clamp,
+)
+
 # Config file location & format preference live in the core `biopb` package so
-# the umbrella CLI and biopb-mcp share one definition (all three depend on
-# `biopb`). Re-exported for back-compat (`biopb_tensor_server.core.config.find_config`
-# and the name constants). See biopb._locations for the JSON-canonical
-# rationale (biopb/biopb#34).
+# the umbrella CLI shares one definition (both depend on `biopb`). Re-exported
+# for back-compat (`biopb_tensor_server.core.config.find_config` and the name
+# constants). See biopb._locations for the JSON-canonical rationale
+# (biopb/biopb#34).
 from biopb._locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
@@ -118,12 +131,6 @@ from biopb_tensor_server.core.remote import (
 _is_remote_url = is_remote_url
 
 logger = logging.getLogger(__name__)
-
-# Python 3.11+ has tomllib in stdlib
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 
 # Default on-disk cache location for the file backend. Uses the system temp dir
@@ -170,18 +177,18 @@ def _default_cache_backend() -> str:
 # downscale_factor=0 -> ZeroDivisionError in GetFlightInfo; pixel_budget_cubic_root
 # <= 0 -> infinite loop in the precache worker; reduction_method="bogus" -> a
 # read-time ValueError; downscale_factor=1 -> a silently single-level pyramid.
-# Validate at construction instead, in each dataclass's __post_init__, so EVERY
-# path that builds a config -- both file formats AND direct dataclass
-# construction (resolve_all_sources, the future generator) -- is covered by one
-# declarative source of truth.
+# The declarative fix is this table, checked at the read step (parse_config) by
+# the shared biopb._config_validate walker -- the same walker and the same policy
+# biopb-mcp and the control's admin endpoints use, so a knob is judged identically
+# wherever it is met. The same table also feeds the JSON Schema emitter
+# (config_schema.py), so the constraints are declared exactly once.
 #
-# Severity is WARN during the TOML deprecation window: a config that loaded
-# before must not become a hard startup failure on upgrade. Flip
-# _STRICT_VALIDATION -> True (warn -> raise) when the legacy read path is removed
-# (the "fail fast at startup" end state). The same table feeds the planned JSON
-# Schema emitter, so the constraints are declared once.
-
-_STRICT_VALIDATION = False
+# Policy: warn and use the default (never raise). See _config_validate's module
+# docstring for why -- in short, this server is a control-plane child that is
+# restarted on crash with capped backoff, so refusing to load would turn one bad
+# number into a permanent restart loop whose real cause is buried in a log. The
+# bad value still never reaches the request path, which was the actual ask.
+# `validate` and the admin PUT stay strict: a human is there to act on it.
 
 # Methods PyramidConfig.reduction_method accepts (matched case-insensitively):
 # the *computable* subset of the protocol vocabulary, plus its aliases.
@@ -231,7 +238,11 @@ _CONSTRAINTS = {
         "query_timeout_ms": _Range(min=1),
     },
     "ServerConfig": {
-        "port": _Range(min=1, max=65535),
+        # 0 is not a typo-shaped value here: it is the "let the OS assign an
+        # ephemeral port" sentinel the flight server binds on (used by the test
+        # harness and by anyone running two planes on one box), so the floor is
+        # 0, not 1. Above 65535 there is no such reading -- that is a typo.
+        "port": _Range(min=0, max=65535),
         "log_level": _Enum(
             {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
         ),
@@ -242,7 +253,8 @@ _CONSTRAINTS = {
     },
 }
 
-# Class name -> the config section it maps to, for friendlier messages.
+# Class name -> the config section it maps to. Read by the schema emitter
+# (config_schema.ondisk_location) and by the messages here.
 _SECTION_FOR = {
     "CacheConfig": "cache",
     "PyramidConfig": "pyramid",
@@ -251,43 +263,67 @@ _SECTION_FOR = {
     "ServerConfig": "server",
 }
 
+# The nested sections the checker walks. ServerConfig itself is the "server"
+# section (its scalars are top-level fields, not a nested dataclass), so it is
+# passed separately in _sections_of.
+_NESTED_SECTIONS = ("cache", "pyramid", "precache", "metadata_db")
 
-def _config_problems(instance) -> List[Tuple[str, str]]:
-    """``(field, message)`` for each :data:`_CONSTRAINTS` violation on *instance*
-    (empty when valid).
 
-    The shared core of the two validation surfaces, so both judge a value by the
-    exact same rule: the warn/raise :func:`_validate_config` policy run at
-    construction, and the endpoint's :func:`validate_config_dict` gate.
+def _sections_of(config: ServerConfig) -> List[Tuple[str, Any]]:
+    """``(section_name, section_object)`` pairs for :func:`check_sections`.
+
+    The dataclass instances are passed as-is -- the shared walker reads a
+    dataclass or a dict alike, so the tensor server needs no dict projection of
+    its config just to validate it.
     """
-    constraints = _CONSTRAINTS.get(type(instance).__name__)
-    if not constraints:
-        return []
-    return [
-        (key, f"{key}={getattr(instance, key)!r} (expected {c.describe()})")
-        for key, c in constraints.items()
-        if not c.ok(getattr(instance, key))
+    return [("server", config)] + [
+        (name, getattr(config, name)) for name in _NESTED_SECTIONS
     ]
 
 
-def _validate_config(instance) -> None:
-    """Check *instance*'s fields against :data:`_CONSTRAINTS` (warn, or raise
-    when ``_STRICT_VALIDATION``). Called from each config dataclass's
-    ``__post_init__`` so every construction path is covered."""
-    problems = _config_problems(instance)
-    if not problems:
-        return
-    name = type(instance).__name__
-    msg = f"Invalid config value(s) in [{_SECTION_FOR.get(name, name)}]: " + "; ".join(
-        message for _field, message in problems
-    )
-    if _STRICT_VALIDATION:
-        raise ValueError(msg)
-    logger.warning(
-        "%s. Used as-is for now; this will become an error in a future release. "
-        "See biopb/biopb#34.",
-        msg,
-    )
+def _config_problems(config: ServerConfig) -> List[Problem]:
+    """Every :data:`_CONSTRAINTS` violation in *config* (empty when valid)."""
+    return check_sections(_sections_of(config), _CONSTRAINTS)
+
+
+def _dataclass_default(cls, key: str) -> Any:
+    """The declared default of field *key* on dataclass *cls*.
+
+    Read off the field rather than off a constructed instance so resolving one
+    bad leaf does not build a whole config (and its nested sections) again.
+    """
+    for f in fields(cls):
+        if f.name != key:
+            continue
+        if f.default is not _DC_MISSING:
+            return f.default
+        if f.default_factory is not _DC_MISSING:  # type: ignore[misc]
+            return f.default_factory()  # type: ignore[misc]
+    return MISSING
+
+
+def _clamp_invalid(config: ServerConfig) -> None:
+    """Warn about each violation and reset that field to its dataclass default.
+
+    The load-path policy (see :mod:`biopb._config_validate`): a bad knob must not
+    reach the request path, but must also not stop the server from coming up --
+    it is supervised, and refusing would just be restarted into the same failure.
+    Falling back to the *dataclass* default means "the default" is exactly what
+    an omitted key would have produced.
+    """
+
+    def _target(section: str):
+        return config if section == "server" else getattr(config, section)
+
+    def default_for(path: Tuple[str, ...]) -> Any:
+        section, key = path
+        return _dataclass_default(type(_target(section)), key)
+
+    def apply(path: Tuple[str, ...], value: Any) -> None:
+        section, key = path
+        setattr(_target(section), key, value)
+
+    warn_and_clamp(_config_problems(config), default_for, apply, logger)
 
 
 @dataclass
@@ -478,7 +514,6 @@ class CacheConfig:
     def __post_init__(self):
         if isinstance(self.file_cache_dir, str):
             self.file_cache_dir = Path(self.file_cache_dir)
-        _validate_config(self)
 
 
 @dataclass
@@ -519,9 +554,6 @@ class PyramidConfig:
             "(Lx*Ly*Lz <= this**3); bounds a whole-volume 3-D read."
         },
     )
-
-    def __post_init__(self):
-        _validate_config(self)
 
 
 @dataclass
@@ -576,9 +608,6 @@ class PrecacheConfig:
         },
     )
 
-    def __post_init__(self):
-        _validate_config(self)
-
 
 @dataclass
 class MetadataDbConfig:
@@ -608,9 +637,6 @@ class MetadataDbConfig:
         default=30000,
         metadata={"help": "Catalog SQL query timeout (milliseconds)."},
     )
-
-    def __post_init__(self):
-        _validate_config(self)
 
 
 @dataclass
@@ -726,28 +752,24 @@ class ServerConfig:
     metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
-    def __post_init__(self):
-        _validate_config(self)
-
 
 def load_config(path: Path) -> ServerConfig:
-    """Load configuration from a JSON or TOML file.
+    """Load configuration from a JSON file.
 
-    JSON is the canonical format; TOML is still read for back-compat during the
-    migration window (biopb/biopb#34) and emits a deprecation warning. Format is
-    chosen by file extension, with a content sniff for unknown / extension-less
-    paths. Either way the file is parsed to a plain dict and handed to the
-    format-agnostic :func:`parse_config`.
+    JSON is the only format read (biopb/biopb#34); a legacy ``biopb.toml``
+    raises with the migration command. The file is parsed to a plain dict and
+    handed to the format-agnostic :func:`parse_config`.
 
     Args:
-        path: Path to JSON (``.json``) or TOML (``.toml``) config file
+        path: Path to a JSON config file (``biopb.json``)
 
     Returns:
         ServerConfig object
 
     Raises:
         FileNotFoundError: If config file doesn't exist
-        ValueError: If the file cannot be parsed as its declared/sniffed format
+        ValueError: If the file is not valid JSON (including a legacy TOML), or
+            if it carries an out-of-range / bad-enum value
     """
     if isinstance(path, str):
         path = Path(path)
@@ -762,33 +784,6 @@ def load_config(path: Path) -> ServerConfig:
 # Name of the sibling JSON Schema file save_config drops next to the config so
 # editors validate it offline (relative $schema), independent of any hosted URL.
 SCHEMA_SIDECAR_NAME = "biopb.schema.json"
-
-
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    """Write *data* as pretty JSON to *path* atomically (temp file + os.replace).
-
-    Writing to a sibling temp file and renaming over the target means a reader
-    never sees a half-written file, and a failed write leaves the original
-    untouched. Unlike biopb-mcp's same-named helper this *raises* on failure --
-    the admin endpoint surfaces a write/permission error to the user rather than
-    silently swallowing it.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
 
 
 def save_config(data: Dict[str, Any], path: Path) -> Path:
@@ -832,8 +827,8 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
     payload = dict(data)
     payload["$schema"] = f"./{SCHEMA_SIDECAR_NAME}"
 
-    _atomic_write_json(schema_path, build_config_schema())
-    _atomic_write_json(path, payload)
+    atomic_write_json(schema_path, build_config_schema(), raise_on_error=True)
+    atomic_write_json(path, payload, raise_on_error=True)
 
     if legacy_toml is not None and legacy_toml.exists():
         backup = legacy_toml.with_name(legacy_toml.name + ".bak")
@@ -911,36 +906,28 @@ def restore_redacted_secrets(
     return merged
 
 
+# Appended to every read failure: a legacy TOML is the one shape of "not JSON"
+# with a one-command fix, and a user meeting a parse error has no other way to
+# learn the format changed (biopb/biopb#34).
+_MIGRATE_HINT = (
+    "JSON is the only supported config format; convert a legacy "
+    f"{LEGACY_CONFIG_NAME} with `biopb server migrate-config`. See biopb/biopb#34."
+)
+
+
 def _read_config_file(path: Path) -> Dict[str, Any]:
-    """Read a config file into a plain dict, dispatching on format.
+    """Read a config file into a plain dict.
 
-    Dispatch is by extension (``.json`` / ``.toml``); an unknown or
-    extension-less path is sniffed (JSON first, since it is canonical, then
-    TOML). Reading TOML logs a one-line deprecation warning naming the canonical
-    alternative.
+    JSON only. A ``.toml`` path is rejected without parsing (the read path was
+    dropped once the deprecation window closed); every other extension --
+    including none -- is read as JSON, so an unconventionally-named config still
+    loads. Both failures name ``biopb server migrate-config``.
     """
-    suffix = path.suffix.lower()
-
-    if suffix == ".json":
-        return _load_json(path)
-    if suffix == ".toml":
-        _warn_toml_deprecated(path)
-        return _load_toml(path)
-
-    # Unknown / extension-less: sniff. Prefer JSON (canonical); on a JSON parse
-    # failure fall back to TOML rather than guessing from bytes.
-    raw = path.read_bytes()
-    try:
-        return json.loads(raw)
-    except ValueError:
-        pass
-    _warn_toml_deprecated(path)
-    try:
-        return tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+    if path.suffix.lower() == ".toml":
         raise ValueError(
-            f"Config file {path} is neither valid JSON nor valid TOML: {e}"
-        ) from e
+            f"Config file {path} is in the legacy TOML format. " + _MIGRATE_HINT
+        )
+    return _load_json(path)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -948,25 +935,31 @@ def _load_json(path: Path) -> Dict[str, Any]:
         with open(path, "rb") as f:
             return json.load(f)
     except ValueError as e:
-        raise ValueError(f"Invalid JSON in config file {path}: {e}") from e
+        raise ValueError(
+            f"Invalid JSON in config file {path}: {e}. " + _MIGRATE_HINT
+        ) from e
 
 
-def _load_toml(path: Path) -> Dict[str, Any]:
+def read_legacy_toml(path: Path) -> Dict[str, Any]:
+    """Read a pre-#34 ``biopb.toml`` into a plain dict.
+
+    The **only** remaining TOML reader, and deliberately not reachable from
+    :func:`load_config`: it exists for `biopb server migrate-config`, which
+    converts the old file to canonical JSON. ``tomllib`` is imported lazily so
+    the server's own read path carries no TOML dependency.
+    """
+    import sys
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib
+
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise ValueError(f"Invalid TOML in config file {path}: {e}") from e
-
-
-def _warn_toml_deprecated(path: Path) -> None:
-    logger.warning(
-        "Config file %s uses the legacy TOML format, which is deprecated; "
-        "JSON (%s) is now canonical. TOML will keep working during the "
-        "migration window. See biopb/biopb#34.",
-        path,
-        CANONICAL_CONFIG_NAME,
-    )
 
 
 # The known-key set for the unknown-key warning is the config JSON Schema's
@@ -1077,9 +1070,27 @@ def _carry(
 
 
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
-    """Parse configuration from a dictionary.
+    """Build a :class:`ServerConfig` from a raw config dict, checked and clamped.
 
-    Format-agnostic: ``data`` is a plain dict already read from JSON or TOML by
+    The read step, and the single place a config from disk (or from the admin
+    endpoint) is validated: :func:`_build_config` does the wire->dataclass
+    mapping, then :func:`_clamp_invalid` warns about every out-of-range /
+    bad-enum knob and substitutes its default, so nothing invalid reaches the
+    request path and the server still starts (biopb/biopb#34).
+    """
+    config = _build_config(data)
+    _clamp_invalid(config)
+    return config
+
+
+def _build_config(data: Dict[str, Any]) -> ServerConfig:
+    """Construct the config dataclasses from a raw dict, without validating.
+
+    Split from :func:`parse_config` so the value check has something to run
+    *against* -- :func:`validate_config_dict` needs the unclamped objects to
+    report what was wrong, which it cannot see once the defaults are in place.
+
+    Format-agnostic: ``data`` is a plain dict already read from JSON by
     :func:`load_config`.
 
     Field **defaults** are owned solely by the config dataclasses: this parser
@@ -1092,10 +1103,10 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     pyramid knobs, source ``path``), and per-field coercions.
 
     Args:
-        data: Config dictionary (from JSON or TOML)
+        data: Config dictionary (from JSON)
 
     Returns:
-        ServerConfig object
+        ServerConfig object, values as given
     """
     _warn_unknown_config_keys(data)
 
@@ -1299,14 +1310,16 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 
 def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Validate a raw config dict with the SAME rules the server enforces at
-    load, independent of the warn/raise policy (:data:`_STRICT_VALIDATION`).
+    load, reported rather than raised.
 
     Returns ``[{"path": [section, key], "message": str}, ...]`` (empty = valid),
     using the on-disk ``(section, key)`` paths
     :func:`config_schema.ondisk_location` assigns, so a caller can merge/dedupe
     these against JSON-Schema errors by path.
 
-    This is the authoritative *semantic* gate. It catches everything
+    This is the strict end of the one validation scheme: the load path warns and
+    clamps, but a human submitting a value gets it rejected instead, with every
+    problem at once so the form can highlight each field. It catches everything
     :data:`_CONSTRAINTS` covers -- notably the case-insensitive enums
     (``log_level``, ``reduction_method``) the published JSON Schema deliberately
     cannot express (``_Enum.to_json_schema`` emits no hard ``enum`` for them, so
@@ -1315,12 +1328,13 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     accepts is one the server will actually load. See biopb/biopb#34.
     """
     try:
-        cfg = parse_config(data)
+        # _build_config, not parse_config: the clamp would have already replaced
+        # every bad value with its default, leaving nothing to report.
+        cfg = _build_config(data)
     except Exception as exc:  # noqa: BLE001 - untrusted input must never crash the gate
         # Structural failure: a missing url or un-coercible number (ValueError /
-        # TypeError), a wrong-typed section that makes parse_config walk a
-        # non-dict (AttributeError, e.g. {"server": "x"}), or -- once
-        # _STRICT_VALIDATION flips -- a strict sub-parse. Report as a single
+        # TypeError), or a wrong-typed section that makes the parser walk a
+        # non-dict (AttributeError, e.g. {"server": "x"}). Report as a single
         # root-level problem rather than letting it crash the caller (the admin
         # endpoint would otherwise 500 instead of returning a clean 422).
         return [{"path": [], "message": str(exc)}]
@@ -1329,12 +1343,22 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     # scope is a cycle (mirrors save_config's build_config_schema import).
     from biopb_tensor_server.core.config_schema import ondisk_location
 
+    # The checker reports dataclass-field paths; the endpoint needs the on-disk
+    # ones (CacheConfig.memory_max_entries lives at [cache] max_entries), so the
+    # section/key is remapped before it leaves -- in the message too, whose
+    # `field=...` lead-in would otherwise name the internal field the on-disk path
+    # doesn't (e.g. path [cache] max_entries with "memory_max_entries=...").
     problems: List[Dict[str, Any]] = []
-    for inst in (cfg, cfg.cache, cfg.pyramid, cfg.precache, cfg.metadata_db):
-        class_name = type(inst).__name__
-        for field_name, message in _config_problems(inst):
-            section, key = ondisk_location(class_name, field_name)
-            problems.append({"path": [section, key], "message": message})
+    for problem in _config_problems(cfg):
+        section, key = problem.path
+        class_name = type(
+            cfg if section == "server" else getattr(cfg, section)
+        ).__name__
+        on_section, on_key = ondisk_location(class_name, key)
+        message = problem.message
+        if on_key != key and message.startswith(f"{key}="):
+            message = f"{on_key}=" + message[len(key) + 1 :]
+        problems.append({"path": [on_section, on_key], "message": message})
     return problems
 
 
