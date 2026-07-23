@@ -29,6 +29,12 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          # setuptools_scm needs tags to version the in-tree biopb. Without them
+          # it stamps 0.1.dev1, which fails biopb-tensor-server's biopb>=0.7.0
+          # constraint, so pip discards the editable install and pulls the PyPI
+          # wheel (missing in-tree symbols). Mirrors tensor-server-ci.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
