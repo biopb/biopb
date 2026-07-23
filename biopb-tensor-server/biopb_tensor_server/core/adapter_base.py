@@ -42,6 +42,7 @@ from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
     decode_chunk_id,
+    decode_reduction_method,
     decode_scale_info,
     encode_chunk_id,
     encode_chunk_id_with_scale,
@@ -51,7 +52,6 @@ from biopb_tensor_server.core.chunk import (
     normalized_slice_bounds,
 )
 from biopb_tensor_server.core.downsample import (
-    DEFAULT_REDUCTION_METHOD,
     ceil_div,
     downsample_block,
     get_output_dtype,
@@ -750,13 +750,11 @@ class TensorAdapter(SourceAdapter):
 
             if is_scaled_chunk_flag:
                 scale_hint = decode_scale_info(chunk_id)
-                # reduction_method left the chunk_id (#178): it is advisory (the
-                # cache key never distinguished it, #76) and do_get carries no
-                # request here, so a cold compute uses the server default.
-                # Crop and downsample (no padding needed - bounds aligned via floor_div)
-                result_arr = downsample_block(
-                    result_arr, scale_hint, DEFAULT_REDUCTION_METHOD
-                )
+                # The requested reduction_method rides in the chunk_id (#578), so a
+                # do_get honors it; a method-free (old/area) scaled chunk_id decodes
+                # to the default. Crop + downsample (bounds aligned via floor_div).
+                reduction_method = decode_reduction_method(chunk_id)
+                result_arr = downsample_block(result_arr, scale_hint, reduction_method)
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
             # string, wrapped zero-copy. This preserves the exact dtype including
@@ -1311,11 +1309,12 @@ def _get_read_plan(
 
         # NO splitting check needed - safe_chunk_size guarantees it fits
 
-        # Encode: array_id + virtual_bounds + optional scale_hint (identity only;
-        # reduction_method is advisory and no longer carried in the chunk_id, #178).
+        # Encode: array_id + virtual_bounds + optional scale_hint + the requested
+        # reduction_method, so do_get downsamples with the method the client asked
+        # for (biopb/biopb#578). "area"/default adds no byte (identity-stable).
         if scale_hint is not None:
             chunk_id = encode_chunk_id_with_scale(
-                base_desc.array_id, virtual_bounds, scale_hint
+                base_desc.array_id, virtual_bounds, scale_hint, reduction_method
             )
         else:
             chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
