@@ -120,13 +120,17 @@ def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
     The lean catalog descriptor from ``list_sources`` carries no pyramid -- it
     is filled only at open time (``get_flight_info``) -- so when the passed
     *tensor_desc* lacks one, fetch the open-time descriptor once via
-    ``get_descriptor``.
+    ``get_descriptor``. That fetch is a **describe** (biopb/biopb#563): it asks
+    for the pyramid (``with_pyramid=True``) but not the O(chunks) read plan (the
+    default ``with_read_plan=False``) nor the heavy OME tree (``with_metadata``
+    defaults False) -- so learning the levels no longer builds and discards a
+    level-0 plan, and this probe is cheap enough to run per open.
     """
     levels = list(getattr(tensor_desc, "pyramid", None) or [])
     if levels:
         return levels
     try:
-        full = client.get_descriptor(tensor_id)
+        full = client.get_descriptor(tensor_id, with_pyramid=True)
         return list(getattr(full, "pyramid", None) or [])
     except Exception:  # noqa: BLE001 - advisory; fall back to a client plan
         logger.debug(
