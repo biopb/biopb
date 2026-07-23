@@ -1337,6 +1337,11 @@ class TestZeroCopySurvivesUnlink:
     def test_read_is_zero_copy(self, file_backend):
         """Decoding a ~64 KiB chunk off the segment allocates ~nothing."""
         arrs, _ = self._seal_segment_with(file_backend)
+        # pa.total_allocated_bytes() is the process-wide default-pool counter, so
+        # this before/after delta only isolates this call's allocation while the
+        # suite runs serially. Keep tensor-server tests single-process (no
+        # pytest-xdist ``-n``) or a concurrent test's allocation would leak in
+        # and make this flaky.
         before = pa.total_allocated_bytes()
         batch = file_backend._read_batch_from_segment(b"z0")
         allocated = pa.total_allocated_bytes() - before

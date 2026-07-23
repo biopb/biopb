@@ -1183,7 +1183,7 @@ class ArrowFileBackend(CacheBackend):
         # delete-on-last-close semantics. The one dependency is that
         # ``MemoryMappedFile.close()`` releases the handle while buffers retain
         # the view, which holds on pyarrow >= 14 (the pinned floor); see #572
-        # and ``cachefile_test.test_windows_zero_copy_survives_unlink``.
+        # and ``cachefile_test.TestZeroCopySurvivesUnlink``.
         # Serve the unified binary schema as-is (biopb/biopb#293); just strip
         # the internal cache-key column so the wire batch is the clean
         # [data, shape, dtype]. No binary->typed conversion.
