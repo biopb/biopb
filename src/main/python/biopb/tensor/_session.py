@@ -547,6 +547,9 @@ class CatalogClient:
             tensor_read=TensorReadOption(
                 tensor_id=first_tensor.array_id,
                 with_metadata=True,
+                # Metadata describe: read only metadata_json, so skip the O(chunks)
+                # read plan (biopb/biopb#563). Pyramid stays off (unneeded here).
+                with_read_plan=False,
             ),
         )
         flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
@@ -625,7 +628,9 @@ class CatalogClient:
         self,
         source_id: str,
         tensor_id: Optional[str] = None,
-        with_metadata: bool = True,
+        with_metadata: bool = False,
+        with_pyramid: bool = False,
+        with_read_plan: bool = False,
     ) -> "TensorDescriptor":
         """Fetch one tensor's descriptor directly from the server (internal).
 
@@ -638,19 +643,33 @@ class CatalogClient:
         ``_unresolved_source_error`` steering the caller to :meth:`resolve`,
         rather than triggering a download.
 
-        ``with_metadata`` fills the descriptor's ``metadata_json`` (the full OME
-        tree). Default ``True``. Pass ``False`` when only the structural
-        descriptor (shape/chunk/dtype/dim_labels, plus the always-filled pyramid
-        and physical scale) is needed -- a caching proxy mirroring an upstream's
-        structure, which serves metadata from its own catalog, does this so it
-        never depends on the upstream having a metadata catalog.
+        The three ``with_*`` flags are the ``GetFlightInfo`` response field masks
+        (biopb/biopb#563); each selects one optional part of the response:
+
+        - ``with_metadata`` -- fill ``metadata_json`` (the full OME tree).
+        - ``with_pyramid`` -- advertise the resolution pyramid on the descriptor.
+        - ``with_read_plan`` -- enumerate the per-request chunk endpoints.
+
+        This primitive returns only the ``TensorDescriptor`` (never the endpoints),
+        so all three masks **default off** -- the cheapest structural probe. With
+        ``with_read_plan=False`` the O(chunks) plan the caller would discard is
+        skipped; ``with_pyramid=False`` skips the (per-level, potentially remote)
+        pyramid sizing; ``with_metadata=False`` skips the heavy OME tree. Callers
+        that need any of those parts opt in. An old server ignores the unknown
+        ``with_pyramid``/``with_read_plan`` masks and fills everything, so the
+        result is never *missing* a field the caller asked for -- at worst it
+        carries extra the caller drops.
 
         The descriptor is cached in ``self._state.descriptors`` (keyed by the
         echoed-back array_id). ``self._state.sources`` is intentionally NOT touched, so
         a single-tensor probe never clobbers a full enumeration cached by
         ``list_sources()`` (issue #75).
         """
-        read_opt = TensorReadOption(with_metadata=with_metadata)
+        read_opt = TensorReadOption(
+            with_metadata=with_metadata,
+            with_pyramid=with_pyramid,
+            with_read_plan=with_read_plan,
+        )
         # Anchor on the source's default tensor via the EMPTY-tensor_id path
         # (server resolves it to the first descriptor's qualified array_id, #44)
         # for both the unset case and a bare source_id. Sending the source_id as
@@ -682,7 +701,11 @@ class CatalogClient:
         return tensor_desc
 
     def get_descriptor(
-        self, array_id: str, with_metadata: bool = True
+        self,
+        array_id: str,
+        with_metadata: bool = False,
+        with_pyramid: bool = True,
+        with_read_plan: bool = False,
     ) -> "TensorDescriptor":
         """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
 
@@ -700,12 +723,25 @@ class CatalogClient:
         never triggering a download. Call :meth:`resolve` first to read such a
         source.
 
+        The ``with_*`` flags are the ``GetFlightInfo`` response field masks
+        (biopb/biopb#563). This is a *describe* call -- the stable per-tensor
+        facts, not a read -- so it defaults to returning shape/dtype/dim_labels/
+        chunk_shape, the resolution **pyramid**, and physical_scale, while
+        **skipping the read plan** (``with_read_plan=False`` -- the endpoints are
+        the per-request O(chunks) half a describe discards) and the **heavy OME
+        metadata tree** (``with_metadata=False``, opt-in). Set ``with_metadata=True``
+        for ``metadata_json``; set ``with_pyramid=False`` to skip pyramid sizing
+        when only the bare structure is needed.
+
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
                 tensor source) or ``"aics_7f3/Image:0"`` (multi-tensor source).
-            with_metadata: fill ``metadata_json`` (default ``True``); pass
-                ``False`` for the structural descriptor only (a proxy mirroring
-                upstream structure that serves metadata from its own catalog).
+            with_metadata: fill ``metadata_json`` (the full OME tree). Default
+                ``False`` -- opt in when you need it.
+            with_pyramid: advertise the resolution pyramid on the descriptor.
+                Default ``True`` (the primary describe consumer reads it).
+            with_read_plan: enumerate the per-request chunk endpoints. Default
+                ``False``; a describe discards them, so the plan is skipped.
 
         Returns:
             The ``TensorDescriptor`` for that tensor.
@@ -713,7 +749,11 @@ class CatalogClient:
         # source_id is the slash-free prefix; the full array_id is the tensor_id.
         source_id = array_id.split("/", 1)[0]
         return self._fetch_tensor_descriptor(
-            source_id, array_id, with_metadata=with_metadata
+            source_id,
+            array_id,
+            with_metadata=with_metadata,
+            with_pyramid=with_pyramid,
+            with_read_plan=with_read_plan,
         )
 
     def _iter_action_messages(self, action, msg_cls, *, unknown_action_msg=None):

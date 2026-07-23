@@ -571,9 +571,14 @@ class RemoteTensorAdapter(TensorAdapter):
         try:
             # Structural mirror only -- metadata is served from this proxy's own
             # catalog (#253), so do not demand the upstream carry a metadata
-            # catalog (a DB-less upstream would otherwise fail this probe).
+            # catalog (a DB-less upstream would otherwise fail this probe). The
+            # pyramid is likewise unwanted here (_localize_descriptor strips it,
+            # and open-time forward_flight_info refills it), so skip its
+            # upstream per-level sizing too (biopb/biopb#563).
             desc = self.client.get_descriptor(
-                self._to_upstream_array_id(self.array_id), with_metadata=False
+                self._to_upstream_array_id(self.array_id),
+                with_metadata=False,
+                with_pyramid=False,
             )
         except Exception as exc:
             self._mark_unreachable(exc)
@@ -614,8 +619,9 @@ class RemoteTensorAdapter(TensorAdapter):
         A caching proxy mirrors its upstream 1:1 and re-derives no chunk grid,
         pyramid, or physical scale of its own, so consult the upstream once
         (``forward_flight_info``) and use its localized plan verbatim -- the
-        forwarded descriptor already carries the upstream's native grid, its
-        server-advertised pyramid, and its physical scale (kept by
+        forwarded descriptor already carries the upstream's native grid, the
+        server-advertised pyramid *when the request opted in* (``with_pyramid``,
+        relayed to the upstream, biopb/biopb#563), and its physical scale (kept by
         ``_localize_forwarded_descriptor``; only ``metadata_json`` is stripped and
         refilled locally from the mirror catalog). On an upstream failure the
         forward returns ``None`` and we fall back to the base local planner --
@@ -654,9 +660,13 @@ class RemoteTensorAdapter(TensorAdapter):
                     return out
 
         upstream_array_id = self._to_upstream_array_id(self.array_id)
-        # Structural mirror only (metadata comes from the local catalog, #253), so
-        # this serve-path probe does not require the upstream to have a catalog.
-        desc = self.client.get_descriptor(upstream_array_id, with_metadata=False)
+        # Structural mirror only (metadata comes from the local catalog, #253; the
+        # pyramid is stripped by _localize_descriptor and refilled at open time),
+        # so this serve-path probe skips both -- and requires no upstream catalog
+        # nor upstream per-level pyramid sizing (biopb/biopb#563).
+        desc = self.client.get_descriptor(
+            upstream_array_id, with_metadata=False, with_pyramid=False
+        )
         return self._localize_descriptor(desc)
 
     def forward_flight_info(
@@ -672,9 +682,11 @@ class RemoteTensorAdapter(TensorAdapter):
         OME-TIFF family), fall through to the 64 MB default grid, and
         over-amplify a single-plane read ~125x. Instead, consult the upstream
         once for its **authoritative** ``GetFlightInfo`` -- carrying the native
-        grid, the server-advertised pyramid (a pyramidal OME-Zarr upstream's
-        precompute levels included), the physical scale, and scaled ``chunk_id``s
-        for a downsampled read -- and return it localized, with each
+        grid, the server-advertised pyramid when the request opted in via
+        ``with_pyramid`` (a pyramidal OME-Zarr upstream's precompute levels
+        included; the mask is relayed upstream, biopb/biopb#563), the physical
+        scale, and scaled ``chunk_id``s for a downsampled read -- and return it
+        localized, with each
         ``chunk_id``'s ``array_id`` rewritten upstream->local. Nothing is
         re-implemented, and the rewritten ``chunk_id``s round-trip: a later
         ``do_get`` on one forwards straight back upstream via
@@ -746,18 +758,25 @@ class RemoteTensorAdapter(TensorAdapter):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.
 
         Re-targets the incoming ``read_opt`` at the upstream array_id and forwards
-        its slice/scale/reduction hints verbatim. ``with_metadata`` is forced
+        its slice/scale/reduction hints verbatim, plus the two response field
+        masks (biopb/biopb#563): ``with_pyramid`` and ``with_read_plan`` ride
+        through so the upstream advertises the pyramid / skips the plan exactly as
+        the original client asked -- the proxy re-derives neither, so whatever the
+        original request masked out must be masked out upstream too. ``physical_scale``
+        rides the upstream descriptor unconditionally. ``with_metadata`` is forced
         False: the local server fills the response ``metadata_json`` itself from
-        the mirror catalog (biopb/biopb#253), and ``pyramid``/``physical_scale``
-        ride the upstream descriptor unconditionally (the upstream fills them at
-        open time regardless of ``with_metadata``), so the forwarded call needs
-        only the descriptor + endpoints.
+        the mirror catalog (biopb/biopb#253).
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
         up_read_opt = TensorReadOption(
             tensor_id=upstream_array_id,
             with_metadata=False,
+            with_pyramid=read_opt.with_pyramid,
         )
+        # with_read_plan is an optional bool: forward it only when the caller set
+        # it, so an unset field keeps defaulting true at the upstream as well.
+        if read_opt.HasField("with_read_plan"):
+            up_read_opt.with_read_plan = read_opt.with_read_plan
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
         if read_opt.scale_hint:

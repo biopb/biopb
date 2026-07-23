@@ -206,6 +206,14 @@ message TensorReadOption {
   // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
   string reduction_method = 4;
 
+  // Field masks over the GetFlightInfo response (biopb/biopb#563). A tensor
+  // *describe* (the stable per-tensor facts: shape/dtype/dim_labels/chunk_shape,
+  // the resolution pyramid, physical_scale, metadata_json) and a *read plan*
+  // (the per-request O(chunks) endpoints) are welded into one call; these three
+  // bools -- with_metadata, with_pyramid, with_read_plan -- select which parts
+  // the server computes and returns, so a client can ask for a cheap describe
+  // without paying for a plan it discards.
+
   // If true, server populates metadata_json with wrapped metadata.
   // Wrapped structure: {"type": source_type, "dim_label": [...], "metadata": {...}}
   bool with_metadata = 5;
@@ -215,6 +223,23 @@ message TensorReadOption {
   // server-side concern. Reserved so the field number/name are never reused.
   reserved 6;
   reserved "compact_grid_ok";
+
+  // If true, server advertises the resolution pyramid on the response
+  // descriptor (TensorDescriptor.pyramid). Opt-in (default false): advertising a
+  // native pyramid opens each level's store to size it (network I/O per level
+  // for a cloud store), so a client that does not consume the pyramid does not
+  // pay for it. physical_scale, the other cheap describe fact, is filled
+  // unconditionally.
+  bool with_pyramid = 7;
+
+  // Whether to enumerate the per-request chunk endpoints (the O(chunks) read
+  // plan). Default true -- a normal read needs the endpoints; an old client that
+  // omits the field is served the full plan, exactly as before. Set false for a
+  // describe-only GetFlightInfo: the response carries the descriptor
+  // (shape/dtype/pyramid/physical_scale/metadata_json, per the other masks) with
+  // an empty endpoint list, skipping the plan. `optional` so the *unset* default
+  // is true (a proto3 bool would default false).
+  optional bool with_read_plan = 8;
 }
 
 // Client command for GetFlightInfo requests.

@@ -1180,7 +1180,9 @@ class TestAdvertisedPyramidDescriptor:
 
         cmd = FlightCmd(
             source_id=source_id,
-            tensor_read=TensorReadOption(tensor_id=tensor_id),
+            # Pyramid advertisement is opt-in (biopb/biopb#563); this class asserts
+            # get_flight_info fills it, so request it.
+            tensor_read=TensorReadOption(tensor_id=tensor_id, with_pyramid=True),
         )
         desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         return server.get_flight_info(None, desc)
@@ -1266,6 +1268,77 @@ class TestAdvertisedPyramidDescriptor:
             assert infos
             src = DataSourceDescriptor.FromString(infos[0].descriptor.command)
             assert all(len(t.pyramid) == 0 for t in src.tensors)
+        finally:
+            server.shutdown()
+
+    # --- GetFlightInfo response field masks (biopb/biopb#563) ----------------
+    # with_metadata / with_pyramid / with_read_plan independently select which
+    # parts of the response the server computes: metadata_json, the pyramid
+    # advertisement, and the per-request chunk endpoints.
+
+    def _flight_info_opt(self, server, read_opt):
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import FlightCmd
+
+        cmd = FlightCmd(
+            source_id=read_opt.tensor_id.split("/", 1)[0],
+            tensor_read=read_opt,
+        )
+        desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        return server.get_flight_info(None, desc)
+
+    def test_pyramid_advertisement_is_opt_in(self, tmp_path):
+        # with_pyramid gates the pyramid: unset (default false) => none advertised;
+        # set => the computed pyramid rides the descriptor.
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("big", self._big_zarr_adapter(tmp_path))
+            bare = self._descriptor(
+                self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
+            )
+            assert len(bare.pyramid) == 0
+            asked = self._descriptor(
+                self._flight_info_opt(
+                    server, TensorReadOption(tensor_id="big", with_pyramid=True)
+                )
+            )
+            assert len(asked.pyramid) >= 2
+        finally:
+            server.shutdown()
+
+    def test_read_plan_defaults_on_when_unset(self, tmp_path):
+        # with_read_plan is optional/default-true: an unset field (old client or a
+        # plain read) still enumerates the chunk endpoints, exactly as before.
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("big", self._big_zarr_adapter(tmp_path))
+            info = self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
+            assert len(info.endpoints) >= 1
+        finally:
+            server.shutdown()
+
+    def test_describe_only_skips_the_read_plan(self, tmp_path):
+        # with_read_plan=False => the descriptor rides back with NO endpoints; the
+        # pyramid still honors its own mask, so describe+pyramid works without a plan.
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("big", self._big_zarr_adapter(tmp_path))
+            info = self._flight_info_opt(
+                server,
+                TensorReadOption(
+                    tensor_id="big", with_read_plan=False, with_pyramid=True
+                ),
+            )
+            assert len(info.endpoints) == 0
+            desc = self._descriptor(info)
+            assert list(desc.shape) == [20000, 20000]  # base per-tensor facts
+            assert len(desc.pyramid) >= 2  # pyramid advertised (its own mask)
         finally:
             server.shutdown()
 

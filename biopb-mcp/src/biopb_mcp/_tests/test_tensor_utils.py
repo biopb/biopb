@@ -286,7 +286,7 @@ class TestAdvertisedPyramid:
 
         levels = build_pyramid_levels(client, "src", "src/A2", lean, config=_CFG)
 
-        client.get_descriptor.assert_called_once_with("src/A2")
+        client.get_descriptor.assert_called_once_with("src/A2", with_pyramid=True)
         assert len(levels) == 2
         assert [c[1] for c in calls] == ["area", "area"]
 
@@ -330,7 +330,7 @@ class TestAdvertisedPyramidLevelsHelper:
         )
         out = _advertised_pyramid_levels(client, "src", "src/A2", SimpleNamespace())
         assert len(out) == 1
-        client.get_descriptor.assert_called_once_with("src/A2")
+        client.get_descriptor.assert_called_once_with("src/A2", with_pyramid=True)
 
 
 class TestBuildPyramidCanonicalOrder:

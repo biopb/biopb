@@ -814,5 +814,65 @@ class TestGetPhysicalScale:
             client.get_physical_scale("src")
 
 
+class TestGetDescriptorFieldMasks:
+    """get_descriptor sends describe-shaped GetFlightInfo field masks (#563).
+
+    The three response masks (with_metadata / with_pyramid / with_read_plan) are
+    opt-in per part. get_descriptor is a *describe* -- the stable per-tensor
+    facts, not a read -- so it defaults to with_metadata=False (opt in for the
+    heavy OME tree), with_pyramid=True (the describe consumer reads the levels),
+    and with_read_plan=False (skip the per-request plan a describe discards).
+
+    The with_metadata default flip (True -> False) is the one intentional break
+    from the old always-metadata behavior, so guard the exact masks on the wire
+    here -- callers that need metadata now opt in, so a silent revert of the
+    default would otherwise go uncaught.
+    """
+
+    @staticmethod
+    def _client_capturing_read_opt():
+        # Build without __init__ (no connection); mock the flight client so we can
+        # decode the FlightCmd the descriptor probe puts on the wire.
+        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        state = _ClientState(
+            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
+        )
+        # get_flight_info returns a FlightInfo whose descriptor.command is a
+        # serialized TensorDescriptor (what _fetch_tensor_descriptor parses back).
+        info = Mock()
+        info.descriptor.command = TensorDescriptor(
+            array_id="src/A2"
+        ).SerializeToString()
+        state.client.get_flight_info.return_value = info
+        client._state = state
+        client._catalog = CatalogClient(state)
+        client._fetcher = ChunkFetcher(state, client._catalog)
+        return client, state
+
+    @staticmethod
+    def _sent_read_opt(state):
+        from biopb.tensor.descriptor_pb2 import FlightCmd
+
+        fd = state.client.get_flight_info.call_args.args[0]
+        return FlightCmd.FromString(fd.command).tensor_read
+
+    def test_defaults_are_describe_shaped(self):
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2")
+        read_opt = self._sent_read_opt(state)
+        assert read_opt.with_metadata is False  # the intentional opt-in break
+        assert read_opt.with_pyramid is True
+        assert read_opt.HasField("with_read_plan")  # optional bool set explicitly
+        assert read_opt.with_read_plan is False
+
+    def test_with_metadata_opt_in_is_forwarded(self):
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2", with_metadata=True)
+        read_opt = self._sent_read_opt(state)
+        assert read_opt.with_metadata is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
