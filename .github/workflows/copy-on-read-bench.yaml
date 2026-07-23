@@ -34,9 +34,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install biopb-tensor-server
+      - name: Install biopb + biopb-tensor-server
         run: |
           python -m pip install --upgrade pip setuptools
+          # Install the in-tree biopb FIRST (editable), so biopb-tensor-server
+          # resolves its `biopb >= 0.7.0` dep against this checkout rather than
+          # pulling the published wheel from PyPI -- the server imports in-tree
+          # symbols (e.g. biopb._lifecycle.file_lock.ExclusiveFileLock) the last
+          # release doesn't have. Mirrors tensor-server-ci's install order.
+          pip install -e ".[tensor]"
           pip install -e "./biopb-tensor-server"
 
       - name: Report host memory (context for the numbers)
