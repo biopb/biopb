@@ -818,6 +818,87 @@ class TestArrayFromUnifiedBatch:
         assert np.array_equal(got, a)
 
 
+class TestPinnedSegmentAccounting:
+    """Client-side pinned-segment accounting (disk-leak workaround, #571).
+
+    A fast-path view keeps its segment's mmap alive, pinning the server's disk
+    against reclamation. The client caps the total mapped-segment size and copies
+    the chunk out once over budget, so the leak is bounded.
+    """
+
+    def setup_method(self):
+        import biopb.tensor._pool as pool
+
+        pool._pinned_total = 0
+        pool._pinned_segments.clear()
+
+    teardown_method = setup_method
+
+    def test_refcounted_by_inode(self):
+        import biopb.tensor._pool as pool
+
+        class _Anchor:
+            pass
+
+        a1, a2, a3 = _Anchor(), _Anchor(), _Anchor()
+        # Two chunks from one segment (same inode) pin its disk exactly once.
+        pool._register_segment_pin(100, 64_000_000, a1)
+        pool._register_segment_pin(100, 64_000_000, a2)
+        pool._register_segment_pin(200, 32_000_000, a3)
+        assert pool._pinned_total == 96_000_000
+        assert pool._pinned_segments[100].refs == 2
+        assert pool._pinned_segments[200].refs == 1
+
+    def test_last_holder_unpins_segment(self):
+        import gc
+
+        import biopb.tensor._pool as pool
+
+        class _Anchor:
+            pass
+
+        a1, a2 = _Anchor(), _Anchor()
+        pool._register_segment_pin(100, 64_000_000, a1)
+        pool._register_segment_pin(100, 64_000_000, a2)
+
+        del a1
+        gc.collect()
+        # Still one holder of inode 100 -> segment stays pinned.
+        assert pool._pinned_segments[100].refs == 1
+        assert pool._pinned_total == 64_000_000
+
+        del a2
+        gc.collect()
+        # Last holder gone -> the finalizer un-pins and reclaims the account.
+        assert 100 not in pool._pinned_segments
+        assert pool._pinned_total == 0
+
+    def test_gate_default_and_env_override(self):
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import _pin_budget_exhausted, _pin_limit_bytes
+
+        # Nothing pinned -> under the (16 GiB) default budget.
+        assert _pin_budget_exhausted() is False
+
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "1000"}):
+            assert _pin_limit_bytes() == 1000
+            pool._pinned_total = 999
+            assert _pin_budget_exhausted() is False
+            pool._pinned_total = 1000  # at the limit -> exhausted (>=)
+            assert _pin_budget_exhausted() is True
+
+        # 0 disables the view handoff outright (always copy).
+        pool._pinned_total = 0
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "0"}):
+            assert _pin_budget_exhausted() is True
+
+        # Unparseable / negative fall back to the default.
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "garbage"}):
+            assert _pin_limit_bytes() == pool._PIN_LIMIT_DEFAULT
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "-1"}):
+            assert _pin_limit_bytes() == pool._PIN_LIMIT_DEFAULT
+
+
 # ==============================================================================
 # Integration: file-backed server <-> client
 # ==============================================================================
@@ -1010,6 +1091,95 @@ class TestCachefileIntegration:
             assert np.array_equal(block, expected)
             client.close()
         finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
+    def test_fast_path_view_pins_segment_and_unpins_on_gc(self):
+        """A fast-path view charges its segment against the pinned-disk budget
+        and releases the charge when the block (and its backing buffer) is gc'd
+        -- the accounting that lets the client bound the server disk-leak (#571)."""
+        import gc
+
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            pool._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            client.get_tensor("z").compute(scheduler="threads")  # warm cache
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            # Reset accounting after the warm compute so we measure this one fetch.
+            gc.collect()
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+
+            block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+            assert pool._cachefile_support.get(loc) is True  # fast path used
+            assert not block.flags.owndata  # a view, not a copy
+            # The segment is now pinned for as long as the block references it.
+            assert pool._pinned_total > 0
+            assert len(pool._pinned_segments) == 1
+
+            del block
+            gc.collect()
+            # Block gone -> the finalizer un-pins the segment; budget reclaimed.
+            assert pool._pinned_total == 0
+            assert not pool._pinned_segments
+            client.close()
+        finally:
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
+    def test_fast_path_copies_when_over_pin_budget(self):
+        """Over the pinned-segment budget the fast path copies the chunk out and
+        releases the mapping instead of handing out another view -- so it pins no
+        further server disk (the disk-leak bound, #571). It still reads off the
+        warm mmap (fast path used), it just owns its bytes and is still
+        read-only."""
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            pool._cachefile_support.clear()
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            client.get_tensor("z").compute(scheduler="threads")  # warm cache
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            # limit 0 -> always over budget -> always copy.
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "0"}):
+                pool._pinned_total = 0
+                pool._pinned_segments.clear()
+                block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+
+            assert pool._cachefile_support.get(loc) is True  # still the mmap path
+            assert block.flags.owndata  # copied out, does not alias the mapping
+            assert not block.flags.writeable  # uniform read-only contract
+            # No segment was pinned -- the whole point over budget.
+            assert pool._pinned_total == 0
+            assert not pool._pinned_segments
+            expected = src[start[0] : stop[0], start[1] : stop[1]]
+            assert np.array_equal(block, expected)
+            client.close()
+        finally:
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
             server.shutdown()
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
