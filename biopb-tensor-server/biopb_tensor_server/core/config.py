@@ -668,7 +668,7 @@ class ServerConfig:
         metadata={
             "help": "Seconds an idle persistent file handle (OME-TIFF store, "
             "NDTiff acquisition) is kept warm before it is closed; the next read "
-            "reopens it (<= 0 disables reaping). Adapters that reopen per read "
+            "reopens it (0 disables reaping). Adapters that reopen per read "
             "(hdf5, mrc, ...) are unaffected."
         },
     )

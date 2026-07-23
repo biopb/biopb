@@ -480,8 +480,10 @@ class NdTiffAdapter(TensorAdapter):
             self._release_persistent_handle()
 
     def __del__(self):
-        # GC backstop: release the fds even without an explicit close(). No lock
-        # -- nothing references the adapter, so no read can be in flight.
+        # GC backstop: release the fds even without an explicit close(). Fires
+        # only when the adapter is unreferenced -- so no read is in flight, and
+        # the release hook's brief reaper-lock take (discard) can't re-enter a
+        # lock this thread already holds.
         try:
             self._release_persistent_handle()
         except Exception:
