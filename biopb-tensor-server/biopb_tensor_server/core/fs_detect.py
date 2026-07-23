@@ -194,7 +194,13 @@ def _linux_network_type(path: Path) -> Optional[str]:
     """Find *path*'s mount in /proc/self/mountinfo and classify its fstype.
 
     Picks the mount whose mount point is the longest prefix of the resolved
-    path, so a network export mounted below a local root is detected.
+    path, so a network export mounted below a local root is detected. When two
+    mounts share the *same* mount point (the standard automount layout: an
+    ``autofs`` entry with the real ``nfs`` mounted on top of it at the identical
+    path), the later-listed one wins -- mountinfo lists mounts bottom-to-top, so
+    the last entry at a point is the effective (topmost) mount. Using ``>=`` (not
+    ``>``) for the tie is what surfaces the ``nfs`` shadowing an ``autofs`` at
+    ``/home``; a strict ``>`` would keep the first-seen ``autofs`` and miss it.
     """
     target = os.path.realpath(path)
     best_len = -1
@@ -213,7 +219,9 @@ def _linux_network_type(path: Path) -> Optional[str]:
                 continue
             mount_point = _unescape_mountinfo(fields[4])
             fstype = fields[sep + 1]
-            if _path_under(target, mount_point) and len(mount_point) > best_len:
+            # >= so a mount shadowing an earlier one at the same point (autofs ->
+            # nfs) wins; ties resolve to the last-listed (topmost) mount.
+            if _path_under(target, mount_point) and len(mount_point) >= best_len:
                 best_len = len(mount_point)
                 best_type = fstype
     return _classify_fstype(best_type)

@@ -101,12 +101,17 @@ class TestLinuxNetworkType:
         "45 23 0:42 / /mnt/local rw,relatime shared:9 - xfs /dev/sdb1 rw\n"
     )
 
-    def _classify(self, target: str):
+    def _classify(self, target: str, mountinfo: "str | None" = None):
         # _linux_network_type opens /proc/self/mountinfo and realpath()s target;
         # feed a fixed table and normalize realpath to forward slashes so this
         # Linux-only parser sees a POSIX path even when the test host is Windows
         # (str(Path("/mnt/lab")) yields backslashes there).
-        with patch("builtins.open", return_value=io.StringIO(self._MOUNTINFO)):
+        with patch(
+            "builtins.open",
+            return_value=io.StringIO(
+                self._MOUNTINFO if mountinfo is None else mountinfo
+            ),
+        ):
             with patch(
                 "os.path.realpath", side_effect=lambda p: str(p).replace(os.sep, "/")
             ):
@@ -124,6 +129,19 @@ class TestLinuxNetworkType:
     def test_longest_prefix_wins_over_root(self):
         # /mnt/lab (nfs4) must beat / (ext4) even though both are prefixes.
         assert self._classify("/mnt/lab") == "nfs4"
+
+    def test_nfs_shadowing_autofs_at_same_mountpoint(self):
+        # The standard automount layout: an autofs entry with the real nfs
+        # mounted on top at the *identical* mount point. mountinfo lists mounts
+        # bottom-to-top, so the nfs (last) is the effective mount and must win --
+        # a strict-'>' tie-break would keep the first-seen autofs and miss it,
+        # silently leaving the mmap file cache on NFS (biopb/biopb#571).
+        shadowed = (
+            "23 28 0:21 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+            "44 23 0:41 / /home/FCAM rw,relatime shared:9 - autofs systemd-1 rw\n"
+            "45 44 0:42 / /home/FCAM rw,relatime shared:9 - nfs fs01:/home rw,vers=4.2\n"
+        )
+        assert self._classify("/home/FCAM/jyu/cache", shadowed) == "nfs"
 
 
 class TestCloudPathHint:
