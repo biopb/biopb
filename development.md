@@ -396,7 +396,19 @@ editing the code.
   contract). The view's safety rests on the server never truncating a mapped
   segment inode: segment ids are strictly monotonic and eviction only `unlink`s,
   so the one truncating `"wb"` open always targets a fresh path — an NFS
-  `cache_dir` would break that and wants an explicit gate. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
+  `cache_dir` would break that and wants an explicit gate. The view's *cost* is a
+  disk-leak: while a client holds it the server can't reclaim that segment's
+  blocks even after eviction `unlink`s it (the inode survives to last close), so
+  a client pinning many segments keeps the server's `cache_dir` above budget.
+  The client bounds that leak with **pinned-segment accounting** (still
+  `biopb/biopb#571`): it tracks the on-disk size of the distinct segments it
+  keeps mapped (refcounted by inode, released by a `weakref.finalize` on the
+  backing Arrow buffer) and, once over `BIOPB_CACHEFILE_PIN_LIMIT_BYTES`
+  (default 16 GiB), copies the chunk out and drops the mapping instead of pinning
+  another segment — still off the warm mmap, no `do_get`. The hot path stays
+  cheap: the gate is a lock-free int compare, the segment size reuses the
+  `stat` the fast path already does, and only the view branch pays a lock + one
+  finalizer. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
   segment `unlink` — `biopb/biopb#5` — so Windows clients use `do_get`); the
   client honors `BIOPB_CACHEFILE_TRANSFER_DISABLED=1` to force the socket, and
   falls back to `do_get` whenever a chunk can't be located (memory backend, old

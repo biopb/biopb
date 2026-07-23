@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import threading
+import weakref
 from functools import cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,6 +60,11 @@ logger = logging.getLogger(__name__)
 # truncating a mapped segment inode (see file_backend `_create_segment`); an
 # NFS cache_dir would violate that and wants an explicit gate before this path
 # runs there.
+#
+# A held view also *pins* its segment's disk on the server (an evicted/unlinked
+# segment's blocks survive to the last close), so the process caps the total
+# mapped-segment size and copies the chunk out once over budget -- see the
+# pinned-segment accounting below (disk-leak workaround, biopb/biopb#571).
 
 # Highest on-disk segment format version this client can parse. The client
 # reads server-written segment bytes directly, so the layout is a cross-process
@@ -192,14 +198,35 @@ def _should_try_cachefile(location: str) -> bool:
     return _cachefile_supported(location) is not False
 
 
+def _decode_unified_batch(batch: pa.RecordBatch) -> Tuple[np.ndarray, pa.Buffer]:
+    """Decode the server's unified cache schema into a read-only array *view*
+    and the Arrow buffer backing it.
+
+    The file cache stores each chunk as ``[data: binary, shape: list<int64>,
+    dtype: string, ...]`` where ``data`` is the raw C-contiguous bytes of the
+    raveled array. Raw bytes are reinterpreted via the dtype string, so
+    endianness round-trips (biopb/biopb#293).
+
+    The returned array aliases ``data_buf`` (numpy holds it through the buffer
+    protocol), so the two share a lifetime. A caller that must keep the buffer's
+    backing alive -- or anchor a finalizer to it, as the pinned-segment
+    accounting does -- uses the returned buffer, which is the exact object the
+    array references (not a fresh wrapper, whose lifetime would be independent).
+    """
+    dtype = np.dtype(batch.column("dtype")[0].as_py())
+    shape = tuple(batch.column("shape").to_pylist()[0])
+    count = int(np.prod(shape)) if shape else 0
+    # binary array buffers = [validity, offsets, data]; data holds the blob.
+    data_buf = batch.column("data").buffers()[2]
+    arr = np.frombuffer(data_buf, dtype=dtype, count=count).reshape(shape)
+    arr.flags.writeable = False
+    return arr, data_buf
+
+
 def _array_from_unified_batch(
     batch: pa.RecordBatch, *, copy: bool = True
 ) -> np.ndarray:
     """Reconstruct a numpy array from the server's unified cache schema.
-
-    The file cache stores each chunk as ``[data: binary, shape: list<int64>,
-    dtype: string, ...]`` where ``data`` is the raw C-contiguous bytes of the
-    raveled array.
 
     The result is **read-only** (``writeable=False``) regardless of ``copy``, so
     the contract a consumer sees is uniform whether a chunk arrived over
@@ -208,34 +235,117 @@ def _array_from_unified_batch(
     (biopb/biopb#571). A chunk is a shared, cached view of server-owned bytes;
     mutating one in place is never safe, so callers must copy before writing.
 
-    Both production read paths pass ``copy=False`` (Option C, biopb/biopb#571):
+    ``copy=False`` (Option C, biopb/biopb#571) hands out a zero-copy view of the
+    batch's Arrow buffer, kept alive through the buffer protocol -- the default
+    for both production paths. The underlying buffer is already immutable, so the
+    former unconditional ``.copy()`` was pure overhead, and for a 64 MB chunk it
+    fell off glibc's 32 MiB mmap-threshold cliff.
 
-    - ``do_get`` -- a view onto the in-memory Arrow buffer, which numpy keeps
-      alive through the buffer protocol.
-    - the mmap fast path -- a view onto the server's segment *mapping*; the
-      caller closes its ``MemoryMappedFile`` handle immediately, but Arrow
-      refcounts the mapping so it survives as long as this array references it
-      (``ndarray -> pyarrow.Buffer -> MemoryMappedFile``).
-
-    Either way the underlying buffer is already immutable, so the former
-    ``.copy()`` was pure overhead -- and for a 64 MB chunk it fell off glibc's
-    32 MiB mmap-threshold cliff.
-
-    ``copy=True`` (the default) is retained as the owned-copy fallback for
-    callers that must *not* alias server memory -- e.g. a cache backing that can
-    be truncated under the reader (NFS), where handing out the mapping view is
-    unsafe. It allocates a fresh buffer and freezes it read-only to match.
+    ``copy=True`` (the default here) is the owned-copy fallback for callers that
+    must *not* alias server memory -- e.g. the mmap fast path once it is over its
+    pinned-segment budget (release the mapping now, don't pin more server disk),
+    or a cache backing that can be truncated under the reader (NFS). It allocates
+    a fresh buffer and freezes it read-only to match.
     """
-    dtype = np.dtype(batch.column("dtype")[0].as_py())
-    shape = tuple(batch.column("shape").to_pylist()[0])
-    count = int(np.prod(shape)) if shape else 0
-    # binary array buffers = [validity, offsets, data]; data holds the blob.
-    data_buf = batch.column("data").buffers()[2]
-    arr = np.frombuffer(data_buf, dtype=dtype, count=count).reshape(shape)
+    arr, _ = _decode_unified_batch(batch)
     if copy:
         arr = arr.copy()
-    arr.flags.writeable = False
+        arr.flags.writeable = False
     return arr
+
+
+# ------------------------------------------------------------------------------
+# Pinned-segment accounting (disk-leak workaround, biopb/biopb#571)
+# ------------------------------------------------------------------------------
+#
+# A fast-path view keeps its segment file's mapping alive, so the server cannot
+# reclaim that segment's disk blocks while the client holds the array -- even
+# after eviction unlinks the file (the inode survives to the last close). A
+# client that holds many views can thus keep the server's cache_dir above its
+# configured budget.
+#
+# Bound it: track the on-disk size of the distinct segments this process keeps
+# mapped, and once that crosses a threshold, copy the chunk out and let the
+# mapping go (copy=True) instead of handing out another view -- so no further
+# segment is pinned until some views drop. Refcounted per inode: many chunks
+# from one segment pin it once; a segment un-pins when the last view of it is
+# garbage-collected (a weakref.finalize on the backing Arrow buffer).
+#
+# Kept cheap on the hot read path: the gate is a lock-free read of a plain int;
+# only the view branch pays a lock + one weakref.finalize (per chunk actually
+# mapped), and the segment size is taken from the stat the fast path already does.
+
+_PIN_LIMIT_DEFAULT = 16 * 1024 * 1024 * 1024  # 16 GiB mapped before copying
+
+
+def _pin_limit_bytes() -> int:
+    """Max on-disk segment bytes this process keeps mmap-pinned before the fast
+    path falls back to copying. ``BIOPB_CACHEFILE_PIN_LIMIT_BYTES`` overrides;
+    ``0`` forces every fast-path read to copy (no view is ever handed out); a
+    negative or unparseable value uses the default."""
+    raw = os.environ.get("BIOPB_CACHEFILE_PIN_LIMIT_BYTES")
+    if raw is None:
+        return _PIN_LIMIT_DEFAULT
+    try:
+        val = int(raw)
+    except ValueError:
+        return _PIN_LIMIT_DEFAULT
+    return val if val >= 0 else _PIN_LIMIT_DEFAULT
+
+
+class _SegmentPin:
+    __slots__ = ("size", "refs")
+
+    def __init__(self, size: int):
+        self.size = size
+        self.refs = 0
+
+
+_pinned_lock = threading.Lock()
+_pinned_segments: Dict[int, _SegmentPin] = {}  # segment inode -> pin record
+_pinned_total = 0  # sum of sizes of currently-pinned segments (bytes)
+
+
+def _pin_budget_exhausted() -> bool:
+    """Whether the process is at/above its pinned-segment budget.
+
+    Lock-free by design: ``_pinned_total`` is a plain int (atomic under the GIL)
+    and the bound is a heuristic, so a momentarily stale read is acceptable and
+    the localhost hot read path stays clear of lock traffic.
+    """
+    return _pinned_total >= _pin_limit_bytes()
+
+
+def _register_segment_pin(inode: int, size: int, anchor: object) -> None:
+    """Charge a fast-path view against its segment, and release the charge when
+    the view is collected.
+
+    ``anchor`` must be the Arrow buffer the returned array actually holds (its
+    ``base`` chain), so the finalizer fires exactly when the last array derived
+    from this read -- and thus the last hold on the mapping -- is gone.
+    Refcounted by inode so many chunks read from one segment count its disk once.
+    """
+    global _pinned_total
+    with _pinned_lock:
+        pin = _pinned_segments.get(inode)
+        if pin is None:
+            pin = _pinned_segments[inode] = _SegmentPin(size)
+            _pinned_total += size
+        pin.refs += 1
+    weakref.finalize(anchor, _release_segment_pin, inode)
+
+
+def _release_segment_pin(inode: int) -> None:
+    """Drop one view's charge against ``inode``; un-pin the segment on the last."""
+    global _pinned_total
+    with _pinned_lock:
+        pin = _pinned_segments.get(inode)
+        if pin is None:
+            return
+        pin.refs -= 1
+        if pin.refs <= 0:
+            _pinned_total -= pin.size
+            del _pinned_segments[inode]
 
 
 def _try_cachefile_transfer(
@@ -248,9 +358,11 @@ def _try_cachefile_transfer(
     """Attempt the cache-file fast path for a chunk.
 
     Asks the server to locate the chunk on disk (chunk_locate), then mmaps the
-    segment file, reads the single IPC message, copies it out, and releases the
-    mapping. Returns the array, or None to fall back to do_get (server too old,
-    chunk not cached/locatable, or any read failure).
+    segment file and reads the single IPC message. Normally hands out a zero-copy
+    view onto the mapping (Option C); once the process is over its pinned-segment
+    budget it copies the chunk out and releases the mapping instead. Returns the
+    array, or None to fall back to do_get (server too old, chunk not
+    cached/locatable, or any read failure).
     """
     ticket = TensorTicket(chunk_id=chunk_id)
     action = flight.Action("chunk_locate", ticket.SerializeToString())
@@ -295,7 +407,10 @@ def _try_cachefile_transfer(
         byte_offset = int(info["byte_offset"])
         generation_id = int(info["generation_id"])
         # Detect a segment evicted and recreated at the same path before we map.
-        if os.stat(segment_path).st_ino != generation_id:
+        # Reuse this stat's st_size as the segment's pinned-disk cost below, so
+        # the accounting adds no extra syscall.
+        st = os.stat(segment_path)
+        if st.st_ino != generation_id:
             return None
         mm = pa.memory_map(segment_path, "r")
         try:
@@ -309,10 +424,18 @@ def _try_cachefile_transfer(
             # below drops *this* handle but the munmap waits for the last Buffer,
             # which the returned array keeps alive through
             #   ndarray -> pyarrow.Buffer -> MemoryMappedFile -> fd + mapping.
-            # So closing here is still correct and no ownership machinery (pool,
-            # finalizer, mapping LRU) is needed. This makes partial reads nearly
+            # So closing here is still correct. This makes partial reads nearly
             # free: untouched chunk pages are never faulted in.
-            arr = _array_from_unified_batch(batch, copy=False)
+            #
+            # The view keeps the server from reclaiming this segment's disk while
+            # we hold it, so once the process is over its pinned-segment budget we
+            # copy the chunk out and let the mapping go instead -- still off the
+            # warm page cache (no do_get), just bounding the disk-leak.
+            if _pin_budget_exhausted():
+                arr = _array_from_unified_batch(batch, copy=True)
+            else:
+                arr, data_buf = _decode_unified_batch(batch)
+                _register_segment_pin(generation_id, st.st_size, data_buf)
         finally:
             mm.close()
         logger.debug(f"_try_cachefile_transfer: read {arr.nbytes} bytes via mmap")
