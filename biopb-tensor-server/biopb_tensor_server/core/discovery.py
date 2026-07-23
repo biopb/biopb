@@ -17,12 +17,14 @@ Key components:
 
 from __future__ import annotations
 
+import abc
 import fnmatch
 import hashlib
 import logging
 import os
 from pathlib import Path
 from typing import (
+    IO,
     TYPE_CHECKING,
     Any,
     Callable,
@@ -229,228 +231,379 @@ def should_skip_walk_entry(
     return _is_offline_placeholder(path, stat_result)
 
 
-class ClaimContext:
-    """Unified path access for claim protocol.
+class ClaimContext(abc.ABC):
+    """Unified path access for the claim protocol.
 
-    Wraps local Path or RemoteStore operations with identical interface,
-    allowing claim() to work with both filesystem types uniformly.
+    ``claim()`` implementations probe the filesystem through this seam so they
+    work identically over a local ``Path``, a remote ``RemoteStore``, or a
+    pre-walked directory snapshot. The variance is expressed as a **type**, not a
+    set of mode flags: calling ``ClaimContext(...)`` dispatches to one of three
+    concrete shapes (the ``pathlib.Path`` idiom -- constructing the base returns a
+    subclass), so each operation is a single implementation instead of a
+    remote-vs-live-vs-snapshot ladder:
+
+    - :class:`RemoteContext` -- every probe hits a ``RemoteStore``.
+    - :class:`LiveLocalContext` -- a bare local ``Path``, probed live each call.
+    - :class:`SnapshotContext` -- a local ``Path`` plus the ``is_dir`` /
+      ``signature`` / ``child_listing`` the state walk already computed, so the
+      claim phase answers without re-stat'ing or re-reading the directory.
+
+    Sub-contexts from :meth:`join` / :meth:`parent` are :class:`LiveLocalContext`
+    (or :class:`RemoteContext`) **by construction** -- a structural probe below a
+    snapshot entry carries no cache and stats live, and that is now expressed by
+    the type it returns rather than implied by leaving cache fields unset.
     """
 
-    def __init__(
-        self,
-        path: Path | str,
+    # Factory dispatch. ``ClaimContext(...)`` picks the concrete shape from its
+    # arguments and returns an uninitialized instance of it; Python then calls
+    # that subclass's ``__init__`` with the same arguments (so each subclass
+    # ``__init__`` accepts the arguments its own call sites pass). Constructing a
+    # subclass directly (``LiveLocalContext(path)``) skips the dispatch.
+    def __new__(
+        cls,
+        path: Path | str = "",
         store: Optional[RemoteStore] = None,
         is_dir: Optional[bool] = None,
         signature: Optional[Tuple] = None,
         cloud_root: bool = False,
         child_listing: Optional[List[str]] = None,
-    ):
-        self._store = store
+    ) -> ClaimContext:
+        if cls is not ClaimContext:
+            return object.__new__(cls)
         if store is not None:
-            # Remote context. The local-only caches/flags below are meaningless
-            # here: remote reads go through cheap range requests (no residency or
-            # child-listing optimization applies), and a remote path is never a
-            # "cloud root" in the placeholder sense, so every probe hits the store.
-            self._path = None
-            self._remote_path = str(path)
-            self._cached_is_dir = None
-            self._signature = None
-            self._cloud_root = False
-            self._child_listing = None
-            return
+            chosen: type = RemoteContext
+        elif is_dir is not None:
+            chosen = SnapshotContext
+        else:
+            chosen = LiveLocalContext
+        return object.__new__(chosen)
 
+    # --- shared flag properties (overridden only by the shapes that differ) ---
+
+    @property
+    def is_remote(self) -> bool:
+        """Check if this is a remote context."""
+        return False
+
+    @property
+    def store(self) -> Optional[RemoteStore]:
+        """Underlying RemoteStore if remote, else None."""
+        return None
+
+    @property
+    def cloud_root(self) -> bool:
+        """Whether this path is under a configured ``cloud = true`` root."""
+        return False
+
+    @property
+    def signature(self) -> Optional[Tuple]:
+        """Content-identity signature for this entry, or None if not supplied.
+
+        Non-None only on :class:`SnapshotContext` (the state walk's per-entry stat
+        signature); ``None`` on live-walk / ``join()`` / remote contexts, which
+        signals content-probe caches to run uncached.
+        """
+        return None
+
+    # --- path operations (each concrete shape implements these) ---
+    #
+    # Abstract, so the base cannot be instantiated and a concrete shape that
+    # forgets an override is rejected at construction (and flagged by type
+    # checkers) rather than at first call. ``_LocalContext`` supplies the shared
+    # ones and stays abstract on the four structural probes its leaves differ on.
+
+    @abc.abstractmethod
+    def is_dir(self) -> bool:
+        """Check if path is directory."""
+
+    @abc.abstractmethod
+    def is_file(self) -> bool:
+        """Check if path is file."""
+
+    @abc.abstractmethod
+    def exists(self) -> bool:
+        """Check if path exists."""
+
+    @abc.abstractmethod
+    def read_text(self, subpath: str = "") -> str:
+        """Read file contents as text (``subpath`` empty for the current path)."""
+
+    @abc.abstractmethod
+    def open(self, mode: str = "rb") -> IO:
+        """Open this path as a stream (``rb`` by default).
+
+        The shape-agnostic read seam: a local shape opens the ``Path``, a remote
+        shape opens through its ``RemoteStore``, so an adapter that needs a
+        file-like handle (``pydicom.dcmread`` on a header) stays blind to which
+        concrete context it got. The returned object is a context manager.
+        """
+
+    @abc.abstractmethod
+    def join(self, subpath: str) -> ClaimContext:
+        """Create a (live) context for ``subpath`` under this one."""
+
+    @abc.abstractmethod
+    def glob(self, pattern: str) -> List[ClaimContext]:
+        """Find entries matching ``pattern`` in this directory (maxdepth 1)."""
+
+    @property
+    @abc.abstractmethod
+    def path_str(self) -> str:
+        """Get path as string (for SourceClaim)."""
+
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        """Get filename/directory name."""
+
+    @property
+    @abc.abstractmethod
+    def parent(self) -> ClaimContext:
+        """Get parent directory context."""
+
+    @abc.abstractmethod
+    def is_resident(self) -> bool:
+        """Recall-free: is this path's content local and cheap to read right now?
+
+        The per-read residency gate an adapter's ``claim()`` consults before
+        opening a sidecar or container: when it returns False the read would
+        trigger a whole-file cloud recall (or block offline), so the adapter
+        defers and emits an *unresolved* claim instead (cloud-storage phase 2).
+        """
+
+
+class RemoteContext(ClaimContext):
+    """Claim context backed by a ``RemoteStore``: every probe is a store call.
+
+    The local-only caches/flags do not apply here -- remote reads go through cheap
+    range requests (no residency or child-listing optimization), and a remote path
+    is never a "cloud root" in the placeholder sense, so every probe hits the
+    store. ``cloud_root``/``signature`` therefore keep the base defaults.
+    """
+
+    def __init__(self, path: Path | str, store: RemoteStore):
+        self._remote_path = str(path)
+        self._store = store
+
+    @property
+    def is_remote(self) -> bool:
+        return True
+
+    @property
+    def store(self) -> RemoteStore:
+        return self._store
+
+    def is_dir(self) -> bool:
+        return self._store.isdir(self._remote_path)
+
+    def is_file(self) -> bool:
+        return self._store.isfile(self._remote_path)
+
+    def exists(self) -> bool:
+        return self._store.exists(self._remote_path)
+
+    def read_text(self, subpath: str = "") -> str:
+        target = (
+            (self._remote_path + "/" + subpath).lstrip("/")
+            if subpath
+            else self._remote_path
+        )
+        return self._store.read_text(target)
+
+    def open(self, mode: str = "rb") -> IO:
+        return self._store.open(self._remote_path, mode=mode)
+
+    def join(self, subpath: str) -> ClaimContext:
+        new_path = (
+            self._remote_path.rstrip("/") + "/" + subpath
+            if self._remote_path
+            else subpath
+        )
+        return RemoteContext(new_path, self._store)
+
+    def glob(self, pattern: str) -> List[ClaimContext]:
+        matches = self._store.find(pattern, maxdepth=1)
+        return [RemoteContext(m, self._store) for m in matches]
+
+    @property
+    def path_str(self) -> str:
+        return self._store._join(self._remote_path)
+
+    @property
+    def name(self) -> str:
+        return self._remote_path.rstrip("/").split("/")[-1]
+
+    @property
+    def parent(self) -> ClaimContext:
+        parent_path = (
+            self._remote_path.rsplit("/", 1)[0] if "/" in self._remote_path else ""
+        )
+        return RemoteContext(parent_path, self._store)
+
+    def is_resident(self) -> bool:
+        # Remote contexts read via cheap range requests, so always resident --
+        # remote claim behavior is unchanged.
+        return True
+
+
+class _LocalContext(ClaimContext):
+    """Shared local-``Path`` behavior for :class:`LiveLocalContext` and
+    :class:`SnapshotContext`.
+
+    Holds the path and the cloud-root flag and implements everything that does not
+    depend on the snapshot caches (``read_text``, ``path_str``, ``name``,
+    ``is_resident``, and the ``join``/``parent`` sub-contexts). The two leaves
+    differ only in whether the structural probes (``is_dir``/``is_file``/
+    ``exists``/``glob``) read the filesystem live or answer from the state walk.
+    """
+
+    def __init__(self, path: Path | str, cloud_root: bool = False):
         self._path = Path(path)
-        self._remote_path = None
-        # When the caller already knows this entry's kind — the snapshot-driven
-        # discovery hands in the ``is_directory`` the state walk computed from its
-        # single ``DirEntry.stat()`` — cache it so ``is_dir``/``is_file``/``exists``
-        # answer without re-stat'ing the entry. Every registered adapter's
-        # ``claim()`` opens with an ``is_file()``/``is_dir()`` gate, so each rescan
-        # entry was being stat'd once per adapter (~16×) for a fact the walk already
-        # held (biopb/biopb#56, items 3+4). ``join()`` sub-contexts get no cache, so
-        # structural probes (``.zattrs``, ``zarr.json``, ``NDTiff.index``, …) still
-        # stat live.
-        self._cached_is_dir = is_dir
-        # The entry's content-identity signature (st_dev, st_ino, st_size,
-        # st_mtime_ns, st_ctime_ns), as computed by the state walk. Adapters that
-        # open the file to sniff content (``_get_ome_metadata_from_tiff``) key a
-        # process-wide cache on it so a steady-state rescan re-reads unchanged
-        # headers from memory instead of disk (biopb/biopb#56, item 6). Top-level
-        # contexts only; ``join()`` sub-contexts carry no signature.
-        self._signature = signature
         # True when this entry lives under a ``cloud = true`` root. Lets an
         # adapter's ``claim()`` (and the resolve-time re-claim) suppress
         # content-membership multi-file grouping under cloud regardless of
         # per-file residency -- residency can't gate the resolve path, where the
         # file is already resident.
         self._cloud_root = cloud_root
-        # The directory's child paths as the state walk recorded them
-        # (snapshot-driven discovery only). When present, ``glob()`` serves
-        # single-level name-pattern matches from this list instead of re-reading
-        # the directory off disk. A directory-claiming adapter globs its candidate
-        # directory up to 6× per rescan cycle (TIFF sequence: ``*.tif``, ``*.tiff``
-        # + 4 metadata patterns), and on cloud storage each glob is a directory
-        # enumeration round-trip (~0.5-1 s/dir on OneDrive Files-On-Demand) — yet
-        # the state walk already enumerated every directory's children once, so the
-        # claim phase can reuse that listing instead of re-hitting the filesystem
-        # (biopb/biopb#65). ``None`` on live-walk and ``join()`` sub-contexts, which
-        # fall back to a real ``glob`` (same discipline as the ``is_dir`` /
-        # ``signature`` caches).
-        self._child_listing = child_listing
 
     @property
     def cloud_root(self) -> bool:
-        """Whether this path is under a configured ``cloud = true`` root."""
         return self._cloud_root
 
-    def is_dir(self) -> bool:
-        """Check if path is directory."""
-        if self._store:
-            return self._store.isdir(self._remote_path)
-        if self._cached_is_dir is not None:
-            return self._cached_is_dir
-        return self._path.is_dir()
-
-    def is_file(self) -> bool:
-        """Check if path is file."""
-        if self._store:
-            return self._store.isfile(self._remote_path)
-        if self._cached_is_dir is not None:
-            # The entry exists (it came from a successful stat) and is not a
-            # directory ⇒ a file for claim purposes. Differs from ``Path.is_file()``
-            # (S_ISREG) only for the rare non-regular entry (socket/fifo/device),
-            # which every file-gated adapter rejects at its next extension/content
-            # check anyway.
-            return not self._cached_is_dir
-        return self._path.is_file()
-
-    def exists(self) -> bool:
-        """Check if path exists."""
-        if self._store:
-            return self._store.exists(self._remote_path)
-        if self._cached_is_dir is not None:
-            return True
-        return self._path.exists()
-
     def read_text(self, subpath: str = "") -> str:
-        """Read file contents as text.
-
-        Args:
-            subpath: Relative path within this context (empty for current path)
-        """
-        if self._store:
-            target = (
-                (self._remote_path + "/" + subpath).lstrip("/")
-                if subpath
-                else self._remote_path
-            )
-            return self._store.read_text(target)
         target = self._path / subpath if subpath else self._path
         return target.read_text()
 
-    def join(self, subpath: str) -> ClaimContext:
-        """Create context for subpath."""
-        if self._store:
-            new_path = (
-                self._remote_path.rstrip("/") + "/" + subpath
-                if self._remote_path
-                else subpath
-            )
-            return ClaimContext(new_path, self._store)
-        return ClaimContext(self._path / subpath)
-
-    def glob(self, pattern: str) -> List[ClaimContext]:
-        """Find files matching ``pattern`` in this directory (maxdepth 1).
-
-        When a cached child listing is available (snapshot-driven discovery) and
-        the pattern is a single directory level — which every directory-claiming
-        adapter's claim glob is (``*.tif``, ``metadata.txt``, ``*.companion.ome``,
-        …) — the matches are served by ``fnmatch``ing the cached basenames, with no
-        filesystem read (biopb/biopb#65). ``fnmatch`` mirrors ``Path.glob``'s
-        per-platform case sensitivity (case-sensitive on POSIX, case-insensitive on
-        Windows) via ``os.path.normcase``. Multi-level patterns (containing ``/``
-        or ``**``) and contexts without a cached listing fall back to a real glob.
-        """
-        if self._store:
-            matches = self._store.find(pattern, maxdepth=1)
-            return [ClaimContext(m, self._store) for m in matches]
-        if self._child_listing is not None and "/" not in pattern:
-            return [
-                ClaimContext(Path(child))
-                for child in self._child_listing
-                if fnmatch.fnmatch(os.path.basename(child), pattern)
-            ]
-        return [ClaimContext(p) for p in self._path.glob(pattern)]
+    def open(self, mode: str = "rb") -> IO:
+        return self._path.open(mode)
 
     @property
     def path_str(self) -> str:
-        """Get path as string (for SourceClaim)."""
-        if self._store:
-            return self._store._join(self._remote_path)
         return str(self._path)
 
     @property
     def name(self) -> str:
-        """Get filename/directory name."""
-        if self._store:
-            return self._remote_path.rstrip("/").split("/")[-1]
         return self._path.name
+
+    def join(self, subpath: str) -> ClaimContext:
+        # A sub-context carries no snapshot cache: structural probes below a
+        # snapshot entry (``.zattrs``, ``zarr.json``, ``NDTiff.index``, …) stat
+        # live. Returning a LiveLocalContext expresses that by construction.
+        return LiveLocalContext(self._path / subpath)
 
     @property
     def parent(self) -> ClaimContext:
-        """Get parent directory context."""
-        if self._store:
-            parent_path = (
-                self._remote_path.rsplit("/", 1)[0] if "/" in self._remote_path else ""
-            )
-            return ClaimContext(parent_path, self._store)
-        return ClaimContext(self._path.parent)
-
-    @property
-    def is_remote(self) -> bool:
-        """Check if this is a remote context."""
-        return self._store is not None
-
-    @property
-    def store(self) -> Optional[RemoteStore]:
-        """Get underlying RemoteStore if remote."""
-        return self._store
-
-    @property
-    def signature(self) -> Optional[Tuple]:
-        """Content-identity signature for this entry, or None if not supplied.
-
-        Set only on the top-level snapshot-driven contexts (the state walk's
-        per-entry stat signature); ``None`` on live-walk and ``join()`` contexts,
-        which signals content-probe caches to run uncached.
-        """
-        return self._signature
+        return LiveLocalContext(self._path.parent)
 
     def is_resident(self) -> bool:
-        """Recall-free: is this path's content local and cheap to read right now?
-
-        This is the per-read residency gate an adapter's ``claim()`` consults
-        before opening a sidecar or container: when it returns False the read
-        would trigger a whole-file cloud recall (or block offline), so the adapter
-        defers and emits an *unresolved* claim instead (cloud-storage phase 2).
-
-        Remote contexts read via cheap range requests, so they are always treated
-        as resident -- remote claim behavior is unchanged. A local path is
-        resident unless it is an offline cloud placeholder, detected by
-        ``_is_offline_placeholder`` (a stat-only check that never opens content).
-        """
-        if self._store is not None:
-            return True
         # The placeholder signal (st_blocks == 0) is a per-file concept; a
         # directory legitimately reports zero blocks on some filesystems (macOS
         # APFS), so treat a directory as resident -- mirrors SourceAdapter
         # .is_resident and should_skip_walk_entry (which gates on `not is_dir`).
+        # A local file is resident unless it is an offline cloud placeholder
+        # (``_is_offline_placeholder``, a stat-only check that never opens content).
         try:
             if self._path.is_dir():
                 return True
         except OSError:
             return False
         return not _is_offline_placeholder(self._path)
+
+
+class LiveLocalContext(_LocalContext):
+    """A bare local ``Path`` probed live -- ``is_dir``/``is_file``/``exists``/
+    ``glob`` read the filesystem each call.
+
+    Produced for the recursive live walk, the config one-shot scan, and every
+    :meth:`join` / :meth:`parent` sub-context.
+    """
+
+    def is_dir(self) -> bool:
+        return self._path.is_dir()
+
+    def is_file(self) -> bool:
+        return self._path.is_file()
+
+    def exists(self) -> bool:
+        return self._path.exists()
+
+    def glob(self, pattern: str) -> List[ClaimContext]:
+        return [LiveLocalContext(p) for p in self._path.glob(pattern)]
+
+
+class SnapshotContext(_LocalContext):
+    """A local ``Path`` plus the facts the state walk already computed, so the
+    claim phase answers structural probes without re-touching the filesystem.
+
+    Every registered adapter's ``claim()`` opens with an ``is_file()``/
+    ``is_dir()`` gate, so each rescan entry was being stat'd once per adapter
+    (~16×) for a fact the walk already held from its single ``DirEntry.stat()``
+    (biopb/biopb#56, items 3+4). A directory-claiming adapter also globs its
+    candidate directory up to 6× per rescan cycle (TIFF sequence: ``*.tif``,
+    ``*.tiff`` + 4 metadata patterns) — and on cloud storage each glob is a
+    directory-enumeration round-trip (~0.5–1 s/dir on OneDrive Files-On-Demand) —
+    yet the state walk already enumerated every directory's children once
+    (biopb/biopb#65). This context serves both from memory; sub-contexts from
+    :meth:`join` / :meth:`parent` drop the caches and probe live.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        is_dir: bool,
+        signature: Optional[Tuple] = None,
+        cloud_root: bool = False,
+        child_listing: Optional[List[str]] = None,
+    ):
+        super().__init__(path, cloud_root)
+        # The entry's kind, as the state walk computed it from its DirEntry.stat().
+        self._cached_is_dir = is_dir
+        # The entry's content-identity signature (st_dev, st_ino, st_size,
+        # st_mtime_ns, st_ctime_ns). Adapters that open the file to sniff content
+        # (``_get_ome_metadata_from_tiff``) key a process-wide cache on it so a
+        # steady-state rescan re-reads unchanged headers from memory (#56 item 6).
+        self._signature = signature
+        # The directory's child paths as the state walk recorded them; ``glob()``
+        # serves single-level name matches from this instead of re-reading the
+        # directory (#65). ``None`` on files (only directories glob).
+        self._child_listing = child_listing
+
+    @property
+    def signature(self) -> Optional[Tuple]:
+        return self._signature
+
+    def is_dir(self) -> bool:
+        return self._cached_is_dir
+
+    def is_file(self) -> bool:
+        # The entry exists (it came from a successful stat) and is not a directory
+        # ⇒ a file for claim purposes. Differs from ``Path.is_file()`` (S_ISREG)
+        # only for the rare non-regular entry (socket/fifo/device), which every
+        # file-gated adapter rejects at its next extension/content check anyway.
+        return not self._cached_is_dir
+
+    def exists(self) -> bool:
+        return True
+
+    def glob(self, pattern: str) -> List[ClaimContext]:
+        """Find entries matching ``pattern`` in this directory (maxdepth 1).
+
+        When a cached child listing is available and the pattern is a single
+        directory level — which every directory-claiming adapter's claim glob is
+        (``*.tif``, ``metadata.txt``, ``*.companion.ome``, …) — the matches are
+        served by ``fnmatch``ing the cached basenames, with no filesystem read
+        (biopb/biopb#65). ``fnmatch`` mirrors ``Path.glob``'s per-platform case
+        sensitivity (case-sensitive on POSIX, case-insensitive on Windows) via
+        ``os.path.normcase``. Multi-level patterns (containing ``/`` or ``**``) and
+        contexts without a cached listing fall back to a real glob.
+        """
+        if self._child_listing is not None and "/" not in pattern:
+            return [
+                LiveLocalContext(Path(child))
+                for child in self._child_listing
+                if fnmatch.fnmatch(os.path.basename(child), pattern)
+            ]
+        return [LiveLocalContext(p) for p in self._path.glob(pattern)]
 
 
 def walk_with_identity_tracking(

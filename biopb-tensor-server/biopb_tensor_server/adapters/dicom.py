@@ -327,13 +327,11 @@ class DicomAdapter(TensorAdapter):
         try:
             import pydicom
 
-            if ctx.is_remote:
-                # Remote: read via file-like object
-                with ctx.store.open(ctx._remote_path, mode="rb") as fobj:
-                    ds = pydicom.dcmread(fobj, stop_before_pixels=True)
-            else:
-                # Local: read metadata only (no pixel data)
-                ds = pydicom.dcmread(ctx.path_str, stop_before_pixels=True)
+            # Read metadata only (no pixel data). ctx.open() is the shape-agnostic
+            # read seam -- a local Path handle or a remote store handle -- so this
+            # stays blind to whether the context is local or remote.
+            with ctx.open("rb") as fobj:
+                ds = pydicom.dcmread(fobj, stop_before_pixels=True)
 
             # Check for image-related tags (indicating pixel data capability)
             if not (hasattr(ds, "Rows") and hasattr(ds, "Columns")):
@@ -532,12 +530,12 @@ class DicomSeriesAdapter(TensorAdapter):
         if ctx.cloud_root:
             return None
 
-        # Find DICOM files. Route through ctx.glob (not ctx._path.glob) so the
-        # snapshot's cached child listing serves the match without re-reading the
-        # directory (biopb/biopb#65); unwrap to the underlying Path objects the
-        # rest of this method (dcmread / try_claim_path) consumes.
+        # Find DICOM files. Route through ctx.glob (not a raw directory glob) so
+        # the snapshot's cached child listing serves the match without re-reading
+        # the directory (biopb/biopb#65); unwrap to the path strings the rest of
+        # this method (dcmread / try_claim_path) consumes.
         dcm_files = [
-            c._path
+            c.path_str
             for c in (ctx.glob("*.dcm") + ctx.glob("*.DICOM") + ctx.glob("*.dicom"))
         ]
 

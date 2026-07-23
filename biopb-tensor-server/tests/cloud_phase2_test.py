@@ -21,6 +21,7 @@ from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     DiscoveryState,
+    LiveLocalContext,
     SourceClaim,
     should_skip_walk_entry,
 )
@@ -127,10 +128,13 @@ class TestShouldSkipAdmit:
 # --------------------------------------------------------------------------- #
 
 
-class _RaisingReadCtx(ClaimContext):
-    """A ClaimContext whose content reads explode, proving claim() never reads."""
+class _RaisingReadCtx(LiveLocalContext):
+    """A local ClaimContext whose content reads explode, proving claim() never reads."""
 
     def read_text(self, subpath: str = "") -> str:
+        raise AssertionError("claim() must not read content for this adapter")
+
+    def open(self, mode: str = "rb") -> object:
         raise AssertionError("claim() must not read content for this adapter")
 
 
