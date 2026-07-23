@@ -143,6 +143,16 @@ class TestTensorConfig:
         )
         assert config.claim_generic_images is True
 
+    def test_handle_reaper_ttl_defaults_to_150(self):
+        config = parse_config({"server": {}, "sources": []})
+        assert config.handle_reaper_ttl == 150.0
+
+    def test_parse_handle_reaper_ttl(self):
+        # Carried and coerced to float; 0 is the documented "disable" sentinel.
+        config = parse_config({"server": {"handle_reaper_ttl": 45}, "sources": []})
+        assert config.handle_reaper_ttl == 45.0
+        assert parse_config({"server": {"handle_reaper_ttl": 0}}).handle_reaper_ttl == 0.0
+
 
 class TestReductionMethodNormalization:
     """Tests for normalize_reduction_method and the deprecated linear alias."""
@@ -779,15 +789,13 @@ class TestGetPhysicalScale:
 
     def test_ndtiff_physical_scale_from_summary(self):
         """NDTiff PixelSize_um / z-step map onto x/y/z; p/t/c zeroed."""
-        import types
-
         from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
 
         a = NdTiffAdapter.__new__(NdTiffAdapter)
         a.dim_labels = ["p", "t", "c", "z", "y", "x"]
-        a._dataset = types.SimpleNamespace(
-            summary_metadata={"PixelSize_um": 0.16, "z-step_um": 0.5}
-        )
+        # Summary is snapshotted at registration (biopb/biopb#71), so
+        # _physical_scale reads _summary_metadata, not a live self._dataset.
+        a._summary_metadata = {"PixelSize_um": 0.16, "z-step_um": 0.5}
         scale, unit = a._physical_scale()
         assert scale == [0.0, 0.0, 0.0, 0.5, 0.16, 0.16]
         assert unit == ["", "", "", "µm", "µm", "µm"]

@@ -238,6 +238,7 @@ _CONSTRAINTS = {
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
         "stable_rescans_required": _Range(min=0),
+        "handle_reaper_ttl": _Range(min=0),
     },
 }
 
@@ -660,6 +661,15 @@ class ServerConfig:
         metadata={
             "help": "Seconds between forced full rescans that bypass subtree "
             "pruning (<= 0 disables this backstop)."
+        },
+    )
+    handle_reaper_ttl: float = field(
+        default=150.0,
+        metadata={
+            "help": "Seconds an idle persistent file handle (OME-TIFF store, "
+            "NDTiff acquisition) is kept warm before it is closed; the next read "
+            "reopens it (<= 0 disables reaping). Adapters that reopen per read "
+            "(hdf5, mrc, ...) are unaffected."
         },
     )
     stability_window: float = field(
@@ -1114,6 +1124,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         )
 
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
+    _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
     _carry(
         server_kwargs,

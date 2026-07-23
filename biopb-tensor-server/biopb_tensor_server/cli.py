@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
+from biopb_tensor_server.adapters._handle_reaper import set_handle_reaper_ttl
 from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
@@ -427,6 +428,10 @@ def _setup_flight_server(
     # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
     # Off by default so recursive scans don't register screenshots/icons/movies.
     set_claim_generic_images(server_config.claim_generic_images)
+
+    # Apply the idle-handle reaper TTL to the opt-in adapters (OME-TIFF, NDTiff)
+    # before any source registers, so it fully takes effect (biopb/biopb#71).
+    set_handle_reaper_ttl(server_config.handle_reaper_ttl)
 
     # Initialize cache manager for virtual chunks
     cache_config = server_config.cache
