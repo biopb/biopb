@@ -242,6 +242,19 @@ adapter. The default backend is an in-process LRU memory cache
 (`OrderedDict`-based, in `cache/memory_backend.py`).
 An optional `ArrowFileBackend` persists decoded chunks to disk.
 
+**Local-disk gate (biopb/biopb#571).** The file backend mmaps its segments (for
+its own segment reads/boot index and the localhost client fast path) and assumes
+local-POSIX semantics — an unlinked-but-mapped inode survives to last close, a
+mapped page never vanishes. A **network** (`nfs`/`cifs`/…) or **cloud
+Files-On-Demand** (`OneDrive`/`iCloud`/`Dropbox`) `cache_dir` breaks that (mmap
+SIGBUS/ESTALE on an evicted segment; a recall stall on a dehydrated one). So the
+launcher classifies the configured `file_cache_dir` **once at startup**
+(`core/fs_detect.py` — Linux `/proc/self/mountinfo`, Windows `GetDriveTypeW`/UNC,
+macOS `statfs`, plus cloud-root path heuristics; all metadata-only, never
+raising, and demoting **only on a positive signal**) and falls back to the
+**memory backend** when the dir isn't plain local disk — which also disables the
+client fast path for free (a memory backend never locates a chunk).
+
 **Sidecar boot index (biopb/biopb#300).** Each sealed segment `seg_NNNN.arrow`
 gets a `seg_NNNN.idx` sidecar written at seal time (natural rotation and
 graceful close) recording every entry's key -> byte range. Boot restores the

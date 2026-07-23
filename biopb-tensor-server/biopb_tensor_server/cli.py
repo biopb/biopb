@@ -37,6 +37,7 @@ from biopb_tensor_server.core.config import (
     resolve_all_sources,
     validate_config_dict,
 )
+from biopb_tensor_server.core.fs_detect import unsafe_cache_dir_reason
 from biopb_tensor_server.core.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -448,23 +449,42 @@ def _setup_flight_server(
         )
         console.print("[green]Raw chunk cache: OS page cache[/green]")
     elif cache_config.backend == "file":
-        try:
-            manager = CacheManager.initialize(cache_config)
-        except OSError as e:
-            # Cache dir not writable (e.g. read-only HPC scratch). Fall back to
-            # the in-memory backend so the server still starts; the localhost
-            # cache-file fast path (issue #9) is simply unavailable.
+
+        def _memory_fallback() -> CacheConfig:
+            return CacheConfig(
+                backend="memory",
+                memory_max_entries=cache_config.memory_max_entries,
+                memory_max_bytes=cache_config.memory_max_bytes,
+            )
+
+        # The file cache mmaps its segments and assumes local-POSIX semantics
+        # (unlinked-but-mapped inodes stay alive, mapped pages never vanish). A
+        # network mount (NFS/CIFS) can SIGBUS/ESTALE a mapping to an evicted
+        # segment, and a cloud Files-On-Demand folder recalls a dehydrated
+        # segment on mmap read -- so classify the cache dir once and fall back to
+        # memory rather than serve unsafe reads (biopb/biopb#571 follow-up). This
+        # also disables the localhost client fast path for free: a memory backend
+        # never locates a chunk, so clients use do_get.
+        unsafe = unsafe_cache_dir_reason(cache_config.file_cache_dir)
+        if unsafe:
             console.print(
-                f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
-                f"({e}); falling back to in-memory cache.[/yellow]"
+                f"[yellow]File cache dir {cache_config.file_cache_dir} is on "
+                f"{unsafe}; the mmap-based file cache is unsafe there, falling "
+                f"back to in-memory cache.[/yellow]"
             )
-            manager = CacheManager.initialize(
-                CacheConfig(
-                    backend="memory",
-                    memory_max_entries=cache_config.memory_max_entries,
-                    memory_max_bytes=cache_config.memory_max_bytes,
+            manager = CacheManager.initialize(_memory_fallback())
+        else:
+            try:
+                manager = CacheManager.initialize(cache_config)
+            except OSError as e:
+                # Cache dir not writable (e.g. read-only HPC scratch). Fall back
+                # to the in-memory backend so the server still starts; the
+                # localhost cache-file fast path (issue #9) is simply unavailable.
+                console.print(
+                    f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
+                    f"({e}); falling back to in-memory cache.[/yellow]"
                 )
-            )
+                manager = CacheManager.initialize(_memory_fallback())
         if isinstance(manager.backend, ArrowFileBackend):
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] "
