@@ -888,6 +888,73 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def _one_endpoint(self, client):
+        """A real (chunk_id, start, stop) triple for source "z"'s first chunk."""
+        ctx = client._get_tensor_context("z")
+        chunk_id, bounds = ctx.endpoints[0]
+        return chunk_id, tuple(bounds.start), tuple(bounds.stop)
+
+    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
+    def test_fetched_block_is_read_only_fast_path(self):
+        """End-to-end read contract: a chunk pulled through the real fetch leaf
+        via the localhost mmap fast path is read-only, and mutating it raises."""
+        import biopb.tensor.client as cmod
+        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, _src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            # Warm the server's file cache so chunk_locate can find the chunk.
+            client.get_tensor("z").compute(scheduler="threads")
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+            assert cmod._cachefile_support.get(loc) is True  # fast path was used
+            assert block.shape == (48, 48)
+            assert not block.flags.writeable
+            with pytest.raises(ValueError):
+                block[0, 0] = 0
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fetched_block_is_read_only_do_get(self):
+        """End-to-end read contract on the do_get path (fast path disabled): the
+        zero-copy view is read-only on every platform, and still decodes right."""
+        import biopb.tensor.client as cmod
+        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            cmod._cachefile_support.clear()
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
+                client = TensorFlightClient(loc, cache_bytes=0)
+                chunk_id, start, stop = self._one_endpoint(client)
+
+                block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+                # Fast path was never probed -- this is the do_get view path.
+                assert cmod._cachefile_support.get(loc) is None
+                assert not block.flags.writeable
+                # The view holds the correct chunk bytes for its bounds.
+                expected = src[start[0] : stop[0], start[1] : stop[1]]
+                assert np.array_equal(block, expected)
+                with pytest.raises(ValueError):
+                    block[0, 0] = 0
+                client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 # ==============================================================================
 # Backend: direct-seek segment reads
