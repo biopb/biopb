@@ -399,6 +399,58 @@ class TestLocateEntry:
             be2.close()
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_segment_files_are_never_truncated_in_place(self):
+        """Load-bearing invariant for the localhost mmap fast path (Option C,
+        biopb/biopb#571): a client hands out a zero-copy *view* onto a segment
+        mapping, so a segment inode must never be truncated or recreated in place
+        while it could still be mapped -- that would SIGBUS the remote reader far
+        from the read that produced the array.
+
+        The guard is strictly-monotonic segment ids (``_next_segment_id``, boot
+        max+1, only incremented): the sole truncating open,
+        ``pa.OSFile(path, "wb")``, must target a fresh path every time, even
+        across rotation and eviction. Spy on that open and assert no segment path
+        is ever opened for write twice.
+        """
+        import re
+
+        d = tempfile.mkdtemp()
+        cfg = ArrowFileConfig(
+            cache_dir=Path(d),
+            max_segment_bytes=64 * 1024,  # tiny -> frequent rotation
+            max_total_bytes=256 * 1024,  # tiny -> frequent eviction
+        )
+        seg_re = re.compile(r"seg_\d+\.arrow$")
+        opened_for_write: list[str] = []
+        real_osfile = pa.OSFile
+
+        def spy_osfile(path, mode="rb", *a, **k):
+            if "w" in mode and seg_re.search(str(path)):
+                opened_for_write.append(str(path))
+            return real_osfile(path, mode, *a, **k)
+
+        be = ArrowFileBackend(cfg)
+        try:
+            with patch.object(pa, "OSFile", spy_osfile):
+                for i in range(200):
+                    a = ((np.arange(4000, dtype=np.uint16) + i) % 509).astype(np.uint16)
+                    key = f"k-{i}".encode()
+                    be.get_or_acquire(
+                        key, (lambda a=a: (_make_typed_batch(a), a.nbytes))
+                    )
+                    be.release(key)
+        finally:
+            be.close()
+            shutil.rmtree(d, ignore_errors=True)
+
+        # The workload must actually rotate (else the test proves nothing)...
+        assert len(opened_for_write) > 1, "test did not rotate segments"
+        # ...and no segment path was ever truncated/recreated in place.
+        assert len(opened_for_write) == len(set(opened_for_write)), (
+            "a segment path was opened 'wb' twice -- a mapped inode could be "
+            "truncated under a remote reader (Option C invariant broken)"
+        )
+
 
 class TestLocateViaManager:
     def test_memory_backend_returns_none(self):
@@ -720,7 +772,7 @@ class TestCachefileIntegration:
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
-        server, _src = self._serve_zarr(tmp, cfg)
+        server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
             cmod._cachefile_support.clear()
@@ -735,6 +787,44 @@ class TestCachefileIntegration:
             assert not block.flags.writeable
             with pytest.raises(ValueError):
                 block[0, 0] = 0
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
+    def test_fast_path_hands_out_mmap_view_that_outlives_close(self):
+        """Option C (biopb/biopb#571): the fast path returns a zero-copy *view*
+        onto the segment mapping, not an owned copy. The leaf closes its
+        MemoryMappedFile handle before returning, so this also proves Arrow keeps
+        the mapping alive for the array's lifetime -- the block still decodes the
+        correct bytes after the handle is gone and every intermediate ref is
+        dropped and gc'd."""
+        import biopb.tensor.client as cmod
+        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            client.get_tensor("z").compute(scheduler="threads")  # warm cache
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+            assert cmod._cachefile_support.get(loc) is True
+            # A view, not an owned copy: this is the whole point of Option C.
+            assert not block.flags.owndata
+            # The mmap handle was already closed inside the leaf; force a gc to
+            # drop any stray decode intermediates, then read through the mapping.
+            import gc
+
+            gc.collect()
+            expected = src[start[0] : stop[0], start[1] : stop[1]]
+            assert np.array_equal(block, expected)
             client.close()
         finally:
             server.shutdown()
