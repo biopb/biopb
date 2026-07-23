@@ -151,7 +151,9 @@ class TestTensorConfig:
         # Carried and coerced to float; 0 is the documented "disable" sentinel.
         config = parse_config({"server": {"handle_reaper_ttl": 45}, "sources": []})
         assert config.handle_reaper_ttl == 45.0
-        assert parse_config({"server": {"handle_reaper_ttl": 0}}).handle_reaper_ttl == 0.0
+        assert (
+            parse_config({"server": {"handle_reaper_ttl": 0}}).handle_reaper_ttl == 0.0
+        )
 
 
 class TestReductionMethodNormalization:
