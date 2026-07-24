@@ -320,26 +320,34 @@ See **[docs/http-server.md](docs/http-server.md)** for the full endpoint table, 
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
 
-# for grpc only (no web server)
-biopb-tensor-server serve ...
+# for grpc only (no web server) — same flight options + token handling as launch
+biopb-tensor-server serve --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable]
 ```
 
-Startup sequence:
+`serve` and `launch` share the Flight-server flags (`--host`/`--port`/`--writable`
+override the config bind; `--token`/`--log-level`/`--log-file`) and the same
+fail-closed token resolution (`_resolve_flight_token`). `launch` adds the HTTP
+sidecar (`--web-host`/`--web-port`/`--cors`) and layers the sidecar fail-closed
+check on top (`_resolve_launch_token`).
 
-1. Decide whether a token is enforced from the config's `server.host`: a
-   loopback `server.host` runs tokenless (**local mode**); a public
-   `server.host` (`0.0.0.0`/`::`/a real IP) **requires** a token (**remote
-   mode**).
+Startup sequence (`launch`):
+
+1. Decide whether a token is enforced from the effective flight bind (`--host`
+   override, else config `server.host`): a loopback bind runs tokenless (**local
+   mode**); a public bind (`0.0.0.0`/`::`/a real IP) **requires** a token
+   (**remote mode**).
 2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var →
-   `secrets.token_urlsafe(32)` auto-generated (public `server.host` only; local
-   mode uses no token). No interactive prompt.
+   `secrets.token_urlsafe(32)` auto-generated (public flight bind only; local
+   mode uses no token). No interactive prompt. `launch` then refuses a public
+   `--web-host` when the resolved token is `None`.
 3. Print the one-time access token (remote mode only).
 4. Load `biopb.json` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
-6. Derive CORS origins from `--web-url` (default `http://localhost:5173`) or
-   explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
+6. Build CORS origins: loopback variants of the sidecar's own address by
+   default (no web app is bundled here), plus any explicit `--cors` origins for
+   a browser app served elsewhere.
 7. Call `run_http_server(...)` — **blocking** uvicorn call. The sidecar is
    API-only; it serves no static assets (the control plane serves the browser UI).
 

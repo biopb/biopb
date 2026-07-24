@@ -149,27 +149,30 @@ biopb-tensor-server list-tensors  List all data sources and tensors in a config
 biopb-tensor-server version  Show version information
 ```
 
-### Key options for `launch`:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--config, -c` | (required) | Path to config file (`biopb.json`) |
-| `--web-port` | 8814 | HTTP server port |
-| `--web-host` | 127.0.0.1 | HTTP server bind address |
-| `--token` | (auto) | Website access token (remote mode; auto-generated if omitted) |
-| `--open` | false | Open browser after startup |
-| `--web-url` | http://localhost:5173 | Base URL of web app (CORS + --open) |
-| `--cors` | (derived from --web-url) | Extra CORS origins (repeatable) |
-| `--log-level, -l` | INFO | DEBUG, INFO, WARNING, ERROR, CRITICAL |
+Both commands share the Flight-server options; `launch` adds the HTTP sidecar on
+top.
 
 ### Key options for `serve`:
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config, -c` | (required) | Path to config file (`biopb.json`) |
-| `--host, -h` | (from config) | gRPC server host |
-| `--port, -p` | (from config) | gRPC server port |
+| `--host, -h` | (from config) | Flight server host (overrides config) |
+| `--port, -p` | (from config) | Flight server port (overrides config) |
 | `--writable` | false | Enable write mode for data upload |
+| `--token` | (auto) | Flight access token; auto-generated on a public bind if omitted |
+| `--log-level, -l` | INFO | DEBUG, INFO, WARNING, ERROR, CRITICAL |
+| `--log-file` | (none) | Rotating log file path |
+
+### Key options for `launch`:
+
+All of `serve`'s options above, plus the HTTP sidecar:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--web-host` | 127.0.0.1 | HTTP sidecar bind address |
+| `--web-port` | 8816 | HTTP sidecar port |
+| `--cors` | (loopback only) | CORS origin to allow (repeatable); needed for a browser app on another origin |
 
 ### Python Client
 
