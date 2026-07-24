@@ -39,7 +39,7 @@ class TestThreadLocalPool:
                 local_pool = getattr(client_module._THREAD_LOCAL, "clients", {})
                 if local_pool is None:
                     local_pool = {}
-                local_pool[("test_loc", None)] = (os.getpid(), mock_client)
+                local_pool[("test_loc", None)] = mock_client
                 client_module._THREAD_LOCAL.clients = local_pool
                 results[thread_id] = mock_client
             except Exception as e:
@@ -66,32 +66,62 @@ class TestThreadLocalPool:
 
 
 class TestForkSafety:
-    """Tests for fork-safety behavior (pid mismatch detection)."""
+    """Fork-safety via the single ``_reset_pools_after_fork`` handler.
 
-    def test_pid_change_detected(self):
-        """Test that pid mismatch is detected in stored connections."""
-        # Simulate a pid mismatch scenario
-        stored_pid = 999999  # Different pid
-        current_pid = os.getpid()
+    Every process-global pool is cleared in a forked child (inherited gRPC
+    sockets are broken and inherited mmap views alias the parent's fds), and the
+    inherited locks are swapped for fresh ones so a lock held at fork can't
+    deadlock the child. We can't fork inside a unit test without a live server,
+    so these call the handler directly and check its post-conditions.
+    """
 
-        # The check in _get_thread_client compares pid
-        assert stored_pid != current_pid
+    def test_handler_registered_at_import(self):
+        # register_at_fork is Unix-only; on Windows there is no fork to guard.
+        if hasattr(os, "register_at_fork"):
+            assert callable(pool_module._reset_pools_after_fork)
 
-    def test_stale_connection_cleanup_on_pid_mismatch(self):
-        """Test that stale connections are cleaned up when pid mismatches."""
-        # When a process forks, inherited gRPC sockets are broken
-        # The child process should detect pid mismatch and create new connections
-        # This is tested conceptually here
-        current_pid = os.getpid()
+    def test_handler_clears_every_pool(self):
+        import numpy as np
 
-        # Create a mock pool entry with old pid
-        mock_client = MagicMock()
-        old_entry = (999999, mock_client)  # Tuple of (pid, client)
+        loc = "grpc://fork-test:8815"
+        key = (loc, None)
+        # Populate all the pools the handler must clear.
+        client_module._CACHE_POOL[key] = MagicMock()
+        client_module._CALL_OPTS_POOL[key] = MagicMock()
+        client_module._CONNECTION_REGISTRY[12345] = {key: MagicMock()}
+        pool_module._view_cache_put(loc, None, "k", np.arange(4))
+        pool_module._THREAD_LOCAL.clients = {key: MagicMock()}
+        with pool_module._pinned_lock:
+            pool_module._pinned_segments[999] = pool_module._SegmentPin(1024)
+            pool_module._pinned_total = 1024
 
-        # The logic in _get_thread_client checks:
-        # if pid == current_pid: return client
-        # else: close old client, create new one
-        assert old_entry[0] != current_pid
+        pool_module._reset_pools_after_fork()
+
+        assert key not in client_module._CACHE_POOL
+        assert key not in client_module._CALL_OPTS_POOL
+        assert 12345 not in client_module._CONNECTION_REGISTRY
+        assert key not in pool_module._VIEW_CACHE
+        assert pool_module._THREAD_LOCAL.clients == {}
+        assert pool_module._pinned_segments == {}
+        assert pool_module._pinned_total == 0
+
+    def test_handler_swaps_locks_for_fresh_ones(self):
+        # A lock held at the instant of fork is inherited *locked*; the handler
+        # must replace it (pointer swap), not try to release it.
+        old_pool_lock = pool_module._POOL_LOCK
+        old_view_lock = pool_module._VIEW_CACHE_LOCK
+        old_pinned_lock = pool_module._pinned_lock
+        old_pool_lock.acquire()  # simulate: held by a thread that won't survive fork
+        try:
+            pool_module._reset_pools_after_fork()
+        finally:
+            old_pool_lock.release()
+        # Fresh objects, so the child can take them without deadlocking.
+        assert pool_module._POOL_LOCK is not old_pool_lock
+        assert pool_module._VIEW_CACHE_LOCK is not old_view_lock
+        assert pool_module._pinned_lock is not old_pinned_lock
+        assert pool_module._POOL_LOCK.acquire(blocking=False)
+        pool_module._POOL_LOCK.release()
 
 
 class TestEvictDeadThreads:
@@ -260,18 +290,20 @@ class TestViewCache:
         pool_module._clear_view_cache(self.LOC, None)
         assert pool_module._view_cache_get(self.LOC, None, "k") is None
 
-    def test_fresh_dict_per_pid(self):
-        # A forked worker (different pid) must not reuse the parent's view arrays.
+    def test_fresh_dict_after_fork(self):
+        # A forked worker must not reuse the parent's view arrays (they alias mmap
+        # fds). The at-fork handler clears _VIEW_CACHE, so the child's next
+        # _get_view_cache yields a fresh, empty dict rather than the inherited one.
         import numpy as np
 
         arr = np.arange(8)
         pool_module._view_cache_put(self.LOC, None, "k", arr)
-        stored_pid, _ = pool_module._VIEW_CACHE[(self.LOC, None)]
-        # Simulate a different pid recorded for this key -> a fresh dict is made.
-        pool_module._VIEW_CACHE[(self.LOC, None)] = (stored_pid + 1, {})
-        wvd = pool_module._get_view_cache(self.LOC, None)
-        assert len(wvd) == 0
-        assert pool_module._VIEW_CACHE[(self.LOC, None)][0] == os.getpid()
+        inherited = pool_module._VIEW_CACHE[(self.LOC, None)]
+        pool_module._reset_pools_after_fork()  # simulate the child side of a fork
+        assert (self.LOC, None) not in pool_module._VIEW_CACHE
+        fresh = pool_module._get_view_cache(self.LOC, None)
+        assert fresh is not inherited
+        assert len(fresh) == 0
 
 
 class TestConfigureCache:
@@ -287,7 +319,7 @@ class TestConfigureCache:
         with patch.object(pool_module, "_is_localhost_location", return_value=False):
             eff = client_module.configure_cache("grpc://remote:8815", None, 1000)
         assert eff == 1000
-        cache = client_module._CACHE_POOL[("grpc://remote:8815", None)][1]
+        cache = client_module._CACHE_POOL[("grpc://remote:8815", None)]
         assert cache.available_bytes == 1000
 
     def test_resizes_in_place(self):
@@ -295,7 +327,7 @@ class TestConfigureCache:
         with patch.object(pool_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 1000)
             client_module.configure_cache(loc, None, 2000)
-        assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 2000
+        assert client_module._CACHE_POOL[(loc, None)].available_bytes == 2000
 
     def test_localhost_now_pins_a_cache(self):
         # After the gate removal a localhost connection is no longer pinned off:
@@ -304,14 +336,14 @@ class TestConfigureCache:
         with patch.object(pool_module, "_is_localhost_location", return_value=True):
             eff = client_module.configure_cache(loc, None, 1000)
         assert eff == 1000
-        assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 1000
+        assert client_module._CACHE_POOL[(loc, None)].available_bytes == 1000
 
     def test_zero_pins_off(self):
         loc = "grpc://remote:8815"
         with patch.object(pool_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 1000)
             assert client_module.configure_cache(loc, None, 0) == 0
-        assert client_module._CACHE_POOL[(loc, None)][1] is None
+        assert client_module._CACHE_POOL[(loc, None)] is None
 
     def test_pinned_off_survives_later_fetch_request(self):
         """configure_cache(.., 0) must not be undone by a later nonzero fetch."""

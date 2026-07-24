@@ -118,7 +118,7 @@ class TestMakeCachePlugin:
         plugin = _bootstrap._make_cache_plugin(loc, None, 777)
         try:
             plugin.setup(worker=None)  # what dask calls on each worker
-            assert tclient._CACHE_POOL[(loc, None)][1].available_bytes == 777
+            assert tclient._CACHE_POOL[(loc, None)].available_bytes == 777
         finally:
             tclient._CACHE_POOL.clear()
 

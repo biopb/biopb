@@ -7,7 +7,8 @@ subsystem and holds no reference to ``TensorFlightClient``:
 
 - **Connection/cache pools** keyed by ``(location, token)``: a per-thread
   ``FlightClient`` for lock-free access, plus a cross-thread ``Cache`` and
-  ``FlightCallOptions``. Fork-safe (each entry records the pid that created it).
+  ``FlightCallOptions``. Fork-safe via a single ``os.register_at_fork`` handler
+  that clears every pool in the child (inherited sockets/mmaps are unsafe).
 - **The localhost cache-file fast path** (issue #9): read a chunk straight from
   the server's on-disk segment via ``chunk_locate`` + mmap instead of ``do_get``.
 - **The chunk-fetch leaf functions and dask-array builder**: pickle-safe because
@@ -375,12 +376,10 @@ def _release_segment_pin(inode: int) -> None:
 #
 # Keyed like the strong cache by ``chunk_id.hex()`` (which already encodes
 # array_id + bounds + scale + method + content version, so hits can't collide),
-# per ``(location, token)``, and per-pid (a fork gets a fresh dict: the parent's
-# view arrays alias mmap fds the child must not reuse).
+# per ``(location, token)``. A fork gets a fresh dict via the at-fork handler
+# below (the parent's view arrays alias mmap fds the child must not reuse).
 
-_VIEW_CACHE: Dict[
-    Tuple[str, Optional[str]], Tuple[int, "weakref.WeakValueDictionary"]
-] = {}
+_VIEW_CACHE: Dict[Tuple[str, Optional[str]], "weakref.WeakValueDictionary"] = {}
 _VIEW_CACHE_LOCK = threading.Lock()
 
 
@@ -389,14 +388,11 @@ def _get_view_cache(
 ) -> "weakref.WeakValueDictionary":
     """The per-``(location, token)`` weak view cache for this process."""
     key = (location, token)
-    pid = os.getpid()
     with _VIEW_CACHE_LOCK:
-        entry = _VIEW_CACHE.get(key)
-        if entry is None or entry[0] != pid:
-            wvd: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
-            _VIEW_CACHE[key] = (pid, wvd)
-            return wvd
-        return entry[1]
+        wvd = _VIEW_CACHE.get(key)
+        if wvd is None:
+            wvd = _VIEW_CACHE[key] = weakref.WeakValueDictionary()
+        return wvd
 
 
 def _view_cache_get(
@@ -530,9 +526,10 @@ def _try_cachefile_transfer(
 # FlightClient connections are stored per-thread for lock-free access.
 # Cache and CallOptions remain shared across threads for cross-thread cache hits.
 #
-# Fork-safety: Each thread stores (pid, client) to detect forked processes.
-# When a process forks, child threads detect pid mismatch and create fresh
-# connections (inherited gRPC sockets are broken).
+# Fork-safety: all of these process-global pools are cleared in the child by a
+# single ``os.register_at_fork`` handler (see below) -- inherited gRPC sockets are
+# broken across fork and inherited mmap views alias the parent's fds, so the child
+# must rebuild everything lazily rather than reuse a copy of the parent's pools.
 #
 
 # Per-thread storage: thread gets its own FlightClient per (location, token)
@@ -547,11 +544,11 @@ _REGISTRY_LOCK = threading.Lock()
 # Shared pools for cache and call options (cross-thread cache hits enabled)
 #
 # Cache pool value is tri-state per (location, token):
-#   - absent          -> never configured; first fetch creates a default cache
-#   - (pid, Cache)    -> pinned/created with that budget
-#   - (pid, None)     -> deliberately pinned OFF by configure_cache(); a later
+#   - key absent      -> never configured; first fetch creates a default cache
+#   - Cache           -> pinned/created with that budget
+#   - None            -> deliberately pinned OFF by configure_cache(); a later
 #                        fetch must honor this and NOT recreate a cache.
-_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Optional[Cache]]] = {}
+_CACHE_POOL: Dict[Tuple[str, Optional[str]], Optional[Cache]] = {}
 _CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
 _POOL_LOCK = threading.Lock()
 
@@ -573,6 +570,58 @@ def _cleanup_connection_pool():
         _CALL_OPTS_POOL.clear()
 
 
+def _reset_pools_after_fork() -> None:
+    """Clear every inherited process-global pool in a forked child.
+
+    ``fork`` is the only process-creation path that copies this module's state
+    into the child: dask's default multi-process/``fork`` workers inherit the
+    parent's pools, but the copies are unsafe -- a ``FlightClient``'s gRPC socket
+    is broken across fork, and a cached mmap view aliases the parent's fd/mapping.
+    So the child starts from empty pools and rebuilds each lazily on next use.
+    (``spawn``/``forkserver`` re-import the module fresh, so there is nothing to
+    clear there; ``subprocess`` is fork+exec and never runs at-fork handlers.)
+
+    Two care points, both handled here:
+
+    * **Locks.** A thread can hold any of these locks at the instant of fork; the
+      child inherits it *locked* with no thread left to release it. We reassign
+      fresh ``Lock()`` objects (a pointer swap, never ``.acquire()``) so the first
+      post-fork use can't deadlock.
+    * **Thread-local / globals.** Only the forking thread survives in the child;
+      other threads' thread-locals vanished with them. We reset the surviving
+      thread's ``_THREAD_LOCAL.clients`` and zero ``_pinned_total`` (needs
+      ``global``). Inherited ``weakref.finalize`` callbacks that later fire on a
+      parent buffer find ``_pinned_segments`` already cleared and no-op safely.
+
+    Discards references without closing them: the inherited fds are shared with
+    the still-running parent, so closing here would disturb the parent's sockets.
+    """
+    global _POOL_LOCK, _VIEW_CACHE_LOCK, _pinned_lock, _pinned_total
+    global _REGISTRY_LOCK, _cachefile_support_lock
+    # Fresh locks first (inherited ones may be held by now-dead parent threads).
+    _POOL_LOCK = threading.Lock()
+    _VIEW_CACHE_LOCK = threading.Lock()
+    _pinned_lock = threading.Lock()
+    _REGISTRY_LOCK = threading.Lock()
+    _cachefile_support_lock = threading.Lock()
+    # Drop every inherited pool (references only -- do not close parent fds).
+    _CACHE_POOL.clear()
+    _CALL_OPTS_POOL.clear()
+    _CONNECTION_REGISTRY.clear()
+    _VIEW_CACHE.clear()
+    _pinned_segments.clear()
+    _pinned_total = 0
+    _THREAD_LOCAL.clients = {}
+
+
+# fork inherits this module's pools into the child; register_at_fork fires for
+# os.fork()/multiprocessing 'fork' (the dask-worker case) but not subprocess or
+# spawn/forkserver. Unix-only -- Windows has no fork (spawn re-imports fresh), so
+# the attribute is simply absent there.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_pools_after_fork)
+
+
 def _evict_dead_threads():
     """Close connections from threads that have died."""
     for thread_id, clients in list(_CONNECTION_REGISTRY.items()):
@@ -591,8 +640,9 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
     """Get thread-local FlightClient (no lock for read access).
 
     Creates FlightClient lazily on first call per thread. Thread-safe via
-    thread-local storage. Fork-safe: stale connections from parent process
-    are detected and cleaned up before use.
+    thread-local storage. Fork-safe: the at-fork handler clears the surviving
+    thread's client pool in the child, so a fresh client is built on next use
+    (inherited gRPC sockets are broken across fork).
 
     Args:
         location: Flight server location string
@@ -602,7 +652,6 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
         FlightClient for this thread and location
     """
     key = (location, token)
-    current_pid = os.getpid()
 
     # Fast path: thread already has client for this location (no lock)
     local_pool = getattr(_THREAD_LOCAL, "clients", None)
@@ -610,20 +659,7 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
         local_pool = {}
         _THREAD_LOCAL.clients = local_pool
     elif key in local_pool:
-        pid_client = local_pool[key]
-        if isinstance(pid_client, tuple):
-            pid, client = pid_client
-            if pid == current_pid:
-                return client
-            # Forked child - inherited gRPC socket is broken, create new
-            try:
-                client.close()
-            except Exception:
-                pass
-            del local_pool[key]
-        else:
-            # Legacy format (shouldn't happen, but handle gracefully)
-            return pid_client
+        return local_pool[key]
 
     # Slow path: create new client with gRPC options tuned for 64MB chunks, register for cleanup
     # 80MB max message size (slightly above 64MB chunk threshold)
@@ -634,7 +670,7 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
             ("grpc.max_receive_message_size", 80 * 1024 * 1024),
         ],
     )
-    local_pool[key] = (current_pid, client)
+    local_pool[key] = client
 
     thread_id = threading.current_thread().ident
     if thread_id is not None:
@@ -666,7 +702,6 @@ def _get_shared_cache(
         Cache instance shared across threads, or None when caching is disabled.
     """
     key = (location, token)
-    current_pid = os.getpid()
 
     # An already-pooled entry wins: it may have been pinned by configure_cache()
     # at worker startup, in which case the per-fetch cache_bytes is irrelevant.
@@ -674,10 +709,7 @@ def _get_shared_cache(
     # return as-is so the decision is not undone by this fetch's cache_bytes.
     with _POOL_LOCK:
         if key in _CACHE_POOL:
-            pool_pid, cache = _CACHE_POOL[key]
-            if pool_pid == current_pid:
-                return cache
-            del _CACHE_POOL[key]  # fork-safety: inherited stale entry
+            return _CACHE_POOL[key]
 
     # Not pooled yet: resolve the requested size and create lazily (or skip).
     effective = _resolve_cache_bytes(location, cache_bytes)
@@ -686,8 +718,8 @@ def _get_shared_cache(
 
     with _POOL_LOCK:
         if key not in _CACHE_POOL:
-            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
-        return _CACHE_POOL[key][1]
+            _CACHE_POOL[key] = Cache(available_bytes=effective)
+        return _CACHE_POOL[key]
 
 
 def _get_shared_call_options(
@@ -724,8 +756,8 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
     are shared across threads for cross-thread cache hits.
 
     Each worker process has its own pool after unpickle. If a process
-    forks after pool was populated, the child detects pid mismatch and
-    creates fresh connections.
+    forks after the pool was populated, the at-fork handler clears the
+    child's inherited copy so fresh connections are built on next use.
 
     Args:
         location: Flight server location string
@@ -768,7 +800,6 @@ def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> in
     # a later fetch can't undo the decision from its own cache_bytes.
     effective = _resolve_cache_bytes(location, cache_bytes)
     key = (location, token)
-    current_pid = os.getpid()
 
     with _POOL_LOCK:
         existing = _CACHE_POOL.get(key)
@@ -776,15 +807,13 @@ def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> in
             # Pin OFF authoritatively: store a None-cache sentinel instead of
             # deleting, so a later fetch's _get_shared_cache honors the decision
             # rather than recreating a cache from its own cache_bytes.
-            _CACHE_POOL[key] = (current_pid, None)
+            _CACHE_POOL[key] = None
             return 0
-        # (Re)create when absent, inherited from a fork, or a different size.
-        if (
-            existing is None
-            or existing[0] != current_pid
-            or existing[1].available_bytes != effective
-        ):
-            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
+        # (Re)create when absent, pinned OFF (None sentinel), or a different size.
+        # ``existing is None`` covers both the absent and pinned-off cases, so the
+        # ``.available_bytes`` check only runs on a real Cache.
+        if existing is None or existing.available_bytes != effective:
+            _CACHE_POOL[key] = Cache(available_bytes=effective)
 
     return effective
 
