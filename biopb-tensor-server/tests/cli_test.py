@@ -30,6 +30,28 @@ def _cache_lock_is_free(lock_path: Path) -> bool:
 _VALID_TOKEN = "a" * 32  # 32 URL-safe chars: passes _web_auth.valid_token
 
 
+def _run_serve(config, **overrides):
+    """Invoke `serve` as a plain function with explicit option defaults.
+
+    Calling a typer command directly bypasses typer's default resolution, so each
+    Option would otherwise arrive as an unresolved `OptionInfo` -- harmless where a
+    value is only formatted, but `serve` now resolves the flight token eagerly and
+    an `OptionInfo` token would blow up in `valid_token`. Mirror the CLI defaults.
+    """
+    kwargs = {
+        "config": config,
+        "log_level": None,
+        "log_scope_biopb": True,
+        "host": None,
+        "port": None,
+        "writable": False,
+        "token": None,
+        "log_file": None,
+    }
+    kwargs.update(overrides)
+    return cli.serve(**kwargs)
+
+
 class _FakeServer:
     def __init__(self):
         self.shutdown_calls = 0
@@ -66,7 +88,7 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
         lambda *args, **kwargs: (server, source_manager, watcher, None),
     )
 
-    cli.serve(config=Path("unused.json"))
+    _run_serve(Path("unused.json"))
 
     assert source_manager.stop_calls == 1
     assert watcher.stop_calls == 1
@@ -119,22 +141,79 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     )
 
     # Pass explicit values rather than typer OptionInfo defaults (calling the
-    # command as a plain function bypasses typer's default resolution; a truthy
-    # OptionInfo for open_browser would otherwise launch a real browser).
+    # command as a plain function bypasses typer's default resolution).
     cli.launch(
         config=Path("unused.json"),
         log_level=None,
         log_scope_biopb=True,
+        host=None,
+        port=None,
+        writable=False,
         web_port=8816,
         web_host="127.0.0.1",
         token=None,
-        open_browser=False,
-        web_url="http://localhost:5173",
         cors_origins=None,
         log_file=None,
     )
 
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
+
+
+def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
+    monkeypatch,
+):
+    """`launch` mirrors `serve`: --host/--port/--writable override the config's
+    flight bind, and the token mode switch follows the *overridden* host. A public
+    --host with no token must auto-generate one (fail-closed), not bind open.
+    """
+    captured: dict = {}
+    # Config binds loopback; the override makes the flight plane public.
+    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured.update(kwargs)
+        return (
+            SimpleNamespace(serve=lambda: None),
+            _FakeStoppable(),
+            _FakeStoppable(),
+            None,
+        )
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    monkeypatch.setattr(
+        cli,
+        "run_http_server",
+        lambda **kwargs: captured.update(sidecar_token=kwargs.get("token")),
+    )
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+
+    cli.launch(
+        config=Path("unused.json"),
+        log_level=None,
+        log_scope_biopb=True,
+        host="0.0.0.0",
+        port=9001,
+        writable=True,
+        web_port=8816,
+        web_host="127.0.0.1",
+        token=None,
+        cors_origins=None,
+        log_file=None,
+    )
+
+    # Overrides reached the flight server...
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 9001
+    assert captured["writable"] is True
+    # ...and the public override drove fail-closed token auto-gen, enforced on
+    # both the flight plane and the sidecar (same effective token).
+    tok = captured["token"]
+    assert tok and cli._web_auth.valid_token(tok)
+    assert captured["sidecar_token"] == tok
 
 
 def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
@@ -269,7 +348,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
         lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable(), None),
     )
 
-    cli.serve(config=Path("unused.json"))
+    _run_serve(Path("unused.json"))
 
     assert _cache_lock_is_free(lock_path)
 
@@ -302,7 +381,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
 
     try:
         with pytest.raises(typer.Exit):
-            cli.serve(config=Path("unused.json"))
+            _run_serve(Path("unused.json"))
         # Released by the finally's graceful shutdown despite the early exit.
         assert _cache_lock_is_free(lock_path)
     finally:
@@ -511,6 +590,42 @@ class TestResolveLaunchToken:
         assert cli._resolve_launch_token("127.0.0.1", "127.0.0.1", "short", "") is None
 
 
+class TestResolveFlightToken:
+    """`serve`'s token decision — the shared ladder `launch` builds on.
+
+    The flight bind is the single mode switch: loopback → local mode (tokenless);
+    a public bind fails *closed* by auto-generating a token rather than serving the
+    data API open (biopb/biopb#515 follow-up: `serve` used to fail open here).
+    """
+
+    def test_loopback_is_tokenless(self):
+        assert cli._resolve_flight_token("127.0.0.1", None, "") is None
+
+    def test_public_bind_autogenerates_token(self):
+        # The gap this closes: a public flight bind with no token no longer serves
+        # the gRPC data API unauthenticated — it auto-generates one.
+        tok = cli._resolve_flight_token("0.0.0.0", None, "")
+        assert tok and cli._web_auth.valid_token(tok)
+
+    def test_supplied_token_is_honored(self):
+        assert cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, "") == _VALID_TOKEN
+
+    def test_env_token_is_honored(self):
+        assert cli._resolve_flight_token("0.0.0.0", None, _VALID_TOKEN) == _VALID_TOKEN
+
+    def test_supplied_token_beats_env(self):
+        env = "b" * 32
+        assert cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, env) == _VALID_TOKEN
+
+    def test_malformed_supplied_token_falls_through_to_mode(self):
+        # A too-short --token is not usable; on a loopback bind it falls through to
+        # local mode (tokenless), not a silent accept — and on a public bind it
+        # auto-generates rather than binding open.
+        assert cli._resolve_flight_token("127.0.0.1", "short", "") is None
+        tok = cli._resolve_flight_token("0.0.0.0", "short", "")
+        assert tok and cli._web_auth.valid_token(tok)
+
+
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     """A static-only config reaches SERVING and reports a freshness timestamp.
 
@@ -611,7 +726,7 @@ def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypat
         return _FakeServer(), _FakeStoppable(), _FakeStoppable(), None
 
     monkeypatch.setattr(cli, "_setup_flight_server", _capture)
-    cli.serve(config=config_path)
+    _run_serve(config_path)
 
     from biopb_tensor_server.core.config import PyramidConfig
 
@@ -623,6 +738,6 @@ def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys
     config_path.write_text("[server]\nport = 8815\n")
 
     with pytest.raises(typer.Exit) as exc:
-        cli.serve(config=config_path)
+        _run_serve(config_path)
     assert exc.value.exit_code == 1
     assert "migrate-config" in capsys.readouterr().out

@@ -133,14 +133,13 @@ All error messages are passed through `_redact()` before storage:
 
 ## CORS
 
-Two different defaults, depending on how the app is built:
+Both `create_app(cors_origins=None)` and the CLI launcher default to the loopback
+variants of the sidecar's own bind: `http://localhost:8814`,
+`http://127.0.0.1:8814`, `http://[::1]:8814` (substituting the actual
+`--web-host:--web-port`). That covers the control front reaching the data API and
+`/ws/render` over loopback. No web app is bundled with this package, so there is
+no frontend origin in the default set.
 
-- **`create_app(cors_origins=None)`** — the loopback variants of the sidecar's own
-  port: `http://localhost:8814`, `http://127.0.0.1:8814`, `http://[::1]:8814`.
-- **The CLI launcher** — passes its own list instead: the variants of `--web-url`
-  (default `http://localhost:5173`, the Vite dev server) plus the loopback
-  variants of the sidecar's actual `--web-host:--web-port` bind, which is how the
-  control front reaches the data API and `/ws/render`.
-
-Override with the `cors_origins` argument to `create_app`, or `--cors`
-(repeatable) / `--web-url` on the CLI launcher.
+A browser app served on another origin must be allowed explicitly: the
+`cors_origins` argument to `create_app`, or `--cors` (repeatable) on the CLI
+launcher.
