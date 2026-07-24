@@ -25,6 +25,11 @@ from biopb_mcp._connection import (
 def _clear_env(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+    # resolve_from_config now also reads the control's local credential file
+    # (biopb/biopb#470). Default it to absent so a unit test never picks up a real
+    # credential from the dev machine's state dir; tests that exercise the handoff
+    # override this.
+    monkeypatch.setattr("biopb._credentials.read_credential", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +71,22 @@ class TestResolveFromConfig:
         url, token = TensorConnection.resolve_from_config({})
         assert url == DEFAULT_CONFIG["tensor_browser"]["server_url"]
         assert token is None
+
+    def test_token_from_credential_file(self, monkeypatch):
+        # No env token, but the control wrote a local credential (#470): it is the
+        # token, which is exactly the agent-spawned-over-stdio case where
+        # BIOPB_TENSOR_TOKEN never reached this process.
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        _url, token = TensorConnection.resolve_from_config({})
+        assert token == "cred-tok"
+
+    def test_env_token_overrides_credential_file(self, monkeypatch):
+        # An explicit BIOPB_TENSOR_TOKEN wins over the credential file (the escape
+        # hatch for a remote plane whose token the user supplies out of band).
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-tok")
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        _url, token = TensorConnection.resolve_from_config({})
+        assert token == "env-tok"
 
 
 # ---------------------------------------------------------------------------

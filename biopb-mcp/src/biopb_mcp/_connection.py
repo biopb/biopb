@@ -194,21 +194,22 @@ class TensorConnection:
         ``BIOPB_TENSOR_URL`` env -> ``tensor_browser.server_url`` config ->
         default.
 
-        The token comes from ``BIOPB_TENSOR_TOKEN`` **only** — and note this is
-        the sole way we can learn one, since the control's ensure reply carries
-        the plane's endpoint but no credential. That is fine for a tokenless
-        local plane and for a remote one (whose token the user supplies out of
-        band), but a *local plane behind an optional token* leaves us unable to
-        authenticate unless that token also reaches this process's environment —
-        which it does not when an agent spawns biopb-mcp over stdio. The user
-        recovers by entering the token in the Tensor Browser or exporting
-        ``BIOPB_TENSOR_TOKEN``; the real fix is a local credential handoff (see
-        biopb/biopb#470).
+        The token comes from ``BIOPB_TENSOR_TOKEN`` if set (an explicit override,
+        e.g. for a remote plane whose token the user supplies out of band),
+        otherwise from the local credential file the control writes to the user's
+        state dir (biopb/biopb#470). That file is what closes the gap for a *local
+        plane behind an optional token*: an agent spawns biopb-mcp over stdio with
+        none of the control's environment, so the token never arrived via
+        ``BIOPB_TENSOR_TOKEN`` — but the control handed it off on the filesystem
+        instead. ``None`` (a tokenless local plane, or no control has written a
+        credential) leaves us unauthenticated, which is correct for that case.
         """
+        from biopb._credentials import read_credential
+
         url = os.environ.get("BIOPB_TENSOR_URL") or get_setting(
             config, "tensor_browser.server_url"
         )
-        token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
+        token = os.environ.get("BIOPB_TENSOR_TOKEN") or read_credential()
         return url, token
 
     @property
