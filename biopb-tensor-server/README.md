@@ -1,6 +1,6 @@
 # Biopb-Tensor-Server
 
-A high-performance Arrow Flight + HTTP server for serving multi-dimensional microscopy image data with lazy, chunked, multi-resolution, zero-copy access. Supports OME-Zarr, OME-TIFF, HDF5, CZI, LIF, ND2, DICOM, NIfTI, and more — with a built-in web viewer.
+A high-performance Arrow Flight + HTTP server for serving multi-dimensional microscopy image data with lazy, chunked, multi-resolution, zero-copy access. Supports OME-Zarr, OME-TIFF, HDF5, CZI, LIF, ND2, DICOM, NIfTI, and more.
 
 ## Core Concept
 
@@ -32,19 +32,19 @@ curl -fsSL https://biopb.org/install.sh | bash
 ```bash
 docker run -d --rm --init \
     --name biopb-tensor \
-    -p 8813:8813 -p 8815:8815 \
+    -p 8814:8814 -p 8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
     jiyuuchc/biopb-tensor-server:latest
 ```
 
-The container runs the **control plane** as its single web origin: open
-`http://localhost:8813` for the dashboard, with the data viewer at
-`http://localhost:8813/viewer`. The
-Arrow Flight gRPC endpoint stays on `:8815` for SDK clients. The HTTP sidecar
-(`:8814`) is now internal to the container and is not published. `--init` gives
-the container a reaping init as PID 1 — optional, since the control plane (PID 1)
-handles `docker stop` and reaps its own child, but it cleans up any stray orphans.
+The container is a headless data plane: `biopb-tensor-server launch` runs the
+Arrow Flight gRPC endpoint (`:8815`, for SDK clients) and the FastAPI HTTP
+sidecar (`:8814`, the data-plane API). There is no bundled webapp. The browser
+UI lives in the top-level `web/` workspace — see `web/README.md` for how to
+build and serve it. `--init` gives the container a reaping init as PID 1 —
+optional, since `launch` (PID 1) handles `docker stop` gracefully, but it
+cleans up any stray orphans.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
@@ -54,7 +54,7 @@ See [containerize.md](containerize.md) for a complete list of deployment options
 - Transport is **unencrypted** by default! Only deploy on trusted intranet!
 - If BIOPB_TENSOR_TOKEN is not given, the server generates a random token that can be viewed with `docker logs biopb-tensor`
 - **Local mode** (loopback `server.host`, the default) enforces no token — the single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
-- Bind to localhost-only `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
+- Bind to localhost-only `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
 
 ## Configuration
 
@@ -86,7 +86,7 @@ discovery; a specific source like `my-zarr` lets you override its metadata.
 To use your custom configuration:
 
 ```bash
-docker run -d -p 8813:8813 -p 8815:8815 \
+docker run -d -p 8814:8814 -p 8815:8815 \
     -v ~/biopb.json:/custom.json \
     -v ~/data:/data \
     -v ~/experiment.zarr:/experiment.zarr \
@@ -113,7 +113,6 @@ Directory monitoring uses a claim-based discovery protocol with periodic rescans
 
 - Python >= 3.10, < 3.13
 - pyarrow >= 14.0.0
-- Node.js / pnpm (for web app and TS client)
 
 ### Installation
 ```bash
@@ -138,26 +137,6 @@ biopb-tensor-server launch --config biopb.json --token mytoken...
 
 # gRPC only (no web sidecar)
 biopb-tensor-server serve --config biopb.json
-```
-
-### Web App
-
-The browser UI is one Vite + React SPA in the top-level `web/` workspace (not the
-FastAPI sidecar, which is API-only). Build it before running the server:
-
-```bash
-# Production build (output → web/packages/app/dist/)
-pnpm -C web install && pnpm -C web build
-```
-
-The bundle is copied into the Docker image and served by the **control plane**,
-the single web origin (`:8813`): the dashboard at `/` and the data viewer at
-`/viewer`. On first load you will be prompted for the access token (printed in
-the container logs, or set via `BIOPB_TENSOR_TOKEN`).
-
-For development with hot reload, run the dev server separately:
-```bash
-pnpm -C web dev   # runs on :5173, proxies to a live control on :8813
 ```
 
 ### CLI Reference
