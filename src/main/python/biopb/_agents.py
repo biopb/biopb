@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -167,8 +168,23 @@ def _config_path(spec: AgentSpec) -> Optional[Path]:
     if spec.id == "cursor":
         return home / ".cursor" / "mcp.json"
     if spec.id == "opencode":
-        return home / ".config" / "opencode" / "opencode.json"
+        return _opencode_config_path()
     return None
+
+
+def _opencode_config_path() -> Path:
+    """The opencode global config biopb should target (biopb/biopb#536).
+
+    opencode reads either ``opencode.jsonc`` or ``opencode.json``. Prefer an
+    existing ``.jsonc`` so we edit the file opencode actually honors instead of
+    writing a shadow ``.json`` it may ignore; otherwise fall back to ``.json`` —
+    the canonical file we create on a fresh install. Resolved at call time so a
+    test that repoints ``Path.home()`` is isolated."""
+    base = Path.home() / ".config" / "opencode"
+    jsonc = base / "opencode.jsonc"
+    if jsonc.exists():
+        return jsonc
+    return base / "opencode.json"
 
 
 def _is_installed(spec: AgentSpec) -> bool:
@@ -210,19 +226,116 @@ def _load_json_object(path: Path) -> dict:
     return data
 
 
+def _strip_jsonc(text: str) -> str:
+    """Best-effort JSONC → JSON so :func:`json.loads` can read an opencode
+    ``.jsonc``: drop ``//`` and ``/* */`` comments (outside string literals) and
+    trailing commas (biopb/biopb#536).
+
+    A **read-only** transform used only for status detection — it is intentionally
+    never used to rewrite a file, because it is lossy (it discards the comments).
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:  # keep an escaped char verbatim
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            i += 2
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _load_json_tolerant(path: Path) -> Optional[dict]:
+    """Read ``path`` as a JSON object, tolerating ``.jsonc`` comments / trailing
+    commas. ``None`` (never raises) on any problem — the status-read path, where a
+    config we cannot parse simply reads as "not registered"."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    candidates = (text, _strip_jsonc(text)) if path.suffix == ".jsonc" else (text,)
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _jsonc_unmergeable(path: Path) -> bool:
+    """True when ``path`` is a ``.jsonc`` our strict-JSON writer must not edit:
+    it parses only after comment/trailing-comma stripping, so rewriting it would
+    silently drop the user's comments (biopb/biopb#536). A ``.jsonc`` that is
+    already strict JSON (nothing to lose) returns False and is merged in place;
+    so does a ``.json`` or a missing file."""
+    if path.suffix != ".jsonc" or not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if not text.strip():
+        return False
+    try:
+        json.loads(text)
+        return False
+    except ValueError:
+        return True
+
+
+def _manual_edit_message(spec: AgentSpec, path: Path, *, removing: bool) -> str:
+    """The AgentError text shown when biopb can't safely edit a commented
+    ``.jsonc`` — a clear manual instruction instead of clobbering comments or
+    writing a shadow config (biopb/biopb#536)."""
+    if removing:
+        return (
+            f"{path} has comments, so biopb won't rewrite it (that would drop "
+            f'them). Remove the "biopb" key under "{spec.parent_key}" by hand.'
+        )
+    snippet = json.dumps({spec.parent_key: {"biopb": _mcp_entry(spec)}}, indent=2)
+    return (
+        f"{path} has comments, so biopb won't rewrite it (that would drop them). "
+        f"Add this entry under the top level by hand:\n{snippet}"
+    )
+
+
 def _read_entry(spec: AgentSpec, path: Optional[Path]) -> Optional[dict]:
     """The biopb MCP entry currently in the client's config, or ``None``.
 
     A read-only, exception-tolerant probe used for status (unlike
     :func:`_load_json_object` it never raises — a malformed config simply reads as
     "not registered" for display, and the write path reports the parse error).
+    Reads ``.jsonc`` tolerantly so a commented opencode config is still detected as
+    registered rather than silently reading as "installed" (biopb/biopb#536).
     """
     if path is None or not path.exists():
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    data = _load_json_tolerant(path)
     if not isinstance(data, dict):
         return None
     parent = data.get(spec.parent_key)
@@ -363,6 +476,8 @@ def _register_json(spec: AgentSpec) -> None:
     path = _config_path(spec)
     if path is None:
         raise AgentError(f"{spec.name} has no known config location on this platform")
+    if _jsonc_unmergeable(path):
+        raise AgentError(_manual_edit_message(spec, path, removing=False))
     data = _load_json_object(path)
     parent = data.get(spec.parent_key)
     if not isinstance(parent, dict):
@@ -376,6 +491,13 @@ def _unregister_json(spec: AgentSpec) -> None:
     path = _config_path(spec)
     if path is None or not path.exists():
         return  # nothing registered
+    if _jsonc_unmergeable(path):
+        # Can't safely rewrite a commented .jsonc. If biopb is actually present,
+        # surface a manual-removal instruction rather than silently leaving a
+        # stale entry (biopb/biopb#536); otherwise there is nothing to do.
+        if _read_entry(spec, path) is not None:
+            raise AgentError(_manual_edit_message(spec, path, removing=True))
+        return
     data = _load_json_object(path)
     parent = data.get(spec.parent_key)
     if isinstance(parent, dict) and "biopb" in parent:

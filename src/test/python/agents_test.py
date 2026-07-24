@@ -187,6 +187,100 @@ def test_opencode_uses_its_own_entry_shape(home):
     assert _agents.status("opencode")["state"] == "registered"
 
 
+# --------------------------------------------------------------------------- #
+# opencode .json / .jsonc drift hardening (biopb/biopb#536)
+# --------------------------------------------------------------------------- #
+
+
+def _opencode_dir(home):
+    d = home / ".config" / "opencode"
+    d.mkdir(parents=True)
+    return d
+
+
+def test_opencode_targets_existing_jsonc_over_json(home):
+    # A user who keeps opencode.jsonc: we must target THAT file, not a shadow
+    # opencode.json opencode may ignore.
+    d = _opencode_dir(home)
+    (d / "opencode.jsonc").write_text('{\n  "theme": "dark"\n}\n')
+    _agents.register("opencode")
+    data = json.loads((d / "opencode.jsonc").read_text())
+    assert data["mcp"]["biopb"]["type"] == "local"
+    assert data["theme"] == "dark"  # sibling preserved
+    assert not (d / "opencode.json").exists()  # no shadow file written
+    assert _agents.status("opencode")["state"] == "registered"
+
+
+def test_opencode_fresh_install_creates_json(home):
+    # Neither file exists -> canonical opencode.json is the create target.
+    _opencode_dir(home)
+    _agents.register("opencode")
+    path = _agents._config_path(_agents._spec("opencode"))
+    assert path.name == "opencode.json"
+    assert path.exists()
+
+
+def test_opencode_register_refuses_commented_jsonc(home):
+    d = _opencode_dir(home)
+    original = '{\n  // my agent config\n  "theme": "dark",\n}\n'
+    (d / "opencode.jsonc").write_text(original)
+    with pytest.raises(_agents.AgentError) as exc:
+        _agents.register("opencode")
+    # Fails safe: the commented file is left byte-for-byte, no shadow .json.
+    assert (d / "opencode.jsonc").read_text() == original
+    assert not (d / "opencode.json").exists()
+    # And the message hands the user a ready-to-paste entry.
+    assert '"biopb"' in str(exc.value)
+
+
+def test_opencode_status_detects_entry_in_commented_jsonc(home):
+    # A commented jsonc that already registers biopb must read as "registered",
+    # not silently fall back to "installed".
+    d = _opencode_dir(home)
+    (d / "opencode.jsonc").write_text(
+        "{\n"
+        "  // comment tolerated by the status reader\n"
+        '  "mcp": {\n'
+        '    "biopb": {"type": "local", "command": ["'
+        + _CMD
+        + '", "--transport", "stdio"], "enabled": true},\n'
+        "  },\n"
+        "}\n"
+    )
+    assert _agents.status("opencode")["state"] == "registered"
+
+
+def test_opencode_register_merges_clean_jsonc_in_place(home):
+    # A .jsonc with no comments is strict JSON: safe to merge and rewrite (nothing
+    # lost), so registration proceeds rather than refusing.
+    d = _opencode_dir(home)
+    (d / "opencode.jsonc").write_text('{"theme": "dark"}')
+    s = _agents.register("opencode")
+    assert s["state"] == "registered"
+    data = json.loads((d / "opencode.jsonc").read_text())
+    assert data["theme"] == "dark"
+    assert data["mcp"]["biopb"]["enabled"] is True
+
+
+def test_opencode_unregister_commented_jsonc_with_entry_raises(home):
+    d = _opencode_dir(home)
+    (d / "opencode.jsonc").write_text(
+        "{\n"
+        "  // keep me\n"
+        '  "mcp": {"biopb": {"type": "local", "command": ["x"], "enabled": true}},\n'
+        "}\n"
+    )
+    with pytest.raises(_agents.AgentError):
+        _agents.unregister("opencode")
+
+
+def test_opencode_unregister_commented_jsonc_without_entry_is_silent(home):
+    d = _opencode_dir(home)
+    (d / "opencode.jsonc").write_text('{\n  // no biopb here\n  "theme": "dark",\n}\n')
+    # Nothing to remove -> stays idempotent, no raise.
+    _agents.unregister("opencode")
+
+
 def test_claude_desktop_config_paths(home, monkeypatch):
     spec = _agents._spec("claude-desktop")
     monkeypatch.setattr(_agents.sys, "platform", "linux")
