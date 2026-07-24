@@ -254,7 +254,7 @@ export default function DashboardPage() {
           >
             <path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294.016.257.016.515 0 .772-.01.147.039.246.088.294l.814.806c.475.469.679 1.216.364 1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.103-.303c-.066-.019-.176-.011-.299.071a4.909 4.909 0 0 1-.668.386c-.133.066-.194.158-.212.224l-.288 1.107c-.17.645-.716 1.195-1.459 1.259a8.147 8.147 0 0 1-1.402 0c-.743-.064-1.289-.614-1.459-1.259l-.288-1.107c-.018-.066-.079-.158-.212-.224a4.911 4.911 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a7.988 7.988 0 0 1-.704-1.217c-.315-.675-.111-1.422.364-1.891l.814-.806c.049-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147-.039-.246-.088-.294l-.814-.806C.635 6.045.431 5.298.746 4.623a7.921 7.921 0 0 1 .704-1.218c.428-.609 1.176-.806 1.82-.63l1.103.303c.066.019.176.011.299-.071.214-.143.437-.272.668-.386.133-.066.194-.158.212-.224l.288-1.107C6.01.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Zm0 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7ZM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z" />
           </svg>
-          MCP Settings
+          Settings
         </a>
         <button
           className="lock-btn"
@@ -571,8 +571,8 @@ const DASH_CSS = `
   .ctrl-dash h1 { font-size: 15px; margin: 0; font-weight: 600; }
   /* Control-plane version, tucked right after the title (the 12px header gap is
      halved so it reads as a subtitle of the h1, not a separate item). */
-  .ctrl-dash .hdr-version { font-size: 11px; color: #778; font-variant-numeric: tabular-nums;
-           margin-left: -6px; }
+  .ctrl-dash .hdr-version { font-size: 12px; color: #aab; font-variant-numeric: tabular-nums;
+           margin-left: -6px; margin-top: 2px; align-self: center; }
   .ctrl-dash h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a8;
        margin: 0 0 10px; }
   /* Status pill on the left, colored by connection health like the admin
