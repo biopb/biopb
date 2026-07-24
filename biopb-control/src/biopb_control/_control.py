@@ -95,6 +95,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect as ws_connect
 
+from . import __version__
 from ._supervisor import DataPlaneSupervisor
 
 logger = logging.getLogger(__name__)
@@ -541,6 +542,7 @@ def build_app(
         return JSONResponse(
             {
                 "control": "ok",
+                "version": __version__,
                 "data_plane": supervisor.snapshot(),
                 "sessions": len(_sessions.list_sessions()),
             }

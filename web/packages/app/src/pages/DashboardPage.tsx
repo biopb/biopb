@@ -88,6 +88,9 @@ async function jpost(url: string): Promise<{ error?: string; data_plane?: DataPl
 export default function DashboardPage() {
   useDocumentTitle("BioPB control - dashboard");
   const [conn, setConn] = useState("…");
+  // The control's own package version, from /api/status. Absent on an older
+  // control that predates the field, so render nothing rather than "undefined".
+  const [version, setVersion] = useState<string | null>(null);
   // Connection health drives the status pill's color (green ok / red down),
   // mirroring the admin pages' status-pill. null = not yet probed (neutral).
   const [connOk, setConnOk] = useState<boolean | null>(null);
@@ -108,6 +111,7 @@ export default function DashboardPage() {
       setConn("control: ok · " + (s.sessions || 0) + " session(s)");
       setConnOk(true);
       setDataPlane(s.data_plane || {});
+      if (s.version) setVersion(s.version);
     } catch {
       setConn("control unreachable");
       setConnOk(false);
@@ -221,6 +225,11 @@ export default function DashboardPage() {
           aria-hidden="true"
         />
         <h1>BioPB control - dashboard</h1>
+        {version && (
+          <span className="hdr-version" title="control plane version">
+            v{version}
+          </span>
+        )}
         {/* Status pill on the LEFT (right after the title), matching the admin
             pages' status-pill placement; the spacer below pushes the actions to
             the right edge. Colored by connection health, like those pages. */}
@@ -560,6 +569,10 @@ const DASH_CSS = `
   .ctrl-dash header { padding: 10px 16px; background: #1b1b1b; border-bottom: 1px solid #333;
            display: flex; align-items: center; gap: 12px; position: sticky; top: 0; }
   .ctrl-dash h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  /* Control-plane version, tucked right after the title (the 12px header gap is
+     halved so it reads as a subtitle of the h1, not a separate item). */
+  .ctrl-dash .hdr-version { font-size: 11px; color: #778; font-variant-numeric: tabular-nums;
+           margin-left: -6px; }
   .ctrl-dash h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a8;
        margin: 0 0 10px; }
   /* Status pill on the left, colored by connection health like the admin
