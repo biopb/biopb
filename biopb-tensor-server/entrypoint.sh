@@ -12,10 +12,13 @@ set -e
 # MONITOR        - Enable live fs monitoring (default: true)
 # BIOPB_BASE_PORT - Base port for all services (default: 8810)
 #                  HTTP sidecar=BASE+4, gRPC Flight=BASE+5
-# COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Access token for the sidecar and gRPC (auto-generated if not set)
+# BIOPB_TENSOR_ALLOW_NO_TOKEN - Set truthy (1/true/yes/on, case-insensitive) to serve
+#                  the data API WITHOUT a token even on the public 0.0.0.0 bind
+#                  (insecure; trusted networks only). Ignored when BIOPB_TENSOR_TOKEN is set.
 # BIOPB_BIND_LOCALHOST - Set to "true" to bind both HTTP and gRPC to localhost only (Singularity/HPC only)
-# BIOPB_EXTERNAL_HOST - External hostname/IP for the printed endpoint URLs (auto-detected if not set)
+# BIOPB_EXTERNAL_HOST - External hostname/IP shown in the printed endpoint URLs only;
+#                  display-only, does not affect binding (auto-detected if not set)
 # BIOPB_CORS_ORIGINS - Space-separated extra CORS origins (→ launch --cors,
 #                  repeatable). The sidecar's own origin is always allowed;
 #                  set this to allow a browser SPA served from a different
@@ -77,9 +80,6 @@ else
     "file_max_segment_mb": ${CACHE_MAX_SEGMENT_MB:-256},
     "file_max_total_gb": ${CACHE_MAX_TOTAL_GB:-16}
   },
-  "compute": {
-    "backend": "${COMPUTE_BACKEND:-auto}"
-  },
   "sources": [
     {
       "url": "${DATA_DIR}",
@@ -112,12 +112,28 @@ fi
 # open, so generate one; a loopback-only bind (BIOPB_BIND_LOCALHOST) runs in local
 # mode with no token. `launch` also enforces this fail-closed, but generating here
 # keeps the token in the logs (and the env) deterministically.
+# Normalize BIOPB_TENSOR_ALLOW_NO_TOKEN exactly like the Python predicate
+# _allow_no_token_from_env() (strip + lowercase, accept 1/true/yes/on), so the two
+# never diverge: e.g. "yes"/"on"/"TRUE" must skip generation here too, else this
+# generates a token and passes --token, silently overriding an opt-out `launch`
+# would have honored.
+_allow_no_token="${BIOPB_TENSOR_ALLOW_NO_TOKEN#"${BIOPB_TENSOR_ALLOW_NO_TOKEN%%[![:space:]]*}"}"
+_allow_no_token="${_allow_no_token%"${_allow_no_token##*[![:space:]]}"}"
+_allow_no_token="${_allow_no_token,,}"
+
 TOKEN_ARGS=()
 if [ -n "$BIOPB_TENSOR_TOKEN" ]; then
     TOKEN_ARGS=(--token "$BIOPB_TENSOR_TOKEN")
 elif [ "$BIND_ADDR" = "127.0.0.1" ]; then
     # Loopback-only bind (Singularity BIOPB_BIND_LOCALHOST): local mode, no token.
     # Every listener is same-machine, so no token is enforced -- pass nothing.
+    TOKEN_ARGS=()
+elif [ "$_allow_no_token" = "1" ] || [ "$_allow_no_token" = "true" ] || [ "$_allow_no_token" = "yes" ] || [ "$_allow_no_token" = "on" ]; then
+    # Deliberate insecure opt-out: run tokenless even on the public 0.0.0.0 bind
+    # (e.g. a host-loopback-published container on a trusted machine). Pass no
+    # --token and skip generation; `launch` honors the same env var and serves the
+    # data API OPEN. The var is already in the container env (-e), so launch sees it.
+    echo "WARNING: BIOPB_TENSOR_ALLOW_NO_TOKEN set -- serving the data API WITHOUT a token. Trusted networks only."
     TOKEN_ARGS=()
 else
     GEN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"

@@ -589,6 +589,24 @@ class TestResolveLaunchToken:
         # falls through to local mode (tokenless), not a silent accept.
         assert cli._resolve_launch_token("127.0.0.1", "127.0.0.1", "short", "") is None
 
+    def test_allow_no_token_serves_public_sidecar_open(self):
+        # The deliberate escape hatch: with allow_no_token, a public flight + public
+        # sidecar and no token is served OPEN (None) instead of auto-generating /
+        # refusing. Insecure-by-request, off by default.
+        assert cli._resolve_launch_token("0.0.0.0", "0.0.0.0", None, "", True) is None
+
+    def test_allow_no_token_overrides_the_public_sidecar_refusal(self):
+        # Loopback flight + public sidecar normally refuses; the override turns that
+        # into a warning + tokenless serve rather than typer.Exit.
+        assert cli._resolve_launch_token("127.0.0.1", "0.0.0.0", None, "", True) is None
+
+    def test_allow_no_token_does_not_override_a_supplied_token(self):
+        # The override only matters when no token is supplied; a real token wins.
+        assert (
+            cli._resolve_launch_token("0.0.0.0", "0.0.0.0", _VALID_TOKEN, "", True)
+            == _VALID_TOKEN
+        )
+
 
 class TestResolveFlightToken:
     """`serve`'s token decision — the shared ladder `launch` builds on.
@@ -624,6 +642,18 @@ class TestResolveFlightToken:
         assert cli._resolve_flight_token("127.0.0.1", "short", "") is None
         tok = cli._resolve_flight_token("0.0.0.0", "short", "")
         assert tok and cli._web_auth.valid_token(tok)
+
+    def test_allow_no_token_serves_public_bind_open(self):
+        # The escape hatch: a public flight bind with no token is served OPEN (None)
+        # instead of auto-generating one. Off by default, so the fail-closed default
+        # is unchanged unless explicitly requested.
+        assert cli._resolve_flight_token("0.0.0.0", None, "", True) is None
+
+    def test_allow_no_token_does_not_override_a_supplied_token(self):
+        # A real token still wins over the override.
+        assert (
+            cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, "", True) == _VALID_TOKEN
+        )
 
 
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):

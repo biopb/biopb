@@ -239,12 +239,13 @@ remote server" workflow redirects to an "add a proxied source" affordance.
 
 Reconfiguring the local server's `sources` (including proxied remotes) plus
 cache/pyramid/server knobs is exposed through the **web-app admin surface**, not a
-napari Qt form: `GET`/`PUT /api/config` + `GET /api/admin/status` +
-`POST /api/admin/restart` on the `:8814` sidecar, with napari reduced to a single
+napari Qt form: `GET`/`PUT /api/config` + `GET /api/admin/status` on the `:8814`
+sidecar (restart is control-owned — the admin page calls the control's
+`POST /api/data_plane/restart`), with napari reduced to a single
 "open admin" browser action. The tool edits the tensor server's canonical config
 `~/.config/biopb/biopb.json` — **not** the biopb-mcp client config
 (`~/.config/biopb/mcp-config.json`). Because the server reads config once at startup
-(no hot-reload), applying = write → `biopb server restart` → reconnect, then **poll
+(no hot-reload), applying = write → control-driven restart → reconnect, then **poll
 `health` and show scan progress** (`full_scan_in_progress`,
 `last_full_scan_finished_at`, climbing `source_count`) so the post-restart discovery
 scan isn't a blind wait. Full route/restart/auth design lives in
@@ -289,7 +290,7 @@ in **progressive-discovery.md**.
   delegated `GetFlightInfo` so on-disk OME-Zarr levels are reused, not recomputed.
 - **Per-user eviction budget** — the proxy's `file_max_total_bytes` should default
   to a whole-user budget, not a per-worker slice.
-- **Live `reconfigure`** — v1 apply is write + `biopb server restart`; a
+- **Live `reconfigure`** — v1 apply is write + a control-driven restart; a
   `do_action("reconfigure")` for incremental source add/remove (no full rescan)
   is a possible follow-up.
 - **Alias ergonomics** — `<alias>__<source_id>` is verbose in the agent's `client`
