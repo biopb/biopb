@@ -12,10 +12,13 @@ set -e
 # MONITOR        - Enable live fs monitoring (default: true)
 # BIOPB_BASE_PORT - Base port for all services (default: 8810)
 #                  HTTP sidecar=BASE+4, gRPC Flight=BASE+5
-# COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Access token for the sidecar and gRPC (auto-generated if not set)
+# BIOPB_TENSOR_ALLOW_NO_TOKEN - Set to "true"/"1" to serve the data API WITHOUT a token
+#                  even on the public 0.0.0.0 bind (insecure; trusted networks only).
+#                  Ignored when BIOPB_TENSOR_TOKEN is set.
 # BIOPB_BIND_LOCALHOST - Set to "true" to bind both HTTP and gRPC to localhost only (Singularity/HPC only)
-# BIOPB_EXTERNAL_HOST - External hostname/IP for the printed endpoint URLs (auto-detected if not set)
+# BIOPB_EXTERNAL_HOST - External hostname/IP shown in the printed endpoint URLs only;
+#                  display-only, does not affect binding (auto-detected if not set)
 # BIOPB_CORS_ORIGINS - Space-separated extra CORS origins (→ launch --cors,
 #                  repeatable). The sidecar's own origin is always allowed;
 #                  set this to allow a browser SPA served from a different
@@ -77,9 +80,6 @@ else
     "file_max_segment_mb": ${CACHE_MAX_SEGMENT_MB:-256},
     "file_max_total_gb": ${CACHE_MAX_TOTAL_GB:-16}
   },
-  "compute": {
-    "backend": "${COMPUTE_BACKEND:-auto}"
-  },
   "sources": [
     {
       "url": "${DATA_DIR}",
@@ -118,6 +118,13 @@ if [ -n "$BIOPB_TENSOR_TOKEN" ]; then
 elif [ "$BIND_ADDR" = "127.0.0.1" ]; then
     # Loopback-only bind (Singularity BIOPB_BIND_LOCALHOST): local mode, no token.
     # Every listener is same-machine, so no token is enforced -- pass nothing.
+    TOKEN_ARGS=()
+elif [ "${BIOPB_TENSOR_ALLOW_NO_TOKEN}" = "true" ] || [ "${BIOPB_TENSOR_ALLOW_NO_TOKEN}" = "1" ]; then
+    # Deliberate insecure opt-out: run tokenless even on the public 0.0.0.0 bind
+    # (e.g. a host-loopback-published container on a trusted machine). Pass no
+    # --token and skip generation; `launch` honors the same env var and serves the
+    # data API OPEN. The var is already in the container env (-e), so launch sees it.
+    echo "WARNING: BIOPB_TENSOR_ALLOW_NO_TOKEN set -- serving the data API WITHOUT a token. Trusted networks only."
     TOKEN_ARGS=()
 else
     GEN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"

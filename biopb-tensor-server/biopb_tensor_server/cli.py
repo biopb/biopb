@@ -70,10 +70,27 @@ def _host_is_public(host: str) -> bool:
     return host not in _LOOPBACK_HOSTS
 
 
+def _allow_no_token_from_env() -> bool:
+    """Whether ``BIOPB_TENSOR_ALLOW_NO_TOKEN`` opts out of token enforcement.
+
+    The default is fail-closed (a public bind auto-generates a token; the launcher
+    refuses a public sidecar with none). A truthy value here forces **tokenless**
+    operation even on a public bind — the deliberate, insecure escape hatch for a
+    trusted network. It only matters when no token is otherwise supplied.
+    """
+    return os.environ.get("BIOPB_TENSOR_ALLOW_NO_TOKEN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _resolve_flight_token(
     server_host: str,
     token: Optional[str],
     env_token: str,
+    allow_no_token: bool = False,
 ) -> Optional[str]:
     """Resolve the token the Flight (gRPC) server enforces, fail-closed on a
     public bind.
@@ -82,6 +99,13 @@ def _resolve_flight_token(
     switch: a loopback bind is **local mode** (tokenless, same-machine only); any
     public bind is **remote mode** and MUST carry a token, so a public bind with
     none supplied auto-generates one rather than serving the data API open.
+
+    ``allow_no_token`` (from ``BIOPB_TENSOR_ALLOW_NO_TOKEN``) is the deliberate,
+    insecure escape hatch: it forces **tokenless** operation even on a public bind
+    -- for a host-loopback-published Docker container (or any trusted network)
+    where the token is pure friction. It only takes effect when no token is
+    otherwise supplied; a real ``--token`` / env token still wins. Off by default,
+    so the fail-closed guarantee is unchanged unless it is explicitly set.
 
     Shared by ``serve`` and ``launch``; ``launch`` layers its sidecar fail-closed
     check on top of the returned token (see ``_resolve_launch_token``).
@@ -93,6 +117,14 @@ def _resolve_flight_token(
     if env_token and _web_auth.valid_token(env_token):
         return env_token.strip()
     if _host_is_public(server_host):
+        if allow_no_token:
+            console.print(
+                "[bold red]WARNING: token enforcement disabled "
+                "(BIOPB_TENSOR_ALLOW_NO_TOKEN) on a public flight bind "
+                f"(server.host={server_host}). The data API is served OPEN — "
+                "only do this on a trusted network.[/bold red]"
+            )
+            return None
         generated = secrets.token_urlsafe(32)
         console.print(
             "[yellow]Auto-generated secure access token "
@@ -108,6 +140,7 @@ def _resolve_launch_token(
     web_host: str,
     token: Optional[str],
     env_token: str,
+    allow_no_token: bool = False,
 ) -> Optional[str]:
     """Decide the token ``launch`` enforces, fail-closed on every public listener.
 
@@ -120,19 +153,36 @@ def _resolve_launch_token(
     token would otherwise resolve to ``None`` and the data API would bind public
     and open.)
 
+    ``allow_no_token`` (from ``BIOPB_TENSOR_ALLOW_NO_TOKEN``) is the same deliberate
+    escape hatch as in :func:`_resolve_flight_token`: it turns the public-sidecar
+    refusal into a loud warning instead, so an operator can knowingly serve the data
+    API open on a trusted network. Off by default — the refusal stands unless it is
+    explicitly set.
+
     Returns the effective token (``None`` = local mode). Raises ``typer.Exit(1)``
-    if the sidecar would bind public without a token.
+    if the sidecar would bind public without a token (unless ``allow_no_token``).
     """
-    effective_token = _resolve_flight_token(server_host, token, env_token)
+    effective_token = _resolve_flight_token(
+        server_host, token, env_token, allow_no_token
+    )
 
     if effective_token is None and _host_is_public(web_host):
+        if allow_no_token:
+            console.print(
+                "[bold red]WARNING: token enforcement disabled "
+                "(BIOPB_TENSOR_ALLOW_NO_TOKEN); binding the HTTP sidecar public "
+                f"(--web-host {web_host}) with no token. The data API is served "
+                "OPEN — only do this on a trusted network.[/bold red]"
+            )
+            return None
         console.print(
             "[red]Refusing to bind the HTTP sidecar to a public address "
             f"(--web-host {web_host}) with no access token.[/red]\n"
             "The sidecar re-exposes the data API, so this would serve it "
             "unauthenticated to the network. Either bind it to loopback "
-            "(--web-host 127.0.0.1), or make the flight server public "
-            "(server.host) so a token is enforced across both listeners."
+            "(--web-host 127.0.0.1), make the flight server public "
+            "(server.host) so a token is enforced across both listeners, or "
+            "set BIOPB_TENSOR_ALLOW_NO_TOKEN=1 to serve it open deliberately."
         )
         raise typer.Exit(1)
 
@@ -841,6 +891,7 @@ def serve(
         effective_host,
         token,
         os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+        _allow_no_token_from_env(),
     )
 
     if effective_token is not None:
@@ -1182,6 +1233,7 @@ def launch(
         web_host,
         token,
         os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+        _allow_no_token_from_env(),
     )
 
     if effective_token is not None:

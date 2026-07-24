@@ -115,10 +115,17 @@ docker run -d --rm \
     --name biopb-tensor \
     -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
+    -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
     jiyuuchc/biopb-tensor-server:latest
 ```
 
-or use a custom config file:
+The ports are published to host loopback only (`127.0.0.1`), so
+`BIOPB_TENSOR_ALLOW_NO_TOKEN=1` runs it without an access token for a
+single-machine setup. Drop that env var to have the container auto-generate a
+token (printed in `docker logs biopb-tensor`); do so whenever the ports are
+reachable from other hosts.
+
+Or use a custom config file:
 
 ```bash
 docker run -d --rm \
@@ -127,6 +134,7 @@ docker run -d --rm \
     -v ~/biopb.json:/biopb.json \
     -v ${YOUR_DATA_LOCATION}:/data \
     -e CONFIG_FILE=/biopb.json \
+    -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
     jiyuuchc/biopb-tensor-server:latest
 ```
 
@@ -163,7 +171,7 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
 - Python >= 3.10, < 3.13
 - pyarrow >= 14.0.0
 
-### Installation
+### Setup
 ```bash
 # From repository root
 pip install -e biopb-tensor-server/

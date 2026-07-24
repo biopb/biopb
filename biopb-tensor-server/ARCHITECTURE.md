@@ -577,6 +577,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
+| `BIOPB_TENSOR_ALLOW_NO_TOKEN` | `serve`/`launch` token resolution (`_allow_no_token_from_env`) | Truthy (`1`/`true`/`yes`/`on`) forces **tokenless** operation even on a public bind — the deliberate insecure escape hatch (trusted networks only). Only takes effect when no token is supplied; auto-generation and the public-sidecar refusal both become a loud warning instead. Off by default, so the fail-closed guarantee is unchanged unless explicitly set. |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_OMETIFF_PARALLEL_READ` | `OmeTiffAdapter.get_data` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**: reads decode under the lock, as before. |
 
@@ -591,6 +592,7 @@ The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handl
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
 - **Local mode** (loopback `server.host`) enforces no token — the 90% single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
 - **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `server.host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`server.host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
+- **The one deliberate escape hatch is `BIOPB_TENSOR_ALLOW_NO_TOKEN`** (`_allow_no_token_from_env`). Truthy, it forces tokenless operation even on a public bind — auto-generation and the public-sidecar refusal both degrade to a loud warning. It only takes effect when no token is otherwise supplied, and is **off by default**, so the fail-closed guarantee above holds unless an operator explicitly opts out for a trusted network (the host-loopback-published Docker case, where the in-container bind is `0.0.0.0` but the ports are published to `127.0.0.1`). This is *not* the old auto dev-bypass (removed in #447) — it is explicit, per-deployment, and self-announcing.
 - For Docker local mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
 - For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
