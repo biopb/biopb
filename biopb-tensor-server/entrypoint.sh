@@ -15,7 +15,11 @@ set -e
 # COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Access token for the sidecar and gRPC (auto-generated if not set)
 # BIOPB_BIND_LOCALHOST - Set to "true" to bind both HTTP and gRPC to localhost only (Singularity/HPC only)
-# BIOPB_EXTERNAL_HOST - External hostname/IP for the printed access URL (auto-detected if not set)
+# BIOPB_EXTERNAL_HOST - External hostname/IP for the printed endpoint URLs (auto-detected if not set)
+# BIOPB_CORS_ORIGINS - Space-separated extra CORS origins (→ launch --cors,
+#                  repeatable). The sidecar's own origin is always allowed;
+#                  set this to allow a browser SPA served from a different
+#                  origin (e.g. "http://localhost:5173 http://my.host:8813").
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
 # CACHE_MAX_SEGMENT_MB - Max segment size for file cache (default: 256)
 # CACHE_MAX_TOTAL_GB   - Max total size for file cache (default: 16)
@@ -87,7 +91,7 @@ EOF
     CONFIG_FILE="$BIOPB_TMP/runtime-config.json"
 fi
 
-# Construct best-effort external URL for the printed access URL
+# Construct best-effort external host for the printed endpoint URLs
 # Priority: env var override > hostname > IP from default route > localhost
 if [ -n "$BIOPB_EXTERNAL_HOST" ]; then
     WEB_HOST="$BIOPB_EXTERNAL_HOST"
@@ -124,10 +128,10 @@ fi
 
 # Run `biopb-tensor-server launch` in the foreground (container PID 1). It starts
 # the Arrow Flight server (binds [server].host/port from the config) and the
-# FastAPI HTTP sidecar (--web-host/--web-port) in a single process.
-#   --web-host $BIND_ADDR : bind the sidecar publicly (0.0.0.0 -> reachable via -p)
-#   --web-port $HTTP_PORT : the published data-plane API port
-#   --web-url             : external origin used only for the printed access URL
+# FastAPI HTTP sidecar (--web-host/--web-port) in a single process. This is a
+# headless data plane — no webapp is served. CORS is configurable via
+# BIOPB_CORS_ORIGINS (→ repeated --cors) for a browser SPA served from a
+# different origin; otherwise launch defaults to localhost variants.
 #
 # PID 1 note: launch installs a SIGTERM handler so `docker stop` tears down
 # gracefully (releasing the file-cache process lock). PID 1 does not reap
@@ -137,8 +141,12 @@ LAUNCH_ARGS=(
     --config "$CONFIG_FILE"
     --web-host "$BIND_ADDR"
     --web-port "$HTTP_PORT"
-    --web-url "http://${WEB_HOST}:${HTTP_PORT}"
 )
+if [ -n "$BIOPB_CORS_ORIGINS" ]; then
+    for origin in $BIOPB_CORS_ORIGINS; do
+        LAUNCH_ARGS+=(--cors "$origin")
+    done
+fi
 
 echo "HTTP sidecar: http://${WEB_HOST}:${HTTP_PORT}   Flight gRPC: ${WEB_HOST}:${GRPC_PORT}"
 exec biopb-tensor-server launch "${LAUNCH_ARGS[@]}" "${TOKEN_ARGS[@]}"

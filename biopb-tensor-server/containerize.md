@@ -82,6 +82,7 @@ docker run -d --init \
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port in container. Derived: **HTTP sidecar=BASE+4** (publish this — the data-plane API), gRPC Flight=BASE+5 (publish for SDK clients) |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for the HTTP sidecar and gRPC; printed once in the logs when auto-generated |
+| `BIOPB_CORS_ORIGINS` | (unset) | Space-separated CORS origins (→ repeated `--cors`). Set this to allow a browser SPA served from a different origin to call the sidecar (e.g. `BIOPB_CORS_ORIGINS="http://localhost:5173 http://my.host:8813"`) |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written. **Not to be confused with**  `$TMPDIR` |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB |
@@ -174,6 +175,7 @@ singularity run \
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port - HTTP sidecar=BASE+4, gRPC=BASE+5 |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for the HTTP sidecar and gRPC; printed once in the logs when auto-generated |
+| `BIOPB_CORS_ORIGINS` | (unset) | Space-separated CORS origins (→ repeated `--cors`). Set this to allow a browser SPA served from a different origin to call the sidecar |
 | `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to loopback → **local mode, no token** (useful on shared nodes reached via localhost). A public container bind still auto-generates a token. |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Singularity auto-binds host `/tmp`, so the cache lands at `/tmp/biopb-cache-<uid>` on host disk (persistent). Set it to relocate — see [Cache Storage](#cache-storage) |
@@ -226,9 +228,24 @@ curl http://localhost:8814/readyz
 
 This image does not serve a webapp. Run the SPA separately (a dev server, a
 static host, or a control-plane deployment) and point it at this container's
-published HTTP sidecar (`:8814`) and Flight gRPC (`:8815`) ports. You will be
-prompted for the token (shown once in container logs, or set via
-`BIOPB_TENSOR_TOKEN`).
+published HTTP sidecar (`:8814`) and Flight gRPC (`:8815`) ports.
+
+**CORS.** The HTTP sidecar allows requests from its own origin and localhost
+variants by default. If the SPA is served from a *different* origin, the
+browser's CORS preflight will reject `Authorization: Bearer <token>` calls.
+Set `BIOPB_CORS_ORIGINS` to the SPA's origin(s) (space-separated) so the
+sidecar allows them:
+
+```bash
+docker run -d -p 8814:8814 -p 8815:8815 \
+    -v ~/data:/data \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
+    -e BIOPB_CORS_ORIGINS="http://localhost:5173 http://my.host:8813" \
+    biopb-tensor-server:latest
+```
+
+The access token is shown once in the container logs, or set explicitly via
+`BIOPB_TENSOR_TOKEN`.
 
 ## Architecture
 

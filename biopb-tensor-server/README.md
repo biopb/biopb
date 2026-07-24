@@ -1,6 +1,6 @@
 # Biopb-Tensor-Server
 
-A high-performance Arrow Flight + HTTP server for serving multi-dimensional microscopy image data with lazy, chunked, multi-resolution, zero-copy access. Supports OME-Zarr, OME-TIFF, HDF5, CZI, LIF, ND2, DICOM, NIfTI, and more — with a built-in web viewer.
+A high-performance Arrow Flight + HTTP server for serving multi-dimensional microscopy image data with lazy, chunked, multi-resolution, zero-copy access. Supports OME-Zarr, OME-TIFF, HDF5, CZI, LIF, ND2, DICOM, NIfTI, and more.
 
 ## Core Concept
 
@@ -40,11 +40,11 @@ docker run -d --rm --init \
 
 The container is a headless data plane: `biopb-tensor-server launch` runs the
 Arrow Flight gRPC endpoint (`:8815`, for SDK clients) and the FastAPI HTTP
-sidecar (`:8814`, the data-plane API). There is no bundled webapp — point a
-browser UI (a dev server, or a separate control deployment) at these published
-ports. `--init` gives the container a reaping init as PID 1 — optional, since
-`launch` (PID 1) handles `docker stop` gracefully, but it cleans up any stray
-orphans.
+sidecar (`:8814`, the data-plane API). There is no bundled webapp. The browser
+UI lives in the top-level `web/` workspace — see `web/README.md` for how to
+build and serve it. `--init` gives the container a reaping init as PID 1 —
+optional, since `launch` (PID 1) handles `docker stop` gracefully, but it
+cleans up any stray orphans.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
@@ -113,7 +113,6 @@ Directory monitoring uses a claim-based discovery protocol with periodic rescans
 
 - Python >= 3.10, < 3.13
 - pyarrow >= 14.0.0
-- Node.js / pnpm (for web app and TS client)
 
 ### Installation
 ```bash
@@ -138,28 +137,6 @@ biopb-tensor-server launch --config biopb.json --token mytoken...
 
 # gRPC only (no web sidecar)
 biopb-tensor-server serve --config biopb.json
-```
-
-### Web App
-
-The browser UI is one Vite + React SPA in the top-level `web/` workspace (not the
-FastAPI sidecar, which is API-only). Build it before running the server:
-
-```bash
-# Production build (output → web/packages/app/dist/)
-pnpm -C web install && pnpm -C web build
-```
-
-The bundle is **not** bundled into the tensor-server Docker image (which is a
-headless data plane — Flight + HTTP sidecar only). Serve the SPA separately — a
-dev server, a static host, or a control-plane deployment — and point it at the
-server's published HTTP sidecar (`:8814`) and Flight gRPC (`:8815`) ports. On
-first load you will be prompted for the access token (printed in the container
-logs, or set via `BIOPB_TENSOR_TOKEN`).
-
-For development with hot reload, run the dev server separately:
-```bash
-pnpm -C web dev   # runs on :5173, proxies to a live tensor server on :8814
 ```
 
 ### CLI Reference
