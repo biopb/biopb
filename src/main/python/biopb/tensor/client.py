@@ -630,11 +630,11 @@ class TensorFlightClient:
             Dictionary with copy-cache size/item_count plus ``view_items``.
         """
         key = (self._location, self._token)
-        view_items = len(_VIEW_CACHE.get(key, (0, {}))[1])
-        pool_entry = _CACHE_POOL.get(key)
-        if pool_entry is None:
-            # No copy cache allocated yet, or copy caching is off. Report the
-            # resolved size so a disabled copy cache truthfully shows max_bytes 0.
+        wvd = _VIEW_CACHE.get(key)
+        view_items = len(wvd) if wvd is not None else 0
+        if key not in _CACHE_POOL:
+            # No copy cache allocated yet. Report the resolved size so a
+            # not-yet-created copy cache truthfully shows what it would allow.
             resolved = _resolve_cache_bytes(self._location, self._cache_bytes)
             return {
                 "size_bytes": 0,
@@ -642,7 +642,7 @@ class TensorFlightClient:
                 "item_count": 0,
                 "view_items": view_items,
             }
-        cache = pool_entry[1]  # Extract cache from (pid, cache) tuple
+        cache = _CACHE_POOL[key]  # Cache, or None when pinned off
         if cache is None:
             # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
             return {
@@ -662,9 +662,9 @@ class TensorFlightClient:
         """Clear both the strong copy cache and the weak view cache for this
         connection namespace (the latter drops only weak references)."""
         key = (self._location, self._token)
-        pool_entry = _CACHE_POOL.get(key)
-        if pool_entry is not None and pool_entry[1] is not None:
-            pool_entry[1].clear()
+        cache = _CACHE_POOL.get(key)
+        if cache is not None:
+            cache.clear()
         _clear_view_cache(self._location, self._token)
 
     def __enter__(self):
