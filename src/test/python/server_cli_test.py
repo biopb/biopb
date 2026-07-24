@@ -605,11 +605,10 @@ class TestDashboardCommand:
 
 
 class TestVersionCommand:
-    """`biopb version` reports the release-v* deployment version (from the
-    installer's marker file) plus each of the three bundled wheels, resolved
-    independently so an absent one shows 'not installed' rather than breaking
-    the command. The release line is deliberately NOT any single wheel's
-    version."""
+    """`biopb version` reports the two version lines: the product deployment
+    (`release`, from the installer's marker file — the shared release-v* version
+    of tensor-server / mcp / control / web) and the `biopb` SDK (its own v* line).
+    The release line is deliberately NOT any single wheel's version."""
 
     @staticmethod
     def _labels(output: str) -> dict:
@@ -622,27 +621,30 @@ class TestVersionCommand:
                 out[label.strip()] = value.strip()
         return out
 
-    def test_reports_release_and_bundled_packages(self, monkeypatch, tmp_path):
-        # Release version comes from the installer's marker file, not a package.
+    def test_reports_release_and_sdk(self, monkeypatch, tmp_path):
+        # Two lines only: the product deployment (marker) and the biopb SDK.
         marker = tmp_path / "release.version"
         marker.write_text("1.2.3\n")
         monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
-        # A stand-in metadata lookup: two of the triple installed, one absent.
-        installed = {"biopb": "1.2.3.dev9+gabc", "biopb-tensor-server": "1.2.3"}
         monkeypatch.setattr(
-            cli, "_package_version", lambda name: installed.get(name, "not installed")
+            cli,
+            "_package_version",
+            lambda name: {"biopb": "0.9.3"}.get(name, "not installed"),
         )
 
         res = CliRunner().invoke(cli.app, ["version"])
 
         assert res.exit_code == 0, res.output
         labels = self._labels(res.output)
-        # Deployment version is the marker's contents, distinct from biopb's own.
+        # Deployment version is the marker's contents (the release-v* product
+        # line), distinct from the biopb SDK's own v* version.
         assert labels["release"] == "1.2.3"
-        assert labels["biopb"] == "1.2.3.dev9+gabc"
-        assert labels["biopb-tensor-server"] == "1.2.3"
-        # The absent third wheel is reported, not silently dropped.
-        assert labels["biopb-mcp"] == "not installed"
+        assert labels["biopb"] == "0.9.3"
+        # The product wheels are no longer listed individually — they all share
+        # the release version, so the marker stands in for the set.
+        assert set(labels) == {"release", "biopb"}
+        assert "biopb-tensor-server" not in labels
+        assert "biopb-mcp" not in labels
 
     def test_release_version_unknown_when_marker_absent(self, monkeypatch, tmp_path):
         # A dev checkout / non-installer setup has no marker: report 'unknown',

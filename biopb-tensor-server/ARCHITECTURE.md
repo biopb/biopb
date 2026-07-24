@@ -599,22 +599,21 @@ The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handl
 
 ## Versioning
 
-The tensor server has its **own version line**, keyed to the per-package tag
-`server-v*`. Its Docker image is cut on that tag by `tensor-server-ci`, on its own
-cadence — distinct from the SDK line (`v*`, for `biopb` + `biopb-image-base`) and
-the product bundle line (`release-v*`, for mcp/control/web + the GitHub release).
-See `../docs/release-model.md`.
+The tensor server tracks the **product line**, keyed to the tag `release-v*` (the
+same line as `biopb-mcp`, `biopb-control`, and the `web/` bundle). Its wheel ships
+in the `release-v*` GitHub bundle and its Docker image is cut on the same tag by
+`tensor-server-ci` — distinct only from the SDK line (`v*`, for `biopb` +
+`biopb-image-base`). See `../docs/release-model.md`.
 
 ```
-git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
+git tags (release-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
 ```
 
-Version is derived via `setuptools_scm` with `tag_regex = "^server-v..."` (and a
-matching `git describe --match 'server-v*'`). The web JS packages instead track the
-product `release-v*` tag (`web/scripts/sync-version.js`), not this one.
+Version is derived via `setuptools_scm` with `tag_regex = "^release-v..."` (and a
+matching `git describe --match 'release-v*'`). The web JS packages track the same
+product `release-v*` tag (`web/scripts/sync-version.js`).
 
-**Docker image** (own cadence): `git tag server-v0.11.0 && git push --tags`.
-`tensor-server-ci`'s `publish` job then builds and pushes
+**Docker image**: `git tag release-v0.11.0 && git push --tags` (the same tag that
+cuts the GitHub bundle). `tensor-server-ci`'s `publish` job then builds and pushes
 `biopb-tensor-server:0.11.0` (+ `:latest` for a clean X.Y.Z) to ghcr.io + Docker
-Hub. The **wheel** still ships in the `release-v*` GitHub bundle (versioned off
-this `server-v*` line), and the SDK (incl. image-base) releases on `v*`.
+Hub. The SDK (incl. image-base) releases separately on `v*`.
