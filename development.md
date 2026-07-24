@@ -47,8 +47,9 @@ tensor HTTP sidecar 8814, flight gRPC 8815) binds loopback — the single-machin
 90% case. Local mode is tokenless by default (no unlock step), but a token is
 **optional**: pass `--token` / `BIOPB_TENSOR_TOKEN` and it is enforced across the
 loopback listeners too (the browser then gates behind the unlock page, exactly as
-in remote). A local token is **provisional** — see the caveats below before
-relying on it. `biopb control start
+in remote). A local token is a supported mode — the control hands its credential
+to local clients on the filesystem (see the credential handoff below); one
+residual UI gap is noted there. `biopb control start
 --remote` runs **remote mode**: the control's browser UI *and* the flight server
 bind publicly behind a **required** token (supplied via `--token` /
 `BIOPB_TENSOR_TOKEN`, else generated and printed), the sidecar stays on loopback
@@ -63,27 +64,30 @@ policy lives in the stdlib-only `biopb._web_auth` predicates that the control an
 the sidecar both bind to (so they cannot drift); there is no separate "dev-mode"
 token bypass.
 
-**Caveats on an optional local token** (biopb/biopb#470 tracks the fix). The token
-gates the listeners as described, but three places still read "a token is
-enforced" as a proxy for "this deployment is remote", because that was exact until
-the two were decoupled:
+**The local credential handoff** (biopb/biopb#470). Credential distribution is off
+the HTTP API and on the filesystem, the standard local-daemon pattern (Jupyter's
+runtime JSON, Docker): the control writes the resolved data-plane token to an
+owner-only file in the user's state dir (`state/biopb/tensor-server.token`) when it
+starts serving, and removes it on a clean stop. `_control_client` and `_connection`
+read it there (via `biopb._credentials`), with `BIOPB_TENSOR_TOKEN` kept as an
+explicit override. The endpoint never returns the token, so a loopback-reachable,
+unauthenticated control is not a token oracle. The boundary is filesystem
+permissions: `0600` on POSIX, and on Windows a DACL granting only the current user
+with inheritance disabled (the faithful `0600` analogue — `os.chmod` can't express
+owner-only there). This defends against *other uids* on a shared host, not a
+same-uid process (neither does an env var, which additionally leaks via
+`/proc/<pid>/environ`, `ps e`, and every inherited child).
 
-- **biopb-mcp cannot reach a token-gated local plane on its own.** The control's
-  ensure reply carries the plane's endpoint but no credential, so biopb-mcp learns
-  the token only from its own `BIOPB_TENSOR_TOKEN`. An agent spawning it over
-  stdio does not pass one. Recover by exporting `BIOPB_TENSOR_TOKEN` into the
-  agent's environment, or by entering the token in the napari Tensor Browser.
-- **The admin UI's server-side file chooser disappears** (`/api/admin/browse`
-  404s): the sidecar reports `local: token is None`, so a loopback plane behind a
-  token looks remote to it. Fails closed.
-- **`POST /api/data_plane/ensure` stays unauthenticated** — it is biopb-mcp's only
-  tokenless way to bring the plane up. On a shared host, loopback is reachable by
-  every uid, so another local user can drive this one idempotent, non-destructive
-  route on a deployment you asked to gate.
+With the handoff in place, biopb-mcp authenticates to a token-gated local plane on
+its own (no env var needed), and `POST /api/data_plane/ensure` is gated like every
+other `/api/*` route (the client carries the token; the old unauthenticated-state-
+change exemption, #424 item 2, is gone).
 
-So an optional local token is real defense-in-depth against *other users reading
-your data*, but it is not yet a fully-supported mode: prefer it where the browser
-UI is the workload, and expect the agent path to need the env var.
+One residual, tracked in #470 and separately fixable: **the admin UI's server-side
+file chooser disappears** on a token-gated local plane (`/api/admin/browse` 404s)
+because the sidecar computes `local: token is None`, so a loopback plane behind a
+token looks remote to it. It should derive `local` from the bind instead; it fails
+closed in the meantime.
 
 ---
 
