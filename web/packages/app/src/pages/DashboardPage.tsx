@@ -591,6 +591,16 @@ const DASH_CSS = `
   .ctrl-dash main { padding: 16px; max-width: 760px; }
   .ctrl-dash .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
           background: #161616; }
+  /* Desktop-only 2-column layout: on wide viewports the cards flow into two
+     masonry columns (CSS multi-column), so each column packs its cards tightly
+     top-to-bottom instead of aligning them into rows — uneven card heights
+     leave no inter-row gap. break-inside keeps a card whole. The per-card
+     bottom margin still spaces cards within a column. Below the breakpoint it
+     stays the single 760px column above. */
+  @media (min-width: 960px) {
+    .ctrl-dash main { max-width: none; column-count: 2; column-gap: 16px; }
+    .ctrl-dash .card { break-inside: avoid; }
+  }
   .ctrl-dash .badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; text-transform: uppercase;
            vertical-align: middle; }
   .ctrl-dash .serving { background: #243; color: #7e7; }
