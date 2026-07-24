@@ -3,10 +3,11 @@ name: Web CI
 # The web/ workspace (Vite SPA + tensor-flight-client) is served by biopb-control,
 # NOT the tensor server — which is API-only since the single-origin refactor
 # (biopb#440). So the JS unit suite and typecheck live here, on their own `web/**`
-# trigger, rather than bolted onto Tensor Server CI. The product Docker image's
-# webapp build still runs in tensor-server-ci.yaml (the image bundles the built
-# dist); this workflow is the fast per-PR feedback for web-only changes, which
-# otherwise ran no CI at all (no ruleset requires these checks).
+# trigger, rather than bolted onto Tensor Server CI. This is now the ONLY place the
+# webapp is compiled: the tensor-server Docker image is a headless data plane and
+# no longer bundles the webapp. This workflow is the fast per-PR feedback for
+# web-only changes, which otherwise ran no CI at all (no ruleset requires these
+# checks).
 on:
   push:
     branches:
