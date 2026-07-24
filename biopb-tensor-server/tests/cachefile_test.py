@@ -698,32 +698,32 @@ class TestLocalhostDetection:
     """Localhost detection (still used to gate the cache-file fast path)."""
 
     def test_localhost_explicit(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://localhost:8815") is True
 
     def test_127_0_0_1(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://127.0.0.1:8815") is True
 
     def test_ipv6_loopback(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://[::1]:8815") is True
 
     def test_grpc_tls_scheme(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc+tls://localhost:8815") is True
 
     def test_not_localhost_remote_ip(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://192.168.1.100:8815") is False
 
     def test_not_localhost_remote_hostname(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://example.com:8815") is False
 
@@ -752,24 +752,24 @@ class TestExtractSchemaMetadata:
 
 class TestShouldTryCachefile:
     def setup_method(self):
-        import biopb.tensor.client as c
+        import biopb.tensor._pool as c
 
         c._cachefile_support.clear()
 
     def test_enabled_on_localhost(self):
-        from biopb.tensor.client import _should_try_cachefile
+        from biopb.tensor._pool import _should_try_cachefile
 
         # Enabled on every platform now, Windows included (biopb/biopb#582).
         assert _should_try_cachefile("grpc://localhost:8815") is True
 
     def test_disabled_by_env(self):
-        from biopb.tensor.client import _should_try_cachefile
+        from biopb.tensor._pool import _should_try_cachefile
 
         with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
             assert _should_try_cachefile("grpc://localhost:8815") is False
 
     def test_disabled_for_remote(self):
-        from biopb.tensor.client import _should_try_cachefile
+        from biopb.tensor._pool import _should_try_cachefile
 
         assert _should_try_cachefile("grpc://192.168.1.100:8815") is False
 
@@ -777,13 +777,13 @@ class TestShouldTryCachefile:
         """The fast path is no longer gated on os.name (biopb/biopb#582): a
         Windows host still takes the localhost path, so the copy on read the
         POSIX gate used to protect is not needed."""
-        import biopb.tensor.client as c
+        import biopb.tensor._pool as c
 
         with patch.object(os, "name", "nt"):
             assert c._should_try_cachefile("grpc://localhost:8815") is True
 
     def test_skips_after_unsupported_memoized(self):
-        import biopb.tensor.client as c
+        import biopb.tensor._pool as c
 
         c._set_cachefile_supported("grpc://localhost:8815", False)
         assert c._should_try_cachefile("grpc://localhost:8815") is False
@@ -885,7 +885,7 @@ class TestClientViewSurvivesServerUnlink:
 
 class TestArrayFromUnifiedBatch:
     def test_decode_matches_source(self):
-        from biopb.tensor.client import _array_from_unified_batch
+        from biopb.tensor._pool import _array_from_unified_batch
 
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
         unified = _make_typed_batch(a)  # already the unified binary schema
@@ -894,7 +894,7 @@ class TestArrayFromUnifiedBatch:
         assert np.array_equal(got, a)
 
     def test_view_decode_matches_source(self):
-        from biopb.tensor.client import _array_from_unified_batch
+        from biopb.tensor._pool import _array_from_unified_batch
 
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
         got = _array_from_unified_batch(_make_typed_batch(a), copy=False)
@@ -904,7 +904,7 @@ class TestArrayFromUnifiedBatch:
     def test_both_paths_return_readonly(self):
         # The mutability contract is uniform across the do_get view path
         # (copy=False) and the mmap fast path (copy=True) -- biopb/biopb#571.
-        from biopb.tensor.client import _array_from_unified_batch
+        from biopb.tensor._pool import _array_from_unified_batch
 
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
         for copy in (True, False):
@@ -916,7 +916,7 @@ class TestArrayFromUnifiedBatch:
     def test_copy_owns_its_bytes(self):
         # copy=True must not alias the batch's Arrow buffer: the mmap fast path
         # closes its segment mapping the instant the helper returns.
-        from biopb.tensor.client import _array_from_unified_batch
+        from biopb.tensor._pool import _array_from_unified_batch
 
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
         got = _array_from_unified_batch(_make_typed_batch(a), copy=True)
@@ -927,7 +927,7 @@ class TestArrayFromUnifiedBatch:
         # it must stay valid after every intermediate Arrow ref is dropped.
         import gc
 
-        from biopb.tensor.client import _array_from_unified_batch
+        from biopb.tensor._pool import _array_from_unified_batch
 
         a = (np.arange(4000, dtype=np.uint32) % 251).astype(np.uint32).reshape(40, 100)
         batch = _make_typed_batch(a)
@@ -995,7 +995,7 @@ class TestPinnedSegmentAccounting:
 
     def test_gate_default_and_env_override(self):
         import biopb.tensor._pool as pool
-        from biopb.tensor.client import _pin_budget_exhausted, _pin_limit_bytes
+        from biopb.tensor._pool import _pin_budget_exhausted, _pin_limit_bytes
 
         # Nothing pinned -> under the (16 GiB) default budget.
         assert _pin_budget_exhausted() is False
@@ -1049,7 +1049,7 @@ class TestCachefileIntegration:
         return server, src
 
     def test_cachefile_path_matches_source_and_is_exercised(self):
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -1071,7 +1071,7 @@ class TestCachefileIntegration:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_do_get_fallback_when_disabled(self):
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -1093,7 +1093,7 @@ class TestCachefileIntegration:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_memory_backend_falls_back_but_data_correct(self):
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -1113,7 +1113,7 @@ class TestCachefileIntegration:
     def test_newer_segment_format_falls_back(self):
         """A server segment format newer than the client understands declines
         the fast path (and is memoized off), but data is still correct via do_get."""
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -1233,8 +1233,9 @@ class TestCachefileIntegration:
     def test_fetched_block_is_read_only_fast_path(self):
         """End-to-end read contract: a chunk pulled through the real fetch leaf
         via the localhost mmap fast path is read-only, and mutating it raises."""
-        import biopb.tensor.client as cmod
-        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+        import biopb.tensor._pool as cmod
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
@@ -1266,8 +1267,9 @@ class TestCachefileIntegration:
         the mapping alive for the array's lifetime -- the block still decodes the
         correct bytes after the handle is gone and every intermediate ref is
         dropped and gc'd."""
-        import biopb.tensor.client as cmod
-        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+        import biopb.tensor._pool as cmod
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
@@ -1303,7 +1305,8 @@ class TestCachefileIntegration:
         import gc
 
         import biopb.tensor._pool as pool
-        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
@@ -1347,7 +1350,8 @@ class TestCachefileIntegration:
         warm mmap (fast path used), it just owns its bytes and is still
         read-only."""
         import biopb.tensor._pool as pool
-        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
@@ -1386,8 +1390,9 @@ class TestCachefileIntegration:
     def test_fetched_block_is_read_only_do_get(self):
         """End-to-end read contract on the do_get path (fast path disabled): the
         zero-copy view is read-only on every platform, and still decodes right."""
-        import biopb.tensor.client as cmod
-        from biopb.tensor.client import TensorFlightClient, _fetch_chunk_distributed
+        import biopb.tensor._pool as cmod
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))

@@ -24,7 +24,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
-from biopb.tensor._pool import _build_dask_array_from_chunk_map
+from biopb.tensor._pool import (
+    _build_dask_array_from_chunk_map,
+    _chunk_map_from_endpoints,
+    _get_shared_call_options,
+    _get_thread_client,
+)
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -130,6 +135,24 @@ def _request_crop_slices(
     return tuple(crop)
 
 
+def _parse_flight_endpoints(
+    info: "flight.FlightInfo",
+) -> Tuple[List[bytes], List[ChunkBounds]]:
+    """Decode a FlightInfo's endpoints into parallel ``(chunk_ids, bounds)`` lists.
+
+    chunk_id is an opaque server-minted token (echoed back to do_get); a chunk's
+    bounds ride on the endpoint's app_metadata, so the client never decodes the
+    chunk_id byte format. Shared by every GetFlightInfo read planner.
+    """
+    chunks: List[bytes] = []
+    chunk_bounds_list: List[ChunkBounds] = []
+    for endpoint in info.endpoints:
+        ticket = TensorTicket.FromString(endpoint.ticket.ticket)
+        chunks.append(ticket.chunk_id)
+        chunk_bounds_list.append(ChunkBounds.FromString(endpoint.app_metadata))
+    return chunks, chunk_bounds_list
+
+
 def _fetch_endpoints_via_get_flight_info(
     pb: SerializedTensor,
 ) -> Tuple[List[bytes], List[ChunkBounds]]:
@@ -159,25 +182,20 @@ def _fetch_endpoints_via_get_flight_info(
     if descriptor.reduction_method:
         read_opt.reduction_method = descriptor.reduction_method
 
-    # FlightCmd.source_id is the slash-free prefix of the array_id (identity
-    # policy: array_id is source_id or source_id/field). tensor_id (above)
-    # carries the full array_id, which the server reduces to the within-source
-    # field -- so this works for multi-tensor SerializedTensors too, not only
-    # the single-tensor case where array_id == source_id.
-    cmd = FlightCmd(
-        source_id=descriptor.array_id.split("/", 1)[0],
-        tensor_read=read_opt,
-    )
+    # FlightCmd.source_id is the slash-free routing prefix of the array_id
+    # (identity policy, via the _split_array_id seam). tensor_id (above) carries
+    # the full array_id, which the server reduces to the within-source field --
+    # so this works for multi-tensor SerializedTensors too, not only the
+    # single-tensor case where array_id == source_id.
+    source_id, _ = _split_array_id(descriptor.array_id)
+    cmd = FlightCmd(source_id=source_id, tensor_read=read_opt)
 
-    # Create temporary client for this GetFlightInfo call
-    client = flight.FlightClient(pb.location)
-    call_options = (
-        flight.FlightCallOptions(
-            headers=[(b"authorization", f"Bearer {pb.auth_token}".encode())]
-        )
-        if pb.auth_token
-        else flight.FlightCallOptions()
-    )
+    # Reuse the worker's pooled per-thread connection (with its tuned gRPC
+    # message-size options) rather than dialing a throwaway client; a later chunk
+    # fetch to the same (location, token) then rides the same connection.
+    token = pb.auth_token or None
+    client = _get_thread_client(pb.location, token)
+    call_options = _get_shared_call_options(pb.location, token)
 
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
@@ -185,18 +203,7 @@ def _fetch_endpoints_via_get_flight_info(
     # Check schema version compatibility
     _check_wire_protocol(info.schema)
 
-    # Parse endpoints into chunk info. chunk_id is an opaque server-minted token
-    # (echoed back to do_get); a chunk's bounds ride on the endpoint's
-    # app_metadata, so the client never decodes the chunk_id byte format.
-    chunks = []
-    chunk_bounds_list = []
-    for endpoint in info.endpoints:
-        ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-        bounds = ChunkBounds.FromString(endpoint.app_metadata)
-        chunks.append(ticket.chunk_id)
-        chunk_bounds_list.append(bounds)
-
-    client.close()
+    chunks, chunk_bounds_list = _parse_flight_endpoints(info)
     logger.debug(f"_fetch_endpoints_via_get_flight_info: got {len(chunks)} endpoints")
 
     return chunks, chunk_bounds_list
@@ -746,11 +753,13 @@ class CatalogClient:
         Returns:
             The ``TensorDescriptor`` for that tensor.
         """
-        # source_id is the slash-free prefix; the full array_id is the tensor_id.
-        source_id = array_id.split("/", 1)[0]
+        # Route through the identity seam: source_id is the slash-free routing
+        # prefix; tensor_id is the qualified array_id (or None for a bare id,
+        # which _fetch_tensor_descriptor anchors on the source's default tensor).
+        source_id, tensor_id = _split_array_id(array_id)
         return self._fetch_tensor_descriptor(
             source_id,
-            array_id,
+            tensor_id,
             with_metadata=with_metadata,
             with_pyramid=with_pyramid,
             with_read_plan=with_read_plan,
@@ -1229,14 +1238,9 @@ class ChunkFetcher:
             response_desc
         )
 
-        # Parse endpoints into (chunk_id, bounds) pairs. chunk_id is an opaque
-        # server-minted token (echoed back to do_get); a chunk's bounds ride on the
-        # endpoint's app_metadata, so the client never decodes the chunk_id format.
-        endpoints = []
-        for endpoint in info.endpoints:
-            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-            bounds = ChunkBounds.FromString(endpoint.app_metadata)
-            endpoints.append((ticket.chunk_id, bounds))
+        # Parse endpoints into (chunk_id, bounds) pairs.
+        chunk_ids, bounds_list = _parse_flight_endpoints(info)
+        endpoints = list(zip(chunk_ids, bounds_list, strict=True))
 
         return _TensorContext(
             descriptor=response_desc,
@@ -1395,28 +1399,13 @@ class ChunkFetcher:
         shape = tuple(desc.shape)
         dtype = np.dtype(desc.dtype)
 
-        # Create a mapping from chunk index to chunk_id and bounds
-        chunk_map = {}
-        axis_starts = [
-            sorted({int(bounds.start[axis]) for bounds in chunk_bounds})
-            for axis in range(len(shape))
-        ]
-        axis_index_maps = [
-            {start: index for index, start in enumerate(starts)}
-            for starts in axis_starts
-        ]
-        for chunk_id, bounds in zip(chunks, chunk_bounds, strict=True):
-            chunk_idx = tuple(
-                axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
-            )
-            chunk_map[chunk_idx] = (chunk_id, bounds)
-
-        # The actual fetch is done by _fetch_chunk_distributed which uses
-        # module-level pools; _build_dask_array_from_chunk_map emits a single
-        # Blockwise (map_blocks) layer for a regular grid, falling back to
-        # da.block-of-from_delayed for ragged/sparse grids.
-        ndim = len(shape)
-        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
+        # Invert the endpoint list into the block-index -> (chunk_id, bounds) map
+        # + grid shape (shared with tensor_from_pb). The actual fetch is done by
+        # _fetch_chunk_distributed which uses module-level pools;
+        # _build_dask_array_from_chunk_map emits a single Blockwise (map_blocks)
+        # layer for a regular grid, falling back to da.block-of-from_delayed for
+        # ragged/sparse grids.
+        chunk_map, grid_shape = _chunk_map_from_endpoints(chunks, chunk_bounds, shape)
 
         return _build_dask_array_from_chunk_map(
             chunk_map,
