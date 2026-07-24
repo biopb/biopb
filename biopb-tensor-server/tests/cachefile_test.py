@@ -73,6 +73,27 @@ def _read_via_location(loc: ChunkLocation) -> np.ndarray:
         mm.close()
 
 
+def _reset_client_pools(location: str) -> None:
+    """Wipe the process-global client caches/accounting for a clean fetch test."""
+    import biopb.tensor._pool as pool
+
+    pool._CACHE_POOL.clear()
+    pool._VIEW_CACHE.clear()
+    with pool._cachefile_support_lock:
+        pool._cachefile_support.clear()
+    with pool._pinned_lock:
+        pool._pinned_segments.clear()
+    pool._pinned_total = 0
+
+
+def _first_chunk(client, array_id: str):
+    """(chunk_id, start, stop) of a tensor's first chunk, from its endpoint list."""
+    pb = client.get_tensor_pb(array_id)
+    ep = pb.endpoints[0]
+    b = ep.chunk_bounds
+    return ep.ticket.chunk_id, tuple(b.start), tuple(b.stop)
+
+
 @pytest.fixture
 def file_backend():
     d = tempfile.mkdtemp()
@@ -1109,6 +1130,94 @@ class TestCachefileIntegration:
                 got = client.get_tensor("z").compute(scheduler="threads")
                 assert np.array_equal(got, src)  # correct via do_get fallback
                 assert cmod._cachefile_support.get(loc) is False  # declined + memoized
+                client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_view_is_weak_cached_not_copy_cached(self):
+        """A fast-path mmap view lands in the weak view cache (free; dedups a live
+        reference) and never the strong copy cache, and it self-evicts when the
+        last holder is dropped. Runs on every platform -- the fast path is no
+        longer OS-gated (biopb/biopb#582)."""
+        import gc
+
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, _src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            _reset_client_pools(loc)
+            client = TensorFlightClient(loc, cache_bytes=10_000_000)
+            # Warm the server's on-disk cache so chunks are locatable, then let
+            # the transient warm-time views drop.
+            client.get_tensor("z").compute(scheduler="threads")
+            gc.collect()
+            cid, start, stop = _first_chunk(client, "z")
+
+            arr = pool._fetch_chunk_distributed(loc, None, cid, start, stop, 10_000_000)
+            assert pool._cachefile_supported(loc) is True  # fast path was used
+            assert not arr.flags.writeable  # read-only view contract
+            info = client.cache_info()
+            assert info["size_bytes"] == 0  # strong copy cache untouched
+            assert info["view_items"] >= 1  # view cached weakly
+
+            # Re-fetch while we still hold `arr`: a view-cache hit -> same object,
+            # no second chunk_locate.
+            again = pool._fetch_chunk_distributed(
+                loc, None, cid, start, stop, 10_000_000
+            )
+            assert again is arr
+
+            # Drop every holder -> the weak entry (and the segment pin) self-evicts.
+            del arr, again
+            gc.collect()
+            assert client.cache_info()["view_items"] == 0
+            assert pool._pinned_total == 0  # pin released with the last view
+            # A subsequent fetch is a fresh miss served correctly by the fast path.
+            fresh = pool._fetch_chunk_distributed(
+                loc, None, cid, start, stop, 10_000_000
+            )
+            assert fresh is not None and not fresh.flags.writeable
+            del fresh
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_copy_is_strong_cached_not_weak_cached(self):
+        """A do_get copy (fast path disabled) lands in the strong RAM cache, not
+        the weak view cache."""
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, _src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            _reset_client_pools(loc)
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
+                client = TensorFlightClient(loc, cache_bytes=10_000_000)
+                cid, start, stop = _first_chunk(client, "z")
+                arr = pool._fetch_chunk_distributed(
+                    loc, None, cid, start, stop, 10_000_000
+                )
+                info = client.cache_info()
+                assert info["size_bytes"] > 0  # copy cached strongly
+                assert info["view_items"] == 0  # nothing weak-cached
+                # Re-fetch hits the strong cache: same cached object.
+                assert (
+                    pool._fetch_chunk_distributed(
+                        loc, None, cid, start, stop, 10_000_000
+                    )
+                    is arr
+                )
                 client.close()
         finally:
             server.shutdown()

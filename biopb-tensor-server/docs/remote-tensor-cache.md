@@ -19,8 +19,12 @@ happen to be `tensor-server` entries. Two user-facing wins fall out:
    MCP dask workers read the proxy's segments through the existing `chunk_locate`
    mmap fast path — **one** cache per machine in the OS page cache instead of a
    per-worker in-RAM `cachey` slice.
-2. **No client cache for local reads.** Workers point at `grpc://localhost:<proxy>`,
-   so the existing localhost rules zero out the per-worker cache automatically.
+2. **No per-worker RAM copy for local reads.** Workers point at
+   `grpc://localhost:<proxy>`, so each read is an mmap **view** cached *weakly*
+   (shared OS page-cache pages, self-evicting) rather than a strong per-worker
+   `cachey` copy — nothing is duplicated in worker RAM. (The old localhost
+   "no-cache" gate that used to zero the per-worker cache was removed; the weak
+   view cache achieves the same no-duplication outcome without disabling caching.)
 
 ### The load-bearing finding — the segment cache already wraps every adapter
 

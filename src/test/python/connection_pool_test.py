@@ -154,40 +154,42 @@ class TestSharedCache:
 
 
 class TestCachePolicy:
-    """Tests for the localhost-aware cache-size resolver (piece 1)."""
+    """Tests for the strong (copy) cache-size resolver.
+
+    The localhost-off gate was removed: the copy cache now bounds only chunks that
+    cost real RAM (do_get / over-budget copies), and mmap views are cached weakly
+    (free), so localhost caches copies like any other host. The resolver is now
+    just ``requested if requested > 0 else 0`` -- see :class:`TestViewCache` for
+    the weak view cache.
+    """
 
     def test_resolve_zero_or_negative_request_disables(self):
         assert client_module._resolve_cache_bytes("grpc://remote:8815", 0) == 0
         assert client_module._resolve_cache_bytes("grpc://remote:8815", -5) == 0
 
-    def test_resolve_remote_keeps_requested_size(self):
+    def test_resolve_keeps_requested_size_any_host(self):
+        # No host special-casing anymore: remote and localhost both keep the size.
         with patch.object(pool_module, "_is_localhost_location", return_value=False):
             assert (
                 client_module._resolve_cache_bytes("grpc://remote:8815", 1000) == 1000
             )
-
-    def test_resolve_localhost_disables_by_default(self, monkeypatch):
-        monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
-        with patch.object(pool_module, "_is_localhost_location", return_value=True):
-            assert (
-                client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 0
-            )
-
-    def test_resolve_localhost_opt_in_via_env(self, monkeypatch):
-        monkeypatch.setenv("BIOPB_CACHE_LOCAL", "1")
         with patch.object(pool_module, "_is_localhost_location", return_value=True):
             assert (
                 client_module._resolve_cache_bytes("grpc://localhost:8815", 1000)
                 == 1000
             )
 
-    def test_shared_cache_is_none_for_localhost(self, monkeypatch):
-        monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
+    def test_shared_cache_created_for_localhost(self, monkeypatch):
+        # Localhost now gets a real copy cache (was pinned off before the gate
+        # removal). Env opt-in (BIOPB_CACHE_LOCAL) no longer exists.
+        loc = "grpc://localhost-cache-test:8815"
         with patch.object(pool_module, "_is_localhost_location", return_value=True):
-            assert (
-                client_module._get_shared_cache("grpc://localhost:8815", None, 1000)
-                is None
-            )
+            cache = client_module._get_shared_cache(loc, None, 1000)
+            try:
+                assert cache is not None
+                assert cache.available_bytes == 1000
+            finally:
+                client_module._CACHE_POOL.pop((loc, None), None)
 
     def test_shared_cache_created_for_remote(self):
         loc = "grpc://remote-cache-test:9999"
@@ -202,6 +204,74 @@ class TestCachePolicy:
     def test_localhost_detection_loopback_literals(self):
         assert client_module._is_localhost_location("grpc://127.0.0.1:8815") is True
         assert client_module._is_localhost_location("grpc://localhost:8815") is True
+
+
+class TestViewCache:
+    """The weak view cache: caches mmap views without extending their lifetime."""
+
+    LOC = "grpc://view-cache-test:8815"
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        pool_module._VIEW_CACHE.pop((self.LOC, None), None)
+        yield
+        pool_module._VIEW_CACHE.pop((self.LOC, None), None)
+
+    def test_hit_while_a_strong_ref_is_held(self):
+        import numpy as np
+
+        arr = np.arange(8)  # the "real holder"
+        pool_module._view_cache_put(self.LOC, None, "k", arr)
+        got = pool_module._view_cache_get(self.LOC, None, "k")
+        assert got is arr  # same object, not a copy
+
+    def test_miss_after_last_strong_ref_drops(self):
+        import gc
+
+        import numpy as np
+
+        arr = np.arange(8)
+        pool_module._view_cache_put(self.LOC, None, "k", arr)
+        del arr
+        gc.collect()
+        # No strong holder left -> the weak entry self-prunes -> miss.
+        assert pool_module._view_cache_get(self.LOC, None, "k") is None
+
+    def test_holds_no_strong_reference(self):
+        import weakref
+
+        import numpy as np
+
+        arr = np.arange(8)
+        ref = weakref.ref(arr)
+        pool_module._view_cache_put(self.LOC, None, "k", arr)
+        del arr
+        import gc
+
+        gc.collect()
+        # The cache did not keep it alive.
+        assert ref() is None
+
+    def test_clear_drops_entries(self):
+        import numpy as np
+
+        arr = np.arange(8)
+        pool_module._view_cache_put(self.LOC, None, "k", arr)
+        pool_module._clear_view_cache(self.LOC, None)
+        assert pool_module._view_cache_get(self.LOC, None, "k") is None
+
+    def test_fresh_dict_per_pid(self):
+        # A forked worker (different pid) must not reuse the parent's view arrays.
+        import numpy as np
+
+        arr = np.arange(8)
+        pool_module._view_cache_put(self.LOC, None, "k", arr)
+        stored_pid, _ = pool_module._VIEW_CACHE[(self.LOC, None)]
+        # Simulate a different pid recorded for this key -> a fresh dict is made.
+        pool_module._VIEW_CACHE[(self.LOC, None)] = (stored_pid + 1, {})
+        wvd = pool_module._get_view_cache(self.LOC, None)
+        assert len(wvd) == 0
+        assert pool_module._VIEW_CACHE[(self.LOC, None)][0] == os.getpid()
 
 
 class TestConfigureCache:
@@ -227,16 +297,14 @@ class TestConfigureCache:
             client_module.configure_cache(loc, None, 2000)
         assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 2000
 
-    def test_localhost_pins_off(self):
+    def test_localhost_now_pins_a_cache(self):
+        # After the gate removal a localhost connection is no longer pinned off:
+        # configure_cache creates a real copy cache like any other host.
         loc = "grpc://srv:8815"
-        # first create a real cache as if remote, then re-resolve as localhost
-        with patch.object(pool_module, "_is_localhost_location", return_value=False):
-            client_module.configure_cache(loc, None, 1000)
         with patch.object(pool_module, "_is_localhost_location", return_value=True):
             eff = client_module.configure_cache(loc, None, 1000)
-        assert eff == 0
-        # pinned off -> entry present with a None-cache sentinel (not deleted)
-        assert client_module._CACHE_POOL[(loc, None)][1] is None
+        assert eff == 1000
+        assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 1000
 
     def test_zero_pins_off(self):
         loc = "grpc://remote:8815"

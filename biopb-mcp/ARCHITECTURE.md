@@ -420,8 +420,9 @@ default. Sections are **flat / top-level** (each maps 1:1 to a section dataclass
   cluster down after this long with **no kernel attached**, 0 disables). The
   session child owns the cluster (see Lifecycle).
 - **`tensor`** — `health_poll_min/max_interval` (the #44 source watcher's backoff;
-  min ≤ 0 disables). (The localhost client-cache decision lives in the tensor
-  client — `_resolve_cache_bytes`, off by default, `BIOPB_CACHE_LOCAL=1` to opt in.)
+  min ≤ 0 disables). (The tensor client always caches now: mmap views weakly —
+  free, no budget — and do_get/over-budget copies strongly under
+  `_resolve_cache_bytes`; the old localhost `BIOPB_CACHE_LOCAL` gate was removed.)
 - **`viewer`** — `compute_scheduler` (default `threads`; pins the viewer's *serial*
   slice reads to a single-process scheduler so they share one main-process chunk
   cache instead of scattering across per-worker caches — **#8**; `_viewer_compute.
