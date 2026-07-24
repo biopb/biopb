@@ -154,9 +154,10 @@ def _is_localhost_location(location: str) -> bool:
     # IPv6 bracketed or regular hostname
     hostname = match.group(1) or match.group(2)
 
-    # Direct localhost matches
+    # Direct localhost matches (the set is all-lowercase, so lowercasing the
+    # hostname is the only comparison needed).
     localhost_names = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-    if hostname.lower() in localhost_names or hostname in localhost_names:
+    if hostname.lower() in localhost_names:
         return True
 
     # Resolve hostname via getaddrinfo
@@ -722,6 +723,20 @@ def _get_shared_cache(
         return _CACHE_POOL[key]
 
 
+def _build_call_options(token: Optional[str]) -> flight.FlightCallOptions:
+    """Build FlightCallOptions carrying the bearer token (or none for no auth).
+
+    The single place the ``authorization: Bearer <token>`` header is assembled,
+    so the auth scheme lives in exactly one spot rather than being re-derived at
+    every connection site.
+    """
+    if token:
+        return flight.FlightCallOptions(
+            headers=[(b"authorization", f"Bearer {token}".encode())]
+        )
+    return flight.FlightCallOptions()
+
+
 def _get_shared_call_options(
     location: str, token: Optional[str]
 ) -> flight.FlightCallOptions:
@@ -738,12 +753,7 @@ def _get_shared_call_options(
 
     with _POOL_LOCK:
         if key not in _CALL_OPTS_POOL:
-            if token:
-                _CALL_OPTS_POOL[key] = flight.FlightCallOptions(
-                    headers=[(b"authorization", f"Bearer {token}".encode())]
-                )
-            else:
-                _CALL_OPTS_POOL[key] = flight.FlightCallOptions()
+            _CALL_OPTS_POOL[key] = _build_call_options(token)
 
     return _CALL_OPTS_POOL[key]
 
@@ -990,6 +1000,37 @@ def _regular_grid_chunks(
         return None  # sparse grid (Cartesian product not fully populated)
 
     return tuple(axis_chunks)
+
+
+def _chunk_map_from_endpoints(
+    chunks: List[bytes],
+    chunk_bounds: List[Any],
+    shape: Tuple[int, ...],
+) -> Tuple[Dict[Tuple[int, ...], Tuple[bytes, Any]], Tuple[int, ...]]:
+    """Invert a parallel ``(chunk_id, bounds)`` endpoint list into the
+    ``block-index -> (chunk_id, bounds)`` map and grid shape the dask builder wants.
+
+    The block index along each axis is the rank of a chunk's per-axis start among
+    the distinct starts on that axis, so the endpoint order does not matter. Shared
+    by both read entry points (``ChunkFetcher._build_dask_array`` and
+    ``tensor_from_pb``) so the endpoint->grid inversion lives in one place.
+    """
+    ndim = len(shape)
+    axis_index_maps = [
+        {
+            start: index
+            for index, start in enumerate(
+                sorted({int(bounds.start[axis]) for bounds in chunk_bounds})
+            )
+        }
+        for axis in range(ndim)
+    ]
+    chunk_map: Dict[Tuple[int, ...], Tuple[bytes, Any]] = {}
+    for chunk_id, bounds in zip(chunks, chunk_bounds, strict=True):
+        chunk_idx = tuple(axis_index_maps[d][int(bounds.start[d])] for d in range(ndim))
+        chunk_map[chunk_idx] = (chunk_id, bounds)
+    grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
+    return chunk_map, grid_shape
 
 
 def _build_dask_array_from_chunk_map(

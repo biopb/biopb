@@ -35,10 +35,12 @@ from biopb.tensor._pool import (
     _THREAD_LOCAL as _THREAD_LOCAL,
     _VIEW_CACHE as _VIEW_CACHE,
     _array_from_unified_batch as _array_from_unified_batch,
+    _build_call_options as _build_call_options,
     _build_dask_array_from_chunk_map as _build_dask_array_from_chunk_map,
     _cachefile_support as _cachefile_support,
     _cachefile_support_lock as _cachefile_support_lock,
     _cachefile_supported as _cachefile_supported,
+    _chunk_map_from_endpoints as _chunk_map_from_endpoints,
     _cleanup_connection_pool as _cleanup_connection_pool,
     _clear_view_cache as _clear_view_cache,
     _decode_unified_batch as _decode_unified_batch,
@@ -197,13 +199,7 @@ class TensorFlightClient:
         self._token = token
         self._cache_bytes = cache_bytes
         self._client = flight.FlightClient(normalized)
-        self._call_options = (
-            flight.FlightCallOptions(
-                headers=[(b"authorization", f"Bearer {token}".encode())]
-            )
-            if token
-            else flight.FlightCallOptions()
-        )
+        self._call_options = _build_call_options(token)
         # The connection + the two catalog caches live in one shared _ClientState.
         # The collaborators (#278 item C) read/write it; this facade exposes the
         # caches back-compatibly via the _sources/_descriptors properties below.
@@ -434,25 +430,11 @@ class TensorFlightClient:
             logger.debug("tensor_from_pb: endpoints empty, calling GetFlightInfo")
             chunks, chunk_bounds_list = _fetch_endpoints_via_get_flight_info(pb)
 
-        # Build chunk map
-        chunk_map = {}
-        axis_starts = [
-            sorted({int(bounds.start[axis]) for bounds in chunk_bounds_list})
-            for axis in range(len(shape))
-        ]
-        axis_index_maps = [
-            {start: index for index, start in enumerate(starts)}
-            for starts in axis_starts
-        ]
-        for chunk_id, bounds in zip(chunks, chunk_bounds_list, strict=True):
-            chunk_idx = tuple(
-                axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
-            )
-            chunk_map[chunk_idx] = (chunk_id, bounds)
-
-        # Build dask array with lazy chunk fetching
-        ndim = len(shape)
-        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
+        # Build the block-index -> (chunk_id, bounds) map + grid shape for lazy
+        # chunk fetching (shared with ChunkFetcher._build_dask_array).
+        chunk_map, grid_shape = _chunk_map_from_endpoints(
+            chunks, chunk_bounds_list, shape
+        )
 
         # Extract schema_metadata from pb for SHM transfer
         schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
@@ -632,29 +614,32 @@ class TensorFlightClient:
         key = (self._location, self._token)
         wvd = _VIEW_CACHE.get(key)
         view_items = len(wvd) if wvd is not None else 0
+
+        # Describe the strong copy cache only; the weak view cache is reported
+        # separately via view_items.
         if key not in _CACHE_POOL:
             # No copy cache allocated yet. Report the resolved size so a
             # not-yet-created copy cache truthfully shows what it would allow.
-            resolved = _resolve_cache_bytes(self._location, self._cache_bytes)
-            return {
-                "size_bytes": 0,
-                "max_bytes": resolved,
-                "item_count": 0,
-                "view_items": view_items,
-            }
-        cache = _CACHE_POOL[key]  # Cache, or None when pinned off
-        if cache is None:
-            # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
-            return {
-                "size_bytes": 0,
-                "max_bytes": 0,
-                "item_count": 0,
-                "view_items": view_items,
-            }
+            size_bytes, max_bytes, item_count = (
+                0,
+                _resolve_cache_bytes(self._location, self._cache_bytes),
+                0,
+            )
+        else:
+            cache = _CACHE_POOL[key]  # Cache, or None when pinned off
+            if cache is None:
+                # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
+                size_bytes, max_bytes, item_count = 0, 0, 0
+            else:
+                size_bytes, max_bytes, item_count = (
+                    cache.total_bytes,
+                    cache.available_bytes,
+                    len(cache.data),
+                )
         return {
-            "size_bytes": cache.total_bytes,
-            "max_bytes": cache.available_bytes,
-            "item_count": len(cache.data),
+            "size_bytes": size_bytes,
+            "max_bytes": max_bytes,
+            "item_count": item_count,
             "view_items": view_items,
         }
 
