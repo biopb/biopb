@@ -142,20 +142,20 @@ dependencies = [
 where = ["."]
 include = ["biopb_tensor_server*"]
 
-# Version derived from git tags (server-vX.Y.Z tensor-server tag)
+# Version derived from git tags (the product `release-vX.Y.Z` tag)
 [tool.setuptools_scm]
 version_file = "biopb_tensor_server/_version.py"
 root = ".."
-# The tensor server has its OWN version line, keyed to the per-package tag
-# `server-v*` — its Docker image is cut on that tag by tensor-server-ci, on its
-# own cadence, independent of the product `release-v*` bundle and the SDK `v*`
-# line. `.+` so a prerelease (`server-v0.11.0rc1`) is captured, not just X.Y.Z.
+# The tensor server tracks the product `release-v*` line (like biopb-mcp and
+# biopb-control): its wheel is bundled into the GitHub release and its Docker
+# image is cut on the same tag by tensor-server-ci — no separate `server-v*`
+# line. `.+` so a prerelease (`release-v0.11.0rc1`) is captured, not just X.Y.Z.
 # The `--match` below keeps `git describe` from grabbing the nearest tag of
-# another prefix (`release-v*` / the SDK's `v*`) and mis-versioning the wheel.
-tag_regex = "^server-v(?P<version>.+)$"
+# the SDK's `v*` prefix and mis-versioning the wheel.
+tag_regex = "^release-v(?P<version>.+)$"
 
 [tool.setuptools_scm.scm.git]
-describe_command = "git describe --tags --match 'server-v*'"
+describe_command = "git describe --tags --match 'release-v*'"
 
 # Lint/format config lives at the monorepo root [tool.ruff] (issue #82).
 
