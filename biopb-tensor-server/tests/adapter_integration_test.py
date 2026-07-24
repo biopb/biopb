@@ -746,11 +746,13 @@ class TestCacheIntegration:
     """Integration tests for cache behavior across adapters."""
 
     @pytest.fixture(autouse=True)
-    def _enable_local_cache(self, monkeypatch):
-        # The client disables its per-process chunk cache for localhost servers
-        # by default (the server already caches its data). These tests exercise
-        # the client cache directly against a localhost server, so opt back in.
-        monkeypatch.setenv("BIOPB_CACHE_LOCAL", "1")
+    def _force_copy_cache(self, monkeypatch):
+        # These tests assert on the STRONG copy cache (cachey byte growth/reuse).
+        # On localhost a read is normally served as a weak-cached mmap view that
+        # never touches the copy cache, so force the do_get socket path to
+        # exercise the copy cache directly. (The localhost no-cache gate was
+        # removed; the copy cache is always on now.)
+        monkeypatch.setenv("BIOPB_CACHEFILE_TRANSFER_DISABLED", "1")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_cache_hit_multiple_reads(self, simple_zarr_array):

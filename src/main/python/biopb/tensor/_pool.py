@@ -103,30 +103,22 @@ def _set_cachefile_supported(location: str, supported: bool) -> None:
         _cachefile_support[location] = supported
 
 
-def _cache_local_enabled() -> bool:
-    """Whether to keep a client-side chunk cache for a *localhost* server.
-
-    Default ``False``: on localhost the tensor server already caches its data
-    (and the cache-file fast path makes a re-fetch cheap), so a per-process client
-    cache is mostly a redundant second copy -- and under a multi-process dask
-    cluster it is replicated in every worker, multiplying memory use. Set
-    ``BIOPB_CACHE_LOCAL=1`` to opt back in (e.g. a slow loopback proxy).
-    """
-    return os.environ.get("BIOPB_CACHE_LOCAL", "").lower() in ("1", "true", "yes")
-
-
 def _resolve_cache_bytes(location: str, requested: int) -> int:
-    """Effective per-process chunk-cache size for a connection.
+    """Effective size of the per-process *strong* chunk cache for a connection.
 
-    Single point that decides whether (and how big) a client-side cache is.
-    Folds in the localhost rule: a localhost server gets no cache (returns 0)
-    unless explicitly re-enabled; otherwise the requested size is honored.
+    The strong cache (cachey) holds only chunks that cost real client RAM: the
+    ``do_get`` results and the over-pin-budget copies (see
+    ``_fetch_chunk_distributed``). mmap-view chunks never land here -- they go in
+    the weak view cache, which costs no RAM and needs no budget -- so this is
+    purely the *copy* budget: the requested size, or 0 to disable.
+
+    Localhost is no longer special-cased. The old localhost-off rule existed
+    because caching a *copy* on localhost was a redundant second RAM copy of what
+    the server already caches; now that mmap views are cached weakly (free, shared
+    with the OS page cache), that objection is gone, so localhost caches like
+    anywhere else. ``location`` is retained for signature/back-compat only.
     """
-    if requested <= 0:
-        return 0
-    if not _cache_local_enabled() and _is_localhost_location(location):
-        return 0
-    return requested
+    return requested if requested > 0 else 0
 
 
 @cache
@@ -355,21 +347,98 @@ def _release_segment_pin(inode: int) -> None:
             del _pinned_segments[inode]
 
 
+# ------------------------------------------------------------------------------
+# Weak view cache (mmap-view reuse without a lifetime, biopb/biopb#571 follow-up)
+# ------------------------------------------------------------------------------
+#
+# A localhost fast-path chunk is handed out as a zero-copy mmap *view* (Option C):
+# its pixels are file-backed pages shared with the OS page cache, so the array
+# costs the client ~no private RAM -- but holding it strongly would keep the
+# server's segment pinned on disk for the whole cache lifetime (the disk-leak the
+# pinned-segment accounting bounds). We cache these views by **weak** reference
+# instead: a WeakValueDictionary keeps NO strong hold, so it never extends a
+# view's lifetime. The entry stays servable only while some real holder (an
+# in-flight caller, a dask task result, a viewer layer) keeps the array alive, and
+# it -- along with the segment pin behind it -- is released automatically the
+# instant that last holder drops it.
+#
+# The upshot, and why this can be always-on (no localhost gate, no budget):
+#   * zero client RAM: the cache holds nothing alive.
+#   * zero *extra* server-disk pin: never a pin held past natural use.
+#   * eviction is free and automatic: GC is the eviction; dead entries self-prune.
+# What it buys is deduping overlapping-lifetime reads of one chunk (skipping even
+# the chunk_locate round trip). A chunk re-read *after* it was fully dropped simply
+# misses and re-runs the cheap localhost fast path -- the deliberate trade for
+# needing no eviction machinery. Copies (do_get / over-budget) are NOT weak-cached:
+# they have no other holder and are dear to refetch, so they go in the strong,
+# RAM-budgeted cachey cache instead.
+#
+# Keyed like the strong cache by ``chunk_id.hex()`` (which already encodes
+# array_id + bounds + scale + method + content version, so hits can't collide),
+# per ``(location, token)``, and per-pid (a fork gets a fresh dict: the parent's
+# view arrays alias mmap fds the child must not reuse).
+
+_VIEW_CACHE: Dict[
+    Tuple[str, Optional[str]], Tuple[int, "weakref.WeakValueDictionary"]
+] = {}
+_VIEW_CACHE_LOCK = threading.Lock()
+
+
+def _get_view_cache(
+    location: str, token: Optional[str]
+) -> "weakref.WeakValueDictionary":
+    """The per-``(location, token)`` weak view cache for this process."""
+    key = (location, token)
+    pid = os.getpid()
+    with _VIEW_CACHE_LOCK:
+        entry = _VIEW_CACHE.get(key)
+        if entry is None or entry[0] != pid:
+            wvd: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+            _VIEW_CACHE[key] = (pid, wvd)
+            return wvd
+        return entry[1]
+
+
+def _view_cache_get(
+    location: str, token: Optional[str], cache_key: str
+) -> Optional[np.ndarray]:
+    """Return a still-live cached view for ``cache_key``, or None (miss/collected).
+
+    Lock-free get on the WeakValueDictionary (GIL-atomic; a value being collected
+    concurrently just reads as a miss)."""
+    return _get_view_cache(location, token).get(cache_key)
+
+
+def _view_cache_put(
+    location: str, token: Optional[str], cache_key: str, arr: np.ndarray
+) -> None:
+    """Weak-cache a freshly read mmap view. Adds no strong reference to ``arr``."""
+    _get_view_cache(location, token)[cache_key] = arr
+
+
+def _clear_view_cache(location: str, token: Optional[str]) -> None:
+    """Drop the weak view cache for a connection (releases only weak refs)."""
+    _get_view_cache(location, token).clear()
+
+
 def _try_cachefile_transfer(
     client: flight.FlightClient,
     location: str,
     token: Optional[str],
     chunk_id: bytes,
     call_options: flight.FlightCallOptions,
-) -> Optional[np.ndarray]:
+) -> Optional[Tuple[np.ndarray, bool]]:
     """Attempt the cache-file fast path for a chunk.
 
     Asks the server to locate the chunk on disk (chunk_locate), then mmaps the
     segment file and reads the single IPC message. Normally hands out a zero-copy
     view onto the mapping (Option C); once the process is over its pinned-segment
-    budget it copies the chunk out and releases the mapping instead. Returns the
-    array, or None to fall back to do_get (server too old, chunk not
-    cached/locatable, or any read failure).
+    budget it copies the chunk out and releases the mapping instead.
+
+    Returns ``(array, is_view)`` -- ``is_view`` True for a zero-copy mmap view
+    (shared page-cache pages, a pinned segment: weak-cache it), False for an
+    over-budget owned copy (private RAM: strong-cache it) -- or None to fall back
+    to do_get (server too old, chunk not cached/locatable, or any read failure).
     """
     ticket = TensorTicket(chunk_id=chunk_id)
     action = flight.Action("chunk_locate", ticket.SerializeToString())
@@ -440,13 +509,15 @@ def _try_cachefile_transfer(
             # warm page cache (no do_get), just bounding the disk-leak.
             if _pin_budget_exhausted():
                 arr = _array_from_unified_batch(batch, copy=True)
+                is_view = False
             else:
                 arr, data_buf = _decode_unified_batch(batch)
                 _register_segment_pin(generation_id, st.st_size, data_buf)
+                is_view = True
         finally:
             mm.close()
         logger.debug(f"_try_cachefile_transfer: read {arr.nbytes} bytes via mmap")
-        return arr
+        return arr, is_view
     except (OSError, ValueError, KeyError, pa.ArrowInvalid) as e:
         logger.debug(f"cache-file read failed, falling back to do_get: {e}")
         return None
@@ -751,9 +822,17 @@ def _fetch_chunk_distributed(
         numpy array with chunk data
     """
     client, cache, call_options = _get_worker_resources(location, token, cache_bytes)
-
-    # Cache lookup (cache is None when caching is disabled, e.g. localhost)
     cache_key = chunk_id.hex()
+
+    # Weak view-cache hit: a previously-read mmap view still kept alive by some
+    # other holder. Free, and skips even the chunk_locate round trip.
+    view = _view_cache_get(location, token, cache_key)
+    if view is not None:
+        logger.debug(f"fetch_chunk_distributed: view-cache hit for {cache_key[:16]}")
+        return view
+
+    # Strong copy-cache hit (do_get / over-pin-budget copies). ``cache`` is None
+    # only when the copy budget is 0 (cache_bytes <= 0 / pinned off).
     if cache is not None:
         cached = cache.get(cache_key)
         if cached is not None:
@@ -763,10 +842,15 @@ def _fetch_chunk_distributed(
     logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
 
     arr = None
+    is_view = False
 
     # Try the localhost cache-file fast path if all conditions met (issue #9)
     if _should_try_cachefile(location):
-        arr = _try_cachefile_transfer(client, location, token, chunk_id, call_options)
+        result = _try_cachefile_transfer(
+            client, location, token, chunk_id, call_options
+        )
+        if result is not None:
+            arr, is_view = result
 
     # Fallback to do_get if the fast path wasn't attempted or failed
     if arr is None:
@@ -782,11 +866,16 @@ def _fetch_chunk_distributed(
         # (biopb/biopb#571). The mmap fast path above hands out a view too, but
         # for a different reason: there the buffer aliases the segment *mapping*,
         # which Arrow refcounts so it outlives that path's local ``mm.close()``.
-        # Both paths return a read-only array.
+        # Both paths return a read-only array. This one is a private in-memory
+        # buffer, not a shared mmap view, so it is NOT a view for caching purposes.
         arr = _array_from_unified_batch(reader.read_all().to_batches()[0], copy=False)
 
-    # Cache the result (skipped when caching is disabled)
-    if cache is not None:
+    # Route the result to the matching cache: mmap views cost ~no client RAM and
+    # pin server disk, so weak-cache them (free, self-evicting, uncounted); copies
+    # cost real RAM, so strong-cache them under the byte budget (skipped if off).
+    if is_view:
+        _view_cache_put(location, token, cache_key, arr)
+    elif cache is not None:
         cache.put(cache_key, arr, cost=arr.nbytes)
 
     return arr

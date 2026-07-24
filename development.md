@@ -412,8 +412,12 @@ editing the code.
   another segment — still off the warm mmap, no `do_get`. The hot path stays
   cheap: the gate is a lock-free int compare, the segment size reuses the
   `stat` the fast path already does, and only the view branch pays a lock + one
-  finalizer. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
-  segment `unlink` — `biopb/biopb#5` — so Windows clients use `do_get`); the
+  finalizer. Runs on **all platforms, not just POSIX** (`biopb/biopb#582`): the
+  old gate assumed a client mmap blocks the server's segment `unlink`, but the
+  client keeps only a mapped *view* (not an open handle), so Windows removes the
+  name at once and the view keeps the pages valid until munmap — delete-on-last-
+  close, exactly as on POSIX (the `biopb/biopb#5` concern was about an open
+  *handle*). The
   client honors `BIOPB_CACHEFILE_TRANSFER_DISABLED=1` to force the socket, and
   falls back to `do_get` whenever a chunk can't be located (memory backend, old
   server, evicted segment). Replaces the old `/dev/shm` `shm_transfer` path,
@@ -443,21 +447,27 @@ editing the code.
   read grid from the 64 MB transfer cap (client-selectable granularity) is the
   structural fix — `biopb/biopb#8`.
 
-- **The localhost client chunk cache is off by default, and locality-sensitive
-  under distributed dask.** On localhost the per-process client cache
-  (`biopb.tensor.client`, gated by `_resolve_cache_bytes` / `BIOPB_CACHE_LOCAL`)
-  is disabled: the server already caches, and under `biopb-mcp`'s default
-  *multi-process distributed* dask a per-process cache is replicated per worker.
-  `biopb-mcp` bounds it with a cluster-wide `dask_cache_budget` (split
-  `budget // n_workers` by a worker-init plugin; localhost still resolves to 0
-  unless `BIOPB_CACHE_LOCAL=1` is set). **Caveat measured:**
-  even with the cache on, the viewer's *serial* plane reads scatter across workers
-  — dask's locality scheduler keys on tracked task *dependencies*, not the opaque
-  per-worker cache side-effect, so repeated reads of the same chunk round-robin
-  onto different workers (≈25% hit, N× redundant copies). The clean viewer fix is
-  to compute its slices on a single-process scheduler (one shared cache) —
-  `biopb/biopb-mcp#8`; the per-worker cache helps mainly when paired with that or
-  with deterministic chunk→home-worker sharding.
+- **The client chunk cache is two-tier, split by what a chunk actually costs.**
+  The read path (`biopb.tensor._pool`, `_fetch_chunk_distributed`) routes each
+  fetched chunk to one of two per-process caches: an mmap **view** from the
+  localhost fast path (shared OS page-cache pages, ~0 private RAM, but it pins a
+  server segment on disk) goes in a **weak** `WeakValueDictionary` — free,
+  uncounted, and self-evicting (GC releases the entry and the pin the instant the
+  last real holder drops the array); a **copy** (`do_get` result or an
+  over-pin-budget copy — real private RAM) goes in the **strong** `cachey` cache,
+  bounded by `_resolve_cache_bytes` (the requested size, `0` to disable). This is
+  why there is no longer a localhost "off by default" gate (`BIOPB_CACHE_LOCAL`
+  was removed): the old objection — a redundant second RAM copy replicated per
+  dask worker — never applied to weak views (shared page cache, nothing
+  replicated), and copies (rare on localhost) are what the budget bounds.
+  `biopb-mcp` sizes the copy budget cluster-wide via `dask_cache_budget` (split
+  `budget // n_workers` by a worker-init plugin). The weak cache dedups
+  *overlapping-lifetime* reads of one chunk; a chunk re-read after it was fully
+  dropped simply misses and re-runs the cheap (~1 ms) localhost fast path. **Caveat
+  measured (viewer):** the viewer's *serial* plane reads scatter across workers —
+  dask's locality scheduler keys on tracked task *dependencies*, not an opaque
+  per-worker cache side-effect — so the clean viewer fix is a single-process
+  scheduler (one shared cache) — `biopb/biopb-mcp#8`.
 
 - **The standard Flight verbs are extended with custom `do_action` types** on
   the tensor server: `health`, `create_source`, `upload_status`, `chunk_locate`

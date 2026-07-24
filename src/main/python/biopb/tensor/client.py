@@ -33,13 +33,14 @@ from biopb.tensor._pool import (
     _POOL_LOCK as _POOL_LOCK,
     _REGISTRY_LOCK as _REGISTRY_LOCK,
     _THREAD_LOCAL as _THREAD_LOCAL,
+    _VIEW_CACHE as _VIEW_CACHE,
     _array_from_unified_batch as _array_from_unified_batch,
     _build_dask_array_from_chunk_map as _build_dask_array_from_chunk_map,
-    _cache_local_enabled as _cache_local_enabled,
     _cachefile_support as _cachefile_support,
     _cachefile_support_lock as _cachefile_support_lock,
     _cachefile_supported as _cachefile_supported,
     _cleanup_connection_pool as _cleanup_connection_pool,
+    _clear_view_cache as _clear_view_cache,
     _decode_unified_batch as _decode_unified_batch,
     _evict_dead_threads as _evict_dead_threads,
     _fetch_chunk_block as _fetch_chunk_block,
@@ -59,6 +60,8 @@ from biopb.tensor._pool import (
     _set_cachefile_supported as _set_cachefile_supported,
     _should_try_cachefile as _should_try_cachefile,
     _try_cachefile_transfer as _try_cachefile_transfer,
+    _view_cache_get as _view_cache_get,
+    _view_cache_put as _view_cache_put,
     configure_cache as configure_cache,
 )
 from biopb.tensor._session import (
@@ -614,35 +617,55 @@ class TensorFlightClient:
         )
 
     def cache_info(self) -> Dict:
-        """Return cache statistics from the pooled cache for this connection.
+        """Return cache statistics for this connection.
+
+        The ``size_bytes``/``max_bytes``/``item_count`` fields describe the
+        **strong** copy cache (cachey) -- ``do_get`` results and over-budget
+        copies, the only chunks that cost client RAM. mmap views live in the weak
+        view cache, which costs no RAM and has no byte budget; ``view_items``
+        reports how many are currently live (a lower bound -- entries self-prune
+        as their arrays are collected).
 
         Returns:
-            Dictionary with cache size and item count
+            Dictionary with copy-cache size/item_count plus ``view_items``.
         """
         key = (self._location, self._token)
+        view_items = len(_VIEW_CACHE.get(key, (0, {}))[1])
         pool_entry = _CACHE_POOL.get(key)
         if pool_entry is None:
-            # No cache allocated -- either nothing fetched yet, or caching is
-            # disabled for this connection (e.g. localhost). Report the resolved
-            # size so a disabled cache truthfully shows max_bytes == 0.
+            # No copy cache allocated yet, or copy caching is off. Report the
+            # resolved size so a disabled copy cache truthfully shows max_bytes 0.
             resolved = _resolve_cache_bytes(self._location, self._cache_bytes)
-            return {"size_bytes": 0, "max_bytes": resolved, "item_count": 0}
+            return {
+                "size_bytes": 0,
+                "max_bytes": resolved,
+                "item_count": 0,
+                "view_items": view_items,
+            }
         cache = pool_entry[1]  # Extract cache from (pid, cache) tuple
         if cache is None:
             # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
-            return {"size_bytes": 0, "max_bytes": 0, "item_count": 0}
+            return {
+                "size_bytes": 0,
+                "max_bytes": 0,
+                "item_count": 0,
+                "view_items": view_items,
+            }
         return {
             "size_bytes": cache.total_bytes,
             "max_bytes": cache.available_bytes,
             "item_count": len(cache.data),
+            "view_items": view_items,
         }
 
     def cache_clear(self):
-        """Clear the pooled cache for this connection namespace."""
+        """Clear both the strong copy cache and the weak view cache for this
+        connection namespace (the latter drops only weak references)."""
         key = (self._location, self._token)
         pool_entry = _CACHE_POOL.get(key)
         if pool_entry is not None and pool_entry[1] is not None:
             pool_entry[1].clear()
+        _clear_view_cache(self._location, self._token)
 
     def __enter__(self):
         return self
