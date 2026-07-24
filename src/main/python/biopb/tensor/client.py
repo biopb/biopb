@@ -19,51 +19,23 @@ import pyarrow.flight as flight
 
 # The pickle-safe connection/cache pool + cache-file fast path + chunk-fetch /
 # dask-array builder subsystem lives in biopb.tensor._pool (issue #278 item C).
-# Re-exported here (redundant `as` aliases mark intentional re-exports) so
-# ``biopb.tensor.client.<name>`` stays a stable import surface for existing
-# callers: biopb-mcp's ``configure_cache`` dask worker plugin, the cachefile /
-# connection-pool tests, and the benchmarks. A few (``_build_dask_array_from_
-# chunk_map``, ``_CACHE_POOL``, ``_resolve_cache_bytes``) are also used directly
-# by TensorFlightClient below.
+# Import only what TensorFlightClient uses directly below, plus ``configure_cache``
+# -- re-exported (redundant `as` alias) for biopb-mcp's dask worker-init plugin,
+# which pins each worker's cache budget via ``biopb.tensor.client.configure_cache``.
+# The rest of _pool's internals are deliberately NOT re-exported here: their tests
+# and benchmarks import them from ``biopb.tensor._pool`` directly. A client
+# re-export would be a footgun -- ``_reset_pools_after_fork`` rebinds the module's
+# locks (``_POOL_LOCK`` etc.), so a name bound here at import time goes stale after
+# a fork, and patching a re-export never lands on the binding _pool actually
+# resolves.
 from biopb.tensor._pool import (
-    _CACHE_POOL as _CACHE_POOL,
-    _CACHEFILE_SUPPORTED_FORMAT as _CACHEFILE_SUPPORTED_FORMAT,
-    _CALL_OPTS_POOL as _CALL_OPTS_POOL,
-    _CONNECTION_REGISTRY as _CONNECTION_REGISTRY,
-    _POOL_LOCK as _POOL_LOCK,
-    _REGISTRY_LOCK as _REGISTRY_LOCK,
-    _THREAD_LOCAL as _THREAD_LOCAL,
-    _VIEW_CACHE as _VIEW_CACHE,
-    _array_from_unified_batch as _array_from_unified_batch,
-    _build_call_options as _build_call_options,
-    _build_dask_array_from_chunk_map as _build_dask_array_from_chunk_map,
-    _cachefile_support as _cachefile_support,
-    _cachefile_support_lock as _cachefile_support_lock,
-    _cachefile_supported as _cachefile_supported,
-    _chunk_map_from_endpoints as _chunk_map_from_endpoints,
-    _cleanup_connection_pool as _cleanup_connection_pool,
-    _clear_view_cache as _clear_view_cache,
-    _decode_unified_batch as _decode_unified_batch,
-    _evict_dead_threads as _evict_dead_threads,
-    _fetch_chunk_block as _fetch_chunk_block,
-    _fetch_chunk_distributed as _fetch_chunk_distributed,
-    _get_shared_cache as _get_shared_cache,
-    _get_shared_call_options as _get_shared_call_options,
-    _get_thread_client as _get_thread_client,
-    _get_worker_resources as _get_worker_resources,
-    _is_cachefile_disabled_by_env as _is_cachefile_disabled_by_env,
-    _is_localhost_location as _is_localhost_location,
-    _pin_budget_exhausted as _pin_budget_exhausted,
-    _pin_limit_bytes as _pin_limit_bytes,
-    _register_segment_pin as _register_segment_pin,
-    _regular_grid_chunks as _regular_grid_chunks,
-    _release_segment_pin as _release_segment_pin,
-    _resolve_cache_bytes as _resolve_cache_bytes,
-    _set_cachefile_supported as _set_cachefile_supported,
-    _should_try_cachefile as _should_try_cachefile,
-    _try_cachefile_transfer as _try_cachefile_transfer,
-    _view_cache_get as _view_cache_get,
-    _view_cache_put as _view_cache_put,
+    _CACHE_POOL,
+    _VIEW_CACHE,
+    _build_call_options,
+    _build_dask_array_from_chunk_map,
+    _chunk_map_from_endpoints,
+    _clear_view_cache,
+    _resolve_cache_bytes,
     configure_cache as configure_cache,
 )
 from biopb.tensor._session import (

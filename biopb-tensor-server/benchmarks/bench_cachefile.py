@@ -65,14 +65,17 @@ def _start_server(zpath):
 
 
 def _fresh_client(location):
-    # Re-import per run so the per-location capability cache starts empty and the
-    # env-var gate is re-read; client cache off to force a transport every fetch.
+    # Reload _pool per run so the per-location capability cache (_cachefile_support,
+    # which lives there, not on client) starts empty and the env-var gate is
+    # re-read; client cache off to force a transport every fetch.
     import importlib
 
+    import biopb.tensor._pool as pool
     import biopb.tensor.client as c
 
+    importlib.reload(pool)
     importlib.reload(c)
-    return c, c.TensorFlightClient(location, cache_bytes=0)
+    return pool, c.TensorFlightClient(location, cache_bytes=0)
 
 
 def _bench(location, disable_cachefile, shape, trials=4):
@@ -81,7 +84,7 @@ def _bench(location, disable_cachefile, shape, trials=4):
     else:
         os.environ.pop("BIOPB_CACHEFILE_TRANSFER_DISABLED", None)
 
-    cmod, client = _fresh_client(location)
+    pool, client = _fresh_client(location)
     darr = client.get_tensor("gt")
     Z = shape[0]
     chunk_starts = list(range(0, Z, CHUNK_Z))
@@ -107,7 +110,7 @@ def _bench(location, disable_cachefile, shape, trials=4):
             darr[z : z + 1].compute(scheduler="threads")
         scans.append(time.perf_counter() - t0)
 
-    used = (not disable_cachefile) and (cmod._cachefile_support.get(location) is True)
+    used = (not disable_cachefile) and (pool._cachefile_support.get(location) is True)
     client.close()
     pc = np.array(per_chunk)
     return {
