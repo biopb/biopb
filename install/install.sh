@@ -1634,11 +1634,16 @@ _unregister_agents() {
         macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
         Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
     esac
+    # opencode reads either opencode.json or opencode.jsonc; target the file the
+    # user actually keeps (prefer .jsonc) so teardown matches registration (#536).
+    local oc_cfg="$HOME/.config/opencode/opencode.json"
+    [ -f "$HOME/.config/opencode/opencode.jsonc" ] && oc_cfg="$HOME/.config/opencode/opencode.jsonc"
+
     local row label file parent
     for row in \
         "Claude Desktop|$cd_cfg|mcpServers" \
         "Cursor|$HOME/.cursor/mcp.json|mcpServers" \
-        "opencode|$HOME/.config/opencode/opencode.json|mcp"; do
+        "opencode|$oc_cfg|mcp"; do
         IFS='|' read -r label file parent <<< "$row"
         [ -n "$file" ] || continue
         if [ "$(_mcp_unmerge "$file" "$parent")" = "removed" ]; then
@@ -1646,6 +1651,14 @@ _unregister_agents() {
             removed_any=1
         fi
     done
+
+    # A commented opencode.jsonc can't be edited by _mcp_unmerge's strict-JSON
+    # rewriter (json.load fails, it no-ops), so a biopb entry there survives the
+    # loop above. Point the user at it by hand rather than leave it stale (#536).
+    if [ -f "$HOME/.config/opencode/opencode.jsonc" ] \
+        && grep -q '"biopb"' "$HOME/.config/opencode/opencode.jsonc" 2>/dev/null; then
+        _info "opencode: remove the 'biopb' entry from $HOME/.config/opencode/opencode.jsonc by hand"
+    fi
 
     # Hermes' YAML is edited by hand on install, so we can't safely edit it back.
     if [ -f "$HOME/.hermes/config.yaml" ] \
