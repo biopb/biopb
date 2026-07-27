@@ -22,6 +22,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from dask.utils import parse_bytes
 
 from biopb_image_base.common import _MAX_MSG_SIZE, TokenValidationInterceptor
 from biopb_image_base.debug import get_system_info
@@ -567,14 +568,12 @@ def run_server(
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        # Parse size string
-        size_str = cache_size.upper()
-        if size_str.endswith("GB"):
-            cache_bytes = int(size_str[:-2]) * 1024 * 1024 * 1024
-        elif size_str.endswith("MB"):
-            cache_bytes = int(size_str[:-2]) * 1024 * 1024
-        else:
-            cache_bytes = int(cache_size)
+        # Parse the size string with common units, or a bare byte count. Uses
+        # dask.utils.parse_bytes for one uniform size grammar across the project
+        # (also accepts GiB/MiB/KB/TB and spaces). NOTE: parse_bytes reads "GB"
+        # as decimal 1e9 -- use "GiB" for the binary 2**30 the old ad-hoc parser
+        # assumed.
+        cache_bytes = parse_bytes(cache_size)
 
         logger.info(
             f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})"

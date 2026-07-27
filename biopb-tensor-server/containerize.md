@@ -42,7 +42,7 @@ docker run -d --rm \
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written. **Not to be confused with**  `$TMPDIR` |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB |
-| `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB |
+| `CACHE_MAX_SEGMENT_MB` | (unset) | Max size of each cache segment file, in MB. Unset → server default (~64 MB) |
 
 ### Cache Storage
 
@@ -127,7 +127,7 @@ singularity run \
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Singularity auto-binds host `/tmp`, so the cache lands at `/tmp/biopb-cache-<uid>` on host disk (persistent). Set it to relocate — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
-| `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB (same applicability as above) |
+| `CACHE_MAX_SEGMENT_MB` | (unset) | Max size of each cache segment file, in MB. Unset → server default (~64 MB) (same applicability as above) |
 
 ### More examples
 

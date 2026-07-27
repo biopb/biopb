@@ -233,6 +233,54 @@ class TestCachePolicy:
         assert pool_module._is_localhost_location("grpc://localhost:8815") is True
 
 
+class TestDefaultCacheBytes:
+    """BIOPB_TENSOR_CACHE_LIMIT sets the client's default cache budget; a
+    constructor ``cache_bytes`` overrides it."""
+
+    def test_unset_uses_builtin_default(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_TENSOR_CACHE_LIMIT", raising=False)
+        assert pool_module._default_cache_bytes() == pool_module._CACHE_LIMIT_DEFAULT
+
+    def test_env_parses_units(self):
+        with patch.dict(os.environ, {"BIOPB_TENSOR_CACHE_LIMIT": "2GiB"}):
+            assert pool_module._default_cache_bytes() == 2 * 1024**3
+        with patch.dict(os.environ, {"BIOPB_TENSOR_CACHE_LIMIT": "512 MB"}):
+            assert pool_module._default_cache_bytes() == 512 * 1000**2
+        with patch.dict(os.environ, {"BIOPB_TENSOR_CACHE_LIMIT": "0"}):
+            assert pool_module._default_cache_bytes() == 0  # 0 disables the cache
+
+    def test_env_bad_or_empty_falls_back(self):
+        for bad in ("garbage", ""):
+            with patch.dict(os.environ, {"BIOPB_TENSOR_CACHE_LIMIT": bad}):
+                assert (
+                    pool_module._default_cache_bytes()
+                    == pool_module._CACHE_LIMIT_DEFAULT
+                )
+
+    def test_constructor_none_resolves_env(self):
+        from biopb.tensor.client import TensorFlightClient
+
+        with patch.dict(os.environ, {"BIOPB_TENSOR_CACHE_LIMIT": "256MB"}):
+            client = TensorFlightClient("grpc://localhost:19999")
+            assert client._cache_bytes == 256 * 1000**2
+
+    def test_constructor_arg_overrides_env(self):
+        from biopb.tensor.client import TensorFlightClient
+
+        with patch.dict(os.environ, {"BIOPB_TENSOR_CACHE_LIMIT": "256MB"}):
+            # An explicit value wins over the env, including 0 (disable).
+            assert (
+                TensorFlightClient(
+                    "grpc://localhost:19999", cache_bytes=777
+                )._cache_bytes
+                == 777
+            )
+            assert (
+                TensorFlightClient("grpc://localhost:19999", cache_bytes=0)._cache_bytes
+                == 0
+            )
+
+
 class TestViewCache:
     """The weak view cache: caches mmap views without extending their lifetime."""
 

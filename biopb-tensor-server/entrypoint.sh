@@ -24,7 +24,7 @@ set -e
 #                  set this to allow a browser SPA served from a different
 #                  origin (e.g. "http://localhost:5173 http://my.host:8813").
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
-# CACHE_MAX_SEGMENT_MB - Max segment size for file cache (default: 256)
+# CACHE_MAX_SEGMENT_MB - Max segment size for file cache (unset: server default, ~64 MB)
 # CACHE_MAX_TOTAL_GB   - Max total size for file cache (default: 16)
 
 # Single base port env var - all ports derived from it
@@ -68,6 +68,12 @@ else
     echo "Generating runtime config from environment variables"
     DATA_DIR="${DATA_DIR:-/data}"
     MONITOR="${MONITOR:-true}"
+    # Segment cap: omit the key unless explicitly set, so the server's built-in
+    # default (64 MB) applies. Set CACHE_MAX_SEGMENT_MB only to override it.
+    SEGMENT_CFG=""
+    if [ -n "$CACHE_MAX_SEGMENT_MB" ]; then
+        SEGMENT_CFG="    \"file_max_segment_mb\": ${CACHE_MAX_SEGMENT_MB},"
+    fi
     cat > "$BIOPB_TMP/runtime-config.json" << EOF
 {
   "server": {
@@ -77,7 +83,7 @@ else
   },
   "cache": {
     "backend": "file",
-    "file_max_segment_mb": ${CACHE_MAX_SEGMENT_MB:-256},
+${SEGMENT_CFG}
     "file_max_total_gb": ${CACHE_MAX_TOTAL_GB:-16}
   },
   "sources": [

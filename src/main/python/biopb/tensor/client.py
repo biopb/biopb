@@ -35,6 +35,7 @@ from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
     _clear_view_cache,
+    _default_cache_bytes,
     _resolve_cache_bytes,
     configure_cache as configure_cache,
 )
@@ -151,16 +152,21 @@ class TensorFlightClient:
     def __init__(
         self,
         location: str = "grpc://localhost:8815",
-        cache_bytes: int = 1_000_000_000,  # 1GB default
+        cache_bytes: Optional[int] = None,
         token: Optional[str] = None,
     ):
         """Initialize the Flight client.
 
         Args:
             location: Flight server location
-            cache_bytes: Maximum bytes for chunk cache (default 1GB)
+            cache_bytes: Maximum bytes for the chunk cache. ``None`` (the default)
+                resolves ``BIOPB_TENSOR_CACHE_LIMIT`` (a size string like ``"2GiB"``,
+                or a bare byte count) and falls back to 1 GB; a value passed here
+                overrides the env. ``0`` disables the cache.
             token: Bearer token for server authentication.  ``None`` disables auth.
         """
+        if cache_bytes is None:
+            cache_bytes = _default_cache_bytes()
         logger.info(
             f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}"
         )
@@ -356,7 +362,7 @@ class TensorFlightClient:
     @staticmethod
     def tensor_from_pb(
         pb: SerializedTensor,
-        cache_bytes: int = 1_000_000_000,
+        cache_bytes: Optional[int] = None,
     ) -> da.Array:
         """Reconstruct a lazy dask array from SerializedTensor protobuf.
 
@@ -371,14 +377,18 @@ class TensorFlightClient:
 
         Args:
             pb: SerializedTensor protobuf object
-            cache_bytes: Maximum bytes for chunk cache (default 1GB).
-                Only effective for the first tensor created in a process
-                for a given (location, auth_token) pair.
+            cache_bytes: Maximum bytes for the chunk cache. ``None`` (the default)
+                resolves ``BIOPB_TENSOR_CACHE_LIMIT`` (or 1 GB); a value passed
+                here overrides the env. Only effective for the first tensor
+                created in a process for a given (location, auth_token) pair.
 
         Returns:
             dask.array with lazy chunk loading
         """
         import pickle
+
+        if cache_bytes is None:
+            cache_bytes = _default_cache_bytes()
 
         # Debug path: unpickle directly if debug_pickled_array is present
         if pb.debug_pickled_array:

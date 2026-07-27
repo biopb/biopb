@@ -260,9 +260,8 @@ function Write-ServerConfig {
                 aggressive_dir_pruning = $true
             }
             cache = [pscustomobject]@{
-                backend             = "file"
-                file_max_segment_mb = 256
-                file_max_total_gb   = 32
+                backend           = "file"
+                file_max_total_gb = 32
             }
         }
     }
