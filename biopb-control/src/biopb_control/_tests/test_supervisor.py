@@ -413,3 +413,115 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
     finally:
         server.shutdown()
         sup.stop()  # reap the binder child
+
+
+# --------------------------------------------------------------------------- #
+# advertised flight endpoint (biopb/biopb#604)
+# --------------------------------------------------------------------------- #
+# The control advertises where clients should dial the plane, and biopb-mcp takes
+# that URL verbatim. The scheme depends on `server.tls` in a config file the admin
+# UI can edit and restart the plane into *without* restarting the control, so a
+# spec-derived guess goes stale and every local client then dials plaintext at a
+# TLS port. The plane's own sidecar is asked instead.
+
+
+def test_advertised_endpoint_comes_from_the_running_plane(spec, monkeypatch):
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
+    monkeypatch.setattr(sup, "_probe_flight_endpoint", lambda: "grpcs://127.0.0.1:9999")
+    try:
+        sup.ensure()
+        assert sup.wait_until_up(10.0) is True
+        # Not grpc://<spec host:port> -- the plane's own account wins.
+        assert sup.snapshot()["grpc_url"] == "grpcs://127.0.0.1:9999"
+    finally:
+        sup.stop()
+
+
+def test_advertised_endpoint_falls_back_when_the_plane_is_silent(spec, monkeypatch):
+    """An unreachable sidecar must not break the status payload."""
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
+    monkeypatch.setattr(sup, "_probe_flight_endpoint", lambda: None)
+    try:
+        sup.ensure()
+        assert sup.wait_until_up(10.0) is True
+        assert sup.snapshot()["grpc_url"] == f"grpc://{spec.grpc_host}:{spec.grpc_port}"
+    finally:
+        sup.stop()
+
+
+def test_a_silent_plane_is_retried_not_cached(spec, monkeypatch):
+    """A freshly spawned plane has not opened its sidecar yet.
+
+    Caching that miss for the child's whole life would pin the fallback scheme
+    past the point the real one becomes knowable -- the exact staleness this
+    lookup exists to avoid.
+    """
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
+    answers = [None, None, "grpcs://127.0.0.1:8815"]
+    monkeypatch.setattr(sup, "_probe_flight_endpoint", lambda: answers.pop(0))
+    try:
+        sup.ensure()
+        assert sup.wait_until_up(10.0) is True
+        assert sup.snapshot()["grpc_url"].startswith("grpc://")  # still booting
+        assert sup.snapshot()["grpc_url"].startswith("grpc://")
+        assert sup.snapshot()["grpc_url"] == "grpcs://127.0.0.1:8815"  # sidecar up
+    finally:
+        sup.stop()
+
+
+def test_a_successful_read_is_cached_per_child(spec, monkeypatch):
+    """The value can only change across a respawn, and snapshot() is polled."""
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
+    calls = []
+
+    def _probe():
+        calls.append(1)
+        return "grpcs://127.0.0.1:8815"
+
+    monkeypatch.setattr(sup, "_probe_flight_endpoint", _probe)
+    try:
+        sup.ensure()
+        assert sup.wait_until_up(10.0) is True
+        for _ in range(4):
+            assert sup.snapshot()["grpc_url"] == "grpcs://127.0.0.1:8815"
+        assert len(calls) == 1
+    finally:
+        sup.stop()
+
+
+def test_probe_reads_flight_location_off_the_sidecar(spec, monkeypatch):
+    """The probe itself: an HTTP GET of /api/admin/status, stdlib only."""
+    import json
+    from unittest.mock import patch
+
+    sup = DataPlaneSupervisor(spec)
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"flight_location": "grpcs://127.0.0.1:8815"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("urllib.request.urlopen", return_value=_Resp()):
+        assert sup._probe_flight_endpoint() == "grpcs://127.0.0.1:8815"
+
+    # A payload without the field (an older plane) is "unknown", not a crash.
+    class _Old(_Resp):
+        def read(self):
+            return json.dumps({"running": True}).encode()
+
+    with patch("urllib.request.urlopen", return_value=_Old()):
+        assert sup._probe_flight_endpoint() is None
+
+
+def test_probe_survives_an_unreachable_sidecar(spec):
+    """spec.web_port is a closed port -- connection refused, not an exception."""
+    assert DataPlaneSupervisor(spec)._probe_flight_endpoint() is None

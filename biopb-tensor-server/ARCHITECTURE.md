@@ -410,10 +410,29 @@ The auto-generated cert always carries `localhost`/`127.0.0.1`/`::1` SANs
 (`core.tls._host_identity`), so the loopback dial passes gRPC's name check; a BYO
 cert minted only for a public name does not, and must be re-minted to include one.
 
+**The plane reports its own endpoint.** `/api/admin/status` carries
+`flight_location` — the URL the sidecar is actually dialing, scheme and all — and
+the control's `DataPlaneSupervisor` advertises *that* as `grpc_url` rather than
+rebuilding `grpc://{host}:{port}` from its spec. It has to: the scheme comes from
+`server.tls` in a config file the admin UI can edit and restart the plane into
+**without** restarting the control, so a scheme resolved once at control startup
+would be wrong from then on, and every local client that trusts the advertised URL
+(`biopb-mcp` takes it verbatim) would dial plaintext at a TLS port. The read is
+one stdlib `urllib` GET per child, cached — but only on success, since a
+just-spawned plane has not opened its sidecar yet and caching that miss would pin
+the fallback scheme for the child's whole life. An unreachable sidecar falls back
+to the spec-derived URL rather than breaking the status payload.
+
+Local clients of a TLS plane trust it the same way the sidecar does — the cert
+off local disk, not a TOFU pin (`biopb_mcp._connection._local_ca`), failing loudly
+if it is unreadable rather than degrading to pinning.
+
 **Still open (case 1 / control).** The admin UI has no TLS toggle, and a missing
 `[tls]` extra surfaces as a buried `tensor-server.log` crash rather than an
 actionable message in the browser. That needs a `find_spec("cryptography")`
-preflight ahead of the restart (biopb/biopb#604).
+preflight ahead of the restart (biopb/biopb#604). Token rotation is deliberately
+out of scope: the token is resolved once at `biopb control start`, so rotating it
+is a control-level operation, not something the plane's admin UI can offer.
 
 Startup sequence (`launch`):
 

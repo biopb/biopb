@@ -110,7 +110,7 @@ class TestAutoConnectResolution:
         monkeypatch.setattr(
             _connection,
             "TensorFlightClient",
-            lambda url, token=None: seen.append(url) or _fake_client({}),
+            lambda url, token=None, **_: seen.append(url) or _fake_client({}),
         )
         conn.auto_connect()
         assert conn.is_connected
@@ -126,7 +126,7 @@ class TestAutoConnectResolution:
         monkeypatch.setattr(
             _connection,
             "TensorFlightClient",
-            lambda url, token=None: seen.append(url) or _fake_client({}),
+            lambda url, token=None, **_: seen.append(url) or _fake_client({}),
         )
         conn.auto_connect()
         assert conn.is_connected
@@ -303,7 +303,7 @@ class TestConnect:
         sources = {"a": MagicMock(), "b": MagicMock()}
         client = _fake_client(sources)
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         persisted = {}
         monkeypatch.setattr(
@@ -327,7 +327,7 @@ class TestConnect:
     def test_on_connect_hook_fires_with_final_url_token(self, monkeypatch):
         client = _fake_client({"a": MagicMock()})
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -343,11 +343,11 @@ class TestConnect:
         sources = {"a": MagicMock()}
         client = _fake_client(sources)
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        def boom(url, token):
+        def boom(url, token, **_):
             raise RuntimeError("hook boom")
 
         conn = TensorConnection(config={})
@@ -361,7 +361,7 @@ class TestConnect:
         big = {str(i): MagicMock() for i in range(SERVER_QUERY_THRESHOLD + 1)}
         client = _fake_client(big)
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -370,7 +370,7 @@ class TestConnect:
         assert conn.use_server_query is True
 
     def test_failure_resets_and_raises(self, monkeypatch):
-        def boom(url, token=None):
+        def boom(url, token=None, **_):
             raise RuntimeError("nope")
 
         monkeypatch.setattr(_connection, "TensorFlightClient", boom)
@@ -396,7 +396,7 @@ class TestConnect:
     def test_refresh_relists(self, monkeypatch):
         client = _fake_client({"a": MagicMock()})
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -410,7 +410,7 @@ class TestConnect:
     def test_mark_disconnected_resets_state(self, monkeypatch):
         client = _fake_client({"a": MagicMock()})
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -439,7 +439,7 @@ class TestConnect:
         client = _fake_client({"cloud_x": MagicMock()})
         client.resolve.return_value = resolved
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -471,7 +471,7 @@ class TestConnect:
         client = _fake_client({"cloud_x": MagicMock()})
         client.warm.return_value = terminal
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -497,7 +497,7 @@ class TestConnect:
         client = _fake_client({})
         client.add_source.return_value = result
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -528,7 +528,7 @@ class TestConnect:
         client = _fake_client({"x": MagicMock()})
         client.remove_source.return_value = result
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -576,7 +576,7 @@ class TestConnectReadiness:
             "source_count": 3,
         }
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -597,7 +597,7 @@ class TestConnectReadiness:
         client = _fake_client(sources)
         client.health_check.side_effect = RuntimeError("no health action")
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -612,7 +612,7 @@ class TestConnectReadiness:
         client = _fake_client({})
         client.list_sources.side_effect = RuntimeError("unavailable")
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
 
         conn = TensorConnection(config={})
@@ -645,7 +645,7 @@ class TestScanFreshness:
         client = _fake_client({})
         client.health_check.return_value = health
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
         monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
         conn = TensorConnection(config={})
@@ -784,7 +784,7 @@ def _connected_conn(monkeypatch, sources, health_results):
     """
     client = _fake_client(sources)
     monkeypatch.setattr(
-        _connection, "TensorFlightClient", lambda url, token=None: client
+        _connection, "TensorFlightClient", lambda url, token=None, **_: client
     )
     monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
     conn = TensorConnection(config={})
@@ -947,7 +947,7 @@ def test_health_delegates(monkeypatch):
     client = _fake_client({})
     client.health_check.return_value = "SERVING"
     monkeypatch.setattr(
-        _connection, "TensorFlightClient", lambda url, token=None: client
+        _connection, "TensorFlightClient", lambda url, token=None, **_: client
     )
     monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
@@ -1171,3 +1171,65 @@ class TestConnectErrorMessage:
         # Even an exception with an empty str() yields an actionable message.
         msg = connect_error_message(RuntimeError(), self.URL, token=None)
         assert msg.strip()
+
+
+# --- local TLS plane: explicit anchor, never TOFU (biopb/biopb#604) ---------
+# A loopback grpcs:// plane is this machine's own and its cert is already on this
+# machine's disk, so it is trusted directly rather than pinned from the wire --
+# same cert and same reasoning as the tensor server's own HTTP sidecar.
+
+
+def _seed_cert(monkeypatch, tmp_path, body: bytes = b"-----BEGIN CERTIFICATE-----\n"):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from biopb._locations import tls_server_cert
+
+    path = tls_server_cert()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+def test_plaintext_and_remote_planes_get_no_anchor(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path)
+    # Plaintext: nothing to anchor.
+    assert _connection._local_ca("grpc://localhost:8815") is None
+    # Remote TLS: its cert is not on this disk and cannot be -- TOFU stays.
+    assert _connection._local_ca("grpcs://data.mylab.example:8815") is None
+
+
+def test_a_local_tls_plane_is_anchored_on_the_on_disk_cert(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path, b"PEMBYTES")
+    for url in ("grpcs://localhost:8815", "grpcs://127.0.0.1:8815"):
+        assert _connection._local_ca(url) == b"PEMBYTES"
+
+
+def test_an_unreadable_local_cert_errors_rather_than_falling_back_to_tofu(
+    monkeypatch, tmp_path
+):
+    """Degrading here would trade a verified anchor for an unverified one exactly
+    where the strong option was meant to apply."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    with pytest.raises(RuntimeError, match="could not be read"):
+        _connection._local_ca("grpcs://localhost:8815")
+
+
+def test_an_empty_local_cert_errors(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path, b"   \n")
+    with pytest.raises(RuntimeError, match="empty"):
+        _connection._local_ca("grpcs://localhost:8815")
+
+
+def test_connect_passes_the_anchor_to_the_client(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path, b"PEMBYTES")
+    captured = {}
+
+    def _fake_client(url, token=None, tls_ca_pem=None):
+        captured.update(url=url, tls_ca_pem=tls_ca_pem)
+        client = MagicMock()
+        client.health_check.return_value = {"status": "SERVING"}
+        client.list_sources.return_value = {}
+        return client
+
+    monkeypatch.setattr(_connection, "TensorFlightClient", _fake_client)
+    TensorConnection().connect("grpcs://127.0.0.1:8815", token=None)
+    assert captured["tls_ca_pem"] == b"PEMBYTES"
