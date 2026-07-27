@@ -32,6 +32,11 @@ _promote_after: float = 10.0
 # message and the agent is told via the initialize `instructions` field.
 _headless: bool = False
 
+# Whether the curated-skills catalog is advertised to the agent (mirrors
+# `services.skills_enabled`, off by default). Set by the launcher
+# (set_skills_enabled); gates the _SKILLS_INSTRUCTIONS fragment in the handshake.
+_skills_enabled: bool = False
+
 # This process's logfile path (set by the launcher), surfaced by server_status so
 # an agent can find its own log. None when output goes to a terminal (foreground
 # `--transport http` / `biopb mcp view`) rather than a file.
@@ -54,10 +59,6 @@ _BASE_INSTRUCTIONS = (
     "start of the session (and again to recover after a failure or after the "
     "user closes the viewer window); it blocks until the kernel is ready.\n"
     "\n"
-    "At the start of a task, call `find_skills` to check for a curated workflow "
-    "before improvising; read the matching `skill://<id>` resource for the "
-    "steps.\n"
-    "\n"
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
     "explicitly asks.\n"
@@ -77,9 +78,18 @@ _BASE_INSTRUCTIONS = (
     "- Put intermediate results back on `viewer` for the user to validate at "
     "each step.\n"
     "- Do not assume — ask the user to clarify uncertainties; they know the "
-    "data better than you do.\n"
-    "- After accomplishing a task, ask the user whether a new skill should be generated and added "
-    "to the agent's toolbox for future use."
+    "data better than you do."
+)
+
+# Appended to _BASE_INSTRUCTIONS only when the skills catalog is enabled
+# (`services.skills_enabled`, off by default). Kept out of the base so a default
+# install neither points the agent at `find_skills` (which would return nothing)
+# nor prompts it to author skills — set_skills_enabled owns the field.
+_SKILLS_INSTRUCTIONS = (
+    "At the start of a task, call `find_skills` to check for a curated workflow "
+    "before improvising; read the matching `skill://<id>` resource for the "
+    "steps. After accomplishing a task, ask the user whether a new skill should "
+    "be generated and added to the agent's toolbox for future use."
 )
 
 # Appended to _BASE_INSTRUCTIONS when the session is headless. Phrased to fire
@@ -318,23 +328,40 @@ def set_session_log_path(path: str | None):
     _session_log_path = path
 
 
+def _recompose_instructions():
+    """Rebuild the handshake ``instructions`` from ``_BASE_INSTRUCTIONS`` plus
+    whichever optional fragments the current mode enables (skills, then
+    headless).
+
+    Recomposing from the base in both directions is idempotent, so flipping any
+    dimension back off can't leave a stale fragment in the handshake while
+    preserving the always-on base guidance. The low-level Server holds the
+    `instructions` returned in the handshake.
+    """
+    parts = [_BASE_INSTRUCTIONS]
+    if _skills_enabled:
+        parts.append(_SKILLS_INSTRUCTIONS)
+    if _headless:
+        parts.append(_HEADLESS_INSTRUCTIONS)
+    mcp._mcp_server.instructions = "\n\n".join(parts)
+
+
 def set_headless(headless: bool):
     """Mark the session compute-only (no viewer) and advertise it to the agent
-    via the initialize ``instructions`` field.
-
-    Recomposes that field from ``_BASE_INSTRUCTIONS`` in both directions
-    (idempotent): append the headless directive when headless, drop it
-    otherwise, so a flip back to visible can't leave a stale HEADLESS directive
-    in the handshake while preserving the always-on base guidance. The
-    low-level Server holds the `instructions` returned in the handshake.
-    """
+    via the initialize ``instructions`` field (append the headless directive
+    when headless, drop it otherwise)."""
     global _headless
     _headless = bool(headless)
-    mcp._mcp_server.instructions = (
-        _BASE_INSTRUCTIONS + "\n\n" + _HEADLESS_INSTRUCTIONS
-        if _headless
-        else _BASE_INSTRUCTIONS
-    )
+    _recompose_instructions()
+
+
+def set_skills_enabled(enabled: bool):
+    """Advertise (or hide) the curated-skills catalog in the agent's initialize
+    ``instructions``. Off by default, so a default install never points the
+    agent at ``find_skills`` (which would return nothing)."""
+    global _skills_enabled
+    _skills_enabled = bool(enabled)
+    _recompose_instructions()
 
 
 def _format_execute_result(res: dict) -> str:
