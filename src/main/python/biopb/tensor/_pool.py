@@ -671,7 +671,11 @@ def _evict_dead_threads():
             del _CONNECTION_REGISTRY[thread_id]
 
 
-def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClient:
+def _get_thread_client(
+    location: str,
+    token: Optional[str],
+    tls_root_certs: Optional[bytes] = None,
+) -> flight.FlightClient:
     """Get thread-local FlightClient (no lock for read access).
 
     Creates FlightClient lazily on first call per thread. Thread-safe via
@@ -682,6 +686,11 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
     Args:
         location: Flight server location string
         token: Bearer token (or None for no auth)
+        tls_root_certs: PEM trust anchor for a ``grpc+tls://`` location (the
+            TOFU-pinned server cert). ``None`` for a plaintext connection, or to
+            fall back to the system trust store. Not part of the pool key: the
+            cert is a function of the location, so ``(location, token)`` already
+            identifies the connection.
 
     Returns:
         FlightClient for this thread and location
@@ -698,12 +707,14 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
 
     # Slow path: create new client with gRPC options tuned for 64MB chunks, register for cleanup
     # 80MB max message size (slightly above 64MB chunk threshold)
+    tls_kwargs = {"tls_root_certs": tls_root_certs} if tls_root_certs else {}
     client = flight.FlightClient(
         location,
         generic_options=[
             ("grpc.max_send_message_size", 80 * 1024 * 1024),
             ("grpc.max_receive_message_size", 80 * 1024 * 1024),
         ],
+        **tls_kwargs,
     )
     local_pool[key] = client
 
@@ -792,7 +803,12 @@ def _get_shared_call_options(
     return _CALL_OPTS_POOL[key]
 
 
-def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int):
+def _get_worker_resources(
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    tls_root_certs: Optional[bytes] = None,
+):
     """Get cached FlightClient, Cache, and CallOptions for a connection namespace.
 
     Creates resources lazily on first call per (location, token) key.
@@ -812,7 +828,7 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
         Tuple of (FlightClient, Optional[Cache], FlightCallOptions). The cache
         is None when caching is disabled for this connection (e.g. localhost).
     """
-    client = _get_thread_client(location, token)
+    client = _get_thread_client(location, token, tls_root_certs)
     cache = _get_shared_cache(location, token, cache_bytes)
     call_options = _get_shared_call_options(location, token)
 
@@ -871,6 +887,7 @@ def _fetch_chunk_distributed(
     bounds_stop: Tuple[int, ...],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]] = None,
+    tls_root_certs: Optional[bytes] = None,
 ) -> np.ndarray:
     """Fetch a chunk from Flight server using worker-local resources.
 
@@ -895,7 +912,9 @@ def _fetch_chunk_distributed(
     Returns:
         numpy array with chunk data
     """
-    client, cache, call_options = _get_worker_resources(location, token, cache_bytes)
+    client, cache, call_options = _get_worker_resources(
+        location, token, cache_bytes, tls_root_certs
+    )
     cache_key = chunk_id.hex()
 
     # Weak view-cache hit: a previously-read mmap view still kept alive by some
@@ -961,6 +980,7 @@ def _fetch_chunk_block(
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]] = None,
+    tls_root_certs: Optional[bytes] = None,
 ) -> np.ndarray:
     """Single-``Blockwise``-layer callback that fetches one block.
 
@@ -982,6 +1002,7 @@ def _fetch_chunk_block(
         tuple(bounds_stop),
         cache_bytes,
         schema_metadata,
+        tls_root_certs,
     )
 
 
@@ -1077,6 +1098,7 @@ def _build_dask_array_from_chunk_map(
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]],
+    tls_root_certs: Optional[bytes] = None,
 ) -> da.Array:
     """Build the lazy chunk-fetching dask array from a chunk-index map.
 
@@ -1122,7 +1144,15 @@ def _build_dask_array_from_chunk_map(
         )
         dep = BlockwiseDepDict(mapping=dep_map, numblocks=numblocks)
         return _regular_blockwise_array(
-            name, dep, chunks, dtype, location, token, cache_bytes, schema_metadata
+            name,
+            dep,
+            chunks,
+            dtype,
+            location,
+            token,
+            cache_bytes,
+            schema_metadata,
+            tls_root_certs,
         )
 
     # Fallback: ragged/sparse grid -> one delayed task per chunk.
@@ -1140,6 +1170,7 @@ def _build_dask_array_from_chunk_map(
                 tuple(bounds.stop),
                 cache_bytes,
                 schema_metadata,
+                tls_root_certs,
             ),
             shape=chunk_shape,
             dtype=dtype,
@@ -1156,6 +1187,7 @@ def _regular_blockwise_array(
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]],
+    tls_root_certs: Optional[bytes] = None,
 ) -> da.Array:
     """Wrap a per-block ``BlockwiseDep`` in a single ``Blockwise`` (map_blocks) layer.
 
@@ -1178,6 +1210,8 @@ def _regular_blockwise_array(
         cache_bytes,
         None,
         schema_metadata,
+        None,
+        tls_root_certs,
         None,
         numblocks={},
     )

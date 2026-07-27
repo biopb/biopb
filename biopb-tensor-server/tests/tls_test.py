@@ -145,3 +145,46 @@ def test_plaintext_client_is_refused_by_tls_server(simple_zarr_array):
         client.close()
     finally:
         server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
+    """TensorFlightClient over grpcs:// pins the server cert (TOFU) and reads it.
+
+    End-to-end for biopb/biopb#604 item 1: the SDK client resolves TLS trust by
+    pinning the presented cert on first connect, threads the pinned PEM through
+    the chunk-fetch pool, and a lazy dask read succeeds over TLS.
+    """
+    import numpy as np
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+    # Isolate the TOFU pin store (state/biopb/tls-known-hosts.json) to a tmp tree.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    cert_pem, key_pem = _self_signed_cert()
+
+    server = TensorFlightServer(
+        "grpc://localhost:0",
+        tls_cert_chain=cert_pem,
+        tls_private_key=key_pem,
+    )
+    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        # grpcs:// -> TOFU fetch+pin the self-signed cert, then read over TLS.
+        client = TensorFlightClient(f"grpcs://localhost:{server.port}")
+        got = client.get_tensor("img").compute()
+        np.testing.assert_array_equal(got, arr[:])
+        # The cert was actually pinned for this host:port.
+        from biopb._locations import tls_known_hosts
+
+        assert f"localhost:{server.port}" in tls_known_hosts().read_text()
+        client.close()
+    finally:
+        server.shutdown()

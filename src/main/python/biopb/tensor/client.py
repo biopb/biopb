@@ -54,6 +54,7 @@ from biopb.tensor._session import (
     _TensorContext,
     _unresolved_source_error as _unresolved_source_error,
 )
+from biopb.tensor._tls import resolve_tls_root_certs
 from biopb.tensor._upload import UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -172,11 +173,17 @@ class TensorFlightClient:
         )
         # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
         normalized = _normalize_location(location)
+        # For a TLS location, pin/verify the server cert via TOFU (once, here) and
+        # carry the resolved PEM through the connection so every dask worker trusts
+        # the same root without re-pinning (biopb/biopb#604). None for plaintext.
+        tls_root_certs = resolve_tls_root_certs(normalized)
         # Pickle-safe connection parameters (callers read client._client etc.)
         self._location = normalized
         self._token = token
         self._cache_bytes = cache_bytes
-        self._client = flight.FlightClient(normalized)
+        self._tls_root_certs = tls_root_certs
+        tls_kwargs = {"tls_root_certs": tls_root_certs} if tls_root_certs else {}
+        self._client = flight.FlightClient(normalized, **tls_kwargs)
         self._call_options = _build_call_options(token)
         # The connection + the two catalog caches live in one shared _ClientState.
         # The collaborators (#278 item C) read/write it; this facade exposes the
@@ -187,6 +194,7 @@ class TensorFlightClient:
             location=self._location,
             token=self._token,
             cache_bytes=self._cache_bytes,
+            tls_root_certs=self._tls_root_certs,
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
@@ -430,6 +438,7 @@ class TensorFlightClient:
             pb.auth_token if pb.auth_token else None,
             cache_bytes,
             schema_metadata,
+            resolve_tls_root_certs(pb.location),
         )
 
         # Crop to the originally requested region if original_slice_hint present
