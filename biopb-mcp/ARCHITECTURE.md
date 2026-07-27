@@ -261,11 +261,7 @@ and URL/token resolution + persistence.
   recorded in `last_status`/`last_message`, never raised) and must be driven **off
   the caller's main thread** because `connect()` blocks on I/O (the kernel runs it
   on a daemon thread; the widget on a connect worker that signals the tree render
-  back to the Qt main thread). **The endpoint carries its own scheme**: the
-  control reports what the *running* plane says it is (`grpc://` or `grpcs://`),
-  read off the plane's sidecar rather than reconstructed, because the admin UI can
-  toggle `server.tls` and restart the plane without restarting the control — a
-  scheme guessed once at control startup would be stale from then on (#604).
+  back to the Qt main thread).
 - **A local TLS plane is trusted from disk, never pinned** (`_local_ca`). A
   loopback `grpcs://` plane is this machine's own and its certificate is already
   on this machine's disk, so it is passed as an explicit `tls_ca_pem` anchor

@@ -1120,17 +1120,6 @@ class TestAdminStatusRoute:
         # this (biopb/biopb#244).
         assert body["local"] is True
 
-    def test_status_reports_the_flight_endpoint_it_is_using(self, admin_client):
-        """A supervising control advertises this to clients instead of rebuilding it.
-
-        The scheme depends on `server.tls`, which the admin UI can edit and
-        restart the plane into without restarting the control -- so the plane's
-        own account is the only one that cannot go stale (biopb/biopb#604).
-        """
-        tc, _ = admin_client
-        location = tc.get("/api/admin/status").json()["flight_location"]
-        assert location.startswith(("grpc://", "grpcs://"))
-
     def test_status_reports_not_supervised_by_default(self, admin_client):
         # A directly-launched `biopb server start` is not control-owned, so its
         # admin UI keeps the self-restart path (biopb/biopb#418).

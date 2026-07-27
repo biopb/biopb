@@ -1341,14 +1341,6 @@ async def admin_status(request: Request) -> JSONResponse:
             # fails closed (a feature hides), so it is accepted for now; the fix is
             # to derive this from the actual bind. See biopb/biopb#470.
             "local": ctx.token is None,
-            # The Flight endpoint this sidecar is actually talking to, scheme and
-            # all. It is the plane's *own* account of where it can be reached, so
-            # a supervising control can advertise it to clients instead of
-            # reconstructing it: the scheme depends on `server.tls` in a config
-            # file the admin UI can edit and restart the plane into, which a
-            # control that read the config once at startup would get wrong from
-            # then on (biopb/biopb#604).
-            "flight_location": ctx.flight_location,
             "config_path": str(ctx.config_path) if ctx.config_path else None,
             "health": _h("status"),
             "source_count": _h("source_count"),

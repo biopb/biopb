@@ -115,11 +115,6 @@ class DataPlaneSupervisor:
         self._winjob = None
         self._state = _State()
         self._lock = threading.RLock()
-        # The endpoint the *running* plane reports for itself, and the child it
-        # was read from. Cached because it can only change across a respawn, and
-        # `snapshot()` is on the dashboard's poll path (see _flight_endpoint).
-        self._flight_endpoint: Optional[str] = None
-        self._flight_endpoint_pid: Optional[int] = None
 
     @property
     def log_path(self) -> Optional[Path]:
@@ -140,76 +135,6 @@ class DataPlaneSupervisor:
                 return True
         except OSError:
             return False
-
-    def _flight_endpoint_fallback(self) -> str:
-        """Where the plane *should* be reachable, from the spec alone."""
-        return f"grpc://{self._spec.grpc_host}:{self._spec.grpc_port}"
-
-    def _flight_endpoint_for_clients(self) -> str:
-        """The Flight URL clients should dial, as reported by the plane itself.
-
-        The scheme is not knowable from this side. ``launch`` decides TLS from
-        ``server.tls`` in the config file — which the admin UI can edit and then
-        restart the plane into, *without* restarting the control. A control that
-        resolved the scheme once at startup would therefore advertise ``grpc://``
-        for a plane now serving TLS, and every local client that trusts this URL
-        (``biopb-mcp`` takes it verbatim) would dial plaintext at a TLS port and
-        fail. Asking the running plane is the only answer that cannot go stale
-        (biopb/biopb#604).
-
-        The plane's HTTP sidecar reports its own ``flight_location`` on
-        ``/api/admin/status``. Read once per child and cached: the value can only
-        change across a respawn, and this sits on the dashboard's status poll.
-        Any failure falls back to the spec-derived URL — an unreachable sidecar
-        must not break the status payload, and the fallback is exactly the value
-        this method replaced.
-        """
-        proc = self._proc
-        pid = proc.pid if proc is not None else None
-        if pid is None:
-            return self._flight_endpoint_fallback()
-        if self._flight_endpoint is not None and self._flight_endpoint_pid == pid:
-            return self._flight_endpoint
-
-        endpoint = self._probe_flight_endpoint()
-        if endpoint is None:
-            # Only a *successful* read is cached. A freshly spawned plane has not
-            # opened its sidecar yet, and caching that miss for the child's whole
-            # life would pin the fallback scheme past the point the real one is
-            # knowable — the exact staleness this method exists to avoid.
-            return self._flight_endpoint_fallback()
-        self._flight_endpoint = endpoint
-        self._flight_endpoint_pid = pid
-        return endpoint
-
-    def _probe_flight_endpoint(self) -> Optional[str]:
-        """GET the sidecar's ``flight_location``; ``None`` if it can't be read.
-
-        stdlib ``urllib`` on purpose — the supervisor stays importable without
-        pulling a client stack in (invariant I2, the same reason liveness is a
-        bare TCP connect).
-        """
-        import json
-        import urllib.error
-        import urllib.request
-
-        host = self._spec.web_host
-        if host in ("0.0.0.0", ""):
-            host = "127.0.0.1"
-        elif host == "::":
-            host = "[::1]"
-        url = f"http://{host}:{self._spec.web_port}/api/admin/status"
-        req = urllib.request.Request(url)
-        if self._spec.token:
-            req.add_header("Authorization", f"Bearer {self._spec.token}")
-        try:
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except (OSError, urllib.error.URLError, ValueError) as exc:
-            logger.debug("data plane did not report its flight endpoint: %s", exc)
-            return None
-        location = payload.get("flight_location")
-        return location if isinstance(location, str) and location else None
 
     def _build_argv(self) -> list[str]:
         s = self._spec
@@ -631,7 +556,7 @@ class DataPlaneSupervisor:
                 state = "stopped"
             return {
                 "state": state,
-                "grpc_url": self._flight_endpoint_for_clients(),
+                "grpc_url": f"grpc://{self._spec.grpc_host}:{self._spec.grpc_port}",
                 "web_url": f"http://{self._spec.web_host}:{self._spec.web_port}/",
                 "pid": self._proc.pid if child_alive else None,
                 "restarts": st.restarts,
