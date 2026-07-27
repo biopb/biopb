@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import typer
 from biopb import _web_auth
 from biopb._lifecycle import deathwatch as _deathwatch
+from biopb._locations import tls_server_cert
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
@@ -57,6 +58,9 @@ logger = logging.getLogger(__name__)
 
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
+
+cert_app = typer.Typer(help="Manage the server's self-signed TLS certificate")
+app.add_typer(cert_app, name="cert")
 
 # The bind address is the mode: a loopback bind is reachable same-machine only
 # (local mode); anything else is network-reachable. The wildcard binds
@@ -466,12 +470,146 @@ def _grpc_location(host: str, port: int) -> str:
     return f"grpc://{authority}:{port}"
 
 
+def _resolve_tls_material(
+    tls: bool,
+    tls_cert: Optional[Path],
+    tls_key: Optional[Path],
+    san: Optional[List[str]] = None,
+) -> Tuple[Optional[bytes], Optional[bytes]]:
+    """Resolve the TLS cert + key (PEM bytes) the flight server should serve.
+
+    Three modes: no TLS (``(None, None)``); an explicit BYO cert (both
+    ``--tls-cert`` and ``--tls-key`` given, read from disk); or ``--tls`` alone,
+    which reuses — auto-generating on first use — the self-signed cert in the
+    state tree (biopb/biopb#604), printing its path + fingerprint so an operator
+    can eyeball-verify the value a client will TOFU-pin. Supplying only one of
+    ``--tls-cert`` / ``--tls-key`` is an error.
+
+    ``--san`` adds names/IPs to a cert generated *here*; an already-generated cert
+    is reused as-is, so widening its SANs means ``cert init --force --san ...``.
+    """
+    if (tls_cert is None) != (tls_key is None):
+        console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
+        raise typer.Exit(code=2)
+
+    # A BYO cert (both files given) is read straight off disk -- no `cryptography`
+    # needed, so this is the escape hatch when the [tls] extra isn't installed.
+    if tls_cert is not None:
+        return tls_cert.read_bytes(), tls_key.read_bytes()
+
+    if not tls:
+        return None, None
+
+    from biopb_tensor_server.core.tls import (
+        cert_fingerprint,
+        ensure_server_cert,
+        format_fingerprint,
+    )
+
+    existed = tls_server_cert().exists()
+    try:
+        cert_pem, key_pem = ensure_server_cert(extra_sans=san)
+    except RuntimeError as e:
+        # cryptography (the [tls] extra) is absent -- surface the actionable
+        # message cleanly and exit, rather than dumping a traceback.
+        console.print(f"[red]{_rich_escape(str(e))}[/red]")
+        raise typer.Exit(code=2) from None
+    if san and existed:
+        console.print(
+            "[yellow]--san ignored: reusing the existing certificate. Run "
+            "`cert init --force --san ...` to re-mint it with those names.[/yellow]"
+        )
+    console.print(f"[green]TLS enabled[/green] (self-signed, cert {tls_server_cert()})")
+    # A fingerprint must reach the operator byte-for-byte: soft_wrap so a narrow
+    # terminal cannot break it across lines, and emoji/markup off because Rich
+    # otherwise rewrites colon-delimited hex pairs (":cd:" -> a CD emoji).
+    console.print(
+        f"  fingerprint: {format_fingerprint(cert_fingerprint(cert_pem))}",
+        soft_wrap=True,
+        markup=False,
+        emoji=False,
+        highlight=False,
+    )
+    return cert_pem, key_pem
+
+
+@cert_app.command("init")
+def cert_init(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Regenerate even if a cert already exists (rotates it; connected "
+        "clients that pinned the old cert must clear their pin to reconnect).",
+    ),
+    san: Optional[List[str]] = typer.Option(
+        None,
+        "--san",
+        help="Extra hostname or IP to put in the certificate (repeatable). Needed "
+        "when clients dial a name this host cannot discover itself (a NAT/VPN "
+        "address, a CNAME) -- gRPC verifies the dialed name against the SANs even "
+        "though trust comes from the client's pin. Only applies when the cert is "
+        "generated, so pair it with --force to widen an existing one.",
+    ),
+):
+    """Generate the server's self-signed TLS cert (if absent) and show its details.
+
+    Mints a self-signed certificate for this host's names/IPs into the state dir
+    and prints its path + SHA-256 fingerprint. `serve --tls` generates the same
+    cert on first use, so this is mainly for pre-seeding or rotating it, and for
+    reading off the fingerprint a client will pin on first connect (TOFU,
+    biopb/biopb#604).
+    """
+    from biopb._locations import tls_server_key
+
+    from biopb_tensor_server.core.tls import (
+        cert_fingerprint,
+        ensure_server_cert,
+        format_fingerprint,
+    )
+
+    existed = tls_server_cert().exists() and tls_server_key().exists()
+    try:
+        cert_pem, _ = ensure_server_cert(regenerate=force, extra_sans=san)
+    except RuntimeError as e:
+        # The [tls] extra (cryptography) is not installed -- advise, don't crash.
+        console.print(f"[red]{_rich_escape(str(e))}[/red]")
+        raise typer.Exit(code=2) from None
+
+    if existed and not force:
+        console.print(
+            f"[green]TLS cert already present[/green] at {tls_server_cert()} "
+            "(use --force to regenerate)."
+        )
+        if san:
+            console.print(
+                "[yellow]--san ignored: the existing cert was reused. Re-run with "
+                "--force to mint one carrying those names.[/yellow]"
+            )
+    else:
+        verb = "Regenerated" if existed else "Generated"
+        console.print(f"[green]{verb} self-signed TLS cert[/green]")
+    console.print(f"  cert:        {tls_server_cert()}")
+    console.print(f"  key:         {tls_server_key()}")
+    # A fingerprint must reach the operator byte-for-byte: soft_wrap so a narrow
+    # terminal cannot break it across lines, and emoji/markup off because Rich
+    # otherwise rewrites colon-delimited hex pairs (":cd:" -> a CD emoji).
+    console.print(
+        f"  fingerprint: {format_fingerprint(cert_fingerprint(cert_pem))}",
+        soft_wrap=True,
+        markup=False,
+        emoji=False,
+        highlight=False,
+    )
+
+
 def _setup_flight_server(
     server_config: ServerConfig,
     host: Optional[str] = None,
     port: Optional[int] = None,
     writable: Optional[bool] = None,
     token: Optional[str] = None,
+    tls_cert_chain: Optional[bytes] = None,
+    tls_private_key: Optional[bytes] = None,
 ) -> Tuple[
     TensorFlightServer, Optional[object], Optional[object], Optional[PrecacheWorker]
 ]:
@@ -482,6 +620,9 @@ def _setup_flight_server(
         host: Override host
         port: Override port
         token: Access token for Flight server authentication
+        tls_cert_chain: PEM cert chain -- serves TLS (grpc+tls://) when supplied
+            together with ``tls_private_key`` (see ``TensorFlightServer``).
+        tls_private_key: PEM private key paired with ``tls_cert_chain``.
 
     Returns:
         Tuple of (flight_server, source_manager, watcher, precache_worker)
@@ -632,6 +773,8 @@ def _setup_flight_server(
         max_list_flights_results=server_config.metadata_db.max_list_flights_results,
         grpc_max_message_size=80 * 1024 * 1024,
         pyramid_config=server_config.pyramid,
+        tls_cert_chain=tls_cert_chain,
+        tls_private_key=tls_private_key,
     )
 
     # Set up watcher for monitored sources (None for static-only configs)
@@ -860,6 +1003,33 @@ def serve(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
+    tls: bool = typer.Option(
+        False,
+        "--tls",
+        help="Serve the flight plane over TLS. Uses the self-signed cert in the "
+        "state dir (auto-generated on first use); clients connect with grpcs:// "
+        "and pin it on first connect (TOFU). See also `cert init`.",
+    ),
+    tls_cert: Optional[Path] = typer.Option(
+        None,
+        "--tls-cert",
+        exists=True,
+        help="PEM certificate chain to serve instead of the auto self-signed cert "
+        "(requires --tls-key).",
+    ),
+    tls_key: Optional[Path] = typer.Option(
+        None,
+        "--tls-key",
+        exists=True,
+        help="PEM private key paired with --tls-cert.",
+    ),
+    san: Optional[List[str]] = typer.Option(
+        None,
+        "--san",
+        help="Extra hostname/IP for the auto-generated cert (repeatable). Use it "
+        "when clients dial a name this host cannot discover itself; ignored if a "
+        "cert already exists (re-mint with `cert init --force --san ...`).",
+    ),
     log_file: Optional[str] = typer.Option(
         None,
         "--log-file",
@@ -871,7 +1041,7 @@ def serve(
     Example:
         biopb-tensor-server serve --config biopb.json
         biopb-tensor-server serve -c config.json --port 9000
-        biopb-tensor-server serve -c config.json --log-level DEBUG
+        biopb-tensor-server serve -c config.json --tls --host 0.0.0.0
     """
     server_config = _load_config_or_exit(config)
 
@@ -914,6 +1084,8 @@ def serve(
     # _setup_flight_server acquires the lock during cache init and can still raise
     # afterwards (e.g. a bad static source); keeping it inside the try means such
     # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
+
     server = source_manager = watcher = precache_worker = None
     try:
         server, source_manager, watcher, precache_worker = _setup_flight_server(
@@ -922,9 +1094,14 @@ def serve(
             port=port,
             writable=writable,
             token=effective_token,
+            tls_cert_chain=tls_cert_chain,
+            tls_private_key=tls_private_key,
         )
 
         location = _grpc_location(effective_host, port or server_config.port)
+        if tls_cert_chain is not None:
+            # Advertise the scheme clients actually dial for a TLS server.
+            location = location.replace("grpc://", "grpcs://", 1)
         console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
         console.print("Press Ctrl+C to stop\n")
 

@@ -46,6 +46,10 @@ def _run_serve(config, **overrides):
         "port": None,
         "writable": False,
         "token": None,
+        "tls": False,
+        "tls_cert": None,
+        "tls_key": None,
+        "san": None,
         "log_file": None,
     }
     kwargs.update(overrides)

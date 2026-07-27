@@ -229,6 +229,37 @@ def sessions_dir() -> Path:
     return d
 
 
+def tls_known_hosts() -> Path:
+    """TOFU pin store for the tensor Flight client (``state/biopb/tls-known-hosts.json``).
+
+    Maps a ``host:port`` to the server certificate pinned on first connect (the
+    SSH ``known_hosts`` model, biopb/biopb#604). Machine-local, regenerable trust
+    state — hence the state tree, beside the pids/sentinels — not user-authored
+    config. Resolved at call time for test isolation; not created on access (an
+    absent file is the normal "nothing pinned yet" case).
+    """
+    return state_dir() / "tls-known-hosts.json"
+
+
+def tls_server_cert() -> Path:
+    """The tensor server's TLS certificate (``state/biopb/tls/server-cert.pem``).
+
+    Auto-generated self-signed cert served when the flight plane runs with
+    ``--tls`` (biopb/biopb#604). Public material — world-readable is fine — kept
+    in the state tree beside its key. Resolved at call time for test isolation.
+    """
+    return state_dir() / "tls" / "server-cert.pem"
+
+
+def tls_server_key() -> Path:
+    """The tensor server's TLS private key (``state/biopb/tls/server-key.pem``).
+
+    The secret half of :func:`tls_server_cert`; written owner-only (``0600`` on
+    POSIX). Resolved at call time for test isolation.
+    """
+    return state_dir() / "tls" / "server-key.pem"
+
+
 def control_pid_file() -> Path:
     """The control plane's pid file."""
     return state_dir() / "control.pid"

@@ -48,6 +48,15 @@ dependencies = [
     "pillow >= 9.0.0",
     "simplejpeg >= 1.6.0",
   ]
+  # Self-signed TLS cert generation for `serve --tls` / `cert init` (#604).
+  # Kept OUT of the default install closure on purpose: `cryptography` pulls a
+  # Rust/OpenSSL build surface that has no Intel-macOS wheel on recent releases
+  # and broke `curl install.sh | bash` there (#355, fixed by dropping the dep).
+  # TLS *serving* is a server-deployment choice, so it opts in via this extra;
+  # the SDK client's TOFU pinning is stdlib-`ssl` only and needs nothing here.
+  tls = [
+    "cryptography >= 41.0.0",
+  ]
   test = [
     "pytest >= 7.0.0",
     "pytest-timeout >= 2.1.0",
@@ -57,8 +66,10 @@ dependencies = [
     # The test suite imports the web stack at collection time (cli_test.py pulls
     # in cli -> http_server -> fastapi; http_server_test.py uses TestClient), so
     # the web extra is required to run `pytest tests/`. Kept as a self-reference
-    # so the dependency list stays defined once, in [web].
+    # so the dependency list stays defined once, in [web]. [tls] likewise lets
+    # the TLS tests run (they skip when cryptography is absent).
     "biopb-tensor-server[web]",
+    "biopb-tensor-server[tls]",
   ]
   # Vendor microscopy formats via bioio (successor to aicsimageio). Each reader
   # is its own plugin with modern, uncapped deps, so none re-imposes the
