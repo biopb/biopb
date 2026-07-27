@@ -68,10 +68,10 @@ commit to validate before it lands on `main`.
   so publishing one would park unmerged code next to the real releases for nobody
   to consume. To try an RC image, build it locally from the tagged commit
   (`docker build -f biopb-tensor-server/Dockerfile .`).
-- **`v…rc1`** marks the SDK line a prerelease. `image-runtime-ci` still **does**
-  push a version-pinned `biopb-image-base:<A>rc1` (it does not move `:latest`) —
-  image-base is a build input other images `FROM`, so a pullable RC tag is worth
-  the registry clutter in a way a leaf server image is not.
+- **`v…rc1`** does the same for the SDK's `biopb-image-base` image:
+  `image-runtime-ci` tests and builds it, and publishes nothing. Derived services
+  build `FROM biopb-image-base` — `:latest` or a pinned stable `X.Y.Z` — which an
+  rc never moved anyway.
 
 The `v*` PyPI tag (biopb) follows PyPI's own prerelease rules: a `…rc1` version
 uploads as a prerelease, which `pip` ignores unless `--pre`.
@@ -104,7 +104,9 @@ now the same `release-v*` line, so equal to `release` on a real tag), and `napar
 On a `v*` tag, `python-ci`/`java-ci` publish `biopb` to PyPI/Maven, and
 `image-runtime-ci`'s `publish` job builds the `biopb-image-base` image (biopb +
 tensor-server wheels) and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**,
-tagged with the SDK version (and `:latest` for a clean `X.Y.Z`).
+tagged with the SDK version **and** `:latest`. Like the tensor-server image, it
+publishes **only on a final `vX.Y.Z`** — an rc tag tests and builds the image but
+publishes nothing.
 
 ### Idempotent Docker publish (the "did the version change?" check)
 
@@ -173,7 +175,7 @@ single source of truth.
 
 | Tag | Workflow | Publishes |
 |---|---|---|
-| `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb`) + Maven Central (`biopb` Java) + Docker `biopb-image-base:A` |
+| `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb`) + Maven Central (`biopb` Java) — **and**, for a stable tag only, Docker `biopb-image-base:A` + `:latest` |
 | `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` and the canonical `biopb.org/{install.sh,install.ps1,biopb-engine.ps1}` |
 
 The canonical install scripts are published by a **step inside `release.yaml`**,
@@ -198,6 +200,6 @@ web all ship together on `release-v*`.
   installer was promoted to root post-first-release; the host-side copy/redirect
   should point at it).
 - Prerelease test tags (`release-v…rc1`, `v…rc1`) publish harmlessly: the
-  installer skips the GitHub release, `release-v…rc1` publishes no Docker image
-  at all, and `v…rc1`'s pinned `biopb-image-base` tag leaves `:latest` on the
-  last stable image (see "Release candidates" above).
+  installer skips the GitHub release and **neither tag publishes a Docker image
+  at all**, so both `:latest` tags stay on the last stable image (see "Release
+  candidates" above).
