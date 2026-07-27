@@ -407,8 +407,9 @@ editing the code.
   The client bounds that leak with **pinned-segment accounting** (still
   `biopb/biopb#571`): it tracks the on-disk size of the distinct segments it
   keeps mapped (refcounted by inode, released by a `weakref.finalize` on the
-  backing Arrow buffer) and, once over `BIOPB_CACHEFILE_PIN_LIMIT_BYTES`
-  (default 16 GiB), copies the chunk out and drops the mapping instead of pinning
+  backing Arrow buffer) and, once over `BIOPB_CACHEFILE_PIN_LIMIT`
+  (**off by default** — a size like `16GiB` enables it), copies the chunk out and
+  drops the mapping instead of pinning
   another segment — still off the warm mmap, no `do_get`. The hot path stays
   cheap: the gate is a lock-free int compare, the segment size reuses the
   `stat` the fast path already does, and only the view branch pays a lock + one

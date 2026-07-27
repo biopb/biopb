@@ -38,6 +38,7 @@ from dask.base import tokenize
 from dask.blockwise import BlockwiseDep, BlockwiseDepDict, blockwise as _blockwise
 from dask.delayed import delayed
 from dask.highlevelgraph import HighLevelGraph
+from dask.utils import parse_bytes
 
 from biopb.tensor.ticket_pb2 import TensorTicket
 
@@ -265,31 +266,40 @@ def _array_from_unified_batch(
 # client that holds many views can thus keep the server's cache_dir above its
 # configured budget.
 #
-# Bound it: track the on-disk size of the distinct segments this process keeps
-# mapped, and once that crosses a threshold, copy the chunk out and let the
-# mapping go (copy=True) instead of handing out another view -- so no further
-# segment is pinned until some views drop. Refcounted per inode: many chunks
-# from one segment pin it once; a segment un-pins when the last view of it is
+# Optionally bound it (OFF by default -- see _PIN_LIMIT_DEFAULT): track the
+# on-disk size of the distinct segments this process keeps mapped, and once that
+# crosses the configured cap, copy the chunk out and let the mapping go
+# (copy=True) instead of handing out another view -- so no further segment is
+# pinned until some views drop. Refcounted per inode: many chunks from one
+# segment pin it once; a segment un-pins when the last view of it is
 # garbage-collected (a weakref.finalize on the backing Arrow buffer).
 #
 # Kept cheap on the hot read path: the gate is a lock-free read of a plain int;
 # only the view branch pays a lock + one weakref.finalize (per chunk actually
 # mapped), and the segment size is taken from the stat the fast path already does.
 
-_PIN_LIMIT_DEFAULT = 16 * 1024 * 1024 * 1024  # 16 GiB mapped before copying
+# -1 == no cap: the client-side pin-budget check is disabled by default, so the
+# fast path always hands out a view and never falls back to copying on budget.
+# The disk-leak above only bites a cache_dir under real space pressure, so the
+# bound is opt-in via BIOPB_CACHEFILE_PIN_LIMIT (a size string like "16GiB")
+# rather than paid by every deployment.
+_PIN_LIMIT_DEFAULT = -1
 
 
 def _pin_limit_bytes() -> int:
     """Max on-disk segment bytes this process keeps mmap-pinned before the fast
-    path falls back to copying. ``BIOPB_CACHEFILE_PIN_LIMIT_BYTES`` overrides;
-    ``0`` forces every fast-path read to copy (no view is ever handed out); a
-    negative or unparseable value uses the default."""
-    raw = os.environ.get("BIOPB_CACHEFILE_PIN_LIMIT_BYTES")
-    if raw is None:
+    path falls back to copying. ``BIOPB_CACHEFILE_PIN_LIMIT`` overrides, taking a
+    size string with common units (``"16GiB"``, ``"512MB"``, ``"2 GB"``) or a
+    bare byte count: a positive value is the cap, ``0`` forces every fast-path
+    read to copy (no view is ever handed out), and any negative value -- or an
+    unparseable/empty one, or the unset default -- means **no cap** (pin without
+    bound)."""
+    raw = os.environ.get("BIOPB_CACHEFILE_PIN_LIMIT")
+    if raw is None or not raw.strip():
         return _PIN_LIMIT_DEFAULT
     try:
-        val = int(raw)
-    except ValueError:
+        val = parse_bytes(raw)
+    except (ValueError, TypeError):
         return _PIN_LIMIT_DEFAULT
     return val if val >= 0 else _PIN_LIMIT_DEFAULT
 
@@ -310,11 +320,16 @@ _pinned_total = 0  # sum of sizes of currently-pinned segments (bytes)
 def _pin_budget_exhausted() -> bool:
     """Whether the process is at/above its pinned-segment budget.
 
-    Lock-free by design: ``_pinned_total`` is a plain int (atomic under the GIL)
+    A negative limit (the default, ``_PIN_LIMIT_DEFAULT == -1``) means **no cap**:
+    the fast path pins without bound and this never reports exhausted. Otherwise
+    lock-free by design: ``_pinned_total`` is a plain int (atomic under the GIL)
     and the bound is a heuristic, so a momentarily stale read is acceptable and
     the localhost hot read path stays clear of lock traffic.
     """
-    return _pinned_total >= _pin_limit_bytes()
+    limit = _pin_limit_bytes()
+    if limit < 0:
+        return False
+    return _pinned_total >= limit
 
 
 def _register_segment_pin(inode: int, size: int, anchor: object) -> None:

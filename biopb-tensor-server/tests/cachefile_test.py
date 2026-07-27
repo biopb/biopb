@@ -997,26 +997,41 @@ class TestPinnedSegmentAccounting:
         import biopb.tensor._pool as pool
         from biopb.tensor._pool import _pin_budget_exhausted, _pin_limit_bytes
 
-        # Nothing pinned -> under the (16 GiB) default budget.
+        # Default is -1 == no cap: nothing is ever "exhausted", not even a huge
+        # pinned total -> the fast path pins without bound.
+        assert pool._PIN_LIMIT_DEFAULT == -1
         assert _pin_budget_exhausted() is False
+        pool._pinned_total = 10**15
+        assert _pin_budget_exhausted() is False
+        pool._pinned_total = 0
 
-        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "1000"}):
+        # A bare byte count still works, and enforces at the limit (>=).
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "1000"}):
             assert _pin_limit_bytes() == 1000
             pool._pinned_total = 999
             assert _pin_budget_exhausted() is False
             pool._pinned_total = 1000  # at the limit -> exhausted (>=)
             assert _pin_budget_exhausted() is True
 
+        # Human-friendly units parse via dask.utils.parse_bytes.
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "2GiB"}):
+            assert _pin_limit_bytes() == 2 * 1024**3
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "512 MB"}):
+            assert _pin_limit_bytes() == 512 * 1000**2
+
         # 0 disables the view handoff outright (always copy).
         pool._pinned_total = 0
-        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "0"}):
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "0"}):
             assert _pin_budget_exhausted() is True
 
-        # Unparseable / negative fall back to the default.
-        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "garbage"}):
-            assert _pin_limit_bytes() == pool._PIN_LIMIT_DEFAULT
-        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "-1"}):
-            assert _pin_limit_bytes() == pool._PIN_LIMIT_DEFAULT
+        # Unparseable / negative / empty resolve to the default (-1 == no cap),
+        # so the budget check stays disabled even with a large pinned total.
+        pool._pinned_total = 10**15
+        for bad in ("garbage", "-1", ""):
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": bad}):
+                assert _pin_limit_bytes() == pool._PIN_LIMIT_DEFAULT
+                assert _pin_budget_exhausted() is False
+        pool._pinned_total = 0
 
 
 # ==============================================================================
@@ -1366,7 +1381,7 @@ class TestCachefileIntegration:
             chunk_id, start, stop = self._one_endpoint(client)
 
             # limit 0 -> always over budget -> always copy.
-            with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT_BYTES": "0"}):
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "0"}):
                 pool._pinned_total = 0
                 pool._pinned_segments.clear()
                 block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
