@@ -858,6 +858,56 @@ def _require_biopb_control() -> None:
         raise typer.Exit(1)
 
 
+def _require_tls_extra() -> None:
+    """Exit(2) with an install hint if ``--tls`` cannot possibly work.
+
+    ``cryptography`` is an opt-in extra (biopb/biopb#355 -- it drags a
+    Rust/OpenSSL build surface that breaks ``curl install.sh | bash`` on some
+    platforms), so a default install cannot mint the self-signed certificate
+    ``--tls`` needs.
+
+    Without this check the failure lands in the *wrong place entirely*: the
+    control starts fine and reports success, then its supervised plane exits 2
+    on every spawn and crash-loops on backoff, with the one useful sentence
+    buried in ``tensor-server.log``. The user sees a control that started and a
+    data plane that never serves. Checking here fails the command the user
+    actually typed, before anything is spawned.
+
+    Same-interpreter check: the control is spawned as ``sys.executable -m
+    biopb_control`` and spawns the plane the same way, so this process's import
+    spec is the plane's (and ``sys.executable`` names the exact environment to
+    install into -- which a generic ``pip install`` hint would not, under the
+    ``uv tool`` layout the installer uses).
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cryptography") is not None:
+        return
+    console.print(
+        "[red]--tls needs the 'cryptography' package, which is not installed."
+        "[/red]\nIt is an opt-in extra: it needs a Rust/OpenSSL build that the "
+        "default install deliberately avoids (biopb/biopb#355).\n"
+    )
+    console.print(
+        "[yellow]Install it into the environment that runs the data plane:[/yellow]"
+    )
+    # The one line the reader must copy verbatim, so it gets the same treatment
+    # as a printed fingerprint: soft_wrap so a narrow terminal cannot break it
+    # across lines, and markup off because Rich reads a bare `[tls]` as a style
+    # tag and silently eats it.
+    console.print(
+        f"    {sys.executable} -m pip install 'biopb-tensor-server[tls]'",
+        soft_wrap=True,
+        markup=False,
+        highlight=False,
+    )
+    console.print(
+        "\nThen retry. Or start without [bold]--tls[/bold] — the data plane still "
+        "serves, clients just dial grpc:// instead of grpcs://."
+    )
+    raise typer.Exit(2)
+
+
 def _control_endpoint() -> Tuple[str, int]:
     """The control-API (host, port) from the shared core-SDK location."""
     from ._endpoints import control_host, control_port
@@ -1105,6 +1155,8 @@ def control_start(
     than something to validate against (biopb/biopb#604).
     """
     _require_biopb_control()
+    if tls:
+        _require_tls_extra()
     _ensure_dirs()
     _reject_legacy_toml(config)
 
@@ -1397,6 +1449,8 @@ def control_run(
     `biopb control start` for the local/remote mode model.
     """
     _require_biopb_control()
+    if tls:
+        _require_tls_extra()
     _ensure_dirs()
     _reject_legacy_toml(config)
     from biopb_control import run_control

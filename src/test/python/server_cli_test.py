@@ -823,3 +823,61 @@ class TestPlaneBind:
         }
         assert "--tls" not in cli._control_run_argv(**kwargs)
         assert "--tls" in cli._control_run_argv(**kwargs, tls=True)
+
+
+class TestTlsExtraPreflight:
+    """`--tls` is checked before anything is spawned (biopb/biopb#604).
+
+    `cryptography` is an opt-in extra, so a default install cannot mint the
+    self-signed cert `--tls` needs. Without this check the control starts and
+    reports success, then its supervised plane exits 2 on every spawn and
+    crash-loops on backoff with the one useful sentence buried in
+    tensor-server.log -- a control that started and a plane that never serves.
+    """
+
+    def _without_cryptography(self, monkeypatch):
+        import importlib.util
+
+        real = importlib.util.find_spec
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name, *a, **k: (
+                None if name == "cryptography" else real(name, *a, **k)
+            ),
+        )
+
+    def test_passes_when_the_extra_is_installed(self):
+        # No exception: this environment has it (the [tls] extra is synced).
+        cli._require_tls_extra()
+
+    def test_exits_2_with_an_install_hint(self, monkeypatch, capsys):
+        self._without_cryptography(monkeypatch)
+        with pytest.raises(typer.Exit) as exc:
+            cli._require_tls_extra()
+        assert exc.value.exit_code == 2
+        out = capsys.readouterr().out
+        assert "cryptography" in out
+        assert "pip install" in out
+
+    def test_the_install_command_survives_a_narrow_terminal(self, monkeypatch):
+        """The one line the reader copies verbatim must not be wrapped or eaten.
+
+        Rich reads a bare `[tls]` as a style tag (so the extra silently vanishes)
+        and hard-wraps at the terminal width (so the command splits mid-path).
+        """
+        import io
+
+        from rich.console import Console
+
+        self._without_cryptography(monkeypatch)
+        buf = io.StringIO()
+        monkeypatch.setattr(cli, "console", Console(file=buf, width=40))
+        with pytest.raises(typer.Exit):
+            cli._require_tls_extra()
+        out = buf.getvalue()
+        assert "biopb-tensor-server[tls]" in out  # markup did not eat the extra
+        assert any(
+            "pip install 'biopb-tensor-server[tls]'" in line
+            for line in out.splitlines()
+        )  # ...and it is on one line, at 40 columns

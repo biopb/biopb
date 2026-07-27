@@ -108,8 +108,8 @@ def _resolve_flight_token(
     """Resolve the token the Flight (gRPC) server enforces, fail-closed on a
     public bind.
 
-    The flight bind (config ``server.host``, or a ``--host`` override) is the mode
-    switch: a loopback bind is **local mode** (tokenless, same-machine only); any
+    The flight bind (``--host``, loopback by default) is the mode switch: a
+    loopback bind is **local mode** (tokenless, same-machine only); any
     public bind is **remote mode** and MUST carry a token, so a public bind with
     none supplied auto-generates one rather than serving the data API open.
 
@@ -134,14 +134,14 @@ def _resolve_flight_token(
             console.print(
                 "[bold red]WARNING: token enforcement disabled "
                 "(BIOPB_TENSOR_ALLOW_NO_TOKEN) on a public flight bind "
-                f"(server.host={server_host}). The data API is served OPEN — "
+                f"(--host {server_host}). The data API is served OPEN — "
                 "only do this on a trusted network.[/bold red]"
             )
             return None
         generated = secrets.token_urlsafe(32)
         console.print(
             "[yellow]Auto-generated secure access token "
-            f"(server.host={server_host} is a public bind).[/yellow]"
+            f"(--host {server_host} is a public bind).[/yellow]"
         )
         return generated
     # Loopback flight bind, no token supplied: local mode.
@@ -162,7 +162,7 @@ def _resolve_launch_token(
     (``--web-host``). Because it re-exposes the whole data API, a **public sidecar
     with no enforced token** is exactly the "public + unauthenticated" combination
     the model makes unrepresentable — so it is refused rather than served open.
-    (This is the ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the
+    (This is the ``--web-host 0.0.0.0`` + loopback ``--host`` footgun: the
     token would otherwise resolve to ``None`` and the data API would bind public
     and open.)
 
@@ -194,7 +194,7 @@ def _resolve_launch_token(
             "The sidecar re-exposes the data API, so this would serve it "
             "unauthenticated to the network. Either bind it to loopback "
             "(--web-host 127.0.0.1), make the flight server public "
-            "(server.host) so a token is enforced across both listeners, or "
+            "(--host 0.0.0.0) so a token is enforced across both listeners, or "
             "set BIOPB_TENSOR_ALLOW_NO_TOKEN=1 to serve it open deliberately."
         )
         raise typer.Exit(1)
@@ -1070,9 +1070,9 @@ def serve(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
 
-    # The flight bind is the mode switch; --host overrides config, so resolve the
-    # token against the effective host. A public bind with no token auto-generates
-    # one (fail-closed) rather than serving the data API open.
+    # The flight bind is the mode switch, so resolve the token against it. A
+    # public bind with no token auto-generates one (fail-closed) rather than
+    # serving the data API open.
     effective_host = host
     effective_token = _resolve_flight_token(
         effective_host,
@@ -1357,7 +1357,7 @@ def launch(
     token: Optional[str] = typer.Option(
         None,
         "--token",
-        help="Access token (required when server.host is non-loopback; "
+        help="Access token (required when --host is non-loopback; "
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
@@ -1447,7 +1447,7 @@ def launch(
     _deathwatch.install()
 
     # --- Token management ---
-    # The flight bind (server.host, or a --host override) is the mode switch; the
+    # The flight bind (--host) is the mode switch; the
     # sidecar's own bind (--web-host) must never be public-and-unauthenticated.
     # _resolve_launch_token decides the enforced token fail-closed (and refuses a
     # public sidecar with no token). There is no separate dev flag.
