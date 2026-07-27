@@ -1557,7 +1557,9 @@ install_biopb() {
     else
         _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
     fi
-    _info "The agent launches biopb-mcp for you and a napari window opens."
+    _info "Then prompt it:"
+    _cmd "start biopb and report status"
+    _info "That brings up the napari viewer and the data plane."
     _info "Keep the agent session running while you work."
     echo ""
 
