@@ -88,6 +88,70 @@ def is_local_url(url: str) -> bool:
     return host is None or host in _LOCAL_HOSTS
 
 
+class LocalTrustError(RuntimeError):
+    """The local data plane's TLS certificate could not be used as a trust anchor.
+
+    A distinct type because :func:`connect_error_message` classifies failures by
+    *substring*, and the most likely cause here -- an unreadable cert file --
+    stringifies as ``[Errno 13] Permission denied: '<path>'``. That matches the
+    "permission denied" auth marker, so a file-permission problem would be
+    reported as "the server needs a token" and send the reader hunting for a
+    credential that has nothing to do with it. Matching on the type instead is
+    exact, and it cannot be broken by the wording of an errno string.
+    """
+
+
+def _local_ca(url: str) -> bytes | None:
+    """Explicit TLS trust anchor for a *local* data plane, read off local disk.
+
+    A loopback ``grpcs://`` plane is this machine's own, and the certificate it
+    serves is already on this machine's disk — so trust it directly instead of
+    pinning whatever the handshake presents (TOFU). An anchor read from local
+    disk is strictly stronger than one learned from the wire, and it keeps this
+    client out of the shared pin store, which would otherwise strand it the
+    moment an operator rotated the cert with ``cert init --force``. Same
+    reasoning, and the same cert, as the tensor server's own HTTP sidecar
+    (biopb/biopb#604).
+
+    Returns ``None`` — leaving TOFU in charge — for a plaintext endpoint or a
+    remote one, whose cert is not on this disk and cannot be.
+
+    Raises :class:`LocalTrustError` when a local plane is TLS but its cert is
+    unreadable.
+    That is deliberate: silently falling back to TOFU there would pin a cert we
+    were supposed to already know, trading a verified anchor for an unverified
+    one exactly where the strong option was meant to apply.
+
+    Known edge: a loopback ``grpcs://`` URL that is really a *tunnel* (``ssh -L``)
+    to a remote plane is indistinguishable from a local one by host alone, so it
+    is anchored on the local cert and the handshake fails. Loud and fixable
+    (point the tunnel at a non-loopback alias, or dial the plane directly), not
+    silent — but it is a real constraint on that setup.
+    """
+    if not url.lower().startswith("grpcs://") or not is_local_url(url):
+        return None
+
+    from biopb._locations import tls_server_cert
+
+    cert_path = tls_server_cert()
+    try:
+        pem = cert_path.read_bytes()
+    except OSError as exc:
+        raise LocalTrustError(
+            f"The local data plane at {url} serves TLS, but its certificate could "
+            f"not be read from {cert_path} ({exc}). A local plane is trusted from "
+            "its cert on disk, not by pinning it from the wire — so this is not "
+            "retried as trust-on-first-use. Check the state dir is the one the "
+            "server writes to (XDG_STATE_HOME), or re-mint the cert with "
+            "`biopb-tensor-server cert init`."
+        ) from exc
+    if not pem.strip():
+        raise LocalTrustError(
+            f"The local data plane's TLS certificate at {cert_path} is empty."
+        )
+    return pem
+
+
 # Substrings (lowercased) that mark a connect failure as an authentication
 # problem across the Flight/gRPC stacks, vs a plain "server is down".
 _AUTH_ERROR_MARKERS = (
@@ -116,7 +180,17 @@ def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
     (e.g. a GUI-entered token lost across a kernel restart) — so that case names
     the fix; an unreachable server gets a friendly hint; anything else echoes the
     underlying error so nothing is hidden.
+
+    Classification is by substring, which is why anything with an *exact* signal
+    is matched by type first (see :class:`LocalTrustError`) -- an errno string
+    that happens to contain a marker word would otherwise be misreported.
     """
+    # Before the substring scan: a LocalTrustError already carries an actionable
+    # message, and its most likely cause (an unreadable cert) contains the words
+    # "permission denied", which the auth markers below would otherwise claim.
+    if isinstance(exc, LocalTrustError):
+        return str(exc)
+
     text = f"{type(exc).__name__}: {exc}".strip()
     low = text.lower()
     if any(m in low for m in _AUTH_ERROR_MARKERS):
@@ -237,7 +311,7 @@ class TensorConnection:
         behave exactly as before (issue #12).
         """
         try:
-            client = TensorFlightClient(url, token=token)
+            client = TensorFlightClient(url, token=token, tls_ca_pem=_local_ca(url))
 
             # Advisory probe: any failure falls through to list_sources(),
             # which stays the authoritative connectivity test.

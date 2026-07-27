@@ -410,10 +410,16 @@ The auto-generated cert always carries `localhost`/`127.0.0.1`/`::1` SANs
 (`core.tls._host_identity`), so the loopback dial passes gRPC's name check; a BYO
 cert minted only for a public name does not, and must be re-minted to include one.
 
+Local clients of a TLS plane trust it the same way the sidecar does — the cert
+off local disk, not a TOFU pin (`biopb_mcp._connection._local_ca`), failing loudly
+if it is unreadable rather than degrading to pinning.
+
 **Still open (case 1 / control).** The admin UI has no TLS toggle, and a missing
 `[tls]` extra surfaces as a buried `tensor-server.log` crash rather than an
 actionable message in the browser. That needs a `find_spec("cryptography")`
-preflight ahead of the restart (biopb/biopb#604).
+preflight ahead of the restart (biopb/biopb#604). Token rotation is deliberately
+out of scope: the token is resolved once at `biopb control start`, so rotating it
+is a control-level operation, not something the plane's admin UI can offer.
 
 Startup sequence (`launch`):
 
