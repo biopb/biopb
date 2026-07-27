@@ -123,6 +123,25 @@ def _resolve_cache_bytes(location: str, requested: int) -> int:
     return requested if requested > 0 else 0
 
 
+_CACHE_LIMIT_DEFAULT = 1_000_000_000  # 1 GB strong (copy) cache when unset
+
+
+def _default_cache_bytes() -> int:
+    """Default strong (copy) chunk-cache budget for a client that doesn't pass
+    one. ``BIOPB_TENSOR_CACHE_LIMIT`` overrides, taking a size string with common
+    units (``"1GiB"``, ``"512MB"``, ``"2 GB"``) or a bare byte count; ``0``
+    disables the cache. An unparseable/empty value falls back to the built-in 1 GB
+    default. A ``cache_bytes`` passed to the constructor takes precedence over
+    this (the constructor resolves ``None`` -> this, anything else -> as given)."""
+    raw = os.environ.get("BIOPB_TENSOR_CACHE_LIMIT")
+    if raw is None or not raw.strip():
+        return _CACHE_LIMIT_DEFAULT
+    try:
+        return parse_bytes(raw)
+    except (ValueError, TypeError):
+        return _CACHE_LIMIT_DEFAULT
+
+
 @cache
 def _is_localhost_location(location: str) -> bool:
     """Check if location points to localhost.

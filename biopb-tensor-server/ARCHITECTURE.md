@@ -576,6 +576,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | Variable | Where consumed | Purpose |
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
+| `BIOPB_TENSOR_CACHE_LIMIT` | TensorFlightClient (Python) | Default client-side chunk-cache budget when the caller passes no `cache_bytes`; a size string with common units (`2GiB`, `512MB`) or a bare byte count (parsed via `dask.utils.parse_bytes`), `0` disables the cache. Unset/unparseable → 1 GB. A constructor `cache_bytes` overrides it. |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
 | `BIOPB_TENSOR_ALLOW_NO_TOKEN` | `serve`/`launch` token resolution (`_allow_no_token_from_env`) | Truthy (`1`/`true`/`yes`/`on`) forces **tokenless** operation even on a public bind — the deliberate insecure escape hatch (trusted networks only). Only takes effect when no token is supplied; auto-generation and the public-sidecar refusal both become a loud warning instead. Off by default, so the fail-closed guarantee is unchanged unless explicitly set. |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
