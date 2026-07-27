@@ -13,6 +13,7 @@ from biopb_mcp._tensor_utils import (
     add_tensor_layer,
     build_layer_scale,
     build_pyramid_levels,
+    get_samples_dim_index,
     get_xy_dim_indices,
     get_z_dim_index,
 )
@@ -364,6 +365,35 @@ class TestBuildPyramidCanonicalOrder:
         levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
         assert levels[0].shape == (3, 10, 64, 64)
 
+    def test_keeps_samples_axis_trailing(self):
+        # The biopb/biopb#596 case: [T, C, Z, Y, X, S] must stay [.., Y, X, S],
+        # NOT transpose S into a leading slider axis.
+        desc = _make_tensor_desc([1, 1, 1, 512, 512, 3], ["T", "C", "Z", "Y", "X", "S"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((1, 1, 1, 512, 512, 3))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (1, 1, 1, 512, 512, 3)
+
+    def test_moves_buried_samples_axis_to_the_end(self):
+        # [S, Y, X] -> [Z(=1), Y, X, S]: singleton Z is inserted ahead of Y/X
+        # and S stays strictly last.
+        desc = _make_tensor_desc([3, 64, 32], ["s", "y", "x"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (1, 64, 32, 3)
+
+    def test_size_three_channel_axis_is_not_treated_as_colour(self):
+        # [C, Y, X] with C=3 is a channel stack, not RGB -> C stays leading.
+        desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (3, 1, 64, 32)
+
     def test_uses_source_desc_labels_when_tensor_unlabeled(self):
         # Per-tensor labels missing -> fall back to the source descriptor's
         # labels for both the reorder and the (implicit) scale alignment.
@@ -376,6 +406,39 @@ class TestBuildPyramidCanonicalOrder:
             client, "src", "t1", desc, source_desc=source_desc, config=_CFG
         )
         assert levels[0].shape == (3, 1, 64, 32)
+
+
+class TestSamplesDimIndex:
+    """Interleaved RGB(A) samples axis detection -- label-gated on size 3/4, and
+    deliberately without a positional fallback (biopb/biopb#596)."""
+
+    def test_detects_rgb(self):
+        assert (
+            get_samples_dim_index([1, 1, 1, 8, 8, 3], ["T", "C", "Z", "Y", "X", "S"])
+            == 5
+        )
+
+    def test_detects_rgba(self):
+        assert (
+            get_samples_dim_index([1, 1, 1, 8, 8, 4], ["T", "C", "Z", "Y", "X", "S"])
+            == 5
+        )
+
+    def test_detects_samples_synonym_and_is_case_insensitive(self):
+        assert get_samples_dim_index([8, 8, 3], ["y", "x", "samples"]) == 2
+
+    def test_ignores_wrong_size(self):
+        # An "S" axis of 5 is not colour.
+        assert (
+            get_samples_dim_index([1, 1, 1, 8, 8, 5], ["T", "C", "Z", "Y", "X", "S"])
+            is None
+        )
+
+    def test_ignores_unlabeled_trailing_three(self):
+        # The whole point of label-gating: a 3-channel [C, Y, X] stack must not
+        # be rendered as false colour.
+        assert get_samples_dim_index([3, 8, 8], ["c", "y", "x"]) is None
+        assert get_samples_dim_index([8, 8, 3], None) is None
 
 
 def _make_physical_client(scale_vec=None, unit_vec=None, raises=False):
@@ -436,6 +499,21 @@ def test_build_layer_scale_maps_misordered_source_axes_by_label():
     assert scale == [1.0, 1.0, 0.25, 0.5]
     assert info["physical_size_y"] == 0.25
     assert info["physical_size_x"] == 0.5
+
+
+def test_build_layer_scale_rgb_drops_the_samples_axis():
+    # Canonical rgb output is [T, C, Z, Y, X, S] (ndim 6), but napari does not
+    # count S as a layer dimension -- layer.ndim is 5 and len(scale) must match.
+    client = _make_physical_client(
+        [0.0, 0.0, 2.0, 0.325, 0.325, 0.0],
+        ["", "", "µm", "µm", "µm", ""],
+    )
+    desc = _make_tensor_desc([1, 1, 10, 64, 64, 3], ["T", "C", "Z", "Y", "X", "S"])
+    scale, info = build_layer_scale(
+        client, "src", ndim=6, tensor_id="t1", tensor_desc=desc, rgb=True
+    )
+    assert scale == [1.0, 1.0, 2.0, 0.325, 0.325]
+    assert info["physical_size_x"] == 0.325
 
 
 def test_build_layer_scale_none_when_no_physical_sizes():
@@ -518,6 +596,36 @@ class TestAddTensorLayer:
         assert arr.shape == (3, 1, 64, 32)
         # Scale aligns to the canonical output: [c, z, y, x].
         assert kwargs["scale"] == [1.0, 1.0, 0.25, 0.5]
+
+    def test_interleaved_rgb_gets_rgb_kwarg_and_shorter_scale(self):
+        viewer = MagicMock()
+        client = _make_physical_client(
+            [0.0, 0.0, 0.0, 0.25, 0.5, 0.0], ["", "", "", "µm", "µm", ""]
+        )
+        client.get_tensor.return_value = da.zeros((1, 1, 1, 64, 32, 3))
+        desc = _make_tensor_desc([1, 1, 1, 64, 32, 3], ["T", "C", "Z", "Y", "X", "S"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+
+        arr = viewer.add_image.call_args[0][0]
+        _, kwargs = viewer.add_image.call_args
+        assert arr.shape == (1, 1, 1, 64, 32, 3)
+        assert kwargs["rgb"] is True
+        # napari's layer.ndim is data.ndim - 1 for rgb, and scale must match it.
+        assert len(kwargs["scale"]) == arr.ndim - 1
+        assert kwargs["scale"] == [1.0, 1.0, 1.0, 0.25, 0.5]
+
+    def test_non_rgb_leaves_rgb_unset(self):
+        # napari's own auto-detection must keep applying to unlabelled data.
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((256, 256))
+        desc = _make_tensor_desc([256, 256], ["y", "x"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+
+        _, kwargs = viewer.add_image.call_args
+        assert "rgb" not in kwargs
 
 
 class TestOriginInitialView:
