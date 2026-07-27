@@ -105,6 +105,48 @@ def test_generate_without_cryptography_raises_actionable(monkeypatch):
         generate_self_signed_cert(["localhost"], ["127.0.0.1"])
 
 
+def test_cert_init_without_cryptography_advises_cleanly(monkeypatch):
+    """`cert init` without the extra exits non-zero with advice, not a traceback."""
+    import sys
+
+    from biopb_tensor_server.cli import app
+
+    monkeypatch.setitem(sys.modules, "cryptography", None)
+    result = CliRunner().invoke(app, ["cert", "init"])
+    assert result.exit_code == 2
+    assert "biopb-tensor-server[tls]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_serve_tls_without_cryptography_exits_cleanly(monkeypatch):
+    """`serve --tls` (auto-gen) without the extra raises a clean typer.Exit."""
+    import sys
+
+    import typer
+    from biopb_tensor_server.cli import _resolve_tls_material
+
+    monkeypatch.setitem(sys.modules, "cryptography", None)
+    with pytest.raises(typer.Exit):
+        _resolve_tls_material(True, None, None)
+
+
+def test_byo_cert_needs_no_cryptography(tmp_path, monkeypatch):
+    """--tls-cert/--tls-key read files directly -- the crypto-free escape hatch."""
+    import sys
+
+    from biopb_tensor_server.cli import _resolve_tls_material
+    from biopb_tensor_server.core.tls import generate_self_signed_cert
+
+    cert_pem, key_pem = generate_self_signed_cert(["localhost"], ["127.0.0.1"])
+    cf, kf = tmp_path / "c.pem", tmp_path / "k.pem"
+    cf.write_bytes(cert_pem)
+    kf.write_bytes(key_pem)
+
+    monkeypatch.setitem(sys.modules, "cryptography", None)  # extra absent
+    cert, key = _resolve_tls_material(False, cf, kf)
+    assert cert == cert_pem and key == key_pem
+
+
 # --- CLI: cert init ---------------------------------------------------------
 
 

@@ -351,10 +351,23 @@ kept out of the default install closure: it drags a Rust/OpenSSL build surface
 with no recent Intel-macOS wheel that broke `curl install.sh | bash` there
 (biopb/biopb#355, which *dropped* the transitive dep). So TLS *serving* opts in
 (`pip install 'biopb-tensor-server[tls]'`; `serve --tls`/`cert init` raise an
-actionable error if it is absent), while the SDK client's TOFU pinning
-(`biopb.tensor._tls`) is stdlib-`ssl` only and needs nothing extra. `--tls` is on
-`serve` only for now; `launch` (the HTTP-sidecar path) and the control-supervised
-plane are a follow-up.
+actionable error if it is absent — cleanly, not as a traceback), while the SDK
+client's TOFU pinning (`biopb.tensor._tls`) is stdlib-`ssl` only and needs nothing
+extra. A **BYO cert** (`--tls-cert`/`--tls-key`) is read straight off disk and
+needs no `cryptography` at all — the escape hatch when the extra isn't installed.
+
+**Switching an installed (non-`[tls]`) deployment to remote TLS:**
+`pip install 'biopb-tensor-server[tls]'`, then `serve --tls --host 0.0.0.0`
+(the public bind auto-generates a token; print it once). Clients connect
+`grpcs://<host>:8815` with that token and TOFU-pin the cert. Skip the install and
+bring a cert via `--tls-cert`/`--tls-key` instead.
+
+**Caveat — not yet config-driven.** `--tls` is on `serve` only. The
+control-supervised data plane runs `launch` (`_supervisor.py`) with no `--tls`,
+and there is **no TLS config field**, so editing config in the admin UI and
+restarting does **not** enable TLS today. Wiring TLS into `launch` + config + the
+supervisor — and surfacing the missing-`[tls]` error in the admin UI rather than a
+buried `tensor-server.log` crash — is the case-1 / control follow-up (biopb/biopb#604).
 
 Startup sequence (`launch`):
 

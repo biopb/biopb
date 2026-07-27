@@ -488,6 +488,8 @@ def _resolve_tls_material(
         console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
         raise typer.Exit(code=2)
 
+    # A BYO cert (both files given) is read straight off disk -- no `cryptography`
+    # needed, so this is the escape hatch when the [tls] extra isn't installed.
     if tls_cert is not None:
         return tls_cert.read_bytes(), tls_key.read_bytes()
 
@@ -496,7 +498,13 @@ def _resolve_tls_material(
 
     from biopb_tensor_server.core.tls import cert_fingerprint, ensure_server_cert
 
-    cert_pem, key_pem = ensure_server_cert()
+    try:
+        cert_pem, key_pem = ensure_server_cert()
+    except RuntimeError as e:
+        # cryptography (the [tls] extra) is absent -- surface the actionable
+        # message cleanly and exit, rather than dumping a traceback.
+        console.print(f"[red]{_rich_escape(str(e))}[/red]")
+        raise typer.Exit(code=2) from None
     console.print(
         "[green]TLS enabled[/green] (self-signed, cert "
         f"{tls_server_cert()}, fingerprint {cert_fingerprint(cert_pem)[:16]})"
@@ -526,7 +534,12 @@ def cert_init(
     from biopb_tensor_server.core.tls import cert_fingerprint, ensure_server_cert
 
     existed = tls_server_cert().exists() and tls_server_key().exists()
-    cert_pem, _ = ensure_server_cert(regenerate=force)
+    try:
+        cert_pem, _ = ensure_server_cert(regenerate=force)
+    except RuntimeError as e:
+        # The [tls] extra (cryptography) is not installed -- advise, don't crash.
+        console.print(f"[red]{_rich_escape(str(e))}[/red]")
+        raise typer.Exit(code=2) from None
 
     if existed and not force:
         console.print(
