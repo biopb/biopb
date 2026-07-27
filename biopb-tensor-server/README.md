@@ -109,11 +109,43 @@ curl -fsSL https://biopb.org/install.sh | bash
 biopb control start
 ```
 
-### Docker
+### Docker — the remote data server
 
-The image is a **Flight-only data plane**: one gRPC port, no HTTP surface. Browse
-its data from a machine running the full biopb stack, which mounts it as a remote
-source.
+Docker is the standard way to run a **remote, headless data server**: the image
+is a Flight-only data plane (one gRPC port, no HTTP surface, no browser origin),
+so a lab file server needs nothing but Docker and the data.
+
+```bash
+docker run -d --restart unless-stopped \
+    --name biopb-tensor \
+    -p 8815:8815 \
+    -v ${YOUR_DATA_LOCATION}:/data \
+    -v biopb-state:/root/.local/state \
+    -e BIOPB_TENSOR_TLS=1 \
+    jiyuuchc/biopb-tensor-server:latest
+
+docker logs biopb-tensor    # copy the access token, printed once
+```
+
+`BIOPB_TENSOR_TLS=1` serves TLS with a self-signed cert the server mints itself —
+**no CA to distribute**; clients pin it on first connect (TOFU). The public bind
+auto-generates an access token. The state volume keeps the cert stable across
+container recreates.
+
+Then, from your own machine, add it as a source in your `biopb.json` and browse
+it in the usual UI:
+
+```json
+{ "sources": [
+    { "type": "tensor-server", "url": "grpcs://data.mylab.example:8815" }
+] }
+```
+
+Pass the server's token to your own stack as `BIOPB_UPSTREAM_TENSOR_TOKEN`. Your
+browser only ever talks to your own loopback control, so it never has to trust
+the server's certificate.
+
+For a **single-machine** setup, publish to loopback and skip both:
 
 ```bash
 docker run -d --rm \
@@ -124,28 +156,10 @@ docker run -d --rm \
     jiyuuchc/biopb-tensor-server:latest
 ```
 
-The port is published to host loopback only (`127.0.0.1`), so
-`BIOPB_TENSOR_ALLOW_NO_TOKEN=1` runs it without an access token for a
-single-machine setup. Drop that env var to have the container auto-generate a
-token (printed in `docker logs biopb-tensor`); do so whenever the port is
-reachable from other hosts — and add `-e BIOPB_TENSOR_TLS=1` to encrypt the
-wire (clients then dial `grpcs://`).
-
-Or use a custom config file:
-
-```bash
-docker run -d --rm \
-    --name biopb-tensor \
-    -p 127.0.0.1:8815:8815 \
-    -v ~/biopb.json:/biopb.json \
-    -v ${YOUR_DATA_LOCATION}:/data \
-    -e CONFIG_FILE=/biopb.json \
-    -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
-    jiyuuchc/biopb-tensor-server:latest
-```
-
-The FastAPI HTTP sidecar (port 8814) is off by default; set
-`BIOPB_ENABLE_HTTP_SIDECAR=1` and publish 8814 to get it back.
+Add `-v ~/biopb.json:/biopb.json -e CONFIG_FILE=/biopb.json` to either form to
+supply a full config instead of the env-var defaults. The FastAPI HTTP sidecar
+(port 8814) is off by default; set `BIOPB_ENABLE_HTTP_SIDECAR=1` and publish 8814
+to get it back.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 

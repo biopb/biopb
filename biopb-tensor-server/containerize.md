@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container is a **headless, Flight-only data plane** — `biopb-tensor-server serve` runs directly as PID 1:
+This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. **The container is the standard shape for a remote data server** — a machine that serves data to other machines and runs no UI of its own. It is a **headless, Flight-only data plane**: `biopb-tensor-server serve` runs directly as PID 1.
 
 - **TensorFlightServer** (gRPC on port 8815) — Arrow Flight server for tensor data. **The only listener.**
 - **HTTP sidecar** (port 8814) — the FastAPI data-plane API is **off by default**; set `BIOPB_ENABLE_HTTP_SIDECAR=1` to serve it (the container then runs `launch` instead).
@@ -16,6 +16,71 @@ container's cert. See biopb/biopb#604.
 
 ## Docker Usage
 
+**The container is the standard way to run a remote data server.** The default
+below is a full remote deployment — public bind, TLS, access token — on a machine
+that only needs Docker and the data:
+
+```bash
+docker run -d --restart unless-stopped \
+    --name biopb-tensor \
+    -p 8815:8815 \
+    -v ${YOUR_DATA_DIR}:/data \
+    -v biopb-state:/root/.local/state \
+    -e BIOPB_TENSOR_TLS=1 \
+    biopb-tensor-server:latest
+
+docker logs biopb-tensor    # copy the generated access token, printed once
+```
+
+> replace `${YOUR_DATA_DIR}` with a real path on that machine
+
+That is the whole server side. The container binds `0.0.0.0`, so it
+auto-generates an access token (fail-closed: a public bind is never left open),
+and `BIOPB_TENSOR_TLS=1` serves Flight over TLS with a **self-signed** cert it
+mints on first use. There is **no CA to distribute** — clients pin the cert on
+first connect (TOFU, the SSH host-key model).
+
+From any machine running the full biopb stack, mount it as a remote source in
+that machine's `biopb.json` and hand it the token:
+
+```json
+{ "sources": [
+    { "type": "tensor-server", "url": "grpcs://data.mylab.example:8815" }
+] }
+```
+
+```bash
+BIOPB_UPSTREAM_TENSOR_TOKEN=<the token from docker logs> biopb control start
+```
+
+The container's catalog then shows up in your own dataviewer/napari session, and
+reads stream `your machine → container`, cached locally. Your browser only ever
+talks to your own loopback control, so it never has to trust the container's
+certificate — the first `grpcs://` connection pins it (TOFU) and every later one
+verifies against that pin.
+
+> `BIOPB_UPSTREAM_TENSOR_TOKEN` is one token for one upstream. Mounting several
+> upstreams with *different* credentials needs per-source credentials — tracked as
+> biopb/biopb#604 item 4.
+
+> **Mount the state dir.** The generated cert lives at
+> `/root/.local/state/biopb/tls/`. Without the volume above it is lost on
+> `docker rm`, and the next container mints a *different* cert — which every
+> client that pinned the old one will refuse (by design). `-e XDG_STATE_HOME=/state`
+> with `-v biopb-state:/state` works too.
+
+To serve a certificate you already have, mount it and point `BIOPB_TLS_CERT` /
+`BIOPB_TLS_KEY` at the in-container paths instead — no state volume needed.
+
+TLS and `BIOPB_ENABLE_HTTP_SIDECAR` are mutually exclusive today: the sidecar's
+internal client does not yet speak TLS to the Flight server, so the entrypoint
+refuses that combination rather than silently serving plaintext.
+
+### Single machine (no network exposure)
+
+If the data and the browser are on the *same* box, publish to host loopback and
+skip both TLS and the token:
+
 ```bash
 docker run -d --rm \
     --name biopb-tensor \
@@ -25,45 +90,10 @@ docker run -d --rm \
     biopb-tensor-server:latest
 ```
 
-> replace `${YOUR_DATA_DIR}` with a real path on your computer
-
-> The container binds `0.0.0.0` internally, so by default it auto-generates an
-> access token (printed in `docker logs biopb-tensor`). Because the port above
-> is published to host loopback only (`127.0.0.1`), `BIOPB_TENSOR_ALLOW_NO_TOKEN=1`
-> opts out of that and serves the data API without a token — convenient for a
-> single-machine setup. Drop it (and grab the logged token) if the port is
-> reachable from other hosts.
-
-### TLS (remote deployment)
-
-For a container reachable beyond loopback, serve Flight over TLS. The server
-mints a **self-signed** cert on first use and clients pin it on first connect
-(TOFU) — there is no CA to distribute:
-
-```bash
-docker run -d --rm \
-    --name biopb-tensor \
-    -p 8815:8815 \
-    -v ${YOUR_DATA_DIR}:/data \
-    -v biopb-state:/root/.local/state \
-    -e BIOPB_TENSOR_TLS=1 \
-    biopb-tensor-server:latest
-```
-
-Clients dial `grpcs://<host>:8815` with the token from the logs.
-
-> **Mount the state dir.** The generated cert lives at
-> `/root/.local/state/biopb/tls/`. Without a volume there it is lost on `docker rm`,
-> and the next container mints a *different* cert — which every client that pinned
-> the old one will refuse (by design). The volume above (or `-e XDG_STATE_HOME=/state`
-> with `-v biopb-state:/state`) keeps the identity stable.
-
-To serve a certificate you already have, mount it and point `BIOPB_TLS_CERT` /
-`BIOPB_TLS_KEY` at the in-container paths instead — no state volume needed.
-
-TLS and `BIOPB_ENABLE_HTTP_SIDECAR` are mutually exclusive today: the sidecar's
-internal client does not yet speak TLS to the Flight server, so the entrypoint
-refuses that combination rather than silently serving plaintext.
+The container always binds `0.0.0.0` internally, so `BIOPB_TENSOR_ALLOW_NO_TOKEN=1`
+is what opts out of the auto-generated token; that is safe **only** because
+`-p 127.0.0.1:` keeps the port off the network. Drop it (and grab the logged
+token) the moment the port is reachable from another host.
 
 ### Environment Variables
 
@@ -112,10 +142,22 @@ docker run \
 ### More examples
 
 ```bash
-# Public server (with an access token) with custom base port (BIOPB_BASE_PORT=9000 -> gRPC=9005)
+# Remote server on a custom base port (BIOPB_BASE_PORT=9000 -> gRPC=9005),
+# with a token you chose instead of the generated one
 docker run -d -p 9005:9005 \
     -v ~/data:/data \
+    -v biopb-state:/root/.local/state \
     -e BIOPB_BASE_PORT=9000 \
+    -e BIOPB_TENSOR_TLS=1 \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server:latest
+
+# Remote server with a certificate you already have (no state volume needed)
+docker run -d -p 8815:8815 \
+    -v ~/data:/data \
+    -v ~/certs:/certs:ro \
+    -e BIOPB_TLS_CERT=/certs/server.pem \
+    -e BIOPB_TLS_KEY=/certs/server-key.pem \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
@@ -211,9 +253,13 @@ the container, where `BIOPB_TENSOR_TOKEN` is set:
 
 ```bash
 docker exec biopb-tensor python -c \
-  "from biopb.tensor import TensorFlightClient as C; \
-   print(C('grpc://localhost:8815').health_check()['status'])"
+  "import os; from biopb.tensor import TensorFlightClient as C; \
+   print(C('grpc://localhost:8815', token=os.environ.get('BIOPB_TENSOR_TOKEN')).health_check()['status'])"
 ```
+
+> The SDK client does not read `BIOPB_TENSOR_TOKEN` on its own — pass it, as
+> above, or the call is unauthenticated (which is what you want in tokenless
+> mode, where `token=None`).
 
 > `docker exec` sees the environment the container was **started** with, so this
 > works when you pass `-e BIOPB_TENSOR_TOKEN=...` (or run tokenless). With an
