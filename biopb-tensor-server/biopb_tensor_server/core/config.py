@@ -11,7 +11,6 @@ JSON is the only supported format; a pre-#34 ``biopb.toml`` is converted with
 Example config (explicit):
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "sources": [
     {
       "type": "zarr",
@@ -28,7 +27,6 @@ Example config (explicit):
 Example config (relaxed auto-discovery):
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "sources": [
     { "url": "/data/" },
     { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images" }
@@ -41,7 +39,6 @@ needs an explicit ``type`` + ``dataset`` (it is not auto-detected).
 Example config (remote storage):
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "credentials": {
     "default_profile": "aws-prod",
     "profiles": [
@@ -238,11 +235,6 @@ _CONSTRAINTS = {
         "query_timeout_ms": _Range(min=1),
     },
     "ServerConfig": {
-        # 0 is not a typo-shaped value here: it is the "let the OS assign an
-        # ephemeral port" sentinel the flight server binds on (used by the test
-        # harness and by anyone running two planes on one box), so the floor is
-        # 0, not 1. Above 65535 there is no such reading -- that is a typo.
-        "port": _Range(min=0, max=65535),
         "log_level": _Enum(
             {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
         ),
@@ -647,40 +639,23 @@ class ServerConfig:
     source the config JSON Schema reads (see ``config_schema.py``). The nested
     section objects (``cache``/``pyramid``/``precache``/``credentials``/
     ``metadata_db``) and ``sources`` document themselves.
+
+    **The network bind is deliberately not here** (biopb/biopb#604). ``host``,
+    ``port``, ``tls``, ``tls_cert`` and ``tls_key`` used to live in this section
+    and now come only from the CLI (``serve``/``launch`` flags, which the control
+    passes explicitly when it spawns the plane). This file answers *what to
+    serve* -- sources, cache, pyramid, credentials -- while *where and how to
+    expose it* is a deployment decision owned by whoever starts the process. The
+    sidecar's own bind (``--web-host``/``--web-port``) was always CLI-only; this
+    just makes the flight plane consistent with it.
+
+    Two things fall out. The control cannot hold a stale view of a bind it
+    dictated, so a port edited underneath it can no longer wedge its liveness
+    probe. And "public + tokenless" stops being a config state that has to be
+    *validated* against and becomes unrepresentable: the flag that binds publicly
+    (``--remote``) is the same one that requires a token.
     """
 
-    host: str = field(
-        default="0.0.0.0",
-        metadata={
-            "help": "Address the Flight gRPC server binds. Loopback (127.0.0.1) "
-            "is local mode; a public address requires a token (remote mode)."
-        },
-    )
-    port: int = field(
-        default=8815,
-        metadata={"help": "TCP port for the Flight gRPC data-plane server."},
-    )
-    tls: bool = field(
-        default=False,
-        metadata={
-            "help": "Serve the Flight plane over TLS using the self-signed "
-            "certificate in the state dir (generated on first use). Clients dial "
-            "grpcs:// and pin the cert on first connect. Requires the 'tls' extra "
-            "(cryptography); ignored when tls_cert/tls_key are set."
-        },
-    )
-    tls_cert: Optional[Path] = field(
-        default=None,
-        metadata={
-            "help": "PEM certificate chain to serve instead of the self-signed "
-            "one (requires tls_key). Read straight off disk, so this is the TLS "
-            "path that does not need the 'tls' extra."
-        },
-    )
-    tls_key: Optional[Path] = field(
-        default=None,
-        metadata={"help": "PEM private key paired with tls_cert."},
-    )
     log_level: str = field(
         default="INFO",
         metadata={"help": "Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL)."},
@@ -1061,11 +1036,54 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
             continue
         if not isinstance(value, dict):
             continue
-        _warn_extra_keys(value, section_keys.get(section, set()), section)
+        known = section_keys.get(section, set())
+        if section == "server":
+            # The retired bind keys get their own, far more actionable message
+            # from _warn_retired_bind_keys; suppress the generic "unknown key"
+            # line so it does not bury that one.
+            known = known | set(_RETIRED_BIND_KEYS)
+        _warn_extra_keys(value, known, section)
         if section == "credentials":
             for prof in value.get("profiles", []) or []:
                 if isinstance(prof, dict):
                     _warn_extra_keys(prof, profile_keys, "credentials.profiles")
+
+
+# Bind/TLS keys that used to live in [server] and are now CLI-only
+# (biopb/biopb#604). Mapped to the flag that replaced each one.
+_RETIRED_BIND_KEYS = {
+    "host": "--host",
+    "port": "--port",
+    "tls": "--tls",
+    "tls_cert": "--tls-cert",
+    "tls_key": "--tls-key",
+}
+
+
+def _warn_retired_bind_keys(server_data: Dict[str, Any]) -> None:
+    """Warn — loudly — for a ``[server]`` bind key that is no longer read.
+
+    Ignoring these silently would be the worst possible break: a config saying
+    ``"host": "0.0.0.0"`` was someone's *remote* deployment, and quietly moving it
+    to the loopback default would take their server off the network with no
+    signal. So the message names the exact flag that replaces the key, and it is
+    a warning rather than a hard error because a config is often shared across
+    hosts that have already migrated their launch command.
+    """
+    if not isinstance(server_data, dict):
+        return
+    for key in _RETIRED_BIND_KEYS:
+        if server_data.get(key) is None:
+            continue
+        logger.warning(
+            "Config key `server.%s` is no longer read and is IGNORED: the "
+            "network bind moved to the command line (biopb/biopb#604). Pass "
+            "`%s` to `biopb-tensor-server serve/launch`, or -- under the control "
+            "plane -- use `biopb control start [--remote] [--tls]`, which passes "
+            "it down. Remove the key to silence this.",
+            key,
+            _RETIRED_BIND_KEYS[key],
+        )
 
 
 def _carry(
@@ -1135,13 +1153,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     # every default.
     server_data = data.get("server", {})
     server_kwargs: Dict[str, Any] = {}
-    _carry(server_kwargs, "host", server_data)
-    _carry(server_kwargs, "port", server_data)
-    _carry(server_kwargs, "tls", server_data, cast=bool)
-    # Cert/key are paths on the wire; a falsy value means "unset" -> the default.
-    for _tls_key in ("tls_cert", "tls_key"):
-        if server_data.get(_tls_key):
-            server_kwargs[_tls_key] = Path(server_data[_tls_key])
+    _warn_retired_bind_keys(server_data)
     _carry(server_kwargs, "log_level", server_data)
     _carry(server_kwargs, "log_scope_to_biopb", server_data)
 

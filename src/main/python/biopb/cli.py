@@ -344,11 +344,9 @@ def _reject_legacy_toml(config: Path) -> None:
     """Refuse to start on a pre-#34 ``biopb.toml``, naming the migration command.
 
     The server no longer reads TOML (biopb/biopb#34), and every config probe on
-    the start path is best-effort (an unreadable config silently falls back to
-    defaults -- ``_read_flight_host`` even fails *closed* to a public bind). So a
-    legacy config would otherwise surface as an unrelated "public bind needs a
-    token" refusal, or as a plane that starts on defaults and serves none of the
-    user's data. Check it once, up front, where the user can act on it.
+    the start path is best-effort, so a legacy config would otherwise surface as
+    a plane that starts on defaults and serves none of the user's data. Check it
+    once, up front, where the user can act on it.
     """
     if config and config.suffix.lower() == ".toml" and config.exists():
         console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
@@ -360,22 +358,23 @@ def _reject_legacy_toml(config: Path) -> None:
         raise typer.Exit(1)
 
 
-def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
-    """Loopback-reachable gRPC host/port from the config (default
-    127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
-    the returned host is always something connect()-able locally."""
-    host, port = "127.0.0.1", 8815
-    if config and config.exists():
-        try:
-            from biopb_tensor_server.core.config import (
-                load_config as _load_server_config,
-            )
+def _plane_bind(remote: bool) -> Tuple[str, int]:
+    """The flight plane's bind, decided by the deployment mode alone.
 
-            cfg = _load_server_config(config)
-            host = cfg.host or host
-            port = int(cfg.port or port)
-        except Exception:
-            pass
+    ``--remote`` binds every public listener; the default binds loopback. This
+    used to be read out of ``biopb.json`` (``server.host``), which made the mode
+    a *property of a file* the control snapshotted at startup -- so a config edit
+    could silently disagree with the running plane, and "local mode" was public
+    whenever the config said so. Deriving it from the flag makes the two
+    inseparable: the switch that exposes the plane is the same one that requires
+    a token (biopb/biopb#604).
+    """
+    return ("0.0.0.0" if remote else "127.0.0.1", _DEFAULT_FLIGHT_PORT)
+
+
+def _probe_hostport(remote: bool) -> Tuple[str, int]:
+    """Loopback-reachable form of :func:`_plane_bind`, for health probes."""
+    host, port = _plane_bind(remote)
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
     return host, port
@@ -384,11 +383,11 @@ def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
 def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
     """Best-effort gRPC endpoint + token for a running server's health query.
 
-    Reads host/port from the config (defaults 127.0.0.1:8815); a server
-    bound to 0.0.0.0/:: is reached over loopback. The token comes from
-    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
+    Always loopback: a plane bound to 0.0.0.0/:: is reachable there too, and
+    these probes only ever ask about a plane on this machine. The token comes
+    from BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
     """
-    host, port = _resolve_grpc_hostport(config)
+    host, port = _probe_hostport(remote=False)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
     return f"grpc://{host}:{port}", token
 
@@ -901,28 +900,10 @@ def _control_start_lock() -> Path:
 
 
 _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
+_DEFAULT_FLIGHT_PORT = 8815
 
 
-def _read_flight_host(config: Path) -> str:
-    """The flight (gRPC) server's configured bind address (``server.host``).
-
-    Defaults to ``0.0.0.0`` when the config can't be read, so an unreadable
-    config is treated as a *public* bind — the fail-closed direction.
-    """
-    grpc_host = "0.0.0.0"
-    if config.exists():
-        try:
-            from biopb_tensor_server.core.config import (
-                load_config as _load_server_config,
-            )
-
-            grpc_host = _load_server_config(config).host
-        except Exception:
-            pass
-    return grpc_host
-
-
-def _resolve_mode(config: Path, remote: bool, token: Optional[str]) -> Optional[str]:
+def _resolve_mode(remote: bool, token: Optional[str]) -> Optional[str]:
     """Resolve the data-plane token for the chosen deployment mode.
 
     Token enforcement is **independent** of the network mode: a token may be
@@ -934,18 +915,18 @@ def _resolve_mode(config: Path, remote: bool, token: Optional[str]) -> Optional[
 
     - **Local** (default): every listener binds loopback. A token is *optional*;
       when one is supplied it is enforced (the browser then gates behind the
-      unlock page, same as remote). Fail-closed: a config that binds the flight
-      server publicly (``server.host`` non-loopback) with **no** token is refused,
-      because that would expose data on the network without auth.
+      unlock page, same as remote).
     - **Remote** (``--remote``): the flight server + control bind publicly, so a
       token is **required** — supplied, or else generated and printed.
+
+    There is no longer a "config binds publicly but no token" case to refuse: the
+    bind comes from ``remote`` itself (see :func:`_plane_bind`), so the only way
+    to bind publicly is the flag that also demands a token. Fail-closed by
+    construction rather than by validation (biopb/biopb#604).
 
     Returns the token to enforce (``None`` only when none is supplied in local
     mode).
     """
-    grpc_host = _read_flight_host(config)
-    flight_public = grpc_host not in _LOCALHOST_ADDRS
-
     token = token or os.environ.get("BIOPB_TENSOR_TOKEN")
     if token:
         # Validate here with the shared rule the tensor `launch` applies, so the
@@ -962,24 +943,12 @@ def _resolve_mode(config: Path, remote: bool, token: Optional[str]) -> Optional[
             raise typer.Exit(1)
         return token
 
-    # No token supplied.
     if remote:
         import secrets as _secrets
 
         token = _secrets.token_urlsafe(32)
         console.print(f"[bold green]Generated access token:[/bold green] {token}")
         return token
-
-    # Local mode, tokenless — must not expose data on the network without auth.
-    if flight_public:
-        console.print(
-            f"[red]The flight server config binds publicly (server.host="
-            f"{grpc_host}), but no token would be enforced.[/red] "
-            "Pass [bold]--token[/bold] (or set BIOPB_TENSOR_TOKEN) to enforce one, "
-            "start with [bold]--remote[/bold], or set server.host to a loopback "
-            "address (127.0.0.1)."
-        )
-        raise typer.Exit(1)
     return None
 
 
@@ -1006,6 +975,7 @@ def _control_run_argv(
     log_level: str,
     data_plane: bool,
     remote: bool,
+    tls: bool = False,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -1022,7 +992,7 @@ def _control_run_argv(
     (0.0.0.0) so the browser UI is reachable off-box, while the local (default)
     mode keeps every listener on loopback.
     """
-    grpc_host, grpc_port = _resolve_grpc_hostport(config)
+    grpc_host, grpc_port = _plane_bind(remote)
     control_host, control_port = _control_endpoint()
     # Remote mode: bind the control's HTTP listener on all interfaces so the
     # dashboard/dataviewer is reachable off-box (the token gates it). The starter
@@ -1062,6 +1032,8 @@ def _control_run_argv(
         argv.append("--no-data-plane")
     if remote:
         argv.append("--remote")
+    if tls:
+        argv.append("--tls")
     return argv
 
 
@@ -1086,6 +1058,14 @@ def control_start(
         "and the flight server publicly, and require an access token. Without it "
         "(the default) every listener binds loopback; a token is optional (pass "
         "--token to enforce one).",
+    ),
+    tls: bool = typer.Option(
+        False,
+        "--tls",
+        help="Serve the data plane's flight port over TLS with a self-signed "
+        "certificate (generated on first use); clients dial grpcs:// and pin it "
+        "on first connect. Requires the 'tls' extra; read the fingerprint with "
+        "`biopb-tensor-server cert init`.",
     ),
     token: Optional[str] = typer.Option(
         None,
@@ -1119,9 +1099,10 @@ def control_start(
     optional defense-in-depth gate on a shared machine); and **remote**
     (``--remote``) binds the control's browser UI and the flight server publicly
     behind a *required* token, for serving a tensor deployment to other machines.
-    The tensor HTTP sidecar always stays on loopback (the control proxies it),
-    and the flight server's bind comes from the config's ``server.host`` — local
-    mode refuses to start if that is non-loopback and no token is enforced.
+    The tensor HTTP sidecar always stays on loopback (the control proxies it).
+    The flight server's bind follows this flag alone — it is no longer read from
+    ``biopb.json`` — so "public but unauthenticated" is unrepresentable rather
+    than something to validate against (biopb/biopb#604).
     """
     _require_biopb_control()
     _ensure_dirs()
@@ -1164,7 +1145,7 @@ def control_start(
             # crash-loop on EADDRINUSE. Skipped for --no-data-plane (the plane comes
             # up on demand, guarded there too).
             if data_plane:
-                grpc_host, grpc_port = _resolve_grpc_hostport(config)
+                grpc_host, grpc_port = _probe_hostport(remote)
                 if _port_listening(grpc_host, grpc_port):
                     console.print(
                         f"[red]Data-plane gRPC port {grpc_host}:{grpc_port} is already "
@@ -1178,7 +1159,7 @@ def control_start(
                     )
                     raise typer.Exit(1)
 
-            resolved_token = _resolve_mode(config, remote, token)
+            resolved_token = _resolve_mode(remote, token)
             argv = _control_run_argv(
                 config=config,
                 static_dir=static_dir,
@@ -1189,6 +1170,7 @@ def control_start(
                 log_level=log_level,
                 data_plane=data_plane,
                 remote=remote,
+                tls=tls,
             )
 
             log_file = _control_log_file()
@@ -1384,6 +1366,14 @@ def control_run(
         "publicly). Without it every listener binds loopback; a token is optional "
         "(pass --token to enforce one).",
     ),
+    tls: bool = typer.Option(
+        False,
+        "--tls",
+        help="Serve the data plane's flight port over TLS with a self-signed "
+        "certificate (generated on first use); clients dial grpcs:// and pin it "
+        "on first connect. Requires the 'tls' extra; read the fingerprint with "
+        "`biopb-tensor-server cert init`.",
+    ),
     token: Optional[str] = typer.Option(
         None,
         "--token",
@@ -1412,9 +1402,9 @@ def control_run(
     from biopb_control import run_control
     from biopb_control._supervisor import DataPlaneSpec
 
-    grpc_host, grpc_port = _resolve_grpc_hostport(config)
+    grpc_host, grpc_port = _plane_bind(remote)
     control_host, control_port = _control_endpoint()
-    resolved_token = _resolve_mode(config, remote, token)
+    resolved_token = _resolve_mode(remote, token)
     # Remote mode binds the control's own listener publicly so the browser UI is
     # reachable off-box; the token gates it. The sidecar always stays on loopback.
     if remote:
@@ -1423,6 +1413,7 @@ def control_run(
         config=config,
         grpc_host=grpc_host,
         grpc_port=grpc_port,
+        tls=tls,
         web_host="127.0.0.1",
         web_port=web_port,
         static_dir=static_dir if (static_dir and static_dir.exists()) else None,

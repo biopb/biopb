@@ -139,7 +139,7 @@ def test_installer_default_config_validates(validator):
     data dir) or unmonitored (the static, seeded sample bundle).
     """
     base = {
-        "server": {"host": "127.0.0.1", "port": 8815, "aggressive_dir_pruning": True},
+        "server": {"log_level": "INFO", "aggressive_dir_pruning": True},
         "cache": {
             "backend": "file",
             "file_max_segment_mb": 256,
@@ -158,8 +158,7 @@ def test_installer_default_config_validates(validator):
         {"pyramid": {"downscale_factor": 2}},  # boundary (min)
         {"precache": {"backlog_high_water": 0.0}},  # boundary (min)
         {"precache": {"backlog_high_water": 1.0}},  # boundary (max)
-        {"server": {"port": 65535}},  # boundary (max)
-        {"server": {"port": 0}},  # ephemeral-port sentinel, not a typo
+        {"metadata_db": {"query_timeout_ms": 1}},  # boundary (min)
         {"server": {"log_level": "info"}},  # case-insensitive enum stays lenient
         {"cache": {"backend": "memory"}},
         {"sources": [{"url": "/d", "type": "ome-zarr"}]},
@@ -176,8 +175,7 @@ def test_accepts_valid(validator, cfg):
 @pytest.mark.parametrize(
     "cfg",
     [
-        {"server": {"port": -1}},
-        {"server": {"port": 70000}},
+        {"metadata_db": {"query_timeout_ms": 0}},
         {"cache": {"backend": "bogus"}},
         {"pyramid": {"downscale_factor": 1}},  # silently single-level before
         {"pyramid": {"downscale_factor": 0}},  # ZeroDivisionError before

@@ -42,7 +42,7 @@ dim_labels = ["z", "y", "x"]
 """
 
 _JSON = {
-    "server": {"host": "127.0.0.1", "port": 9000},
+    "server": {"log_level": "DEBUG"},
     "cache": {"backend": "memory", "max_bytes": 123456789},
     "sources": [
         {
@@ -55,8 +55,7 @@ _JSON = {
 
 
 def _assert_expected(cfg):
-    assert cfg.host == "127.0.0.1"
-    assert cfg.port == 9000
+    assert cfg.log_level == "DEBUG"
     assert cfg.cache.backend == "memory"
     assert cfg.cache.memory_max_bytes == 123456789
     assert len(cfg.sources) == 1

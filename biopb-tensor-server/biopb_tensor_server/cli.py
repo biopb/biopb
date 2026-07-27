@@ -68,6 +68,15 @@ app.add_typer(cert_app, name="cert")
 # *not* in this set and are treated as public — fail-closed.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# The flight plane's bind, owned by the CLI alone (biopb/biopb#604 -- it used to
+# be `server.host`/`server.port` in biopb.json). Loopback by default: the bind is
+# the mode switch, so the safe default is the one that exposes nothing, and going
+# public is an explicit act (`--host 0.0.0.0`, or `biopb control start --remote`).
+# The old config default was `0.0.0.0`, which made "local mode" public unless a
+# config said otherwise.
+DEFAULT_FLIGHT_HOST = "127.0.0.1"
+DEFAULT_FLIGHT_PORT = 8815
+
 
 def _host_is_public(host: str) -> bool:
     """True if ``host`` is a network-reachable bind address (not loopback)."""
@@ -470,39 +479,6 @@ def _grpc_location(host: str, port: int) -> str:
     return f"grpc://{authority}:{port}"
 
 
-def _merge_tls_options(
-    tls: Optional[bool],
-    tls_cert: Optional[Path],
-    tls_key: Optional[Path],
-    server_config,
-) -> Tuple[bool, Optional[Path], Optional[Path]]:
-    """Resolve the three TLS knobs CLI-over-config.
-
-    TLS is a config field (``server.tls`` / ``server.tls_cert`` / ``server.tls_key``)
-    as well as a flag, because the control supervisor spawns ``launch -c
-    config.json`` with no TLS arguments -- so a config that cannot express TLS is
-    a data plane the control can never serve over TLS.
-
-    ``--tls/--no-tls`` is tri-state: ``None`` (neither given) defers to the
-    config, so a flag can turn TLS on *or* off against a config that says
-    otherwise.
-
-    ``--no-tls`` also **drops any cert/key pair**. A cert on its own still means
-    "serve TLS" (that is the pre-existing contract -- ``--tls-cert`` alone never
-    needed ``--tls``), and :func:`_resolve_tls_material` therefore honors the pair
-    before it looks at the flag. So an explicit "off" has to be applied here, or
-    ``--no-tls`` against a config carrying ``tls_cert`` would silently serve TLS
-    anyway.
-    """
-    if tls is False:
-        return False, None, None
-    return (
-        server_config.tls if tls is None else tls,
-        tls_cert or server_config.tls_cert,
-        tls_key or server_config.tls_key,
-    )
-
-
 def _resolve_tls_material(
     tls: bool,
     tls_cert: Optional[Path],
@@ -645,8 +621,8 @@ def cert_init(
 
 def _setup_flight_server(
     server_config: ServerConfig,
-    host: Optional[str] = None,
-    port: Optional[int] = None,
+    host: str = DEFAULT_FLIGHT_HOST,
+    port: int = DEFAULT_FLIGHT_PORT,
     writable: Optional[bool] = None,
     token: Optional[str] = None,
     tls_cert_chain: Optional[bytes] = None,
@@ -672,8 +648,6 @@ def _setup_flight_server(
         typer.Exit: If no sources configured or no sources loaded successfully
     """
     # Apply overrides
-    host = host or server_config.host
-    port = port or server_config.port
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
 
@@ -1020,17 +994,18 @@ def serve(
         "--log-scope-biopb/--log-scope-all",
         help="Scope logging to biopb_tensor_server only (default) or affect all packages",
     ),
-    host: Optional[str] = typer.Option(
-        None,
+    host: str = typer.Option(
+        DEFAULT_FLIGHT_HOST,
         "--host",
         "-h",
-        help="Server host (overrides config)",
+        help="Address the Flight gRPC server binds. Loopback (the default) is "
+        "local mode; a public address is remote mode and requires a token.",
     ),
-    port: Optional[int] = typer.Option(
-        None,
+    port: int = typer.Option(
+        DEFAULT_FLIGHT_PORT,
         "--port",
         "-p",
-        help="Server port (overrides config)",
+        help="TCP port for the Flight gRPC server.",
     ),
     writable: bool = typer.Option(
         False,
@@ -1044,14 +1019,13 @@ def serve(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
-    tls: Optional[bool] = typer.Option(
-        None,
-        "--tls/--no-tls",
+    tls: bool = typer.Option(
+        False,
+        "--tls",
         help="Serve the flight plane over TLS. Uses the self-signed cert in the "
         "state dir (auto-generated on first use); clients connect with grpcs:// "
-        "and pin it on first connect (TOFU). Overrides server.tls in the config "
-        "either way; omit both to use the config. --no-tls also ignores any "
-        "configured cert/key pair. See also `cert init`.",
+        "and pin it on first connect (TOFU). Implied by --tls-cert/--tls-key. "
+        "See also `cert init`.",
     ),
     tls_cert: Optional[Path] = typer.Option(
         None,
@@ -1099,7 +1073,7 @@ def serve(
     # The flight bind is the mode switch; --host overrides config, so resolve the
     # token against the effective host. A public bind with no token auto-generates
     # one (fail-closed) rather than serving the data API open.
-    effective_host = host or server_config.host
+    effective_host = host
     effective_token = _resolve_flight_token(
         effective_host,
         token,
@@ -1127,9 +1101,7 @@ def serve(
     # _setup_flight_server acquires the lock during cache init and can still raise
     # afterwards (e.g. a bad static source); keeping it inside the try means such
     # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
-    tls_cert_chain, tls_private_key = _resolve_tls_material(
-        *_merge_tls_options(tls, tls_cert, tls_key, server_config), san
-    )
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
 
     server = source_manager = watcher = precache_worker = None
     try:
@@ -1143,7 +1115,7 @@ def serve(
             tls_private_key=tls_private_key,
         )
 
-        location = _grpc_location(effective_host, port or server_config.port)
+        location = _grpc_location(effective_host, port)
         if tls_cert_chain is not None:
             # Advertise the scheme clients actually dial for a TLS server.
             location = location.replace("grpc://", "grpcs://", 1)
@@ -1199,7 +1171,6 @@ def validate(
         sources = resolve_all_sources(server_config)
 
         console.print("[green]✓ Config valid[/green]")
-        console.print(f"  Server: {server_config.host}:{server_config.port}")
         console.print(f"  Cache: backend={server_config.cache.backend}, ")
         if server_config.cache.backend == "memory":
             console.print(
@@ -1355,17 +1326,18 @@ def launch(
         "--log-scope-biopb/--log-scope-all",
         help="Scope logging to biopb_tensor_server only (default) or affect all packages",
     ),
-    host: Optional[str] = typer.Option(
-        None,
+    host: str = typer.Option(
+        DEFAULT_FLIGHT_HOST,
         "--host",
         "-h",
-        help="Flight server host (overrides config)",
+        help="Address the Flight gRPC server binds. Loopback (the default) is "
+        "local mode; a public address is remote mode and requires a token.",
     ),
-    port: Optional[int] = typer.Option(
-        None,
+    port: int = typer.Option(
+        DEFAULT_FLIGHT_PORT,
         "--port",
         "-p",
-        help="Flight server port (overrides config)",
+        help="TCP port for the Flight gRPC server.",
     ),
     writable: bool = typer.Option(
         False,
@@ -1389,15 +1361,14 @@ def launch(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
-    tls: Optional[bool] = typer.Option(
-        None,
-        "--tls/--no-tls",
+    tls: bool = typer.Option(
+        False,
+        "--tls",
         help="Serve the flight plane over TLS. Uses the self-signed cert in the "
         "state dir (auto-generated on first use); clients connect with grpcs:// "
         "and pin it on first connect (TOFU). The HTTP sidecar reaches the flight "
-        "plane over loopback and trusts the same cert directly. Overrides "
-        "server.tls in the config either way, and --no-tls also ignores any "
-        "configured cert/key pair. See also `cert init`.",
+        "plane over loopback and trusts the same cert directly. Implied by "
+        "--tls-cert/--tls-key. See also `cert init`.",
     ),
     tls_cert: Optional[Path] = typer.Option(
         None,
@@ -1480,7 +1451,7 @@ def launch(
     # sidecar's own bind (--web-host) must never be public-and-unauthenticated.
     # _resolve_launch_token decides the enforced token fail-closed (and refuses a
     # public sidecar with no token). There is no separate dev flag.
-    effective_host = host or server_config.host
+    effective_host = host
     effective_token = _resolve_launch_token(
         effective_host,
         web_host,
@@ -1527,9 +1498,7 @@ def launch(
     # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
     # returns normally on shutdown (it does not re-raise), so cleanup must run in
     # `finally` rather than an except block regardless.
-    tls_cert_chain, tls_private_key = _resolve_tls_material(
-        *_merge_tls_options(tls, tls_cert, tls_key, server_config), san
-    )
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
 
     flight_server = source_manager = watcher = precache_worker = None
     try:
@@ -1554,9 +1523,7 @@ def launch(
             _flight_connect_host = "127.0.0.1"
         elif _flight_connect_host == "::":
             _flight_connect_host = "::1"
-        flight_location = _grpc_location(
-            _flight_connect_host, port or server_config.port
-        )
+        flight_location = _grpc_location(_flight_connect_host, port)
         if tls_cert_chain is not None:
             # The sidecar is on the same host as the flight plane and holds the
             # very cert that plane serves, so it trusts it directly (passed below

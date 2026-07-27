@@ -93,11 +93,12 @@ export const ADMIN_NAV: AdminNavItem[] = [
     id: "server",
     label: "Server",
     description:
-      "Network binding, logging, and how the server watches source folders for " +
-      "changes.",
+      "Logging, write mode, and how the server watches source folders for " +
+      "changes. The network bind (host, port, TLS) is chosen when the server is " +
+      "started, not here — see `biopb control start --remote / --tls`.",
     kind: "fields",
     section: "server",
-    commonFields: ["host", "port", "log_level", "writable"],
+    commonFields: ["log_level", "writable"],
   },
   {
     id: "metadata_db",

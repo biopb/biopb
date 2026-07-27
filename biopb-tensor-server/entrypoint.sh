@@ -108,10 +108,10 @@ if [ "${BIOPB_BIND_LOCALHOST}" = "true" ] || [ "${BIOPB_BIND_LOCALHOST}" = "1" ]
     fi
 fi
 
-# Use existing config file if provided, otherwise generate from env vars. A
-# supplied CONFIG_FILE owns [server].host/port (the Flight bind); keep
-# [server].port == BASE+5 so the published gRPC port matches. The sidecar's own
-# HTTP port is set by --web-port below regardless of the config.
+# Use existing config file if provided, otherwise generate from env vars. The
+# Flight bind is NOT in the config any more (biopb/biopb#604): --host/--port are
+# passed below, so a supplied CONFIG_FILE cannot move the published gRPC port out
+# from under the -p mapping. It still owns everything else (sources, cache, ...).
 if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     echo "Using config file: $CONFIG_FILE"
 else
@@ -127,8 +127,6 @@ else
     cat > "$BIOPB_TMP/runtime-config.json" << EOF
 {
   "server": {
-    "host": "$BIND_ADDR",
-    "port": $GRPC_PORT,
     "aggressive_dir_pruning": true
   },
   "cache": {
@@ -218,6 +216,8 @@ if [ "$ENABLE_SIDECAR" = true ]; then
     # different origin; otherwise launch defaults to localhost variants.
     LAUNCH_ARGS=(
         --config "$CONFIG_FILE"
+        --host "$BIND_ADDR"
+        --port "$GRPC_PORT"
         --web-host "$BIND_ADDR"
         --web-port "$HTTP_PORT"
     )
@@ -235,5 +235,6 @@ else
     [ ${#TLS_ARGS[@]} -gt 0 ] && GRPC_SCHEME="grpcs"
     echo "Flight: ${GRPC_SCHEME}://${WEB_HOST}:${GRPC_PORT}"
     exec biopb-tensor-server serve --config "$CONFIG_FILE" \
+        --host "$BIND_ADDR" --port "$GRPC_PORT" \
         "${TLS_ARGS[@]}" "${TOKEN_ARGS[@]}"
 fi

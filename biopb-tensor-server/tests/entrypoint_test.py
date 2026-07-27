@@ -108,9 +108,21 @@ def test_default_generates_token_and_config(tmp_path):
     argv, _ = _run(tmp_path)
     assert "--token" in argv
     cfg = Path(argv[argv.index("--config") + 1])
+    assert json.loads(cfg.read_text())["sources"]
+
+
+def test_the_bind_is_passed_as_flags_not_written_into_the_config(tmp_path):
+    """The generated config must not carry the bind (biopb/biopb#604).
+
+    A CONFIG_FILE the user mounts can no longer move the gRPC port out from under
+    the container's `-p` mapping, because the port is not a config key at all.
+    """
+    argv, _ = _run(tmp_path)
+    assert argv[argv.index("--host") + 1] == "0.0.0.0"
+    assert argv[argv.index("--port") + 1] == "8815"
+    cfg = Path(argv[argv.index("--config") + 1])
     server = json.loads(cfg.read_text())["server"]
-    assert server["host"] == "0.0.0.0"
-    assert server["port"] == 8815
+    assert "host" not in server and "port" not in server
 
 
 def test_sidecar_opt_in_runs_launch(tmp_path):

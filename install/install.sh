@@ -165,8 +165,10 @@ if not isinstance(data, dict):
 # startup. `enabled = false` is a deliberate user choice (read-only mount, disk
 # constraints, etc.) -- preserve it; the deprecation warning on startup is the
 # intended informational signal, and Phase 4 is the single hard cutover.
-data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
-                           "aggressive_dir_pruning": True})
+# No host/port here: the flight bind moved onto the command line
+# (biopb/biopb#604), and `biopb control start` passes it down. Writing it would
+# only earn a "no longer read" warning on every startup.
+data.setdefault("server", {"aggressive_dir_pruning": True})
 data.setdefault("cache", {"backend": "file", "file_max_total_gb": 32})
 md = data.pop("metadata_db", None)
 if isinstance(md, dict):

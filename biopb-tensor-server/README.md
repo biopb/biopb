@@ -112,8 +112,7 @@ biopb control start
 ### Docker — the remote data server
 
 Docker is the standard way to run a **remote, headless data server**: the image
-is a Flight-only data plane (one gRPC port, no HTTP surface, no browser origin),
-so a lab file server needs nothing but Docker and the data.
+is a Flight-only data plane (one gRPC port, no HTTP sidecar).
 
 ```bash
 docker run -d --restart unless-stopped \
@@ -171,11 +170,11 @@ See [containerize.md](containerize.md) for a complete list of deployment options
 
 ## Configuration
 
-You can create a custom config file to fine-tune server behavior, e.g. specifying multiple data sources.
+You can create a custom config file to fine-tune server behavior, e.g. specifying multiple data sources. The config covers *what* to serve; *where and how* to expose it (`--host`/`--port`/`--tls`) is set on the command line, not here.
 
 ```json
 {
-  "server": { "host": "127.0.0.1", "port": 8815, "log_level": "INFO" },
+  "server": { "log_level": "INFO" },
   "cache": {
     "backend": "file",
     "file_max_segment_mb": 256,
@@ -221,14 +220,13 @@ biopb-tensor-server diagnose ...  Diagnostic commands for a running server
 #### Launch
 
 ```bash
-# Local mode (loopback server.host — no token required)
+# Local mode (the default loopback bind — no token required)
 biopb-tensor-server launch --config biopb.json
 
-# Remote mode (public server.host — token required, auto-generated if omitted)
-biopb-tensor-server launch --config biopb.json --token mytoken...
+# Remote mode (a public bind — token required, auto-generated if omitted)
+biopb-tensor-server launch --config biopb.json --host 0.0.0.0 --token mytoken...
 
-# Over TLS (clients dial grpcs:// and pin the cert on first connect).
-# Also settable as server.tls in the config; --tls/--no-tls overrides it.
+# Over TLS (clients dial grpcs:// and pin the cert on first connect)
 biopb-tensor-server launch --config biopb.json --tls
 
 # gRPC only (no web sidecar)
