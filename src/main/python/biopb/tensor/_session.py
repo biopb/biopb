@@ -198,6 +198,9 @@ def _fetch_endpoints_via_get_flight_info(
     # Reuse the worker's pooled per-thread connection (with its tuned gRPC
     # message-size options) rather than dialing a throwaway client; a later chunk
     # fetch to the same (location, token) then rides the same connection.
+    # The TLS resolve is memoized per process, so evaluating it eagerly here --
+    # even when the pooled client already exists and discards the value -- costs a
+    # dict lookup rather than a handshake.
     token = pb.auth_token or None
     client = _get_thread_client(pb.location, token, resolve_tls_root_certs(pb.location))
     call_options = _get_shared_call_options(pb.location, token)

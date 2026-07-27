@@ -9,6 +9,14 @@ build. This module mints that leaf with the right subject-alternative names
 host's LAN IPs) and a long validity, and caches it in the state tree so it is
 generated once and reused.
 
+**The SANs still matter under TOFU.** Pinning supplies the *trust anchor*, but
+gRPC keeps hostname verification on, so the name a client actually dials must
+appear in this cert's SANs or the handshake fails — after a successful pin, which
+reads as "it pinned but won't connect". :func:`collect_san_hosts` can only see the
+host's own view of itself, so a name that lives elsewhere (a NAT/VPN address, a
+CNAME, a reverse-proxy hostname) has to be named explicitly:
+``cert init --force --san <name>`` / ``serve --tls --san <name>``.
+
 Lives beside the token machinery (both are resolved by the ``serve``/``launch``
 CLI) rather than in the control plane, so a **headless** tensor server with no
 control installed can still stand up TLS on its own (case 2 of biopb/biopb#604).
@@ -27,6 +35,8 @@ import logging
 import os
 import socket
 import ssl
+import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple
 
@@ -34,29 +44,98 @@ from biopb._locations import tls_server_cert, tls_server_key
 
 logger = logging.getLogger(__name__)
 
-# ~27 months. Comfortably under the 825-day ceiling browsers enforce for
-# publicly-trusted leaves; irrelevant to a TOFU pin (which ignores validity) but
-# a sane default for anyone who does import the cert into a trust store.
+# ~27 months, the total span (the cert is backdated one day against clock skew
+# and the span measured from there). At or under the 825-day ceiling browsers
+# enforce for publicly-trusted leaves; irrelevant to a TOFU pin (which ignores
+# validity) but a sane default for anyone who does import the cert into a trust
+# store.
 _DEFAULT_VALIDITY_DAYS = 825
 
+# Ceiling on each name-resolution probe below. Generous for a working
+# resolver, and short enough that a broken one costs a startup blip rather
+# than a stall.
+_NAME_PROBE_TIMEOUT_S = 5.0
 
-def collect_san_hosts() -> Tuple[List[str], List[str]]:
-    """Best-effort ``(dns_names, ip_addresses)`` for the server's certificate.
 
-    Gathers every address a client on the LAN might use to reach this host:
-    ``localhost`` + the hostname + the FQDN as DNS names, and the loopback plus
-    the primary outbound LAN IP as IP addresses. Every probe is wrapped — name
-    resolution can fail on an offline box — so this never raises; a thin result
-    (just loopback) still yields a usable cert for same-host use.
+def split_san_values(values: List[str]) -> Tuple[List[str], List[str]]:
+    """Partition operator-supplied SAN strings into ``(dns_names, ip_addresses)``.
+
+    A value that parses as an IP literal becomes an ``iPAddress`` SAN, everything
+    else a ``dNSName``. This is what backs ``--san`` on ``cert init`` /
+    ``serve --tls``: the auto-collected names cover the host's own view of itself,
+    but a client may dial a name this host cannot see (a NAT/VPN address, a CNAME,
+    a reverse-proxy hostname), and gRPC verifies the *dialed* name against the SANs
+    even though the trust anchor came from a TOFU pin.
+    """
+    dns: List[str] = []
+    ips: List[str] = []
+    for value in values:
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            dns.append(value)
+        else:
+            ips.append(value)
+    return dns, ips
+
+
+def _bounded(label: str, probe, default):
+    """Run a name-resolution *probe*, giving up after ``_NAME_PROBE_TIMEOUT_S``.
+
+    ``getfqdn`` / ``getaddrinfo`` take no timeout argument and block in libc until
+    the resolver answers. On a host whose resolver is slow about its *own* name —
+    a macOS runner doing mDNS is the measured case, ~60 s per call — that would
+    stall `serve --tls` startup before the port ever opens. A SAN we could not
+    resolve is a cert one name thinner, which is recoverable (`--san`); a server
+    that will not start is not, so the probe is bounded and its result optional.
+
+    The worker is a daemon thread, deliberately: if the resolver never answers,
+    the thread stays parked in libc forever and must not hold up interpreter exit.
+    """
+    result = [default]
+
+    def _run():
+        try:
+            result[0] = probe()
+        except OSError:
+            pass
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(_NAME_PROBE_TIMEOUT_S)
+    if worker.is_alive():
+        logger.warning(
+            "%s took longer than %.0fs while collecting certificate SANs; "
+            "continuing without it. Name the address clients dial with --san if "
+            "it is missing from the certificate.",
+            label,
+            _NAME_PROBE_TIMEOUT_S,
+        )
+    return result[0]
+
+
+@lru_cache(maxsize=1)
+def _host_identity() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """The probe half of :func:`collect_san_hosts`, resolved once per process.
+
+    A process's own identity does not change under it, so the (possibly slow,
+    see :func:`_bounded`) probes run once and every later caller reads the cache.
+
+    Returns tuples because the result is cached: :func:`collect_san_hosts` copies
+    them into fresh lists so no caller can mutate the shared value.
     """
     dns: List[str] = ["localhost"]
     ips: List[str] = ["127.0.0.1", "::1"]
 
-    for probe in (socket.gethostname, socket.getfqdn):
-        try:
-            name = probe()
-        except OSError:
-            continue
+    try:
+        hostname = socket.gethostname()  # a syscall, not a lookup
+    except OSError:
+        hostname = ""
+    fqdn = _bounded("getfqdn()", socket.getfqdn, "")
+    for name in (hostname, fqdn):
         if name and name not in dns:
             dns.append(name)
 
@@ -72,15 +151,37 @@ def collect_san_hosts() -> Tuple[List[str], List[str]]:
         pass
 
     # Any additional addresses the hostname resolves to (multi-homed hosts).
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            addr = info[4][0]
-            if addr and addr not in ips:
-                ips.append(addr)
-    except OSError:
-        pass
+    resolved = (
+        _bounded(
+            "getaddrinfo()",
+            lambda: [info[4][0] for info in socket.getaddrinfo(hostname, None)],
+            [],
+        )
+        if hostname
+        else []
+    )
+    for addr in resolved:
+        if addr and addr not in ips:
+            ips.append(addr)
 
-    return dns, ips
+    return tuple(dns), tuple(ips)
+
+
+def collect_san_hosts() -> Tuple[List[str], List[str]]:
+    """Best-effort ``(dns_names, ip_addresses)`` for the server's certificate.
+
+    Gathers every address a client on the LAN might use to reach this host:
+    ``localhost`` + the hostname + the FQDN as DNS names, and the loopback plus
+    the primary outbound LAN IP as IP addresses. Every probe is wrapped — name
+    resolution can fail on an offline box — so this never raises; a thin result
+    (just loopback) still yields a usable cert for same-host use.
+
+    Only what this host can see about *itself*: a name that lives elsewhere (a
+    NAT/VPN address, a CNAME, a reverse-proxy hostname) has to be named with
+    ``--san``, and must be, because gRPC verifies the dialed name against these.
+    """
+    dns, ips = _host_identity()
+    return list(dns), list(ips)
 
 
 def generate_self_signed_cert(
@@ -120,16 +221,43 @@ def generate_self_signed_cert(
         except ValueError:
             logger.debug("skipping unparseable SAN IP %r", ip)
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    # Backdated one day against client/server clock skew; `days` is the total
+    # span measured from there, so it matches the documented validity exactly.
+    not_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=1
+    )
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=days))
+        .not_valid_before(not_before)
+        .not_valid_after(not_before + datetime.timedelta(days=days))
         .add_extension(x509.SubjectAlternativeName(san), critical=False)
+        # An end-entity cert, explicitly: it is its own trust anchor only because
+        # a client pins it, never because it may sign anything. Stating that (plus
+        # a serverAuth EKU and a matching KeyUsage) keeps stricter TLS stacks --
+        # which may reject a leaf that omits them -- from refusing the handshake.
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=True,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
         .sign(key, hashes.SHA256())
     )
     cert_pem = cert.public_bytes(serialization.Encoding.PEM)
@@ -150,6 +278,18 @@ def cert_fingerprint(cert_pem: bytes) -> str:
     return hashlib.sha256(der).hexdigest()
 
 
+def format_fingerprint(fingerprint: str) -> str:
+    """Colon-group a hex fingerprint for display (``AB:CD:...``).
+
+    Operators eyeball-compare this against a client's pin, so every printout of a
+    fingerprint uses the full digest in this one grouped form -- a truncated
+    prefix is not something a human should be asked to trust.
+    """
+    return ":".join(
+        fingerprint[i : i + 2].upper() for i in range(0, len(fingerprint), 2)
+    )
+
+
 def _write_cert_files(cert_path: Path, key_path: Path, cert_pem: bytes, key_pem: bytes):
     """Persist cert (public) + key (owner-only) to disk, creating the dir."""
     cert_path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,13 +305,19 @@ def ensure_server_cert(
     key_path: Path | None = None,
     *,
     regenerate: bool = False,
+    extra_sans: List[str] | None = None,
 ) -> Tuple[bytes, bytes]:
     """Return the server's TLS cert + key (PEM bytes), generating them if needed.
 
     Reuses an existing cert/key pair at the given paths (defaulting to the state
     tree). When either file is missing, or ``regenerate`` is set, a fresh
-    self-signed cert is minted for this host's SANs and written to disk — so
-    ``serve --tls`` on a fresh host just works, and ``cert init --force`` re-mints.
+    self-signed cert is minted for this host's SANs — plus any *extra_sans* the
+    operator named — and written to disk, so ``serve --tls`` on a fresh host just
+    works and ``cert init --force`` re-mints.
+
+    *extra_sans* only affects a cert that is **generated** here: an existing pair
+    is returned untouched (adding a name to a minted cert means re-minting it,
+    i.e. ``cert init --force --san <name>``).
     """
     cert_path = cert_path or tls_server_cert()
     key_path = key_path or tls_server_key()
@@ -180,6 +326,10 @@ def ensure_server_cert(
         return cert_path.read_bytes(), key_path.read_bytes()
 
     dns_names, ip_addresses = collect_san_hosts()
+    if extra_sans:
+        extra_dns, extra_ips = split_san_values(extra_sans)
+        dns_names += [d for d in extra_dns if d not in dns_names]
+        ip_addresses += [i for i in extra_ips if i not in ip_addresses]
     cert_pem, key_pem = generate_self_signed_cert(dns_names, ip_addresses)
     _write_cert_files(cert_path, key_path, cert_pem, key_pem)
     logger.info(

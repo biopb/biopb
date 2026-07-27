@@ -323,10 +323,10 @@ See **[docs/http-server.md](docs/http-server.md)** for the full endpoint table, 
 biopb-tensor-server launch --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
 
 # for grpc only (no web server) — same flight options + token handling as launch
-biopb-tensor-server serve --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--tls]
+biopb-tensor-server serve --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--tls] [--san NAME]
 
 # generate / rotate the self-signed TLS cert and print its fingerprint
-biopb-tensor-server cert init [--force]
+biopb-tensor-server cert init [--force] [--san NAME]
 ```
 
 `serve` and `launch` share the Flight-server flags (`--host`/`--port`/`--writable`
@@ -345,6 +345,29 @@ and refuses a later mismatched cert. `cert init` pre-seeds or rotates the cert a
 prints the fingerprint a client will pin. `--tls-cert`/`--tls-key` serve a BYO cert
 instead. The cert machinery lives beside the token machinery (`core/tls.py`),
 *not* in the control plane, so case 2 (no control installed) works.
+
+**Pinning is the trust anchor; the SANs still have to match.** gRPC keeps
+hostname verification on, so the name a client dials must appear in the cert's
+SANs — pinning only replaces the *CA*, not the name check. `collect_san_hosts()`
+enumerates what the host can see about itself (`localhost`, hostname/FQDN,
+loopback, the primary outbound IP, `getaddrinfo` results), which misses a name
+that lives elsewhere: a NAT/VPN address, a CNAME, a reverse-proxy hostname. That
+case pins fine and *then* fails every handshake, so it gets explicit handling at
+both ends — `--san NAME` (repeatable, on `cert init` and `serve --tls`; applies
+only when the cert is generated, hence `cert init --force --san …` to widen an
+existing one), and a client-side probe that logs the exact name and the
+`cert init --force --san` fix instead of leaving an opaque TLS error. The probe is
+diagnostic only: any outcome other than a definite hostname mismatch is silent, so
+it can never break a working connection.
+
+TOFU resolution is **memoized per process** keyed by `host:port`
+(`_tls.clear_pin_cache()` drops it). The call sites evaluate it eagerly on paths
+that usually reuse an already-open pooled connection, so without the memo every
+`GetFlightInfo` would open a throwaway TLS handshake just to re-derive a value it
+already had — and a momentary failure of *that* side handshake would fail a call
+the healthy pooled connection could have served. The consequence is that a cert
+rotation is detected at process start, not mid-run; that matches the ceremony a
+mismatch requires anyway (confirm, clear the pin, reconnect).
 
 `cryptography` (the cert generator) is an **opt-in `[tls]` extra**, deliberately
 kept out of the default install closure: it drags a Rust/OpenSSL build surface

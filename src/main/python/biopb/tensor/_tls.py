@@ -17,10 +17,18 @@ The security boundary is the same as SSH: the *first* handshake is trusted
 implicitly, so TOFU protects against an attacker who arrives *after* pinning, not
 one already in the path at first connect — an accepted trade on a trusted LAN.
 
-Resolution runs once, in the process that constructs ``TensorFlightClient``, and
-yields plain PEM bytes. Those bytes are what the connection pool passes to every
-worker's ``FlightClient`` as ``tls_root_certs`` — so dask workers never re-run
-TOFU or touch the pin store; they receive the resolved cert as ordinary data.
+Resolution yields plain PEM bytes. Those bytes are what the connection pool
+passes to every worker's ``FlightClient`` as ``tls_root_certs`` — so a worker
+executing a chunk-fetch task receives the resolved cert as ordinary graph data
+and never touches the pin store. A worker that opens its *own* client (the
+``tensor_from_pb`` path) resolves once per process and then reads the memo below.
+
+Trust and hostname verification are separate concerns, and only the first is
+TOFU's job: pinning supplies the trust *anchor*, but gRPC still verifies the
+dialed hostname against the certificate's SANs. A cert that pins fine can
+therefore still fail the handshake if the client dials a name the server did not
+put in its SANs, so :func:`resolve_tls_root_certs` probes for exactly that case
+and logs the fix rather than leaving an opaque gRPC error.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import os
 import socket
 import ssl
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlsplit
@@ -46,6 +55,20 @@ _TLS_SCHEME = "grpc+tls"
 # Bound the first-connect cert fetch so an unreachable host fails fast rather
 # than hanging client construction.
 _FETCH_TIMEOUT_S = 10.0
+
+# Per-process memo, ``host:port -> PEM``. Resolution is called on paths that can
+# hit a pooled, already-open connection (``_get_thread_client``'s fast path) and
+# is evaluated eagerly as an argument there, so without this every
+# ``GetFlightInfo`` would open a throwaway TLS handshake just to re-derive a
+# value it already has -- and a momentary failure of that side handshake would
+# fail a call the healthy pooled connection could have served.
+#
+# The memo is deliberately not invalidated: a server that rotates its cert
+# mid-process keeps failing against the memoized pin until the client restarts,
+# which is the same "confirm, then clear the pin" ceremony a mismatch requires
+# anyway.
+_memo_lock = threading.Lock()
+_memo: Dict[str, bytes] = {}
 
 
 class TlsPinMismatchError(Exception):
@@ -93,6 +116,49 @@ def _fingerprint(pem: bytes) -> str:
     return hashlib.sha256(der).hexdigest()
 
 
+def _warn_if_dialed_name_not_in_cert(host: str, port: int, pem: bytes) -> None:
+    """Log an actionable warning if *host* is not covered by the cert's SANs.
+
+    gRPC verifies the dialed name against the certificate even when the trust
+    anchor is a TOFU pin, so a cert whose SANs omit the name the client uses
+    pins successfully and then fails every handshake with an opaque TLS error.
+    We reproduce that check here — one verifying handshake against the pinned
+    cert — purely to name the cause and the fix.
+
+    Diagnostic only: on anything other than a definite hostname-verification
+    failure (including any failure of this probe itself) it stays silent, so it
+    can never turn a working connection into a broken one.
+    """
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cadata=pem.decode("ascii"))
+        with socket.create_connection((host, port), timeout=_FETCH_TIMEOUT_S) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host):
+                return
+    except ssl.SSLCertVerificationError as e:
+        # verify_message is the OpenSSL reason; code 62 is hostname mismatch.
+        if "hostname mismatch" not in str(e).lower():
+            return
+        logger.warning(
+            "TLS certificate for %s:%s is pinned, but does not list '%s' among "
+            "its subject-alternative names, so the connection will fail "
+            "hostname verification. Re-mint the server's certificate with that "
+            "name (`biopb-tensor-server cert init --force --san %s`) and clear "
+            "the '%s:%s' entry from the client's pin store, or dial a name the "
+            "certificate does list.",
+            host,
+            port,
+            host,
+            host,
+            host,
+            port,
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic must never break the caller
+        return
+
+
 def _load_pins(store: Path) -> Dict[str, str]:
     """Read the ``host:port -> PEM`` pin store; an absent/corrupt file is empty."""
     try:
@@ -138,14 +204,43 @@ def resolve_tls_root_certs(location: str) -> Optional[bytes]:
     The returned bytes are handed to ``pyarrow.flight.FlightClient(...,
     tls_root_certs=...)`` — using the pinned leaf itself as the trust anchor, so
     verification succeeds iff the server presents that exact certificate.
+
+    The result is memoized per process and per ``host:port``: callers evaluate
+    this eagerly on paths that often reuse an already-open pooled connection, and
+    repeating the handshake there would be pure cost.
     """
     hp = _host_port(location)
     if hp is None:
         return None
     host, port = hp
     key = f"{host}:{port}"
-    store = tls_known_hosts()
 
+    with _memo_lock:
+        memoized = _memo.get(key)
+    if memoized is not None:
+        return memoized
+
+    resolved = _resolve_uncached(host, port, key)
+    _warn_if_dialed_name_not_in_cert(host, port, resolved)
+    with _memo_lock:
+        _memo[key] = resolved
+    return resolved
+
+
+def clear_pin_cache() -> None:
+    """Forget every memoized resolution, so the next connect re-runs TOFU.
+
+    Needed after a *legitimate* server cert rotation (together with clearing the
+    stale entry in the pin store) if the client process is long-lived, and by
+    tests that drive the pin state machine within one process.
+    """
+    with _memo_lock:
+        _memo.clear()
+
+
+def _resolve_uncached(host: str, port: int, key: str) -> bytes:
+    """Do the actual TOFU exchange for ``host:port`` — fetch, compare, pin."""
+    store = tls_known_hosts()
     presented = _fetch_server_cert(host, port)
     pins = _load_pins(store)
     pinned = pins.get(key)

@@ -44,6 +44,45 @@ def test_collect_san_includes_loopback():
     assert "127.0.0.1" in ips
 
 
+def test_host_identity_is_resolved_once_per_process():
+    """The SAN probes are cached: a stalling resolver is paid for once, not per cert."""
+    from biopb_tensor_server.core import tls as tls_mod
+
+    tls_mod._host_identity.cache_clear()
+    assert tls_mod._host_identity.cache_info().misses == 0
+    for _ in range(3):
+        tls_mod.collect_san_hosts()
+    assert tls_mod._host_identity.cache_info().misses == 1
+
+
+def test_collect_san_hosts_returns_a_fresh_list_each_call():
+    """The cached value is shared, so callers must not be able to mutate it."""
+    from biopb_tensor_server.core.tls import collect_san_hosts
+
+    dns, _ = collect_san_hosts()
+    dns.append("mutated.example")
+    again, _ = collect_san_hosts()
+    assert "mutated.example" not in again
+
+
+def test_a_stalling_name_probe_is_abandoned_not_awaited(monkeypatch):
+    """A wedged resolver must cost a bounded blip, not block server startup."""
+    from biopb_tensor_server.core import tls as tls_mod
+
+    monkeypatch.setattr(tls_mod, "_NAME_PROBE_TIMEOUT_S", 0.1)
+    started = threading.Event()
+
+    def _never_returns():
+        started.set()
+        time.sleep(30)
+        return "too.late.example"
+
+    began = time.monotonic()
+    assert tls_mod._bounded("stub", _never_returns, "fallback") == "fallback"
+    assert time.monotonic() - began < 5
+    assert started.is_set()  # it really ran; we abandoned it, not skipped it
+
+
 def test_generated_cert_is_self_signed_with_sans():
     from biopb_tensor_server.core.tls import generate_self_signed_cert
     from cryptography import x509
@@ -63,6 +102,88 @@ def test_generated_cert_is_self_signed_with_sans():
     ips = san.get_values_for_type(x509.IPAddress)
     assert ipaddress.ip_address("127.0.0.1") in ips
     assert ipaddress.ip_address("10.0.0.5") in ips
+
+
+def test_generated_cert_is_an_end_entity_server_cert():
+    """BasicConstraints/KeyUsage/EKU, so a strict TLS stack accepts the leaf."""
+    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from cryptography import x509
+
+    cert_pem, _ = generate_self_signed_cert(["localhost"], ["127.0.0.1"])
+    cert = x509.load_pem_x509_certificate(cert_pem)
+
+    bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+    assert bc.ca is False
+    eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    assert x509.oid.ExtendedKeyUsageOID.SERVER_AUTH in eku
+    ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+    assert ku.digital_signature and not ku.key_cert_sign
+
+
+def test_validity_span_matches_the_documented_days():
+    from biopb_tensor_server.core import tls as tls_mod
+    from cryptography import x509
+
+    cert_pem, _ = tls_mod.generate_self_signed_cert(["localhost"], [], days=10)
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    span = cert.not_valid_after_utc - cert.not_valid_before_utc
+    assert span.days == 10
+
+
+def test_split_san_values_partitions_names_and_ips():
+    from biopb_tensor_server.core.tls import split_san_values
+
+    dns, ips = split_san_values(["lab.example", " 10.0.0.5 ", "::1", "", "vpn-host"])
+    assert dns == ["lab.example", "vpn-host"]
+    assert ips == ["10.0.0.5", "::1"]
+
+
+def test_extra_sans_land_in_the_generated_cert():
+    """`--san` covers a name this host cannot discover about itself."""
+    from biopb_tensor_server.core.tls import ensure_server_cert
+    from cryptography import x509
+
+    cert_pem, _ = ensure_server_cert(extra_sans=["vpn.lab.example", "10.8.0.4"])
+    san = (
+        x509.load_pem_x509_certificate(cert_pem)
+        .extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        .value
+    )
+    assert "vpn.lab.example" in san.get_values_for_type(x509.DNSName)
+    assert ipaddress.ip_address("10.8.0.4") in san.get_values_for_type(x509.IPAddress)
+
+
+def test_extra_sans_ignored_when_reusing_an_existing_cert():
+    from biopb_tensor_server.core.tls import ensure_server_cert
+    from cryptography import x509
+
+    first, _ = ensure_server_cert()
+    again, _ = ensure_server_cert(extra_sans=["vpn.lab.example"])
+    assert again == first  # reuse wins; widening requires --force
+    san = (
+        x509.load_pem_x509_certificate(again)
+        .extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        .value
+    )
+    assert "vpn.lab.example" not in san.get_values_for_type(x509.DNSName)
+
+    rotated, _ = ensure_server_cert(regenerate=True, extra_sans=["vpn.lab.example"])
+    san = (
+        x509.load_pem_x509_certificate(rotated)
+        .extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        .value
+    )
+    assert "vpn.lab.example" in san.get_values_for_type(x509.DNSName)
+
+
+def test_cert_init_san_requires_force_to_widen():
+    from biopb_tensor_server.cli import app
+
+    runner = CliRunner()
+    assert runner.invoke(app, ["cert", "init"]).exit_code == 0
+    out = runner.invoke(app, ["cert", "init", "--san", "vpn.lab.example"])
+    assert out.exit_code == 0
+    assert "--san ignored" in out.output
 
 
 def test_ensure_server_cert_generates_then_reuses():
@@ -151,14 +272,15 @@ def test_byo_cert_needs_no_cryptography(tmp_path, monkeypatch):
 
 
 def test_cert_init_generates_and_prints_fingerprint():
+    """The full digest is printed, colon-grouped and unwrapped (copy-pasteable)."""
     from biopb._locations import tls_server_cert
     from biopb_tensor_server.cli import app
-    from biopb_tensor_server.core.tls import cert_fingerprint
+    from biopb_tensor_server.core.tls import cert_fingerprint, format_fingerprint
 
     result = CliRunner().invoke(app, ["cert", "init"])
     assert result.exit_code == 0, result.output
     assert tls_server_cert().exists()
-    fp = cert_fingerprint(tls_server_cert().read_bytes())
+    fp = format_fingerprint(cert_fingerprint(tls_server_cert().read_bytes()))
     assert fp in result.output
 
 

@@ -8,6 +8,7 @@ PATH and assert the argv it would have exec'd.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -69,6 +70,29 @@ def _run(tmp_path, env=None, expect_ok=True):
     else:
         argv = args_file.read_text().splitlines() if args_file.exists() else []
     return argv, proc
+
+
+def test_uses_no_bash4_only_constructs():
+    """macOS still ships bash 3.2, which parses the whole file before running it.
+
+    So one bash-4 construct anywhere -- `${v,,}` was the one that bit -- makes the
+    entire script unusable there, not just the branch containing it. The container
+    has bash 5, but this suite runs the script with the host's bash, and a dev on
+    macOS should be able to read/run it too.
+    """
+    code = "\n".join(
+        line
+        for line in ENTRYPOINT.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    bash4_only = {
+        "${var,,} / ${var^^} case modification": r"\$\{[A-Za-z_][A-Za-z_0-9]*(,,|\^\^)",
+        "associative arrays": r"\bdeclare\s+-A\b",
+        "mapfile/readarray": r"\b(mapfile|readarray)\b",
+        "&>> append-both redirect": r"&>>",
+    }
+    for label, pattern in bash4_only.items():
+        assert not re.search(pattern, code), f"bash 4+ only: {label}"
 
 
 def test_default_is_flight_only(tmp_path):

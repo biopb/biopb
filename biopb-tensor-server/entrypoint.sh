@@ -51,11 +51,15 @@ set -e
 # Normalize a boolean env var exactly like the Python predicate
 # _allow_no_token_from_env() (strip + lowercase, accept 1/true/yes/on), so the
 # shell and Python readings of the same variable can never diverge.
+#
+# Lowercasing goes through `tr`, not `${v,,}`: that expansion needs bash 4, and
+# macOS still ships bash 3.2 -- which parses the whole script before running it,
+# so a single `${v,,}` makes the file unusable there, not just this branch.
 _is_truthy() {
     local v="$1"
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
-    case "${v,,}" in
+    case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on) return 0 ;;
         *) return 1 ;;
     esac

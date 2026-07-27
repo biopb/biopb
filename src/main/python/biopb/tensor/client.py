@@ -173,9 +173,10 @@ class TensorFlightClient:
         )
         # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
         normalized = _normalize_location(location)
-        # For a TLS location, pin/verify the server cert via TOFU (once, here) and
-        # carry the resolved PEM through the connection so every dask worker trusts
-        # the same root without re-pinning (biopb/biopb#604). None for plaintext.
+        # For a TLS location, pin/verify the server cert via TOFU (once per
+        # process, memoized in _tls) and carry the resolved PEM through the
+        # connection so every dask worker trusts the same root without touching
+        # the pin store (biopb/biopb#604). None for plaintext.
         tls_root_certs = resolve_tls_root_certs(normalized)
         # Pickle-safe connection parameters (callers read client._client etc.)
         self._location = normalized
