@@ -617,5 +617,7 @@ product `release-v*` tag (`web/scripts/sync-version.js`).
 
 **Docker image**: `git tag release-v0.11.0 && git push --tags` (the same tag that
 cuts the GitHub bundle). `tensor-server-ci`'s `publish` job then builds and pushes
-`biopb-tensor-server:0.11.0` (+ `:latest` for a clean X.Y.Z) to ghcr.io + Docker
-Hub. The SDK (incl. image-base) releases separately on `v*`.
+`biopb-tensor-server:0.11.0` + `:latest` to ghcr.io + Docker Hub. Only a **final**
+`release-vX.Y.Z` publishes — an rc tag (`release-v0.12.0rc1`) runs the tests and
+the image build but pushes nothing. The SDK (incl. image-base) releases
+separately on `v*`.

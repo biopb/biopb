@@ -1,7 +1,8 @@
 name: Tensor Server CI
 
 # Test/build on branch pushes & PRs; PUBLISH the tensor-server Docker image on a
-# `release-v*` tag. The tensor server tracks the product line (docs/release-model.md):
+# FINAL `release-vX.Y.Z` tag (an rc/a/b prerelease tag tests + builds but publishes
+# nothing). The tensor server tracks the product line (docs/release-model.md):
 # the same `release-v*` tag cuts the wheel bundle + GitHub release (release.yaml)
 # and builds the Docker image here — this workflow owns the image build, not
 # release.yaml. (Path filters are not evaluated for tag pushes, so a `release-v*`
@@ -181,15 +182,50 @@ jobs:
             wheels/biopb*.whl
           retention-days: 1
 
-  # Publish the tensor-server Docker image on a `release-v*` tag (ghcr.io + Docker
-  # Hub jiyuuchc/). The image's version IS the tag (biopb-tensor-server's
-  # setuptools_scm reads `release-v*`); a clean X.Y.Z also moves :latest, an
-  # rc/a/b prerelease publishes only its pinned tag. Idempotent: an already-
-  # published version is skipped, so re-running a tag is a noop. This is the ONLY
-  # place the tensor-server image is published — release.yaml never builds it.
-  publish:
-    needs: [js-test, test]
+  # Gate: only a FINAL `release-vX.Y.Z` tag publishes an image. A PEP 440
+  # prerelease (`…rc1`/`a1`/`b1`) still runs the full test + build matrix above —
+  # that is what an rc tag is for — but pushes NOTHING to a registry. Registry
+  # tags are permanent and public: every rc left a `biopb-tensor-server:X.Y.ZrcN`
+  # tag sitting next to the real releases, and the RCs are cut off `dev` (they are
+  # exempt from release.yaml's on-main guard by design), so those images were
+  # published straight from unmerged code. Nothing consumes them — the installer
+  # skips prereleases and docs/deploy examples pull `:latest` or a pinned X.Y.Z.
+  #
+  # A tiny separate job because GitHub's `if:` expressions have no regex, so
+  # "tag is X.Y.Z and not X.Y.ZrcN" cannot be written inline (and `contains(…,
+  # 'a')` would match "release-v" itself). Deciding here rather than per-step also
+  # means an rc never builds wheels or logs into Docker Hub, and the skip is
+  # visible in the run graph.
+  guard:
     if: startsWith(github.ref, 'refs/tags/release-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Decide whether to publish
+        id: decide
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF#refs/tags/release-v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "final release $VER -> publish the image"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::prerelease $VER -> no image published (only a final release-vX.Y.Z tag publishes the tensor-server image)"
+          fi
+
+  # Publish the tensor-server Docker image on a FINAL `release-vX.Y.Z` tag
+  # (ghcr.io + Docker Hub jiyuuchc/). The image's version IS the tag
+  # (biopb-tensor-server's setuptools_scm reads `release-v*`) and it always moves
+  # :latest, since prereleases are filtered out by `guard` above. Idempotent: an
+  # already-published version is skipped, so re-running a tag is a noop. This is
+  # the ONLY place the tensor-server image is published — release.yaml never
+  # builds it.
+  publish:
+    needs: [js-test, test, guard]
+    if: needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -225,14 +261,12 @@ jobs:
           set -euo pipefail
           # release-v* tag -> the product version (== the tensor server's wheel version).
           VER="${GITHUB_REF#refs/tags/release-v}"
+          # Belt-and-braces: `guard` already proved this is a final X.Y.Z, so a
+          # prerelease reaching here means the gate was mis-wired -- fail loudly
+          # rather than quietly move :latest onto an rc image.
+          [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::expected a final release-vX.Y.Z tag, got $VER"; exit 1; }
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          # PEP 440 prerelease (a/b/rc) does NOT move :latest.
-          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            PRERELEASE=false
-          else
-            PRERELEASE=true
-          fi
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           # VER is the tag name suffix (this job only runs on refs/tags/release-v*),
           # so it is a clean version with no setuptools_scm '+local' segment and is
           # already a valid Docker reference -- no sanitization needed (matches
@@ -242,13 +276,11 @@ jobs:
             echo "tags<<TAGS_EOF"
             echo "ghcr.io/$owner/biopb-tensor-server:$VER"
             echo "docker.io/jiyuuchc/biopb-tensor-server:$VER"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-tensor-server:latest"
-              echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
-            fi
+            echo "ghcr.io/$owner/biopb-tensor-server:latest"
+            echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "tensor-server $VER (prerelease=$PRERELEASE)"
+          echo "tensor-server $VER (final release; moves :latest)"
 
       - name: Login to ghcr.io
         uses: docker/login-action@v3
