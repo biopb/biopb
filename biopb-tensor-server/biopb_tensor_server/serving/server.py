@@ -60,6 +60,20 @@ from biopb_tensor_server.serving.upload_manager import UploadManager
 logger = logging.getLogger(__name__)
 
 
+def _ensure_tls_scheme(location: str) -> str:
+    """Rewrite a location to Arrow Flight's TLS scheme (``grpc+tls://``).
+
+    A TLS server binds a ``grpc+tls://`` location; callers commonly pass the
+    plaintext ``grpc://`` (default) or the client-facing ``grpcs://`` shorthand,
+    so accept either and normalize. An already-``grpc+tls://`` location is left
+    untouched.
+    """
+    for prefix in ("grpc://", "grpcs://"):
+        if location.startswith(prefix):
+            return "grpc+tls://" + location[len(prefix) :]
+    return location
+
+
 def to_flight_error(exc: Exception) -> flight.FlightError:
     """Map a tensor-server domain error to a typed Flight error at the boundary.
 
@@ -241,6 +255,8 @@ class TensorFlightServer(flight.FlightServerBase):
         max_list_flights_results: int = 100000,
         grpc_max_message_size: Optional[int] = None,
         pyramid_config: Optional[PyramidConfig] = None,
+        tls_cert_chain: Optional[bytes] = None,
+        tls_private_key: Optional[bytes] = None,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -253,8 +269,27 @@ class TensorFlightServer(flight.FlightServerBase):
             metadata_db: MetadataDatabase instance for source filtering queries (optional)
             max_list_flights_results: Safety cap on list_flights() returned sources
             grpc_max_message_size: gRPC max message size in bytes (default: 16MB)
+            tls_cert_chain: PEM-encoded server certificate chain. When supplied
+                together with ``tls_private_key`` the server serves TLS: the
+                location scheme is forced to ``grpc+tls://`` and clients must
+                connect with ``grpcs://`` (see ``TensorFlightClient``). Pass
+                neither for a plaintext ``grpc://`` server; passing exactly one
+                is an error.
+            tls_private_key: PEM-encoded private key matching ``tls_cert_chain``.
             **kwargs: Additional arguments passed to FlightServerBase
         """
+        # TLS is all-or-nothing: a cert without its key (or vice versa) can't
+        # serve, so fail loudly rather than silently drop to plaintext.
+        if (tls_cert_chain is None) != (tls_private_key is None):
+            raise ValueError(
+                "tls_cert_chain and tls_private_key must be provided together"
+            )
+        if tls_cert_chain is not None:
+            # FlightServerBase serves TLS only when the location scheme says so;
+            # accept the plaintext/grpcs shorthands and rewrite to Arrow's form.
+            location = _ensure_tls_scheme(location)
+            kwargs["tls_certificates"] = [(tls_cert_chain, tls_private_key)]
+
         # Apply gRPC max message size via URL query parameter
         if grpc_max_message_size:
             separator = "&" if "?" in location else "?"
