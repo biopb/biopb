@@ -616,7 +616,9 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | `BIOPB_TENSOR_CACHE_LIMIT` | TensorFlightClient (Python) | Default client-side chunk-cache budget when the caller passes no `cache_bytes`; a size string with common units (`2GiB`, `512MB`) or a bare byte count (parsed via `dask.utils.parse_bytes`), `0` disables the cache. Unset/unparseable → 1 GB. A constructor `cache_bytes` overrides it. |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
 | `BIOPB_TENSOR_ALLOW_NO_TOKEN` | `serve`/`launch` token resolution (`_allow_no_token_from_env`) | Truthy (`1`/`true`/`yes`/`on`) forces **tokenless** operation even on a public bind — the deliberate insecure escape hatch (trusted networks only). Only takes effect when no token is supplied; auto-generation and the public-sidecar refusal both become a loud warning instead. Off by default, so the fail-closed guarantee is unchanged unless explicitly set. |
-| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
+| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
+| `BIOPB_ENABLE_HTTP_SIDECAR` | Docker/Singularity entrypoint | Truthy → run `launch` (Flight + the HTTP sidecar) instead of the default Flight-only `serve`. See *Container shape* below. |
+| `BIOPB_TENSOR_TLS`, `BIOPB_TLS_CERT`/`BIOPB_TLS_KEY` | Docker/Singularity entrypoint | Serve Flight over TLS with the self-signed cert (`serve --tls`), or with a mounted BYO cert. Mutually exclusive with the sidecar opt-in. |
 | `BIOPB_OMETIFF_PARALLEL_READ` | `OmeTiffAdapter.get_data` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**: reads decode under the lock, as before. |
 
 The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handle_reaper_ttl` (seconds, default `150`, `<= 0` disables). It applies to every opt-in adapter (OME-TIFF, NDTiff), set once at startup via `set_handle_reaper_ttl`.
@@ -631,9 +633,44 @@ The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handl
 - **Local mode** (loopback `server.host`) enforces no token — the 90% single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
 - **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `server.host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`server.host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
 - **The one deliberate escape hatch is `BIOPB_TENSOR_ALLOW_NO_TOKEN`** (`_allow_no_token_from_env`). Truthy, it forces tokenless operation even on a public bind — auto-generation and the public-sidecar refusal both degrade to a loud warning. It only takes effect when no token is otherwise supplied, and is **off by default**, so the fail-closed guarantee above holds unless an operator explicitly opts out for a trusted network (the host-loopback-published Docker case, where the in-container bind is `0.0.0.0` but the ports are published to `127.0.0.1`). This is *not* the old auto dev-bypass (removed in #447) — it is explicit, per-deployment, and self-announcing.
-- For Docker local mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
+- For Docker local mode with localhost-only access, use `-p 127.0.0.1:8815:8815`.
 - For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
+
+---
+
+## Container shape (Flight-only by default)
+
+The published image is a **pure gRPC data-plane endpoint**: `entrypoint.sh` runs
+`biopb-tensor-server serve`, so the container has **one** listener (Flight 8815)
+and no HTTP surface at all — no browser origin, no CORS, no unlock page
+(biopb/biopb#604 item 3). Browsing containerized data is a *downstream* concern:
+a machine running the full stack adds `grpc://`/`grpcs://<host>:8815` as a remote
+source, and its browser talks only to its own loopback control. That is what
+makes remote TLS cheap — no browser ever has to trust the container's cert.
+
+The FastAPI sidecar is still installed (the `web` extra) and returns with
+`BIOPB_ENABLE_HTTP_SIDECAR=1`, which switches the entrypoint back to `launch`
+plus `--web-host`/`--web-port`/`--cors`. Only the *default* changed.
+
+Two consequences worth knowing:
+
+- **TLS and the sidecar are mutually exclusive**, and the entrypoint refuses the
+  combination (exit 2) rather than quietly serving plaintext: the sidecar's
+  internal `TensorFlightClient` does not yet dial `grpcs://` (the same case-1 gap
+  as the control-supervised plane, above).
+- **The self-signed cert lives in the container's state dir**, so it is ephemeral
+  unless a volume is mounted at `/root/.local/state`. A recreated container mints
+  a new cert, which every TOFU-pinned client then refuses — correct behavior, but
+  it must be designed around. A BYO cert (`BIOPB_TLS_CERT`/`BIOPB_TLS_KEY`) is the
+  other stable option.
+
+The `[tls]` extra *is* installed in the image: the reason it is opt-in on PyPI
+(no recent Intel-macOS `cryptography` wheel, biopb/biopb#355) is a source-install
+problem this linux image never has.
+
+`entrypoint.sh` is covered by `tests/entrypoint_test.py`, which runs the real
+script with a stub CLI on `PATH` and asserts the argv it execs.
 
 ---
 

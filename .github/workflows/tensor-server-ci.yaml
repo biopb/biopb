@@ -121,10 +121,10 @@ jobs:
 
   # CI build: verify the wheels + Docker image compile. Never pushes — the actual
   # publish is the publish job below on `release-v*`. The uploaded artifacts are a
-  # convenience for inspecting a run, not a release input. The image is a headless
-  # data plane (Flight + HTTP sidecar via `biopb-tensor-server launch`): no control
-  # plane, no bundled webapp, so no pnpm/webapp build here. The webapp compiles in
-  # web-ci.yaml.
+  # convenience for inspecting a run, not a release input. The image is a headless,
+  # Flight-only data plane (`biopb-tensor-server serve`; the HTTP sidecar is an
+  # opt-in env var): no control plane, no bundled webapp, so no pnpm/webapp build
+  # here. The webapp compiles in web-ci.yaml.
   build:
     needs: [js-test, test]
     runs-on: ubuntu-latest

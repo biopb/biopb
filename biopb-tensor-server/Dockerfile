@@ -8,10 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 # Copy pre-built wheels (built locally with: pip wheel . --no-deps -w wheels/ &&
 # pip wheel ./biopb-tensor-server --no-deps -w wheels/)
 #
-# This image is a headless data plane: the Arrow Flight server + its FastAPI HTTP
-# sidecar, launched directly via `biopb-tensor-server launch`. There is no control
-# plane and no bundled webapp — a browser UI is served elsewhere (dev server or a
-# separate control deployment) and points at this server's published ports.
+# This image is a headless data plane: by default just the Arrow Flight server
+# (`biopb-tensor-server serve`), a pure gRPC endpoint with no HTTP surface
+# (biopb/biopb#604 case 2). There is no control plane and no bundled webapp — a
+# browser reaches this data through a downstream biopb stack that mounts it as a
+# remote source. The FastAPI HTTP sidecar is still in the image and is restored
+# with BIOPB_ENABLE_HTTP_SIDECAR=1 (see entrypoint.sh).
 COPY wheels/biopb-*.whl /app/wheels/
 COPY wheels/biopb_tensor_server-*.whl /app/wheels/
 
@@ -19,12 +21,16 @@ COPY wheels/biopb_tensor_server-*.whl /app/wheels/
 # Zarr-2 window) live in each wheel's own metadata, so no manual pre-pin is
 # needed. The tensor server depends on core `biopb`, so install that wheel first
 # (its own deps resolve from PyPI). The `web` extra pulls the sidecar's ASGI
-# stack (fastapi/uvicorn); `bioformats` pulls bioio-bioformats + scyjava for the
-# Java Bio-Formats fallback (ZVI, ...), and the runtime image ships a JDK below.
+# stack (fastapi/uvicorn) — kept so BIOPB_ENABLE_HTTP_SIDECAR=1 still works;
+# `tls` pulls cryptography for `serve --tls` self-signed cert generation (the
+# extra exists because cryptography has no recent Intel-macOS wheel — biopb#355 —
+# which is a source-install problem this linux image never has); `bioformats`
+# pulls bioio-bioformats + scyjava for the Java Bio-Formats fallback (ZVI, ...),
+# and the runtime image ships a JDK below.
 WORKDIR /app
 RUN TENSOR_WHEEL=$(ls /app/wheels/biopb_tensor_server-*.whl) \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir "$TENSOR_WHEEL[web,aics,czi,bioformats,medical,ndtiff]"
+    && pip install --no-cache-dir "$TENSOR_WHEEL[web,tls,aics,czi,bioformats,medical,ndtiff]"
 
 # Stage 2: Runtime (python only)
 FROM python:3.11-slim
@@ -53,9 +59,13 @@ RUN echo 'import scyjava.config; scyjava.config.set_java_constraints(fetch="neve
 RUN mkdir -p /data \
     && chmod +x /usr/local/bin/entrypoint.sh
 
-# Expose the HTTP sidecar (8814, the data-plane API) + Flight gRPC (8815). Both
-# are token-authenticated on a public bind. There is no control web origin.
-EXPOSE 8814 8815
+# Expose Flight gRPC (8815) — the only listener by default, token-authenticated
+# on a public bind. The HTTP sidecar (8814) is opt-in
+# (BIOPB_ENABLE_HTTP_SIDECAR=1) and is not listed here, so `docker run -P` does
+# not publish a port nothing is listening on; publish it explicitly (`-p
+# 8814:8814`) when you enable it.
+EXPOSE 8815
 
-# The entrypoint runs `biopb-tensor-server launch` in the foreground (PID 1).
+# The entrypoint runs `biopb-tensor-server serve` in the foreground (PID 1) —
+# or `launch` when the HTTP sidecar is opted in.
 ENTRYPOINT ["entrypoint.sh"]

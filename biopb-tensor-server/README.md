@@ -110,33 +110,42 @@ biopb control start
 ```
 
 ### Docker
+
+The image is a **Flight-only data plane**: one gRPC port, no HTTP surface. Browse
+its data from a machine running the full biopb stack, which mounts it as a remote
+source.
+
 ```bash
 docker run -d --rm \
     --name biopb-tensor \
-    -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 \
+    -p 127.0.0.1:8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
     -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
     jiyuuchc/biopb-tensor-server:latest
 ```
 
-The ports are published to host loopback only (`127.0.0.1`), so
+The port is published to host loopback only (`127.0.0.1`), so
 `BIOPB_TENSOR_ALLOW_NO_TOKEN=1` runs it without an access token for a
 single-machine setup. Drop that env var to have the container auto-generate a
-token (printed in `docker logs biopb-tensor`); do so whenever the ports are
-reachable from other hosts.
+token (printed in `docker logs biopb-tensor`); do so whenever the port is
+reachable from other hosts — and add `-e BIOPB_TENSOR_TLS=1` to encrypt the
+wire (clients then dial `grpcs://`).
 
 Or use a custom config file:
 
 ```bash
 docker run -d --rm \
     --name biopb-tensor \
-    -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 \
+    -p 127.0.0.1:8815:8815 \
     -v ~/biopb.json:/biopb.json \
     -v ${YOUR_DATA_LOCATION}:/data \
     -e CONFIG_FILE=/biopb.json \
     -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
     jiyuuchc/biopb-tensor-server:latest
 ```
+
+The FastAPI HTTP sidecar (port 8814) is off by default; set
+`BIOPB_ENABLE_HTTP_SIDECAR=1` and publish 8814 to get it back.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
