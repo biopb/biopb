@@ -323,7 +323,10 @@ See **[docs/http-server.md](docs/http-server.md)** for the full endpoint table, 
 biopb-tensor-server launch --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
 
 # for grpc only (no web server) — same flight options + token handling as launch
-biopb-tensor-server serve --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable]
+biopb-tensor-server serve --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--tls]
+
+# generate / rotate the self-signed TLS cert and print its fingerprint
+biopb-tensor-server cert init [--force]
 ```
 
 `serve` and `launch` share the Flight-server flags (`--host`/`--port`/`--writable`
@@ -331,6 +334,27 @@ override the config bind; `--token`/`--log-level`/`--log-file`) and the same
 fail-closed token resolution (`_resolve_flight_token`). `launch` adds the HTTP
 sidecar (`--web-host`/`--web-port`/`--cors`) and layers the sidecar fail-closed
 check on top (`_resolve_launch_token`).
+
+**TLS (`serve --tls`, biopb/biopb#604).** The encryption story is deliberately
+CA-free: `--tls` serves the flight plane over `grpc+tls://` using a **self-signed**
+cert (its own trust anchor), auto-generated into the state tree
+(`state/biopb/tls/`) on first use — so a headless server stands up TLS with no CA
+to manage. Clients connect with `grpcs://` and **pin the cert on first connect**
+(TOFU, `biopb.tensor._tls`); the SDK stores the pin in `state/biopb/tls-known-hosts.json`
+and refuses a later mismatched cert. `cert init` pre-seeds or rotates the cert and
+prints the fingerprint a client will pin. `--tls-cert`/`--tls-key` serve a BYO cert
+instead. The cert machinery lives beside the token machinery (`core/tls.py`),
+*not* in the control plane, so case 2 (no control installed) works.
+
+`cryptography` (the cert generator) is an **opt-in `[tls]` extra**, deliberately
+kept out of the default install closure: it drags a Rust/OpenSSL build surface
+with no recent Intel-macOS wheel that broke `curl install.sh | bash` there
+(biopb/biopb#355, which *dropped* the transitive dep). So TLS *serving* opts in
+(`pip install 'biopb-tensor-server[tls]'`; `serve --tls`/`cert init` raise an
+actionable error if it is absent), while the SDK client's TOFU pinning
+(`biopb.tensor._tls`) is stdlib-`ssl` only and needs nothing extra. `--tls` is on
+`serve` only for now; `launch` (the HTTP-sidecar path) and the control-supervised
+plane are a follow-up.
 
 Startup sequence (`launch`):
 

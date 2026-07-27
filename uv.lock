@@ -847,6 +847,9 @@ test = [
     { name = "simplejpeg" },
     { name = "uvicorn", extra = ["standard"] },
 ]
+tls = [
+    { name = "cryptography" },
+]
 web = [
     { name = "fastapi" },
     { name = "pillow" },
@@ -866,10 +869,11 @@ requires-dist = [
     { name = "bioio-ome-tiff", marker = "extra == 'aics'" },
     { name = "bioio-tifffile", marker = "extra == 'aics'" },
     { name = "biopb", editable = "." },
+    { name = "biopb-tensor-server", extras = ["tls"], marker = "extra == 'test'", editable = "biopb-tensor-server" },
     { name = "biopb-tensor-server", extras = ["web"], marker = "extra == 'test'", editable = "biopb-tensor-server" },
     { name = "cachey", specifier = ">=0.1.0" },
     { name = "cjdk", marker = "extra == 'bioformats'", specifier = ">=0.5.0" },
-    { name = "cryptography", marker = "extra == 'test'", specifier = ">=41.0.0" },
+    { name = "cryptography", marker = "extra == 'tls'", specifier = ">=41.0.0" },
     { name = "dask", extras = ["array"], specifier = ">=2024.0.0" },
     { name = "duckdb" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.111.0" },
@@ -898,7 +902,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = ">=0.30.0" },
     { name = "zarr", specifier = ">=2.0.0,<3" },
 ]
-provides-extras = ["web", "test", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff", "em"]
+provides-extras = ["web", "tls", "test", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff", "em"]
 
 [[package]]
 name = "black"
