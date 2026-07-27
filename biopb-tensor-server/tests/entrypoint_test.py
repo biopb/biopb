@@ -159,12 +159,32 @@ def test_half_a_byo_cert_is_refused(tmp_path):
     assert "BIOPB_TLS_KEY" in proc.stderr
 
 
-def test_tls_with_sidecar_is_refused(tmp_path):
-    """The sidecar's internal client can't reach a TLS Flight server yet."""
+def test_tls_reaches_launch_when_the_sidecar_is_on(tmp_path):
+    """TLS + sidecar used to be refused (the sidecar could not dial a TLS plane).
+
+    It now reaches Flight over loopback trusting the same cert, so the entrypoint
+    must forward the TLS flags to `launch` rather than reject the combination.
+    """
     env = {"BIOPB_TENSOR_TLS": "1", "BIOPB_ENABLE_HTTP_SIDECAR": "1"}
-    _, proc = _run(tmp_path, env, expect_ok=False)
-    assert proc.returncode == 2
-    assert "TLS" in proc.stderr
+    argv, proc = _run(tmp_path, env)
+    assert argv[0] == "launch"
+    assert "--tls" in argv
+    assert "grpcs://" in proc.stdout  # the scheme clients must dial
+
+
+def test_byo_cert_reaches_launch_when_the_sidecar_is_on(tmp_path):
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_text("cert")
+    key.write_text("key")
+    env = {
+        "BIOPB_TLS_CERT": str(cert),
+        "BIOPB_TLS_KEY": str(key),
+        "BIOPB_ENABLE_HTTP_SIDECAR": "1",
+    }
+    argv, _ = _run(tmp_path, env)
+    assert argv[0] == "launch"
+    assert argv[argv.index("--tls-cert") + 1] == str(cert)
+    assert argv[argv.index("--tls-key") + 1] == str(key)
 
 
 def test_allow_no_token_passes_no_token(tmp_path):

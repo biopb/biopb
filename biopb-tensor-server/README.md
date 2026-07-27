@@ -164,7 +164,8 @@ docker run -d --rm \
 Add `-v ~/biopb.json:/biopb.json -e CONFIG_FILE=/biopb.json` to either form to
 supply a full config instead of the env-var defaults. The FastAPI HTTP sidecar
 (port 8814) is off by default; set `BIOPB_ENABLE_HTTP_SIDECAR=1` and publish 8814
-to get it back.
+to get it back — it composes with TLS, reaching the Flight plane over loopback
+and trusting the same certificate directly.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
@@ -225,6 +226,10 @@ biopb-tensor-server launch --config biopb.json
 
 # Remote mode (public server.host — token required, auto-generated if omitted)
 biopb-tensor-server launch --config biopb.json --token mytoken...
+
+# Over TLS (clients dial grpcs:// and pin the cert on first connect).
+# Also settable as server.tls in the config; --tls/--no-tls overrides it.
+biopb-tensor-server launch --config biopb.json --tls
 
 # gRPC only (no web sidecar)
 biopb-tensor-server serve --config biopb.json

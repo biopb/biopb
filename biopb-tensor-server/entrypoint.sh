@@ -31,7 +31,9 @@ set -e
 #                  one and pinned clients refuse to reconnect.
 # BIOPB_TLS_CERT / BIOPB_TLS_KEY - Paths (in-container) to a BYO PEM cert + key to
 #                  serve instead of the self-signed one. Takes precedence over
-#                  BIOPB_TENSOR_TLS; both must be set together.
+#                  BIOPB_TENSOR_TLS; both must be set together. With the sidecar
+#                  opted in, the cert must carry a loopback SAN (localhost /
+#                  127.0.0.1) -- that is how the co-located sidecar reaches Flight.
 # BIOPB_TENSOR_TOKEN - Access token for gRPC (and the sidecar, if enabled;
 #                  auto-generated if not set)
 # BIOPB_TENSOR_ALLOW_NO_TOKEN - Set truthy (1/true/yes/on, case-insensitive) to serve
@@ -162,9 +164,11 @@ else
 fi
 
 # Resolve TLS material for the Flight plane. A BYO cert wins over the self-signed
-# one; both files must be given together (`serve` re-validates and refuses one).
-# TLS is a `serve` flag only -- the sidecar's internal client does not yet speak
-# TLS to the Flight server -- so the two options are mutually exclusive today.
+# one; both files must be given together (`serve`/`launch` re-validate and refuse
+# one). Both commands take these flags: the sidecar reaches the Flight plane over
+# loopback and trusts the same certificate directly, so TLS and the sidecar are
+# no longer mutually exclusive. A BYO cert must carry a loopback SAN for that dial
+# to pass gRPC's name check.
 TLS_ARGS=()
 if [ -n "$BIOPB_TLS_CERT" ] || [ -n "$BIOPB_TLS_KEY" ]; then
     if [ -z "$BIOPB_TLS_CERT" ] || [ -z "$BIOPB_TLS_KEY" ]; then
@@ -174,13 +178,6 @@ if [ -n "$BIOPB_TLS_CERT" ] || [ -n "$BIOPB_TLS_KEY" ]; then
     TLS_ARGS=(--tls-cert "$BIOPB_TLS_CERT" --tls-key "$BIOPB_TLS_KEY")
 elif _is_truthy "$BIOPB_TENSOR_TLS"; then
     TLS_ARGS=(--tls)
-fi
-
-if [ ${#TLS_ARGS[@]} -gt 0 ] && [ "$ENABLE_SIDECAR" = true ]; then
-    echo "ERROR: TLS is not supported together with BIOPB_ENABLE_HTTP_SIDECAR --" >&2
-    echo "       the HTTP sidecar's internal client cannot yet reach a TLS Flight" >&2
-    echo "       server. Run Flight-only with TLS, or the sidecar without it." >&2
-    exit 2
 fi
 
 # Resolve the tensor-server access token. `serve`/`launch` re-validate it on the
@@ -227,13 +224,16 @@ if [ "$ENABLE_SIDECAR" = true ]; then
     for origin in $BIOPB_CORS_ORIGINS; do
         LAUNCH_ARGS+=(--cors "$origin")
     done
-    echo "HTTP sidecar: http://${WEB_HOST}:${HTTP_PORT}   Flight gRPC: ${WEB_HOST}:${GRPC_PORT}"
-    exec biopb-tensor-server launch "${LAUNCH_ARGS[@]}" "${TOKEN_ARGS[@]}"
+    GRPC_SCHEME="grpc"
+    [ ${#TLS_ARGS[@]} -gt 0 ] && GRPC_SCHEME="grpcs"
+    echo "HTTP sidecar: http://${WEB_HOST}:${HTTP_PORT}   Flight: ${GRPC_SCHEME}://${WEB_HOST}:${GRPC_PORT}"
+    exec biopb-tensor-server launch "${LAUNCH_ARGS[@]}" \
+        "${TLS_ARGS[@]}" "${TOKEN_ARGS[@]}"
 else
     # Flight only: a pure gRPC data-plane endpoint, no HTTP surface.
-    SCHEME="grpc"
-    [ ${#TLS_ARGS[@]} -gt 0 ] && SCHEME="grpcs"
-    echo "Flight: ${SCHEME}://${WEB_HOST}:${GRPC_PORT}"
+    GRPC_SCHEME="grpc"
+    [ ${#TLS_ARGS[@]} -gt 0 ] && GRPC_SCHEME="grpcs"
+    echo "Flight: ${GRPC_SCHEME}://${WEB_HOST}:${GRPC_PORT}"
     exec biopb-tensor-server serve --config "$CONFIG_FILE" \
         "${TLS_ARGS[@]}" "${TOKEN_ARGS[@]}"
 fi

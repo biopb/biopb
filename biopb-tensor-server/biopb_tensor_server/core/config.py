@@ -660,6 +660,27 @@ class ServerConfig:
         default=8815,
         metadata={"help": "TCP port for the Flight gRPC data-plane server."},
     )
+    tls: bool = field(
+        default=False,
+        metadata={
+            "help": "Serve the Flight plane over TLS using the self-signed "
+            "certificate in the state dir (generated on first use). Clients dial "
+            "grpcs:// and pin the cert on first connect. Requires the 'tls' extra "
+            "(cryptography); ignored when tls_cert/tls_key are set."
+        },
+    )
+    tls_cert: Optional[Path] = field(
+        default=None,
+        metadata={
+            "help": "PEM certificate chain to serve instead of the self-signed "
+            "one (requires tls_key). Read straight off disk, so this is the TLS "
+            "path that does not need the 'tls' extra."
+        },
+    )
+    tls_key: Optional[Path] = field(
+        default=None,
+        metadata={"help": "PEM private key paired with tls_cert."},
+    )
     log_level: str = field(
         default="INFO",
         metadata={"help": "Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL)."},
@@ -1116,6 +1137,11 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     server_kwargs: Dict[str, Any] = {}
     _carry(server_kwargs, "host", server_data)
     _carry(server_kwargs, "port", server_data)
+    _carry(server_kwargs, "tls", server_data, cast=bool)
+    # Cert/key are paths on the wire; a falsy value means "unset" -> the default.
+    for _tls_key in ("tls_cert", "tls_key"):
+        if server_data.get(_tls_key):
+            server_kwargs[_tls_key] = Path(server_data[_tls_key])
     _carry(server_kwargs, "log_level", server_data)
     _carry(server_kwargs, "log_scope_to_biopb", server_data)
 
