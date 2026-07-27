@@ -109,7 +109,7 @@ curl -fsSL https://biopb.org/install.sh | bash
 biopb control start
 ```
 
-### Docker — the remote data server
+### Docker — remote data server
 
 Docker is the standard way to run a **remote, headless data server**: the image
 is a Flight-only data plane (one gRPC port, no HTTP sidecar).
@@ -126,45 +126,8 @@ docker run -d --restart unless-stopped \
 docker logs biopb-tensor    # copy the access token, printed once
 ```
 
-`BIOPB_TENSOR_TLS=1` serves TLS with a self-signed cert the server mints itself —
-**no CA to distribute**; clients pin it on first connect (TOFU). The public bind
-auto-generates an access token. The state volume keeps the cert stable across
-container recreates.
-
-Then, from your own machine, add it as a source in your `biopb.json` and browse
-it in the usual UI:
-
-```json
-{ "sources": [
-    { "type": "tensor-server", "url": "grpcs://data.mylab.example:8815" }
-] }
-```
-
-Pass the server's token to your own stack as `BIOPB_UPSTREAM_TENSOR_TOKEN`. Your
-browser only ever talks to your own loopback control, so it never has to trust
-the server's certificate.
-
-Mounting **several** remote servers — or pinning an upstream's certificate up
-front instead of trusting it on first connect — uses a per-source credentials
-profile (`storage_type: "biopb-tensor"`, with `token` plus optional
-`tls_fingerprint` / `tls_ca_file`); see [containerize.md](containerize.md).
-
-For a **single-machine** setup, publish to loopback and skip both:
-
-```bash
-docker run -d --rm \
-    --name biopb-tensor \
-    -p 127.0.0.1:8815:8815 \
-    -v ${YOUR_DATA_LOCATION}:/data \
-    -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
-    jiyuuchc/biopb-tensor-server:latest
-```
-
-Add `-v ~/biopb.json:/biopb.json -e CONFIG_FILE=/biopb.json` to either form to
-supply a full config instead of the env-var defaults. The FastAPI HTTP sidecar
-(port 8814) is off by default; set `BIOPB_ENABLE_HTTP_SIDECAR=1` and publish 8814
-to get it back — it composes with TLS, reaching the Flight plane over loopback
-and trusting the same certificate directly.
+`BIOPB_TENSOR_TLS=1` enables encryption. The server writes the TLS cert to
+`/root/.local/state` so it can be reused across restarts.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
