@@ -8,6 +8,7 @@ the service module itself imports no Qt/napari.)
 
 import contextlib
 import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -1233,3 +1234,45 @@ def test_connect_passes_the_anchor_to_the_client(monkeypatch, tmp_path):
     monkeypatch.setattr(_connection, "TensorFlightClient", _fake_client)
     TensorConnection().connect("grpcs://127.0.0.1:8815", token=None)
     assert captured["tls_ca_pem"] == b"PEMBYTES"
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="chmod 000 blocks neither root nor Windows, so the read would succeed",
+)
+def test_an_unreadable_cert_is_not_reported_as_an_auth_problem(monkeypatch, tmp_path):
+    """Regression: `[Errno 13] Permission denied` matched the auth markers.
+
+    `connect_error_message` classifies by substring, and a cert the process
+    cannot read stringifies as "Permission denied" — which the auth markers
+    claimed, so a file-permission problem was reported as "the tensor server
+    needs a token" and sent the reader after a credential that had nothing to do
+    with it.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from biopb._locations import tls_server_cert
+
+    cert = tls_server_cert()
+    cert.parent.mkdir(parents=True, exist_ok=True)
+    cert.write_bytes(b"PEM")
+    cert.chmod(0o000)
+    try:
+        with pytest.raises(_connection.LocalTrustError) as exc:
+            _connection._local_ca("grpcs://127.0.0.1:8815")
+    finally:
+        cert.chmod(0o600)
+
+    message = connect_error_message(exc.value, "grpcs://127.0.0.1:8815", None)
+    assert "needs a token" not in message
+    assert "Authentication" not in message
+    assert str(cert) in message  # names the actual file to fix
+
+
+def test_a_real_auth_failure_is_still_reported_as_one():
+    """The type check must not shadow the substring path it runs ahead of."""
+    message = connect_error_message(
+        RuntimeError("Flight returned unauthenticated error"),
+        "grpc://127.0.0.1:8815",
+        None,
+    )
+    assert "needs a token" in message

@@ -269,7 +269,10 @@ and URL/token resolution + persistence.
   it keeps this client out of the pin store, which would otherwise strand it the
   moment an operator ran `cert init --force`. A remote plane still TOFU-pins (its
   cert cannot be on this disk). If a local plane is TLS but the cert is
-  unreadable, this **raises** rather than degrading to TOFU. Known edge: a
+  unreadable, this **raises** `LocalTrustError` rather than degrading to TOFU — a
+distinct type because `connect_error_message` classifies by *substring*, and an
+unreadable cert stringifies as `[Errno 13] Permission denied`, which the auth
+markers would otherwise claim and report as "the server needs a token". Known edge: a
   loopback `grpcs://` URL that is really an `ssh -L` tunnel to a *remote* plane is
   indistinguishable by host, so it is anchored on the local cert and fails the
   handshake — loud, not silent, but a real constraint on that setup.

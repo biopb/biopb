@@ -88,6 +88,19 @@ def is_local_url(url: str) -> bool:
     return host is None or host in _LOCAL_HOSTS
 
 
+class LocalTrustError(RuntimeError):
+    """The local data plane's TLS certificate could not be used as a trust anchor.
+
+    A distinct type because :func:`connect_error_message` classifies failures by
+    *substring*, and the most likely cause here -- an unreadable cert file --
+    stringifies as ``[Errno 13] Permission denied: '<path>'``. That matches the
+    "permission denied" auth marker, so a file-permission problem would be
+    reported as "the server needs a token" and send the reader hunting for a
+    credential that has nothing to do with it. Matching on the type instead is
+    exact, and it cannot be broken by the wording of an errno string.
+    """
+
+
 def _local_ca(url: str) -> bytes | None:
     """Explicit TLS trust anchor for a *local* data plane, read off local disk.
 
@@ -103,7 +116,8 @@ def _local_ca(url: str) -> bytes | None:
     Returns ``None`` — leaving TOFU in charge — for a plaintext endpoint or a
     remote one, whose cert is not on this disk and cannot be.
 
-    Raises ``RuntimeError`` when a local plane is TLS but its cert is unreadable.
+    Raises :class:`LocalTrustError` when a local plane is TLS but its cert is
+    unreadable.
     That is deliberate: silently falling back to TOFU there would pin a cert we
     were supposed to already know, trading a verified anchor for an unverified
     one exactly where the strong option was meant to apply.
@@ -123,7 +137,7 @@ def _local_ca(url: str) -> bytes | None:
     try:
         pem = cert_path.read_bytes()
     except OSError as exc:
-        raise RuntimeError(
+        raise LocalTrustError(
             f"The local data plane at {url} serves TLS, but its certificate could "
             f"not be read from {cert_path} ({exc}). A local plane is trusted from "
             "its cert on disk, not by pinning it from the wire — so this is not "
@@ -132,7 +146,7 @@ def _local_ca(url: str) -> bytes | None:
             "`biopb-tensor-server cert init`."
         ) from exc
     if not pem.strip():
-        raise RuntimeError(
+        raise LocalTrustError(
             f"The local data plane's TLS certificate at {cert_path} is empty."
         )
     return pem
@@ -166,7 +180,17 @@ def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
     (e.g. a GUI-entered token lost across a kernel restart) — so that case names
     the fix; an unreachable server gets a friendly hint; anything else echoes the
     underlying error so nothing is hidden.
+
+    Classification is by substring, which is why anything with an *exact* signal
+    is matched by type first (see :class:`LocalTrustError`) -- an errno string
+    that happens to contain a marker word would otherwise be misreported.
     """
+    # Before the substring scan: a LocalTrustError already carries an actionable
+    # message, and its most likely cause (an unreadable cert) contains the words
+    # "permission denied", which the auth markers below would otherwise claim.
+    if isinstance(exc, LocalTrustError):
+        return str(exc)
+
     text = f"{type(exc).__name__}: {exc}".strip()
     low = text.lower()
     if any(m in low for m in _AUTH_ERROR_MARKERS):
