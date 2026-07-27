@@ -909,3 +909,40 @@ def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
     assert captured["flight_cert"] is None
     assert captured["tls_ca_pem"] is None
     assert captured["flight_location"].startswith("grpc://")
+
+
+def test_no_tls_beats_a_configured_cert(tmp_path):
+    """`--no-tls` must win over a cert/key pair, wherever the pair came from.
+
+    A cert on its own means "serve TLS" (--tls-cert never needed --tls), so
+    _resolve_tls_material honors the pair *before* it looks at the flag. An
+    explicit off therefore has to drop the pair, or --no-tls against a config
+    carrying tls_cert would silently keep serving TLS.
+    """
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERT")
+    key.write_bytes(b"KEY")
+    cfg = _fake_server_config(tls=True, tls_cert=cert, tls_key=key)
+
+    merged = cli._merge_tls_options(False, None, None, cfg)
+    assert merged == (False, None, None)
+    assert cli._resolve_tls_material(*merged, None) == (None, None)
+
+    # ...including a pair given on the command line alongside --no-tls.
+    merged = cli._merge_tls_options(False, cert, key, _fake_server_config())
+    assert cli._resolve_tls_material(*merged, None) == (None, None)
+
+
+def test_a_cert_alone_still_implies_tls(tmp_path):
+    """The pre-existing contract: --tls-cert/--tls-key need no --tls."""
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERT")
+    key.write_bytes(b"KEY")
+
+    merged = cli._merge_tls_options(None, cert, key, _fake_server_config())
+    assert cli._resolve_tls_material(*merged, None) == (b"CERT", b"KEY")
+
+    # Same when the pair comes from the config rather than the flags.
+    cfg = _fake_server_config(tls=False, tls_cert=cert, tls_key=key)
+    merged = cli._merge_tls_options(None, None, None, cfg)
+    assert cli._resolve_tls_material(*merged, None) == (b"CERT", b"KEY")

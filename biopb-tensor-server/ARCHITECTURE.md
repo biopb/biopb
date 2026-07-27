@@ -395,6 +395,10 @@ all from the control: the supervisor spawns `launch -c config.json` and passes n
 TLS arguments, so a config that could not express TLS would be a plane the
 control could never serve over TLS. The flag is tri-state (`--tls/--no-tls`) and
 overrides the config in **both** directions; omitting both defers to the config.
+`--no-tls` additionally drops any cert/key pair — a cert on its own *means*
+"serve TLS" (`--tls-cert` never needed `--tls`), so `_resolve_tls_material`
+honors the pair before it consults the flag, and an explicit off has to be
+applied in `_merge_tls_options` or it would be silently ignored.
 
 Serving TLS from `launch` means the co-located sidecar has to reach a TLS Flight
 plane. It does: the flight location becomes `grpcs://<loopback>` and the served

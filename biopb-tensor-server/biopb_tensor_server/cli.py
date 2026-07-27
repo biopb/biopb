@@ -486,7 +486,16 @@ def _merge_tls_options(
     ``--tls/--no-tls`` is tri-state: ``None`` (neither given) defers to the
     config, so a flag can turn TLS on *or* off against a config that says
     otherwise.
+
+    ``--no-tls`` also **drops any cert/key pair**. A cert on its own still means
+    "serve TLS" (that is the pre-existing contract -- ``--tls-cert`` alone never
+    needed ``--tls``), and :func:`_resolve_tls_material` therefore honors the pair
+    before it looks at the flag. So an explicit "off" has to be applied here, or
+    ``--no-tls`` against a config carrying ``tls_cert`` would silently serve TLS
+    anyway.
     """
+    if tls is False:
+        return False, None, None
     return (
         server_config.tls if tls is None else tls,
         tls_cert or server_config.tls_cert,
@@ -1041,7 +1050,8 @@ def serve(
         help="Serve the flight plane over TLS. Uses the self-signed cert in the "
         "state dir (auto-generated on first use); clients connect with grpcs:// "
         "and pin it on first connect (TOFU). Overrides server.tls in the config "
-        "either way; omit both to use the config. See also `cert init`.",
+        "either way; omit both to use the config. --no-tls also ignores any "
+        "configured cert/key pair. See also `cert init`.",
     ),
     tls_cert: Optional[Path] = typer.Option(
         None,
@@ -1386,7 +1396,8 @@ def launch(
         "state dir (auto-generated on first use); clients connect with grpcs:// "
         "and pin it on first connect (TOFU). The HTTP sidecar reaches the flight "
         "plane over loopback and trusts the same cert directly. Overrides "
-        "server.tls in the config either way. See also `cert init`.",
+        "server.tls in the config either way, and --no-tls also ignores any "
+        "configured cert/key pair. See also `cert init`.",
     ),
     tls_cert: Optional[Path] = typer.Option(
         None,
