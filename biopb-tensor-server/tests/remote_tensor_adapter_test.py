@@ -785,14 +785,16 @@ def test_profile_ca_file_is_read_into_pem_bytes(tmp_path):
     assert creds.tls_ca_pem == ca.read_bytes()
 
 
-def test_profile_fingerprint_is_passed_through():
+def test_profile_fingerprint_is_passed_through_normalized():
+    """The configured fingerprint reaches the credentials, canonicalized so the
+    pool key is stable across spellings (see UpstreamCredentials.__post_init__)."""
     from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
 
     creds = resolve_upstream_credentials(
         _upstream_source(credentials_profile="lab-store"),
         _creds(tls_fingerprint="AB:CD:EF"),
     )
-    assert creds.tls_fingerprint == "AB:CD:EF"
+    assert creds.tls_fingerprint == "abcdef"
 
 
 def test_unreadable_ca_file_fails_rather_than_degrading_to_tofu(tmp_path):
@@ -884,6 +886,41 @@ def test_pooled_clients_are_isolated_by_trust_material(monkeypatch):
     rt._clear_client_pool()
 
 
+def test_pool_key_is_stable_across_fingerprint_spellings(monkeypatch):
+    """Same upstream + same fingerprint in different spellings -> one connection.
+
+    The SDK normalizes fingerprints before comparing, so a colon-grouped and a
+    bare-hex spelling of one digest are the same trust decision; the pool key
+    (UpstreamCredentials) must agree, or it would open two clients the SDK then
+    treats as identical.
+    """
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    built = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            built.append(tls.get("tls_fingerprint"))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    grouped = rt.UpstreamCredentials(tls_fingerprint="AB:CD:EF")
+    bare = rt.UpstreamCredentials(tls_fingerprint="abcdef")
+    assert grouped == bare  # canonicalized in __post_init__
+    a = rt.RemoteTensorAdapter("lab__a", "grpcs://up:1", "a", credentials=grouped)
+    b = rt.RemoteTensorAdapter("lab__b", "grpcs://up:1", "b", credentials=bare)
+
+    assert a.client is b.client
+    assert len(built) == 1
+    assert built[0] == "abcdef"
+    rt._clear_client_pool()
+
+
 def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkeypatch):
     """The catalog enumeration dials the upstream directly, outside the adapter
     pool, so it has to carry the same anchor -- else a grpcs:// upstream with a
@@ -910,7 +947,7 @@ def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkey
         credentials_config=_creds(token="tok", tls_fingerprint="AB:CD"),
     )
     assert seen["token"] == "tok"
-    assert seen["tls_fingerprint"] == "AB:CD"
+    assert seen["tls_fingerprint"] == "abcd"  # normalized in __post_init__
 
 
 def _meta_zarr_cls():

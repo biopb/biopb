@@ -86,11 +86,30 @@ class UpstreamCredentials:
     ``tls_ca_pem`` holds the PEM bytes, not the path they were read from --
     resolving the path is a config-layer concern, and carrying bytes keeps the
     value comparable and self-contained once it reaches the SDK.
+
+    ``tls_fingerprint`` is canonicalized in ``__post_init__`` so it can key the
+    pool safely: the SDK compares fingerprints normalized (colon-grouped display
+    form vs bare hex, any case, all compare equal), so two profiles pinning one
+    upstream with different spellings must collapse to a single pooled client
+    rather than open two connections the SDK would then treat as identical.
     """
 
     token: Optional[str] = None
     tls_ca_pem: Optional[bytes] = None
     tls_fingerprint: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.tls_fingerprint:
+            # Reuse the SDK's own normalization (it re-applies it anyway on the
+            # way in) so this pool key agrees with the SDK's memo key; empty
+            # after stripping means unset.
+            from biopb.tensor._tls import _normalize_fingerprint
+
+            object.__setattr__(
+                self,
+                "tls_fingerprint",
+                _normalize_fingerprint(self.tls_fingerprint) or None,
+            )
 
 
 # Process-wide pool of upstream clients, keyed by (endpoint, credentials) so N
