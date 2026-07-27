@@ -111,9 +111,16 @@ downgrading.
 To serve a certificate you already have, mount it and point `BIOPB_TLS_CERT` /
 `BIOPB_TLS_KEY` at the in-container paths instead — no state volume needed.
 
-TLS and `BIOPB_ENABLE_HTTP_SIDECAR` are mutually exclusive today: the sidecar's
-internal client does not yet speak TLS to the Flight server, so the entrypoint
-refuses that combination rather than silently serving plaintext.
+TLS works with `BIOPB_ENABLE_HTTP_SIDECAR=1`. The sidecar is co-located with the
+Flight plane, reaches it over loopback, and trusts the very certificate that
+plane serves — read off local disk, so it is an explicit trust anchor rather than
+a first-connect pin, and rotating the cert does not strand it.
+
+> **A BYO cert needs a loopback SAN.** gRPC checks the *dialed* name against the
+> certificate's SANs even when trust comes from an explicit anchor, so a cert
+> minted only for a public name (`data.mylab.example`) leaves the sidecar unable
+> to reach Flight over `127.0.0.1`. Include `localhost` / `127.0.0.1` in the SANs,
+> or run Flight-only. The self-signed cert the server mints always carries them.
 
 ### Single machine (no network exposure)
 
@@ -143,8 +150,8 @@ token) the moment the port is reachable from another host.
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port in container. Derived: **gRPC Flight=BASE+5** (publish this — the data plane), HTTP sidecar=BASE+4 (only with the opt-in below) |
 | `BIOPB_ENABLE_HTTP_SIDECAR` | (unset) | Set to `1`/`true` to also serve the FastAPI data-plane HTTP API on BASE+4 (the container runs `launch` instead of `serve`). Off by default — the container is Flight-only. Publish the port explicitly (`-p 8814:8814`); it is not `EXPOSE`d |
-| `BIOPB_TENSOR_TLS` | (unset) | Set to `1`/`true` to serve Flight over TLS with a self-signed cert (auto-generated in the state dir; clients dial `grpcs://` and pin it on first connect). Mount a volume at `/root/.local/state` to keep the cert stable across `docker rm`. Incompatible with `BIOPB_ENABLE_HTTP_SIDECAR` |
-| `BIOPB_TLS_CERT` / `BIOPB_TLS_KEY` | (unset) | In-container paths to a PEM cert + key to serve instead of the self-signed one (mount them in). Must be set together; takes precedence over `BIOPB_TENSOR_TLS` |
+| `BIOPB_TENSOR_TLS` | (unset) | Set to `1`/`true` to serve Flight over TLS with a self-signed cert (auto-generated in the state dir; clients dial `grpcs://` and pin it on first connect). Mount a volume at `/root/.local/state` to keep the cert stable across `docker rm`. Works with `BIOPB_ENABLE_HTTP_SIDECAR` |
+| `BIOPB_TLS_CERT` / `BIOPB_TLS_KEY` | (unset) | In-container paths to a PEM cert + key to serve instead of the self-signed one (mount them in). Must be set together; takes precedence over `BIOPB_TENSOR_TLS`. With the sidecar enabled the cert must carry a loopback SAN |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for gRPC (and the sidecar, if enabled); printed once in the logs when auto-generated |
 | `BIOPB_TENSOR_ALLOW_NO_TOKEN` | (unset) | Set to `1`/`true` to serve the data API **without a token** even on the public `0.0.0.0` bind (insecure — trusted networks only). Ignored when `BIOPB_TENSOR_TOKEN` is set |
 | `BIOPB_CORS_ORIGINS` | (unset) | Space-separated CORS origins (→ repeated `--cors`). Only meaningful with `BIOPB_ENABLE_HTTP_SIDECAR`: allows a browser SPA served from a different origin to call the sidecar (e.g. `BIOPB_CORS_ORIGINS="http://localhost:5173 http://my.host:8813"`) |
@@ -376,7 +383,7 @@ docker logs biopb-tensor
 Common causes:
 - A mounted `CONFIG_FILE` that is malformed (JSON parse or value-validation error — a legacy TOML is rejected outright; convert it with `biopb server migrate-config`) — check `docker logs` for the traceback
 - A port already in use inside the container (e.g. `--network host` colliding with a host process on 8815)
-- `BIOPB_TENSOR_TLS=1` together with `BIOPB_ENABLE_HTTP_SIDECAR=1` — the entrypoint refuses that combination (exit 2); the sidecar cannot yet reach a TLS Flight server
+- A BYO `BIOPB_TLS_CERT` without a loopback SAN, together with `BIOPB_ENABLE_HTTP_SIDECAR=1` — the sidecar cannot complete its loopback handshake, so every data request fails with a Flight connection error. Re-mint the cert including `localhost` / `127.0.0.1`, or run Flight-only
 
 > A config with **no sources** (or whose sources all fail to load) is **not** a
 > startup error — the server boots and serves an **empty catalog** (health

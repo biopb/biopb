@@ -30,6 +30,25 @@ def _cache_lock_is_free(lock_path: Path) -> bool:
 _VALID_TOKEN = "a" * 32  # 32 URL-safe chars: passes _web_auth.valid_token
 
 
+def _fake_server_config(**overrides):
+    """Stand-in ServerConfig for tests that monkeypatch `load_config`.
+
+    Carries every field the CLI commands read off the config, so adding one to
+    ServerConfig surfaces here as a deliberate edit rather than an AttributeError
+    scattered across half the module.
+    """
+    base = {
+        "host": "127.0.0.1",
+        "port": 8815,
+        "log_level": "INFO",
+        "tls": False,
+        "tls_cert": None,
+        "tls_key": None,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 def _run_serve(config, **overrides):
     """Invoke `serve` as a plain function with explicit option defaults.
 
@@ -46,7 +65,7 @@ def _run_serve(config, **overrides):
         "port": None,
         "writable": False,
         "token": None,
-        "tls": False,
+        "tls": None,
         "tls_cert": None,
         "tls_key": None,
         "san": None,
@@ -54,6 +73,33 @@ def _run_serve(config, **overrides):
     }
     kwargs.update(overrides)
     return cli.serve(**kwargs)
+
+
+def _run_launch(config, **overrides):
+    """Invoke `launch` as a plain function with explicit option defaults.
+
+    Same reason as :func:`_run_serve`: calling a typer command directly bypasses
+    typer's default resolution, so every Option would arrive as an OptionInfo.
+    """
+    kwargs = {
+        "config": config,
+        "log_level": None,
+        "log_scope_biopb": True,
+        "host": None,
+        "port": None,
+        "writable": False,
+        "web_port": 8816,
+        "web_host": "127.0.0.1",
+        "token": None,
+        "tls": None,
+        "tls_cert": None,
+        "tls_key": None,
+        "san": None,
+        "cors_origins": None,
+        "log_file": None,
+    }
+    kwargs.update(overrides)
+    return cli.launch(**kwargs)
 
 
 class _FakeServer:
@@ -81,7 +127,7 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     server = _FakeServer()
     source_manager = _FakeStoppable()
     watcher = _FakeStoppable()
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
@@ -117,7 +163,7 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     flight_server = SimpleNamespace(serve=lambda: None)
     source_manager = _FakeStoppable()
     watcher = _FakeStoppable()
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
@@ -144,21 +190,7 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
         lambda *args, **kwargs: order.append("graceful_shutdown"),
     )
 
-    # Pass explicit values rather than typer OptionInfo defaults (calling the
-    # command as a plain function bypasses typer's default resolution).
-    cli.launch(
-        config=Path("unused.json"),
-        log_level=None,
-        log_scope_biopb=True,
-        host=None,
-        port=None,
-        writable=False,
-        web_port=8816,
-        web_host="127.0.0.1",
-        token=None,
-        cors_origins=None,
-        log_file=None,
-    )
+    _run_launch(Path("unused.json"))
 
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
 
@@ -172,7 +204,7 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     """
     captured: dict = {}
     # Config binds loopback; the override makes the flight plane public.
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
@@ -195,19 +227,7 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     )
     monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
 
-    cli.launch(
-        config=Path("unused.json"),
-        log_level=None,
-        log_scope_biopb=True,
-        host="0.0.0.0",
-        port=9001,
-        writable=True,
-        web_port=8816,
-        web_host="127.0.0.1",
-        token=None,
-        cors_origins=None,
-        log_file=None,
-    )
+    _run_launch(Path("unused.json"), host="0.0.0.0", port=9001, writable=True)
 
     # Overrides reached the flight server...
     assert captured["host"] == "0.0.0.0"
@@ -342,7 +362,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     assert not _cache_lock_is_free(lock_path)
 
     server = _FakeServer()
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
@@ -372,7 +392,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)  # held once cache init ran
 
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
@@ -775,3 +795,154 @@ def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys
         _run_serve(config_path)
     assert exc.value.exit_code == 1
     assert "migrate-config" in capsys.readouterr().out
+
+
+# --- TLS: CLI-over-config resolution ----------------------------------------
+# TLS is a config field as well as a flag because the control supervisor spawns
+# `launch -c config.json` with no TLS arguments -- a config that cannot express
+# TLS is a plane the control could never serve over TLS.
+
+
+def _cfg(tls=False, tls_cert=None, tls_key=None):
+    return SimpleNamespace(tls=tls, tls_cert=tls_cert, tls_key=tls_key)
+
+
+def test_tls_flag_omitted_defers_to_the_config():
+    assert cli._merge_tls_options(None, None, None, _cfg(tls=True))[0] is True
+    assert cli._merge_tls_options(None, None, None, _cfg(tls=False))[0] is False
+
+
+def test_tls_flag_overrides_the_config_in_both_directions():
+    # --no-tls must be able to turn off a config that says on, not just the
+    # reverse; that is why the flag is tri-state rather than a bare bool.
+    assert cli._merge_tls_options(False, None, None, _cfg(tls=True))[0] is False
+    assert cli._merge_tls_options(True, None, None, _cfg(tls=False))[0] is True
+
+
+def test_cert_and_key_fall_back_to_the_config():
+    cfg = _cfg(tls_cert=Path("/cfg/c.pem"), tls_key=Path("/cfg/k.pem"))
+    _, cert, key = cli._merge_tls_options(None, None, None, cfg)
+    assert (cert, key) == (Path("/cfg/c.pem"), Path("/cfg/k.pem"))
+    # An explicit flag still wins over the config value.
+    _, cert, _ = cli._merge_tls_options(None, Path("/cli/c.pem"), None, cfg)
+    assert cert == Path("/cli/c.pem")
+
+
+def test_a_missing_cert_path_from_the_config_is_refused(tmp_path):
+    """typer's `exists=True` only guards the CLI; a config path bypasses it.
+
+    Without this check the pair would reach `read_bytes()` and surface as a
+    traceback instead of an actionable message.
+    """
+    missing = tmp_path / "nope.pem"
+    key = tmp_path / "k.pem"
+    key.write_text("key")
+    with pytest.raises(typer.Exit) as exc:
+        cli._resolve_tls_material(True, missing, key, None)
+    assert exc.value.exit_code == 2
+
+
+def _launch_capturing_tls(monkeypatch, server_config, **launch_kwargs):
+    """Run `launch` with the plumbing stubbed, returning what TLS reached where."""
+    captured: dict = {}
+    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+    monkeypatch.setattr(cli, "_resolve_launch_token", lambda *a, **k: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured["flight_cert"] = kwargs.get("tls_cert_chain")
+        return (
+            SimpleNamespace(serve=lambda: None),
+            _FakeStoppable(),
+            _FakeStoppable(),
+            None,
+        )
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    monkeypatch.setattr(cli, "run_http_server", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+    _run_launch(Path("unused.json"), **launch_kwargs)
+    return captured
+
+
+def test_launch_points_the_sidecar_at_grpcs_and_hands_it_the_cert(
+    monkeypatch, tmp_path
+):
+    """The whole point of #604 case 1: `launch` can serve TLS *and* keep its sidecar.
+
+    The sidecar is co-located, so it gets the served cert as an explicit trust
+    anchor rather than pinning it off the wire.
+    """
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERTPEM")
+    key.write_bytes(b"KEYPEM")
+
+    captured = _launch_capturing_tls(
+        monkeypatch, _fake_server_config(), tls_cert=cert, tls_key=key
+    )
+
+    assert captured["flight_cert"] == b"CERTPEM"  # the plane serves it...
+    assert captured["tls_ca_pem"] == b"CERTPEM"  # ...and the sidecar trusts it
+    assert captured["flight_location"].startswith("grpcs://")
+
+
+def test_launch_config_tls_reaches_the_sidecar_with_no_flags(monkeypatch, tmp_path):
+    """The control supervisor spawns `launch -c config.json` and passes no TLS
+    flags, so config-driven TLS has to work on its own or the control can never
+    serve a TLS plane."""
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERTPEM")
+    key.write_bytes(b"KEYPEM")
+
+    captured = _launch_capturing_tls(
+        monkeypatch, _fake_server_config(tls=True, tls_cert=cert, tls_key=key)
+    )
+
+    assert captured["tls_ca_pem"] == b"CERTPEM"
+    assert captured["flight_location"].startswith("grpcs://")
+
+
+def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
+    captured = _launch_capturing_tls(monkeypatch, _fake_server_config())
+    assert captured["flight_cert"] is None
+    assert captured["tls_ca_pem"] is None
+    assert captured["flight_location"].startswith("grpc://")
+
+
+def test_no_tls_beats_a_configured_cert(tmp_path):
+    """`--no-tls` must win over a cert/key pair, wherever the pair came from.
+
+    A cert on its own means "serve TLS" (--tls-cert never needed --tls), so
+    _resolve_tls_material honors the pair *before* it looks at the flag. An
+    explicit off therefore has to drop the pair, or --no-tls against a config
+    carrying tls_cert would silently keep serving TLS.
+    """
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERT")
+    key.write_bytes(b"KEY")
+    cfg = _fake_server_config(tls=True, tls_cert=cert, tls_key=key)
+
+    merged = cli._merge_tls_options(False, None, None, cfg)
+    assert merged == (False, None, None)
+    assert cli._resolve_tls_material(*merged, None) == (None, None)
+
+    # ...including a pair given on the command line alongside --no-tls.
+    merged = cli._merge_tls_options(False, cert, key, _fake_server_config())
+    assert cli._resolve_tls_material(*merged, None) == (None, None)
+
+
+def test_a_cert_alone_still_implies_tls(tmp_path):
+    """The pre-existing contract: --tls-cert/--tls-key need no --tls."""
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERT")
+    key.write_bytes(b"KEY")
+
+    merged = cli._merge_tls_options(None, cert, key, _fake_server_config())
+    assert cli._resolve_tls_material(*merged, None) == (b"CERT", b"KEY")
+
+    # Same when the pair comes from the config rather than the flags.
+    cfg = _fake_server_config(tls=False, tls_cert=cert, tls_key=key)
+    merged = cli._merge_tls_options(None, None, None, cfg)
+    assert cli._resolve_tls_material(*merged, None) == (b"CERT", b"KEY")

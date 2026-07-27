@@ -188,3 +188,85 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
         client.close()
     finally:
         server.shutdown()
+
+
+# --- the co-located HTTP sidecar over a TLS flight plane --------------------
+# `launch` runs the Flight server and the FastAPI sidecar in one process, and the
+# sidecar reaches Flight over loopback as an ordinary TensorFlightClient. That
+# used to make TLS and the sidecar mutually exclusive (the entrypoint refused the
+# combination). The sidecar now trusts the very cert that plane serves, read off
+# local disk -- an explicit anchor, not a trust-on-first-use pin.
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_sidecar_reads_over_tls_without_pinning(
+    simple_zarr_array, tmp_path, monkeypatch
+):
+    """The sidecar serves data off a TLS plane, and never touches the pin store.
+
+    The pin-store assertion is what distinguishes the explicit-anchor path from a
+    TOFU fallback: both would return 200, but only TOFU records a pin -- which
+    would then break the sidecar whenever the cert is rotated.
+    """
+    import zarr
+    from biopb._locations import tls_known_hosts
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.serving.http_server import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    cert_pem, key_pem = _self_signed_cert()
+
+    server = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        app = create_app(
+            flight_location=f"grpcs://localhost:{server.port}",
+            token=None,
+            tls_ca_pem=cert_pem,
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            resp = tc.get("/api/sources")
+            assert resp.status_code == 200
+            assert any(s["source_id"] == "img" for s in resp.json())
+
+        assert not tls_known_hosts().exists(), (
+            "the sidecar holds the cert already -- it must not TOFU-pin it"
+        )
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
+    """A grpc:// sidecar against a TLS plane must fail, not silently degrade."""
+    import zarr
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.serving.http_server import create_app
+    from fastapi.testclient import TestClient
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    cert_pem, key_pem = _self_signed_cert()
+
+    server = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        app = create_app(flight_location=f"grpc://localhost:{server.port}", token=None)
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            assert tc.get("/api/sources").status_code == 502
+    finally:
+        server.shutdown()

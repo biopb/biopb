@@ -470,6 +470,39 @@ def _grpc_location(host: str, port: int) -> str:
     return f"grpc://{authority}:{port}"
 
 
+def _merge_tls_options(
+    tls: Optional[bool],
+    tls_cert: Optional[Path],
+    tls_key: Optional[Path],
+    server_config,
+) -> Tuple[bool, Optional[Path], Optional[Path]]:
+    """Resolve the three TLS knobs CLI-over-config.
+
+    TLS is a config field (``server.tls`` / ``server.tls_cert`` / ``server.tls_key``)
+    as well as a flag, because the control supervisor spawns ``launch -c
+    config.json`` with no TLS arguments -- so a config that cannot express TLS is
+    a data plane the control can never serve over TLS.
+
+    ``--tls/--no-tls`` is tri-state: ``None`` (neither given) defers to the
+    config, so a flag can turn TLS on *or* off against a config that says
+    otherwise.
+
+    ``--no-tls`` also **drops any cert/key pair**. A cert on its own still means
+    "serve TLS" (that is the pre-existing contract -- ``--tls-cert`` alone never
+    needed ``--tls``), and :func:`_resolve_tls_material` therefore honors the pair
+    before it looks at the flag. So an explicit "off" has to be applied here, or
+    ``--no-tls`` against a config carrying ``tls_cert`` would silently serve TLS
+    anyway.
+    """
+    if tls is False:
+        return False, None, None
+    return (
+        server_config.tls if tls is None else tls,
+        tls_cert or server_config.tls_cert,
+        tls_key or server_config.tls_key,
+    )
+
+
 def _resolve_tls_material(
     tls: bool,
     tls_cert: Optional[Path],
@@ -494,7 +527,15 @@ def _resolve_tls_material(
 
     # A BYO cert (both files given) is read straight off disk -- no `cryptography`
     # needed, so this is the escape hatch when the [tls] extra isn't installed.
+    # Existence is re-checked here rather than left to typer's `exists=True`: the
+    # pair can also arrive from the config file, which never passed through it.
     if tls_cert is not None:
+        for label, path in (("tls_cert", tls_cert), ("tls_key", tls_key)):
+            if not path.is_file():
+                console.print(
+                    f"[red]{label} not found: {_rich_escape(str(path))}[/red]"
+                )
+                raise typer.Exit(code=2)
         return tls_cert.read_bytes(), tls_key.read_bytes()
 
     if not tls:
@@ -1003,12 +1044,14 @@ def serve(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
-    tls: bool = typer.Option(
-        False,
-        "--tls",
+    tls: Optional[bool] = typer.Option(
+        None,
+        "--tls/--no-tls",
         help="Serve the flight plane over TLS. Uses the self-signed cert in the "
         "state dir (auto-generated on first use); clients connect with grpcs:// "
-        "and pin it on first connect (TOFU). See also `cert init`.",
+        "and pin it on first connect (TOFU). Overrides server.tls in the config "
+        "either way; omit both to use the config. --no-tls also ignores any "
+        "configured cert/key pair. See also `cert init`.",
     ),
     tls_cert: Optional[Path] = typer.Option(
         None,
@@ -1084,7 +1127,9 @@ def serve(
     # _setup_flight_server acquires the lock during cache init and can still raise
     # afterwards (e.g. a bad static source); keeping it inside the try means such
     # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
-    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
+    tls_cert_chain, tls_private_key = _resolve_tls_material(
+        *_merge_tls_options(tls, tls_cert, tls_key, server_config), san
+    )
 
     server = source_manager = watcher = precache_worker = None
     try:
@@ -1344,6 +1389,37 @@ def launch(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
+    tls: Optional[bool] = typer.Option(
+        None,
+        "--tls/--no-tls",
+        help="Serve the flight plane over TLS. Uses the self-signed cert in the "
+        "state dir (auto-generated on first use); clients connect with grpcs:// "
+        "and pin it on first connect (TOFU). The HTTP sidecar reaches the flight "
+        "plane over loopback and trusts the same cert directly. Overrides "
+        "server.tls in the config either way, and --no-tls also ignores any "
+        "configured cert/key pair. See also `cert init`.",
+    ),
+    tls_cert: Optional[Path] = typer.Option(
+        None,
+        "--tls-cert",
+        exists=True,
+        help="PEM certificate chain to serve instead of the auto self-signed cert "
+        "(requires --tls-key). Must carry a loopback SAN (localhost / 127.0.0.1) "
+        "or the co-located sidecar cannot reach the flight plane.",
+    ),
+    tls_key: Optional[Path] = typer.Option(
+        None,
+        "--tls-key",
+        exists=True,
+        help="PEM private key paired with --tls-cert.",
+    ),
+    san: Optional[List[str]] = typer.Option(
+        None,
+        "--san",
+        help="Extra hostname/IP for the auto-generated cert (repeatable). Use it "
+        "when clients dial a name this host cannot discover itself; ignored if a "
+        "cert already exists (re-mint with `cert init --force --san ...`).",
+    ),
     cors_origins: Optional[List[str]] = typer.Option(
         None,
         "--cors",
@@ -1451,6 +1527,10 @@ def launch(
     # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
     # returns normally on shutdown (it does not re-raise), so cleanup must run in
     # `finally` rather than an except block regardless.
+    tls_cert_chain, tls_private_key = _resolve_tls_material(
+        *_merge_tls_options(tls, tls_cert, tls_key, server_config), san
+    )
+
     flight_server = source_manager = watcher = precache_worker = None
     try:
         flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
@@ -1459,6 +1539,8 @@ def launch(
             port=port,
             writable=writable,
             token=effective_token,
+            tls_cert_chain=tls_cert_chain,
+            tls_private_key=tls_private_key,
         )
 
         # The HTTP sidecar is co-located with the Flight server and reaches it over
@@ -1475,6 +1557,19 @@ def launch(
         flight_location = _grpc_location(
             _flight_connect_host, port or server_config.port
         )
+        if tls_cert_chain is not None:
+            # The sidecar is on the same host as the flight plane and holds the
+            # very cert that plane serves, so it trusts it directly (passed below
+            # as the client's root) rather than trust-on-first-use: an anchor read
+            # off local disk is strictly stronger than a pin learned from the
+            # wire, and it keeps the sidecar off the pin store entirely.
+            #
+            # The auto-generated cert always carries localhost/127.0.0.1/::1 (see
+            # core.tls._host_identity), so the loopback dial matches its SANs. A
+            # BYO cert minted only for a public name does not, and gRPC still
+            # checks the dialed name against the SANs even when trust comes from
+            # this explicit root -- hence the --tls-cert help text.
+            flight_location = flight_location.replace("grpc://", "grpcs://", 1)
         flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
         flight_thread.start()
 
@@ -1521,6 +1616,7 @@ def launch(
             port=web_port,
             cors_origins=effective_cors,
             config_path=str(config),
+            tls_ca_pem=tls_cert_chain,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")

@@ -388,12 +388,32 @@ needs no `cryptography` at all — the escape hatch when the extra isn't install
 `grpcs://<host>:8815` with that token and TOFU-pin the cert. Skip the install and
 bring a cert via `--tls-cert`/`--tls-key` instead.
 
-**Caveat — not yet config-driven.** `--tls` is on `serve` only. The
-control-supervised data plane runs `launch` (`_supervisor.py`) with no `--tls`,
-and there is **no TLS config field**, so editing config in the admin UI and
-restarting does **not** enable TLS today. Wiring TLS into `launch` + config + the
-supervisor — and surfacing the missing-`[tls]` error in the admin UI rather than a
-buried `tensor-server.log` crash — is the case-1 / control follow-up (biopb/biopb#604).
+**Config-driven TLS.** `--tls`/`--tls-cert`/`--tls-key` are on **both** `serve`
+and `launch`, and each mirrors a `server.tls` / `server.tls_cert` /
+`server.tls_key` config field. The config field is what makes TLS reachable at
+all from the control: the supervisor spawns `launch -c config.json` and passes no
+TLS arguments, so a config that could not express TLS would be a plane the
+control could never serve over TLS. The flag is tri-state (`--tls/--no-tls`) and
+overrides the config in **both** directions; omitting both defers to the config.
+`--no-tls` additionally drops any cert/key pair — a cert on its own *means*
+"serve TLS" (`--tls-cert` never needed `--tls`), so `_resolve_tls_material`
+honors the pair before it consults the flag, and an explicit off has to be
+applied in `_merge_tls_options` or it would be silently ignored.
+
+Serving TLS from `launch` means the co-located sidecar has to reach a TLS Flight
+plane. It does: the flight location becomes `grpcs://<loopback>` and the served
+cert PEM is handed to the sidecar's `TensorFlightClient` as `tls_ca_pem` — an
+explicit anchor read off local disk, *not* a TOFU pin. That distinction matters
+operationally: pinning would record the cert in the shared pin store and then
+break the sidecar the moment an operator rotated it with `cert init --force`.
+The auto-generated cert always carries `localhost`/`127.0.0.1`/`::1` SANs
+(`core.tls._host_identity`), so the loopback dial passes gRPC's name check; a BYO
+cert minted only for a public name does not, and must be re-minted to include one.
+
+**Still open (case 1 / control).** The admin UI has no TLS toggle, and a missing
+`[tls]` extra surfaces as a buried `tensor-server.log` crash rather than an
+actionable message in the browser. That needs a `find_spec("cryptography")`
+preflight ahead of the restart (biopb/biopb#604).
 
 Startup sequence (`launch`):
 
@@ -407,11 +427,16 @@ Startup sequence (`launch`):
    `--web-host` when the resolved token is `None`.
 3. Print the one-time access token (remote mode only).
 4. Load `biopb.json` config; instantiate adapters and register sources.
-5. Start `TensorFlightServer` in a **daemon thread**.
-6. Build CORS origins: loopback variants of the sidecar's own address by
+5. Resolve TLS material CLI-over-config (`_merge_tls_options` →
+   `_resolve_tls_material`): a BYO cert/key pair read off disk, else the
+   self-signed state-dir cert, else plaintext.
+6. Start `TensorFlightServer` in a **daemon thread**, serving TLS when step 5
+   produced a cert.
+7. Build CORS origins: loopback variants of the sidecar's own address by
    default (no web app is bundled here), plus any explicit `--cors` origins for
    a browser app served elsewhere.
-7. Call `run_http_server(...)` — **blocking** uvicorn call. The sidecar is
+8. Call `run_http_server(...)` — **blocking** uvicorn call. Under TLS it gets a
+   `grpcs://` flight location plus the served cert as `tls_ca_pem`. The sidecar is
    API-only; it serves no static assets (the control plane serves the browser UI).
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
@@ -645,7 +670,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | `BIOPB_TENSOR_ALLOW_NO_TOKEN` | `serve`/`launch` token resolution (`_allow_no_token_from_env`) | Truthy (`1`/`true`/`yes`/`on`) forces **tokenless** operation even on a public bind — the deliberate insecure escape hatch (trusted networks only). Only takes effect when no token is supplied; auto-generation and the public-sidecar refusal both become a loud warning instead. Off by default, so the fail-closed guarantee is unchanged unless explicitly set. |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_ENABLE_HTTP_SIDECAR` | Docker/Singularity entrypoint | Truthy → run `launch` (Flight + the HTTP sidecar) instead of the default Flight-only `serve`. See *Container shape* below. |
-| `BIOPB_TENSOR_TLS`, `BIOPB_TLS_CERT`/`BIOPB_TLS_KEY` | Docker/Singularity entrypoint | Serve Flight over TLS with the self-signed cert (`serve --tls`), or with a mounted BYO cert. Mutually exclusive with the sidecar opt-in. |
+| `BIOPB_TENSOR_TLS`, `BIOPB_TLS_CERT`/`BIOPB_TLS_KEY` | Docker/Singularity entrypoint | Serve Flight over TLS with the self-signed cert (`--tls`), or with a mounted BYO cert. Forwarded to `serve` *or* `launch`; with the sidecar opted in, a BYO cert needs a loopback SAN. |
 | `BIOPB_OMETIFF_PARALLEL_READ` | `OmeTiffAdapter.get_data` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**: reads decode under the lock, as before. |
 
 The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handle_reaper_ttl` (seconds, default `150`, `<= 0` disables). It applies to every opt-in adapter (OME-TIFF, NDTiff), set once at startup via `set_handle_reaper_ttl`.
@@ -731,10 +756,12 @@ plus `--web-host`/`--web-port`/`--cors`. Only the *default* changed.
 
 Two consequences worth knowing:
 
-- **TLS and the sidecar are mutually exclusive**, and the entrypoint refuses the
-  combination (exit 2) rather than quietly serving plaintext: the sidecar's
-  internal `TensorFlightClient` does not yet dial `grpcs://` (the same case-1 gap
-  as the control-supervised plane, above).
+- **TLS and the sidecar compose.** The sidecar's internal `TensorFlightClient`
+  dials `grpcs://` over loopback with the served cert as its trust anchor, so the
+  entrypoint forwards the TLS flags to `launch` as readily as to `serve`. (They
+  used to be mutually exclusive, refused at exit 2.) A *BYO* cert must carry a
+  loopback SAN — gRPC still name-checks the dial — which the auto-generated cert
+  always does.
 - **The self-signed cert lives in the container's state dir**, so it is ephemeral
   unless a volume is mounted at `/root/.local/state`. A recreated container mints
   a new cert, which every TOFU-pinned client then refuses — correct behavior, but
