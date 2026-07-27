@@ -1,7 +1,8 @@
 name: Image Runtime CI
 
 # Test/build on branch pushes & PRs; PUBLISH the biopb-image-base Docker image on
-# an SDK `v*` tag. image-base tracks the SDK line (it is the foundation compute
+# a FINAL SDK `vX.Y.Z` tag (an rc/a/b prerelease tag tests + builds but publishes
+# nothing — same rule as tensor-server-ci). image-base tracks the SDK line (it is the foundation compute
 # servers build on), so its Docker image is cut on the same `v*` tag that ships
 # the SDK to PyPI/Maven — on the SDK's cadence, not the product's `release-v*`.
 # (Path filters are not evaluated for tag pushes, so a `v*` tag triggers this
@@ -137,16 +138,49 @@ jobs:
           docker run --rm biopb-image-base:ci \
             python -c "from biopb_image_base import stitch, dynamics_local; import scipy; print('image import ok')"
 
-  # Publish the biopb-image-base Docker image on an SDK `v*` tag (ghcr.io + Docker
-  # Hub jiyuuchc/). The image's version IS the SDK version (the `v*` tag);
-  # image-base's setuptools_scm reads `v*`, so the wheel and the image agree. A
-  # clean X.Y.Z also moves :latest; an rc/a/b prerelease publishes only its pinned
-  # tag. Idempotent: an already-published version is skipped, so re-running a tag
-  # is a noop. This is the ONLY place image-base is published — release.yaml no
-  # longer builds it.
-  publish:
-    needs: test
+  # Gate: only a FINAL `vX.Y.Z` tag publishes an image. A PEP 440 prerelease
+  # (`…rc1`/`a1`/`b1`) still runs the full test + build matrix above — that is what
+  # an rc tag is for — but pushes NOTHING to a registry. Registry tags are
+  # permanent and public, and an rc parked a `biopb-image-base:X.Y.ZrcN` tag next
+  # to the real releases that nothing pulls: derived services build
+  # `FROM biopb-image-base` (README) — i.e. `:latest` or a pinned stable X.Y.Z —
+  # and an rc image never moved `:latest` anyway. To try an rc, build it locally
+  # from the tagged commit (biopb-image-runtime/scripts/build.sh).
+  #
+  # A tiny separate job because GitHub's `if:` expressions have no regex, so
+  # "tag is X.Y.Z and not X.Y.ZrcN" cannot be written inline. Deciding here rather
+  # than per-step also means an rc never builds wheels or logs into Docker Hub,
+  # and the skip is visible in the run graph. Mirrors tensor-server-ci's `guard`.
+  guard:
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Decide whether to publish
+        id: decide
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF#refs/tags/v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "final SDK release $VER -> publish the image"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::prerelease $VER -> no image published (only a final vX.Y.Z tag publishes biopb-image-base)"
+          fi
+
+  # Publish the biopb-image-base Docker image on a FINAL SDK `vX.Y.Z` tag (ghcr.io
+  # + Docker Hub jiyuuchc/). The image's version IS the SDK version (the `v*` tag);
+  # image-base's setuptools_scm reads `v*`, so the wheel and the image agree. It
+  # always moves :latest, since prereleases are filtered out by `guard` above.
+  # Idempotent: an already-published version is skipped, so re-running a tag is a
+  # noop. This is the ONLY place image-base is published — release.yaml no longer
+  # builds it.
+  publish:
+    needs: [test, guard]
+    if: needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -184,26 +218,22 @@ jobs:
           set -euo pipefail
           # v* SDK tag -> image-base version (the clean tag name is Docker-safe).
           VER="${GITHUB_REF#refs/tags/v}"
+          # Belt-and-braces: `guard` already proved this is a final X.Y.Z, so a
+          # prerelease reaching here means the gate was mis-wired -- fail loudly
+          # rather than quietly move :latest onto an rc image.
+          [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::expected a final vX.Y.Z tag, got $VER"; exit 1; }
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          # PEP 440 prerelease (a/b/rc) does NOT move :latest.
-          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            PRERELEASE=false
-          else
-            PRERELEASE=true
-          fi
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           owner="${{ github.repository_owner }}"
           {
             echo "tags<<TAGS_EOF"
             echo "ghcr.io/$owner/biopb-image-base:$VER"
             echo "docker.io/jiyuuchc/biopb-image-base:$VER"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-image-base:latest"
-              echo "docker.io/jiyuuchc/biopb-image-base:latest"
-            fi
+            echo "ghcr.io/$owner/biopb-image-base:latest"
+            echo "docker.io/jiyuuchc/biopb-image-base:latest"
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "image-base $VER (prerelease=$PRERELEASE)"
+          echo "image-base $VER (final SDK release; moves :latest)"
 
       - name: Login to ghcr.io
         uses: docker/login-action@v3
