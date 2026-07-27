@@ -155,6 +155,8 @@ class TensorFlightClient:
         location: str = "grpc://localhost:8815",
         cache_bytes: Optional[int] = None,
         token: Optional[str] = None,
+        tls_ca_pem: Optional[bytes] = None,
+        tls_fingerprint: Optional[str] = None,
     ):
         """Initialize the Flight client.
 
@@ -165,6 +167,15 @@ class TensorFlightClient:
                 or a bare byte count) and falls back to 1 GB; a value passed here
                 overrides the env. ``0`` disables the cache.
             token: Bearer token for server authentication.  ``None`` disables auth.
+            tls_ca_pem: PEM bytes to trust for a ``grpcs://`` location (a private
+                CA, or the server's own certificate), instead of pinning whatever
+                the server presents on first connect. Bytes rather than a path:
+                which file a cert came from is the caller's policy, not the SDK's.
+            tls_fingerprint: Expected SHA-256 of the server's certificate for a
+                ``grpcs://`` location, colon-grouped or bare hex. Checked on every
+                connect, so unlike trust-on-first-use it also rejects an attacker
+                who is already in the path the first time. Ignored when
+                *tls_ca_pem* is given.
         """
         if cache_bytes is None:
             cache_bytes = _default_cache_bytes()
@@ -173,11 +184,14 @@ class TensorFlightClient:
         )
         # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
         normalized = _normalize_location(location)
-        # For a TLS location, pin/verify the server cert via TOFU (once per
-        # process, memoized in _tls) and carry the resolved PEM through the
-        # connection so every dask worker trusts the same root without touching
-        # the pin store (biopb/biopb#604). None for plaintext.
-        tls_root_certs = resolve_tls_root_certs(normalized)
+        # For a TLS location, resolve the trust anchor -- a caller-supplied CA or
+        # fingerprint, else TOFU (once per process, memoized in _tls) -- and carry
+        # the resolved PEM through the connection so every dask worker trusts the
+        # same root without touching the pin store or needing the credentials
+        # itself (biopb/biopb#604). None for plaintext.
+        tls_root_certs = resolve_tls_root_certs(
+            normalized, ca_pem=tls_ca_pem, expected_fingerprint=tls_fingerprint
+        )
         # Pickle-safe connection parameters (callers read client._client etc.)
         self._location = normalized
         self._token = token

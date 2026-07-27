@@ -29,6 +29,20 @@ dialed hostname against the certificate's SANs. A cert that pins fine can
 therefore still fail the handshake if the client dials a name the server did not
 put in its SANs, so :func:`resolve_tls_root_certs` probes for exactly that case
 and logs the fix rather than leaving an opaque gRPC error.
+
+TOFU is the *default*, not the only mode. A caller that already knows what the
+server should present can say so, which removes the trust-on-*first*-use hole
+(biopb/biopb#604 item 4 — a downstream server mounting a remote plane configures
+this per upstream):
+
+- ``ca_pem`` — trust this PEM (a private CA, or the server's own leaf) and skip
+  TOFU entirely. The pin store is not consulted or written: the configured anchor
+  is the source of truth, and a second one that can go stale independently would
+  only produce mismatch errors naming a file the operator never edited.
+- ``expected_fingerprint`` — verified-first-use. The presented leaf must match
+  this SHA-256 digest on *every* connect, so an attacker in the path at first
+  connect is refused rather than pinned. Also bypasses the pin store, for the
+  same reason.
 """
 
 from __future__ import annotations
@@ -42,7 +56,7 @@ import ssl
 import tempfile
 import threading
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
 from biopb._locations import tls_known_hosts
@@ -56,28 +70,47 @@ _TLS_SCHEME = "grpc+tls"
 # than hanging client construction.
 _FETCH_TIMEOUT_S = 10.0
 
-# Per-process memo, ``host:port -> PEM``. Resolution is called on paths that can
-# hit a pooled, already-open connection (``_get_thread_client``'s fast path) and
-# is evaluated eagerly as an argument there, so without this every
-# ``GetFlightInfo`` would open a throwaway TLS handshake just to re-derive a
-# value it already has -- and a momentary failure of that side handshake would
-# fail a call the healthy pooled connection could have served.
+# Per-process memo. Resolution is called on paths that can hit a pooled,
+# already-open connection (``_get_thread_client``'s fast path) and is evaluated
+# eagerly as an argument there, so without this every ``GetFlightInfo`` would
+# open a throwaway TLS handshake just to re-derive a value it already has -- and
+# a momentary failure of that side handshake would fail a call the healthy
+# pooled connection could have served.
+#
+# Keyed by the endpoint AND the trust material, not the endpoint alone: one
+# process can front several upstreams, and two of them naming the same
+# ``host:port`` with different configured anchors must not read each other's
+# result (biopb/biopb#604 item 4).
 #
 # The memo is deliberately not invalidated: a server that rotates its cert
 # mid-process keeps failing against the memoized pin until the client restarts,
 # which is the same "confirm, then clear the pin" ceremony a mismatch requires
 # anyway.
+_MemoKey = Tuple[str, Optional[str], Optional[str]]
 _memo_lock = threading.Lock()
-_memo: Dict[str, bytes] = {}
+_memo: Dict[_MemoKey, bytes] = {}
 
 
 class TlsPinMismatchError(Exception):
-    """The server's certificate no longer matches the one pinned for this host.
+    """The server's certificate is not the one this client expected.
 
-    A legitimate cause is cert rotation; a malicious one is a man-in-the-middle.
-    Either way the client refuses to connect until the operator confirms and
-    clears the stale pin (the message names the store and the ``host:port`` key).
+    Raised both for a TOFU pin that no longer matches and for a configured
+    ``expected_fingerprint`` that the presented cert fails. A legitimate cause is
+    cert rotation; a malicious one is a man-in-the-middle. Either way the client
+    refuses to connect until the operator confirms, and the message names what to
+    update -- the pin store entry, or the configured fingerprint.
     """
+
+
+def _normalize_fingerprint(value: str) -> str:
+    """Canonicalize a user-supplied SHA-256 fingerprint for comparison.
+
+    Accepts the two spellings an operator is likely to paste -- our own
+    colon-grouped ``AB:CD:...`` display form and bare hex -- and is
+    case-insensitive, so a fingerprint copied out of any of the tools that print
+    one compares equal.
+    """
+    return value.replace(":", "").replace(" ", "").strip().lower()
 
 
 def _host_port(location: str) -> Optional[tuple[str, int]]:
@@ -192,39 +225,89 @@ def _save_pin(store: Path, key: str, pem: bytes) -> None:
         raise
 
 
-def resolve_tls_root_certs(location: str) -> Optional[bytes]:
-    """Resolve the trusted root cert (PEM bytes) for a Flight *location* via TOFU.
+def resolve_tls_root_certs(
+    location: str,
+    *,
+    ca_pem: Optional[bytes] = None,
+    expected_fingerprint: Optional[str] = None,
+) -> Optional[bytes]:
+    """Resolve the trusted root cert (PEM bytes) for a Flight *location*.
 
     Returns ``None`` for a non-TLS location — a plaintext ``grpc://`` connection
-    needs no cert. For a ``grpc+tls://`` location, returns the pinned certificate
-    (pinning it now if this is the first connect). Raises
-    :class:`TlsPinMismatchError` if the server presents a cert that differs from
-    the pinned one.
+    needs no cert. For a ``grpc+tls://`` location the anchor comes from whichever
+    mode the caller selected:
+
+    - *ca_pem* — trust exactly these PEM bytes (a private CA, or the server's own
+      leaf). Returned unchanged; no network probe, no pin store.
+    - *expected_fingerprint* — fetch the presented leaf and require its SHA-256 to
+      equal this. Unlike TOFU this rejects a wrong cert on the *first* connect
+      too. No pin store.
+    - neither — TOFU: return the pinned cert, pinning it now if this is the first
+      connect to this ``host:port``.
+
+    Raises :class:`TlsPinMismatchError` when the server presents a cert that
+    contradicts the pin or the configured fingerprint.
 
     The returned bytes are handed to ``pyarrow.flight.FlightClient(...,
-    tls_root_certs=...)`` — using the pinned leaf itself as the trust anchor, so
-    verification succeeds iff the server presents that exact certificate.
+    tls_root_certs=...)`` — with a leaf anchor, verification succeeds iff the
+    server presents that exact certificate.
 
-    The result is memoized per process and per ``host:port``: callers evaluate
-    this eagerly on paths that often reuse an already-open pooled connection, and
-    repeating the handshake there would be pure cost.
+    The result is memoized per process, per ``host:port`` *and* per trust
+    material: callers evaluate this eagerly on paths that often reuse an
+    already-open pooled connection, and repeating the handshake there would be
+    pure cost.
     """
     hp = _host_port(location)
     if hp is None:
         return None
     host, port = hp
     key = f"{host}:{port}"
+    fingerprint = (
+        _normalize_fingerprint(expected_fingerprint) if expected_fingerprint else None
+    )
+    memo_key: _MemoKey = (
+        key,
+        hashlib.sha256(ca_pem).hexdigest() if ca_pem else None,
+        fingerprint,
+    )
 
     with _memo_lock:
-        memoized = _memo.get(key)
+        memoized = _memo.get(memo_key)
     if memoized is not None:
         return memoized
 
-    resolved = _resolve_uncached(host, port, key)
+    if ca_pem:
+        resolved = ca_pem
+    elif fingerprint:
+        resolved = _resolve_against_fingerprint(host, port, fingerprint)
+    else:
+        resolved = _resolve_uncached(host, port, key)
     _warn_if_dialed_name_not_in_cert(host, port, resolved)
     with _memo_lock:
-        _memo[key] = resolved
+        _memo[memo_key] = resolved
     return resolved
+
+
+def _resolve_against_fingerprint(host: str, port: int, fingerprint: str) -> bytes:
+    """Verified-first-use: accept the presented cert only if it matches *fingerprint*.
+
+    The configured digest is the whole trust decision, so this deliberately does
+    not touch the pin store: writing one would create a second anchor that can
+    later disagree with the config, and a mismatch report naming a state file the
+    operator never edited is worse than no report.
+    """
+    presented = _fetch_server_cert(host, port)
+    actual = _fingerprint(presented)
+    if actual != fingerprint:
+        raise TlsPinMismatchError(
+            f"TLS certificate for {host}:{port} does not match the configured "
+            f"fingerprint (expected {fingerprint[:16]}, server presented "
+            f"{actual[:16]}). If the server's certificate was legitimately "
+            f"rotated, update the configured fingerprint to the new value; "
+            f"otherwise this may be a man-in-the-middle and you should not "
+            f"connect."
+        )
+    return presented
 
 
 def clear_pin_cache() -> None:

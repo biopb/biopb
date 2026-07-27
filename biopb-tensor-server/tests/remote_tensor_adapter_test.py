@@ -734,9 +734,220 @@ def test_create_from_config_resolves_token_from_credentials_profile():
     )
     source = SourceConfig(url="grpc://lab:8815/img", credentials_profile="lab-store")
     adapter = RemoteTensorAdapter.create_from_config(source, creds)
-    assert adapter._token == "s3cr3t"
+    assert adapter._credentials.token == "s3cr3t"
     assert adapter._upstream_source_id == "img"
     assert adapter._upstream_location == "grpc://lab:8815"
+
+
+# --- per-upstream TLS trust (biopb/biopb#604 item 4) --------------------------
+#
+# Cross-host, the #470 filesystem token handoff does not apply, so a downstream
+# server mounting a remote plane needs that plane's token AND its trust anchor as
+# explicit config -- per source, since it may mount several with different creds.
+
+
+def _creds(**profile_kwargs):
+    """A CredentialsConfig with one biopb-tensor profile named 'lab-store'."""
+    from biopb_tensor_server.core.remote import CredentialProfile, CredentialsConfig
+
+    profile_kwargs.setdefault("name", "lab-store")
+    profile_kwargs.setdefault("storage_type", "biopb-tensor")
+    return CredentialsConfig(
+        default_profile=None, profiles=[CredentialProfile(**profile_kwargs)]
+    )
+
+
+def _upstream_source(**kwargs):
+    from biopb_tensor_server.core.config import SourceConfig
+
+    kwargs.setdefault("url", "grpcs://lab:8815/img")
+    return SourceConfig(**kwargs)
+
+
+def test_no_profile_leaves_tls_trust_unset_so_tofu_applies():
+    """The zero-config default: nothing configured means the SDK pins on first use."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    creds = resolve_upstream_credentials(_upstream_source(), None)
+    assert creds.tls_ca_pem is None
+    assert creds.tls_fingerprint is None
+
+
+def test_profile_ca_file_is_read_into_pem_bytes(tmp_path):
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    ca = tmp_path / "lab-ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n")
+    creds = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"),
+        _creds(tls_ca_file=str(ca)),
+    )
+    assert creds.tls_ca_pem == ca.read_bytes()
+
+
+def test_profile_fingerprint_is_passed_through_normalized():
+    """The configured fingerprint reaches the credentials, canonicalized so the
+    pool key is stable across spellings (see UpstreamCredentials.__post_init__)."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    creds = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"),
+        _creds(tls_fingerprint="AB:CD:EF"),
+    )
+    assert creds.tls_fingerprint == "abcdef"
+
+
+def test_unreadable_ca_file_fails_rather_than_degrading_to_tofu(tmp_path):
+    """A typo'd path must not silently substitute the weaker default.
+
+    The operator configured an explicit anchor precisely to get *stronger* trust
+    than trust-on-first-use, so quietly falling back would undo what they asked
+    for -- and do it invisibly.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    with pytest.raises(ValueError, match="tls_ca_file"):
+        resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(tmp_path / "typo.pem")),
+        )
+
+    empty = tmp_path / "empty.pem"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError, match="empty"):
+        resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(empty)),
+        )
+
+
+def test_ca_and_fingerprint_together_warns_and_keeps_only_the_ca(tmp_path, caplog):
+    """Both name an anchor; say which one is in force rather than let the operator
+    believe a fingerprint is being enforced when it is not."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(b"pem")
+    with caplog.at_level("WARNING"):
+        creds = resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(ca), tls_fingerprint="AB:CD"),
+        )
+    assert creds.tls_ca_pem == b"pem"
+    assert creds.tls_fingerprint is None
+    assert "ignored" in caplog.text
+
+
+def test_profile_token_beats_the_single_upstream_env_var(monkeypatch):
+    """The env var is a single-upstream convenience; a profile is the real binding."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    monkeypatch.setenv("BIOPB_UPSTREAM_TENSOR_TOKEN", "from-env")
+    with_profile = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"), _creds(token="from-profile")
+    )
+    assert with_profile.token == "from-profile"
+    # ...and a source with no profile still gets the env fallback.
+    assert resolve_upstream_credentials(_upstream_source(), None).token == "from-env"
+
+
+def test_pooled_clients_are_isolated_by_trust_material(monkeypatch):
+    """Same endpoint + same token, different anchor -> different connection.
+
+    Sharing one would mean whichever source dialed first silently decides what
+    the other trusts.
+    """
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    built = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            built.append((location, token, tls))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    ca_a = rt.UpstreamCredentials(token="t", tls_ca_pem=b"ca-a")
+    ca_b = rt.UpstreamCredentials(token="t", tls_ca_pem=b"ca-b")
+    a = rt.RemoteTensorAdapter("lab__a", "grpcs://up:1", "a", credentials=ca_a)
+    a2 = rt.RemoteTensorAdapter("lab__a2", "grpcs://up:1", "a2", credentials=ca_a)
+    b = rt.RemoteTensorAdapter("lab__b", "grpcs://up:1", "b", credentials=ca_b)
+
+    assert a.client is a2.client  # identical credentials share one connection
+    assert b.client is not a.client
+    assert len(built) == 2
+    assert built[0][2]["tls_ca_pem"] == b"ca-a"
+    assert built[1][2]["tls_ca_pem"] == b"ca-b"
+    rt._clear_client_pool()
+
+
+def test_pool_key_is_stable_across_fingerprint_spellings(monkeypatch):
+    """Same upstream + same fingerprint in different spellings -> one connection.
+
+    The SDK normalizes fingerprints before comparing, so a colon-grouped and a
+    bare-hex spelling of one digest are the same trust decision; the pool key
+    (UpstreamCredentials) must agree, or it would open two clients the SDK then
+    treats as identical.
+    """
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    built = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            built.append(tls.get("tls_fingerprint"))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    grouped = rt.UpstreamCredentials(tls_fingerprint="AB:CD:EF")
+    bare = rt.UpstreamCredentials(tls_fingerprint="abcdef")
+    assert grouped == bare  # canonicalized in __post_init__
+    a = rt.RemoteTensorAdapter("lab__a", "grpcs://up:1", "a", credentials=grouped)
+    b = rt.RemoteTensorAdapter("lab__b", "grpcs://up:1", "b", credentials=bare)
+
+    assert a.client is b.client
+    assert len(built) == 1
+    assert built[0] == "abcdef"
+    rt._clear_client_pool()
+
+
+def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkeypatch):
+    """The catalog enumeration dials the upstream directly, outside the adapter
+    pool, so it has to carry the same anchor -- else a grpcs:// upstream with a
+    configured CA would still be TOFU-pinned at expansion time."""
+    import biopb.tensor as bt
+    from biopb_tensor_server.core.config import discover_sources
+
+    seen = {}
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            seen.update(location=location, token=token, **tls)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    monkeypatch.setattr(
+        "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
+        lambda client, location: ([], True),
+    )
+    discover_sources(
+        _upstream_source(url="grpcs://lab:8815", credentials_profile="lab-store"),
+        credentials_config=_creds(token="tok", tls_fingerprint="AB:CD"),
+    )
+    assert seen["token"] == "tok"
+    assert seen["tls_fingerprint"] == "abcd"  # normalized in __post_init__
 
 
 def _meta_zarr_cls():
@@ -1677,7 +1888,7 @@ def test_upstream_clients_are_pooled_per_endpoint(monkeypatch):
     built = []
 
     class _FakeClient:
-        def __init__(self, location, cache_bytes=0, token=None):
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
             built.append((location, token))
 
         def close(self):
@@ -1707,7 +1918,7 @@ def test_mark_unreachable_evicts_shared_client(monkeypatch):
     closed = []
 
     class _FakeClient:
-        def __init__(self, location, cache_bytes=0, token=None):
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
             pass
 
         def close(self):
