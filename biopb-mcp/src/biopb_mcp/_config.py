@@ -324,8 +324,8 @@ class DaskConfig:
     cache_budget: str = _h(
         "1G",
         "Cluster-wide chunk-cache budget for the data-plane client, split evenly "
-        "across workers. Human size (1G/512M/2GiB) or int bytes. Localhost servers "
-        "cache nothing regardless; this applies to remote.",
+        "across workers. Human size (1G/512M/2GiB) or int bytes; 0 disables. "
+        "Applies to localhost and remote alike.",
     )
     idle_ttl: float = _h(
         900.0,

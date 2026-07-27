@@ -828,8 +828,9 @@ def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> in
     plugin) to fix the budget deterministically across a dynamically-sized
     cluster.
 
-    A localhost server (the default) or ``cache_bytes <= 0`` pins the cache OFF;
-    later fetches then skip caching rather than recreating one of their own.
+    ``cache_bytes <= 0`` pins the cache OFF; later fetches then skip caching
+    rather than recreating one of their own. Localhost is no longer special-cased
+    -- it caches copies like any other host (see ``_resolve_cache_bytes``).
 
     Args:
         location: Flight server location string
