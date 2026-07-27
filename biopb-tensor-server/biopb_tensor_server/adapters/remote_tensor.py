@@ -32,6 +32,8 @@ import copy
 import logging
 import os
 import threading
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -66,52 +68,78 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Env-var convenience fallback for the single-upstream case (a per-upstream
-# credentials profile -- storage_type="biopb-tensor" -- is the multi-upstream
-# path, wired in the §3 expansion slice).
+# Env-var convenience fallback for the single-upstream case. Deliberately
+# token-only: TLS trust has a zero-config default (TOFU pinning in
+# ``biopb.tensor._tls``), and anything an operator would want to override about
+# it is per-upstream, which is what the credentials profile is for.
 _UPSTREAM_TOKEN_ENV = "BIOPB_UPSTREAM_TENSOR_TOKEN"
 
 
-# Process-wide pool of upstream clients, keyed by (endpoint, token) so N mirrored
-# sources of one upstream share a single connection instead of each opening its
-# own (biopb/biopb#266 B1, the former #249). Distinct tokens stay isolated (they
-# authenticate as different principals). Entries live until the process exits or
-# an unreachable failure evicts one: there is no per-source teardown (nothing
-# closes an upstream client today -- an adapter is dropped by GC), so a handful
-# of endpoints means a handful of clients. A dead entry is evicted on failure and
-# the next access rebuilds it.
-_CLIENT_POOL: Dict[Tuple[str, Optional[str]], Any] = {}
+@dataclass(frozen=True)
+class UpstreamCredentials:
+    """How to authenticate to, and trust, one upstream tensor server.
+
+    Frozen and hashable so it can key the client pool directly: two sources that
+    name the same endpoint with different credentials authenticate as different
+    principals (or trust different anchors) and must not share a connection.
+
+    ``tls_ca_pem`` holds the PEM bytes, not the path they were read from --
+    resolving the path is a config-layer concern, and carrying bytes keeps the
+    value comparable and self-contained once it reaches the SDK.
+    """
+
+    token: Optional[str] = None
+    tls_ca_pem: Optional[bytes] = None
+    tls_fingerprint: Optional[str] = None
+
+
+# Process-wide pool of upstream clients, keyed by (endpoint, credentials) so N
+# mirrored sources of one upstream share a single connection instead of each
+# opening its own (biopb/biopb#266 B1, the former #249). Entries live until the
+# process exits or an unreachable failure evicts one: there is no per-source
+# teardown (nothing closes an upstream client today -- an adapter is dropped by
+# GC), so a handful of endpoints means a handful of clients. A dead entry is
+# evicted on failure and the next access rebuilds it.
+_CLIENT_POOL: Dict[Tuple[str, UpstreamCredentials], Any] = {}
 _CLIENT_POOL_LOCK = threading.Lock()
 
 
-def _pooled_upstream_client(location: str, token: Optional[str]):
-    """Return the shared ``TensorFlightClient`` for ``(location, token)``.
+def _pooled_upstream_client(location: str, credentials: UpstreamCredentials):
+    """Return the shared ``TensorFlightClient`` for ``(location, credentials)``.
 
     Built lazily on first use and cached process-wide so mirrored sources of the
     same upstream reuse one connection (biopb/biopb#266 B1). Construction happens
     under the pool lock; ``TensorFlightClient`` opens its socket lazily, so the
     critical section is short.
     """
-    key = (location, token)
+    key = (location, credentials)
     with _CLIENT_POOL_LOCK:
         client = _CLIENT_POOL.get(key)
         if client is None:
             from biopb.tensor import TensorFlightClient
 
-            client = TensorFlightClient(location, cache_bytes=0, token=token)
+            client = TensorFlightClient(
+                location,
+                cache_bytes=0,
+                token=credentials.token,
+                tls_ca_pem=credentials.tls_ca_pem,
+                tls_fingerprint=credentials.tls_fingerprint,
+            )
             _CLIENT_POOL[key] = client
         return client
 
 
-def _evict_pooled_upstream_client(location: str, token: Optional[str]) -> None:
-    """Drop the pooled client for ``(location, token)`` so the next access rebuilds.
+def _evict_pooled_upstream_client(
+    location: str, credentials: UpstreamCredentials
+) -> None:
+    """Drop the pooled client for the key so the next access rebuilds it.
 
     Called when an upstream call fails: the shared connection may be dead, so
     remove it and best-effort close it. Other adapters still holding a reference
     to the old client rediscover the failure on their own next call and re-evict
     (idempotent) -- the same per-adapter reconnect behavior as before pooling.
     """
-    key = (location, token)
+    key = (location, credentials)
     with _CLIENT_POOL_LOCK:
         client = _CLIENT_POOL.pop(key, None)
     if client is not None:
@@ -236,6 +264,7 @@ class RemoteTensorAdapter(TensorAdapter):
         upstream_source_id: str,
         *,
         token: Optional[str] = None,
+        credentials: Optional[UpstreamCredentials] = None,
         tensor_name: Optional[str] = None,
         alias: Optional[str] = None,
     ):
@@ -249,6 +278,13 @@ class RemoteTensorAdapter(TensorAdapter):
             upstream_location: ``grpc://host:port`` of the upstream server.
             upstream_source_id: The source_id on the upstream server.
             token: Bearer token for the upstream (auth). ``None`` disables auth.
+                A shorthand for ``credentials=UpstreamCredentials(token=...)``,
+                kept because a token alone is the common case when constructing
+                an adapter directly.
+            credentials: Full per-upstream credentials -- token plus TLS trust for
+                a ``grpcs://`` upstream (biopb/biopb#604 item 4). Takes precedence
+                over *token*; omitting both means unauthenticated, and omitting
+                only the TLS fields selects the SDK's TOFU pinning.
             tensor_name: Within-source field for a tensor-layer view (set by
                 ``get_tensor_adapter``); ``None`` is the source / default tensor.
             alias: The configured namespace alias for this upstream, used only to
@@ -274,7 +310,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         self._upstream_location = upstream_location
         self._upstream_source_id = upstream_source_id
-        self._token = token
+        self._credentials = credentials or UpstreamCredentials(token=token)
         # Per-source capability token for the LOCAL server's auth (server reads
         # adapter.capability_token in _authorize_source). Proxied sources inherit
         # server-wide auth, so leave it unset.
@@ -304,7 +340,7 @@ class RemoteTensorAdapter(TensorAdapter):
     def client(self):
         """The upstream ``TensorFlightClient``, shared per endpoint (cache_bytes=0).
 
-        Resolved from a process-wide pool keyed by ``(endpoint, token)`` so every
+        Resolved from a process-wide pool keyed by ``(endpoint, credentials)`` so every
         mirrored source of one upstream reuses a single connection
         (biopb/biopb#266 B1). Still cached on ``self`` (the first access binds the
         pooled client) so ``self._client is None`` keeps meaning "this adapter has
@@ -312,7 +348,9 @@ class RemoteTensorAdapter(TensorAdapter):
         socket; the connection opens on the first metadata/chunk call.
         """
         if self._client is None:
-            self._client = _pooled_upstream_client(self._upstream_location, self._token)
+            self._client = _pooled_upstream_client(
+                self._upstream_location, self._credentials
+            )
         return self._client
 
     def _to_upstream_array_id(self, local_array_id: str) -> str:
@@ -369,7 +407,7 @@ class RemoteTensorAdapter(TensorAdapter):
         # Drop this adapter's reference and evict the shared pooled client so the
         # next call (from any mirrored source of this endpoint) reconnects.
         self._client = None
-        _evict_pooled_upstream_client(self._upstream_location, self._token)
+        _evict_pooled_upstream_client(self._upstream_location, self._credentials)
         logger.warning(
             "upstream tensor server %s unreachable: %s", self._upstream_location, exc
         )
@@ -396,12 +434,12 @@ class RemoteTensorAdapter(TensorAdapter):
                 "'mirror everything' form is expanded during discovery)."
             )
 
-        token = _resolve_upstream_token(source, credentials_config)
+        credentials = resolve_upstream_credentials(source, credentials_config)
         return cls(
             source_id=source.source_id,
             upstream_location=endpoint,
             upstream_source_id=upstream_source_id,
-            token=token,
+            credentials=credentials,
             alias=source.alias,
         )
 
@@ -866,21 +904,73 @@ class RemoteTensorAdapter(TensorAdapter):
         return table.combine_chunks().to_batches()[0]
 
 
-def _resolve_upstream_token(
+def resolve_upstream_credentials(
     source: SourceConfig, credentials_config: Optional[Any]
-) -> Optional[str]:
-    """Resolve the upstream bearer token: credentials profile, then env var.
+) -> UpstreamCredentials:
+    """Resolve one upstream's bearer token and TLS trust (biopb/biopb#604 item 4).
 
-    The full per-upstream ``storage_type="biopb-tensor"`` credentials-profile wiring
-    lands with the §3 expansion; for now honor a named profile's ``token`` when one
-    is configured, else the single-upstream ``BIOPB_UPSTREAM_TENSOR_TOKEN`` env var.
+    The source's ``credentials_profile`` is the per-upstream binding: a downstream
+    server mirroring several remote planes needs a different token -- and possibly
+    a different trust anchor -- for each, so this cannot be one global setting.
+    The single-upstream ``BIOPB_UPSTREAM_TENSOR_TOKEN`` env var remains as a
+    convenience fallback for the token only, and a profile that sets a token wins
+    over it.
+
+    TLS trust is left unset when no profile configures it, which selects the SDK's
+    TOFU pinning -- the zero-config default that makes a ``grpcs://`` upstream work
+    without distributing anything.
     """
+    profile = None
     profile_name = getattr(source, "credentials_profile", None)
     if credentials_config is not None and profile_name:
         try:
             profile = credentials_config.get_profile(profile_name)
         except Exception:
             profile = None
-        if profile is not None and getattr(profile, "token", None):
-            return profile.token
-    return os.environ.get(_UPSTREAM_TOKEN_ENV) or None
+
+    token = getattr(profile, "token", None) if profile is not None else None
+    if not token:
+        token = os.environ.get(_UPSTREAM_TOKEN_ENV) or None
+
+    ca_pem = _read_upstream_ca(profile, profile_name)
+    fingerprint = getattr(profile, "tls_fingerprint", None) if profile else None
+    if ca_pem and fingerprint:
+        # Both name a trust anchor and the CA wins in the SDK; say so rather than
+        # let an operator believe a fingerprint is being enforced when it is not.
+        logger.warning(
+            "credentials profile %r sets both tls_ca_file and tls_fingerprint; "
+            "the CA file is used and the fingerprint is ignored.",
+            profile_name,
+        )
+
+    return UpstreamCredentials(
+        token=token,
+        tls_ca_pem=ca_pem,
+        tls_fingerprint=(fingerprint or None) if not ca_pem else None,
+    )
+
+
+def _read_upstream_ca(profile: Any, profile_name: Optional[str]) -> Optional[bytes]:
+    """Read a profile's ``tls_ca_file`` into PEM bytes, or ``None`` if unset.
+
+    An unreadable path raises rather than degrading to TOFU: an operator who
+    configured an explicit anchor asked for *stronger* trust than the default, so
+    silently substituting the weaker one -- on a typo'd path, at that -- would
+    quietly undo the thing they configured.
+    """
+    ca_file = getattr(profile, "tls_ca_file", None) if profile is not None else None
+    if not ca_file:
+        return None
+    try:
+        pem = Path(ca_file).expanduser().read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"credentials profile {profile_name!r} sets tls_ca_file={ca_file!r}, "
+            f"which could not be read: {exc}"
+        ) from exc
+    if not pem.strip():
+        raise ValueError(
+            f"credentials profile {profile_name!r} sets tls_ca_file={ca_file!r}, "
+            f"which is empty"
+        )
+    return pem

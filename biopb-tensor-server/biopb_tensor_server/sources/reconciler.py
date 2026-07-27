@@ -470,18 +470,28 @@ class Reconciler:
         from biopb.tensor import TensorFlightClient
 
         from biopb_tensor_server.adapters.remote_tensor import (
-            _resolve_upstream_token,
             _split_grpc_url,
             fetch_upstream_catalog,
             list_upstream_source_ids,
+            resolve_upstream_credentials,
         )
         from biopb_tensor_server.core.config import _namespaced_source_id
 
         endpoint, _ = _split_grpc_url(upstream.url)
         alias = upstream.alias
-        token = _resolve_upstream_token(upstream, self._credentials_config)
+        # The catalog fetch dials the upstream directly (not through the adapter
+        # pool), so it needs the same per-upstream token AND trust anchor the
+        # mirrored adapters will use (biopb/biopb#604 item 4) -- otherwise a
+        # grpcs:// upstream with a configured CA would still be TOFU-pinned here.
+        credentials = resolve_upstream_credentials(upstream, self._credentials_config)
 
-        client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+        client = TensorFlightClient(
+            endpoint,
+            cache_bytes=0,
+            token=credentials.token,
+            tls_ca_pem=credentials.tls_ca_pem,
+            tls_fingerprint=credentials.tls_fingerprint,
+        )
         try:
             # ONE bulk query_sources fetches every upstream source's id AND its
             # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs

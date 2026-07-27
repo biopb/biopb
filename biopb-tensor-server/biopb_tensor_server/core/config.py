@@ -1416,9 +1416,9 @@ def _discover_tensor_server(
         source.url,
     )
     from biopb_tensor_server.adapters.remote_tensor import (
-        _resolve_upstream_token,
         _split_grpc_url,
         list_upstream_source_ids,
+        resolve_upstream_credentials,
     )
 
     endpoint, upstream_source_id = _split_grpc_url(source.url)
@@ -1434,8 +1434,14 @@ def _discover_tensor_server(
     # it can.
     from biopb.tensor import TensorFlightClient
 
-    token = _resolve_upstream_token(source, credentials_config)
-    client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+    credentials = resolve_upstream_credentials(source, credentials_config)
+    client = TensorFlightClient(
+        endpoint,
+        cache_bytes=0,
+        token=credentials.token,
+        tls_ca_pem=credentials.tls_ca_pem,
+        tls_fingerprint=credentials.tls_fingerprint,
+    )
     try:
         ids, _complete = list_upstream_source_ids(client, endpoint)
         upstream_ids = sorted(ids)

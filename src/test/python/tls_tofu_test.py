@@ -187,3 +187,70 @@ def test_clear_pin_cache_forces_refetch(monkeypatch):
     _tls.clear_pin_cache()
     _tls.resolve_tls_root_certs(loc)
     assert len(calls) == 2
+
+
+# --- explicit trust: configured CA / fingerprint (biopb/biopb#604 item 4) -----
+
+
+def test_explicit_ca_is_used_verbatim_and_skips_the_network(monkeypatch):
+    """A configured anchor is the answer: no probe, and nothing pinned."""
+
+    def _never(host, port):
+        raise AssertionError("a configured CA must not trigger a cert fetch")
+
+    monkeypatch.setattr(_tls, "_fetch_server_cert", _never)
+    resolved = _tls.resolve_tls_root_certs("grpc+tls://host:8815", ca_pem=CERT_A)
+    assert resolved == CERT_A
+    # The pin store stays untouched -- the config is the single source of truth.
+    assert _tls._load_pins(_tls.tls_known_hosts()) == {}
+
+
+def test_matching_fingerprint_accepts_the_presented_cert(monkeypatch):
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: CERT_A)
+    resolved = _tls.resolve_tls_root_certs(
+        "grpc+tls://host:8815", expected_fingerprint=_tls._fingerprint(CERT_A)
+    )
+    assert resolved == CERT_A
+    # Verified-first-use is self-contained: no pin is written, so the config can
+    # never end up disagreeing with a state file the operator never edited.
+    assert _tls._load_pins(_tls.tls_known_hosts()) == {}
+
+
+def test_wrong_fingerprint_is_refused_on_the_very_first_connect(monkeypatch):
+    """The point of configuring one: an impostor present at first contact loses.
+
+    Plain TOFU would have pinned CERT_B here and reported success.
+    """
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: CERT_B)
+    with pytest.raises(_tls.TlsPinMismatchError, match="configured fingerprint"):
+        _tls.resolve_tls_root_certs(
+            "grpc+tls://host:8815", expected_fingerprint=_tls._fingerprint(CERT_A)
+        )
+
+
+def test_fingerprint_spelling_is_forgiving(monkeypatch):
+    """Whatever the operator pasted -- our colon-grouped display form or bare hex."""
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: CERT_A)
+    digest = _tls._fingerprint(CERT_A)
+    grouped = ":".join(digest[i : i + 2] for i in range(0, len(digest), 2)).upper()
+    for spelling in (digest, digest.upper(), grouped, f"  {grouped}  "):
+        _tls.clear_pin_cache()
+        assert (
+            _tls.resolve_tls_root_certs(
+                "grpc+tls://host:8815", expected_fingerprint=spelling
+            )
+            == CERT_A
+        )
+
+
+def test_one_endpoint_can_carry_different_trust_per_caller(monkeypatch):
+    """The memo keys on the trust material, not just host:port.
+
+    A downstream server fronting two upstreams that happen to resolve to the same
+    ``host:port`` must not serve one's configured anchor to the other.
+    """
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: CERT_A)
+    loc = "grpc+tls://host:8815"
+    assert _tls.resolve_tls_root_certs(loc, ca_pem=CERT_B) == CERT_B
+    assert _tls.resolve_tls_root_certs(loc) == CERT_A  # TOFU, unaffected
+    assert _tls.resolve_tls_root_certs(loc, ca_pem=CERT_B) == CERT_B

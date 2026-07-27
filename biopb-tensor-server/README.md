@@ -145,6 +145,11 @@ Pass the server's token to your own stack as `BIOPB_UPSTREAM_TENSOR_TOKEN`. Your
 browser only ever talks to your own loopback control, so it never has to trust
 the server's certificate.
 
+Mounting **several** remote servers — or pinning an upstream's certificate up
+front instead of trusting it on first connect — uses a per-source credentials
+profile (`storage_type: "biopb-tensor"`, with `token` plus optional
+`tls_fingerprint` / `tls_ca_file`); see [containerize.md](containerize.md).
+
 For a **single-machine** setup, publish to loopback and skip both:
 
 ```bash

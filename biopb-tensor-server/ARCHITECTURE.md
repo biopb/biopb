@@ -360,7 +360,10 @@ existing one), and a client-side probe that logs the exact name and the
 diagnostic only: any outcome other than a definite hostname mismatch is silent, so
 it can never break a working connection.
 
-TOFU resolution is **memoized per process** keyed by `host:port`
+TOFU resolution is **memoized per process** keyed by `host:port` *and* the
+configured trust material (a caller may supply an explicit CA or fingerprint —
+see *Per-upstream credentials* below — and one process fronting two upstreams at
+the same address must not serve one's anchor to the other)
 (`_tls.clear_pin_cache()` drops it). The call sites evaluate it eagerly on paths
 that usually reuse an already-open pooled connection, so without the memo every
 `GetFlightInfo` would open a throwaway TLS handshake just to re-derive a value it
@@ -638,6 +641,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
 | `BIOPB_TENSOR_CACHE_LIMIT` | TensorFlightClient (Python) | Default client-side chunk-cache budget when the caller passes no `cache_bytes`; a size string with common units (`2GiB`, `512MB`) or a bare byte count (parsed via `dask.utils.parse_bytes`), `0` disables the cache. Unset/unparseable → 1 GB. A constructor `cache_bytes` overrides it. |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
+| `BIOPB_UPSTREAM_TENSOR_TOKEN` | `tensor-server` source dialing (`resolve_upstream_credentials`) | Bearer token for **one** upstream tensor server — a single-upstream convenience. A source's credentials profile overrides it, and is the only way to give several upstreams different tokens (or any TLS trust). |
 | `BIOPB_TENSOR_ALLOW_NO_TOKEN` | `serve`/`launch` token resolution (`_allow_no_token_from_env`) | Truthy (`1`/`true`/`yes`/`on`) forces **tokenless** operation even on a public bind — the deliberate insecure escape hatch (trusted networks only). Only takes effect when no token is supplied; auto-generation and the public-sidecar refusal both become a loud warning instead. Off by default, so the fail-closed guarantee is unchanged unless explicitly set. |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_ENABLE_HTTP_SIDECAR` | Docker/Singularity entrypoint | Truthy → run `launch` (Flight + the HTTP sidecar) instead of the default Flight-only `serve`. See *Container shape* below. |
@@ -659,6 +663,55 @@ The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handl
 - For Docker local mode with localhost-only access, use `-p 127.0.0.1:8815:8815`.
 - For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
+
+---
+
+## Per-upstream credentials (mounting a remote plane)
+
+A downstream server that mirrors a remote plane as a `tensor-server` source is a
+*client* of that plane, and cross-host the #470 filesystem token handoff does not
+reach it: the token lives in the upstream host's state dir. So the upstream's
+credentials are explicit config — and because one downstream may mount several
+upstreams belonging to different groups, the binding is **per source**, not one
+global setting (biopb/biopb#604 item 4).
+
+The carrier is the existing credentials profile, with `storage_type:
+"biopb-tensor"` selecting a tensor-server upstream rather than object storage; a
+source names one through `credentials_profile`. Three keys apply:
+
+| Key | Meaning |
+|---|---|
+| `token` | Bearer token for the upstream. Beats the single-upstream `BIOPB_UPSTREAM_TENSOR_TOKEN` env fallback. |
+| `tls_fingerprint` | Expected SHA-256 of the upstream's cert (colon-grouped or bare hex, as `cert init` prints it). Verified on every connect. |
+| `tls_ca_file` | Path to a PEM to trust — a private CA, or the upstream's own leaf. |
+
+`resolve_upstream_credentials()` (in `adapters/remote_tensor.py`) produces one
+frozen `UpstreamCredentials` from the source + config, and **all three** dial
+sites use it: the adapter's pooled client, the reconciler's bulk catalog fetch,
+and the bare-host expansion in `core/config.py`. The latter two dial the upstream
+directly, outside the adapter pool, so leaving either on the old token-only path
+would have TOFU-pinned a `grpcs://` upstream whose CA was configured.
+
+Design points worth keeping:
+
+- **TLS trust is optional, and unset means TOFU.** The zero-config default already
+  works; configuring an anchor buys the one thing TOFU cannot — rejecting an
+  impostor that is in the path at *first* contact, where there is no prior use to
+  trust. `tls_fingerprint` is the light form (paste what the server printed);
+  `tls_ca_file` is for a real private CA.
+- **An unreadable `tls_ca_file` raises.** Degrading to TOFU would silently undo the
+  stronger trust the operator explicitly configured, on something as ordinary as a
+  typo'd path.
+- **Both keys set → the CA wins, with a warning.** Never leave an operator
+  believing a fingerprint is enforced when it isn't.
+- **The client pool keys on the credentials, not just the endpoint.** Two sources
+  naming one `host:port` with different tokens or anchors get different
+  connections; otherwise whichever dialed first would silently decide what the
+  other authenticates as and trusts. The SDK's TOFU memo is keyed the same way,
+  for the same reason.
+- **The env var stays token-only.** `BIOPB_UPSTREAM_TENSOR_TOKEN` remains a
+  single-upstream convenience; TLS trust never grew an env twin, since anything
+  worth overriding about it is inherently per-upstream.
 
 ---
 

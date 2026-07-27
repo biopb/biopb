@@ -59,9 +59,48 @@ talks to your own loopback control, so it never has to trust the container's
 certificate — the first `grpcs://` connection pins it (TOFU) and every later one
 verifies against that pin.
 
-> `BIOPB_UPSTREAM_TENSOR_TOKEN` is one token for one upstream. Mounting several
-> upstreams with *different* credentials needs per-source credentials — tracked as
-> biopb/biopb#604 item 4.
+### Several upstreams, or explicit trust
+
+`BIOPB_UPSTREAM_TENSOR_TOKEN` is one token for one upstream. To mount several —
+or to say up front which certificate an upstream is allowed to present — give
+each source a **credentials profile** instead:
+
+```json
+{
+  "credentials": { "profiles": [
+      { "name": "lab-a", "storage_type": "biopb-tensor", "token": "<token A>",
+        "tls_fingerprint": "AB:CD:…" },
+      { "name": "lab-b", "storage_type": "biopb-tensor", "token": "<token B>",
+        "tls_ca_file": "/etc/biopb/lab-b-ca.pem" }
+  ] },
+  "sources": [
+    { "type": "tensor-server", "url": "grpcs://a.mylab.example:8815",
+      "credentials_profile": "lab-a" },
+    { "type": "tensor-server", "url": "grpcs://b.mylab.example:8815",
+      "credentials_profile": "lab-b" }
+  ]
+}
+```
+
+Each profile carries that upstream's token and, optionally, its trust anchor:
+
+| Key | Effect |
+|---|---|
+| `token` | Bearer token for this upstream. Overrides `BIOPB_UPSTREAM_TENSOR_TOKEN`. |
+| `tls_fingerprint` | The upstream cert's SHA-256, as printed by `cert init` / `serve --tls` (colon-grouped or bare hex). Checked on **every** connect. |
+| `tls_ca_file` | Path to a PEM to trust — a private CA, or the upstream's own certificate. |
+
+Both TLS keys are optional: with neither, the connection falls back to TOFU
+pinning, which needs no configuration at all. Setting one buys you the thing TOFU
+cannot give — protection against an impostor that is *already* in the path the
+first time you connect, since there is no first use to trust. Prefer
+`tls_fingerprint` for a self-signed upstream (copy the digit string the server
+printed) and `tls_ca_file` when you run a private CA. If you set both, the CA
+wins and a warning says so.
+
+A path that cannot be read is an error, not a silent fallback to TOFU — you asked
+for stronger trust than the default, so a typo fails loudly instead of quietly
+downgrading.
 
 > **Mount the state dir.** The generated cert lives at
 > `/root/.local/state/biopb/tls/`. Without the volume above it is lost on

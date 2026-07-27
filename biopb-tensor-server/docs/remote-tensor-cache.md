@@ -72,7 +72,11 @@ one segment cache.
   `source_id`s. Optional for a lone upstream; **required** once a collision is
   possible. Upstream auth rides the existing `credentials_profile` field via a
   `storage_type="biopb-tensor"` profile carrying `token` — one token per upstream,
-  no bespoke `SourceConfig.token`.
+  no bespoke `SourceConfig.token`. The same profile also carries per-upstream TLS
+  trust for a `grpcs://` upstream (`tls_fingerprint` / `tls_ca_file`, both
+  optional; unset falls back to TOFU pinning) — see *Per-upstream credentials* in
+  `../ARCHITECTURE.md`. The single-upstream `BIOPB_UPSTREAM_TENSOR_TOKEN` env var
+  remains as a convenience fallback for the token only.
 
 **Scheme/type plumbing.** `core.remote.is_remote_url` accepts the `grpc*`
 schemes (else `Path("grpc://…").resolve()` mangles the url);
