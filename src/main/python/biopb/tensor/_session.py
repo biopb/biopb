@@ -30,7 +30,7 @@ from biopb.tensor._pool import (
     _get_shared_call_options,
     _get_thread_client,
 )
-from biopb.tensor._tls import resolve_tls_root_certs
+from biopb.tensor._tls import TlsTrust, resolve_tls_trust
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -74,10 +74,11 @@ class _ClientState:
     location: str
     token: Optional[str]
     cache_bytes: int
-    # TOFU-pinned server cert (PEM) for a grpc+tls:// location, else None. Carried
-    # into the lazy chunk-fetch graph so every dask worker's FlightClient trusts
-    # the same pinned root without re-running TOFU (biopb/biopb#604).
-    tls_root_certs: Optional[bytes] = None
+    # Resolved TLS trust for a grpc+tls:// location (the TOFU-pinned server cert
+    # plus any hostname override), else NO_TLS. Carried into the lazy chunk-fetch
+    # graph so every dask worker's FlightClient trusts the same pinned root
+    # without re-running TOFU (biopb/biopb#604, biopb/biopb#606).
+    tls_trust: Optional[TlsTrust] = None
     sources: Dict[str, DataSourceDescriptor] = field(default_factory=dict)
     descriptors: Dict[Tuple[str, str], TensorDescriptor] = field(default_factory=dict)
 
@@ -202,7 +203,7 @@ def _fetch_endpoints_via_get_flight_info(
     # even when the pooled client already exists and discards the value -- costs a
     # dict lookup rather than a handshake.
     token = pb.auth_token or None
-    client = _get_thread_client(pb.location, token, resolve_tls_root_certs(pb.location))
+    client = _get_thread_client(pb.location, token, resolve_tls_trust(pb.location))
     call_options = _get_shared_call_options(pb.location, token)
 
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
@@ -1424,5 +1425,5 @@ class ChunkFetcher:
             self._state.token,
             self._state.cache_bytes,
             schema_metadata,
-            self._state.tls_root_certs,
+            self._state.tls_trust,
         )

@@ -6,9 +6,11 @@ picklable and reconnect per worker process. This module owns exactly that
 subsystem and holds no reference to ``TensorFlightClient``:
 
 - **Connection/cache pools** keyed by ``(location, token)``: a per-thread
-  ``FlightClient`` for lock-free access, plus a cross-thread ``Cache`` and
-  ``FlightCallOptions``. Fork-safe via a single ``os.register_at_fork`` handler
-  that clears every pool in the child (inherited sockets/mmaps are unsafe).
+  ``FlightClient`` for lock-free access (keyed additionally by the resolved TLS
+  trust, which ``location`` does not determine -- see ``_get_thread_client``),
+  plus a cross-thread ``Cache`` and ``FlightCallOptions``. Fork-safe via a single
+  ``os.register_at_fork`` handler that clears every pool in the child (inherited
+  sockets/mmaps are unsafe).
 - **The localhost cache-file fast path** (issue #9): read a chunk straight from
   the server's on-disk segment via ``chunk_locate`` + mmap instead of ``do_get``.
 - **The chunk-fetch leaf functions and dask-array builder**: pickle-safe because
@@ -40,6 +42,7 @@ from dask.delayed import delayed
 from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
+from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.ticket_pb2 import TensorTicket
 
 logger = logging.getLogger(__name__)
@@ -674,7 +677,7 @@ def _evict_dead_threads():
 def _get_thread_client(
     location: str,
     token: Optional[str],
-    tls_root_certs: Optional[bytes] = None,
+    tls_trust: Optional[TlsTrust] = None,
 ) -> flight.FlightClient:
     """Get thread-local FlightClient (no lock for read access).
 
@@ -686,16 +689,20 @@ def _get_thread_client(
     Args:
         location: Flight server location string
         token: Bearer token (or None for no auth)
-        tls_root_certs: PEM trust anchor for a ``grpc+tls://`` location (the
-            TOFU-pinned server cert). ``None`` for a plaintext connection, or to
-            fall back to the system trust store. Not part of the pool key: the
-            cert is a function of the location, so ``(location, token)`` already
-            identifies the connection.
+        tls_trust: resolved TLS trust for a ``grpc+tls://`` location -- the PEM
+            anchor plus any hostname override. ``None``/:data:`NO_TLS` for a
+            plaintext connection, or to fall back to the system trust store.
 
     Returns:
         FlightClient for this thread and location
     """
-    key = (location, token)
+    # The trust key id is part of the pool key. The anchor is *not* a function of
+    # the location alone: one process can front two upstreams naming the same
+    # host:port under different configured anchors (biopb/biopb#604 item 4), and
+    # each carries its own hostname override -- so keying on (location, token)
+    # would hand one upstream a connection built with the other's trust.
+    trust = tls_trust or NO_TLS
+    key = (location, token, trust.key_id)
 
     # Fast path: thread already has client for this location (no lock)
     local_pool = getattr(_THREAD_LOCAL, "clients", None)
@@ -707,7 +714,7 @@ def _get_thread_client(
 
     # Slow path: create new client with gRPC options tuned for 64MB chunks, register for cleanup
     # 80MB max message size (slightly above 64MB chunk threshold)
-    tls_kwargs = {"tls_root_certs": tls_root_certs} if tls_root_certs else {}
+    tls_kwargs = trust.client_kwargs()
     client = flight.FlightClient(
         location,
         generic_options=[
@@ -807,7 +814,7 @@ def _get_worker_resources(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    tls_root_certs: Optional[bytes] = None,
+    tls_trust: Optional[TlsTrust] = None,
 ):
     """Get cached FlightClient, Cache, and CallOptions for a connection namespace.
 
@@ -823,12 +830,14 @@ def _get_worker_resources(
         location: Flight server location string
         token: Bearer token (or None for no auth)
         cache_bytes: Cache size for worker-local cache
+        tls_trust: resolved TLS trust for the connection (see
+            :class:`biopb.tensor._tls.TlsTrust`); None for plaintext
 
     Returns:
         Tuple of (FlightClient, Optional[Cache], FlightCallOptions). The cache
         is None when caching is disabled for this connection (e.g. localhost).
     """
-    client = _get_thread_client(location, token, tls_root_certs)
+    client = _get_thread_client(location, token, tls_trust)
     cache = _get_shared_cache(location, token, cache_bytes)
     call_options = _get_shared_call_options(location, token)
 
@@ -887,7 +896,7 @@ def _fetch_chunk_distributed(
     bounds_stop: Tuple[int, ...],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]] = None,
-    tls_root_certs: Optional[bytes] = None,
+    tls_trust: Optional[TlsTrust] = None,
 ) -> np.ndarray:
     """Fetch a chunk from Flight server using worker-local resources.
 
@@ -913,7 +922,7 @@ def _fetch_chunk_distributed(
         numpy array with chunk data
     """
     client, cache, call_options = _get_worker_resources(
-        location, token, cache_bytes, tls_root_certs
+        location, token, cache_bytes, tls_trust
     )
     cache_key = chunk_id.hex()
 
@@ -980,7 +989,7 @@ def _fetch_chunk_block(
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]] = None,
-    tls_root_certs: Optional[bytes] = None,
+    tls_trust: Optional[TlsTrust] = None,
 ) -> np.ndarray:
     """Single-``Blockwise``-layer callback that fetches one block.
 
@@ -1002,7 +1011,7 @@ def _fetch_chunk_block(
         tuple(bounds_stop),
         cache_bytes,
         schema_metadata,
-        tls_root_certs,
+        tls_trust,
     )
 
 
@@ -1098,7 +1107,7 @@ def _build_dask_array_from_chunk_map(
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]],
-    tls_root_certs: Optional[bytes] = None,
+    tls_trust: Optional[TlsTrust] = None,
 ) -> da.Array:
     """Build the lazy chunk-fetching dask array from a chunk-index map.
 
@@ -1152,7 +1161,7 @@ def _build_dask_array_from_chunk_map(
             token,
             cache_bytes,
             schema_metadata,
-            tls_root_certs,
+            tls_trust,
         )
 
     # Fallback: ragged/sparse grid -> one delayed task per chunk.
@@ -1170,7 +1179,7 @@ def _build_dask_array_from_chunk_map(
                 tuple(bounds.stop),
                 cache_bytes,
                 schema_metadata,
-                tls_root_certs,
+                tls_trust,
             ),
             shape=chunk_shape,
             dtype=dtype,
@@ -1187,7 +1196,7 @@ def _regular_blockwise_array(
     token: Optional[str],
     cache_bytes: int,
     schema_metadata: Optional[Dict[str, str]],
-    tls_root_certs: Optional[bytes] = None,
+    tls_trust: Optional[TlsTrust] = None,
 ) -> da.Array:
     """Wrap a per-block ``BlockwiseDep`` in a single ``Blockwise`` (map_blocks) layer.
 
@@ -1211,7 +1220,7 @@ def _regular_blockwise_array(
         None,
         schema_metadata,
         None,
-        tls_root_certs,
+        tls_trust,
         None,
         numblocks={},
     )
