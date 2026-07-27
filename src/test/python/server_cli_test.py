@@ -835,21 +835,32 @@ class TestTlsExtraPreflight:
     tensor-server.log -- a control that started and a plane that never serves.
     """
 
-    def _without_cryptography(self, monkeypatch):
+    def _cryptography(self, monkeypatch, *, installed: bool):
+        """Force the answer for `cryptography` only, leaving other lookups real.
+
+        Both directions are stubbed rather than read off the ambient
+        environment: whether the [tls] extra is present is exactly what varies
+        between a dev venv (synced --all-extras) and a default install (CI), so
+        an unstubbed test asserts the environment, not the code.
+        """
         import importlib.util
 
         real = importlib.util.find_spec
+        spec = real("importlib.util") if installed else None
         monkeypatch.setattr(
             importlib.util,
             "find_spec",
             lambda name, *a, **k: (
-                None if name == "cryptography" else real(name, *a, **k)
+                spec if name == "cryptography" else real(name, *a, **k)
             ),
         )
 
-    def test_passes_when_the_extra_is_installed(self):
-        # No exception: this environment has it (the [tls] extra is synced).
-        cli._require_tls_extra()
+    def _without_cryptography(self, monkeypatch):
+        self._cryptography(monkeypatch, installed=False)
+
+    def test_passes_when_the_extra_is_installed(self, monkeypatch):
+        self._cryptography(monkeypatch, installed=True)
+        cli._require_tls_extra()  # no exception
 
     def test_exits_2_with_an_install_hint(self, monkeypatch, capsys):
         self._without_cryptography(monkeypatch)
