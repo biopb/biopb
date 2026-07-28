@@ -4,7 +4,12 @@ from typing import Optional, Sequence, Tuple, Union
 import dask.array as da
 import numpy as np
 
-from . import ROI, BinData, ImageData, Mask, Pixels, Point, Rectangle, Tensor
+# Imported from the defining modules, not from `.`: `biopb/image/__init__.py`
+# imports this module, so `from . import ROI, ...` would read names off a
+# half-initialized package and only work while __init__ binds them first.
+from biopb.image.bindata_pb2 import BinData
+from biopb.image.image_data_pb2 import ImageData, Pixels, Tensor
+from biopb.image.roi_pb2 import ROI, Mask, Point, Rectangle
 
 # NOTE: TensorFlightClient is imported lazily inside the lazy_data branch below.
 # It pulls in pyarrow, whose compiled SSE4.2 baseline SIGILLs on pre-SSE4.2 CPUs

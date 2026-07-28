@@ -42,3 +42,11 @@ jobs:
         with:
           version: 0.15.15
           args: format --check
+      # Order-dependent package-façade imports (#619, #621): `from <pkg> import
+      # X` at module scope, where X is a name <pkg>/__init__.py binds rather
+      # than a submodule, loads only while __init__ stays in its current order.
+      # Stdlib AST, no install — and this is the only Python gate that fires on
+      # a change to any of the four packages, so it is where a repo-wide check
+      # belongs. Also runs under pytest in the client suite.
+      - name: Check for order-dependent package-façade imports
+        run: python3 src/test/python/facade_import_test.py
