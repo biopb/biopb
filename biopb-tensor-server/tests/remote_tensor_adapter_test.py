@@ -821,6 +821,24 @@ def test_unreadable_ca_file_fails_rather_than_degrading_to_tofu(tmp_path):
         )
 
 
+def test_a_broken_trust_anchor_raises_the_config_error_type(tmp_path):
+    """It is a *config* error, and stays a ValueError (biopb/biopb#608).
+
+    The type is what lets the reconcile paths tell "the operator typo'd a path"
+    apart from "the upstream is down"; the ValueError base keeps every caller
+    written before the type working.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+    from biopb_tensor_server.core.errors import UpstreamConfigError
+
+    with pytest.raises(UpstreamConfigError) as excinfo:
+        resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(tmp_path / "typo.pem")),
+        )
+    assert isinstance(excinfo.value, ValueError)
+
+
 def test_ca_and_fingerprint_together_warns_and_keeps_only_the_ca(tmp_path, caplog):
     """Both name an anchor; say which one is in force rather than let the operator
     believe a fingerprint is being enforced when it is not."""
@@ -1565,6 +1583,181 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
             proxy.shutdown()
     finally:
         upstream.shutdown()
+
+
+class TestMisconfiguredUpstreamIsNotUnreachable:
+    """A broken credentials config is not retried like a down upstream (#608).
+
+    The fast cadence exists so a *recovering* upstream is mirrored within a tick.
+    An unreadable trust anchor never recovers on its own, so pinning the fast
+    cadence to it re-reads the same broken file every tick forever, under a log
+    line that says "unreachable".
+    """
+
+    def _manager(self, credentials, url="grpc://lab-store:8815"):
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.adapters import get_default_registry
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.discovery import DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
+
+        upstream = SourceConfig(url=url, alias="lab", credentials_profile="lab-store")
+        proxy = TensorFlightServer("grpc://localhost:0")
+        manager = SourceManager(
+            server=proxy,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs=set(),
+            credentials_config=credentials,
+            monitored_upstreams=[upstream],
+        )
+        # The cadence state the due-scheduler would have seeded for this tick.
+        manager._upstream_relist[url] = {"period": 1, "countdown": 0}
+        return manager, upstream, proxy
+
+    def test_it_backs_off_instead_of_pinning_the_fast_cadence(self, tmp_path, caplog):
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            with caplog.at_level("ERROR"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        state = manager._upstream_relist[upstream.url]
+        assert state["period"] == manager._upstream_max_period
+        assert state["countdown"] == manager._upstream_max_period
+        assert upstream.url in manager._failed_upstreams
+        # ...and the operator is told it is config, not connectivity, *and* how
+        # long the back-off means they will wait after fixing it.
+        assert "MISCONFIGURED" in caplog.text
+        assert "tls_ca_file" in caplog.text
+        assert str(manager._upstream_max_period) in caplog.text
+
+    def test_a_fixed_config_is_reported_and_the_fast_cadence_returns(
+        self, tmp_path, caplog
+    ):
+        """The other half of the back-off message.
+
+        Parking a broken upstream at the slow period is only reasonable if the
+        operator learns when their edit took effect -- otherwise the fix is
+        followed by up to an hour of silence indistinguishable from still being
+        broken. Recovery also has to restore the fast cadence: this upstream is
+        slow *because* it was broken, and an unchanged catalog on the first good
+        re-list would otherwise leave it parked there.
+        """
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+            assert (
+                manager._upstream_relist[upstream.url]["period"]
+                == manager._upstream_max_period
+            )
+
+            # The edit lands and the re-list gets through, finding nothing new.
+            # Stubbed at the reconcile seam because what is under test is the
+            # scheduler's reaction to recovery, not the dial itself.
+            manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert "configured correctly again" in caplog.text
+        assert manager._upstream_relist[upstream.url]["period"] == 1
+        assert upstream.url not in manager._failed_upstreams
+
+    def test_a_healthy_upstream_does_not_announce_a_recovery(self, caplog):
+        """Nothing was broken, so there is nothing to report -- and the ordinary
+        back-off must still apply."""
+        manager, upstream, proxy = self._manager(_creds(token="fine"))
+        manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+        try:
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert caplog.text == ""
+        assert manager._upstream_relist[upstream.url]["period"] == 2  # 1 -> doubled
+
+    def test_an_unreachable_upstream_still_retries_fast(self):
+        """The control case: don't broaden the new branch into the old one."""
+        from biopb_tensor_server import TensorFlightServer
+
+        dead = TensorFlightServer("grpc://localhost:0")
+        port = dead.port
+        dead.shutdown()
+
+        manager, upstream, proxy = self._manager(
+            _creds(token="fine"), url=f"grpc://localhost:{port}"
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert manager._upstream_relist[upstream.url]["period"] == 1
+        assert upstream.url in manager._failed_upstreams
+
+    def test_the_same_error_is_reported_once_but_a_new_one_is_not_swallowed(
+        self, tmp_path, caplog
+    ):
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            with caplog.at_level("ERROR"):
+                manager._reconcile_and_reschedule(upstream)
+                first = caplog.text.count("MISCONFIGURED")
+
+                caplog.clear()
+                manager._reconcile_and_reschedule(upstream)
+                assert caplog.text == ""  # unchanged -> not repeated
+
+                # A different breakage (empty file, not a missing one) must be
+                # reported: silence there would hide the operator's next mistake.
+                empty = tmp_path / "empty.pem"
+                empty.write_bytes(b"")
+                manager._reconciler._credentials_config = _creds(tls_ca_file=str(empty))
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert first == 1
+        assert "which is empty" in caplog.text
+
+    def test_registering_a_single_source_entry_names_the_config_error(
+        self, tmp_path, caplog
+    ):
+        """The adapter-build site too: a static ``grpc://host/<id>`` entry does
+        not resolve credentials during discovery, so its broken profile surfaces
+        here -- and "failed to create adapter" reads like a transient upstream."""
+        from biopb_tensor_server.core.discovery import SourceClaim
+
+        manager, _, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        claim = SourceClaim(
+            source_type="tensor-server",
+            primary_path="grpc://lab-store:8815/img",
+            source_id="lab__img",
+            extra_config={"credentials_profile": "lab-store"},
+            is_remote=True,
+        )
+        try:
+            with caplog.at_level("ERROR"):
+                registered = manager._reconciler._register_source_claim(claim)
+        finally:
+            proxy.shutdown()
+
+        assert registered is False
+        assert "MISCONFIGURED" in caplog.text
+        assert "tls_ca_file" in caplog.text
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")

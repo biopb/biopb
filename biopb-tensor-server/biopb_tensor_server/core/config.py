@@ -117,6 +117,7 @@ from biopb_tensor_server.core.discovery import (
     generate_source_id,
     get_file_identity,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import (
     CredentialProfile,
     CredentialsConfig,
@@ -1261,6 +1262,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             region=profile_data.get("region", None),
             token=profile_data.get("token", None),
             endpoint_url=profile_data.get("endpoint_url", None),
+            # Per-upstream TLS trust (biopb/biopb#604 item 4). Both were added to
+            # CredentialProfile and read by resolve_upstream_credentials, but
+            # never parsed here -- so a configured anchor was dropped on load and
+            # every `grpcs://` upstream silently fell back to TOFU pinning, which
+            # is precisely the silent degradation that design set out to prevent.
+            # They are *known* keys (config_schema derives them from the
+            # dataclass), so nothing warned either.
+            tls_ca_file=profile_data.get("tls_ca_file", None),
+            tls_fingerprint=profile_data.get("tls_fingerprint", None),
         )
         if profile.name:
             credentials_profiles.append(profile)
@@ -1795,6 +1805,22 @@ def resolve_all_sources(
     for source in source_list:
         try:
             discovered = discover_sources(source, registry, credentials_config)
+        except UpstreamConfigError as e:
+            if not tolerant:
+                raise
+            # Still skip rather than abort the boot -- one bad entry must not take
+            # the server down -- but not at the volume of a missing static path.
+            # The operator asked for a stronger trust anchor and the server is
+            # coming up without the source that needed it; that is a broken
+            # deployment, not a transient upstream (biopb/biopb#608).
+            logger.error(
+                "NOT SERVING %s: its credentials configuration is broken (%s). "
+                "This is a configuration error, not an unreachable upstream -- "
+                "it will not resolve until the config is corrected.",
+                source.url,
+                e,
+            )
+            continue
         except Exception as e:
             if not tolerant:
                 raise

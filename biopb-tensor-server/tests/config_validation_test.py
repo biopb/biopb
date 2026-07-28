@@ -381,3 +381,33 @@ def test_present_keys_override_defaults_only_where_set():
     assert cfgobj.writable == ServerConfig().writable  # untouched -> default
     assert cfgobj.cache.file_max_segment_bytes == 32 * 1024 * 1024
     assert cfgobj.cache.memory_max_bytes == default_cache.memory_max_bytes
+
+
+def test_per_upstream_tls_trust_survives_the_parse():
+    """`tls_ca_file` / `tls_fingerprint` reach the profile they were written on.
+
+    They were declared on CredentialProfile and read by
+    resolve_upstream_credentials (biopb/biopb#604 item 4), but the profile parser
+    never copied them across -- so a config file that pinned an upstream's trust
+    was loaded with both unset and the `grpcs://` dial silently fell back to
+    trust-on-first-use. Nothing warned, either: they are known keys, so the
+    unknown-key check waved them through.
+    """
+    cfg = parse_config(
+        {
+            "credentials": {
+                "profiles": [
+                    {
+                        "name": "lab-store",
+                        "storage_type": "biopb-tensor",
+                        "tls_ca_file": "/etc/biopb/lab-ca.pem",
+                        "tls_fingerprint": "AB:CD:EF",
+                    }
+                ]
+            }
+        }
+    )
+
+    profile = cfg.credentials.profiles[0]
+    assert profile.tls_ca_file == "/etc/biopb/lab-ca.pem"
+    assert profile.tls_fingerprint == "AB:CD:EF"

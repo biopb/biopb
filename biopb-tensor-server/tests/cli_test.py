@@ -1007,3 +1007,103 @@ class TestMigrateConfig:
 
         res = CliRunner().invoke(core_cli.app, ["server", "migrate-config"])
         assert res.exit_code != 0
+
+
+# --- validate checks the trust anchors it will actually use (biopb/biopb#608) -
+
+
+def _config_with_ca(tmp_path, ca_path, source_url="grpc://lab-store:8815/img"):
+    """A config naming one credentials profile with `tls_ca_file`.
+
+    The default source url is the SINGLE-source form on purpose: expansion
+    returns before resolving credentials for that shape, so nothing else in
+    `validate` would ever read the profile.
+    """
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {"url": source_url, "credentials_profile": "lab-store"},
+                ],
+                "credentials": {
+                    "profiles": [
+                        {
+                            "name": "lab-store",
+                            "storage_type": "biopb-tensor",
+                            "tls_ca_file": str(ca_path),
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    return config_path
+
+
+def test_validate_rejects_a_trust_anchor_it_cannot_read(tmp_path, capsys):
+    """Serve-time is the wrong moment to learn the anchor you asked for is absent."""
+    config_path = _config_with_ca(tmp_path, tmp_path / "typo.pem")
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+
+    assert exc.value.exit_code == 1
+    out = capsys.readouterr().out
+    assert "tls_ca_file" in out
+    assert "credentials.profiles" in out
+    assert "✓ Config valid" not in out
+
+
+def test_validate_rejects_an_empty_trust_anchor(tmp_path, capsys):
+    ca = tmp_path / "empty.pem"
+    ca.write_bytes(b"   \n")
+    config_path = _config_with_ca(tmp_path, ca)
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+
+    assert exc.value.exit_code == 1
+    assert "empty" in capsys.readouterr().out
+
+
+def test_validate_accepts_a_readable_trust_anchor(tmp_path, capsys):
+    ca = tmp_path / "lab-ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n")
+    config_path = _config_with_ca(tmp_path, ca)
+
+    cli.validate(config=config_path)  # no Exit
+
+    assert "✓ Config valid" in capsys.readouterr().out
+
+
+def test_validate_checks_a_profile_no_source_references(tmp_path, capsys):
+    """An unused profile is still config the server will read the moment a source
+    names it -- and a typo found now costs nothing to fix."""
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "sources": [],
+                "credentials": {
+                    "profiles": [
+                        {
+                            "name": "lab-store",
+                            "storage_type": "biopb-tensor",
+                            "tls_ca_file": str(tmp_path / "typo.pem"),
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+
+    assert exc.value.exit_code == 1
+    assert "tls_ca_file" in capsys.readouterr().out

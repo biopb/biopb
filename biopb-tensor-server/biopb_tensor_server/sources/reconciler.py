@@ -51,6 +51,7 @@ from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
     resolve_local_path,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
@@ -854,6 +855,19 @@ class Reconciler:
                     adapter.seed_catalog(
                         tensors, metadata, data_resident, source_url, indexed_at
                     )
+        except UpstreamConfigError as e:
+            # Same skip, different diagnosis: "failed to create adapter" reads as
+            # a transient upstream problem, and this one is an operator edit away
+            # from fixed and will fail identically until then (biopb/biopb#608).
+            self._log_source_failure(
+                claim.source_id,
+                "Source %s (%s) is MISCONFIGURED and cannot be registered: %s. "
+                "Correct the configuration; retrying will not help.",
+                claim.source_id,
+                claim.primary_path,
+                e,
+            )
+            return False
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
