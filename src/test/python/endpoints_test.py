@@ -169,3 +169,46 @@ class TestRuntimeRecord:
         assert json.loads(path.read_text())["port"] == 9003
         # No temp file left behind.
         assert not list(path.parent.glob("*.tmp"))
+
+    def test_each_writer_gets_its_own_temp(self, monkeypatch):
+        """Two publishers must not share a scratch file.
+
+        With a fixed temp name, both truncate and write it before either
+        renames, and the record that lands can be a mix of the two. Only
+        `control start` holds the start lock, so a foreground `control run` on
+        the same state dir really can race it.
+        """
+        from biopb._locations import control_runtime_file
+
+        path = control_runtime_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        seen = set()
+        real_mkstemp = _endpoints.tempfile.mkstemp
+
+        def _spy(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            seen.add(name)
+            return fd, name
+
+        monkeypatch.setattr(_endpoints.tempfile, "mkstemp", _spy)
+        _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
+        _endpoints.write_runtime_record("127.0.0.1", 9004, 4243)
+        assert len(seen) == 2
+
+    def test_failed_write_leaves_no_debris(self, monkeypatch):
+        """A full disk must not strew temp files beside the record.
+
+        The record is republished on every serve, so a leak here accumulates.
+        """
+        from biopb._locations import control_runtime_file
+
+        path = control_runtime_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _boom(*_a, **_k):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(_endpoints.os, "replace", _boom)
+        with pytest.raises(OSError):
+            _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
+        assert not list(path.parent.glob("*.tmp"))

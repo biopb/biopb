@@ -29,6 +29,7 @@ proxies to the session child on the same origin.
 
 import json
 import os
+import tempfile
 
 # --- the base-port convention --------------------------------------------- #
 #
@@ -125,7 +126,6 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
     payload = json.dumps(
         {
             "host": host,
@@ -134,11 +134,28 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
             "create_time": process_create_time(pid),
         }
     )
-    # Same atomic write-then-replace the pid file uses: a client polling for the
-    # control must never observe a half-written record and parse it as "none".
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(payload)
-    os.replace(tmp, path)
+    # Written exactly as the pid file is (daemon.write_pid_file): a *unique*
+    # sibling temp, then os.replace. Unique because the temp name is what makes
+    # concurrent writers safe -- a fixed one has two publishers truncating and
+    # writing the same file before either renames, so the record that lands can
+    # be a mix of both. Racing publishers are reachable here: only `control
+    # start` takes the start lock, so a foreground `control run` sharing the
+    # state dir is not serialized against it. And the temp is unlinked on any
+    # failure, so a full disk leaves no debris beside the record it could not
+    # replace.
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def remove_runtime_record() -> None:
