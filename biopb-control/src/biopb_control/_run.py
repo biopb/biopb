@@ -128,9 +128,13 @@ def run_control(
     # Written after the bind (never advertise a port we failed to take) and
     # unconditionally -- unlike the credential above, a port is not a secret and a
     # tokenless local plane needs discovering just the same.
+    # Best-effort: an unpublishable endpoint costs discovery, not the control.
+    # RuntimeError joins OSError because `Path.home()` raises it on Windows when
+    # the environment has no USERPROFILE/HOMEPATH, so even locating the file can
+    # fail.
     try:
         _endpoints.write_runtime_record(control_host, control_port, os.getpid())
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         logger.warning("could not publish the control endpoint: %s", exc)
 
     if data_plane:

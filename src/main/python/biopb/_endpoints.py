@@ -92,6 +92,11 @@ def _runtime_record() -> dict:
     record", never an exception. This sits under ``control_port()``, which every
     client calls before it can even reach the control -- a hard failure here
     would break discovery entirely rather than degrade to the default.
+
+    ``RuntimeError`` is in the net because locating the file is itself fallible:
+    ``Path.home()`` raises it on Windows when the environment carries no
+    ``USERPROFILE``/``HOMEPATH`` (a scrubbed-env service, or a test that clears
+    ``os.environ``). Nowhere to look is just another way of having no record.
     """
     try:
         from ._locations import control_runtime_file
@@ -99,7 +104,7 @@ def _runtime_record() -> dict:
         with open(control_runtime_file(), encoding="utf-8") as fh:
             rec = json.load(fh)
         return rec if isinstance(rec, dict) else {}
-    except (OSError, ValueError, ImportError):
+    except (OSError, ValueError, ImportError, RuntimeError):
         return {}
 
 
@@ -129,7 +134,7 @@ def remove_runtime_record() -> None:
         from ._locations import control_runtime_file
 
         control_runtime_file().unlink()
-    except (OSError, ImportError):
+    except (OSError, ImportError, RuntimeError):
         pass
 
 

@@ -117,6 +117,28 @@ class TestRuntimeRecord:
         path.write_text(content)
         assert _endpoints.control_port() == _endpoints.CONTROL_DEFAULT_PORT
 
+    def test_undeterminable_home_degrades_to_the_default(self, monkeypatch):
+        """Not even being able to *locate* the record must not raise.
+
+        On Windows `Path.home()` raises RuntimeError when the environment has no
+        USERPROFILE/HOMEPATH -- a scrubbed-env service, or any test that clears
+        `os.environ`. POSIX falls back to the passwd database and never sees it,
+        so this is simulated rather than provoked: it caught a real CI failure
+        that no Linux run could reproduce.
+        """
+        import pathlib
+
+        monkeypatch.delenv("XDG_STATE_HOME")
+
+        def _no_home():
+            raise RuntimeError("Could not determine home directory.")
+
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(_no_home))
+        assert _endpoints.read_runtime_record() == {}
+        assert _endpoints.control_port() == _endpoints.CONTROL_DEFAULT_PORT
+        assert _endpoints.control_host() == _endpoints.CONTROL_DEFAULT_HOST
+        _endpoints.remove_runtime_record()  # no raise either
+
     def test_write_is_atomic(self):
         """Written via a temp file + replace, like the pid file.
 
