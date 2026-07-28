@@ -1008,16 +1008,38 @@ class TestLiveForegroundControl:
         assert pid == os.getpid()
         assert record["port"] == 9003
 
-    def test_recycled_pid_is_not_a_running_control(self):
-        """The case the pid alone cannot see: alive, but a different process."""
-        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
-        # Same pid, still very much alive -- only the create-time token says the
-        # process serving now is not the one that wrote the record.
+    def _repoint_token(self, value):
+        """Rewrite the record's create-time token, leaving the live pid alone."""
         path = _locations.control_runtime_file()
         record = json.loads(path.read_text())
-        record["create_time"] = (record.get("create_time") or 0) + 1
+        record["create_time"] = value
         path.write_text(json.dumps(record))
+
+    def test_recycled_pid_is_not_a_running_control(self, monkeypatch):
+        """The case the pid alone cannot see: alive, but a different process.
+
+        The *live* token is stubbed rather than read, because whether one exists
+        is platform-dependent -- macOS has none, and identity there legitimately
+        degrades to liveness (see the next test). Stubbing keeps the wiring that
+        matters, recorded token vs live token, covered on every platform.
+        """
+        monkeypatch.setattr(_daemon, "_process_create_time", lambda _p: 111)
+        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        self._repoint_token(222)  # some other process holds this pid now
         assert cli._live_foreground_control() is None
+
+    def test_platform_without_create_time_degrades_to_liveness(self, monkeypatch):
+        """No identity source (macOS) must not read as "stopped".
+
+        Stranding a live control is the worse error of the two: the fallback
+        risks believing a recycled pid, refusing to believe a running control
+        would send the user chasing a process that is serving fine.
+        """
+        monkeypatch.setattr(_daemon, "_process_create_time", lambda _p: None)
+        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        self._repoint_token(222)  # unverifiable, so not disqualifying
+        live = cli._live_foreground_control()
+        assert live is not None and live[1] == os.getpid()
 
     def test_dead_pid_is_not_a_running_control(self, monkeypatch):
         cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
@@ -1029,7 +1051,7 @@ class TestLiveForegroundControl:
         cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
         path = _locations.control_runtime_file()
         record = json.loads(path.read_text())
-        del record["create_time"]
+        del record["create_time"]  # the shape written before this field existed
         path.write_text(json.dumps(record))
         live = cli._live_foreground_control()
         assert live is not None and live[1] == os.getpid()
