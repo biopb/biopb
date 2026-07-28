@@ -47,9 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--remote",
         action="store_true",
-        help="serve on the network behind a token: bind the control listener "
-        "publicly (0.0.0.0) and require a token. Without it the control binds "
-        "loopback and runs tokenless.",
+        help="deprecated and redundant: a public --grpc-host already says the "
+        "deployment is public. Kept as an extra token-required trigger; it does "
+        "NOT publish this control listener (use --control-host for that).",
     )
     run.add_argument(
         "--no-data-plane",
@@ -86,29 +86,47 @@ def main(argv: list[str] | None = None) -> int:
     token = (args.token or os.environ.get("BIOPB_TENSOR_TOKEN") or "").strip() or None
 
     # Defaults for the control endpoint come from the shared core-SDK module so a
-    # bare `python -m biopb_control run` and the CLI agree on 8813. Remote mode
-    # binds all interfaces so the browser UI is reachable off-box; an explicit
-    # --control-host (or BIOPB_CONTROL_HOST) can also make it public.
+    # bare `python -m biopb_control run` and the CLI agree on 8813.
+    #
+    # `--remote` does NOT touch this bind (biopb/biopb#614). It used to force
+    # 0.0.0.0, which published a plaintext-HTTP admin UI and put the data-plane
+    # token on the wire in the clear -- the opposite of what the TLS work under
+    # biopb/biopb#604 was for, since the control has no TLS support at all. The
+    # flag now means only "the flight plane is public, so require a token"; the
+    # browser reaches this listener over an SSH tunnel. Publishing it stays
+    # possible, but only as the deliberate, named act of passing a public
+    # `--control-host` (or BIOPB_CONTROL_HOST) -- e.g. behind an operator's own
+    # TLS proxy.
     from biopb import _web_auth
     from biopb._endpoints import control_host, control_port
 
-    resolved_control_host = args.control_host or (
-        "0.0.0.0" if args.remote else control_host()
-    )
+    resolved_control_host = args.control_host or control_host()
 
-    # Fail-closed: a control listener reachable off-box MUST carry a token. Without
-    # one, its /api/* gate falls back to only a loopback-`Host` check, which a
-    # non-browser client trivially spoofs (`Host: 127.0.0.1`) to drive the
-    # stop/restart/session verbs. Key the guard on the *resolved bind*, not on
-    # `--remote`: an explicit public `--control-host` (or BIOPB_CONTROL_HOST) is
-    # just as exposed. `--remote` is kept as a belt-and-suspenders trigger so it is
-    # never accepted token-less even if paired with a loopback --control-host.
+    # Fail-closed: no listener reachable off-box may run token-less. Two of them
+    # can be, and each is checked on its *resolved bind* rather than on a mode
+    # flag:
+    #
+    #   - this control listener. Without a token its /api/* gate falls back to a
+    #     loopback-`Host` check, which a non-browser client trivially spoofs
+    #     (`Host: 127.0.0.1`) to drive the stop/restart/session verbs. Public only
+    #     via an explicit --control-host / BIOPB_CONTROL_HOST.
+    #   - the data plane. A public --grpc-host serves pixels and the whole data
+    #     API off-box, so it must be authenticated even though *this* listener is
+    #     loopback. Deriving it from the address the parent already passes means
+    #     the two layers read one fact through one predicate and cannot disagree
+    #     about it (biopb/biopb#614).
+    #
+    # `--remote` is redundant now that --grpc-host carries this, but stays honored
+    # so a direct invocation that still passes it is never accepted token-less.
     control_is_public = _web_auth.host_is_public_bind(resolved_control_host)
-    if not token and (args.remote or control_is_public):
+    plane_is_public = _web_auth.host_is_public_bind(args.grpc_host)
+    if not token and (args.remote or control_is_public or plane_is_public):
+        exposed = "control API" if control_is_public else "data plane"
         print(
-            "biopb-control: a network-reachable control bind requires an access "
-            "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --control-host to "
-            "loopback (127.0.0.1) for a tokenless local deployment.",
+            f"biopb-control: a network-reachable {exposed} bind requires an access "
+            "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --grpc-host and "
+            "--control-host to loopback (127.0.0.1) for a tokenless local "
+            "deployment.",
             file=sys.stderr,
         )
         return 2

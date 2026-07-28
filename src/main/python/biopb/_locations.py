@@ -265,6 +265,27 @@ def control_pid_file() -> Path:
     return state_dir() / "control.pid"
 
 
+def control_runtime_file() -> Path:
+    """Where a *serving* control publishes its endpoint (``state/biopb/control.json``).
+
+    The discovery half of what the pid file used to imply. ``control.pid`` is a
+    **lifecycle** record -- ``control start`` writes it about the daemon it
+    spawned so ``control stop`` can signal it later -- and a foreground
+    ``control run`` deliberately has none (its terminal or service manager owns
+    the process). But once the control's port became derivable from
+    ``--base-port`` rather than fixed at 8813, *both* forms need to publish
+    **where** they listen, or a client has no way to find a control that moved.
+
+    So the endpoint is written by whoever actually bound the socket
+    (``biopb_control._run``), on the path both commands share, beside the
+    ``tensor-server.token`` credential and on the same publish-on-serve /
+    retract-on-clean-stop lifetime. Not a secret -- the port is not a
+    credential -- so unlike the credential file it carries no owner-only perms
+    and is written unconditionally, including for a tokenless local plane.
+    """
+    return state_dir() / "control.json"
+
+
 def control_stop_sentinel() -> Path:
     """The control plane's Windows stop-sentinel (watched by ``biopb_control._run``)."""
     return state_dir() / "control.stop"

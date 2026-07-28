@@ -14,13 +14,14 @@ it and does not assume the right to stop it.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
 from pathlib import Path
 from typing import Optional
 
-from biopb import _credentials
+from biopb import _credentials, _endpoints
 
 from ._control import serve_control_api
 from ._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -119,6 +120,23 @@ def run_control(
             # an actionable auth error, which is better than failing control startup.
             logger.warning("could not write the local credential file: %s", exc)
 
+    # Publish the endpoint we actually bound so clients can find a control that
+    # `--base-port` moved off 8813 (biopb/biopb#614 follow-up). This is the one
+    # code path both `biopb control start` (via its child) and the foreground
+    # `biopb control run` go through, so a foreground control is discoverable
+    # without needing the pid file that deliberately belongs only to the daemon.
+    # Written after the bind (never advertise a port we failed to take) and
+    # unconditionally -- unlike the credential above, a port is not a secret and a
+    # tokenless local plane needs discovering just the same.
+    # Best-effort: an unpublishable endpoint costs discovery, not the control.
+    # RuntimeError joins OSError because `Path.home()` raises it on Windows when
+    # the environment has no USERPROFILE/HOMEPATH, so even locating the file can
+    # fail.
+    try:
+        _endpoints.write_runtime_record(control_host, control_port, os.getpid())
+    except (OSError, RuntimeError) as exc:
+        logger.warning("could not publish the control endpoint: %s", exc)
+
     if data_plane:
         logger.info("Bringing up the data plane")
         supervisor.ensure()
@@ -164,4 +182,8 @@ def run_control(
     # token behind (a crash can't run this; the next control start overwrites it).
     if spec.token:
         _credentials.remove_credential()
+    # Retract the endpoint too, so discovery does not point clients at a dead
+    # port. A crash leaves it behind, which is why the record carries a pid and
+    # every consumer probes rather than trusting it.
+    _endpoints.remove_runtime_record()
     return 0
