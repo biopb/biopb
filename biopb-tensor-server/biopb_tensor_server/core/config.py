@@ -108,7 +108,6 @@ from biopb._locations import (
     find_config as find_config,
 )
 
-from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
@@ -1621,6 +1620,16 @@ def discover_sources(
         ValueError: If remote URL lacks explicit 'type'
     """
     if registry is None:
+        # Deferred on layering grounds: core should not import adapters. At
+        # directory granularity adapters -> cache -> config -> adapters is a
+        # cycle; at module granularity it is not one *yet*, because
+        # adapters/__init__ does not import cached_source (the module that
+        # reaches the cache) -- only serving/upload_manager does. Re-exporting
+        # cached_source from adapters/__init__, the one adapter module it omits,
+        # would close it for real. So undeferring this import will appear to
+        # work: that is the trap, not a sign the comment is stale.
+        from biopb_tensor_server.adapters import get_default_registry
+
         registry = get_default_registry()
 
     # Case 0: Remote URLs require an explicit (or auto-detectable) type.
@@ -1772,6 +1781,9 @@ def resolve_all_sources(
         List of all concrete SourceConfig objects (one per data source)
     """
     if registry is None:
+        # Deferred for the same layering reason as in discover_sources.
+        from biopb_tensor_server.adapters import get_default_registry
+
         registry = get_default_registry()
 
     source_list = sources if sources is not None else config.sources

@@ -10,10 +10,10 @@ import tempfile
 
 import numpy as np
 import tifffile
+from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.config import (
     SourceConfig,
     discover_sources,
-    get_default_registry,
 )
 
 

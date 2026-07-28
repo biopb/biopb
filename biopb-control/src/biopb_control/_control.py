@@ -95,7 +95,6 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect as ws_connect
 
-from . import __version__
 from ._supervisor import DataPlaneSupervisor
 
 logger = logging.getLogger(__name__)
@@ -539,6 +538,12 @@ def build_app(
         # plane's supervisor snapshot, and how many sessions are live. Sync (the
         # snapshot probes the port and list_sessions() touches the filesystem), so
         # Starlette runs it in the threadpool.
+        #
+        # __version__ is read here, not imported at module scope: __init__ binds
+        # it and *then* imports _run -> _control, so a module-level `from . import
+        # __version__` only works while those two stay in that order.
+        from . import __version__
+
         return JSONResponse(
             {
                 "control": "ok",
