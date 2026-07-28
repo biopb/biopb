@@ -279,12 +279,22 @@ markers would otherwise claim and report as "the server needs a token". Known ed
 - **Fallback resolution** (`resolve_from_config`, used only on that no-control
   path — the control's endpoint wins whenever it answers): env
   (`BIOPB_TENSOR_URL`/`BIOPB_TENSOR_TOKEN`) → config (`tensor_browser.server_url`)
-  → default `grpc://localhost:8815`. Only the URL is persisted. The token is
-  `BIOPB_TENSOR_TOKEN` if set, else the control's local credential file
+  → default `grpc://localhost:8815`. Only the URL is persisted, and a URL taken
+  verbatim from `$BIOPB_TENSOR_URL` is not (**#626**) — a one-off redirect must
+  not become the standing config later tokenless starts re-dial.
+- **The credential follows the endpoint's origin** (**#626**, the biopb-mcp half
+  of **#615**): the token is resolved per endpoint at dial time, not once at
+  construction. A control-ensured endpoint reads `BIOPB_TENSOR_TOKEN` /
+  GUI-entered token, else the control's local credential file
   (`biopb._credentials`, **#470**) — the filesystem handoff that lets an
   agent-spawned biopb-mcp authenticate a token-gated local plane without the env
-  var. The control writes that file (owner-only) at start-up and carries the same
-  token on its own gated `/api/data_plane/ensure` POST.
+  var (the control writes that file owner-only at start-up and carries the same
+  token on its own gated `/api/data_plane/ensure` POST). A fallback endpoint from
+  env/config gets the explicit token or none: the file is *this machine's*
+  credential for the control's own plane, and presenting it to an address that
+  routed around the control would disclose it to a host it was never issued for.
+  `connect()` never writes the dialed token back to `self.token` (explicit only),
+  and a tokenless auth refusal names the withheld file in its error message.
 - **Self-healing catalog** (`start_source_watch`, **#44**): a catalog cached at
   connect can be *partial* (the server reports `SERVING` before it finishes
   enumerating scenes). A daemon thread `health_check()`s and re-lists on any

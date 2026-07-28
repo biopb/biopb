@@ -73,16 +73,18 @@ class TestResolveFromConfig:
         assert url == DEFAULT_CONFIG["tensor_browser"]["server_url"]
         assert token is None
 
-    def test_token_from_credential_file(self, monkeypatch):
-        # No env token, but the control wrote a local credential (#470): it is the
-        # token, which is exactly the agent-spawned-over-stdio case where
-        # BIOPB_TENSOR_TOKEN never reached this process.
+    def test_credential_file_not_read_at_construction(self, monkeypatch):
+        # The control's credential (#470) is the token for the plane the control
+        # owns, but this method resolves the endpoint used when NO control
+        # answered — pairing the two here is what sent the local credential to
+        # endpoints the control never named (#626). It is resolved per endpoint
+        # in auto_connect instead; see TestCredentialFileScope.
         monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
         _url, token = TensorConnection.resolve_from_config({})
-        assert token == "cred-tok"
+        assert token is None
 
-    def test_env_token_overrides_credential_file(self, monkeypatch):
-        # An explicit BIOPB_TENSOR_TOKEN wins over the credential file (the escape
+    def test_env_token_is_the_explicit_token(self, monkeypatch):
+        # An explicit BIOPB_TENSOR_TOKEN still applies everywhere (the escape
         # hatch for a remote plane whose token the user supplies out of band).
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-tok")
         monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
@@ -320,7 +322,10 @@ class TestConnect:
         assert conn.client is client
         assert conn.sources == sources
         assert conn.url == "grpc://host:9"
-        assert conn.token == "t"
+        # The dial's token is NOT promoted into self.token (#626): that field
+        # holds only an explicit (env/GUI) token, so a credential-file token used
+        # for a control-named endpoint can't leak into later fallback dials.
+        assert conn.token is None
         assert conn.use_server_query is False
         assert conn.is_connected is True
         assert persisted == {"url": "grpc://host:9"}
@@ -938,6 +943,21 @@ class TestPersistUrl:
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
         assert saved["services"]["process_image_servers"] == ["grpc://ops:5"]
 
+    def test_skips_url_taken_from_env(self, monkeypatch):
+        # A URL from $BIOPB_TENSOR_URL is a one-off redirect, not standing
+        # config: persisting it would make every later tokenless start silently
+        # re-dial it once the env var is gone (#626).
+        from biopb_mcp._config import CONFIG
+
+        CONFIG.set("tensor_browser.server_url", "grpc://old:1", persist=False)
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://oneoff:7")
+
+        conn = TensorConnection(config={})
+        conn.url = "grpc://oneoff:7"
+        conn.persist_url()
+
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://old:1"
+
 
 # ---------------------------------------------------------------------------
 # health
@@ -1133,6 +1153,120 @@ class TestAutoConnect:
         assert conn.last_status == "error"
         assert "biopb control start" in conn.last_message
 
+    def test_no_control_auth_refusal_keeps_classified_reason(self, monkeypatch):
+        # The fallback plane ANSWERED and refused the dial, so "no data plane,
+        # run biopb control start" would be false. Keep the reason connect()
+        # classified (#626 point 3).
+        conn = TensorConnection(config={})
+        conn.url = "grpc://host:9"
+
+        def refuse(url, token=None):
+            conn.last_status = "error"
+            conn.last_message = _connection.connect_error_message(
+                RuntimeError("FlightUnauthenticatedError: token required"), url, token
+            )
+            raise RuntimeError("FlightUnauthenticatedError: token required")
+
+        monkeypatch.setattr(conn, "connect", refuse)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
+
+        conn.auto_connect()  # must not raise
+
+        assert conn.last_status == "error"
+        assert "Authentication required" in conn.last_message
+        assert "biopb control start" not in conn.last_message
+
+
+# ---------------------------------------------------------------------------
+# credential-file scope (#626): the control's credential travels only with an
+# endpoint the control itself named
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialFileScope:
+    """The control's credential file (#470) is resolved per endpoint, at dial
+    time: it authenticates the control-ensured endpoint, and never a fallback
+    URL from env/config — which may be a host the credential was not issued for
+    (#626). Both branches are exercised with the file "on disk" so they cannot
+    drift apart again."""
+
+    def _capture_dials(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            _connection,
+            "TensorFlightClient",
+            lambda url, token=None, **_: seen.append((url, token)) or _fake_client({}),
+        )
+        return seen
+
+    def test_control_endpoint_authenticates_from_credential_file(self, monkeypatch):
+        # The control named the endpoint, so its handoff file is the right token
+        # for it — the agent-spawned-over-stdio case where BIOPB_TENSOR_TOKEN
+        # never reached this process (#470).
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(
+            _connection,
+            "ensure_data_plane",
+            lambda *a, **k: {"grpc_url": "grpc://control:9", "state": "serving"},
+        )
+        seen = self._capture_dials(monkeypatch)
+
+        conn.auto_connect()
+
+        assert seen == [("grpc://control:9", "cred-tok")]
+        # The effective token is not promoted to the explicit one.
+        assert conn.token is None
+
+    def test_fallback_endpoint_never_gets_credential_file(self, monkeypatch):
+        # No control answered: the URL came from config/env, so this machine's
+        # credential is withheld — even though the file exists on disk.
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
+        seen = self._capture_dials(monkeypatch)
+
+        conn.auto_connect()
+
+        assert conn.is_connected
+        assert seen == [("grpc://cfg:2", None)]
+
+    def test_fallback_endpoint_still_uses_explicit_env_token(self, monkeypatch):
+        # $BIOPB_TENSOR_TOKEN is explicit — someone naming a server can also
+        # name its token — so it still applies to a fallback dial.
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-tok")
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
+        seen = self._capture_dials(monkeypatch)
+
+        conn.auto_connect()
+
+        assert seen == [("grpc://cfg:2", "env-tok")]
+
+    def test_explicit_token_beats_credential_file_on_control_endpoint(
+        self, monkeypatch
+    ):
+        # A GUI-entered token (the widget writes conn.token) wins over the file
+        # on the control branch too.
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
+        conn.token = "typed"
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(
+            _connection,
+            "ensure_data_plane",
+            lambda *a, **k: {"grpc_url": "grpc://control:9", "state": "serving"},
+        )
+        seen = self._capture_dials(monkeypatch)
+
+        conn.auto_connect()
+
+        assert seen == [("grpc://control:9", "typed")]
+
 
 # ---------------------------------------------------------------------------
 # connect_error_message (issue #86 secondary)
@@ -1149,6 +1283,18 @@ class TestConnectErrorMessage:
         assert self.URL in msg
         # Names the fix so the user knows what to do.
         assert "token" in msg.lower()
+        # No credential file on disk (autouse fixture) -> no withheld-file note.
+        assert "credential file" not in msg
+
+    def test_auth_required_names_the_withheld_credential_file(self, monkeypatch):
+        # A tokenless dial while the control's credential file exists means the
+        # file was deliberately not used (#626): say so, or a reader who knows
+        # the credential exists debugs the file instead of supplying a token.
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        exc = RuntimeError("FlightUnauthenticatedError: token required")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "Authentication required" in msg
+        assert "credential file was not used" in msg
 
     def test_auth_failed_when_token_present(self):
         exc = RuntimeError("PermissionDenied: invalid token")
