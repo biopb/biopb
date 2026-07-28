@@ -120,6 +120,31 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
     return f"{type(exc).__name__} from the data plane at {where}: {exc}"
 
 
+def _operation_error(
+    exc: Exception, endpoint: _data_plane.Endpoint, context: str
+) -> str:
+    """Classify a failure raised *after* the client was built.
+
+    ``TensorFlightClient`` opens its socket lazily, so the connect-time failures
+    :func:`_dial_error` exists for -- no token, wrong token, nothing listening --
+    do not surface when the client is constructed. They surface on the command's
+    first RPC, inside the command body. Routing only ``cache-stats`` through the
+    classifier therefore left the other four printing "Error querying server:
+    <raw exception>" for exactly the cases #615 filed: the plane answered and
+    refused, and the message did not say so.
+
+    Anything Flight-typed is the plane's answer and gets classified. Everything
+    else keeps the command's own phrasing: a bad slice, a missing zarr install
+    and an unwritable output file are the command's business, and reporting them
+    as though the data plane said something would be a fresh misattribution.
+    """
+    import pyarrow.flight as flight
+
+    if isinstance(exc, (_data_plane.LocalTrustError, flight.FlightError)):
+        return _dial_error(exc, endpoint)
+    return f"{context}: {exc}"
+
+
 def _resolve_endpoint(
     server: Optional[str], token: Optional[str]
 ) -> _data_plane.Endpoint:
@@ -263,7 +288,9 @@ def query(
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Error querying server:[/red] {exc}")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Error querying server')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
@@ -289,7 +316,7 @@ def metadata(
         biopb tensor metadata my-source -s grpc://myhost:9000 --token mytoken123
     """
     start_time = time.time()
-    client, _ = _connect(server, token, cache_bytes)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         sources = client.list_sources()
         if source_id not in sources:
@@ -339,7 +366,11 @@ def metadata(
     except typer.Exit:
         raise
     except Exception as exc:
-        console.print(f"[red]Error fetching metadata:[/red] {exc}")
+        # stderr, like every other command's failure path: an error belongs on
+        # the stream a caller is not parsing for results.
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Error fetching metadata')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
@@ -387,7 +418,7 @@ def get(
         biopb tensor get my-source --token mytoken123 -o output.pkl
     """
     start_time = time.time()
-    client, _ = _connect(server, token, cache_bytes)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         selection = _parse_slice_hint(slice_hint)
         fmt = _infer_format(output, format)
@@ -457,7 +488,9 @@ def get(
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Failed to fetch tensor:[/red] {exc}")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to fetch tensor')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
@@ -486,7 +519,7 @@ def stats(
         biopb tensor stats my-source/pos_0 -S 0:512 -s grpc://myhost:9000 --token mytoken123
     """
     start_time = time.time()
-    client, _ = _connect(server, token, cache_bytes)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         selection = _parse_slice_hint(slice_hint)
 
@@ -521,7 +554,9 @@ def stats(
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Failed to compute statistics:[/red] {exc}")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to compute statistics')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
@@ -612,7 +647,9 @@ def cache_stats(
     try:
         stats = client.cache_stats()
     except Exception as exc:  # noqa: BLE001 - rendered by type, not swallowed
-        stderr_console.print(f"[red]{_dial_error(exc, endpoint)}[/red]")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to read cache statistics')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()

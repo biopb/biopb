@@ -580,3 +580,69 @@ class TestCacheStatsCommand:
         assert "certificate" in result.stderr and "cert init" in result.stderr
         assert "token" not in result.stderr
         assert _data_plane.LocalTrustError is not None  # the type, not a substring
+
+
+class TestEveryCommandClassifiesItsFailures:
+    """The classifier has to reach all five commands, not just cache-stats.
+
+    ``TensorFlightClient`` opens its socket lazily, so a refused dial does not
+    raise where the client is *built* -- it raises on the command's first RPC,
+    inside the command body. Until this, only ``cache-stats`` routed that body
+    through the classifier, so `query`/`metadata`/`get`/`stats` still printed
+    "Error querying server: <raw exception>" for exactly the failures
+    biopb/biopb#615 was filed about.
+    """
+
+    # (argv, the client method whose call is the command's first RPC)
+    CASES = [
+        (["query"], "list_sources"),
+        (["metadata", "my-source"], "list_sources"),
+        (["get", "my-source", "-o", "-"], "get_tensor_pb"),
+        (["stats", "my-source"], "get_tensor"),
+        (["cache-stats"], "cache_stats"),
+    ]
+
+    def _run(self, argv, method, exc):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = mock_fc_class.return_value
+            getattr(client, method).side_effect = exc
+            return runner.invoke(app, argv)
+
+    @pytest.mark.parametrize("argv,method", CASES)
+    def test_a_missing_token_is_named_as_one(self, argv, method):
+        import pyarrow.flight as flight
+
+        result = self._run(argv, method, flight.FlightUnauthenticatedError("no token"))
+
+        assert result.exit_code == 1
+        assert "requires an access token" in result.stderr
+        assert "unreachable" not in result.stderr.lower()
+
+    @pytest.mark.parametrize("argv,method", CASES)
+    def test_an_unreachable_plane_says_so_and_names_the_endpoint(self, argv, method):
+        import pyarrow.flight as flight
+        from biopb import _data_plane
+
+        result = self._run(argv, method, flight.FlightUnavailableError("refused"))
+
+        assert result.exit_code == 1
+        assert "Cannot reach the data plane" in result.stderr
+        # The origin is part of the message: a guessed default is not the same
+        # failure as an endpoint the control published.
+        assert _data_plane.default_url() in result.stderr
+
+    def test_a_local_failure_keeps_the_command_s_own_words(self):
+        """Not everything that goes wrong in a command body is the plane's doing.
+
+        A bad slice or an unwritable file must not be reported as though the
+        server said something -- that would just trade one misattribution for
+        another.
+        """
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = mock_fc_class.return_value
+            client.get_tensor.side_effect = MemoryError("cannot allocate")
+            result = runner.invoke(app, ["stats", "my-source"])
+
+        assert result.exit_code == 1
+        assert "Failed to compute statistics" in result.stderr
+        assert "data plane" not in result.stderr
