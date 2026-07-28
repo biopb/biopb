@@ -309,6 +309,46 @@ def test_cert_init_force_rotates():
     assert tls_server_cert().read_bytes() != before  # rotated
 
 
+def _labelled(output: str, label: str) -> str:
+    """The one output line starting with `  <label>:`."""
+    return next(ln for ln in output.splitlines() if ln.strip().startswith(label + ":"))
+
+
+def test_cert_init_paths_survive_a_narrow_terminal(monkeypatch):
+    """cert/key/fingerprint are copied verbatim, so none may be wrapped.
+
+    A path split mid-component is unusable in the mount/scp/trust-config it gets
+    pasted into, and the reader cannot tell a wrap from a real path.
+    """
+    from biopb._locations import tls_server_cert, tls_server_key
+    from biopb_tensor_server.cli import app
+
+    monkeypatch.setenv("COLUMNS", "60")
+    out = CliRunner().invoke(app, ["cert", "init"])
+    assert out.exit_code == 0, out.output
+    for label, path in (("cert", tls_server_cert()), ("key", tls_server_key())):
+        assert str(path) in _labelled(out.output, label)
+    # The fingerprint is 95 chars -- well past the 60-column width it must defeat.
+    assert len(_labelled(out.output, "fingerprint")) > 60
+
+
+def test_cert_init_prints_a_bracketed_path_intact(tmp_path, monkeypatch):
+    """Rich markup is off, so a `[...]` directory name is not eaten as a style tag.
+
+    This is the failure that does not announce itself: with markup on, a state
+    dir named `st[ate]dir` prints as `stdir` -- a *wrong* path, rendered as
+    confidently as a right one.
+    """
+    from biopb._locations import tls_server_cert
+    from biopb_tensor_server.cli import app
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "st[ate]dir"))
+    out = CliRunner().invoke(app, ["cert", "init"])
+    assert out.exit_code == 0, out.output
+    assert "st[ate]dir" in out.output
+    assert str(tls_server_cert()) in _labelled(out.output, "cert")
+
+
 # --- end to end: generated cert actually serves + a TOFU client reads -------
 
 

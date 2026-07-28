@@ -78,6 +78,31 @@ DEFAULT_FLIGHT_HOST = "127.0.0.1"
 DEFAULT_FLIGHT_PORT = 8815
 
 
+def _print_verbatim(*rows: Tuple[str, object]) -> None:
+    """Print a ``label: value`` block the operator will copy byte-for-byte.
+
+    Cert paths and fingerprints get pasted into a mount, an ``scp``, or a
+    client's trust config, so Rich's two conveniences become corruption:
+
+    * it hard-wraps at the terminal width, splitting a long path mid-component
+      into something unusable that still *looks* like a path;
+    * it eats square brackets as style tags, so a state dir named
+      ``st[ate]dir`` prints as ``stdir`` -- a **wrong** path rendered as
+      confidently as a right one -- and rewrites the fingerprint's
+      colon-delimited hex pairs (``:cd:`` -> a CD emoji).
+
+    So: ``soft_wrap`` on, and markup/emoji/highlight off.
+    """
+    for label, value in rows:
+        console.print(
+            f"  {label:<12} {value}",
+            soft_wrap=True,
+            markup=False,
+            emoji=False,
+            highlight=False,
+        )
+
+
 def _host_is_public(host: str) -> bool:
     """True if ``host`` is a network-reachable bind address (not loopback)."""
     return host not in _LOOPBACK_HOSTS
@@ -536,16 +561,10 @@ def _resolve_tls_material(
             "[yellow]--san ignored: reusing the existing certificate. Run "
             "`cert init --force --san ...` to re-mint it with those names.[/yellow]"
         )
-    console.print(f"[green]TLS enabled[/green] (self-signed, cert {tls_server_cert()})")
-    # A fingerprint must reach the operator byte-for-byte: soft_wrap so a narrow
-    # terminal cannot break it across lines, and emoji/markup off because Rich
-    # otherwise rewrites colon-delimited hex pairs (":cd:" -> a CD emoji).
-    console.print(
-        f"  fingerprint: {format_fingerprint(cert_fingerprint(cert_pem))}",
-        soft_wrap=True,
-        markup=False,
-        emoji=False,
-        highlight=False,
+    console.print("[green]TLS enabled[/green] (self-signed)")
+    _print_verbatim(
+        ("cert:", tls_server_cert()),
+        ("fingerprint:", format_fingerprint(cert_fingerprint(cert_pem))),
     )
     return cert_pem, key_pem
 
@@ -594,8 +613,7 @@ def cert_init(
 
     if existed and not force:
         console.print(
-            f"[green]TLS cert already present[/green] at {tls_server_cert()} "
-            "(use --force to regenerate)."
+            "[green]TLS cert already present[/green] (use --force to regenerate)."
         )
         if san:
             console.print(
@@ -605,17 +623,10 @@ def cert_init(
     else:
         verb = "Regenerated" if existed else "Generated"
         console.print(f"[green]{verb} self-signed TLS cert[/green]")
-    console.print(f"  cert:        {tls_server_cert()}")
-    console.print(f"  key:         {tls_server_key()}")
-    # A fingerprint must reach the operator byte-for-byte: soft_wrap so a narrow
-    # terminal cannot break it across lines, and emoji/markup off because Rich
-    # otherwise rewrites colon-delimited hex pairs (":cd:" -> a CD emoji).
-    console.print(
-        f"  fingerprint: {format_fingerprint(cert_fingerprint(cert_pem))}",
-        soft_wrap=True,
-        markup=False,
-        emoji=False,
-        highlight=False,
+    _print_verbatim(
+        ("cert:", tls_server_cert()),
+        ("key:", tls_server_key()),
+        ("fingerprint:", format_fingerprint(cert_fingerprint(cert_pem))),
     )
 
 
