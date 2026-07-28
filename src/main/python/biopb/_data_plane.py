@@ -27,6 +27,15 @@ but the *scheme* need not be, so :func:`probe_scheme` asks the listener instead
 of assuming. Every :class:`Endpoint` records which of the three answered, so a
 failed dial can say where the address came from rather than blaming the server.
 
+**The credential follows the address.** Where the endpoint came from decides
+whether the control's credential file is readable for it: that file is the token
+the control wrote for the plane *it* owns, so it travels only with the endpoint
+the control itself named. An override or ``$BIOPB_TENSOR_URL`` deliberately
+routed around the control — it may name another user's server, or a lab store
+across the network — and quietly attaching this machine's credential to that dial
+would send a local secret somewhere it was never issued for. Those endpoints
+carry an explicit token or none.
+
 Deliberately stdlib-only, like ``_endpoints`` / ``_credentials`` / ``_locations``
 beside it: it is imported by the core CLI and by biopb-mcp, and importing it must
 never drag in pyarrow. Classifying a *Flight* failure therefore does not live
@@ -230,6 +239,10 @@ def resolve(
     a custom port. *token* is an explicit ``--token`` and likewise wins over the
     environment and over the control's credential file.
 
+    The credential file is read only for an endpoint the control named (see the
+    module docstring): an address that bypassed the control is dialed with an
+    explicit token or with none.
+
     Set ``probe=False`` to skip the socket scheme probe on the default fallback
     (a caller that only wants to *name* the endpoint, not dial it).
 
@@ -239,7 +252,14 @@ def resolve(
     url, origin = _resolve_url(override, timeout=timeout, probe=probe)
     return Endpoint(
         url=url,
-        token=resolve_token(token),
+        # The credential file is the control's handoff for the plane IT owns, so
+        # it travels only with an endpoint the control named. An address given on
+        # the command line or in the environment routed around the control on
+        # purpose -- possibly to somebody else's server -- and attaching this
+        # machine's token to that dial would hand a local credential to a host the
+        # user never authorized it for. Those endpoints authenticate explicitly or
+        # not at all.
+        token=resolve_token(token, allow_credential_file=origin == "control"),
         tls_ca_pem=local_ca(url),
         origin=origin,
     )
@@ -261,7 +281,9 @@ def _resolve_url(
     return f"{scheme or 'grpc'}://127.0.0.1:{port}", "default"
 
 
-def resolve_token(explicit: Optional[str] = None) -> Optional[str]:
+def resolve_token(
+    explicit: Optional[str] = None, *, allow_credential_file: bool = True
+) -> Optional[str]:
     """The data-plane token: explicit -> ``BIOPB_TENSOR_TOKEN`` -> credential file.
 
     The credential file is what closes the gap for a *local plane behind a token*
@@ -270,14 +292,22 @@ def resolve_token(explicit: Optional[str] = None) -> Optional[str]:
     environment can still authenticate. The core CLI read only the env var until
     #615, which is why a token-gated local plane reported itself as unreachable.
 
-    ``None`` — unauthenticated, correct for a tokenless local plane — when none of
-    the three yields one. A blank value is ``None``, never ``""``: an empty string
-    would be sent as an empty ``Bearer`` header rather than omitted.
+    ``allow_credential_file=False`` drops that last step, for a caller dialing an
+    endpoint the control did not name: the file holds *this machine's* credential
+    for the control's own plane, and it has no business being sent to an address
+    the user pointed elsewhere. The two explicit sources still apply — someone
+    naming a server can also name its token.
+
+    ``None`` — unauthenticated, correct for a tokenless local plane — when nothing
+    yields one. A blank value is ``None``, never ``""``: an empty string would be
+    sent as an empty ``Bearer`` header rather than omitted.
     """
+    given = (explicit or "").strip() or os.environ.get(ENV_TOKEN, "").strip()
+    if given:
+        return given
+    if not allow_credential_file:
+        return None
+
     from ._credentials import read_credential
 
-    return (
-        (explicit or "").strip()
-        or os.environ.get(ENV_TOKEN, "").strip()
-        or read_credential()
-    )
+    return read_credential()

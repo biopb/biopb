@@ -522,6 +522,25 @@ class TestCacheStatsCommand:
         assert "requires an access token" in result.stderr
         assert "unreachable" not in result.stderr.lower()
 
+    def test_an_explicit_endpoint_is_told_why_the_credential_file_was_skipped(self):
+        """Otherwise the reader knows a credential exists and blames the file.
+
+        A named endpoint is deliberately not dialed with the control's credential
+        (that token belongs to the plane the control owns), so the message has to
+        say the file was *unused*, not missing or broken.
+        """
+        import pyarrow.flight as flight
+
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.side_effect = flight.FlightUnauthenticatedError("no token")
+            result = runner.invoke(
+                app, ["cache-stats", "--server", "grpc://data.mylab.example:8815"]
+            )
+        assert result.exit_code == 1
+        assert "requires an access token" in result.stderr
+        assert "credential" in result.stderr
+        assert "--token" in result.stderr
+
     def test_a_rejected_token_says_so(self):
         import pyarrow.flight as flight
 

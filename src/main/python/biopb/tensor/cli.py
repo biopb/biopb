@@ -53,8 +53,9 @@ _OPT_TOKEN = typer.Option(
     None,
     "--token",
     "-t",
-    help="Bearer token. Default: $BIOPB_TENSOR_TOKEN, else the credential file "
-    "the control plane writes.",
+    help="Bearer token. Default: $BIOPB_TENSOR_TOKEN, else -- for the endpoint the "
+    "control plane published -- the credential file it writes. An endpoint given "
+    "with --server or $BIOPB_TENSOR_URL is never dialed with that file.",
 )
 _OPT_CACHE_BYTES = typer.Option(
     100_000_000, "--cache-bytes", help="Maximum bytes for the client-side chunk cache"
@@ -94,6 +95,15 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
     ):
         if endpoint.token:
             return f"The data plane at {where} rejected the token."
+        if endpoint.origin in ("flag", "env"):
+            # Say why the credential file did not apply. Without this the reader
+            # sees a token-gated plane they know the control has a credential for,
+            # and reasonably concludes the file is broken rather than unused.
+            return (
+                f"The data plane at {where} requires an access token. An endpoint "
+                "named explicitly is not dialed with the control plane's credential "
+                f"file, so pass --token or set ${_data_plane.ENV_TOKEN}."
+            )
         return (
             f"The data plane at {where} requires an access token. Pass --token, set "
             f"${_data_plane.ENV_TOKEN}, or start it through `biopb control start` "

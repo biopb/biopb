@@ -326,9 +326,100 @@ class TestTokenResolution:
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "   ")
         assert _data_plane.resolve_token("") is None
 
-    def test_the_endpoint_carries_the_resolved_token(self):
+    def test_the_endpoint_carries_the_resolved_token(self, control):
         self._write_credential("file-token")
+        control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
         assert _data_plane.resolve(probe=False).token == "file-token"
+
+    def test_the_file_is_not_read_when_it_is_not_allowed(self):
+        self._write_credential("file-token")
+        assert _data_plane.resolve_token(allow_credential_file=False) is None
+
+    def test_an_explicit_token_still_applies_without_the_file(self, monkeypatch):
+        # Naming a server does not stop you naming its token.
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
+        assert _data_plane.resolve_token(allow_credential_file=False) == "env-token"
+        assert (
+            _data_plane.resolve_token("flag-token", allow_credential_file=False)
+            == "flag-token"
+        )
+
+
+class TestTheCredentialFollowsTheAddress:
+    """The control's credential file rides only the endpoint the control named.
+
+    That file is this machine's token for the plane the control owns. An address
+    the user supplied went around the control on purpose -- it may be another
+    user's server, or a store across the network -- so attaching the local
+    credential to it would send a secret somewhere it was never issued for.
+    """
+
+    def _write_credential(self, token="file-token"):
+        from biopb._credentials import write_credential
+
+        write_credential(token)
+
+    def test_a_control_named_endpoint_gets_the_file(self, control):
+        self._write_credential()
+        control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
+
+        endpoint = _data_plane.resolve(probe=False)
+
+        assert endpoint.origin == "control"
+        assert endpoint.token == "file-token"
+
+    def test_a_server_flag_does_not(self, control):
+        """Even with a control running and a credential on disk."""
+        self._write_credential()
+        control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
+
+        endpoint = _data_plane.resolve("grpc://data.mylab.example:8815", probe=False)
+
+        assert endpoint.origin == "flag"
+        assert endpoint.token is None
+
+    def test_the_env_url_does_not_either(self, monkeypatch, control):
+        self._write_credential()
+        control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://data.mylab.example:8815")
+
+        endpoint = _data_plane.resolve(probe=False)
+
+        assert endpoint.origin == "env"
+        assert endpoint.token is None
+
+    def test_a_loopback_flag_is_no_exception(self, control):
+        """Locality is not the test -- the control's say-so is.
+
+        A local address is still an address the user chose; the file belongs to
+        the plane the control owns, which this may or may not be.
+        """
+        self._write_credential()
+        control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
+
+        assert _data_plane.resolve("grpc://127.0.0.1:9915", probe=False).token is None
+
+    def test_the_guessed_default_does_not_get_it(self):
+        """No control answered, so nothing vouches for what is on that port."""
+        self._write_credential()
+
+        endpoint = _data_plane.resolve(probe=False)
+
+        assert endpoint.origin == "default"
+        assert endpoint.token is None
+
+    def test_an_explicit_token_reaches_a_flagged_endpoint(self):
+        # The user names the server *and* its token -- the supported way to dial
+        # something the control does not own.
+        endpoint = _data_plane.resolve(
+            "grpc://data.mylab.example:8815", "their-token", probe=False
+        )
+        assert endpoint.token == "their-token"
+
+    def test_the_env_token_reaches_it_too(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
+        endpoint = _data_plane.resolve("grpc://data.mylab.example:8815", probe=False)
+        assert endpoint.token == "env-token"
 
 
 class TestLocalTrustAnchor:
