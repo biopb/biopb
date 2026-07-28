@@ -10,6 +10,7 @@ on any platform; time.sleep is neutralized.
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
@@ -122,6 +123,84 @@ class TestCacheStats:
         )
         assert res.exit_code == 0, res.output
         assert captured["token"] == "secret"
+
+
+class TestCacheStatsEndpointResolution:
+    """`_resolve_grpc_endpoint` exercised for real — no stub in front of it.
+
+    Every other test in :class:`TestCacheStats` monkeypatches this function, so
+    the suite stayed green (91/91) while `biopb server cache-stats` died on an
+    unhandled ``TypeError`` for the whole of #618: that PR changed
+    ``_probe_hostport`` from ``(remote: bool)`` to ``(grpc_bind, base_port)`` and
+    missed this caller, the only one outside the start path. Mocking the one
+    caller of the one broken function hid it completely.
+
+    So these tests call the resolver itself, and drive `cache-stats` end to end
+    with only the true external boundary (the Flight client) replaced — the dial
+    string has to be *computed* to be asserted on. See biopb/biopb#615.
+    """
+
+    def test_resolves_the_default_loopback_flight_endpoint(self, monkeypatch):
+        # Regression guard for the #618 signature break: this call is what raised
+        # TypeError, and it raises before any dial, so no server is involved.
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+        assert cli._resolve_grpc_endpoint(Path("ignored.json")) == (
+            "grpc://127.0.0.1:8815",
+            None,
+        )
+
+    def test_port_follows_the_base_port_convention(self, monkeypatch):
+        # 8815 is not a literal here: it is base+5. Pinning the derivation (not
+        # just the number) keeps this honest if the offsets ever move.
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+        location, _ = cli._resolve_grpc_endpoint(Path("ignored.json"))
+        expected = cli._endpoints.flight_port_for(cli._endpoints.BASE_DEFAULT_PORT)
+        assert location.endswith(f":{expected}") and expected == 8815
+
+    def test_token_is_read_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
+        assert cli._resolve_grpc_endpoint(Path("ignored.json"))[1] == "env-token"
+
+    def test_blank_env_token_resolves_to_none(self, monkeypatch):
+        # "" must not be handed to the client as a token (it would be sent as an
+        # empty Bearer header rather than omitted).
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "")
+        assert cli._resolve_grpc_endpoint(Path("ignored.json"))[1] is None
+
+    def test_cache_stats_dials_the_endpoint_it_resolved(self, monkeypatch):
+        """End to end with only the Flight client stubbed.
+
+        `_query_server` swallows every exception into "unreachable", so a broken
+        resolver reaches the user as a wrong sentence rather than a traceback.
+        Asserting the constructor *was* reached, and with which location, is what
+        makes that swallow unable to hide a regression here.
+        """
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+        captured = {}
+
+        class FakeFlightClient:
+            def __init__(self, location, cache_bytes=0, token=None):
+                captured["location"] = location
+                captured["token"] = token
+
+            def cache_stats(self):
+                return {"hits": 3, "misses": 1, "total_entries": 4}
+
+            def close(self):
+                captured["closed"] = True
+
+        import biopb.tensor.client as tensor_client
+
+        monkeypatch.setattr(tensor_client, "TensorFlightClient", FakeFlightClient)
+
+        res = CliRunner().invoke(cli.app, ["server", "cache-stats"])
+
+        assert res.exit_code == 0, res.output
+        # Empty on a resolver that raised before dialling — the #618 failure.
+        assert captured.get("location") == "grpc://127.0.0.1:8815"
+        assert captured["token"] is None
+        assert captured.get("closed") is True
+        assert "75.0%" in res.output  # 3/(3+1), so the stats really rendered
 
 
 class TestQueryServerHelper:
