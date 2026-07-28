@@ -5,7 +5,7 @@ shared checker (clamp at load, reject at the strict surfaces), the installers
 write `biopb.json`, and the JSON Schema emitter is in. The
 coexistence window (dual-format read + warn-level validation) ran from the
 initial migration to the read-path removal; what remains of TOML is the one-way
-door out of it: `biopb server migrate-config` and the installers' automatic
+door out of it: `biopb-tensor-server migrate-config` and the installers' automatic
 conversion. Touches `biopb-tensor-server` (config) and the `biopb` umbrella CLI.
 
 ## Why
@@ -31,7 +31,7 @@ untouched, and one read-side change covers every code path that loads a config.
 ```
 load_config(path)
   └── _read_config_file(path)        ← the ONLY format-aware step
-        ├── .toml  → refuse: "run `biopb server migrate-config`"
+        ├── .toml  → refuse: "run `biopb-tensor-server migrate-config`"
         └── other  → json.load  (an odd extension is still read as JSON)
   └── parse_config(dict)             ← unchanged, format-agnostic
 
@@ -45,7 +45,7 @@ read_legacy_toml(path)               ← the last TOML reader, off the load path
 rejected *without parsing*, and a JSON syntax error (which is what TOML bytes
 under a `.json` name produce) carries the same hint — a parse error is the only
 place a user learns the format changed, so both name
-`biopb server migrate-config`.
+`biopb-tensor-server migrate-config`.
 
 **Default-path resolution — one shared impl.** `find_config(dir)` returns the
 first of `biopb.json` → `biopb.toml` that exists, else the canonical
@@ -173,7 +173,7 @@ See `tensor-server-admin-endpoint.md`.
 
 ## Equivalent configs
 
-What `biopb server migrate-config` produces — the shape mapping, if you ever
+What `biopb-tensor-server migrate-config` produces — the shape mapping, if you ever
 need to read an old file by eye.
 
 ```toml

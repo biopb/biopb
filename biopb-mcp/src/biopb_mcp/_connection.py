@@ -24,8 +24,8 @@ import os
 import threading
 import time
 from typing import Dict, Tuple
-from urllib.parse import urlparse
 
+from biopb import _data_plane
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
@@ -36,11 +36,6 @@ logger = logging.getLogger(__name__)
 
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
-
-
-# Hosts considered "local" — asking the control to bring up the data plane only
-# makes sense for a server on this machine (a remote one is not ours to start).
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class ServerStarting(Exception):
@@ -79,77 +74,16 @@ def _starting_message(health) -> str:
     return msg
 
 
-def is_local_url(url: str) -> bool:
-    """Return True if *url* points at the local machine."""
-    try:
-        host = urlparse(url).hostname
-    except Exception:
-        return False
-    return host is None or host in _LOCAL_HOSTS
-
-
-class LocalTrustError(RuntimeError):
-    """The local data plane's TLS certificate could not be used as a trust anchor.
-
-    A distinct type because :func:`connect_error_message` classifies failures by
-    *substring*, and the most likely cause here -- an unreadable cert file --
-    stringifies as ``[Errno 13] Permission denied: '<path>'``. That matches the
-    "permission denied" auth marker, so a file-permission problem would be
-    reported as "the server needs a token" and send the reader hunting for a
-    credential that has nothing to do with it. Matching on the type instead is
-    exact, and it cannot be broken by the wording of an errno string.
-    """
-
-
-def _local_ca(url: str) -> bytes | None:
-    """Explicit TLS trust anchor for a *local* data plane, read off local disk.
-
-    A loopback ``grpcs://`` plane is this machine's own, and the certificate it
-    serves is already on this machine's disk — so trust it directly instead of
-    pinning whatever the handshake presents (TOFU). An anchor read from local
-    disk is strictly stronger than one learned from the wire, and it keeps this
-    client out of the shared pin store, which would otherwise strand it the
-    moment an operator rotated the cert with ``cert init --force``. Same
-    reasoning, and the same cert, as the tensor server's own HTTP sidecar
-    (biopb/biopb#604).
-
-    Returns ``None`` — leaving TOFU in charge — for a plaintext endpoint or a
-    remote one, whose cert is not on this disk and cannot be.
-
-    Raises :class:`LocalTrustError` when a local plane is TLS but its cert is
-    unreadable.
-    That is deliberate: silently falling back to TOFU there would pin a cert we
-    were supposed to already know, trading a verified anchor for an unverified
-    one exactly where the strong option was meant to apply.
-
-    Known edge: a loopback ``grpcs://`` URL that is really a *tunnel* (``ssh -L``)
-    to a remote plane is indistinguishable from a local one by host alone, so it
-    is anchored on the local cert and the handshake fails. Loud and fixable
-    (point the tunnel at a non-loopback alias, or dial the plane directly), not
-    silent — but it is a real constraint on that setup.
-    """
-    if not url.lower().startswith("grpcs://") or not is_local_url(url):
-        return None
-
-    from biopb._locations import tls_server_cert
-
-    cert_path = tls_server_cert()
-    try:
-        pem = cert_path.read_bytes()
-    except OSError as exc:
-        raise LocalTrustError(
-            f"The local data plane at {url} serves TLS, but its certificate could "
-            f"not be read from {cert_path} ({exc}). A local plane is trusted from "
-            "its cert on disk, not by pinning it from the wire — so this is not "
-            "retried as trust-on-first-use. Check the state dir is the one the "
-            "server writes to (XDG_STATE_HOME), or re-mint the cert with "
-            "`biopb-tensor-server cert init`."
-        ) from exc
-    if not pem.strip():
-        raise LocalTrustError(
-            f"The local data plane's TLS certificate at {cert_path} is empty."
-        )
-    return pem
+# The local-plane trust anchor and the "is this our machine?" predicate both live
+# in the core SDK now (``biopb._data_plane``), shared with the `biopb tensor`
+# commands. They were duplicated here while the CLI had its own resolver, which is
+# how the two ended up disagreeing about where a plane lives and what secures it
+# (biopb/biopb#615). Re-exported under the original names -- callers (and the
+# ``connect_error_message`` type check below) are unchanged.
+is_local_url = _data_plane.is_local_url
+local_ca = _data_plane.local_ca
+_local_ca = _data_plane.local_ca
+LocalTrustError = _data_plane.LocalTrustError
 
 
 # Substrings (lowercased) that mark a connect failure as an authentication
@@ -278,13 +212,10 @@ class TensorConnection:
         instead. ``None`` (a tokenless local plane, or no control has written a
         credential) leaves us unauthenticated, which is correct for that case.
         """
-        from biopb._credentials import read_credential
-
-        url = os.environ.get("BIOPB_TENSOR_URL") or get_setting(
+        url = os.environ.get(_data_plane.ENV_URL) or get_setting(
             config, "tensor_browser.server_url"
         )
-        token = os.environ.get("BIOPB_TENSOR_TOKEN") or read_credential()
-        return url, token
+        return url, _data_plane.resolve_token()
 
     @property
     def is_connected(self) -> bool:

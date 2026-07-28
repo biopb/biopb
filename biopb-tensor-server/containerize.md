@@ -381,7 +381,7 @@ docker logs biopb-tensor
 ```
 
 Common causes:
-- A mounted `CONFIG_FILE` that is malformed (JSON parse or value-validation error — a legacy TOML is rejected outright; convert it with `biopb server migrate-config`) — check `docker logs` for the traceback
+- A mounted `CONFIG_FILE` that is malformed (JSON parse or value-validation error — a legacy TOML is rejected outright; convert it with `biopb-tensor-server migrate-config`) — check `docker logs` for the traceback
 - A port already in use inside the container (e.g. `--network host` colliding with a host process on 8815)
 - A BYO `BIOPB_TLS_CERT` without a loopback SAN, together with `BIOPB_ENABLE_HTTP_SIDECAR=1` — the sidecar cannot complete its loopback handshake, so every data request fails with a Flight connection error. Re-mint the cert including `localhost` / `127.0.0.1`, or run Flight-only
 

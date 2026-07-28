@@ -8,7 +8,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import typer
 from rich.console import Console
@@ -75,19 +75,21 @@ def _add_optional_typer(name: str, import_path: str, help: str) -> None:
 
 
 # TensorFlight client diagnostics
-_add_optional_typer("tensor", "biopb.tensor.cli", "TensorFlight client diagnostics")
+_add_optional_typer(
+    "tensor",
+    "biopb.tensor.cli",
+    "Query a TensorFlight data plane (sources, tensors, stats, cache).",
+)
 
 # ProcessImage client operations
-_add_optional_typer("image", "biopb.image.cli", "ProcessImage client operations")
+_add_optional_typer("image", "biopb.image.cli", "Call ProcessImage algorithm servers.")
 
-# Tensor server daemon management
-server_app = typer.Typer(
-    name="server",
-    help="Biopb tensor-server diagnostics (cache-stats, migrate-config). The "
-    "control plane (`biopb control`) owns the data-plane process lifecycle; the "
-    "former standalone-daemon commands (start/stop/restart/status/logs) are gone.",
-)
-app.add_typer(server_app, name="server")
+# The `biopb server` group is gone (biopb/biopb#615). Its lifecycle commands went
+# first, when the control plane took over the data-plane process; the two that
+# outlived them were not a group: `cache-stats` is a Flight query, so it moved to
+# `biopb tensor cache-stats` beside the other queries, and `migrate-config` needs
+# biopb-tensor-server to do anything at all, so it moved to
+# `biopb-tensor-server migrate-config` and left the SDK.
 
 # Daemon management constants. On-disk locations come from the shared
 # `_locations` module (XDG-aware): the installed webapp bundle is a portable
@@ -157,7 +159,7 @@ def _package_version(dist_name: str) -> str:
         return "unknown"
 
 
-@app.command()
+@app.command(help="Show the product deployment and biopb SDK versions.")
 def version():
     """Show the two version lines: the product deployment and the biopb SDK."""
     rows = [
@@ -356,8 +358,8 @@ def _reject_legacy_toml(config: Path) -> None:
         console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
         console.print(
             "JSON is the only supported format. Convert it with "
-            "[bold]biopb server migrate-config[/bold] (settings are preserved "
-            "and the old file is backed up), then retry."
+            "[bold]biopb-tensor-server migrate-config[/bold] (settings are "
+            "preserved and the old file is backed up), then retry."
         )
         raise typer.Exit(1)
 
@@ -382,62 +384,6 @@ def _probe_hostport(grpc_bind: str, base_port: int) -> Tuple[str, int]:
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
     return host, port
-
-
-def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
-    """Best-effort gRPC endpoint + token for a running server's health query.
-
-    Always loopback: a plane bound to 0.0.0.0/:: is reachable there too, and
-    these probes only ever ask about a plane on this machine. That is why the
-    bind passed to :func:`_probe_hostport` is the loopback literal rather than a
-    resolved ``--grpc-bind`` -- the probe normalizes every public bind to
-    loopback anyway, so the address cannot change the answer and only the base
-    port can. The token comes from BIOPB_TENSOR_TOKEN if set -- localhost-only
-    daemons run without one.
-
-    Assumes the *default* base port, so it finds a plane only where a default
-    deployment puts one. That is the standing limitation tracked in
-    biopb/biopb#615, which replaces this reconstruction with asking the control
-    (whose ``/health`` snapshot carries the endpoint *and* the scheme) and
-    falling back to the state dir; the scheme and the token are hardcoded here
-    for the same reason. Left as-is here deliberately: this restores the
-    behavior #618 broke without pre-empting that design.
-    """
-    host, port = _probe_hostport("127.0.0.1", _endpoints.BASE_DEFAULT_PORT)
-    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
-    return f"grpc://{host}:{port}", token
-
-
-def _query_server(
-    location: str, token: Optional[str], call: Callable[[Any], dict]
-) -> Optional[dict]:
-    """Open a short-lived TensorFlightClient to *location*, return ``call(client)``.
-
-    Returns None if the client import fails or the server is unreachable; the
-    client is always closed. The shared body behind the status/cache-stats probes.
-    """
-    try:
-        from biopb.tensor.client import TensorFlightClient
-    except Exception:
-        return None
-    client = None
-    try:
-        client = TensorFlightClient(location, cache_bytes=0, token=token)
-        return call(client)
-    except Exception:
-        return None
-    finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-
-
-def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
-    """Return the server's cache-stats dict, or None if unreachable / no cache."""
-    return _query_server(location, token, lambda c: c.cache_stats())
 
 
 @dataclass
@@ -527,202 +473,6 @@ def _emit_daemon_status(
     console.print(table)
 
 
-def _fmt_mb(n_bytes: int) -> str:
-    """Format a byte count as MB."""
-    return f"{n_bytes / (1024 * 1024):.1f} MB"
-
-
-def _hit_rate(hits: int, misses: int) -> str:
-    """Hit rate as a percentage string (guards divide-by-zero)."""
-    total = hits + misses
-    return f"{(hits / total * 100):.1f}%" if total else "n/a"
-
-
-def _render_cache_stats(stats: dict) -> None:
-    """Render a CacheStats dict (from TensorFlightClient.cache_stats) as tables."""
-    g = stats.get
-    table = Table(title="Cache Statistics")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green", justify="right")
-
-    hits, misses = g("hits", 0), g("misses", 0)
-    table.add_row("Hits", str(hits))
-    table.add_row("Misses", str(misses))
-    table.add_row("Hit rate", _hit_rate(hits, misses))
-    table.add_row("Evictions", str(g("evictions", 0)))
-    table.add_row("Pending waits", str(g("pending_waits", 0)))
-    table.add_row("Oversized skips", str(g("oversized_skips", 0)))
-    table.add_row("Ref-held evictions skipped", str(g("ref_held_evictions_skipped", 0)))
-    table.add_row("Entries", str(g("total_entries", 0)))
-    table.add_row("Size", _fmt_mb(g("total_bytes", 0)))
-    if g("max_entries", 0):
-        table.add_row("Max entries", str(g("max_entries")))
-    if g("max_bytes", 0):
-        table.add_row("Max size", _fmt_mb(g("max_bytes")))
-    console.print(table)
-
-    pool_stats = stats.get("pool_stats") or {}
-    if pool_stats:
-        ptable = Table(title="Per-pool Statistics")
-        for col in ("Pool", "Hits", "Misses", "Hit rate", "Segments", "Size"):
-            ptable.add_column(
-                col,
-                style="cyan" if col == "Pool" else "green",
-                justify="left" if col == "Pool" else "right",
-            )
-        for name, p in sorted(pool_stats.items()):
-            ptable.add_row(
-                name,
-                str(p.get("hits", 0)),
-                str(p.get("misses", 0)),
-                _hit_rate(p.get("hits", 0), p.get("misses", 0)),
-                str(p.get("segments", 0)),
-                _fmt_mb(p.get("bytes", 0)),
-            )
-        console.print(ptable)
-
-
-@server_app.command("cache-stats")
-def cache_stats(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (biopb.json)"
-    ),
-    token: Optional[str] = typer.Option(
-        None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"
-    ),
-    json_output: bool = typer.Option(
-        False, "--json", help="Emit machine-readable JSON instead of a table"
-    ),
-):
-    """Show cache hit/miss diagnostics from the running server.
-
-    Liveness is the Flight query itself: an unreachable server yields no stats
-    (handled below), so there is no separate PID-file gate -- the control plane
-    now owns the data-plane process and writes no ``tensor-server.pid``.
-    """
-    location, env_token = _resolve_grpc_endpoint(config)
-    stats = _query_cache_stats(location, token or env_token)
-
-    if stats is None:
-        console.print(
-            "[red]Could not retrieve cache stats[/red] "
-            "(server unreachable or cache not initialized)."
-        )
-        raise typer.Exit(1)
-
-    if json_output:
-        print(json.dumps(stats))
-        raise typer.Exit(0)
-
-    _render_cache_stats(stats)
-
-
-@server_app.command("migrate-config")
-def migrate_config(
-    config: Path = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Config file (or dir) to migrate; defaults to ~/.config/biopb",
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", "-n", help="Report what would happen; write nothing"
-    ),
-):
-    """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
-
-    JSON is the only format the server reads (biopb/biopb#34), so this command
-    is the upgrade path for a pre-#34 install. It converts a legacy TOML config
-    in place -- reading the raw table (so advanced/unknown keys survive) and
-    writing the sibling ``biopb.json`` (plus its schema sidecar), then backing
-    the old TOML up to ``biopb.toml.bak``. Settings are preserved verbatim, so a
-    running server need not be restarted.
-    """
-    from ._locations import (
-        CANONICAL_CONFIG_NAME,
-        DEFAULT_CONFIG_DIR,
-        LEGACY_CONFIG_NAME,
-    )
-
-    # Resolve the config directory. --config may point at a file (use its parent)
-    # or a directory; with nothing given, use the standard location.
-    if config is None:
-        config_dir = DEFAULT_CONFIG_DIR
-    elif config.is_dir():
-        config_dir = config
-    else:
-        config_dir = config.parent
-
-    toml_path = config_dir / LEGACY_CONFIG_NAME
-    json_path = config_dir / CANONICAL_CONFIG_NAME
-
-    if not toml_path.exists():
-        if json_path.exists():
-            console.print(
-                f"[green]Already canonical:[/green] {json_path} is JSON; "
-                "nothing to migrate."
-            )
-        else:
-            console.print(
-                f"[yellow]No legacy config found[/yellow] at {toml_path} "
-                "(and no JSON either); nothing to migrate."
-            )
-        raise typer.Exit(0)
-
-    # A legacy TOML exists. If a JSON also exists it already shadows the TOML
-    # (find_config prefers JSON), so we must NOT overwrite it from the TOML --
-    # just retire the stale TOML to clear the both-files shadow warning.
-    if json_path.exists():
-        backup = toml_path.with_name(toml_path.name + ".bak")
-        console.print(
-            f"[yellow]Both configs present:[/yellow] {json_path} is already "
-            f"canonical and in use; the legacy {toml_path.name} is ignored."
-        )
-        if dry_run:
-            console.print(f"  [dim](dry run)[/dim] would back it up to {backup.name}")
-            raise typer.Exit(0)
-        toml_path.replace(backup)
-        console.print(f"  Retired the legacy TOML -> {backup.name}")
-        raise typer.Exit(0)
-
-    # The migration case: TOML only. Read the raw table and write canonical JSON.
-    # `read_legacy_toml` is the last TOML reader in the tree -- the server's own
-    # load path no longer parses TOML at all (biopb/biopb#34).
-    try:
-        from biopb_tensor_server.core.config import read_legacy_toml, save_config
-    except Exception as exc:  # noqa: BLE001 - optional dependency
-        console.print(
-            "[red]Config migration is unavailable:[/red] "
-            f"{exc}\n"
-            "[yellow]Re-run the BioPB installer to fix.[/yellow]"
-        )
-        raise typer.Exit(1)
-
-    try:
-        data = read_legacy_toml(toml_path)
-    except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
-        console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
-        raise typer.Exit(1)
-
-    if dry_run:
-        backup = toml_path.with_name(toml_path.name + ".bak")
-        console.print(f"[cyan](dry run)[/cyan] would migrate {toml_path}")
-        console.print(f"  write  {json_path} (+ schema sidecar)")
-        console.print(f"  backup {toml_path.name} -> {backup.name}")
-        raise typer.Exit(0)
-
-    try:
-        written = save_config(data, toml_path)
-    except Exception as exc:  # noqa: BLE001 - write must surface, not crash
-        console.print(f"[red]Failed to write {json_path}:[/red] {exc}")
-        raise typer.Exit(1)
-
-    console.print(
-        f"[green]Migrated[/green] {toml_path} -> {written} "
-        f"(old file backed up to {toml_path.name}.bak)."
-    )
-
-
 # ---------------------------------------------------------------------------
 # biopb-mcp (`biopb mcp view`)
 #
@@ -736,9 +486,13 @@ def migrate_config(
 # surfaces a clear install hint (rather than a raw ImportError) when it is absent.
 # ---------------------------------------------------------------------------
 
+# Every command below passes an explicit one-line `help=`. Typer prefers it over
+# the docstring, which keeps `--help` to a single sentence per command while the
+# docstring stays where the rationale belongs -- read by maintainers, not printed
+# at a user who asked what a command does.
 mcp_app = typer.Typer(
     name="mcp",
-    help="biopb-mcp MCP server: `view` opens the foreground napari viewer.",
+    help="Run a foreground napari viewer session (biopb-mcp).",
 )
 
 
@@ -788,7 +542,9 @@ def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
         time.sleep(0.25)
 
 
-@mcp_app.command("view")
+@mcp_app.command(
+    "view", help="Open the napari viewer in this terminal (Ctrl-C to stop)."
+)
 def mcp_view(
     port: Optional[int] = typer.Option(
         None,
@@ -853,7 +609,7 @@ app.add_typer(mcp_app, name="mcp")
 # shells out `biopb server start` -- it asks the control plane to ensure the data plane.
 control_app = typer.Typer(
     name="control",
-    help="Biopb control plane: supervise the data plane (start/stop/status/run)",
+    help="Manage the control plane, which supervises the data plane.",
 )
 
 
@@ -1316,7 +1072,9 @@ _OPT_DATA_PLANE = typer.Option(
 )
 
 
-@control_app.command("start")
+@control_app.command(
+    "start", help="Start the control plane (and its data plane) as a daemon."
+)
 def control_start(
     config: Path = _OPT_CONFIG,
     static_dir: Optional[Path] = _OPT_STATIC_DIR,
@@ -1488,7 +1246,7 @@ def _live_foreground_control() -> Optional[Tuple[dict, int]]:
     return record, pid
 
 
-@control_app.command("stop")
+@control_app.command("stop", help="Stop the control plane and the data plane it owns.")
 def control_stop(
     timeout: int = typer.Option(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
@@ -1549,7 +1307,9 @@ def control_stop(
     raise typer.Exit(0)
 
 
-@control_app.command("status")
+@control_app.command(
+    "status", help="Show the control plane's status and the data plane it supervises."
+)
 def control_status(
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -1607,7 +1367,9 @@ def control_status(
     )
 
 
-@control_app.command("logs")
+@control_app.command(
+    "logs", help="Show the control plane's log, or the data plane's with --data-plane."
+)
 def control_logs(
     data_plane: bool = typer.Option(
         False,
@@ -1647,7 +1409,9 @@ def control_logs(
     _tail_and_follow(log_file, follow, lines, _validate_level(level), level_of)
 
 
-@control_app.command("run")
+@control_app.command(
+    "run", help="Run the control plane in the foreground (Ctrl-C to stop)."
+)
 def control_run(
     config: Path = _OPT_CONFIG,
     static_dir: Optional[Path] = _OPT_STATIC_DIR,
@@ -1728,7 +1492,9 @@ def control_run(
 app.add_typer(control_app, name="control")
 
 
-@app.command("dashboard")
+@app.command(
+    "dashboard", help="Open the biopb dashboard, starting the control plane if needed."
+)
 def dashboard(
     base_port: int = _OPT_BASE_PORT,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
@@ -1810,8 +1576,7 @@ def dashboard(
 # truth both this CLI and the control-plane dashboard call.
 agents_app = typer.Typer(
     name="agents",
-    help="Register biopb-mcp with local AI agent clients "
-    "(Claude Code, Claude Desktop, Cursor, opencode).",
+    help="Register biopb-mcp with local AI agent clients.",
 )
 
 # State -> rich style for the status column.
@@ -1872,7 +1637,9 @@ def _resolve_agent_targets(
     return targets
 
 
-@agents_app.command("list")
+@agents_app.command(
+    "list", help="Show each supported client and whether biopb is registered."
+)
 def agents_list(
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -1897,7 +1664,9 @@ def agents_list(
     console.print(table)
 
 
-@agents_app.command("register")
+@agents_app.command(
+    "register", help="Register biopb-mcp with a client (or all, with --all)."
+)
 def agents_register(
     client: Optional[str] = typer.Argument(
         None, help="Client id (e.g. claude-code); omit when using --all"
@@ -1925,7 +1694,9 @@ def agents_register(
     raise typer.Exit(1 if failures else 0)
 
 
-@agents_app.command("unregister")
+@agents_app.command(
+    "unregister", help="Remove biopb-mcp from a client (or all, with --all)."
+)
 def agents_unregister(
     client: Optional[str] = typer.Argument(
         None, help="Client id (e.g. claude-code); omit when using --all"
@@ -2161,7 +1932,11 @@ def _defender_status(targets: List[str]) -> None:
         )
 
 
-@app.command("quick-start", hidden=not _is_windows())
+@app.command(
+    "quick-start",
+    hidden=not _is_windows(),
+    help="Speed up biopb startup on Windows with a Defender exclusion.",
+)
 def quick_start(
     enabled: Optional[bool] = typer.Option(
         None,

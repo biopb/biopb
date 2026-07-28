@@ -1452,15 +1452,15 @@ function Invoke-BiopbInstall {
     $activeConfig = $existingConfig
     if ($effectiveKeep) {
         # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb server
+        # convert it in place to the canonical JSON via `biopb-tensor-server
         # migrate-config` (settings preserved verbatim, old file backed up to
         # biopb.toml.bak) so an upgraded install stops warning about the
         # deprecated format. A JSON config is already canonical -- nothing to do.
-        if ($existingConfig -eq $legacyConfig -and (Get-Command biopb -ErrorAction SilentlyContinue)) {
+        if ($existingConfig -eq $legacyConfig -and (Get-Command biopb-tensor-server -ErrorAction SilentlyContinue)) {
             Report-Info "Migrating legacy TOML config to canonical JSON..."
             $prevEAP2 = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
-            try { & biopb server migrate-config *> $null } catch { }
+            try { & biopb-tensor-server migrate-config *> $null } catch { }
             $ErrorActionPreference = $prevEAP2
             if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $configFile)) {
                 $activeConfig = $configFile

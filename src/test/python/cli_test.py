@@ -4,7 +4,9 @@ Uses typer.testing.CliRunner with mocked TensorFlightClient to avoid
 requiring a live server.
 """
 
+import json
 import os
+import socket
 import tempfile
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +17,27 @@ from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from typer.testing import CliRunner
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_deployment(monkeypatch, tmp_path):
+    """Resolve endpoints against nothing, not against the developer's own box.
+
+    Since biopb/biopb#615 an omitted ``--server`` is *resolved* (env -> the
+    control plane -> the default) rather than defaulted to a constant. Without
+    this fixture a machine with a control plane running would feed these tests a
+    live endpoint, and the state dir would hand them a real credential file.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("BIOPB_TENSOR_URL", "BIOPB_TENSOR_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    with socket.socket() as sock:  # a port nothing is listening on
+        sock.bind(("127.0.0.1", 0))
+        free_port = sock.getsockname()[1]
+    monkeypatch.setenv("BIOPB_CONTROL_HOST", "127.0.0.1")
+    monkeypatch.setenv("BIOPB_CONTROL_PORT", str(free_port))
 
 
 def _build_mock_client() -> MagicMock:
@@ -107,6 +130,7 @@ class TestQueryCommand:
                 location="grpc://custom:9000",
                 cache_bytes=100_000_000,
                 token=None,
+                tls_ca_pem=None,
             )
 
     def test_query_shows_cache_info(self):
@@ -141,7 +165,10 @@ class TestQueryCommand:
             result = runner.invoke(app, ["query"])
 
             assert result.exit_code == 1
-            assert "Cannot connect" in result.stderr
+            # Classified by type and named with the endpoint's origin, so the
+            # sentence says which address failed and where it came from.
+            assert "grpc://127.0.0.1:8815" in result.stderr
+            assert "no control plane answered" in result.stderr
 
 
 class TestMetadataCommand:
@@ -375,3 +402,162 @@ class TestCliIntegration:
         """Test that the app has a name and help text."""
         assert app.info.name == "tensor"
         assert app.info.help is not None
+
+
+class TestCacheStatsCommand:
+    """`biopb tensor cache-stats` — the server's cache, asked over Flight.
+
+    It lived under `biopb server` until biopb/biopb#615, with an endpoint resolver
+    of its own; it now dials through the same one as every other command here.
+    """
+
+    _STATS = {
+        "hits": 80,
+        "misses": 20,
+        "evictions": 3,
+        "pending_waits": 0,
+        "oversized_skips": 0,
+        "ref_held_evictions_skipped": 0,
+        "total_entries": 12,
+        "total_bytes": 5 * 1024 * 1024,
+        "max_bytes": 512 * 1024 * 1024,
+        "pool_stats": {
+            "unified-tiny": {"hits": 50, "misses": 10, "segments": 2, "bytes": 1048576},
+        },
+    }
+
+    def _run(self, *args, stats=None):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = MagicMock()
+            client.cache_stats.return_value = self._STATS if stats is None else stats
+            mock_fc_class.return_value = client
+            result = runner.invoke(app, ["cache-stats", *args])
+        return result, mock_fc_class, client
+
+    def test_table_renders_hit_rate_and_pools(self):
+        result, _, client = self._run()
+        assert result.exit_code == 0, result.output
+        assert "Cache Statistics" in result.stdout
+        assert "80.0%" in result.stdout  # 80/(80+20)
+        assert "Per-pool Statistics" in result.stdout
+        assert "unified-tiny" in result.stdout
+        client.close.assert_called_once()
+
+    def test_json_emits_the_raw_dict(self):
+        result, _, _ = self._run("--json")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["hits"] == 80
+        assert payload["pool_stats"]["unified-tiny"]["segments"] == 2
+
+    def test_an_empty_answer_is_not_rendered_as_zeros(self):
+        # The server answered with no stats: a cache that was never initialized,
+        # which is a different thing from every failure and now says so.
+        result, _, _ = self._run(stats={})
+        assert result.exit_code == 1
+        assert "no cache statistics" in result.stderr
+
+    def test_it_asks_for_no_client_side_cache(self):
+        # A throwaway client asking about the *server's* cache must not allocate
+        # one of its own.
+        _, mock_fc_class, _ = self._run()
+        assert mock_fc_class.call_args.kwargs["cache_bytes"] == 0
+
+    def test_hit_rate_guards_an_empty_cache(self):
+        from biopb.tensor import cli as tensor_cli
+
+        assert tensor_cli._hit_rate(0, 0) == "n/a"
+        assert tensor_cli._hit_rate(3, 1) == "75.0%"
+
+    def test_explicit_token_reaches_the_client(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.return_value.cache_stats.return_value = self._STATS
+            result = runner.invoke(app, ["cache-stats", "--token", "secret"])
+        assert result.exit_code == 0, result.output
+        assert mock_fc_class.call_args.kwargs["token"] == "secret"
+
+    def test_it_dials_the_endpoint_it_resolved(self):
+        """End to end with only the Flight client — the true boundary — replaced.
+
+        Nothing stubs the resolver: #615's crash (and the misreports before it)
+        all lived in the function every other cache-stats test used to replace,
+        so this asserts on the location the client was actually constructed with.
+        """
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.return_value.cache_stats.return_value = self._STATS
+            result = runner.invoke(app, ["cache-stats"])
+        assert result.exit_code == 0, result.output
+        kwargs = mock_fc_class.call_args.kwargs
+        # No control answered (see the autouse fixture), so this is the default
+        # endpoint -- base+5, derived, not the literal 8815 spelled in a command.
+        from biopb import _data_plane
+
+        assert kwargs["location"] == _data_plane.default_url()
+        assert kwargs["token"] is None
+
+    def test_the_control_plane_decides_the_endpoint(self, monkeypatch):
+        """A published endpoint wins over the default — #615's central claim."""
+        monkeypatch.setattr(
+            "biopb._data_plane.control_grpc_url",
+            lambda timeout=1.0: "grpc://127.0.0.1:9915",
+        )
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.return_value.cache_stats.return_value = self._STATS
+            result = runner.invoke(app, ["cache-stats"])
+        assert result.exit_code == 0, result.output
+        assert mock_fc_class.call_args.kwargs["location"] == "grpc://127.0.0.1:9915"
+
+    def test_an_auth_failure_is_not_reported_as_unreachable(self):
+        """#615 fault 3: every failure rendered as "server unreachable".
+
+        The server *answered* — it refused the dial — so the message has to name
+        the token, not send the reader looking for a dead process.
+        """
+        import pyarrow.flight as flight
+
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.side_effect = flight.FlightUnauthenticatedError("no token")
+            result = runner.invoke(app, ["cache-stats"])
+        assert result.exit_code == 1
+        assert "requires an access token" in result.stderr
+        assert "unreachable" not in result.stderr.lower()
+
+    def test_a_rejected_token_says_so(self):
+        import pyarrow.flight as flight
+
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.side_effect = flight.FlightUnauthenticatedError("bad")
+            result = runner.invoke(app, ["cache-stats", "--token", "wrong"])
+        assert result.exit_code == 1
+        assert "rejected the token" in result.stderr
+
+    def test_a_genuinely_unreachable_server_says_unreachable(self):
+        import pyarrow.flight as flight
+
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.side_effect = flight.FlightUnavailableError("refused")
+            result = runner.invoke(app, ["cache-stats"])
+        assert result.exit_code == 1
+        assert "Cannot reach the data plane" in result.stderr
+        # ... and, on the guessed default, that --server exists for the rest.
+        assert "--server" in result.stderr
+
+    def test_an_unreadable_local_cert_is_not_reported_as_an_auth_problem(
+        self, monkeypatch
+    ):
+        """A LocalTrustError stringifies as "Permission denied" (biopb/biopb#610).
+
+        Classified by type, so it names the certificate rather than a token.
+        """
+        from biopb import _data_plane
+
+        monkeypatch.setattr(
+            "biopb._data_plane.control_grpc_url",
+            lambda timeout=1.0: "grpcs://127.0.0.1:8815",
+        )
+        result = runner.invoke(app, ["cache-stats"])  # no cert in the state dir
+        assert result.exit_code == 1
+        # Rich hard-wraps, so match on words rather than the whole sentence.
+        assert "certificate" in result.stderr and "cert init" in result.stderr
+        assert "token" not in result.stderr
+        assert _data_plane.LocalTrustError is not None  # the type, not a substring
