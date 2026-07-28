@@ -305,7 +305,7 @@ under `/data_plane/*`.
 
 Auth mirrors the Flight server: `Authorization: Bearer <token>` / `X-Biopb-Token`,
 timing-safe compared; a `None` token is **local mode** (loopback, no enforcement),
-a token is **remote mode** (public `server.host`). The `TensorFlightClient` opens
+a token is **remote mode** (a public `--host`). The `TensorFlightClient` opens
 lazily on the first authenticated request; a thread-safe `_DiagnosticsState` tracks
 latency / errors / cache hit-rate / per-session rate-limit, with every error string
 `_redact()`ed (filesystem paths and token-like strings -> `[REDACTED]`).
@@ -388,17 +388,25 @@ needs no `cryptography` at all — the escape hatch when the extra isn't install
 `grpcs://<host>:8815` with that token and TOFU-pin the cert. Skip the install and
 bring a cert via `--tls-cert`/`--tls-key` instead.
 
-**Config-driven TLS.** `--tls`/`--tls-cert`/`--tls-key` are on **both** `serve`
-and `launch`, and each mirrors a `server.tls` / `server.tls_cert` /
-`server.tls_key` config field. The config field is what makes TLS reachable at
-all from the control: the supervisor spawns `launch -c config.json` and passes no
-TLS arguments, so a config that could not express TLS would be a plane the
-control could never serve over TLS. The flag is tri-state (`--tls/--no-tls`) and
-overrides the config in **both** directions; omitting both defers to the config.
-`--no-tls` additionally drops any cert/key pair — a cert on its own *means*
-"serve TLS" (`--tls-cert` never needed `--tls`), so `_resolve_tls_material`
-honors the pair before it consults the flag, and an explicit off has to be
-applied in `_merge_tls_options` or it would be silently ignored.
+**The bind and TLS are CLI-only** (biopb/biopb#604). `--host`, `--port`, `--tls`,
+`--tls-cert` and `--tls-key` are on both `serve` and `launch`, and none of them
+has a config counterpart — `server.host`/`server.port`/`server.tls*` were removed
+from `biopb.json` and now warn loudly if present. `biopb.json` answers *what to
+serve*; *where and how to expose it* belongs to whoever starts the process. The
+sidecar's own bind (`--web-host`/`--web-port`) was always CLI-only; this makes
+the flight plane consistent with it.
+
+Two things fall out. The control **dictates** the bind (it passes `--host`/
+`--port`/`--tls` when it spawns the plane), so it cannot hold a stale view of one
+— a port edited underneath it can no longer wedge its liveness probe, and the
+scheme it advertises to clients is the scheme it chose. And "public +
+unauthenticated" stops being a config state to *validate against* and becomes
+unrepresentable: `--remote`, the flag that binds publicly, is the same one that
+requires a token.
+
+The default bind is **loopback**, not the old config default of `0.0.0.0` — the
+safe default is the one that exposes nothing, and going public is an explicit
+act.
 
 Serving TLS from `launch` means the co-located sidecar has to reach a TLS Flight
 plane. It does: the flight location becomes `grpcs://<loopback>` and the served
@@ -424,7 +432,7 @@ is a control-level operation, not something the plane's admin UI can offer.
 Startup sequence (`launch`):
 
 1. Decide whether a token is enforced from the effective flight bind (`--host`
-   override, else config `server.host`): a loopback bind runs tokenless (**local
+   `--host`, loopback by default): a loopback bind runs tokenless (**local
    mode**); a public bind (`0.0.0.0`/`::`/a real IP) **requires** a token
    (**remote mode**).
 2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var →
@@ -597,7 +605,6 @@ Full model — the residency/recall rules, the resolve state machine, and the
 
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "cache": { "max_bytes": 2000000000 },
   "pyramid": {
     "threshold": 4096,
@@ -688,8 +695,8 @@ The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handl
 - Token is stored in `sessionStorage` (clears on tab close, never persisted to disk).
 - The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
-- **Local mode** (loopback `server.host`) enforces no token — the 90% single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
-- **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `server.host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`server.host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
+- **Local mode** (the default loopback `--host`) enforces no token — the 90% single-machine case. **Remote mode** (a public `--host`, which `biopb control start --remote` selects) requires a token, auto-generated if none is supplied.
+- **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `--host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`--host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
 - **The one deliberate escape hatch is `BIOPB_TENSOR_ALLOW_NO_TOKEN`** (`_allow_no_token_from_env`). Truthy, it forces tokenless operation even on a public bind — auto-generation and the public-sidecar refusal both degrade to a loud warning. It only takes effect when no token is otherwise supplied, and is **off by default**, so the fail-closed guarantee above holds unless an operator explicitly opts out for a trusted network (the host-loopback-published Docker case, where the in-container bind is `0.0.0.0` but the ports are published to `127.0.0.1`). This is *not* the old auto dev-bypass (removed in #447) — it is explicit, per-deployment, and self-announcing.
 - For Docker local mode with localhost-only access, use `-p 127.0.0.1:8815:8815`.
 - For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.

@@ -797,42 +797,16 @@ def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys
     assert "migrate-config" in capsys.readouterr().out
 
 
-# --- TLS: CLI-over-config resolution ----------------------------------------
-# TLS is a config field as well as a flag because the control supervisor spawns
-# `launch -c config.json` with no TLS arguments -- a config that cannot express
-# TLS is a plane the control could never serve over TLS.
+# --- TLS material resolution ------------------------------------------------
+# There is no config side to merge against any more (biopb/biopb#604): the flags
+# are the whole story, and a bare --tls-cert/--tls-key still implies TLS.
 
 
-def _cfg(tls=False, tls_cert=None, tls_key=None):
-    return SimpleNamespace(tls=tls, tls_cert=tls_cert, tls_key=tls_key)
+def test_a_missing_cert_path_is_refused(tmp_path):
+    """A cert path that vanished between typer's `exists=True` and the read.
 
-
-def test_tls_flag_omitted_defers_to_the_config():
-    assert cli._merge_tls_options(None, None, None, _cfg(tls=True))[0] is True
-    assert cli._merge_tls_options(None, None, None, _cfg(tls=False))[0] is False
-
-
-def test_tls_flag_overrides_the_config_in_both_directions():
-    # --no-tls must be able to turn off a config that says on, not just the
-    # reverse; that is why the flag is tri-state rather than a bare bool.
-    assert cli._merge_tls_options(False, None, None, _cfg(tls=True))[0] is False
-    assert cli._merge_tls_options(True, None, None, _cfg(tls=False))[0] is True
-
-
-def test_cert_and_key_fall_back_to_the_config():
-    cfg = _cfg(tls_cert=Path("/cfg/c.pem"), tls_key=Path("/cfg/k.pem"))
-    _, cert, key = cli._merge_tls_options(None, None, None, cfg)
-    assert (cert, key) == (Path("/cfg/c.pem"), Path("/cfg/k.pem"))
-    # An explicit flag still wins over the config value.
-    _, cert, _ = cli._merge_tls_options(None, Path("/cli/c.pem"), None, cfg)
-    assert cert == Path("/cli/c.pem")
-
-
-def test_a_missing_cert_path_from_the_config_is_refused(tmp_path):
-    """typer's `exists=True` only guards the CLI; a config path bypasses it.
-
-    Without this check the pair would reach `read_bytes()` and surface as a
-    traceback instead of an actionable message.
+    Without this the pair would reach `read_bytes()` and surface as a traceback
+    instead of an actionable message.
     """
     missing = tmp_path / "nope.pem"
     key = tmp_path / "k.pem"
@@ -888,22 +862,6 @@ def test_launch_points_the_sidecar_at_grpcs_and_hands_it_the_cert(
     assert captured["flight_location"].startswith("grpcs://")
 
 
-def test_launch_config_tls_reaches_the_sidecar_with_no_flags(monkeypatch, tmp_path):
-    """The control supervisor spawns `launch -c config.json` and passes no TLS
-    flags, so config-driven TLS has to work on its own or the control can never
-    serve a TLS plane."""
-    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    cert.write_bytes(b"CERTPEM")
-    key.write_bytes(b"KEYPEM")
-
-    captured = _launch_capturing_tls(
-        monkeypatch, _fake_server_config(tls=True, tls_cert=cert, tls_key=key)
-    )
-
-    assert captured["tls_ca_pem"] == b"CERTPEM"
-    assert captured["flight_location"].startswith("grpcs://")
-
-
 def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
     captured = _launch_capturing_tls(monkeypatch, _fake_server_config())
     assert captured["flight_cert"] is None
@@ -911,38 +869,39 @@ def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
     assert captured["flight_location"].startswith("grpc://")
 
 
-def test_no_tls_beats_a_configured_cert(tmp_path):
-    """`--no-tls` must win over a cert/key pair, wherever the pair came from.
+# --- the bind is the CLI's, not the config's (biopb/biopb#604) ---------------
 
-    A cert on its own means "serve TLS" (--tls-cert never needed --tls), so
-    _resolve_tls_material honors the pair *before* it looks at the flag. An
-    explicit off therefore has to drop the pair, or --no-tls against a config
-    carrying tls_cert would silently keep serving TLS.
+
+def test_retired_bind_keys_warn_loudly_instead_of_being_ignored(caplog):
+    """Silently dropping these would be the worst possible break.
+
+    `"host": "0.0.0.0"` was someone's *remote* deployment; quietly falling back
+    to the loopback default would take their server off the network with no
+    signal at all. The message has to name the flag that replaced the key.
     """
-    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    cert.write_bytes(b"CERT")
-    key.write_bytes(b"KEY")
-    cfg = _fake_server_config(tls=True, tls_cert=cert, tls_key=key)
+    import logging
 
-    merged = cli._merge_tls_options(False, None, None, cfg)
-    assert merged == (False, None, None)
-    assert cli._resolve_tls_material(*merged, None) == (None, None)
+    from biopb_tensor_server.core.config import parse_config
 
-    # ...including a pair given on the command line alongside --no-tls.
-    merged = cli._merge_tls_options(False, cert, key, _fake_server_config())
-    assert cli._resolve_tls_material(*merged, None) == (None, None)
+    with caplog.at_level(logging.WARNING):
+        parse_config({"server": {"host": "0.0.0.0", "port": 9000, "tls": True}})
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    for key, flag in (("host", "--host"), ("port", "--port"), ("tls", "--tls")):
+        assert f"server.{key}" in joined
+        assert flag in joined
 
 
-def test_a_cert_alone_still_implies_tls(tmp_path):
-    """The pre-existing contract: --tls-cert/--tls-key need no --tls."""
-    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    cert.write_bytes(b"CERT")
-    key.write_bytes(b"KEY")
+def test_a_config_bind_cannot_move_the_plane(caplog):
+    """The warning is not cosmetic: the value really is gone."""
+    from biopb_tensor_server.core.config import ServerConfig, parse_config
 
-    merged = cli._merge_tls_options(None, cert, key, _fake_server_config())
-    assert cli._resolve_tls_material(*merged, None) == (b"CERT", b"KEY")
+    cfg = parse_config({"server": {"host": "0.0.0.0", "port": 9000}})
+    assert not hasattr(cfg, "host")
+    assert not hasattr(cfg, "port")
+    assert set(vars(cfg)) == set(vars(ServerConfig()))
 
-    # Same when the pair comes from the config rather than the flags.
-    cfg = _fake_server_config(tls=False, tls_cert=cert, tls_key=key)
-    merged = cli._merge_tls_options(None, None, None, cfg)
-    assert cli._resolve_tls_material(*merged, None) == (b"CERT", b"KEY")
+
+def test_the_default_bind_is_loopback():
+    """Fail-safe. The old config default was 0.0.0.0, which made a plane public
+    unless something said otherwise -- the wrong direction for a default."""
+    assert cli.DEFAULT_FLIGHT_HOST == "127.0.0.1"

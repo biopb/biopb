@@ -28,6 +28,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", required=True, help="tensor-server config path")
     run.add_argument("--grpc-host", default="127.0.0.1")
     run.add_argument("--grpc-port", type=int, default=8815)
+    run.add_argument(
+        "--tls",
+        action="store_true",
+        help="Serve the data plane's flight port over TLS (passed to `launch`).",
+    )
     run.add_argument("--web-host", default="127.0.0.1")
     run.add_argument("--web-port", type=int, default=8814)
     run.add_argument("--static-dir", default=None)
@@ -112,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         config=Path(args.config),
         grpc_host=args.grpc_host,
         grpc_port=args.grpc_port,
+        tls=args.tls,
         web_host=args.web_host,
         web_port=args.web_port,
         static_dir=Path(args.static_dir) if args.static_dir else None,

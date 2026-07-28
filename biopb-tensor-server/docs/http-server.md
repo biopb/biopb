@@ -36,9 +36,9 @@ compares against `expected = self.token`: a `None` token means no enforcement, a
 token present means it is enforced on every protected endpoint. There is no
 separate dev flag.
 
-**Enforcement is independent of the network mode.** The config's `server.host`
-decides the *bind* (loopback = local, public = remote), not whether a token
-exists. Remote mode **requires** one (auto-generated if not supplied — a public
+**Enforcement is independent of the network mode.** The `--host` flag decides
+the *bind* (loopback = local, public = remote; `biopb control start --remote`
+selects the public one), not whether a token exists. Remote mode **requires** one (auto-generated if not supplied — a public
 listener is never left open). Local mode is tokenless *by default*, but a token
 passed via `--token` / `BIOPB_TENSOR_TOKEN` is honored and enforced on the
 loopback listeners too (`_resolve_launch_token` takes a supplied token before it

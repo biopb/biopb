@@ -291,10 +291,8 @@ class TestControlStatus:
 class TestRejectLegacyToml:
     """`control start` / `run` refuse a pre-#34 `biopb.toml` up front.
 
-    Every config probe further in is best-effort (`_read_flight_host` fails
-    *closed* to a public bind on an unreadable config), so without this gate a
-    legacy config surfaces as an unrelated "public bind needs a token" refusal
-    -- or as a plane serving defaults instead of the user's data.
+    Every config probe further in is best-effort, so without this gate a legacy
+    config surfaces as a plane serving defaults instead of the user's data.
     """
 
     def test_legacy_toml_exits_with_the_migration_command(self, tmp_path, capsys):
@@ -324,9 +322,6 @@ class TestControlRunArgv:
 
     @pytest.fixture(autouse=True)
     def _stub_helpers(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            cli, "_resolve_grpc_hostport", lambda _c: ("127.0.0.1", 8815)
-        )
         monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
         monkeypatch.setattr(
             cli, "_get_log_file", lambda: tmp_path / "tensor-server.log"
@@ -368,78 +363,50 @@ class TestControlRunArgv:
 class TestResolveMode:
     """`_resolve_mode` decides the enforced token. Token enforcement is
     independent of the network mode (a token is allowed in *either*); the single
-    fail-closed rule is that a public listener is never left unauthenticated:
-    remote always carries a token, and a local mode with a public flight bind is
-    refused unless a token is supplied."""
+    fail-closed rule is that a public listener is never left unauthenticated.
+
+    Since the plane's bind moved onto ``--remote`` itself (biopb/biopb#604) there
+    is no longer a "config binds publicly but no token" case to refuse: the flag
+    that binds publicly is the same one that requires a token, so the bad state
+    is unrepresentable rather than validated against. `_plane_bind` covers the
+    bind half."""
 
     @pytest.fixture(autouse=True)
-    def _loopback_flight(self, monkeypatch):
-        # Default the flight bind to loopback; individual tests override. Clear any
-        # ambient BIOPB_TENSOR_TOKEN so "tokenless" cases resolve deterministically
-        # (the resolver now reads the env token in either mode).
-        monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "127.0.0.1")
+    def _no_ambient_token(self, monkeypatch):
+        # Clear any ambient BIOPB_TENSOR_TOKEN so "tokenless" cases resolve
+        # deterministically (the resolver reads the env token in either mode).
         monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
 
-    def test_local_loopback_is_tokenless_by_default(self, tmp_path):
-        assert cli._resolve_mode(tmp_path / "c.json", remote=False, token=None) is None
+    def test_local_loopback_is_tokenless_by_default(self):
+        assert cli._resolve_mode(remote=False, token=None) is None
 
-    def test_local_accepts_explicit_token(self, tmp_path):
-        # A token is now allowed in local mode (defense-in-depth on a shared
+    def test_local_accepts_explicit_token(self):
+        # A token is allowed in local mode (defense-in-depth on a shared
         # machine); it is enforced across the loopback-bound listeners.
         assert (
-            cli._resolve_mode(
-                tmp_path / "c.json", remote=False, token="local-token-0123456"
-            )
+            cli._resolve_mode(remote=False, token="local-token-0123456")
             == "local-token-0123456"
         )
 
-    def test_local_reads_env_token(self, tmp_path, monkeypatch):
-        # The token travels via BIOPB_TENSOR_TOKEN in either mode; local mode now
-        # honors it too (matching what the supervised child already enforces).
+    def test_local_reads_env_token(self, monkeypatch):
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token-0123456789")
-        assert (
-            cli._resolve_mode(tmp_path / "c.json", remote=False, token=None)
-            == "env-token-0123456789"
-        )
+        assert cli._resolve_mode(remote=False, token=None) == "env-token-0123456789"
 
-    def test_local_rejects_malformed_token(self, tmp_path):
+    def test_local_rejects_malformed_token(self):
         # A supplied-but-malformed token is refused in local mode too, so it is
-        # never silently ignored downstream (which would leave the listeners open).
+        # never silently ignored downstream (which would leave listeners open).
         with pytest.raises(typer.Exit):
-            cli._resolve_mode(tmp_path / "c.json", remote=False, token="too-short")
-
-    def test_public_flight_refused_when_tokenless(self, tmp_path, monkeypatch):
-        # Fail-closed: a config that binds the flight server publicly must not run
-        # tokenless. This is the guard that makes "public + open" unrepresentable.
-        monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "0.0.0.0")
-        with pytest.raises(typer.Exit):
-            cli._resolve_mode(tmp_path / "c.json", remote=False, token=None)
-
-    def test_local_public_flight_bind_allowed_with_token(self, tmp_path, monkeypatch):
-        # A token satisfies the fail-closed guard: a public flight bind behind a
-        # token is authenticated, so it is representable without --remote.
-        monkeypatch.setattr(cli, "_read_flight_host", lambda _c: "0.0.0.0")
-        assert (
-            cli._resolve_mode(
-                tmp_path / "c.json", remote=False, token="local-token-0123456"
-            )
-            == "local-token-0123456"
-        )
+            cli._resolve_mode(remote=False, token="too-short")
 
     def test_remote_uses_supplied_token(self, tmp_path):
         assert (
-            cli._resolve_mode(
-                tmp_path / "c.json", remote=True, token="supplied-token-0123"
-            )
+            cli._resolve_mode(remote=True, token="supplied-token-0123")
             == "supplied-token-0123"
         )
 
     def test_remote_reads_env_token(self, tmp_path, monkeypatch):
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token-0123456789")
-        assert (
-            cli._resolve_mode(tmp_path / "c.json", remote=True, token=None)
-            == "env-token-0123456789"
-        )
+        assert cli._resolve_mode(remote=True, token=None) == "env-token-0123456789"
 
     def test_remote_rejects_malformed_token(self, tmp_path):
         # Validated with the shared `_web_auth.valid_token` rule the tensor
@@ -447,11 +414,11 @@ class TestResolveMode:
         # non-URL-safe) token is refused here rather than silently regenerated
         # downstream, which would leave the browser holding a rejected token.
         with pytest.raises(typer.Exit):
-            cli._resolve_mode(tmp_path / "c.json", remote=True, token="too-short")
+            cli._resolve_mode(remote=True, token="too-short")
 
     def test_remote_generates_token_when_absent(self, tmp_path, monkeypatch):
         monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
-        tok = cli._resolve_mode(tmp_path / "c.json", remote=True, token=None)
+        tok = cli._resolve_mode(remote=True, token=None)
         assert tok and len(tok) >= 16
 
 
@@ -795,3 +762,133 @@ class TestControlLogs:
         assert res.exit_code == 0, res.output
         assert "boom" in res.output
         assert "serving" not in res.output
+
+
+class TestPlaneBind:
+    """The flight plane's bind follows `--remote` alone (biopb/biopb#604).
+
+    It used to be read from `biopb.json`'s `server.host`, which made the
+    deployment mode a property of a file the control snapshotted at startup: a
+    config edit could disagree with the running plane, and "local mode" was
+    public whenever the config said so. Deriving it from the flag makes the
+    switch that exposes the plane the same one that requires a token.
+    """
+
+    def test_local_binds_loopback(self):
+        assert cli._plane_bind(remote=False)[0] == "127.0.0.1"
+
+    def test_remote_binds_publicly(self):
+        assert cli._plane_bind(remote=True)[0] == "0.0.0.0"
+
+    def test_probes_always_target_loopback(self):
+        # A wildcard is a bind target, not a connect target.
+        assert cli._probe_hostport(remote=True)[0] == "127.0.0.1"
+        assert cli._probe_hostport(remote=False)[0] == "127.0.0.1"
+
+    def test_a_config_bind_is_not_consulted(self, tmp_path, monkeypatch):
+        """The decisive property: nothing on this path reads the config."""
+        config = tmp_path / "biopb.json"
+        config.write_text('{"server": {"host": "0.0.0.0", "port": 9999}}')
+        monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
+        monkeypatch.setattr(cli, "_get_log_file", lambda: tmp_path / "s.log")
+        monkeypatch.setattr(
+            cli, "_control_shutdown_sentinel", lambda: tmp_path / "c.stop"
+        )
+        argv = cli._control_run_argv(
+            config=config,
+            static_dir=None,
+            web_host="127.0.0.1",
+            web_port=8814,
+            log_level="INFO",
+            data_plane=True,
+            remote=False,
+        )
+        assert argv[argv.index("--grpc-host") + 1] == "127.0.0.1"
+        assert argv[argv.index("--grpc-port") + 1] == "8815"
+
+    def test_tls_is_signalled_on_the_child_argv(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
+        monkeypatch.setattr(cli, "_get_log_file", lambda: tmp_path / "s.log")
+        monkeypatch.setattr(
+            cli, "_control_shutdown_sentinel", lambda: tmp_path / "c.stop"
+        )
+        kwargs = {
+            "config": tmp_path / "biopb.json",
+            "static_dir": None,
+            "web_host": "127.0.0.1",
+            "web_port": 8814,
+            "log_level": "INFO",
+            "data_plane": True,
+            "remote": False,
+        }
+        assert "--tls" not in cli._control_run_argv(**kwargs)
+        assert "--tls" in cli._control_run_argv(**kwargs, tls=True)
+
+
+class TestTlsExtraPreflight:
+    """`--tls` is checked before anything is spawned (biopb/biopb#604).
+
+    `cryptography` is an opt-in extra, so a default install cannot mint the
+    self-signed cert `--tls` needs. Without this check the control starts and
+    reports success, then its supervised plane exits 2 on every spawn and
+    crash-loops on backoff with the one useful sentence buried in
+    tensor-server.log -- a control that started and a plane that never serves.
+    """
+
+    def _cryptography(self, monkeypatch, *, installed: bool):
+        """Force the answer for `cryptography` only, leaving other lookups real.
+
+        Both directions are stubbed rather than read off the ambient
+        environment: whether the [tls] extra is present is exactly what varies
+        between a dev venv (synced --all-extras) and a default install (CI), so
+        an unstubbed test asserts the environment, not the code.
+        """
+        import importlib.util
+
+        real = importlib.util.find_spec
+        spec = real("importlib.util") if installed else None
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name, *a, **k: (
+                spec if name == "cryptography" else real(name, *a, **k)
+            ),
+        )
+
+    def _without_cryptography(self, monkeypatch):
+        self._cryptography(monkeypatch, installed=False)
+
+    def test_passes_when_the_extra_is_installed(self, monkeypatch):
+        self._cryptography(monkeypatch, installed=True)
+        cli._require_tls_extra()  # no exception
+
+    def test_exits_2_with_an_install_hint(self, monkeypatch, capsys):
+        self._without_cryptography(monkeypatch)
+        with pytest.raises(typer.Exit) as exc:
+            cli._require_tls_extra()
+        assert exc.value.exit_code == 2
+        out = capsys.readouterr().out
+        assert "cryptography" in out
+        assert "pip install" in out
+
+    def test_the_install_command_survives_a_narrow_terminal(self, monkeypatch):
+        """The one line the reader copies verbatim must not be wrapped or eaten.
+
+        Rich reads a bare `[tls]` as a style tag (so the extra silently vanishes)
+        and hard-wraps at the terminal width (so the command splits mid-path).
+        """
+        import io
+
+        from rich.console import Console
+
+        self._without_cryptography(monkeypatch)
+        buf = io.StringIO()
+        monkeypatch.setattr(cli, "console", Console(file=buf, width=40))
+        with pytest.raises(typer.Exit):
+            cli._require_tls_extra()
+        out = buf.getvalue()
+        assert "biopb-tensor-server[tls]" in out  # markup did not eat the extra
+        assert any(
+            "pip install 'biopb-tensor-server[tls]'" in line
+            for line in out.splitlines()
+        )  # ...and it is on one line, at 40 columns

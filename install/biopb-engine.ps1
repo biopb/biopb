@@ -254,9 +254,9 @@ function Write-ServerConfig {
     }
     if ($null -eq $data) {
         $data = [pscustomobject]@{
+            # No host/port: the flight bind moved onto the command line
+            # (biopb/biopb#604) and `biopb control start` passes it down.
             server = [pscustomobject]@{
-                host                   = "127.0.0.1"
-                port                   = 8815
                 aggressive_dir_pruning = $true
             }
             cache = [pscustomobject]@{

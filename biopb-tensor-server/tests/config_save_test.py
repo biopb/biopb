@@ -98,12 +98,12 @@ def test_migrates_legacy_toml_to_json_with_backup(tmp_path):
 
 def test_saved_config_loads_back_without_unknown_key_warning(tmp_path, caplog):
     path = tmp_path / CANONICAL_CONFIG_NAME
-    save_config({"server": {"host": "127.0.0.1", "port": 9000}}, path)
+    save_config({"server": {"log_level": "DEBUG"}}, path)
 
     with caplog.at_level(logging.WARNING):
         cfg = load_config(path)
 
-    assert cfg.port == 9000
+    assert cfg.log_level == "DEBUG"
     # The embedded $schema must not be reported as an unknown section.
     assert not any("$schema" in rec.getMessage() for rec in caplog.records)
     assert not any(

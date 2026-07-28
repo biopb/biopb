@@ -413,3 +413,49 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
     finally:
         server.shutdown()
         sup.stop()  # reap the binder child
+
+
+# --------------------------------------------------------------------------- #
+# the control dictates the bind (biopb/biopb#604)
+# --------------------------------------------------------------------------- #
+# The plane's bind left biopb.json, so the control passes it down explicitly.
+# It therefore cannot hold a stale view of a bind it chose, and the advertised
+# scheme follows the same decision.
+
+
+def test_the_bind_is_passed_down_to_the_child(spec):
+    argv = DataPlaneSupervisor(spec)._build_argv()
+    assert argv[argv.index("--host") + 1] == spec.grpc_host
+    assert argv[argv.index("--port") + 1] == str(spec.grpc_port)
+    assert "--tls" not in argv
+
+
+def test_tls_is_passed_down_when_asked(tmp_path):
+    spec = DataPlaneSpec(config=tmp_path / "c.json", tls=True)
+    assert "--tls" in DataPlaneSupervisor(spec)._build_argv()
+
+
+def test_a_wildcard_bind_is_probed_over_loopback(tmp_path):
+    """A wildcard is a bind target, not a connect target -- and the address
+    family has to match, or a `::`-bound server with IPV6_V6ONLY refuses an
+    IPv4 probe."""
+    for bind, probe in (
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "::1"),
+        ("10.0.0.5", "10.0.0.5"),
+    ):
+        sup = DataPlaneSupervisor(
+            DataPlaneSpec(config=tmp_path / "c.json", grpc_host=bind)
+        )
+        assert sup._probe_host == probe
+
+
+def test_the_advertised_url_follows_the_bind_and_scheme(tmp_path):
+    plain = DataPlaneSupervisor(
+        DataPlaneSpec(config=tmp_path / "c.json", grpc_host="0.0.0.0", grpc_port=9001)
+    )
+    assert plain.snapshot()["grpc_url"] == "grpc://127.0.0.1:9001"
+    secure = DataPlaneSupervisor(
+        DataPlaneSpec(config=tmp_path / "c.json", grpc_port=9001, tls=True)
+    )
+    assert secure.snapshot()["grpc_url"] == "grpcs://127.0.0.1:9001"

@@ -91,9 +91,10 @@ never a constructed dataclass — share the same code. Direct dataclass
 construction in server code is therefore unvalidated by design (a programming
 error, not a runtime input).
 
-Two values that *look* out of range are sentinels and stay legal:
-`full_rescan_interval <= 0` disables the periodic full scan, and `server.port = 0`
-binds an OS-assigned ephemeral port.
+One value that *looks* out of range is a sentinel and stays legal:
+`full_rescan_interval <= 0` disables the periodic full scan. (`server.port = 0`
+used to be another, for an OS-assigned ephemeral port; the bind left the config
+entirely in biopb/biopb#604 and `--port 0` carries that meaning now.)
 
 **Installer writes JSON.** All four front-ends — `install/install.sh` (POSIX),
 `install/biopb-engine.ps1` (Windows engine), `install/install.ps1`, and
@@ -189,7 +190,6 @@ dim_labels = ["z", "y", "x"]
 
 ```json
 {
-  "server": { "host": "127.0.0.1", "port": 9000 },
   "cache": { "backend": "memory" },
   "sources": [
     { "type": "zarr", "url": "/data/a.zarr", "dim_labels": ["z", "y", "x"] }
