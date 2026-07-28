@@ -9,11 +9,14 @@ on any platform; time.sleep is neutralized.
 """
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
 import pytest
 import typer
+from biopb import _locations
+from biopb._lifecycle import daemon as _daemon
 from typer.testing import CliRunner
 
 
@@ -976,6 +979,60 @@ class TestBasePort:
     def test_env_still_overrides_the_derived_control_port(self, monkeypatch):
         monkeypatch.setenv("BIOPB_CONTROL_PORT", "7777")
         assert cli._control_bind_endpoint(9000)[1] == 7777
+
+
+class TestLiveForegroundControl:
+    """`control status` / `control stop` recognizing a foreground `control run`.
+
+    Such a control writes no pid file, so its endpoint record is the only trace
+    of it. A clean stop retracts the record, which leaves a *crash* as the way to
+    strand one -- so the pid it carries has to be checked for identity, not just
+    liveness, or a recycled pid makes `status` report a dead control as Running
+    and `stop` refuse to touch the daemon it was asked about.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        # XDG_STATE_HOME, the real one -- see endpoints_test's fixture for what
+        # a wrong name silently does to the developer's own state dir.
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    def test_no_record_is_no_foreground_control(self):
+        assert cli._live_foreground_control() is None
+
+    def test_live_pid_with_matching_token_is_recognized(self):
+        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        live = cli._live_foreground_control()
+        assert live is not None
+        record, pid = live
+        assert pid == os.getpid()
+        assert record["port"] == 9003
+
+    def test_recycled_pid_is_not_a_running_control(self):
+        """The case the pid alone cannot see: alive, but a different process."""
+        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        # Same pid, still very much alive -- only the create-time token says the
+        # process serving now is not the one that wrote the record.
+        path = _locations.control_runtime_file()
+        record = json.loads(path.read_text())
+        record["create_time"] = (record.get("create_time") or 0) + 1
+        path.write_text(json.dumps(record))
+        assert cli._live_foreground_control() is None
+
+    def test_dead_pid_is_not_a_running_control(self, monkeypatch):
+        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        monkeypatch.setattr(_daemon, "_is_process_running", lambda _p: False)
+        assert cli._live_foreground_control() is None
+
+    def test_tokenless_record_degrades_to_liveness(self):
+        """A record from before the token existed must not read as "stopped"."""
+        cli._endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        path = _locations.control_runtime_file()
+        record = json.loads(path.read_text())
+        del record["create_time"]
+        path.write_text(json.dumps(record))
+        live = cli._live_foreground_control()
+        assert live is not None and live[1] == os.getpid()
 
 
 class TestTlsExtraPreflight:

@@ -84,6 +84,23 @@ class TestRuntimeRecord:
         _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
         assert _endpoints.read_runtime_record()["pid"] == 4242
 
+    def test_record_carries_a_create_time_token(self):
+        """The pid alone cannot survive pid reuse; the token is what identifies.
+
+        Only a crash strands a record -- a clean stop retracts it -- so a stale
+        record is exactly the case where the pid may since have been recycled.
+        """
+        import os
+
+        from biopb._lifecycle.proc import process_create_time
+
+        _endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
+        record = _endpoints.read_runtime_record()
+        assert "create_time" in record
+        # None only where the platform has no cheap create-time (readers then
+        # degrade to liveness); elsewhere it must name *this* process.
+        assert record["create_time"] == process_create_time(os.getpid())
+
     def test_remove_retracts_it(self):
         _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
         _endpoints.remove_runtime_record()

@@ -1452,6 +1452,30 @@ def control_start(
         raise typer.Exit(1)
 
 
+def _live_foreground_control() -> Optional[Tuple[dict, int]]:
+    """The published record of a live foreground control, as ``(record, pid)``.
+
+    A foreground `biopb control run` writes no pid file -- its terminal or
+    service manager owns it -- so this endpoint record is the only trace of it.
+    Verified for *identity*, not merely liveness: a clean stop retracts the
+    record, so the way to strand one is a crash, and a pid recycled since then
+    would otherwise read as a control still serving. `_is_our_daemon` compares
+    the recorded create-time token and refuses to vouch for a different process.
+
+    Falls back to liveness when the record carries no usable token (written
+    before the field existed, or a platform with no cheap create-time), matching
+    the pid file's own degradation -- never a false "not running".
+    """
+    record = _endpoints.read_runtime_record()
+    pid = record.get("pid")
+    if not isinstance(pid, int):
+        return None
+    token = record.get("create_time")
+    if not _is_our_daemon(pid, token if isinstance(token, int) else None):
+        return None
+    return record, pid
+
+
 @control_app.command("stop")
 def control_stop(
     timeout: int = typer.Option(
@@ -1474,9 +1498,9 @@ def control_stop(
     if not pid:
         # `status` reports a foreground control as Running, so "nothing running"
         # here would flatly contradict it. Say which one is up and who owns it.
-        record = _endpoints.read_runtime_record()
-        record_pid = record.get("pid")
-        if isinstance(record_pid, int) and _is_process_running(record_pid):
+        live = _live_foreground_control()
+        if live:
+            record, record_pid = live
             console.print(
                 f"[yellow]A foreground control plane is running (PID {record_pid}, "
                 f"http://{record.get('host')}:{record.get('port')}).[/yellow]"
@@ -1531,10 +1555,9 @@ def control_status(
     # report it honestly rather than denying it exists.
     foreground = False
     if not running:
-        record = _endpoints.read_runtime_record()
-        record_pid = record.get("pid")
-        if isinstance(record_pid, int) and _is_process_running(record_pid):
-            pid, running, stale, foreground = record_pid, True, False, True
+        live = _live_foreground_control()
+        if live:
+            pid, running, stale, foreground = live[1], True, False, True
 
     control_host, control_port = _control_endpoint()
     health = _query_control_health(control_host, control_port) if running else None

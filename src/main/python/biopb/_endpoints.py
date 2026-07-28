@@ -113,14 +113,27 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
 
     ``pid`` lets ``biopb control status`` tell a live foreground control from a
     record a crashed one left behind -- the distinction the pid file draws for
-    daemons and cannot draw for ``control run``.
+    daemons and cannot draw for ``control run``. It is stamped with the same
+    create-time token the pid file carries, because a pid alone cannot make that
+    distinction: only a crash strands a record (a clean stop retracts it), and a
+    recycled pid would then read as a control that is still up. ``None`` when the
+    platform has no cheap create-time -- readers degrade to liveness there, as
+    they do for a legacy bare-pid file.
     """
+    from ._lifecycle.proc import process_create_time
     from ._locations import control_runtime_file
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    payload = json.dumps({"host": host, "port": port, "pid": pid})
+    payload = json.dumps(
+        {
+            "host": host,
+            "port": port,
+            "pid": pid,
+            "create_time": process_create_time(pid),
+        }
+    )
     # Same atomic write-then-replace the pid file uses: a client polling for the
     # control must never observe a half-written record and parse it as "none".
     with open(tmp, "w", encoding="utf-8") as fh:
