@@ -331,7 +331,7 @@ export function AdminPage() {
       setRestarting(false);
       setRestartMsg(null);
       setRestartError(
-        "Server did not come back within 60s. Check `biopb server status` or the log file.",
+        "Server did not come back within 60s. Check `biopb control status` or the log file.",
       );
     }
   }

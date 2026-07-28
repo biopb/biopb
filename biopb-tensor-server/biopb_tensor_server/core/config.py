@@ -6,7 +6,7 @@ Reads JSON config files (``biopb.json``) carrying:
 - Credential profiles for remote storage (S3, GCS, etc.)
 
 JSON is the only supported format; a pre-#34 ``biopb.toml`` is converted with
-``biopb server migrate-config`` (see biopb/biopb#34).
+``biopb-tensor-server migrate-config`` (see biopb/biopb#34).
 
 Example config (explicit):
 ```json
@@ -906,7 +906,7 @@ def restore_redacted_secrets(
 # learn the format changed (biopb/biopb#34).
 _MIGRATE_HINT = (
     "JSON is the only supported config format; convert a legacy "
-    f"{LEGACY_CONFIG_NAME} with `biopb server migrate-config`. See biopb/biopb#34."
+    f"{LEGACY_CONFIG_NAME} with `biopb-tensor-server migrate-config`. See biopb/biopb#34."
 )
 
 
@@ -916,7 +916,7 @@ def _read_config_file(path: Path) -> Dict[str, Any]:
     JSON only. A ``.toml`` path is rejected without parsing (the read path was
     dropped once the deprecation window closed); every other extension --
     including none -- is read as JSON, so an unconventionally-named config still
-    loads. Both failures name ``biopb server migrate-config``.
+    loads. Both failures name ``biopb-tensor-server migrate-config``.
     """
     if path.suffix.lower() == ".toml":
         raise ValueError(
@@ -939,7 +939,7 @@ def read_legacy_toml(path: Path) -> Dict[str, Any]:
     """Read a pre-#34 ``biopb.toml`` into a plain dict.
 
     The **only** remaining TOML reader, and deliberately not reachable from
-    :func:`load_config`: it exists for `biopb server migrate-config`, which
+    :func:`load_config`: it exists for `biopb-tensor-server migrate-config`, which
     converts the old file to canonical JSON. ``tomllib`` is imported lazily so
     the server's own read path carries no TOML dependency.
     """

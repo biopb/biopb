@@ -1,10 +1,17 @@
 """Client-side diagnostic CLI for querying TensorFlight servers.
 
 Commands:
-    query       List sources and tensors from a running server
-    metadata    Inspect source metadata and tensor descriptors
-    get         Download a tensor to file or stdout (pickle, zarr, or protobuf format)
-    stats       Compute statistics (min, max, mean) for a tensor
+    query        List sources and tensors from a running server
+    metadata     Inspect source metadata and tensor descriptors
+    get          Download a tensor to file or stdout (pickle, zarr, or protobuf format)
+    stats        Compute statistics (min, max, mean) for a tensor
+    cache-stats  Show the server's cache hit/miss diagnostics
+
+Every command dials the *same* plane through the one resolver in
+``biopb._data_plane`` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+the control plane's published endpoint -> the default. ``--server`` stays because
+a plane launched directly on a custom port is recorded nowhere and so cannot be
+discovered; everything else is asked for rather than reconstructed.
 """
 
 import json
@@ -19,15 +26,43 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from biopb import _data_plane
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
     name="tensor",
-    help="TensorFlight client diagnostics",
+    help="Query a TensorFlight data plane (sources, tensors, stats, cache).",
 )
 # Main output to stdout; stderr console for logging/timing only
 console = Console()
 stderr_console = Console(stderr=True)
+
+
+# The endpoint override, shared by every command so the five cannot drift into
+# five defaults again. ``None`` means "resolve it" -- the default is not a
+# constant any more, so spelling one here would reintroduce the reconstruction
+# #615 removed.
+_OPT_SERVER = typer.Option(
+    None,
+    "--server",
+    "-s",
+    help="TensorFlight server URI. Default: $BIOPB_TENSOR_URL, else the endpoint "
+    "the control plane publishes, else the local default.",
+)
+_OPT_TOKEN = typer.Option(
+    None,
+    "--token",
+    "-t",
+    help="Bearer token. Default: $BIOPB_TENSOR_TOKEN, else -- for the endpoint the "
+    "control plane published -- the credential file it writes. An endpoint given "
+    "with --server or $BIOPB_TENSOR_URL is never dialed with that file.",
+)
+_OPT_CACHE_BYTES = typer.Option(
+    100_000_000, "--cache-bytes", help="Maximum bytes for the client-side chunk cache"
+)
+_OPT_SLICE = typer.Option(
+    None, "--slice", "-S", help="Slice specification, e.g. '0:100,0:200'"
+)
 
 
 def _log_timing(start_time: float) -> None:
@@ -36,23 +71,109 @@ def _log_timing(start_time: float) -> None:
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
-def _create_flight_client(
-    location: str,
-    cache_bytes: int,
-    token: Optional[str] = None,
-) -> TensorFlightClient:
-    """Create a Flight client, with user-friendly error handling."""
+def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
+    """Why a dial failed, classified by exception *type*.
+
+    Every failure used to render as "server unreachable or cache not initialized"
+    (biopb/biopb#615 fault 3), which is false for the two most common ones: the
+    server answered and refused the dial. A reader chasing a dead process for what
+    is a missing token loses the afternoon.
+
+    Type, not message substring: an unreadable cert stringifies as ``Permission
+    denied``, which any auth-marker scan claims and misfiles as "needs a token"
+    (biopb/biopb#610). The endpoint's origin is named too — "unreachable" means
+    something different for an address the control published than for a guessed
+    default.
+    """
+    import pyarrow.flight as flight
+
+    where = f"{endpoint.url} ({endpoint.origin_note})"
+    if isinstance(exc, _data_plane.LocalTrustError):
+        return str(exc)
+    if isinstance(
+        exc, (flight.FlightUnauthenticatedError, flight.FlightUnauthorizedError)
+    ):
+        if endpoint.token:
+            return f"The data plane at {where} rejected the token."
+        if endpoint.origin in ("flag", "env"):
+            # Say why the credential file did not apply. Without this the reader
+            # sees a token-gated plane they know the control has a credential for,
+            # and reasonably concludes the file is broken rather than unused.
+            return (
+                f"The data plane at {where} requires an access token. An endpoint "
+                "named explicitly is not dialed with the control plane's credential "
+                f"file, so pass --token or set ${_data_plane.ENV_TOKEN}."
+            )
+        return (
+            f"The data plane at {where} requires an access token. Pass --token, set "
+            f"${_data_plane.ENV_TOKEN}, or start it through `biopb control start` "
+            "(which writes the credential file local clients read)."
+        )
+    if isinstance(exc, (flight.FlightUnavailableError, flight.FlightTimedOutError)):
+        hint = ""
+        if endpoint.origin == "default":
+            hint = (
+                " Nothing published an endpoint, so this is the default one — a "
+                "plane on a different port needs --server."
+            )
+        return f"Cannot reach the data plane at {where}: {exc}.{hint}"
+    return f"{type(exc).__name__} from the data plane at {where}: {exc}"
+
+
+def _operation_error(
+    exc: Exception, endpoint: _data_plane.Endpoint, context: str
+) -> str:
+    """Classify a failure raised *after* the client was built.
+
+    ``TensorFlightClient`` opens its socket lazily, so the connect-time failures
+    :func:`_dial_error` exists for -- no token, wrong token, nothing listening --
+    do not surface when the client is constructed. They surface on the command's
+    first RPC, inside the command body. Routing only ``cache-stats`` through the
+    classifier therefore left the other four printing "Error querying server:
+    <raw exception>" for exactly the cases #615 filed: the plane answered and
+    refused, and the message did not say so.
+
+    Anything Flight-typed is the plane's answer and gets classified. Everything
+    else keeps the command's own phrasing: a bad slice, a missing zarr install
+    and an unwritable output file are the command's business, and reporting them
+    as though the data plane said something would be a fresh misattribution.
+    """
+    import pyarrow.flight as flight
+
+    if isinstance(exc, (_data_plane.LocalTrustError, flight.FlightError)):
+        return _dial_error(exc, endpoint)
+    return f"{context}: {exc}"
+
+
+def _resolve_endpoint(
+    server: Optional[str], token: Optional[str]
+) -> _data_plane.Endpoint:
+    """Resolve the endpoint every command dials, exiting 1 with the reason on failure."""
+    try:
+        return _data_plane.resolve(server, token)
+    except _data_plane.LocalTrustError as exc:
+        stderr_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+
+def _connect(
+    server: Optional[str], token: Optional[str], cache_bytes: int
+) -> Tuple[TensorFlightClient, _data_plane.Endpoint]:
+    """Resolve the endpoint and open a client to it, or exit 1 saying why not."""
+    endpoint = _resolve_endpoint(server, token)
     try:
         # TensorFlightClient.__init__ normalizes the location (grpcs:// ->
         # grpc+tls://) itself, so no pre-normalization is needed here.
-        return TensorFlightClient(
-            location=location, cache_bytes=cache_bytes, token=token
+        client = TensorFlightClient(
+            location=endpoint.url,
+            cache_bytes=cache_bytes,
+            token=endpoint.token,
+            tls_ca_pem=endpoint.tls_ca_pem,
         )
     except Exception as exc:
-        stderr_console.print(
-            f"[red]Cannot connect to server at {location}:[/red] {exc}"
-        )
+        stderr_console.print(f"[red]{_dial_error(exc, endpoint)}[/red]")
         raise typer.Exit(1)
+    return client, endpoint
 
 
 def _parse_slice_hint(slice_hint: Optional[str]) -> Optional[Tuple[slice, ...]]:
@@ -114,41 +235,25 @@ def _infer_format(
     return "pb"  # default
 
 
-@app.command()
+@app.command(help="List the data sources and tensors a server is serving.")
 def query(
-    server: str = typer.Option(
-        "grpc://localhost:8815",
-        "--server",
-        "-s",
-        envvar="BIOPB_TENSOR_SERVER",
-        help="TensorFlight server URI",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        envvar="BIOPB_TENSOR_TOKEN",
-        help="Bearer token for server authentication",
-    ),
-    cache_bytes: int = typer.Option(
-        100_000_000,
-        "--cache-bytes",
-        help="Maximum bytes for client-side chunk cache",
-    ),
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    cache_bytes: int = _OPT_CACHE_BYTES,
 ):
     """List all data sources and tensors from a running TensorFlight server.
 
     Example:
-        biopb tensor query --server grpc://localhost:8815
+        biopb tensor query
         biopb tensor query -s grpc://myhost:9000 --token mytoken123
         BIOPB_TENSOR_TOKEN=mytoken123 biopb tensor query
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes, token)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         sources = client.list_sources()
         if not sources:
-            stderr_console.print(f"[yellow]No sources found on {server}[/yellow]")
+            stderr_console.print(f"[yellow]No sources found on {endpoint.url}[/yellow]")
             _log_timing(start_time)
             return
 
@@ -174,7 +279,7 @@ def query(
 
         cache_info = client.cache_info()
         console.print(
-            f"\n[green]Server:[/green] {server}  "
+            f"\n[green]Server:[/green] {endpoint.url}  "
             f"[green]Sources:[/green] {len(sources)}  "
             f"[green]Cache:[/green] {cache_info.get('size_bytes', 0):,} bytes  "
             f"hits={cache_info.get('hits', 0)} misses={cache_info.get('misses', 0)}"
@@ -183,39 +288,25 @@ def query(
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Error querying server:[/red] {exc}")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Error querying server')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
 
 
-@app.command()
+@app.command(help="Inspect a source's metadata and its tensor descriptors.")
 def metadata(
     source_id: str = typer.Argument(..., help="Source identifier to inspect"),
-    server: str = typer.Option(
-        "grpc://localhost:8815",
-        "--server",
-        "-s",
-        envvar="BIOPB_TENSOR_SERVER",
-        help="TensorFlight server URI",
-    ),
+    server: Optional[str] = _OPT_SERVER,
     tensor: Optional[str] = typer.Option(
         None,
         "--tensor",
         help="Specific tensor ID to inspect (optional)",
     ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-T",
-        envvar="BIOPB_TENSOR_TOKEN",
-        help="Bearer token for server authentication",
-    ),
-    cache_bytes: int = typer.Option(
-        100_000_000,
-        "--cache-bytes",
-        help="Maximum bytes for client-side chunk cache",
-    ),
+    token: Optional[str] = _OPT_TOKEN,
+    cache_bytes: int = _OPT_CACHE_BYTES,
 ):
     """Inspect source metadata and tensor descriptors.
 
@@ -225,7 +316,7 @@ def metadata(
         biopb tensor metadata my-source -s grpc://myhost:9000 --token mytoken123
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes, token)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         sources = client.list_sources()
         if source_id not in sources:
@@ -275,13 +366,17 @@ def metadata(
     except typer.Exit:
         raise
     except Exception as exc:
-        console.print(f"[red]Error fetching metadata:[/red] {exc}")
+        # stderr, like every other command's failure path: an error belongs on
+        # the stream a caller is not parsing for results.
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Error fetching metadata')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
 
 
-@app.command()
+@app.command(help="Download a tensor to a file or stdout (pickle, zarr, or protobuf).")
 def get(
     array_id: str = typer.Argument(
         ...,
@@ -299,31 +394,10 @@ def get(
         "-f",
         help="Output format: pickle (lazy dask), zarr (realized), pb (protobuf). Inferred from filename if not set.",
     ),
-    server: str = typer.Option(
-        "grpc://localhost:8815",
-        "--server",
-        "-s",
-        envvar="BIOPB_TENSOR_SERVER",
-        help="TensorFlight server URI",
-    ),
-    slice_hint: Optional[str] = typer.Option(
-        None,
-        "--slice",
-        "-S",
-        help="Slice specification, e.g. '0:100,0:200'",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        envvar="BIOPB_TENSOR_TOKEN",
-        help="Bearer token for server authentication",
-    ),
-    cache_bytes: int = typer.Option(
-        100_000_000,
-        "--cache-bytes",
-        help="Maximum bytes for client-side chunk cache",
-    ),
+    server: Optional[str] = _OPT_SERVER,
+    slice_hint: Optional[str] = _OPT_SLICE,
+    token: Optional[str] = _OPT_TOKEN,
+    cache_bytes: int = _OPT_CACHE_BYTES,
 ):
     """Download a tensor to file or stdout.
 
@@ -344,7 +418,7 @@ def get(
         biopb tensor get my-source --token mytoken123 -o output.pkl
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes, token)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         selection = _parse_slice_hint(slice_hint)
         fmt = _infer_format(output, format)
@@ -414,43 +488,24 @@ def get(
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Failed to fetch tensor:[/red] {exc}")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to fetch tensor')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
 
 
-@app.command()
+@app.command(help="Compute a tensor's min, max and mean (optionally over a slice).")
 def stats(
     array_id: str = typer.Argument(
         ...,
         help="Array identifier: source_id/tensor_id (tensor_id optional for single-tensor sources)",
     ),
-    server: str = typer.Option(
-        "grpc://localhost:8815",
-        "--server",
-        "-s",
-        envvar="BIOPB_TENSOR_SERVER",
-        help="TensorFlight server URI",
-    ),
-    slice_hint: Optional[str] = typer.Option(
-        None,
-        "--slice",
-        "-S",
-        help="Slice specification, e.g. '0:100,0:200'",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        envvar="BIOPB_TENSOR_TOKEN",
-        help="Bearer token for server authentication",
-    ),
-    cache_bytes: int = typer.Option(
-        100_000_000,
-        "--cache-bytes",
-        help="Maximum bytes for client-side chunk cache",
-    ),
+    server: Optional[str] = _OPT_SERVER,
+    slice_hint: Optional[str] = _OPT_SLICE,
+    token: Optional[str] = _OPT_TOKEN,
+    cache_bytes: int = _OPT_CACHE_BYTES,
 ):
     """Compute statistics (min, max, mean) for a tensor.
 
@@ -464,7 +519,7 @@ def stats(
         biopb tensor stats my-source/pos_0 -S 0:512 -s grpc://myhost:9000 --token mytoken123
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes, token)
+    client, endpoint = _connect(server, token, cache_bytes)
     try:
         selection = _parse_slice_hint(slice_hint)
 
@@ -499,10 +554,121 @@ def stats(
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Failed to compute statistics:[/red] {exc}")
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to compute statistics')}[/red]"
+        )
         raise typer.Exit(1)
     finally:
         client.close()
+
+
+# --- cache-stats ---------------------------------------------------------- #
+#
+# Moved here from `biopb server cache-stats` when that group was retired: it is a
+# question you ask a *server over Flight*, which is what every other command in
+# this module is, and it needs the same client the others build. Under `server`
+# it had its own endpoint resolver, which is how it came to dial a different
+# address than `biopb tensor query` against the same plane (biopb/biopb#615).
+
+
+def _fmt_mb(n_bytes: int) -> str:
+    """Format a byte count as MB."""
+    return f"{n_bytes / (1024 * 1024):.1f} MB"
+
+
+def _hit_rate(hits: int, misses: int) -> str:
+    """Hit rate as a percentage string (guards divide-by-zero)."""
+    total = hits + misses
+    return f"{(hits / total * 100):.1f}%" if total else "n/a"
+
+
+def _render_cache_stats(stats: dict) -> None:
+    """Render a CacheStats dict (from TensorFlightClient.cache_stats) as tables."""
+    g = stats.get
+    table = Table(title="Cache Statistics")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green", justify="right")
+
+    hits, misses = g("hits", 0), g("misses", 0)
+    table.add_row("Hits", str(hits))
+    table.add_row("Misses", str(misses))
+    table.add_row("Hit rate", _hit_rate(hits, misses))
+    table.add_row("Evictions", str(g("evictions", 0)))
+    table.add_row("Pending waits", str(g("pending_waits", 0)))
+    table.add_row("Oversized skips", str(g("oversized_skips", 0)))
+    table.add_row("Ref-held evictions skipped", str(g("ref_held_evictions_skipped", 0)))
+    table.add_row("Entries", str(g("total_entries", 0)))
+    table.add_row("Size", _fmt_mb(g("total_bytes", 0)))
+    if g("max_entries", 0):
+        table.add_row("Max entries", str(g("max_entries")))
+    if g("max_bytes", 0):
+        table.add_row("Max size", _fmt_mb(g("max_bytes")))
+    console.print(table)
+
+    pool_stats = stats.get("pool_stats") or {}
+    if pool_stats:
+        ptable = Table(title="Per-pool Statistics")
+        for col in ("Pool", "Hits", "Misses", "Hit rate", "Segments", "Size"):
+            ptable.add_column(
+                col,
+                style="cyan" if col == "Pool" else "green",
+                justify="left" if col == "Pool" else "right",
+            )
+        for name, p in sorted(pool_stats.items()):
+            ptable.add_row(
+                name,
+                str(p.get("hits", 0)),
+                str(p.get("misses", 0)),
+                _hit_rate(p.get("hits", 0), p.get("misses", 0)),
+                str(p.get("segments", 0)),
+                _fmt_mb(p.get("bytes", 0)),
+            )
+        console.print(ptable)
+
+
+@app.command("cache-stats", help="Show the server's chunk-cache hit/miss diagnostics.")
+def cache_stats(
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show cache hit/miss diagnostics from the running server.
+
+    Liveness is the Flight query itself -- an unreachable server yields no stats,
+    so there is no separate PID-file gate; the control plane owns the data-plane
+    process and writes no ``tensor-server.pid``.
+
+    ``cache_bytes=0``: this opens a throwaway client to ask a question about the
+    *server's* cache, so it must not allocate a client-side one of its own.
+    """
+    client, endpoint = _connect(server, token, cache_bytes=0)
+    try:
+        stats = client.cache_stats()
+    except Exception as exc:  # noqa: BLE001 - rendered by type, not swallowed
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to read cache statistics')}[/red]"
+        )
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+    if not stats:
+        # The server answered with no stats at all -- a cache that was never
+        # initialized. Distinct from every failure above, which is the whole
+        # point: "unreachable or cache not initialized" used to cover both.
+        stderr_console.print(
+            f"[yellow]The data plane at {endpoint.url} reported no cache "
+            "statistics (no cache initialized).[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    if json_output:
+        print(json.dumps(stats))
+        raise typer.Exit(0)
+
+    _render_cache_stats(stats)
 
 
 if __name__ == "__main__":

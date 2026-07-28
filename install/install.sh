@@ -1423,13 +1423,14 @@ install_biopb() {
     local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
         # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb server
+        # convert it in place to the canonical JSON via `biopb-tensor-server
         # migrate-config` (settings preserved verbatim, old file backed up to
         # biopb.toml.bak) so an upgraded install stops warning about the
         # deprecated format. A JSON config is already canonical -- nothing to do.
-        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && command -v biopb >/dev/null 2>&1; then
+        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] &&
+            command -v biopb-tensor-server >/dev/null 2>&1; then
             _info "Migrating legacy TOML config to canonical JSON..."
-            if biopb server migrate-config >/dev/null 2>&1; then
+            if biopb-tensor-server migrate-config >/dev/null 2>&1; then
                 ACTIVE_CONFIG="$CONFIG_FILE"
                 _ok "Migrated config: $LEGACY_CONFIG -> $CONFIG_FILE (old file backed up)"
             else

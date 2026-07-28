@@ -35,7 +35,7 @@ from biopb.tensor.serialized_pb2 import SerializedTensor
 
 app = typer.Typer(
     name="image",
-    help="ProcessImage client operations",
+    help="Call ProcessImage algorithm servers.",
 )
 console = Console()
 stderr_console = Console(stderr=True)
@@ -264,7 +264,7 @@ def _state_style(state: str) -> str:
     }.get(state, "white")
 
 
-@app.command()
+@app.command(help="List the configured algorithm servers with a health probe.")
 def servers(
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -322,7 +322,7 @@ def servers(
     )
 
 
-@app.command()
+@app.command(help="List the operations a ProcessImage server offers.")
 def ops(
     server: str = typer.Option(
         "grpc://localhost:50051",
@@ -401,7 +401,7 @@ def ops(
         channel.close()
 
 
-@app.command()
+@app.command(help="Run an image-processing operation on a ProcessImage server.")
 def process(
     input: Optional[str] = typer.Argument(
         None,

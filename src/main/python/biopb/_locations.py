@@ -42,7 +42,7 @@ has a stdlib writer on both ends, unifies the format with biopb-mcp's
 ``mcp-config.json``, and pairs with JSON Schema for validation. The TOML read
 path was dropped once the deprecation window closed (biopb/biopb#34); a leftover
 ``biopb.toml`` is still *recognized* — by the installers, which convert it, and
-by :func:`find_config`, which names ``biopb server migrate-config`` — so an old
+by :func:`find_config`, which names ``biopb-tensor-server migrate-config`` — so an old
 install fails with the fix rather than with a phantom missing file.
 """
 
@@ -142,7 +142,7 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
 
     A legacy TOML is **no longer readable** (biopb/biopb#34) but is still
     returned when it is the only config present, and both cases log a warning
-    naming ``biopb server migrate-config``. Handing the real file back — rather
+    naming ``biopb-tensor-server migrate-config``. Handing the real file back — rather
     than the canonical name that does not exist — is what lets the caller fail
     with "this config needs migrating" instead of "no config at all", which
     every downstream default (a defaulted bind address, a seeded fresh config)
@@ -154,7 +154,7 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
         if toml_path.exists():
             logger.warning(
                 "Both %s and %s exist in %s; using %s and ignoring the legacy "
-                "%s. Run `biopb server migrate-config` to retire it. "
+                "%s. Run `biopb-tensor-server migrate-config` to retire it. "
                 "See biopb/biopb#34.",
                 CANONICAL_CONFIG_NAME,
                 LEGACY_CONFIG_NAME,
@@ -167,7 +167,7 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
         logger.warning(
             "%s in %s is the legacy TOML config format, which is no longer "
             "read; %s is the only supported format. Run "
-            "`biopb server migrate-config` to convert it. See biopb/biopb#34.",
+            "`biopb-tensor-server migrate-config` to convert it. See biopb/biopb#34.",
             LEGACY_CONFIG_NAME,
             config_dir,
             CANONICAL_CONFIG_NAME,

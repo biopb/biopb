@@ -3,7 +3,7 @@
 
 The legacy TOML read path is gone: a ``.toml`` config is rejected without being
 parsed, and both that refusal and a plain JSON syntax error must name
-``biopb server migrate-config`` -- a parse error is the only place a user
+``biopb-tensor-server migrate-config`` -- a parse error is the only place a user
 learns the format changed. ``find_config`` still *sees* a legacy file, so the
 failure is "migrate this" rather than "no config here".
 """
@@ -113,7 +113,7 @@ def test_missing_file_raises_filenotfound(tmp_path):
 
 
 def test_read_legacy_toml_still_parses_for_migration(tmp_path):
-    # The one surviving TOML reader: `biopb server migrate-config`'s input side.
+    # The one surviving TOML reader: `biopb-tensor-server migrate-config`'s input side.
     toml_path = tmp_path / "biopb.toml"
     toml_path.write_text(_TOML)
     data = read_legacy_toml(toml_path)
