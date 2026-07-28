@@ -2,9 +2,15 @@
 //
 // biopb has two deployment modes: **local** (default — every listener binds
 // loopback, no token) and **remote** (`biopb control start --remote` — the
-// control's browser UI + the flight server bind publicly behind a required
-// token). The same bundle ships to both, so the app can't know its mode at build
-// time; it learns it at runtime from the control's public `/health` probe
+// flight server binds publicly behind a required token). The control that serves
+// this bundle stays on loopback in *both* modes (biopb/biopb#614): it is
+// plaintext HTTP, so a remote browser reaches it through an `ssh -L` tunnel and
+// still sees a same-origin `http://localhost:8813`.
+//
+// The unlock step is therefore driven by the *token*, not by the network mode: a
+// tunneled remote deployment enforces one, and so does a local deployment started
+// with `--token`. The same bundle ships to both, so the app can't know at build
+// time; it learns it at runtime from the control's `/health` probe
 // (`auth_required`). The bundle itself, `/health`, and `/unlock` are always
 // served unauthenticated so the app can bootstrap far enough to ask for a token.
 

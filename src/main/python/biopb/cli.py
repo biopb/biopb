@@ -915,6 +915,30 @@ def _control_endpoint() -> Tuple[str, int]:
     return control_host(), control_port()
 
 
+def _print_ui_tunnel_hint(control_port: int) -> None:
+    """Print the SSH-tunnel recipe for reaching the browser UI off-box.
+
+    ``--remote`` publishes the flight plane and nothing else: the control serves
+    plaintext HTTP and has no TLS support, so a public bind would carry the
+    data-plane token — which unlocks the data *and* admin API — in the clear
+    (biopb/biopb#614). A tunnel gets encryption and authentication for free, adds
+    no listener, and is the pattern Jupyter users already know. Print it here so
+    it is discoverable at the moment the user needs it, rather than folklore.
+    """
+    import socket
+
+    host = socket.gethostname() or "<host>"
+    console.print("  Browser UI: loopback only. From another machine, tunnel it:")
+    # soft_wrap so a narrow terminal cannot break the one line the reader has to
+    # copy verbatim (same treatment as the pip hint in _require_tls_extra).
+    console.print(
+        f"    [bold]ssh -L {control_port}:localhost:{control_port} {host}[/bold]",
+        soft_wrap=True,
+        highlight=False,
+    )
+    console.print(f"    then open http://localhost:{control_port}")
+
+
 def _control_log_file() -> Path:
     """The control plane's own supervision / control-API log (distinct from the data
     plane's tensor-server.log, which the supervised server keeps writing)."""
@@ -960,14 +984,16 @@ def _resolve_mode(remote: bool, token: Optional[str]) -> Optional[str]:
     supplied — via ``--token`` or ``BIOPB_TENSOR_TOKEN`` — in *either* mode, so a
     single-machine deployment can still gate its listeners for defense-in-depth
     on a shared host. What ``--remote`` controls is the *bind address*: local
-    binds every listener to loopback, remote binds the control UI + flight server
-    publicly.
+    binds every listener to loopback, remote binds the flight server publicly.
 
     - **Local** (default): every listener binds loopback. A token is *optional*;
       when one is supplied it is enforced (the browser then gates behind the
       unlock page, same as remote).
-    - **Remote** (``--remote``): the flight server + control bind publicly, so a
-      token is **required** — supplied, or else generated and printed.
+    - **Remote** (``--remote``): the flight server binds publicly, so a token is
+      **required** — supplied, or else generated and printed. The control (the
+      browser UI) stays on loopback in *both* modes; it is plaintext HTTP with no
+      TLS support, so publishing it would put this very token on the wire in the
+      clear (biopb/biopb#614). Reach it from another machine over an SSH tunnel.
 
     There is no longer a "config binds publicly but no token" case to refuse: the
     bind comes from ``remote`` itself (see :func:`_plane_bind`), so the only way
@@ -1038,18 +1064,12 @@ def _control_run_argv(
     (`ps aux`, Task Manager) on exactly the multi-user hosts a token is meant to
     protect (biopb/biopb#414). It travels only via ``BIOPB_TENSOR_TOKEN`` in the
     child env (set by the caller). ``--remote`` — not a secret — is the explicit
-    public-deployment signal; it also binds the control's own listener publicly
-    (0.0.0.0) so the browser UI is reachable off-box, while the local (default)
-    mode keeps every listener on loopback.
+    public-deployment signal; it publishes the *flight* plane only. The control's
+    own listener stays on loopback in either mode (biopb/biopb#614), so
+    ``--control-host`` below is always ``_control_endpoint()``'s host.
     """
     grpc_host, grpc_port = _plane_bind(remote)
     control_host, control_port = _control_endpoint()
-    # Remote mode: bind the control's HTTP listener on all interfaces so the
-    # dashboard/dataviewer is reachable off-box (the token gates it). The starter
-    # still probes readiness over loopback, so _control_endpoint()'s host is kept
-    # only for that probe, not passed through here.
-    if remote:
-        control_host = "0.0.0.0"
     argv = [
         sys.executable,
         "-m",
@@ -1104,10 +1124,11 @@ def control_start(
     remote: bool = typer.Option(
         False,
         "--remote",
-        help="Serve on the network behind a token: bind the control (browser UI) "
-        "and the flight server publicly, and require an access token. Without it "
-        "(the default) every listener binds loopback; a token is optional (pass "
-        "--token to enforce one).",
+        help="Serve the data plane on the network behind a token: bind the "
+        "flight server publicly and require an access token. Without it (the "
+        "default) the flight server binds loopback and a token is optional (pass "
+        "--token to enforce one). The browser UI stays on loopback either way — "
+        "reach it from another machine with the ssh -L tunnel printed on start.",
     ),
     tls: bool = typer.Option(
         False,
@@ -1147,12 +1168,19 @@ def control_start(
     Two deployment modes: **local** (default) binds every listener to loopback —
     the single-machine 90% case, tokenless unless you pass ``--token`` (an
     optional defense-in-depth gate on a shared machine); and **remote**
-    (``--remote``) binds the control's browser UI and the flight server publicly
-    behind a *required* token, for serving a tensor deployment to other machines.
-    The tensor HTTP sidecar always stays on loopback (the control proxies it).
-    The flight server's bind follows this flag alone — it is no longer read from
-    ``biopb.json`` — so "public but unauthenticated" is unrepresentable rather
-    than something to validate against (biopb/biopb#604).
+    (``--remote``) binds the flight server publicly behind a *required* token,
+    for serving a tensor deployment to other machines. The flight server's bind
+    follows this flag alone — it is no longer read from ``biopb.json`` — so
+    "public but unauthenticated" is unrepresentable rather than something to
+    validate against (biopb/biopb#604).
+
+    Only the flight plane is ever published. The tensor HTTP sidecar stays on
+    loopback (the control proxies it), and so does the control itself — the
+    browser UI is plaintext HTTP with no TLS support, so publishing it would send
+    the token that unlocks the whole data and admin API in the clear, which is
+    exactly the client class ``--remote``'s TLS work set out to remove
+    (biopb/biopb#614). To open the UI from another machine, tunnel it:
+    ``ssh -L 8813:localhost:8813 <host>``, then browse http://localhost:8813.
     """
     _require_biopb_control()
     if tls:
@@ -1215,8 +1243,8 @@ def control_start(
             argv = _control_run_argv(
                 config=config,
                 static_dir=static_dir,
-                # The sidecar always binds loopback; the control proxies it. Only
-                # the control (browser UI) and flight server go public in --remote.
+                # The sidecar always binds loopback; the control proxies it. The
+                # flight server is the only listener --remote publishes.
                 web_host="127.0.0.1",
                 web_port=web_port,
                 log_level=log_level,
@@ -1267,6 +1295,8 @@ def control_start(
             else:
                 console.print("  Data plane: not started (--no-data-plane; on-demand)")
             console.print(f"  Logs: {log_file}")
+            if remote:
+                _print_ui_tunnel_hint(control_port)
     except LockTimeout:
         console.print(
             "[red]Another 'biopb control start' is already in progress and did not "
@@ -1414,9 +1444,10 @@ def control_run(
     remote: bool = typer.Option(
         False,
         "--remote",
-        help="Serve on the network behind a token (bind control + flight server "
-        "publicly). Without it every listener binds loopback; a token is optional "
-        "(pass --token to enforce one).",
+        help="Serve the data plane on the network behind a token (bind the flight "
+        "server publicly). Without it every listener binds loopback; a token is "
+        "optional (pass --token to enforce one). The browser UI stays on loopback "
+        "either way — tunnel it with ssh -L to reach it off-box.",
     ),
     tls: bool = typer.Option(
         False,
@@ -1459,10 +1490,10 @@ def control_run(
     grpc_host, grpc_port = _plane_bind(remote)
     control_host, control_port = _control_endpoint()
     resolved_token = _resolve_mode(remote, token)
-    # Remote mode binds the control's own listener publicly so the browser UI is
-    # reachable off-box; the token gates it. The sidecar always stays on loopback.
+    # --remote publishes the flight plane only; the control and the sidecar stay
+    # on loopback in either mode (biopb/biopb#614).
     if remote:
-        control_host = "0.0.0.0"
+        _print_ui_tunnel_hint(control_port)
     spec = DataPlaneSpec(
         config=config,
         grpc_host=grpc_host,
@@ -1495,7 +1526,8 @@ def dashboard(
         False,
         "--remote",
         help="If the control plane isn't already running, start it in remote mode "
-        "(bind publicly behind a token). See 'biopb control start --remote'.",
+        "(bind the flight server publicly behind a token). See 'biopb control "
+        "start --remote'.",
     ),
     no_browser: bool = typer.Option(
         False,

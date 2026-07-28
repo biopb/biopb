@@ -146,11 +146,11 @@ export default function DashboardPage() {
     }
   }, []);
 
-  // Mode-driven unlock gate. Capture a ?token= handed over by the one-time
-  // access URL, then — only in remote mode, where the control's public /health
-  // advertises auth_required — bounce to /unlock if we still have no token. Local
-  // mode advertises auth_required=false, so this never redirects. The /api/*
-  // fetchAuth 401 path is the backstop for a stale/invalid token.
+  // Token-driven unlock gate. Capture a ?token= handed over by the one-time
+  // access URL, then — only where the control's /health advertises auth_required
+  // — bounce to /unlock if we still have no token. A tokenless local deployment
+  // advertises auth_required=false, so this never redirects. The /api/* fetchAuth
+  // 401 path is the backstop for a stale/invalid token.
   useEffect(() => {
     captureUrlToken();
     setHasToken(!!getToken());

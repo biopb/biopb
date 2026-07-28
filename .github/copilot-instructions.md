@@ -68,10 +68,13 @@ For runtime/server changes, check:
 ### 6. Security posture (local/remote two-mode model)
 
 Deployment is two fail-closed modes: **local** (every listener binds loopback, no
-token — the default) and **remote** (`biopb control start --remote`: public bind
-behind a *required* token). The bind address *is* the mode, so "public +
-unauthenticated" is unrepresentable; there is no dev-mode token bypass (a `None`
-token is local mode).
+token — the default) and **remote** (`biopb control start --remote`: the *flight
+plane* binds publicly behind a *required* token). The bind address *is* the mode,
+so "public + unauthenticated" is unrepresentable; there is no dev-mode token
+bypass (a `None` token is local mode). Only the flight plane is ever published —
+the control (browser UI) and the tensor HTTP sidecar stay on loopback in both
+modes, because the control is plaintext HTTP with no TLS support; a remote
+browser tunnels in with `ssh -L 8813:localhost:8813 <host>` (biopb/biopb#614).
 
 Still flag:
 

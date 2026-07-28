@@ -347,17 +347,38 @@ class TestControlRunArgv:
         # And no generated-looking secret slipped in as a bare positional.
         assert not any("BIOPB_TENSOR_TOKEN" in a for a in argv)
 
-    def test_remote_signalled_on_argv_and_binds_control_public(self, tmp_path):
-        # --remote is not a secret, so it stays explicit on the argv; it also
-        # flips the control's own listener to a public bind.
+    def test_remote_signalled_on_argv_but_control_stays_loopback(self, tmp_path):
+        # --remote is not a secret, so it stays explicit on the argv. It publishes
+        # the *flight* plane only: the control's own listener stays on loopback
+        # (biopb/biopb#614) because it is plaintext HTTP with no TLS support, so a
+        # public bind would carry the data/admin token in the clear.
         argv = self._argv(tmp_path, remote=True)
         assert "--remote" in argv
-        assert argv[argv.index("--control-host") + 1] == "0.0.0.0"
+        assert argv[argv.index("--grpc-host") + 1] == "0.0.0.0"
+        assert argv[argv.index("--control-host") + 1] == "127.0.0.1"
 
-    def test_local_mode_has_no_remote_flag_and_loopback_control(self, tmp_path):
+    def test_local_mode_has_no_remote_flag_and_loopback_everything(self, tmp_path):
         argv = self._argv(tmp_path, remote=False)
         assert "--remote" not in argv
+        assert argv[argv.index("--grpc-host") + 1] == "127.0.0.1"
         assert argv[argv.index("--control-host") + 1] == "127.0.0.1"
+
+
+class TestUiTunnelHint:
+    """With the UI off the network, the SSH tunnel is the supported way to reach
+    it off-box -- so `--remote` prints the exact command rather than leaving it as
+    folklore (biopb/biopb#614)."""
+
+    def test_prints_a_copyable_forward_for_the_control_port(self, capsys):
+        cli._print_ui_tunnel_hint(8813)
+        out = capsys.readouterr().out
+        assert "ssh -L 8813:localhost:8813 " in out
+        assert "http://localhost:8813" in out
+
+    def test_honors_a_non_default_control_port(self, capsys):
+        cli._print_ui_tunnel_hint(19999)
+        out = capsys.readouterr().out
+        assert "ssh -L 19999:localhost:19999 " in out
 
 
 class TestResolveMode:

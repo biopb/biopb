@@ -5,14 +5,19 @@ The security-relevant behavior:
 - the access token is read from the ``BIOPB_TENSOR_TOKEN`` env var, not required
   on the argv, so `biopb control start` never puts the secret on a world-readable
   command line (biopb/biopb#414). The explicit ``--token`` flag is still honored;
+- ``--remote`` never publishes this listener (biopb/biopb#614). It says the
+  *flight* plane is public, which requires a token; the control's own bind stays
+  loopback and is published only by an explicit ``--control-host``;
 - a control listener that is reachable off-box is fail-closed on the *resolved
-  bind*: it refuses to run token-less whether it went public via ``--remote``, an
-  explicit ``--control-host <public>``, or ``BIOPB_CONTROL_HOST`` — so a public
-  control API can never come up unauthenticated. Local mode (loopback) binds
-  token-less.
+  bind*: it refuses to run token-less whether it went public via an explicit
+  ``--control-host <public>`` or ``BIOPB_CONTROL_HOST``, and ``--remote`` refuses
+  token-less too — so a public control API can never come up unauthenticated.
+  Local mode (loopback) binds token-less.
 """
 
 from unittest.mock import patch
+
+from biopb import _web_auth
 
 import biopb_control.__main__ as m
 
@@ -86,16 +91,26 @@ def test_local_mode_binds_control_loopback():
     assert kwargs["control_host"] != "0.0.0.0"
 
 
-def test_remote_binds_control_public():
+def test_remote_keeps_control_loopback():
+    """--remote publishes the flight plane, not this listener (biopb/biopb#614).
+
+    The control serves plaintext HTTP with no TLS support, so binding it publicly
+    would put the data-plane token — which unlocks the data *and* admin API — on
+    the wire in the clear. The browser reaches it through an SSH tunnel instead.
+    """
     rc, _, kwargs = _capture(
         _BASE_ARGV + ["--remote"], {"BIOPB_TENSOR_TOKEN": "s3cret"}
     )
     assert rc == 0
-    assert kwargs["control_host"] == "0.0.0.0"
+    assert not _web_auth.host_is_public_bind(kwargs["control_host"])
 
 
 def test_remote_without_token_is_fail_closed():
-    """--remote with no token anywhere must refuse (never serve public + open)."""
+    """--remote with no token anywhere must refuse (never serve public + open).
+
+    Still refused now that --remote leaves *this* listener on loopback: the flag
+    means the flight plane is public, and that plane must never be unauthenticated.
+    """
     rc, spec, _ = _capture(_BASE_ARGV + ["--remote"], {})
     assert rc == 2
     assert spec is None  # run_control never reached
@@ -119,7 +134,12 @@ def test_public_control_host_via_env_without_token_is_fail_closed():
 
 
 def test_public_control_host_with_token_starts():
-    """A public control bind is fine once a token is present."""
+    """A public control bind is fine once a token is present.
+
+    This is now the *only* way to publish the UI (biopb/biopb#614): a deliberate,
+    named act, for an operator fronting it with their own TLS proxy. `--remote`
+    no longer does it implicitly.
+    """
     rc, _, kwargs = _capture(
         _BASE_ARGV + ["--control-host", "0.0.0.0"],
         {"BIOPB_TENSOR_TOKEN": "s3cret"},

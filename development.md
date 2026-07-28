@@ -50,19 +50,32 @@ loopback listeners too (the browser then gates behind the unlock page, exactly a
 in remote). A local token is a supported mode — the control hands its credential
 to local clients on the filesystem (see the credential handoff below); one
 residual UI gap is noted there. `biopb control start
---remote` runs **remote mode**: the control's browser UI *and* the flight server
-bind publicly behind a **required** token (supplied via `--token` /
-`BIOPB_TENSOR_TOKEN`, else generated and printed), the sidecar stays on loopback
-(the control proxies it), and the browser UI gates itself behind an unlock page
-(driven by the control's public `GET /health` → `auth_required`). Token
-enforcement is thus **independent** of the network mode; what `--remote` fixes is
-the *bind address*. The one invariant is **fail-closed** — a public listener is
-never left unauthenticated: `--remote` refuses to run without a token, and local
-mode refuses to start if the config binds the flight server publicly *and* no
-token is supplied, so "public + unauthenticated" is unrepresentable. The one
-policy lives in the stdlib-only `biopb._web_auth` predicates that the control and
-the sidecar both bind to (so they cannot drift); there is no separate "dev-mode"
-token bypass.
+--remote` runs **remote mode**: the **flight server** binds publicly behind a
+**required** token (supplied via `--token` / `BIOPB_TENSOR_TOKEN`, else generated
+and printed), and the browser UI gates itself behind an unlock page (driven by
+the control's `GET /health` → `auth_required`). Token enforcement is thus
+**independent** of the network mode; what `--remote` fixes is the *bind address*.
+The one invariant is **fail-closed** — a public listener is never left
+unauthenticated: `--remote` refuses to run without a token, and the flight bind
+follows the flag alone (not `biopb.json`), so "public + unauthenticated" is
+unrepresentable rather than validated against. The one policy lives in the
+stdlib-only `biopb._web_auth` predicates that the control and the sidecar both
+bind to (so they cannot drift); there is no separate "dev-mode" token bypass.
+
+**Only the flight plane is ever published** (biopb/biopb#614). The tensor HTTP
+sidecar stays on loopback (the control proxies it), and so does the *control*
+itself — in remote mode too. The control has no TLS support at all, so publishing
+it would send the data-plane token — which unlocks the whole data *and* admin API
+— in cleartext, re-introducing exactly the client class `--remote`'s TLS work
+(#604) set out to remove: the browser should only ever talk to its own loopback
+origin and never need to trust the remote's cert. To open the UI from another
+machine, tunnel it — `ssh -L 8813:localhost:8813 <host>`, encrypted and
+authenticated for free, no new listener, the pattern Jupyter users already know —
+which `control start --remote` prints at startup. Publishing the UI anyway is
+still possible for someone fronting it with their own TLS proxy, but only as the
+deliberate, named act of passing a public `--control-host` (or
+`BIOPB_CONTROL_HOST`) to `python -m biopb_control run`; that path is fail-closed
+on the *resolved bind*, so it too refuses to come up token-less.
 
 **The local credential handoff** (biopb/biopb#470). Credential distribution is off
 the HTTP API and on the filesystem, the standard local-daemon pattern (Jupyter's
