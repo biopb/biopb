@@ -388,10 +388,22 @@ def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
     """Best-effort gRPC endpoint + token for a running server's health query.
 
     Always loopback: a plane bound to 0.0.0.0/:: is reachable there too, and
-    these probes only ever ask about a plane on this machine. The token comes
-    from BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
+    these probes only ever ask about a plane on this machine. That is why the
+    bind passed to :func:`_probe_hostport` is the loopback literal rather than a
+    resolved ``--grpc-bind`` -- the probe normalizes every public bind to
+    loopback anyway, so the address cannot change the answer and only the base
+    port can. The token comes from BIOPB_TENSOR_TOKEN if set -- localhost-only
+    daemons run without one.
+
+    Assumes the *default* base port, so it finds a plane only where a default
+    deployment puts one. That is the standing limitation tracked in
+    biopb/biopb#615, which replaces this reconstruction with asking the control
+    (whose ``/health`` snapshot carries the endpoint *and* the scheme) and
+    falling back to the state dir; the scheme and the token are hardcoded here
+    for the same reason. Left as-is here deliberately: this restores the
+    behavior #618 broke without pre-empting that design.
     """
-    host, port = _probe_hostport(remote=False)
+    host, port = _probe_hostport("127.0.0.1", _endpoints.BASE_DEFAULT_PORT)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
     return f"grpc://{host}:{port}", token
 
