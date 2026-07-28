@@ -298,6 +298,14 @@ class UploadSession:
     ) -> Dict[str, Any]:
         """Poll upload status until the source reports READY.
 
+        Applies only to sources created by ``create_source()`` /
+        ``upload_array()``. A source the server tracks no upload for reports
+        UNKNOWN, and that is rejected on the first poll rather than waited out:
+        either the source was never an upload target (a catalog source, on disk
+        or in the cloud, has no upload to wait for), or its record was dropped
+        when the source was removed or the server restarted. Neither reading
+        resolves by polling.
+
         Args:
             source_id: Source identifier returned by create_source().
             timeout_seconds: Maximum time to wait before timing out.
@@ -307,6 +315,7 @@ class UploadSession:
             Final upload status dictionary when READY.
 
         Raises:
+            ValueError: If the server tracks no upload for the source (UNKNOWN).
             TimeoutError: If the upload does not reach READY within the timeout.
             RuntimeError: If the upload reports FAILED.
         """
@@ -316,6 +325,17 @@ class UploadSession:
             state = status.get("state")
             if state == "READY":
                 return status
+            if state == "UNKNOWN":
+                # Nothing to wait for, so fail now instead of polling to the
+                # timeout (biopb/biopb#109). The server records upload progress
+                # when create_source() hands out the id, so UNKNOWN never means
+                # "not started yet" -- it means there is no upload record at
+                # all, which no amount of polling will change.
+                raise ValueError(
+                    f"The server tracks no upload for source '{source_id}' "
+                    "(not an upload target, or its record was dropped by a "
+                    "server restart or source removal)."
+                )
             if state == "FAILED":
                 raise RuntimeError(f"Upload failed for source '{source_id}'")
             if time.monotonic() >= deadline:
