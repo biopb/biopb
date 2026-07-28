@@ -890,11 +890,33 @@ class SourceManager:
         self._upstream_config_errors[url] = message
         logger.error(
             "Upstream %s is MISCONFIGURED, not unreachable: %s. Its catalog is "
-            "kept as-is and re-listing continues at the slow cadence, but it "
-            "cannot succeed until the configuration is corrected.",
+            "kept as-is; correct the configuration and the next re-list picks it "
+            "up -- but that is now up to %d rescan ticks away, not the next one, "
+            "because a config error cannot fix itself between ticks.",
+            url,
+            message,
+            self._upstream_max_period,
+        )
+
+    def _clear_upstream_config_error(self, url: str) -> bool:
+        """Note that a previously misconfigured upstream now resolves.
+
+        Returns whether one was cleared, so the caller can restore the fast
+        cadence with it. The recovery is logged because the failure was: an
+        operator who fixed the config saw an error telling them it could be up to
+        an hour before anything happens, and needs the other half of that
+        sentence -- that the edit took, and when (biopb/biopb#608).
+        """
+        message = self._upstream_config_errors.pop(url, None)
+        if message is None:
+            return False
+        logger.warning(
+            "Upstream %s is configured correctly again (was: %s); re-listed and "
+            "back on the fast cadence.",
             url,
             message,
         )
+        return True
 
     def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
         """Re-list one upstream and set its next-due period from the outcome."""
@@ -925,8 +947,11 @@ class SourceManager:
             )
             return
         self._failed_upstreams.discard(upstream.url)
-        self._upstream_config_errors.pop(upstream.url, None)
-        if changed:
+        recovered = self._clear_upstream_config_error(upstream.url)
+        if changed or recovered:
+            # Recovery is a state change like any other: this upstream was parked
+            # at the slow cadence *because* it was broken, so leaving it there
+            # once it works would make the next real change up to an hour late.
             state["period"] = 1  # the catalog moved -> stay fast
         else:
             # Stable -> back off (double, capped at full_rescan_interval).
@@ -960,7 +985,7 @@ class SourceManager:
                 )
             else:
                 self._failed_upstreams.discard(upstream.url)
-                self._upstream_config_errors.pop(upstream.url, None)
+                self._clear_upstream_config_error(upstream.url)
 
     def add_local_source(
         self,

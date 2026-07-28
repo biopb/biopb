@@ -203,9 +203,13 @@ read or is empty — is the one failure the fast cadence must *not* apply to: it
 will fail identically until an operator edits the config, so re-reading the same
 broken file every tick is pure waste under a log line that says "unreachable".
 It backs the upstream off to the maximum period instead, and is reported once
-(re-reported when the error text changes) as a config error. The serve-path
-expansion (`resolve_all_sources(tolerant=True)`) and the adapter-build site
-likewise still skip the source, but name it as configuration.
+(re-reported when the error text changes) as a config error naming how long that
+back-off is. **Recovery is reported too, and resets the cadence to every-tick** —
+parking a broken upstream for an hour is only reasonable if the operator learns
+that their edit took, and an unchanged catalog on the first good re-list would
+otherwise leave it parked there. The serve-path expansion
+(`resolve_all_sources(tolerant=True)`) and the adapter-build site likewise still
+skip the source, but name it as configuration.
 
 **Unreachable upstream.** A proxy "resolve" is a cheap reconnect, not a cloud
 download, so recovery is **transparent** (no `UnresolvedSourceAdapter` consent

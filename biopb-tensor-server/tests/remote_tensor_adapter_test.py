@@ -1630,9 +1630,60 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
         assert state["period"] == manager._upstream_max_period
         assert state["countdown"] == manager._upstream_max_period
         assert upstream.url in manager._failed_upstreams
-        # ...and the operator is told it is config, not connectivity.
+        # ...and the operator is told it is config, not connectivity, *and* how
+        # long the back-off means they will wait after fixing it.
         assert "MISCONFIGURED" in caplog.text
         assert "tls_ca_file" in caplog.text
+        assert str(manager._upstream_max_period) in caplog.text
+
+    def test_a_fixed_config_is_reported_and_the_fast_cadence_returns(
+        self, tmp_path, caplog
+    ):
+        """The other half of the back-off message.
+
+        Parking a broken upstream at the slow period is only reasonable if the
+        operator learns when their edit took effect -- otherwise the fix is
+        followed by up to an hour of silence indistinguishable from still being
+        broken. Recovery also has to restore the fast cadence: this upstream is
+        slow *because* it was broken, and an unchanged catalog on the first good
+        re-list would otherwise leave it parked there.
+        """
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+            assert (
+                manager._upstream_relist[upstream.url]["period"]
+                == manager._upstream_max_period
+            )
+
+            # The edit lands and the re-list gets through, finding nothing new.
+            # Stubbed at the reconcile seam because what is under test is the
+            # scheduler's reaction to recovery, not the dial itself.
+            manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert "configured correctly again" in caplog.text
+        assert manager._upstream_relist[upstream.url]["period"] == 1
+        assert upstream.url not in manager._failed_upstreams
+
+    def test_a_healthy_upstream_does_not_announce_a_recovery(self, caplog):
+        """Nothing was broken, so there is nothing to report -- and the ordinary
+        back-off must still apply."""
+        manager, upstream, proxy = self._manager(_creds(token="fine"))
+        manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+        try:
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert caplog.text == ""
+        assert manager._upstream_relist[upstream.url]["period"] == 2  # 1 -> doubled
 
     def test_an_unreachable_upstream_still_retries_fast(self):
         """The control case: don't broaden the new branch into the old one."""
