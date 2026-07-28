@@ -346,31 +346,51 @@ prints the fingerprint a client will pin. `--tls-cert`/`--tls-key` serve a BYO c
 instead. The cert machinery lives beside the token machinery (`core/tls.py`),
 *not* in the control plane, so case 2 (no control installed) works.
 
-**Pinning is the trust anchor; the SANs still have to match.** gRPC keeps
+**Pinning is the trust anchor; the SANs are a separate check.** gRPC keeps
 hostname verification on, so the name a client dials must appear in the cert's
 SANs — pinning only replaces the *CA*, not the name check. `collect_san_hosts()`
 enumerates what the host can see about itself (`localhost`, hostname/FQDN,
 loopback, the primary outbound IP, `getaddrinfo` results), which misses a name
 that lives elsewhere: a NAT/VPN address, a CNAME, a reverse-proxy hostname. That
-case pins fine and *then* fails every handshake, so it gets explicit handling at
-both ends — `--san NAME` (repeatable, on `cert init` and `serve --tls`; applies
-only when the cert is generated, hence `cert init --force --san …` to widen an
-existing one), and a client-side probe that logs the exact name and the
-`cert init --force --san` fix instead of leaving an opaque TLS error. The probe is
-diagnostic only: any outcome other than a definite hostname mismatch is silent, so
-it can never break a working connection.
+case pins fine and *then* fails every handshake. The server side fixes it with
+`--san NAME` (repeatable, on `cert init` and `serve --tls`; applies only when the
+cert is generated, hence `cert init --force --san …` to widen an existing one).
+
+The client side removes the ceremony entirely (biopb/biopb#606): when the dialed
+name is missing from the SANs, `_tls` verifies against a name the cert *does*
+list, via `override_hostname` (gRPC's `ssl_target_name_override`). This costs no
+security **because the anchor is the leaf** — the presented cert must be
+byte-identical to the pinned one, so there is no "different but validly-issued
+cert" left for a name check to exclude. It is gated on exactly that (`presented
+DER == anchor DER`), not on which resolution mode is in play: pin a private *CA*
+instead and any host in that PKI could impersonate any other, so a CA anchor keeps
+the name check and gets the warning. Two properties worth knowing: the chain is
+still verified (a wrong override *fails* the handshake — this is not
+`disable_server_verification`, which would make the pin decorative), and gRPC
+sends the substituted name as SNI too, so a deployment with an SNI-routing
+intermediary should configure an explicit anchor (`tls_ca_pem`), which never
+derives an override. When no usable name exists the old diagnostic stands, naming
+the mode's own fix. Deciding *whether* the dialed name is covered is left to
+OpenSSL (one verifying handshake) rather than compared by hand — it is what
+already implements wildcards, IP SANs and the rest, and a naive membership test
+would override certs that in fact match. The second handshake that reads the SANs
+runs only on the already-broken path.
 
 TOFU resolution is **memoized per process** keyed by `host:port` *and* the
 configured trust material (a caller may supply an explicit CA or fingerprint —
 see *Per-upstream credentials* below — and one process fronting two upstreams at
-the same address must not serve one's anchor to the other)
-(`_tls.clear_pin_cache()` drops it). The call sites evaluate it eagerly on paths
+the same address must not serve one's anchor to the other). That key (`TlsTrust.
+key_id`) is also part of the connection pool's key, so the two partition the world
+identically and a shared `host:port` cannot serve one upstream the other's
+connection. The call sites evaluate it eagerly on paths
 that usually reuse an already-open pooled connection, so without the memo every
 `GetFlightInfo` would open a throwaway TLS handshake just to re-derive a value it
 already had — and a momentary failure of *that* side handshake would fail a call
 the healthy pooled connection could have served. The consequence is that a cert
 rotation is detected at process start, not mid-run; that matches the ceremony a
 mismatch requires anyway (confirm, clear the pin, reconnect).
+`_tls.clear_pin_cache()` drops the memo but *not* the pooled clients already built
+with the old anchor, so it is for tests, not an in-process rotation hatch.
 
 `cryptography` (the cert generator) is an **opt-in `[tls]` extra**, deliberately
 kept out of the default install closure: it drags a Rust/OpenSSL build surface

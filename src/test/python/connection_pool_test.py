@@ -525,3 +525,62 @@ class TestConnectionRegistryStructure:
         # The structure is: thread_id -> {(location, token): FlightClient}
         # We can verify the structure by looking at the type
         # (without adding actual connections)
+
+
+class TestTrustKeyedPool:
+    """The per-thread client pool keys on the resolved TLS trust (#606).
+
+    The anchor is *not* a function of the location: one process can front two
+    upstreams naming the same ``host:port`` under different configured anchors
+    (#604 item 4), and each carries its own hostname override. Keying on
+    ``(location, token)`` alone would hand one upstream a connection built with
+    the other's trust -- and, with the override in play, with the other's name
+    check suppressed.
+    """
+
+    @staticmethod
+    def _built_with(monkeypatch):
+        """Record the kwargs every FlightClient in the pool is constructed with."""
+        built = []
+
+        def _fake_client(location, **kwargs):
+            built.append((location, kwargs))
+            return MagicMock(spec=flight.FlightClient)
+
+        monkeypatch.setattr(pool_module.flight, "FlightClient", _fake_client)
+        monkeypatch.setattr(pool_module._THREAD_LOCAL, "clients", {}, raising=False)
+        return built
+
+    def test_distinct_trust_gets_distinct_clients(self, monkeypatch):
+        built = self._built_with(monkeypatch)
+        loc = "grpc+tls://host:8815"
+        a = pool_module.TlsTrust(b"pem-a", None, "host:8815|aaa|-")
+        b = pool_module.TlsTrust(b"pem-b", "alt.example", "host:8815|bbb|-")
+
+        first = pool_module._get_thread_client(loc, None, a)
+        second = pool_module._get_thread_client(loc, None, b)
+
+        assert first is not second
+        assert len(built) == 2
+        assert built[0][1]["tls_root_certs"] == b"pem-a"
+        assert "override_hostname" not in built[0][1]
+        assert built[1][1]["override_hostname"] == "alt.example"
+
+    def test_same_trust_reuses_the_connection(self, monkeypatch):
+        built = self._built_with(monkeypatch)
+        trust = pool_module.TlsTrust(b"pem-a", "alt.example", "host:8815|aaa|-")
+
+        first = pool_module._get_thread_client("grpc+tls://host:8815", None, trust)
+        second = pool_module._get_thread_client("grpc+tls://host:8815", None, trust)
+
+        assert first is second
+        assert len(built) == 1
+
+    def test_plaintext_passes_no_tls_kwargs(self, monkeypatch):
+        built = self._built_with(monkeypatch)
+        pool_module._get_thread_client("grpc://host:8815", None, None)
+        pool_module._get_thread_client("grpc://host:8816", None, pool_module.NO_TLS)
+        assert len(built) == 2
+        for _, kwargs in built:
+            assert "tls_root_certs" not in kwargs
+            assert "override_hostname" not in kwargs
