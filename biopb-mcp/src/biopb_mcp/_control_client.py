@@ -32,6 +32,24 @@ def _base_url() -> str:
     return control_base_url()
 
 
+def _auth_headers() -> dict[str, str]:
+    """Authorization headers for a gated control ``/api/*`` request.
+
+    The control writes the resolved data-plane token to an owner-only file in the
+    user's state dir (biopb/biopb#470); we read it there so ``_control_client`` can
+    authenticate to a token-gated control instead of hoping the token reached this
+    process's environment. Carrying the token *also* clears the CSRF gate on the
+    POST (a request presenting a token header is not a forgeable cross-site one),
+    and it is what let ``/api/data_plane/ensure`` drop its auth exemption (#424
+    item 2). ``{}`` when no credential exists — the tokenless-local case, where the
+    control's gate falls back to a loopback-``Host`` check and the bare POST passes.
+    """
+    from biopb._credentials import read_credential
+
+    token = read_credential()
+    return {"X-Biopb-Token": token} if token else {}
+
+
 def control_reachable(timeout: float = 1.0) -> bool:
     """Whether the control's control API answers ``GET /health``."""
     try:
@@ -88,7 +106,7 @@ def ensure_data_plane(timeout: float = 60.0) -> dict | None:
     url = (
         f"{_base_url()}/api/data_plane/ensure?{urlencode({'client_timeout': timeout})}"
     )
-    req = urllib.request.Request(url, data=b"", method="POST")
+    req = urllib.request.Request(url, data=b"", method="POST", headers=_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())

@@ -19,41 +19,24 @@ import pyarrow.flight as flight
 
 # The pickle-safe connection/cache pool + cache-file fast path + chunk-fetch /
 # dask-array builder subsystem lives in biopb.tensor._pool (issue #278 item C).
-# Re-exported here (redundant `as` aliases mark intentional re-exports) so
-# ``biopb.tensor.client.<name>`` stays a stable import surface for existing
-# callers: biopb-mcp's ``configure_cache`` dask worker plugin, the cachefile /
-# connection-pool tests, and the benchmarks. A few (``_build_dask_array_from_
-# chunk_map``, ``_CACHE_POOL``, ``_resolve_cache_bytes``) are also used directly
-# by TensorFlightClient below.
+# Import only what TensorFlightClient uses directly below, plus ``configure_cache``
+# -- re-exported (redundant `as` alias) for biopb-mcp's dask worker-init plugin,
+# which pins each worker's cache budget via ``biopb.tensor.client.configure_cache``.
+# The rest of _pool's internals are deliberately NOT re-exported here: their tests
+# and benchmarks import them from ``biopb.tensor._pool`` directly. A client
+# re-export would be a footgun -- ``_reset_pools_after_fork`` rebinds the module's
+# locks (``_POOL_LOCK`` etc.), so a name bound here at import time goes stale after
+# a fork, and patching a re-export never lands on the binding _pool actually
+# resolves.
 from biopb.tensor._pool import (
-    _CACHE_POOL as _CACHE_POOL,
-    _CACHEFILE_SUPPORTED_FORMAT as _CACHEFILE_SUPPORTED_FORMAT,
-    _CALL_OPTS_POOL as _CALL_OPTS_POOL,
-    _CONNECTION_REGISTRY as _CONNECTION_REGISTRY,
-    _POOL_LOCK as _POOL_LOCK,
-    _REGISTRY_LOCK as _REGISTRY_LOCK,
-    _THREAD_LOCAL as _THREAD_LOCAL,
-    _array_from_unified_batch as _array_from_unified_batch,
-    _build_dask_array_from_chunk_map as _build_dask_array_from_chunk_map,
-    _cache_local_enabled as _cache_local_enabled,
-    _cachefile_support as _cachefile_support,
-    _cachefile_support_lock as _cachefile_support_lock,
-    _cachefile_supported as _cachefile_supported,
-    _cleanup_connection_pool as _cleanup_connection_pool,
-    _evict_dead_threads as _evict_dead_threads,
-    _fetch_chunk_block as _fetch_chunk_block,
-    _fetch_chunk_distributed as _fetch_chunk_distributed,
-    _get_shared_cache as _get_shared_cache,
-    _get_shared_call_options as _get_shared_call_options,
-    _get_thread_client as _get_thread_client,
-    _get_worker_resources as _get_worker_resources,
-    _is_cachefile_disabled_by_env as _is_cachefile_disabled_by_env,
-    _is_localhost_location as _is_localhost_location,
-    _regular_grid_chunks as _regular_grid_chunks,
-    _resolve_cache_bytes as _resolve_cache_bytes,
-    _set_cachefile_supported as _set_cachefile_supported,
-    _should_try_cachefile as _should_try_cachefile,
-    _try_cachefile_transfer as _try_cachefile_transfer,
+    _CACHE_POOL,
+    _VIEW_CACHE,
+    _build_call_options,
+    _build_dask_array_from_chunk_map,
+    _chunk_map_from_endpoints,
+    _clear_view_cache,
+    _default_cache_bytes,
+    _resolve_cache_bytes,
     configure_cache as configure_cache,
 )
 from biopb.tensor._session import (
@@ -169,16 +152,21 @@ class TensorFlightClient:
     def __init__(
         self,
         location: str = "grpc://localhost:8815",
-        cache_bytes: int = 1_000_000_000,  # 1GB default
+        cache_bytes: Optional[int] = None,
         token: Optional[str] = None,
     ):
         """Initialize the Flight client.
 
         Args:
             location: Flight server location
-            cache_bytes: Maximum bytes for chunk cache (default 1GB)
+            cache_bytes: Maximum bytes for the chunk cache. ``None`` (the default)
+                resolves ``BIOPB_TENSOR_CACHE_LIMIT`` (a size string like ``"2GiB"``,
+                or a bare byte count) and falls back to 1 GB; a value passed here
+                overrides the env. ``0`` disables the cache.
             token: Bearer token for server authentication.  ``None`` disables auth.
         """
+        if cache_bytes is None:
+            cache_bytes = _default_cache_bytes()
         logger.info(
             f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}"
         )
@@ -189,13 +177,7 @@ class TensorFlightClient:
         self._token = token
         self._cache_bytes = cache_bytes
         self._client = flight.FlightClient(normalized)
-        self._call_options = (
-            flight.FlightCallOptions(
-                headers=[(b"authorization", f"Bearer {token}".encode())]
-            )
-            if token
-            else flight.FlightCallOptions()
-        )
+        self._call_options = _build_call_options(token)
         # The connection + the two catalog caches live in one shared _ClientState.
         # The collaborators (#278 item C) read/write it; this facade exposes the
         # caches back-compatibly via the _sources/_descriptors properties below.
@@ -265,9 +247,20 @@ class TensorFlightClient:
         """See :meth:`CatalogClient._fetch_tensor_descriptor`."""
         return self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
 
-    def get_descriptor(self, array_id: str) -> TensorDescriptor:
+    def get_descriptor(
+        self,
+        array_id: str,
+        with_metadata: bool = False,
+        with_pyramid: bool = True,
+        with_read_plan: bool = False,
+    ) -> TensorDescriptor:
         """Fetch one tensor's descriptor by array_id. See :meth:`CatalogClient.get_descriptor`."""
-        return self._catalog.get_descriptor(array_id)
+        return self._catalog.get_descriptor(
+            array_id,
+            with_metadata=with_metadata,
+            with_pyramid=with_pyramid,
+            with_read_plan=with_read_plan,
+        )
 
     def resolve(
         self,
@@ -369,7 +362,7 @@ class TensorFlightClient:
     @staticmethod
     def tensor_from_pb(
         pb: SerializedTensor,
-        cache_bytes: int = 1_000_000_000,
+        cache_bytes: Optional[int] = None,
     ) -> da.Array:
         """Reconstruct a lazy dask array from SerializedTensor protobuf.
 
@@ -384,14 +377,18 @@ class TensorFlightClient:
 
         Args:
             pb: SerializedTensor protobuf object
-            cache_bytes: Maximum bytes for chunk cache (default 1GB).
-                Only effective for the first tensor created in a process
-                for a given (location, auth_token) pair.
+            cache_bytes: Maximum bytes for the chunk cache. ``None`` (the default)
+                resolves ``BIOPB_TENSOR_CACHE_LIMIT`` (or 1 GB); a value passed
+                here overrides the env. Only effective for the first tensor
+                created in a process for a given (location, auth_token) pair.
 
         Returns:
             dask.array with lazy chunk loading
         """
         import pickle
+
+        if cache_bytes is None:
+            cache_bytes = _default_cache_bytes()
 
         # Debug path: unpickle directly if debug_pickled_array is present
         if pb.debug_pickled_array:
@@ -415,25 +412,11 @@ class TensorFlightClient:
             logger.debug("tensor_from_pb: endpoints empty, calling GetFlightInfo")
             chunks, chunk_bounds_list = _fetch_endpoints_via_get_flight_info(pb)
 
-        # Build chunk map
-        chunk_map = {}
-        axis_starts = [
-            sorted({int(bounds.start[axis]) for bounds in chunk_bounds_list})
-            for axis in range(len(shape))
-        ]
-        axis_index_maps = [
-            {start: index for index, start in enumerate(starts)}
-            for starts in axis_starts
-        ]
-        for chunk_id, bounds in zip(chunks, chunk_bounds_list, strict=True):
-            chunk_idx = tuple(
-                axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
-            )
-            chunk_map[chunk_idx] = (chunk_id, bounds)
-
-        # Build dask array with lazy chunk fetching
-        ndim = len(shape)
-        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
+        # Build the block-index -> (chunk_id, bounds) map + grid shape for lazy
+        # chunk fetching (shared with ChunkFetcher._build_dask_array).
+        chunk_map, grid_shape = _chunk_map_from_endpoints(
+            chunks, chunk_bounds_list, shape
+        )
 
         # Extract schema_metadata from pb for SHM transfer
         schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
@@ -598,35 +581,58 @@ class TensorFlightClient:
         )
 
     def cache_info(self) -> Dict:
-        """Return cache statistics from the pooled cache for this connection.
+        """Return cache statistics for this connection.
+
+        The ``size_bytes``/``max_bytes``/``item_count`` fields describe the
+        **strong** copy cache (cachey) -- ``do_get`` results and over-budget
+        copies, the only chunks that cost client RAM. mmap views live in the weak
+        view cache, which costs no RAM and has no byte budget; ``view_items``
+        reports how many are currently live (a lower bound -- entries self-prune
+        as their arrays are collected).
 
         Returns:
-            Dictionary with cache size and item count
+            Dictionary with copy-cache size/item_count plus ``view_items``.
         """
         key = (self._location, self._token)
-        pool_entry = _CACHE_POOL.get(key)
-        if pool_entry is None:
-            # No cache allocated -- either nothing fetched yet, or caching is
-            # disabled for this connection (e.g. localhost). Report the resolved
-            # size so a disabled cache truthfully shows max_bytes == 0.
-            resolved = _resolve_cache_bytes(self._location, self._cache_bytes)
-            return {"size_bytes": 0, "max_bytes": resolved, "item_count": 0}
-        cache = pool_entry[1]  # Extract cache from (pid, cache) tuple
-        if cache is None:
-            # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
-            return {"size_bytes": 0, "max_bytes": 0, "item_count": 0}
+        wvd = _VIEW_CACHE.get(key)
+        view_items = len(wvd) if wvd is not None else 0
+
+        # Describe the strong copy cache only; the weak view cache is reported
+        # separately via view_items.
+        if key not in _CACHE_POOL:
+            # No copy cache allocated yet. Report the resolved size so a
+            # not-yet-created copy cache truthfully shows what it would allow.
+            size_bytes, max_bytes, item_count = (
+                0,
+                _resolve_cache_bytes(self._location, self._cache_bytes),
+                0,
+            )
+        else:
+            cache = _CACHE_POOL[key]  # Cache, or None when pinned off
+            if cache is None:
+                # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
+                size_bytes, max_bytes, item_count = 0, 0, 0
+            else:
+                size_bytes, max_bytes, item_count = (
+                    cache.total_bytes,
+                    cache.available_bytes,
+                    len(cache.data),
+                )
         return {
-            "size_bytes": cache.total_bytes,
-            "max_bytes": cache.available_bytes,
-            "item_count": len(cache.data),
+            "size_bytes": size_bytes,
+            "max_bytes": max_bytes,
+            "item_count": item_count,
+            "view_items": view_items,
         }
 
     def cache_clear(self):
-        """Clear the pooled cache for this connection namespace."""
+        """Clear both the strong copy cache and the weak view cache for this
+        connection namespace (the latter drops only weak references)."""
         key = (self._location, self._token)
-        pool_entry = _CACHE_POOL.get(key)
-        if pool_entry is not None and pool_entry[1] is not None:
-            pool_entry[1].clear()
+        cache = _CACHE_POOL.get(key)
+        if cache is not None:
+            cache.clear()
+        _clear_view_cache(self._location, self._token)
 
     def __enter__(self):
         return self

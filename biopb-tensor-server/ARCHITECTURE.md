@@ -52,7 +52,7 @@ in three collaborators it composes (biopb/biopb#278 item A):
 | Collaborator | Module | Owns |
 |---|---|---|
 | `server.sources` (`SourceRegistry`) | `source_registry.py` | the `source_id → SourceAdapter` map, the registration chokepoint (slash-free id validation), and adapter-lifecycle cleanup (close on unregister/shutdown) |
-| `server.activity` (`ActivityTracker`) | `activity.py` | in-flight heavy-read counters + last-active stamp (the precache idle signal) and the warm-in-progress guard set |
+| `server.activity` (`ActivityTracker`) | `activity.py` | in-flight heavy-read counters + last-active stamp (the precache idle signal) and the warm-in-progress guard set. Fed by every heavy read — `do_get`, `warm`, **and `chunk_locate`**: the localhost fast path *replaces* `do_get`, so leaving it untracked made the server look idle for the whole of a localhost read (biopb/biopb#548) |
 | `server.uploads` (`UploadManager`) | `upload_manager.py` | the writable-server DoPut path: source creation (`cache:`/`ome_zarr:`), polymorphic chunk writes, and the per-source upload-progress state machine |
 
 `register_source` / `unregister_source` / `flight_idle_for` / `mark_ready`
@@ -172,14 +172,14 @@ level 0 is full resolution. The client reads each advertised level via the norma
 
 ### Adapter interface
 
-Two role ABCs in `core/base.py`, and they **nest**: `TensorAdapter` subclasses
+Two role ABCs in `core/adapter_base.py`, and they **nest**: `TensorAdapter` subclasses
 `SourceAdapter`, so a tensor adapter is a source that can also serve pixels
 (biopb/biopb#380). Every concrete format adapter subclasses `TensorAdapter` and
 fills both roles in one object — `get_tensor_adapter()` returns `self` for a
 single-tensor format, and a clone of the same class (or a plain `ZarrAdapter`,
 for OME-Zarr / QPTIFF levels and HCS fields) for a multi-tensor one. The lone
 source-only adapter is `UnresolvedSourceAdapter`, which has no tensors until it
-resolves. The role *scopes* stay disjoint where they are declared — `base.py`
+resolves. The role *scopes* stay disjoint where they are declared — `adapter_base.py`
 asserts that at import time (`_SOURCE_SCOPED_API` / `_TENSOR_SCOPED_API`), so a
 tensor-scoped method can never be written onto `SourceAdapter`.
 
@@ -220,7 +220,9 @@ be justified by open cost.
 | Open cost | Policy | Adapters |
 |---|---|---|
 | O(1) in file size (~0.05–0.1 ms, <0.3% of a 64 MB chunk read) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
-| O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`; `ome-tiff` additionally reaps an idle store (`BIOPB_TIFF_STORE_TTL`) | `ome-tiff`, `qptiff`, `ndtiff` |
+| O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`, and a shared idle reaper closes the handle between reads so the pin is *bounded*, not lifetime-long (TTL from `[server] handle_reaper_ttl`, default 150 s) | `ome-tiff`, `qptiff`, `ndtiff` |
+
+The reaper is one small opt-in utility, `adapters/_handle_reaper.py` (`IdleHandleReaper`): the second-row adapters register the handle on open and expose the `ReapableHandle` contract (`_io_lock`, `_active_reads`, `_persistent_last_access`, `_release_persistent_handle`); a per-pool daemon thread closes any handle idle past its TTL, fenced against an in-flight read, and the next read reopens transparently. `close()` (teardown) and the reaper (steady state) share the one release hook. (`qptiff` keeps a persistent handle + `close()` but is not yet wired to the reaper — its multi-level store pool would register per level.)
 
 `close()` is **declared on `SourceAdapter`** with a concrete no-op default (and
 classified in `_SOURCE_SCOPED_API`, so adding it had to be a deliberate interface
@@ -239,6 +241,19 @@ hook could not see the omission.
 adapter. The default backend is an in-process LRU memory cache
 (`OrderedDict`-based, in `cache/memory_backend.py`).
 An optional `ArrowFileBackend` persists decoded chunks to disk.
+
+**Local-disk gate (biopb/biopb#571).** The file backend mmaps its segments (for
+its own segment reads/boot index and the localhost client fast path) and assumes
+local-POSIX semantics — an unlinked-but-mapped inode survives to last close, a
+mapped page never vanishes. A **network** (`nfs`/`cifs`/…) or **cloud
+Files-On-Demand** (`OneDrive`/`iCloud`/`Dropbox`) `cache_dir` breaks that (mmap
+SIGBUS/ESTALE on an evicted segment; a recall stall on a dehydrated one). So the
+launcher classifies the configured `file_cache_dir` **once at startup**
+(`core/fs_detect.py` — Linux `/proc/self/mountinfo`, Windows `GetDriveTypeW`/UNC,
+macOS `statfs`, plus cloud-root path heuristics; all metadata-only, never
+raising, and demoting **only on a positive signal**) and falls back to the
+**memory backend** when the dir isn't plain local disk — which also disables the
+client fast path for free (a memory backend never locates a chunk).
 
 **Sidecar boot index (biopb/biopb#300).** Each sealed segment `seg_NNNN.arrow`
 gets a `seg_NNNN.idx` sidecar written at seal time (natural rotation and
@@ -305,26 +320,34 @@ See **[docs/http-server.md](docs/http-server.md)** for the full endpoint table, 
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
 
-# for grpc only (no web server)
-biopb-tensor-server serve ...
+# for grpc only (no web server) — same flight options + token handling as launch
+biopb-tensor-server serve --config biopb.json [--host 0.0.0.0] [--port 8815] [--writable]
 ```
 
-Startup sequence:
+`serve` and `launch` share the Flight-server flags (`--host`/`--port`/`--writable`
+override the config bind; `--token`/`--log-level`/`--log-file`) and the same
+fail-closed token resolution (`_resolve_flight_token`). `launch` adds the HTTP
+sidecar (`--web-host`/`--web-port`/`--cors`) and layers the sidecar fail-closed
+check on top (`_resolve_launch_token`).
 
-1. Decide whether a token is enforced from the config's `server.host`: a
-   loopback `server.host` runs tokenless (**local mode**); a public
-   `server.host` (`0.0.0.0`/`::`/a real IP) **requires** a token (**remote
-   mode**).
+Startup sequence (`launch`):
+
+1. Decide whether a token is enforced from the effective flight bind (`--host`
+   override, else config `server.host`): a loopback bind runs tokenless (**local
+   mode**); a public bind (`0.0.0.0`/`::`/a real IP) **requires** a token
+   (**remote mode**).
 2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var →
-   `secrets.token_urlsafe(32)` auto-generated (public `server.host` only; local
-   mode uses no token). No interactive prompt.
+   `secrets.token_urlsafe(32)` auto-generated (public flight bind only; local
+   mode uses no token). No interactive prompt. `launch` then refuses a public
+   `--web-host` when the resolved token is `None`.
 3. Print the one-time access token (remote mode only).
 4. Load `biopb.json` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
-6. Derive CORS origins from `--web-url` (default `http://localhost:5173`) or
-   explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
+6. Build CORS origins: loopback variants of the sidecar's own address by
+   default (no web app is bundled here), plus any explicit `--cors` origins for
+   a browser app served elsewhere.
 7. Call `run_http_server(...)` — **blocking** uvicorn call. The sidecar is
    API-only; it serves no static assets (the control plane serves the browser UI).
 
@@ -553,10 +576,13 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | Variable | Where consumed | Purpose |
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
+| `BIOPB_TENSOR_CACHE_LIMIT` | TensorFlightClient (Python) | Default client-side chunk-cache budget when the caller passes no `cache_bytes`; a size string with common units (`2GiB`, `512MB`) or a bare byte count (parsed via `dask.utils.parse_bytes`), `0` disables the cache. Unset/unparseable → 1 GB. A constructor `cache_bytes` overrides it. |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token for remote mode (else auto-generated) |
+| `BIOPB_TENSOR_ALLOW_NO_TOKEN` | `serve`/`launch` token resolution (`_allow_no_token_from_env`) | Truthy (`1`/`true`/`yes`/`on`) forces **tokenless** operation even on a public bind — the deliberate insecure escape hatch (trusted networks only). Only takes effect when no token is supplied; auto-generation and the public-sidecar refusal both become a loud warning instead. Off by default, so the fail-closed guarantee is unchanged unless explicitly set. |
 | `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to loopback → local mode / no token (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_OMETIFF_PARALLEL_READ` | `OmeTiffAdapter.get_data` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**: reads decode under the lock, as before. |
-| `BIOPB_TIFF_STORE_TTL` | OME-TIFF store reaper | Seconds an idle OME-TIFF `aszarr` store handle is kept warm before the reaper closes it (default `300`). |
+
+The idle-handle reaper TTL is a **config** knob, not an env var: `[server] handle_reaper_ttl` (seconds, default `150`, `<= 0` disables). It applies to every opt-in adapter (OME-TIFF, NDTiff), set once at startup via `set_handle_reaper_ttl`.
 
 ---
 
@@ -567,6 +593,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
 - **Local mode** (loopback `server.host`) enforces no token — the 90% single-machine case. **Remote mode** (public `server.host`) requires a token, auto-generated if none is supplied.
 - **The HTTP sidecar bind (`--web-host`) is fail-closed too.** It has its own bind address, independent of `server.host`, and re-exposes the whole data API. So `launch` **refuses to start** if the sidecar would bind a public address (`--web-host 0.0.0.0`/a real IP) while no token is enforced — the loopback-`server.host` case, where the token resolves to `None`. "Public + unauthenticated" is unrepresentable on *either* listener, not just the flight server (`_resolve_launch_token`).
+- **The one deliberate escape hatch is `BIOPB_TENSOR_ALLOW_NO_TOKEN`** (`_allow_no_token_from_env`). Truthy, it forces tokenless operation even on a public bind — auto-generation and the public-sidecar refusal both degrade to a loud warning. It only takes effect when no token is otherwise supplied, and is **off by default**, so the fail-closed guarantee above holds unless an operator explicitly opts out for a trusted network (the host-loopback-published Docker case, where the in-container bind is `0.0.0.0` but the ports are published to `127.0.0.1`). This is *not* the old auto dev-bypass (removed in #447) — it is explicit, per-deployment, and self-announcing.
 - For Docker local mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
 - For Singularity/HPC local mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
@@ -575,22 +602,23 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
 ## Versioning
 
-The tensor server has its **own version line**, keyed to the per-package tag
-`server-v*`. Its Docker image is cut on that tag by `tensor-server-ci`, on its own
-cadence — distinct from the SDK line (`v*`, for `biopb` + `biopb-image-base`) and
-the product bundle line (`release-v*`, for mcp/control/web + the GitHub release).
-See `../docs/release-model.md`.
+The tensor server tracks the **product line**, keyed to the tag `release-v*` (the
+same line as `biopb-mcp`, `biopb-control`, and the `web/` bundle). Its wheel ships
+in the `release-v*` GitHub bundle and its Docker image is cut on the same tag by
+`tensor-server-ci` — distinct only from the SDK line (`v*`, for `biopb` +
+`biopb-image-base`). See `../docs/release-model.md`.
 
 ```
-git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
+git tags (release-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
 ```
 
-Version is derived via `setuptools_scm` with `tag_regex = "^server-v..."` (and a
-matching `git describe --match 'server-v*'`). The web JS packages instead track the
-product `release-v*` tag (`web/scripts/sync-version.js`), not this one.
+Version is derived via `setuptools_scm` with `tag_regex = "^release-v..."` (and a
+matching `git describe --match 'release-v*'`). The web JS packages track the same
+product `release-v*` tag (`web/scripts/sync-version.js`).
 
-**Docker image** (own cadence): `git tag server-v0.11.0 && git push --tags`.
-`tensor-server-ci`'s `publish` job then builds and pushes
-`biopb-tensor-server:0.11.0` (+ `:latest` for a clean X.Y.Z) to ghcr.io + Docker
-Hub. The **wheel** still ships in the `release-v*` GitHub bundle (versioned off
-this `server-v*` line), and the SDK (incl. image-base) releases on `v*`.
+**Docker image**: `git tag release-v0.11.0 && git push --tags` (the same tag that
+cuts the GitHub bundle). `tensor-server-ci`'s `publish` job then builds and pushes
+`biopb-tensor-server:0.11.0` + `:latest` to ghcr.io + Docker Hub. Only a **final**
+`release-vX.Y.Z` publishes — an rc tag (`release-v0.12.0rc1`) runs the tests and
+the image build but pushes nothing. The SDK (incl. image-base) releases
+separately on `v*`.

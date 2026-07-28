@@ -32,6 +32,11 @@ dependencies = [
     "biopb-mcp",
   ]
   tensor = [
+    # Floor verified for the tensor-server file cache's Windows zero-copy
+    # segment read (#572): it hands out mmap-aliasing batches and unlinks the
+    # segment while a caller holds one, which is safe only where
+    # MemoryMappedFile.close() frees the handle but keeps the view -- pyarrow
+    # >= 14 (measured 14-24). Keep in step with biopb-tensor-server/pyproject.
     "pyarrow >= 14.0.0",
     "dask[array] >= 2024.0.0",
     "cachey >= 0.1.0",

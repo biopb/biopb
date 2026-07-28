@@ -11,6 +11,7 @@ from biopb_tensor_server.adapters.dicom import (
     DicomSeriesAdapter,
     _derive_orientation_from_iop,
 )
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 # Every test here builds/reads DICOM via pydicom (the [dicom]/[medical] extra);
@@ -496,3 +497,35 @@ class TestDicomSeriesAdapter:
             assert metadata["series"]["num_slices"] == num_slices
             assert metadata["spatial"]["pixel_spacing_mm"] == [0.5, 0.5]
             assert metadata["patient"]["PatientID"] == "PATIENT123"
+
+
+class TestDicomContentVersion:
+    """content_version rollout to the DICOM adapters (biopb/biopb#178)."""
+
+    def test_single_file_adapter_adopts_stat_version(self):
+        import pydicom
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcm_path = Path(tmpdir) / "img.dcm"
+            create_synthetic_dicom(dcm_path)
+            ds = pydicom.dcmread(str(dcm_path))
+            adapter = DicomAdapter(ds, "src")
+            # __init__ takes _source_url from ds.filename -> stat signature.
+            assert adapter.content_version is not None
+            assert adapter.content_version == content_version_from_path(str(dcm_path))
+
+    def test_series_adapter_adopts_directory_stat_version(self):
+        from pydicom.uid import generate_uid
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            series_uid = generate_uid()
+            for i in range(3):
+                create_synthetic_dicom(
+                    Path(tmpdir) / f"slice_{i}.dcm",
+                    series_uid=series_uid,
+                    instance_number=i,
+                )
+            adapter = DicomSeriesAdapter(tmpdir, "series")
+            # A directory source versions off the dir's own mtime signal.
+            assert adapter.content_version is not None
+            assert adapter.content_version == content_version_from_path(tmpdir)

@@ -12,16 +12,16 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Tuple
 
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
-    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
     CacheStats,
     EntryState,
+    estimate_batch_bytes,
 )
 
 
@@ -63,7 +63,7 @@ class MemoryCacheBackend(CacheBackend):
 
     def _estimate_size(self, data: pa.RecordBatch) -> int:
         """Estimate size in bytes."""
-        return sum(col.nbytes for col in data.columns)
+        return estimate_batch_bytes(data)
 
     def _evict_if_needed(self, needed_bytes: int) -> None:
         """Evict entries if adding needed_bytes would exceed limits.
@@ -131,7 +131,6 @@ class MemoryCacheBackend(CacheBackend):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-        metadata: Optional[dict] = None,
     ) -> CacheEntry:
         """Get existing entry or create pending and compute.
 
@@ -163,7 +162,6 @@ class MemoryCacheBackend(CacheBackend):
                 entry = CacheEntry(
                     state=EntryState.PENDING,
                     created_at=time.time(),
-                    metadata=metadata or {},
                 )
                 self._entries[key] = entry
                 self._misses += 1
@@ -191,24 +189,7 @@ class MemoryCacheBackend(CacheBackend):
                 self._move_to_end(key)
             return entry
 
-    def get_or_compute(
-        self,
-        key: bytes,
-        compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-        metadata: Optional[dict] = None,
-    ) -> pa.RecordBatch:
-        """Convenience method: get_or_acquire then return data.
-
-        Auto-releases on error.
-        """
-        entry = self.get_or_acquire(key, compute_fn, metadata)
-        return entry.data
-
-    def start_compute(
-        self,
-        key: bytes,
-        metadata: Optional[dict] = None,
-    ) -> Tuple[CacheEntry, bool]:
+    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
         """Start compute phase - returns (entry, is_owner).
 
         is_owner=True means this thread should compute and call complete_entry.
@@ -218,7 +199,6 @@ class MemoryCacheBackend(CacheBackend):
 
         Args:
             key: Cache key bytes
-            metadata: Optional metadata for new entries
 
         Returns:
             (CacheEntry, is_owner) - is_owner indicates if caller owns computation
@@ -243,7 +223,6 @@ class MemoryCacheBackend(CacheBackend):
             entry = CacheEntry(
                 state=EntryState.PENDING,
                 created_at=time.time(),
-                metadata=metadata or {},
             )
             entry.acquire()  # Acquire for compute owner
             self._entries[key] = entry
@@ -257,22 +236,7 @@ class MemoryCacheBackend(CacheBackend):
         size_bytes: int,
     ) -> None:
         """Mark pending entry as ready."""
-        # Check for oversized chunks
-        if size_bytes > MAX_ARROW_BATCH_BYTES:
-            self._oversized_skips += 1
-            # Log warning (import at top level to avoid circular import issues)
-            import logging
-
-            logger = logging.getLogger(__name__)
-            logger.warning(
-                f"Skipping cache for oversized chunk: {size_bytes} bytes > {MAX_ARROW_BATCH_BYTES}"
-            )
-            # Still mark as ready so waiting threads get data
-            with self._lock:
-                entry = self._entries.get(key)
-                if entry is None or entry.state != EntryState.PENDING:
-                    return
-                entry.set_ready(data, size_bytes)
+        if self._skip_if_oversized(key, data, size_bytes):
             return
 
         with self._lock:

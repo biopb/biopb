@@ -19,13 +19,17 @@ happen to be `tensor-server` entries. Two user-facing wins fall out:
    MCP dask workers read the proxy's segments through the existing `chunk_locate`
    mmap fast path — **one** cache per machine in the OS page cache instead of a
    per-worker in-RAM `cachey` slice.
-2. **No client cache for local reads.** Workers point at `grpc://localhost:<proxy>`,
-   so the existing localhost rules zero out the per-worker cache automatically.
+2. **No per-worker RAM copy for local reads.** Workers point at
+   `grpc://localhost:<proxy>`, so each read is an mmap **view** cached *weakly*
+   (shared OS page-cache pages, self-evicting) rather than a strong per-worker
+   `cachey` copy — nothing is duplicated in worker RAM. (The old localhost
+   "no-cache" gate that used to zero the per-worker cache was removed; the weak
+   view cache achieves the same no-duplication outcome without disabling caching.)
 
 ### The load-bearing finding — the segment cache already wraps every adapter
 
 The proxy needs almost no new caching code. `TensorAdapter.resolve_chunk_data`
-(`core/base.py`) is a base-class method shared by every adapter that already wraps
+(`core/adapter_base.py`) is a base-class method shared by every adapter that already wraps
 `get_data(bounds)` in the cache: it caches when the chunk is scaled or the backend
 is an `ArrowFileBackend`, keying on the `chunk_id` via `get_or_acquire`. `do_get`
 (`serving/server.py`) calls `adapter.resolve_chunk_data(chunk_id,
@@ -70,7 +74,7 @@ one segment cache.
   `storage_type="biopb-tensor"` profile carrying `token` — one token per upstream,
   no bespoke `SourceConfig.token`.
 
-**Scheme/type plumbing.** `core.discovery.is_remote_url` accepts the `grpc*`
+**Scheme/type plumbing.** `core.remote.is_remote_url` accepts the `grpc*`
 schemes (else `Path("grpc://…").resolve()` mangles the url);
 `config.detect_source_type` maps `grpc*` → `"tensor-server"` before the remote-bail;
 `config.discover_sources` Case 0 auto-detects the type for a bare `grpc://` source
@@ -81,7 +85,7 @@ require an explicit `type`). `SourceConfig.type`'s `Literal` gained
 ## The adapter — a passthrough that understands nothing
 
 `RemoteTensorAdapter(SourceAdapter, TensorAdapter)` (`adapters/remote_tensor.py`),
-registered `register_with_type("tensor-server", RemoteTensorAdapter)`. **One
+registered `register(RemoteTensorAdapter, "tensor-server")`. **One
 instance per mirrored upstream source**, bound to its `(upstream_endpoint,
 upstream_source_id, alias)`, holding a lazy `TensorFlightClient(location,
 cache_bytes=0, token)`. It is format- and chunking-agnostic; the only thing it
@@ -106,13 +110,14 @@ own upstream. Multi-upstream + local sources coexist in the one flat
   `array_id`. `get_physical_scale()` is overridden to read `physical_scale` /
   `physical_unit` from the upstream `get_descriptor` (the server clears+refills
   these per `GetFlightInfo`, so the base default of `None` would silently drop them).
-- **Chunk layer** — `resolve_chunk_data(chunk_id)` (chunk_id is local): the miss
-  handler rewrites the local `chunk_id` to the upstream's via
-  `chunk.rewrite_chunk_id_array_id` (a **pure byte splice** on the length-prefixed
-  `array_id` field — bounds/ndim/scale tail untouched), forwards it to the upstream
-  `do_get` (`_upstream_record_batch`), and caches the returned `RecordBatch` under
-  the local `cache_key_for_chunk_id(chunk_id)`. Forwarding the *scaled* chunk_id
-  means the **upstream** downsamples and only the small chunk crosses the WAN.
+- **Chunk layer** — `resolve_chunk_data(chunk_id)` (chunk_id is a **proxy
+  envelope**, biopb/biopb#178 W1): the miss handler peels it
+  (`chunk.peel_proxy_envelope`) and forwards the opaque **inner** — the upstream's
+  chunk_id, carried VERBATIM, never decoded or rewritten — to the upstream `do_get`
+  (`_upstream_record_batch`), then caches the returned `RecordBatch` under the
+  envelope's own canonical key (`cache_key_for_chunk_id(chunk_id)`). Forwarding the
+  *scaled* inner means the **upstream** downsamples and only the small chunk crosses
+  the WAN.
 
 For this slice `get_read_plan` is the **inherited uniform-grid planner** — correct
 because a scaled chunk_id forwarded upstream is downsampled there regardless of what
@@ -234,12 +239,13 @@ remote server" workflow redirects to an "add a proxied source" affordance.
 
 Reconfiguring the local server's `sources` (including proxied remotes) plus
 cache/pyramid/server knobs is exposed through the **web-app admin surface**, not a
-napari Qt form: `GET`/`PUT /api/config` + `GET /api/admin/status` +
-`POST /api/admin/restart` on the `:8814` sidecar, with napari reduced to a single
+napari Qt form: `GET`/`PUT /api/config` + `GET /api/admin/status` on the `:8814`
+sidecar (restart is control-owned — the admin page calls the control's
+`POST /api/data_plane/restart`), with napari reduced to a single
 "open admin" browser action. The tool edits the tensor server's canonical config
 `~/.config/biopb/biopb.json` — **not** the biopb-mcp client config
 (`~/.config/biopb/mcp-config.json`). Because the server reads config once at startup
-(no hot-reload), applying = write → `biopb server restart` → reconnect, then **poll
+(no hot-reload), applying = write → control-driven restart → reconnect, then **poll
 `health` and show scan progress** (`full_scan_in_progress`,
 `last_full_scan_finished_at`, climbing `source_count`) so the post-restart discovery
 scan isn't a blind wait. Full route/restart/auth design lives in
@@ -284,7 +290,7 @@ in **progressive-discovery.md**.
   delegated `GetFlightInfo` so on-disk OME-Zarr levels are reused, not recomputed.
 - **Per-user eviction budget** — the proxy's `file_max_total_bytes` should default
   to a whole-user budget, not a per-worker slice.
-- **Live `reconfigure`** — v1 apply is write + `biopb server restart`; a
+- **Live `reconfigure`** — v1 apply is write + a control-driven restart; a
   `do_action("reconfigure")` for incremental source add/remove (no full rescan)
   is a possible follow-up.
 - **Alias ergonomics** — `<alias>__<source_id>` is verbose in the agent's `client`

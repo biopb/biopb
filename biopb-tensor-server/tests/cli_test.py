@@ -5,9 +5,51 @@ import biopb_tensor_server.cli as cli
 import pytest
 import typer
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.cache.recovery import ProcessLock
 from biopb_tensor_server.core.config import CacheConfig
 
+
+def _cache_lock_is_free(lock_path: Path) -> bool:
+    """Whether the cache lock at `lock_path` has been released cleanly.
+
+    Release is no longer observable as the lock file disappearing: exclusion is
+    an OS lock on an open descriptor and the file is deliberately permanent
+    (unlinking it would let a racing acquirer lock a different file by the same
+    name). What "released" means now is that another owner can take it -- and,
+    since a clean release also removes the `.owner` record, that the next owner
+    does not see a crash (biopb/biopb#544).
+    """
+    probe = ProcessLock(lock_path)
+    if not probe.acquire():
+        return False
+    clean = not probe.is_stale()
+    probe.release()
+    return clean
+
+
 _VALID_TOKEN = "a" * 32  # 32 URL-safe chars: passes _web_auth.valid_token
+
+
+def _run_serve(config, **overrides):
+    """Invoke `serve` as a plain function with explicit option defaults.
+
+    Calling a typer command directly bypasses typer's default resolution, so each
+    Option would otherwise arrive as an unresolved `OptionInfo` -- harmless where a
+    value is only formatted, but `serve` now resolves the flight token eagerly and
+    an `OptionInfo` token would blow up in `valid_token`. Mirror the CLI defaults.
+    """
+    kwargs = {
+        "config": config,
+        "log_level": None,
+        "log_scope_biopb": True,
+        "host": None,
+        "port": None,
+        "writable": False,
+        "token": None,
+        "log_file": None,
+    }
+    kwargs.update(overrides)
+    return cli.serve(**kwargs)
 
 
 class _FakeServer:
@@ -46,7 +88,7 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
         lambda *args, **kwargs: (server, source_manager, watcher, None),
     )
 
-    cli.serve(config=Path("unused.toml"))
+    _run_serve(Path("unused.json"))
 
     assert source_manager.stop_calls == 1
     assert watcher.stop_calls == 1
@@ -99,22 +141,79 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     )
 
     # Pass explicit values rather than typer OptionInfo defaults (calling the
-    # command as a plain function bypasses typer's default resolution; a truthy
-    # OptionInfo for open_browser would otherwise launch a real browser).
+    # command as a plain function bypasses typer's default resolution).
     cli.launch(
         config=Path("unused.json"),
         log_level=None,
         log_scope_biopb=True,
+        host=None,
+        port=None,
+        writable=False,
         web_port=8816,
         web_host="127.0.0.1",
         token=None,
-        open_browser=False,
-        web_url="http://localhost:5173",
         cors_origins=None,
         log_file=None,
     )
 
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
+
+
+def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
+    monkeypatch,
+):
+    """`launch` mirrors `serve`: --host/--port/--writable override the config's
+    flight bind, and the token mode switch follows the *overridden* host. A public
+    --host with no token must auto-generate one (fail-closed), not bind open.
+    """
+    captured: dict = {}
+    # Config binds loopback; the override makes the flight plane public.
+    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured.update(kwargs)
+        return (
+            SimpleNamespace(serve=lambda: None),
+            _FakeStoppable(),
+            _FakeStoppable(),
+            None,
+        )
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    monkeypatch.setattr(
+        cli,
+        "run_http_server",
+        lambda **kwargs: captured.update(sidecar_token=kwargs.get("token")),
+    )
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+
+    cli.launch(
+        config=Path("unused.json"),
+        log_level=None,
+        log_scope_biopb=True,
+        host="0.0.0.0",
+        port=9001,
+        writable=True,
+        web_port=8816,
+        web_host="127.0.0.1",
+        token=None,
+        cors_origins=None,
+        log_file=None,
+    )
+
+    # Overrides reached the flight server...
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 9001
+    assert captured["writable"] is True
+    # ...and the public override drove fail-closed token auto-gen, enforced on
+    # both the flight plane and the sidecar (same effective token).
+    tok = captured["token"]
+    assert tok and cli._web_auth.valid_token(tok)
+    assert captured["sidecar_token"] == tok
 
 
 def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
@@ -127,11 +226,11 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     config = CacheConfig(backend="file", file_cache_dir=cache_dir)
     CacheManager.initialize(config)
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()  # lock held while server "runs"
+    assert not _cache_lock_is_free(lock_path)  # held while server "runs"
 
     try:
         cli._graceful_shutdown(source_manager=None, watcher=None, flight_server=None)
-        assert not lock_path.exists()  # released on shutdown
+        assert _cache_lock_is_free(lock_path)  # released on shutdown
     finally:
         mgr = CacheManager.get_instance()
         if mgr is not None:
@@ -146,7 +245,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()
+    assert not _cache_lock_is_free(lock_path)
 
     order = []
     state = {}
@@ -162,7 +261,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
             # be blocked in an upstream re-list); assert it is not the 5s default.
             state["join_timeout"] = join_timeout
             # The cache lock must already be gone by the time this slow step runs.
-            state["lock_at_stop"] = lock_path.exists()
+            state["lock_at_stop"] = not _cache_lock_is_free(lock_path)
             raise RuntimeError("boom")  # a failure here must not matter
 
     try:
@@ -175,7 +274,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
         assert order == ["flight", "source_manager"]
         assert state["lock_at_stop"] is False  # released before the join ran
         assert state["join_timeout"] == 1  # short bound, not the 5s default
-        assert not lock_path.exists()  # released despite source_manager raising
+        assert _cache_lock_is_free(lock_path)  # released despite source_manager raising
     finally:
         mgr = CacheManager.get_instance()
         if mgr is not None:
@@ -196,7 +295,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()
+    assert not _cache_lock_is_free(lock_path)
 
     # Shrink the drain bound so the test is fast; the fake hangs far beyond it.
     monkeypatch.setattr(cli, "_FLIGHT_DRAIN_TIMEOUT_S", 0.3)
@@ -222,7 +321,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
         assert entered.is_set()
         # ...yet the lock is gone (released BEFORE the drain) and we returned
         # promptly rather than blocking on the wedged shutdown().
-        assert not lock_path.exists()
+        assert _cache_lock_is_free(lock_path)
         assert elapsed < 5  # ~0.3s bound, nowhere near the 30s hang
     finally:
         release.set()  # let the daemon drain thread unwind
@@ -236,7 +335,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()
+    assert not _cache_lock_is_free(lock_path)
 
     server = _FakeServer()
     server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
@@ -249,9 +348,9 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
         lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable(), None),
     )
 
-    cli.serve(config=Path("unused.toml"))
+    _run_serve(Path("unused.json"))
 
-    assert not lock_path.exists()
+    assert _cache_lock_is_free(lock_path)
 
 
 def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
@@ -267,7 +366,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
-    assert lock_path.exists()  # held once cache init ran
+    assert not _cache_lock_is_free(lock_path)  # held once cache init ran
 
     server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
@@ -282,13 +381,104 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
 
     try:
         with pytest.raises(typer.Exit):
-            cli.serve(config=Path("unused.json"))
+            _run_serve(Path("unused.json"))
         # Released by the finally's graceful shutdown despite the early exit.
-        assert not lock_path.exists()
+        assert _cache_lock_is_free(lock_path)
     finally:
         mgr = CacheManager.get_instance()
         if mgr is not None:
             mgr.close()
+
+
+def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
+    """A file cache configured on network/cloud storage demotes to memory.
+
+    The Arrow file backend mmaps its segments and assumes local-POSIX semantics;
+    on NFS/CIFS an evicted-but-mapped segment can SIGBUS/ESTALE, and a cloud
+    Files-On-Demand folder recalls a dehydrated segment on mmap read
+    (biopb/biopb#571 follow-up). The launcher classifies the cache dir at startup
+    and, on a positive network/cloud signal, initializes the memory backend
+    instead -- which also disables the localhost fast path (a memory backend
+    never locates a chunk).
+    """
+    import json
+
+    from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.cache.file_backend import ArrowFileBackend
+
+    cache_dir = tmp_path / "cache"  # a real local dir...
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "sources": [],
+            }
+        )
+    )
+    # ...that we make the classifier report as network storage.
+    monkeypatch.setattr(
+        cli, "unsafe_cache_dir_reason", lambda _p: "a network filesystem (nfs4)"
+    )
+
+    config = cli.load_config(config_path)
+    CacheManager.reset()
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        mgr = CacheManager.get_instance()
+        assert not isinstance(mgr.backend, ArrowFileBackend)  # demoted to memory
+        # The file cache dir was never created (backend never touched disk).
+        assert not cache_dir.exists()
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        if source_manager is not None:
+            source_manager.stop(join_timeout=1)
+        server.shutdown()
+        CacheManager.reset()
+
+
+def test_file_cache_on_local_dir_stays_file(tmp_path):
+    """The control case: a local cache dir keeps the Arrow file backend."""
+    import json
+
+    from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.cache.file_backend import ArrowFileBackend
+
+    cache_dir = tmp_path / "cache"
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "sources": [],
+            }
+        )
+    )
+
+    config = cli.load_config(config_path)
+    CacheManager.reset()
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        mgr = CacheManager.get_instance()
+        assert isinstance(mgr.backend, ArrowFileBackend)  # tmp_path is local disk
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        if source_manager is not None:
+            source_manager.stop(join_timeout=1)
+        server.shutdown()
+        CacheManager.reset()
 
 
 def test_setup_empty_sources_serves_empty_catalog(tmp_path):
@@ -399,6 +589,72 @@ class TestResolveLaunchToken:
         # falls through to local mode (tokenless), not a silent accept.
         assert cli._resolve_launch_token("127.0.0.1", "127.0.0.1", "short", "") is None
 
+    def test_allow_no_token_serves_public_sidecar_open(self):
+        # The deliberate escape hatch: with allow_no_token, a public flight + public
+        # sidecar and no token is served OPEN (None) instead of auto-generating /
+        # refusing. Insecure-by-request, off by default.
+        assert cli._resolve_launch_token("0.0.0.0", "0.0.0.0", None, "", True) is None
+
+    def test_allow_no_token_overrides_the_public_sidecar_refusal(self):
+        # Loopback flight + public sidecar normally refuses; the override turns that
+        # into a warning + tokenless serve rather than typer.Exit.
+        assert cli._resolve_launch_token("127.0.0.1", "0.0.0.0", None, "", True) is None
+
+    def test_allow_no_token_does_not_override_a_supplied_token(self):
+        # The override only matters when no token is supplied; a real token wins.
+        assert (
+            cli._resolve_launch_token("0.0.0.0", "0.0.0.0", _VALID_TOKEN, "", True)
+            == _VALID_TOKEN
+        )
+
+
+class TestResolveFlightToken:
+    """`serve`'s token decision — the shared ladder `launch` builds on.
+
+    The flight bind is the single mode switch: loopback → local mode (tokenless);
+    a public bind fails *closed* by auto-generating a token rather than serving the
+    data API open (biopb/biopb#515 follow-up: `serve` used to fail open here).
+    """
+
+    def test_loopback_is_tokenless(self):
+        assert cli._resolve_flight_token("127.0.0.1", None, "") is None
+
+    def test_public_bind_autogenerates_token(self):
+        # The gap this closes: a public flight bind with no token no longer serves
+        # the gRPC data API unauthenticated — it auto-generates one.
+        tok = cli._resolve_flight_token("0.0.0.0", None, "")
+        assert tok and cli._web_auth.valid_token(tok)
+
+    def test_supplied_token_is_honored(self):
+        assert cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, "") == _VALID_TOKEN
+
+    def test_env_token_is_honored(self):
+        assert cli._resolve_flight_token("0.0.0.0", None, _VALID_TOKEN) == _VALID_TOKEN
+
+    def test_supplied_token_beats_env(self):
+        env = "b" * 32
+        assert cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, env) == _VALID_TOKEN
+
+    def test_malformed_supplied_token_falls_through_to_mode(self):
+        # A too-short --token is not usable; on a loopback bind it falls through to
+        # local mode (tokenless), not a silent accept — and on a public bind it
+        # auto-generates rather than binding open.
+        assert cli._resolve_flight_token("127.0.0.1", "short", "") is None
+        tok = cli._resolve_flight_token("0.0.0.0", "short", "")
+        assert tok and cli._web_auth.valid_token(tok)
+
+    def test_allow_no_token_serves_public_bind_open(self):
+        # The escape hatch: a public flight bind with no token is served OPEN (None)
+        # instead of auto-generating one. Off by default, so the fail-closed default
+        # is unchanged unless explicitly requested.
+        assert cli._resolve_flight_token("0.0.0.0", None, "", True) is None
+
+    def test_allow_no_token_does_not_override_a_supplied_token(self):
+        # A real token still wins over the override.
+        assert (
+            cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, "", True) == _VALID_TOKEN
+        )
+
 
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     """A static-only config reaches SERVING and reports a freshness timestamp.
@@ -450,3 +706,68 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
         if precache_worker is not None:
             precache_worker.stop()
         server.shutdown()
+
+
+# --- config errors are a refusal, not a traceback (biopb/biopb#34) ------------
+
+
+def test_validate_reports_a_bad_knob_and_exits_1(tmp_path, capsys):
+    """`validate` is the strict surface: a human asked, so report and fail.
+
+    The load path clamps the same value (a supervised server must still come up),
+    which is exactly why this command validates the *raw* file rather than
+    inspecting a loaded config -- otherwise it would report a clean bill on a
+    config whose bad value had just been defaulted away.
+    """
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps({"server": {"port": 8815}, "pyramid": {"downscale_factor": 0}})
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+    assert exc.value.exit_code == 1
+    out = capsys.readouterr().out
+    assert "downscale_factor" in out
+    # The section name survives rich's markup parser ("[pyramid]" is not a tag).
+    assert "pyramid" in out
+
+
+def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypatch):
+    """A bad knob must not stop the server: the plane is supervised, so refusing
+    to load would be restarted straight back into the same failure with the cause
+    buried in a log (biopb/biopb#34). The value is defaulted instead, so nothing
+    invalid reaches GetFlightInfo either."""
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps({"server": {"port": 8815}, "pyramid": {"downscale_factor": 0}})
+    )
+
+    loaded = {}
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+
+    def _capture(config, port=None, **kwargs):
+        loaded["config"] = config
+        return _FakeServer(), _FakeStoppable(), _FakeStoppable(), None
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture)
+    _run_serve(config_path)
+
+    from biopb_tensor_server.core.config import PyramidConfig
+
+    assert loaded["config"].pyramid.downscale_factor == PyramidConfig().downscale_factor
+
+
+def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys):
+    config_path = tmp_path / "biopb.toml"
+    config_path.write_text("[server]\nport = 8815\n")
+
+    with pytest.raises(typer.Exit) as exc:
+        _run_serve(config_path)
+    assert exc.value.exit_code == 1
+    assert "migrate-config" in capsys.readouterr().out

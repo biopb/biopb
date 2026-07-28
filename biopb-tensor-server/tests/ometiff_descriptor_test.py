@@ -628,6 +628,34 @@ class TestFastMetadata:
         assert adapter._raw_ome_xml  # the embedded OME-XML string
         assert adapter._local_ome_xml() == adapter._raw_ome_xml
 
+    def test_scene_adapter_inherits_ome_xml_without_reopen(self, tmp_path, monkeypatch):
+        # A scene clone inherits the source's parsed OME-XML, so its metadata /
+        # physical-scale paths read the cached string instead of re-opening the
+        # master file once per scene (the source parses the OME-XML once).
+        import tifffile
+
+        path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=2)
+        source = OmeTiffAdapter(path, "scene-share")
+        field = source.list_tensor_descriptors()[0].array_id.split("/", 1)[1]
+        scene = source.get_tensor_adapter(field)
+
+        assert scene._raw_ome_xml_probed is True  # inherited from the source
+        assert scene._raw_ome_xml == source._raw_ome_xml
+
+        # Count real opens (the OME-XML read path has a broad except, so a stub
+        # that raised would be swallowed) -- the scene must open nothing.
+        opens = []
+        real_tifffile = tifffile.TiffFile
+
+        def _counting(*a, **k):
+            opens.append(a[0] if a else None)
+            return real_tifffile(*a, **k)
+
+        monkeypatch.setattr(tifffile, "TiffFile", _counting)
+        assert scene.get_metadata()  # served from the inherited OME-XML
+        scene._physical_scale()  # value or None; must not open either
+        assert opens == [], f"scene re-opened the TIFF for OME-XML: {opens}"
+
 
 class TestFallback:
     def test_remote_url_falls_back(self, tmp_path):
@@ -683,9 +711,11 @@ class TestReadPathTifffileAuthoritative:
         _, scene = self._scene(path, "pure")
         assert not hasattr(scene, "_bio_image")
 
-        plan = scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        plan = scene.plan_flight_info(
+            TensorReadOption(with_pyramid=True), PyramidConfig()
+        )
         assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]
-        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid
+        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid (opt-in)
 
         bounds = ChunkBounds(start=[0, 1, 0, 0, 0], stop=[1, 2, 1, 64, 64])
         arr = np.asarray(scene.get_data(bounds))

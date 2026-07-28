@@ -196,7 +196,9 @@ function Show-Summary {
     Write-Host ""
 
     Write-Inf "Your AI agent launches biopb-mcp over stdio - just start your agent"
-    Write-Inf "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it."
+    Write-Inf "(Claude Code/Desktop, Cursor, opencode), then prompt it:"
+    Write-Cmd "  start biopb and report status"
+    Write-Inf "That brings up the napari viewer and the data plane."
     Write-Host ""
 
     if ($Result.WebappInstalled) {

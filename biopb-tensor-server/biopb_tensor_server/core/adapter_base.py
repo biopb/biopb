@@ -30,16 +30,19 @@ import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
+    SliceHint,
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
+    _version_header,
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
     decode_chunk_id,
+    decode_reduction_method,
     decode_scale_info,
     encode_chunk_id,
     encode_chunk_id_with_scale,
@@ -83,8 +86,9 @@ if TYPE_CHECKING:
 # preserves the exact dtype (endianness included) and is zero-copy on both ends:
 # the server wraps the numpy buffer with no per-element copy, and the cache
 # stores/serves this same schema with no typed<->binary conversion. It is the ONE
-# schema for the do_get wire, the file cache (``UNIFIED_SCHEMA``), and the memory
-# cache. (Cross-language clients decode the binary column per the dtype string;
+# schema for the do_get wire, the file cache, and the memory cache. (The file
+# cache appends a per-batch cache-key column; the schema is otherwise identical.)
+# (Cross-language clients decode the binary column per the dtype string;
 # see the Java client's ``SerializableTensorImg``.)
 CHUNK_WIRE_SCHEMA = pa.schema(
     [
@@ -236,6 +240,16 @@ class SourceAdapter(ABC):
     # total for every other adapter.
     _capability_token: Optional[str] = None
 
+    # Optional content-version token (biopb/biopb#178). When set, it is folded
+    # into every chunk_id this source mints (via ``get_read_plan``) and hence into
+    # the cache key, so a re-registered source with new bytes gets a fresh cache
+    # namespace instead of serving stale cached chunks. None (the base default,
+    # like ``capability_token``) means "unversioned" -- the pre-#178 behavior, and
+    # byte-identical chunk_ids / cache keys -- so an adapter opts in only when it
+    # has a cheap, reliable change signal (e.g. a local file's stat signature).
+    # An opaque token: the codec never interprets it, only namespaces by it.
+    _content_version: Optional[bytes] = None
+
     # Display-only override for the catalog ``source_url`` (the descriptor field
     # the tensor-browser / web viewer group the tree by). Normally None, so the
     # descriptor derives ``source_url`` from the raw path via ``to_catalog_url``.
@@ -280,6 +294,12 @@ class SourceAdapter(ABC):
     @capability_token.setter
     def capability_token(self, value: Optional[str]) -> None:
         self._capability_token = value
+
+    @property
+    def content_version(self) -> Optional[bytes]:
+        """Opaque content-version token folded into this source's chunk_ids, or
+        None when the source is unversioned (see ``_content_version``)."""
+        return self._content_version
 
     @property
     def array_id(self) -> str:
@@ -361,24 +381,16 @@ class SourceAdapter(ABC):
 
     @abstractmethod
     def get_metadata(self) -> dict:
-        """Return metadata as dict. In most cases this is OME metadata.
+        """Return the source-level metadata as a dict. Usually OME metadata.
 
-        Used by the metadata engine to create database.
-        Will be serialized to metadata_json in TensorDescriptor.
+        Called **once at registration** to populate the catalog's
+        ``sources.metadata_json`` row (:meth:`MetadataDatabase.sync_source_added`);
+        the serve path reads it back from the catalog, never by recomputing here
+        (biopb/biopb#253). It must therefore be a pure producer -- do not memoize
+        the result across calls (the catalog is the cache). Genuinely per-tensor
+        metadata that the source row cannot represent is exposed on the tensor
+        adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
         """
-
-    def metadata_covers_all_tensors(self) -> bool:
-        """Whether ``get_metadata()`` applies to *every* tensor of this source.
-
-        When True (the default), the catalog's source-level ``metadata_json`` is a
-        valid serve answer for any tensor, so ``GetFlightInfo(with_metadata)`` may
-        read it from the catalog instead of recomputing on the adapter
-        (biopb/biopb#253). Override to False when metadata is genuinely per-tensor
-        (OME-Zarr HCS plates: the source row holds the *plate* ``.zattrs``, which
-        is not any individual field's OME metadata) so the serve path falls back
-        to the per-tensor ``get_metadata()`` for correctness.
-        """
-        return True
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
@@ -427,10 +439,8 @@ class SourceAdapter(ABC):
         # so importing these at module scope would be circular.
         from pathlib import Path
 
-        from biopb_tensor_server.core.discovery import (
-            _is_offline_placeholder,
-            is_remote_url,
-        )
+        from biopb_tensor_server.core.discovery import _is_offline_placeholder
+        from biopb_tensor_server.core.remote import is_remote_url
 
         if is_remote_url(self._source_url):
             return False
@@ -551,10 +561,10 @@ class TensorAdapter(SourceAdapter):
     from ``get_tensor_adapter``, the multi-tensor ones (bioio / OME-TIFF / EMD)
     return a clone of their own class with tensor context set, and the OME-Zarr /
     QPTIFF level and HCS-field adapters are plain ``ZarrAdapter`` instances. The
-    serve path relies on it -- ``get_flight_info`` calls the source-scoped
-    ``get_metadata()`` on the tensor adapter to get an HCS field's per-field
-    metadata (biopb/biopb#253). Nesting types that reality instead of contradicting
-    it (biopb/biopb#380).
+    serve path relies on it -- an HCS field's per-field metadata comes from the
+    tensor adapter's :meth:`get_tensor_metadata`, which the plate's source-level
+    catalog row cannot represent (biopb/biopb#253). Nesting types that reality
+    instead of contradicting it (biopb/biopb#380).
 
     The converse does not hold: ``UnresolvedSourceAdapter`` is a source that has no
     tensors until it resolves, and stays a plain ``SourceAdapter``. So "source" is
@@ -633,6 +643,19 @@ class TensorAdapter(SourceAdapter):
         desc = self.get_tensor_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
+
+    @staticmethod
+    def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
+        """Per-axis ``slice`` tuple for indexing a backend array with ``bounds``.
+
+        The bounds->slices idiom every ``get_data`` needs to turn chunk bounds
+        into a numpy/zarr/h5py index; shared here so each adapter slices its
+        store the same way.
+        """
+        return tuple(
+            slice(int(s), int(e))
+            for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
 
     def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
         """Validate that bounds are within array shape.
@@ -726,8 +749,11 @@ class TensorAdapter(SourceAdapter):
             result_arr = self.get_data(bounds)
 
             if is_scaled_chunk_flag:
-                scale_hint, reduction_method = decode_scale_info(chunk_id)
-                # Crop and downsample (no padding needed - bounds aligned via floor_div)
+                scale_hint = decode_scale_info(chunk_id)
+                # The requested reduction_method rides in the chunk_id (#578), so a
+                # do_get honors it; a method-free (old/area) scaled chunk_id decodes
+                # to the default. Crop + downsample (bounds aligned via floor_div).
+                reduction_method = decode_reduction_method(chunk_id)
                 result_arr = downsample_block(result_arr, scale_hint, reduction_method)
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
@@ -742,9 +768,7 @@ class TensorAdapter(SourceAdapter):
             # method share one entry, so precache-warmed chunks serve any
             # method at the same bounds/scale (biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(
-                cache_key, compute_fn, metadata={"array_id": array_id}
-            )
+            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
             data = entry.data
             cache_manager.release(cache_key)
         else:
@@ -755,7 +779,10 @@ class TensorAdapter(SourceAdapter):
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
         """Generate a read plan for the requested tensor descriptor.
 
-        Default implementation uses uniform chunk grid planning.
+        A native-pyramid adapter routes a ``precompute`` + ``scale_hint`` read to
+        its matching on-disk level (see :meth:`_plan_precomputed_read`); every
+        other read plans on the default uniform chunk grid, downsampling on the fly
+        for a computed scale.
 
         Args:
             request_desc: TensorDescriptor from the client's read request, which may
@@ -764,8 +791,131 @@ class TensorAdapter(SourceAdapter):
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
         """
         base_desc = self.get_tensor_descriptor()
+        base_shape = tuple(int(dim) for dim in base_desc.shape)
+        scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
+        reduction_method = normalize_reduction_method(request_desc.reduction_method)
+        if reduction_method == "precompute" and scale_hint is not None:
+            return self._plan_precomputed_read(request_desc, scale_hint)
+
         chunk_size = self.get_chunk_size()
-        return _get_read_plan(base_desc, request_desc, chunk_size)
+        # content_version is a SourceAdapter property; every TensorAdapter is a
+        # SourceAdapter, so it is always present -- an unversioned source returns
+        # None.
+        return _get_read_plan(
+            base_desc,
+            request_desc,
+            chunk_size,
+            content_version=self.content_version,
+        )
+
+    # ---- native-pyramid precompute routing ---------------------------------
+    # Turning a ``precompute`` read into a read against one on-disk level's store
+    # is shared here, so the native-pyramid adapters (OME-Zarr multiscales,
+    # QPTIFF) stop duplicating it near-verbatim (biopb/biopb#557). A leaf adapter
+    # supplies only the per-format level lookup + scale extraction:
+    # :meth:`_find_level_for_scale`, :meth:`_level_downsample_factors`, and
+    # :meth:`get_level_adapter`.
+
+    def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
+        """Backend adapter for native pyramid level ``path``, or ``None``.
+
+        Declared here -- rather than sniffed with ``hasattr`` in the server's
+        chunk dispatch -- for the same reason :meth:`close` and :meth:`put_chunk`
+        are: an optional capability the registry drives on every adapter belongs
+        in the interface, where a delegating wrapper's author can see it
+        (biopb/biopb#557). The default ``None`` means "this tensor exposes no
+        native levels," so the chunk dispatcher falls back to
+        :meth:`get_tensor_adapter`. A native-pyramid adapter overrides this to
+        return the level's own backend adapter, whose ``array_id`` is
+        ``source_id/{level}`` -- the value a precompute chunk_id carries, so
+        ``DoGet`` routes the level's chunks straight back here.
+        """
+        return None
+
+    def _plan_precomputed_read(
+        self, request_desc: TensorDescriptor, scale_hint: Tuple[int, ...]
+    ) -> TensorReadPlan:
+        """Plan a ``precompute`` read against the level matching ``scale_hint``.
+
+        Find the native level whose downsample factors equal ``scale_hint``,
+        translate the request's slice into that level's coordinates, and plan the
+        read against the level's own store.
+        """
+        level = self._find_level_for_scale(scale_hint)
+        if level is None:
+            raise ValueError(
+                f"No precomputed level matching scale_hint {tuple(scale_hint)}."
+            )
+        slice_hint = (
+            request_desc.slice_hint if request_desc.HasField("slice_hint") else None
+        )
+        level_slice = _convert_slice_to_level(
+            slice_hint, self._level_downsample_factors(level)
+        )
+        return self._plan_from_precomputed(level, level_slice)
+
+    def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[Any]:
+        """Native level key whose downsample factors equal ``scale_hint``, else None.
+
+        Overridden by native-pyramid adapters. The key is opaque to the shared
+        routing -- an OME-Zarr dataset path, a QPTIFF integer index -- and only
+        round-trips through :meth:`_level_downsample_factors` and
+        :meth:`get_level_adapter`. The default advertises no native levels.
+        """
+        return None
+
+    def _level_downsample_factors(self, level: Any) -> List[int]:
+        """Per-axis integer downsample factors of ``level`` vs level 0.
+
+        The counterpart to :meth:`_find_level_for_scale`: for the level key it
+        returned, the factors that translate a base-coordinate slice into that
+        level's grid. Overridden by native-pyramid adapters.
+        """
+        raise NotImplementedError
+
+    def _plan_from_precomputed(
+        self, level: Any, level_slice: Optional[SliceHint]
+    ) -> TensorReadPlan:
+        """Build a read plan whose chunks target one native level's store.
+
+        The level adapter's descriptor carries ``array_id = source_id/{level}``, so
+        the base planner encodes that into every chunk_id and ``DoGet`` dispatches
+        back through :meth:`get_level_adapter`. The returned descriptor's
+        ``array_id`` is reset to this tensor's, so the client still sees one tensor.
+        """
+        level_adapter = self.get_level_adapter(str(level))
+        level_desc = level_adapter.get_tensor_descriptor()
+        request = TensorDescriptor(
+            array_id=level_desc.array_id,
+            dim_labels=level_desc.dim_labels,
+            shape=list(level_desc.shape),
+            chunk_shape=list(level_desc.chunk_shape),
+            dtype=level_desc.dtype,
+        )
+        if level_slice is not None:
+            request.slice_hint.start[:] = level_slice.start
+            request.slice_hint.stop[:] = level_slice.stop
+        read_plan = level_adapter.get_read_plan(request)
+        read_plan.descriptor.array_id = self.array_id
+        return read_plan
+
+    @staticmethod
+    def _base_structural_descriptor(base_desc: TensorDescriptor) -> TensorDescriptor:
+        """The stable per-tensor facts alone: shape/dtype/dim_labels/chunk_shape.
+
+        Copies only the structural fields off ``base_desc``, deliberately dropping
+        any pyramid / physical_scale / metadata_json the adapter's own
+        ``get_tensor_descriptor`` may already carry -- ``plan_flight_info`` re-fills
+        those under the response field masks (biopb/biopb#563), so a straight
+        ``CopyFrom`` would leak an unmasked pyramid or scale into the response.
+        """
+        return TensorDescriptor(
+            array_id=base_desc.array_id,
+            dim_labels=base_desc.dim_labels,
+            shape=base_desc.shape,
+            chunk_shape=base_desc.chunk_shape,
+            dtype=base_desc.dtype,
+        )
 
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
@@ -780,35 +930,54 @@ class TensorAdapter(SourceAdapter):
         stays lean). ``metadata_json`` itself is still filled by the server from
         the catalog, not here.
 
-        The default plans locally: it applies the request's slice/scale/reduction
-        hints to this tensor's descriptor, runs ``get_read_plan``, then advertises
-        the pyramid and physical scale. A remote-proxy adapter overrides this to
+        ``read_opt`` carries two field masks over this response (biopb/biopb#563):
+
+        - ``with_read_plan`` (default true, an *unset* ``optional`` bool) gates the
+          per-request chunk endpoints. When false this is a **describe-only** call:
+          the request's slice/scale/reduction hints do not apply (describe is the
+          stable per-tensor fact, not a per-request read), so the descriptor is
+          this tensor's base descriptor and the endpoint list is empty --
+          ``get_read_plan`` (the O(chunks) enumeration) is skipped entirely.
+        - ``with_pyramid`` (default false) gates the pyramid advertisement, whose
+          native-level sizing is the expensive part; ``physical_scale`` is the
+          cheap describe fact and is filled unconditionally.
+
+        The default plans locally. A remote-proxy adapter overrides this to
         forward the upstream's authoritative plan instead (biopb/biopb#295).
         """
         base_desc = self.get_tensor_descriptor()
-        request_desc = TensorDescriptor(
-            array_id=base_desc.array_id,
-            dim_labels=base_desc.dim_labels,
-            shape=base_desc.shape,
-            chunk_shape=base_desc.chunk_shape,
-            dtype=base_desc.dtype,
+
+        # with_read_plan is an optional bool defaulting true: an unset field (an
+        # old client, or a plain read) still gets the full plan, as before.
+        with_read_plan = (
+            read_opt.with_read_plan if read_opt.HasField("with_read_plan") else True
         )
-        if read_opt.HasField("slice_hint"):
-            request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-        # scale_hint / reduction_method route the read to a downsampled level.
-        if read_opt.scale_hint:
-            request_desc.scale_hint[:] = list(read_opt.scale_hint)
-        if read_opt.reduction_method:
-            request_desc.reduction_method = read_opt.reduction_method
 
-        read_plan = self.get_read_plan(request_desc)
+        if with_read_plan:
+            request_desc = self._base_structural_descriptor(base_desc)
+            if read_opt.HasField("slice_hint"):
+                request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
+            # scale_hint / reduction_method route the read to a downsampled level.
+            if read_opt.scale_hint:
+                request_desc.scale_hint[:] = list(read_opt.scale_hint)
+            if read_opt.reduction_method:
+                request_desc.reduction_method = read_opt.reduction_method
+            read_plan = self.get_read_plan(request_desc)
+        else:
+            # Describe-only: the base per-tensor descriptor, no chunk enumeration.
+            read_plan = TensorReadPlan(
+                descriptor=self._base_structural_descriptor(base_desc),
+                chunk_endpoints=[],
+            )
 
-        # Advertise the server-decided resolution pyramid, then the compact
-        # physical scale -- both open-time only (never in list_flights).
+        # Advertise the server-decided resolution pyramid (opt-in -- native-level
+        # sizing is the costly part), then the compact physical scale (cheap,
+        # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
-        read_plan.descriptor.pyramid.extend(
-            self._advertised_pyramid(base_desc, pyramid_config)
-        )
+        if read_opt.with_pyramid:
+            read_plan.descriptor.pyramid.extend(
+                self._advertised_pyramid(base_desc, pyramid_config)
+            )
         self._fill_physical_scale(read_plan.descriptor)
         return read_plan
 
@@ -870,6 +1039,25 @@ class TensorAdapter(SourceAdapter):
             )
         return levels
 
+    def get_tensor_metadata(self) -> Optional[dict]:
+        """Per-tensor metadata fields the source-level catalog row does not carry.
+
+        The serve path (``GetFlightInfo(with_metadata)``) reads a source's
+        metadata from the catalog row that :meth:`SourceAdapter.get_metadata`
+        produced once at registration -- the cache -- and **merges** this method's
+        return over it (``row.update(get_tensor_metadata())``). So a tensor
+        adapter returns only the *delta*: the cheap, per-tensor fields the
+        source-level row cannot represent -- an OME-Zarr HCS field's own OME
+        metadata over the plate ``.zattrs`` row, or an EMD signal's
+        ``original_metadata`` over the source's ``{"format": "emd"}`` row.
+
+        Keeping the shared bulk in the catalog and overlaying only the per-tensor
+        delta here is the point (biopb/biopb#253): per-tensor metadata never needs
+        a catalog row of its own. ``None`` (the default) means no delta -- the
+        source-level row fully describes this tensor.
+        """
+        return None
+
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dimension physical pixel size + unit for this tensor, axis order.
 
@@ -929,11 +1117,11 @@ _SOURCE_SCOPED_API = frozenset(
         "source_url",
         "source_type",
         "capability_token",
+        "content_version",
         "claim",
         "create_from_config",
         "list_tensor_descriptors",
         "get_metadata",
-        "metadata_covers_all_tensors",
         "get_source_descriptor",
         "resolve",
         "is_resident",
@@ -950,8 +1138,10 @@ _TENSOR_SCOPED_API = frozenset(
         "get_arrow_schema",
         "resolve_chunk_data",
         "get_read_plan",
+        "get_level_adapter",
         "get_native_pyramid_levels",
         "has_native_pyramid",
+        "get_tensor_metadata",
         "plan_flight_info",
     }
 )
@@ -978,15 +1168,37 @@ assert _SOURCE_SCOPED_API.isdisjoint(_TENSOR_SCOPED_API), (
 )
 
 
+def _convert_slice_to_level(
+    slice_hint: Optional[SliceHint], level_scale: List[int]
+) -> Optional[SliceHint]:
+    """Translate a base-coordinate slice into a level's downsampled grid.
+
+    A pure transform in the precompute read path (like :func:`_get_read_plan`),
+    so it is a module function, not a method: it reads no adapter state, and
+    ``TensorAdapter._plan_precomputed_read`` supplies the level's downsample
+    factors from the per-format hook.
+    """
+    if slice_hint is None:
+        return None
+    level_start = [s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)]
+    level_stop = [s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)]
+    return SliceHint(start=level_start, stop=level_stop)
+
+
 def _get_read_plan(
     base_desc: TensorDescriptor,
     request_desc: TensorDescriptor,
     chunk_size: Tuple[int, ...],
+    content_version: Optional[bytes] = None,
 ) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
+
+    ``content_version`` (biopb/biopb#178), when set, is folded into every minted
+    chunk_id so the cache namespaces by it. It is constant across the grid, so the
+    wrapper header is precomputed once and prepended per chunk (one concat).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
@@ -1050,6 +1262,13 @@ def _get_read_plan(
     # NO NEED to check splitting here - safe_chunk_size ensures it's always safe
     logical_endpoints: List[ChunkEndpoint] = []
 
+    # content_version is constant across the grid, so build its wrapper header
+    # once (biopb/biopb#178) and prepend to each chunk_id -- one concat per chunk,
+    # not a re-encode. None -> unversioned -> chunk_ids are byte-identical to pre-#178.
+    version_header = (
+        _version_header(content_version) if content_version is not None else b""
+    )
+
     # Compute number of chunks along each axis
     n_chunks_per_axis = tuple(
         ceil_div(realized_stop[ax] - realized_start[ax], virtual_chunk_size[ax])
@@ -1090,7 +1309,9 @@ def _get_read_plan(
 
         # NO splitting check needed - safe_chunk_size guarantees it fits
 
-        # Encode: array_id + virtual_bounds + optional scale_hint
+        # Encode: array_id + virtual_bounds + optional scale_hint + the requested
+        # reduction_method, so do_get downsamples with the method the client asked
+        # for (biopb/biopb#578). "area"/default adds no byte (identity-stable).
         if scale_hint is not None:
             chunk_id = encode_chunk_id_with_scale(
                 base_desc.array_id, virtual_bounds, scale_hint, reduction_method
@@ -1099,7 +1320,7 @@ def _get_read_plan(
             chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
 
         logical_endpoints.append(
-            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
+            ChunkEndpoint(chunk_id=version_header + chunk_id, bounds=logical_bounds)
         )
 
     # Build descriptor

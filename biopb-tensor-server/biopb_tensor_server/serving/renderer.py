@@ -15,6 +15,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from biopb_tensor_server.core.axes import build_axis_map, samples_axis
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,82 +178,10 @@ def resolve_color(
     return PRESET_COLOR_MULTIPLIERS.get(color.lower(), (1.0, 1.0, 1.0))
 
 
-# ---------------------------------------------------------------------------
-# Axis mapping (mirror of frontend buildAxisMap)
-# ---------------------------------------------------------------------------
-
-# Recognized axis labels
-AXIS_T_LABELS = {"t", "time", "frame", "frames"}
-AXIS_Z_LABELS = {"z", "depth", "plane", "planes", "slice"}
-AXIS_C_LABELS = {"c", "channel", "channels", "band", "bands"}
-AXIS_Y_LABELS = {"y", "height", "row", "rows"}
-AXIS_X_LABELS = {"x", "width", "col", "cols", "column", "columns"}
-# Interleaved RGB(A) samples axis. aicsimageio labels the samples axis of a
-# photometric-RGB image "S" (dims "TCZYXS"); its size is 3 (RGB) or 4 (RGBA).
-AXIS_S_LABELS = {"s", "samples"}
-
-
-def samples_axis(dim_labels: list[str], shape: tuple[int, ...]) -> Optional[int]:
-    """Index of an interleaved RGB(A) samples axis, or ``None``.
-
-    Detected by *label* (``S`` / ``samples``) gated on a size of 3 or 4, so a
-    size-3 channel or Z axis is never mistaken for color. This axis holds the
-    color components of one pixel and must be composited into RGB, not selected
-    one-plane-at-a-time like T/Z/C.
-    """
-    for i, label in enumerate(dim_labels):
-        if label.lower() in AXIS_S_LABELS and i < len(shape) and shape[i] in (3, 4):
-            return i
-    return None
-
-
-def build_axis_map(dim_labels: list[str]) -> dict[str, Optional[int]]:
-    """Map semantic axis names to dimension indices.
-
-    Mirrors frontend buildAxisMap() in tensor-flight-client.
-    """
-    result: dict[str, Optional[int]] = {
-        "t": None,
-        "z": None,
-        "c": None,
-        "y": None,
-        "x": None,
-    }
-
-    for i, label in enumerate(dim_labels):
-        label_lower = label.lower()
-        if label_lower in AXIS_T_LABELS:
-            result["t"] = i
-        elif label_lower in AXIS_Z_LABELS:
-            result["z"] = i
-        elif label_lower in AXIS_C_LABELS:
-            result["c"] = i
-        elif label_lower in AXIS_Y_LABELS:
-            result["y"] = i
-        elif label_lower in AXIS_X_LABELS:
-            result["x"] = i
-
-    # Fallback heuristic for unmapped axes
-    unassigned = [
-        i
-        for i, label in enumerate(dim_labels)
-        if label.lower()
-        not in AXIS_T_LABELS
-        | AXIS_Z_LABELS
-        | AXIS_C_LABELS
-        | AXIS_Y_LABELS
-        | AXIS_X_LABELS
-    ]
-
-    # Positional fallback: last → X, second-last → Y, third-last → Z
-    if result["x"] is None and unassigned:
-        result["x"] = unassigned.pop()  # last
-    if result["y"] is None and unassigned:
-        result["y"] = unassigned.pop()  # second-last
-    if result["z"] is None and unassigned:
-        result["z"] = unassigned.pop()  # third-last
-
-    return result
+# Axis mapping (the AXIS_*_LABELS sets, samples_axis, build_axis_map) now lives in
+# core.axes so the render path and the core.chunk pyramid helpers share one axis
+# vocabulary; build_axis_map / samples_axis are imported at the top of this module
+# and re-exported here for callers that import them from renderer.
 
 
 # ---------------------------------------------------------------------------

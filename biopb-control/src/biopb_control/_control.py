@@ -95,6 +95,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket
 from websockets.asyncio.client import connect as ws_connect
 
+from . import __version__
 from ._supervisor import DataPlaneSupervisor
 
 logger = logging.getLogger(__name__)
@@ -126,27 +127,15 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 # (GET/HEAD/OPTIONS) don't.
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-# The one /api/ route left unauthenticated: biopb-mcp's _control_client POSTs it
-# to bring the plane up, and it is idempotent (spawns the plane the control
-# already owns), so it stays open rather than forcing the mcp client to carry the
-# token (the accepted #417 posture). The dangerous verbs (stop/restart) and the
-# enumerating reads (status/sessions) are gated.
-#
-# Residual (biopb/biopb#424 item 2): this is an unauthenticated state-change on
-# any token-gated deployment. It is idempotent and non-destructive, so it is
-# accepted rather than gated. The exemption is *load-bearing*, not merely
-# tolerated: _control_client has no way to obtain the token (the control hands
-# back the plane's endpoint but never a credential), so gating this route would
-# lock biopb-mcp out of a gated deployment entirely.
-#
-# NOTE: the old rationale for deferring #424's fix — "a local control is
-# tokenless, so gating it would buy nothing in the supported modes" — no longer
-# holds now that local mode accepts an optional token. On a shared host (the
-# scenario that motivates a local token) loopback is reachable by every uid, so
-# an untrusted local user can drive this route on a deployment the owner asked
-# to gate. Dropping the exemption is blocked on giving local clients a
-# credential path -- see biopb/biopb#470.
-_AUTH_EXEMPT_API_PATHS = frozenset({"/api/data_plane/ensure"})
+# Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
+# exempted (biopb/biopb#424 item 2) because biopb-mcp's _control_client had no way
+# to obtain the token — the control handed back the plane's endpoint but never a
+# credential — so gating this idempotent route would have locked the mcp client out
+# of a token-gated deployment. That exemption was an unauthenticated state-change,
+# safe only while a local control was necessarily tokenless; #468's optional local
+# token falsified that. The credential handoff (biopb/biopb#470) unblocks the fix:
+# the control writes the token to an owner-only file and _control_client carries it,
+# so this route can be gated like the rest and the exemption is gone.
 
 # Data-plane log tail (the dashboard /logs page polls it). Bound BOTH the returned
 # line count and the bytes read off the end of the file, so tailing a multi-GB log
@@ -253,8 +242,6 @@ class _ControlAuthMiddleware:
 
     @staticmethod
     def _guarded(path: str) -> bool:
-        if path in _AUTH_EXEMPT_API_PATHS:
-            return False
         if path.startswith("/api/"):
             return True
         return _is_session_api_path(path)
@@ -555,6 +542,7 @@ def build_app(
         return JSONResponse(
             {
                 "control": "ok",
+                "version": __version__,
                 "data_plane": supervisor.snapshot(),
                 "sessions": len(_sessions.list_sessions()),
             }
@@ -680,14 +668,17 @@ def build_app(
         )
 
     async def api_mcp_config_save(request: Request) -> JSONResponse:
-        # Validate + write the biopb-mcp config. Validation reuses biopb-mcp's own
-        # _CONSTRAINTS table (the exact rules it clamps to at load time), so "the
-        # form accepted it" == "biopb-mcp will accept it" with no jsonschema
-        # dependency in the lean control. Changes apply to the NEXT session (each
-        # session reads config fresh at bootstrap), so there is no server to
-        # restart -- unlike the data plane.
+        # Validate + write the biopb-mcp config. Validation calls biopb-mcp's own
+        # config_problems -- the exact check its load path runs, cross-field rules
+        # included -- so "the form accepted it" == "biopb-mcp will accept it", with
+        # no jsonschema dependency in the lean control and nothing for this handler
+        # to restate. The difference is only what happens next: biopb-mcp clamps to
+        # defaults at load, this endpoint rejects, because a human is here to fix
+        # it (biopb/biopb#34). Changes apply to the NEXT session (each session
+        # reads config fresh at bootstrap), so there is no server to restart --
+        # unlike the data plane.
         try:
-            from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, save_config
+            from biopb_mcp._config import config_problems, save_config
         except Exception as exc:  # noqa: BLE001 - biopb-mcp not installed here
             return JSONResponse(
                 {"error": f"biopb-mcp is not installed: {exc}"}, status_code=501
@@ -705,37 +696,7 @@ def build_app(
                 {"detail": "Config body must be a JSON object"}, status_code=422
             )
 
-        errors: list[dict] = []
-        for section, cls in _SECTION_CLASSES.items():
-            sec = body.get(section)
-            if not isinstance(sec, dict):
-                continue
-            for field, constraint in _CONSTRAINTS.get(cls.__name__, {}).items():
-                if field in sec and not constraint.ok(sec[field]):
-                    errors.append(
-                        {
-                            "path": [section, field],
-                            "message": f"expected {constraint.describe()}",
-                        }
-                    )
-        # Cross-field: the health-poll backoff must not invert (min > max).
-        tensor = body.get("tensor")
-        if isinstance(tensor, dict):
-            lo, hi = (
-                tensor.get("health_poll_min_interval"),
-                tensor.get("health_poll_max_interval"),
-            )
-            if (
-                isinstance(lo, (int, float))
-                and isinstance(hi, (int, float))
-                and lo > hi
-            ):
-                errors.append(
-                    {
-                        "path": ["tensor", "health_poll_min_interval"],
-                        "message": "must be <= health_poll_max_interval",
-                    }
-                )
+        errors = [p.as_dict() for p in config_problems(body)]
         if errors:
             errors.sort(key=lambda d: d["path"])
             return JSONResponse(

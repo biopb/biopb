@@ -145,14 +145,15 @@ def _register_cache_plugin(dask_client, url, token, config: dict, planned_worker
 
     Divides ``dask.cache_budget`` evenly across the workers and installs a
     worker-init plugin so each worker (current and future) caps its per-process
-    cache at ``budget // n_workers`` -- bounding the aggregate cache that would
-    otherwise be replicated per worker.
+    *copy* cache at ``budget // n_workers`` -- bounding the aggregate cache that
+    would otherwise be replicated per worker.
 
-    Localhost needs no special-case here: the tensor client applies the
-    localhost no-cache rule authoritatively per worker (``_resolve_cache_bytes``
-    resolves a localhost location to 0 unless ``BIOPB_CACHE_LOCAL`` is set), so
-    on localhost each worker clamps this budget to 0 regardless. This function
-    just sizes the remote budget.
+    This budget now applies on localhost too. It bounds only the strong cache of
+    chunks that cost real RAM (``do_get`` / over-budget copies); on localhost
+    those are rare (the mmap fast path dominates), and its views are cached
+    *weakly* -- shared with the OS page cache, so not replicated per worker and
+    needing no budget. So the old "localhost clamps to 0" special-case is gone;
+    each worker just applies this budget uniformly.
 
     No-op without a distributed client. Best-effort: a failure here must not
     break the connect flow that invokes it. Called from

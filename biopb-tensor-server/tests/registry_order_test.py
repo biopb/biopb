@@ -31,9 +31,8 @@ from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
 def _order_indices(*adapter_classes):
     """Return each class's index in the default registry's probe order.
 
-    Uses the FIRST occurrence, since one adapter class (e.g. OmeZarrAdapter, which
-    registers under both ``ome-zarr`` and ``ome-zarr-hcs``) may be registered more
-    than once; its earliest slot is the one that governs precedence.
+    Uses the FIRST occurrence to stay robust if an adapter class ever occupies
+    more than one slot; its earliest slot is the one that governs precedence.
     """
     adapters = get_default_registry()._adapters
     return [

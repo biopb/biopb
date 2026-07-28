@@ -49,9 +49,9 @@ from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
     _is_offline_placeholder,
-    is_remote_url,
     resolve_local_path,
 )
+from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
 if TYPE_CHECKING:
@@ -529,7 +529,8 @@ class Reconciler:
             self._commit_remove_source(source_id)
 
         def _row_to_seed(row):
-            """(tensors, metadata, data_resident, source_url) for seed_catalog, or None."""
+            """(tensors, metadata, data_resident, source_url, indexed_at) for
+            seed_catalog, or None."""
             if row is None:
                 return None
             raw = row.get("metadata_json")
@@ -542,6 +543,7 @@ class Reconciler:
                 metadata,
                 bool(row.get("data_resident")),
                 row.get("source_url"),
+                row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
             )
 
         extra_config = {}
@@ -836,8 +838,12 @@ class Reconciler:
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
                 # adapter opting in via seed_catalog (only the remote proxy does).
                 if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    tensors, metadata, data_resident, source_url = catalog_seed
-                    adapter.seed_catalog(tensors, metadata, data_resident, source_url)
+                    tensors, metadata, data_resident, source_url, indexed_at = (
+                        catalog_seed
+                    )
+                    adapter.seed_catalog(
+                        tensors, metadata, data_resident, source_url, indexed_at
+                    )
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,

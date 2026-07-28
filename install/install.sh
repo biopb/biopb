@@ -167,8 +167,7 @@ if not isinstance(data, dict):
 # intended informational signal, and Phase 4 is the single hard cutover.
 data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
                            "aggressive_dir_pruning": True})
-data.setdefault("cache", {"backend": "file", "file_max_segment_mb": 256,
-                          "file_max_total_gb": 32})
+data.setdefault("cache", {"backend": "file", "file_max_total_gb": 32})
 md = data.pop("metadata_db", None)
 if isinstance(md, dict):
     if md.get("enabled", True):
@@ -1557,7 +1556,9 @@ install_biopb() {
     else
         _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
     fi
-    _info "The agent launches biopb-mcp for you and a napari window opens."
+    _info "Then prompt it:"
+    _cmd "start biopb and report status"
+    _info "That brings up the napari viewer and the data plane."
     _info "Keep the agent session running while you work."
     echo ""
 
@@ -1634,11 +1635,16 @@ _unregister_agents() {
         macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
         Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
     esac
+    # opencode reads either opencode.json or opencode.jsonc; target the file the
+    # user actually keeps (prefer .jsonc) so teardown matches registration (#536).
+    local oc_cfg="$HOME/.config/opencode/opencode.json"
+    [ -f "$HOME/.config/opencode/opencode.jsonc" ] && oc_cfg="$HOME/.config/opencode/opencode.jsonc"
+
     local row label file parent
     for row in \
         "Claude Desktop|$cd_cfg|mcpServers" \
         "Cursor|$HOME/.cursor/mcp.json|mcpServers" \
-        "opencode|$HOME/.config/opencode/opencode.json|mcp"; do
+        "opencode|$oc_cfg|mcp"; do
         IFS='|' read -r label file parent <<< "$row"
         [ -n "$file" ] || continue
         if [ "$(_mcp_unmerge "$file" "$parent")" = "removed" ]; then
@@ -1646,6 +1652,14 @@ _unregister_agents() {
             removed_any=1
         fi
     done
+
+    # A commented opencode.jsonc can't be edited by _mcp_unmerge's strict-JSON
+    # rewriter (json.load fails, it no-ops), so a biopb entry there survives the
+    # loop above. Point the user at it by hand rather than leave it stale (#536).
+    if [ -f "$HOME/.config/opencode/opencode.jsonc" ] \
+        && grep -q '"biopb"' "$HOME/.config/opencode/opencode.jsonc" 2>/dev/null; then
+        _info "opencode: remove the 'biopb' entry from $HOME/.config/opencode/opencode.jsonc by hand"
+    fi
 
     # Hermes' YAML is edited by hand on install, so we can't safely edit it back.
     if [ -f "$HOME/.hermes/config.yaml" ] \

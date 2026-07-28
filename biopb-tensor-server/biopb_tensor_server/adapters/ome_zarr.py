@@ -10,16 +10,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.base import TensorReadPlan
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
-from biopb_tensor_server.core.downsample import normalize_reduction_method
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.base import TensorAdapter
+    from biopb_tensor_server.core.adapter_base import TensorAdapter
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
@@ -114,6 +112,36 @@ def _physical_scale_from_multiscales(
     return scale, unit
 
 
+def _axes_to_dim_labels(axes: list) -> Optional[List[str]]:
+    """Dimension labels from an OME ``axes`` array, or ``None`` when it is empty.
+
+    An axis is either a dict (``{"name": "y", ...}``) or a bare string; both the
+    single-image ``__init__`` and every per-field reader turn axes into labels
+    the identical way, so the conversion lives here (issue #558)."""
+    if not axes:
+        return None
+    return [
+        ax.get("name", f"dim{i}") if isinstance(ax, dict) else str(ax)
+        for i, ax in enumerate(axes)
+    ]
+
+
+def _first_dataset_path(multiscales: list) -> Optional[str]:
+    """Path of the first (full-resolution) dataset in a ``multiscales`` block.
+
+    Returns ``datasets[0].path`` (defaulting to ``"0"`` when that entry omits its
+    own path), or ``None`` when the block carries no ``multiscales``/``datasets``.
+    The one place the "which array is level 0" convention is spelled — the create
+    path, the field enumeration, and the field-adapter open all route through it
+    (issue #558)."""
+    if not multiscales:
+        return None
+    datasets = multiscales[0].get("datasets", [])
+    if not datasets:
+        return None
+    return datasets[0].get("path", "0")
+
+
 class _HcsFieldAdapter(ZarrAdapter):
     """A single HCS-plate field, served as a plain Zarr array + its own scale.
 
@@ -126,12 +154,25 @@ class _HcsFieldAdapter(ZarrAdapter):
     field is where the calibration actually lives.
     """
 
-    def __init__(self, *args, physical_scale=None, **kwargs):
+    def __init__(self, *args, physical_scale=None, field_metadata=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._field_physical_scale = physical_scale
+        self._field_metadata = field_metadata
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         return self._field_physical_scale
+
+    def get_tensor_metadata(self) -> Optional[dict]:
+        """This field's own ``.zattrs`` (its OME-NGFF metadata) as the delta.
+
+        The plate's source-level catalog row is the *plate* ``.zattrs`` (the
+        rows/columns/wells layout); the serve path merges this field's own
+        ``.zattrs`` (``multiscales`` / ``omero`` -- disjoint from the plate keys)
+        over it, so a field advertises both its plate context and its own metadata
+        (biopb/biopb#253). ``None`` when the field ``.zattrs`` is unreadable -- the
+        field then carries just the plate row.
+        """
+        return self._field_metadata
 
 
 class OmeZarrAdapter(ZarrAdapter):
@@ -148,7 +189,6 @@ class OmeZarrAdapter(ZarrAdapter):
     For HCS (High-Content Screening) plates:
     - Plate as source, wells/fields as tensors
     - array_id = '{source_id}/{well_name}/{field_index}'
-    - _single_tensor_source = False (multi-tensor)
 
     Chunk ID format: Same as ZarrAdapter
     - array_id prefix
@@ -161,10 +201,6 @@ class OmeZarrAdapter(ZarrAdapter):
        ZarrAdapter instances for specific levels
     3. Level-specific: Created with a specific level array, acts as single-tensor
     """
-
-    # Default: single-tensor (level-specific usage)
-    # Set to False for HCS plates in __init__
-    _single_tensor_source = True
 
     # HCS-specific state (populated if _is_hcs_plate is True)
     _is_hcs_plate: bool = False
@@ -256,7 +292,12 @@ class OmeZarrAdapter(ZarrAdapter):
         """Create adapter instance from SourceConfig.
 
         Handles both regular OME-Zarr multiscale images and HCS plate datasets.
-        For HCS plates, opens the plate root group.
+        The plate/well/field ``.zattrs`` navigation is written once against the
+        unified :class:`ClaimContext` fs seam (local ``Path`` or remote
+        ``RemoteStore``) rather than a hand-forked fsspec/``DirectoryStore`` pair
+        (issue #558). The already-parsed top-level ``.zattrs`` and the local root
+        are threaded into ``__init__`` so it does not re-walk the store back up to
+        the root it just descended from.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
@@ -265,196 +306,123 @@ class OmeZarrAdapter(ZarrAdapter):
         Returns:
             OmeZarrAdapter instance
         """
-        import json
-
         import zarr
-        from fsspec.core import url_to_fs
 
         zarr_path = str(source.url)
+        ctx, zarr_store = cls._source_context_and_store(source, credentials_config)
+
+        # A missing/corrupt sidecar already decodes to None in _read_json_sidecar,
+        # so zattrs is always a dict here. The zarr opens raise typed
+        # Group/ArrayNotFound errors we let propagate (fail fast on a source whose
+        # .zattrs the claim vetted but whose arrays are gone).
+        zattrs = cls._read_json_sidecar(ctx, ".zattrs") or {}
+        if "plate" in zattrs:
+            field_relpath = cls._first_field_relpath(ctx, zattrs)
+            arr = cls._open_field_array(source, zarr_store, zarr_path, field_relpath)
+        else:
+            res = _first_dataset_path(zattrs.get("multiscales", [])) or "0"
+            root = zarr.open_group(zarr_store, mode="r")
+            arr = root[res] if res in root else zarr.open_array(zarr_store, mode="r")
+
+        # Thread the parsed root .zattrs + local root so __init__ skips the store
+        # re-walk. Remote passes no local root -> __init__ falls back to its walk,
+        # preserving the prior remote behavior (its store path is not local).
+        threaded_root = None if source.is_remote else zarr_path
+        return cls(
+            arr,
+            source.source_id,
+            source.dim_labels,
+            _threaded_zattrs=zattrs or None,
+            _threaded_root=threaded_root,
+        )
+
+    @staticmethod
+    def _source_context_and_store(
+        source: "SourceConfig", credentials_config: Optional[Any]
+    ) -> Tuple[ClaimContext, Any]:
+        """A ``(ClaimContext, zarr store)`` pair rooted at the source.
+
+        One seam for both storage kinds (was a hand-forked remote/local pair):
+        the :class:`ClaimContext` reads the ``.zattrs`` sidecars during the plate
+        descent, the store opens the resolution arrays. Remote goes through
+        :class:`RemoteStore` — the same fs abstraction discovery and the base
+        ``ZarrAdapter`` already use — so credential handling stays in one place.
+        """
+        import zarr
 
         if source.is_remote:
-            # Remote storage: use fsspec FSStore
-            # Build storage_options from credentials_config if provided
-            storage_options = {}
-            if credentials_config:
-                profile = credentials_config.get_profile(source.credentials_profile)
-                if profile:
-                    storage_options = profile.to_storage_options()
+            from biopb_tensor_server.core.remote import RemoteStore
 
-            fs, fs_path = url_to_fs(zarr_path, storage_options=storage_options)
-            store = zarr.FSStore(fs, fs_path)
+            store = RemoteStore.from_config(
+                source.url,
+                credentials_config=credentials_config,
+                profile_name=source.credentials_profile,
+            )
+            zarr_store = zarr.FSStore(store.path, fs=store.fs)
+            return ClaimContext("", store), zarr_store
 
-            # Read zattrs to determine type (HCS plate or multiscale)
-            zattrs_bytes = fs.cat_file(fs_path.rstrip("/") + "/.zattrs")
-            zattrs = json.loads(zattrs_bytes)
+        zarr_path = str(source.url)
+        return ClaimContext(Path(zarr_path)), zarr.DirectoryStore(zarr_path)
 
-            # Check for HCS plate metadata
-            if "plate" in zattrs:
-                # HCS plate: open group and first field for array reference
-                root = zarr.open_group(store, mode="r")
+    @staticmethod
+    def _read_json_sidecar(ctx: ClaimContext, name: str) -> Optional[dict]:
+        """Parse the JSON sidecar ``name`` under ``ctx``, or ``None`` if it is
+        absent or unreadable. The single fs-seam read behind the create-time
+        plate navigation, so local and remote decode identically."""
+        try:
+            if not ctx.join(name).exists():
+                return None
+            return json.loads(ctx.read_text(name))
+        except (OSError, json.JSONDecodeError):
+            return None
 
-                # Find first well and field for initial array
-                plate_meta = zattrs.get("plate", {})
-                wells = plate_meta.get("wells", [])
-                if wells:
-                    first_well_path = wells[0].get("path", "0")
+    @classmethod
+    def _first_field_relpath(
+        cls, ctx: ClaimContext, plate_zattrs: dict
+    ) -> Optional[str]:
+        """``well/field/level`` path of the plate's first field's level-0 array.
 
-                    # Read well .zattrs
-                    well_zattrs_bytes = fs.cat_file(
-                        fs_path.rstrip("/")
-                        + "/"
-                        + first_well_path.rstrip("/")
-                        + "/.zattrs"
-                    )
-                    well_zattrs = json.loads(well_zattrs_bytes)
-                    well_info = well_zattrs.get("well", {})
-                    images = well_info.get("images", [])
-                    if images:
-                        first_field_path = images[0].get("path", "0")
+        Navigates plate -> first well -> first field -> first dataset through the
+        fs seam (the descent that ``create_from_config`` used to carry twice).
+        Returns ``None`` when the plate has no wells, the well no images, or the
+        field no datasets — the caller then opens the store root, exactly as the
+        prior per-branch fallbacks did.
+        """
+        wells = plate_zattrs.get("plate", {}).get("wells", [])
+        if not wells:
+            return None
+        well_path = wells[0].get("path", "0").rstrip("/")
 
-                        # Read field .zattrs
-                        field_zattrs_bytes = fs.cat_file(
-                            fs_path.rstrip("/")
-                            + "/"
-                            + first_well_path.rstrip("/")
-                            + "/"
-                            + first_field_path.rstrip("/")
-                            + "/.zattrs"
-                        )
-                        field_zattrs = json.loads(field_zattrs_bytes)
+        well_zattrs = cls._read_json_sidecar(ctx.join(well_path), ".zattrs")
+        images = (well_zattrs or {}).get("well", {}).get("images", [])
+        if not images:
+            return None
+        field_path = images[0].get("path", "0").rstrip("/")
 
-                        # Get first resolution level
-                        multiscales = field_zattrs.get("multiscales", [])
-                        if multiscales:
-                            datasets = multiscales[0].get("datasets", [])
-                            if datasets:
-                                resolution_path = datasets[0].get("path", "0")
-                                arr_path = (
-                                    first_well_path.rstrip("/")
-                                    + "/"
-                                    + first_field_path.rstrip("/")
-                                    + "/"
-                                    + resolution_path
-                                )
-                                arr = zarr.open_array(store, path=arr_path, mode="r")
-                            else:
-                                arr = zarr.open_array(store, mode="r")
-                        else:
-                            arr = zarr.open_array(store, mode="r")
-                    else:
-                        arr = zarr.open_array(store, mode="r")
-                else:
-                    arr = zarr.open_array(store, mode="r")
-            else:
-                # Regular multiscale image
-                resolution_path = "0"
-                if "multiscales" in zattrs and zattrs["multiscales"]:
-                    datasets = zattrs["multiscales"][0].get("datasets", [])
-                    if datasets:
-                        resolution_path = datasets[0].get("path", "0")
+        field_ctx = ctx.join(well_path).join(field_path)
+        field_zattrs = cls._read_json_sidecar(field_ctx, ".zattrs")
+        res = _first_dataset_path((field_zattrs or {}).get("multiscales", []))
+        if res is None:
+            return None
+        return f"{well_path}/{field_path}/{res}"
 
-                # Open the group and then the resolution array
-                root = zarr.open_group(store, mode="r")
-                if resolution_path in root:
-                    arr = root[resolution_path]
-                else:
-                    arr = zarr.open_array(store, mode="r")
-        else:
-            # Local filesystem
-            store = zarr.DirectoryStore(zarr_path)
+    @staticmethod
+    def _open_field_array(
+        source: "SourceConfig", zarr_store, zarr_path: str, relpath: Optional[str]
+    ):
+        """Open a plate field's resolution array (or the store root fallback).
 
-            try:
-                with open(str(Path(zarr_path) / ".zattrs")) as f:
-                    zattrs = json.load(f)
+        Preserves the store rooting each mode had: remote opens through the shared
+        ``FSStore`` + ``path=``; local opens the absolute directory so
+        ``arr.store`` (hence the catalog ``source_url``) roots where it did before.
+        """
+        import zarr
 
-                # Check for HCS plate metadata
-                if "plate" in zattrs:
-                    # HCS plate: open group and first field for array reference
-                    root = zarr.open_group(zarr_path, mode="r")
-
-                    # Find first well and field for initial array
-                    plate_meta = zattrs.get("plate", {})
-                    wells = plate_meta.get("wells", [])
-                    if wells:
-                        first_well_path = wells[0].get("path", "0")
-
-                        # Read well .zattrs
-                        well_zattrs_path = str(
-                            Path(zarr_path) / first_well_path.rstrip("/") / ".zattrs"
-                        )
-                        if Path(well_zattrs_path).exists():
-                            with open(well_zattrs_path) as wf:
-                                well_zattrs = json.load(wf)
-                                well_info = well_zattrs.get("well", {})
-                                images = well_info.get("images", [])
-                                if images:
-                                    first_field_path = images[0].get("path", "0")
-
-                                    # Read field .zattrs
-                                    field_zattrs_path = str(
-                                        Path(zarr_path)
-                                        / first_well_path.rstrip("/")
-                                        / first_field_path.rstrip("/")
-                                        / ".zattrs"
-                                    )
-                                    if Path(field_zattrs_path).exists():
-                                        with open(field_zattrs_path) as ff:
-                                            field_zattrs = json.load(ff)
-
-                                            # Get first resolution level
-                                            multiscales = field_zattrs.get(
-                                                "multiscales", []
-                                            )
-                                            if multiscales:
-                                                datasets = multiscales[0].get(
-                                                    "datasets", []
-                                                )
-                                                if datasets:
-                                                    resolution_path = datasets[0].get(
-                                                        "path", "0"
-                                                    )
-                                                    arr_path = str(
-                                                        Path(zarr_path)
-                                                        / first_well_path.rstrip("/")
-                                                        / first_field_path.rstrip("/")
-                                                        / resolution_path
-                                                    )
-                                                    arr = zarr.open_array(
-                                                        arr_path, mode="r"
-                                                    )
-                                                else:
-                                                    arr = zarr.open_array(
-                                                        zarr_path, mode="r"
-                                                    )
-                                            else:
-                                                arr = zarr.open_array(
-                                                    zarr_path, mode="r"
-                                                )
-                                    else:
-                                        arr = zarr.open_array(zarr_path, mode="r")
-                                else:
-                                    arr = zarr.open_array(zarr_path, mode="r")
-                        else:
-                            arr = zarr.open_array(zarr_path, mode="r")
-                    else:
-                        arr = zarr.open_array(zarr_path, mode="r")
-                else:
-                    # Regular multiscale image
-                    resolution_path = "0"
-                    if "multiscales" in zattrs and zattrs["multiscales"]:
-                        datasets = zattrs["multiscales"][0].get("datasets", [])
-                        if datasets:
-                            resolution_path = datasets[0].get("path", "0")
-
-                    root = zarr.open_group(zarr_path, mode="r")
-                    if resolution_path in root:
-                        arr = root[resolution_path]
-                    else:
-                        arr = zarr.open_array(store, mode="r")
-            except (json.JSONDecodeError, KeyError, FileNotFoundError):
-                arr = zarr.open_array(zarr_path, mode="r")
-
-        return cls(arr, source.source_id, source.dim_labels)
+        if relpath is None:
+            return zarr.open_array(zarr_store, mode="r")
+        if source.is_remote:
+            return zarr.open_array(zarr_store, path=relpath, mode="r")
+        return zarr.open_array(os.path.join(zarr_path, relpath), mode="r")
 
     def __init__(
         self,
@@ -462,6 +430,8 @@ class OmeZarrAdapter(ZarrAdapter):
         source_id: str,
         dim_labels: Optional[List[str]] = None,
         resolution_level: int = 0,
+        _threaded_zattrs: Optional[dict] = None,
+        _threaded_root: Optional[str] = None,
     ):
         """Initialize OME-Zarr adapter.
 
@@ -470,6 +440,12 @@ class OmeZarrAdapter(ZarrAdapter):
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (overrides OME metadata)
             resolution_level: Which resolution level to use (default 0)
+            _threaded_zattrs / _threaded_root: the root ``.zattrs`` and its local
+                path, supplied by :meth:`create_from_config` (which already read
+                them off the fs seam) so this constructor skips walking the store
+                back up to the root. Both must be present to take that shortcut;
+                a direct construction leaves them ``None`` and the walk runs
+                (issue #558).
         """
         # Initialize base ZarrAdapter first
         # We'll override dim_labels below if OME metadata provides better ones
@@ -491,16 +467,51 @@ class OmeZarrAdapter(ZarrAdapter):
         self.axes = []
         self.channel_names = []
 
-        # Determine store path for reading .zattrs
-        store_path = _store_filesystem_path(zarr_array.store)
+        # The group/plate root and its .zattrs. create_from_config threads both
+        # (it already read them descending the store), so we take them as-is;
+        # otherwise walk the store path up to the root.
+        if _threaded_zattrs is not None and _threaded_root is not None:
+            plate_root_path, zattrs = _threaded_root, _threaded_zattrs
+        else:
+            plate_root_path, zattrs = self._find_group_root(
+                _store_filesystem_path(zarr_array.store)
+            )
 
-        # Navigate to find the plate root .zattrs (might be multiple levels up for HCS)
-        # For HCS plates, array is at plate.zarr/A01/0/0, but plate .zattrs is at plate.zarr/
-        # We need to find .zattrs with 'plate' key, not just any .zattrs
+        if zattrs is not None:
+            self.ome_metadata = zattrs
+
+            # Check for HCS plate metadata first
+            if "plate" in zattrs:
+                self._is_hcs_plate = True
+                self._source_type = "ome-zarr-hcs"
+                self._plate_root_path = plate_root_path  # Save for field adapters
+                self._parse_hcs_plate_structure()
+            elif "multiscales" in zattrs:
+                self._source_type = "ome-zarr"
+                self.axes = zattrs["multiscales"][0].get("axes", [])
+                if "omero" in zattrs:
+                    channels = zattrs["omero"].get("channels", [])
+                    self.channel_names = [
+                        ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
+                    ]
+
+        # Override dimension labels from OME metadata if not explicitly provided
+        if dim_labels is None and self.axes:
+            self.dim_labels = _axes_to_dim_labels(self.axes)
+
+    @staticmethod
+    def _find_group_root(store_path: str) -> Tuple[Optional[str], Optional[dict]]:
+        """Walk up from ``store_path`` to the OME-Zarr group/plate root.
+
+        Returns ``(root_path, zattrs)`` for the nearest ancestor whose ``.zattrs``
+        carries ``plate`` (HCS, highest priority) or ``multiscales`` (single
+        image); ``(None, None)`` when neither is found. A ``plate`` ancestor wins
+        even above a ``multiscales`` one, so a field opened deep inside a plate
+        still resolves the plate. Only reached for a direct construction —
+        ``create_from_config`` threads the root it already descended from.
+        """
         plate_root_path = None
         zattrs = None
-
-        # Navigate up to find .zattrs with plate metadata (HCS) or multiscales (single image)
         current_path = store_path.rstrip("/")
         while current_path:
             candidate_zattrs_path = os.path.join(current_path, ".zattrs")
@@ -509,16 +520,14 @@ class OmeZarrAdapter(ZarrAdapter):
                     with open(candidate_zattrs_path) as f:
                         candidate_zattrs = json.load(f)
 
-                    # Check for HCS plate metadata first (highest priority)
+                    # HCS plate metadata is highest priority: stop the moment it
+                    # is found.
                     if "plate" in candidate_zattrs:
-                        plate_root_path = current_path
-                        zattrs = candidate_zattrs
-                        break  # Found plate root, stop searching
+                        return current_path, candidate_zattrs
 
-                    # If we found multiscales without plate, this might be a single image
-                    # But continue searching up to see if there's a plate above
+                    # A multiscales-without-plate is the single-image fallback,
+                    # but keep climbing in case a plate sits above it.
                     if "multiscales" in candidate_zattrs and zattrs is None:
-                        # Save this as fallback (single image case)
                         plate_root_path = current_path
                         zattrs = candidate_zattrs
                 except (OSError, json.JSONDecodeError):
@@ -533,33 +542,35 @@ class OmeZarrAdapter(ZarrAdapter):
                 break
             current_path = parent_path
 
-        if zattrs is not None:
-            self.ome_metadata = zattrs
+        return plate_root_path, zattrs
 
-            # Check for HCS plate metadata first
-            if "plate" in zattrs:
-                self._is_hcs_plate = True
-                self._single_tensor_source = False  # Multi-tensor!
-                self._source_type = "ome-zarr-hcs"
-                self._plate_root_path = plate_root_path  # Save for field adapters
-                self._parse_hcs_plate_structure(plate_root_path)
-            elif "multiscales" in zattrs:
-                self._source_type = "ome-zarr"
-                self.axes = zattrs["multiscales"][0].get("axes", [])
-                if "omero" in zattrs:
-                    channels = zattrs["omero"].get("channels", [])
-                    self.channel_names = [
-                        ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
-                    ]
+    def _read_zattrs_at(self, *parts: str) -> Optional[dict]:
+        """Parse the ``.zattrs`` at ``plate_root/<parts>/.zattrs``, or ``None``.
 
-        # Override dimension labels from OME metadata if not explicitly provided
-        if dim_labels is None and self.axes:
-            self.dim_labels = [
-                ax.get("name", f"dim{i}") if isinstance(ax, dict) else str(ax)
-                for i, ax in enumerate(self.axes)
-            ]
+        The single local reader for a plate's interior sidecars — every per-well
+        and per-field ``.zattrs`` read (the parse, the enumeration, the
+        field-adapter open) goes through here so "where a field's
+        resolution/axes/scale come from" lives in one place (issue #558). HCS
+        field serving is local-only, so this reads the local filesystem directly.
+        """
+        path = os.path.join(
+            self._plate_root_path, *[p.rstrip("/") for p in parts], ".zattrs"
+        )
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
 
-    def _parse_hcs_plate_structure(self, store_path: str) -> None:
+    def _field_array_path(self, well_path: str, field_path: str, level: str) -> str:
+        """Absolute path to a plate field's resolution-``level`` array."""
+        return os.path.join(
+            self._plate_root_path, well_path.rstrip("/"), field_path.rstrip("/"), level
+        )
+
+    def _parse_hcs_plate_structure(self) -> None:
         """Parse HCS plate metadata from plate.zattrs and well .zattrs files.
 
         Populates:
@@ -567,8 +578,8 @@ class OmeZarrAdapter(ZarrAdapter):
         - _hcs_field_count: number of fields per well
         - _hcs_well_metadata: dict mapping well_name -> well .zattrs
 
-        Args:
-            store_path: Path to the plate root directory
+        Reads the interior sidecars relative to ``self._plate_root_path`` (set by
+        ``__init__`` just before this runs) via :meth:`_read_zattrs_at`.
         """
         plate_meta = self.ome_metadata.get("plate", {})
         wells = plate_meta.get("wells", [])
@@ -589,59 +600,33 @@ class OmeZarrAdapter(ZarrAdapter):
         field_count = 0
         well_metadata = {}
         for well_name, well_path in well_paths.items():
-            well_zattrs_path = os.path.join(
-                store_path, well_path.rstrip("/"), ".zattrs"
-            )
-            if os.path.exists(well_zattrs_path):
-                try:
-                    with open(well_zattrs_path) as f:
-                        well_zattrs = json.load(f)
-                        well_metadata[well_name] = well_zattrs
-
-                        # Get field count from well metadata
-                        # well metadata has 'well' key with 'images' list
-                        well_info = well_zattrs.get("well", {})
-                        images = well_info.get("images", [])
-                        if len(images) > field_count:
-                            field_count = len(images)
-                except (OSError, json.JSONDecodeError):
-                    pass
+            well_zattrs = self._read_zattrs_at(well_path)
+            if well_zattrs is None:
+                continue
+            well_metadata[well_name] = well_zattrs
+            # well metadata has a 'well' key with an 'images' list
+            images = well_zattrs.get("well", {}).get("images", [])
+            field_count = max(field_count, len(images))
 
         self._hcs_field_count = field_count
         self._hcs_well_metadata = well_metadata
 
-        # Get axes/dim_labels from first field's multiscales metadata
+        # Axes / channel names come from the first field's multiscales metadata.
         if well_metadata:
-            first_well = list(well_metadata.values())[0]
-            well_info = first_well.get("well", {})
-            images = well_info.get("images", [])
+            first_well_name = next(iter(well_metadata))
+            images = well_metadata[first_well_name].get("well", {}).get("images", [])
             if images:
-                # Path to first field
                 first_field_path = images[0].get("path", "0")
-                # Try to read field .zattrs for axes
-                first_well_name = list(well_metadata.keys())[0]
-                field_zattrs_path = os.path.join(
-                    store_path,
-                    self._hcs_well_paths[first_well_name].rstrip("/"),
-                    first_field_path.rstrip("/"),
-                    ".zattrs",
+                field_zattrs = self._read_zattrs_at(
+                    self._hcs_well_paths[first_well_name], first_field_path
                 )
-                if os.path.exists(field_zattrs_path):
-                    try:
-                        with open(field_zattrs_path) as f:
-                            field_zattrs = json.load(f)
-                            if "multiscales" in field_zattrs:
-                                self.axes = field_zattrs["multiscales"][0].get(
-                                    "axes", []
-                                )
-                                if "omero" in field_zattrs:
-                                    channels = field_zattrs["omero"].get("channels", [])
-                                    self.channel_names = [
-                                        ch.get("label", f"ch{i}")
-                                        for i, ch in enumerate(channels)
-                                    ]
-                    except (OSError, json.JSONDecodeError):
-                        pass
+                multiscales = (field_zattrs or {}).get("multiscales", [])
+                if multiscales:
+                    self.axes = multiscales[0].get("axes", [])
+                    channels = (field_zattrs or {}).get("omero", {}).get("channels", [])
+                    self.channel_names = [
+                        ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
+                    ]
 
     def _enumerate_hcs_fields(self) -> List[TensorDescriptor]:
         """Enumerate all fields in HCS plate as flattened tensor list.
@@ -659,9 +644,6 @@ class OmeZarrAdapter(ZarrAdapter):
 
         descriptors = []
 
-        # Use plate root path for navigation
-        store_path = self._plate_root_path
-
         for well_name, well_path in self._hcs_well_paths.items():
             well_meta = self._hcs_well_metadata.get(well_name, {})
             well_info = well_meta.get("well", {})
@@ -671,54 +653,32 @@ class OmeZarrAdapter(ZarrAdapter):
                 field_path = image_info.get("path", str(field_idx))
                 field_key = f"{well_name}/{field_idx}"
 
-                # Try to read field .zattrs for shape/dtype
-                field_zattrs_path = os.path.join(
-                    store_path, well_path.rstrip("/"), field_path.rstrip("/"), ".zattrs"
-                )
-
                 shape = []
                 chunk_shape = []
                 dtype = ""
                 dim_labels = self.dim_labels
 
-                if os.path.exists(field_zattrs_path):
+                field_zattrs = self._read_zattrs_at(well_path, field_path)
+                multiscales = (field_zattrs or {}).get("multiscales", [])
+                res = _first_dataset_path(multiscales)
+                if res is not None:
+                    # Open the level-0 array for actual shape/chunks/dtype.
                     try:
-                        with open(field_zattrs_path) as f:
-                            field_zattrs = json.load(f)
-                            multiscales = field_zattrs.get("multiscales", [])
-                            if multiscales:
-                                datasets = multiscales[0].get("datasets", [])
-                                if datasets:
-                                    # Get shape/chunks from first resolution level
-                                    first_level_path = datasets[0].get("path", "0")
-
-                                    # Open the array to get actual shape/chunks/dtype
-                                    arr_path = os.path.join(
-                                        store_path,
-                                        well_path.rstrip("/"),
-                                        field_path.rstrip("/"),
-                                        first_level_path,
-                                    )
-                                    try:
-                                        arr = zarr.open_array(arr_path, mode="r")
-                                        shape = list(arr.shape)
-                                        chunk_shape = list(arr.chunks)
-                                        dtype = arr.dtype.str
-                                    except Exception:
-                                        # Fallback: estimate from multiscales metadata
-                                        pass
-
-                                # Get axes from multiscales
-                                axes = multiscales[0].get("axes", [])
-                                if axes:
-                                    dim_labels = [
-                                        ax.get("name", f"dim{i}")
-                                        if isinstance(ax, dict)
-                                        else str(ax)
-                                        for i, ax in enumerate(axes)
-                                    ]
-                    except (OSError, json.JSONDecodeError):
+                        arr = zarr.open_array(
+                            self._field_array_path(well_path, field_path, res),
+                            mode="r",
+                        )
+                        shape = list(arr.shape)
+                        chunk_shape = list(arr.chunks)
+                        dtype = arr.dtype.str
+                    except Exception:
+                        # Fallback: leave shape/dtype unfilled (metadata-only).
                         pass
+                if multiscales:
+                    dim_labels = (
+                        _axes_to_dim_labels(multiscales[0].get("axes", []))
+                        or self.dim_labels
+                    )
 
                 descriptors.append(
                     TensorDescriptor(
@@ -758,16 +718,14 @@ class OmeZarrAdapter(ZarrAdapter):
         return result
 
     def get_metadata(self) -> dict:
-        """Return OME-Zarr .zattrs content directly."""
-        return self.ome_metadata
+        """Return OME-Zarr .zattrs content directly.
 
-    def metadata_covers_all_tensors(self) -> bool:
-        """False for an HCS plate: the source row's metadata is the *plate*
-        ``.zattrs`` (rows/columns/wells layout), not any individual field's OME
-        metadata, so the serve path must read per-field metadata from the adapter
-        rather than the catalog (biopb/biopb#253). A regular multiscale image's
-        metadata does cover its (single) tensor."""
-        return not self._is_hcs_plate
+        For an HCS plate this is the *plate* ``.zattrs`` (rows/columns/wells
+        layout), which is the source-level catalog row -- a field's own OME
+        metadata is served per-tensor via
+        :meth:`_HcsFieldAdapter.get_tensor_metadata` (biopb/biopb#253).
+        """
+        return self.ome_metadata
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the multiscales transforms.
@@ -918,8 +876,7 @@ class OmeZarrAdapter(ZarrAdapter):
         # Create ZarrAdapter for the field's resolution array
         field_adapter = self._create_field_adapter(well_name, field_idx)
 
-        # Set tensor context directly on the field adapter
-        field_adapter._tensor_context = True
+        # Set tensor name on the field adapter
         field_adapter._tensor_name = f"{well_name}/{field_idx}"
 
         self._field_adapters[field_key] = field_adapter
@@ -952,59 +909,40 @@ class OmeZarrAdapter(ZarrAdapter):
 
         field_path = images[field_idx].get("path", str(field_idx))
 
-        # Use plate root path for navigation
-        store_path = self._plate_root_path
-
         # Read the field's .zattrs once: the resolution path, dim labels, and
         # the physical scale (biopb/biopb#272) all come from its multiscales
         # block. A corrupt/absent .zattrs degrades to defaults (no scale).
-        field_zattrs_path = os.path.join(
-            store_path, well_path.rstrip("/"), field_path.rstrip("/"), ".zattrs"
-        )
-
         resolution_path = "0"
         dim_labels = None
         physical_scale = None
-        if os.path.exists(field_zattrs_path):
-            try:
-                with open(field_zattrs_path) as f:
-                    field_zattrs = json.load(f)
-                multiscales = field_zattrs.get("multiscales", [])
-                if multiscales:
-                    ms0 = multiscales[0]
-                    datasets = ms0.get("datasets", [])
-                    if datasets:
-                        resolution_path = datasets[0].get("path", "0")
-                    axes = ms0.get("axes", [])
-                    if axes:
-                        dim_labels = [
-                            ax.get("name", f"dim{i}")
-                            if isinstance(ax, dict)
-                            else str(ax)
-                            for i, ax in enumerate(axes)
-                        ]
-                    # Fall back to the plate source's axes (populated from the
-                    # first field, see _parse_hcs_plate_structure) when THIS
-                    # field's multiscales omits its own -- fields in a plate share
-                    # axis structure, so the source axes carry the right units.
-                    # Passing the field's own (possibly empty) axes here instead
-                    # would make the fallback a no-op.
-                    physical_scale = _physical_scale_from_multiscales(
-                        multiscales, self.axes
-                    )
-            except Exception:
-                logger.debug(
-                    "ome-zarr HCS: field .zattrs unreadable at %s",
-                    field_zattrs_path,
-                    exc_info=True,
+        # The field's own .zattrs -- its OME-NGFF metadata, served per-field via
+        # _HcsFieldAdapter.get_tensor_metadata (the plate row cannot carry it, #253).
+        field_metadata = self._read_zattrs_at(well_path, field_path)
+        try:
+            multiscales = (field_metadata or {}).get("multiscales", [])
+            if multiscales:
+                resolution_path = _first_dataset_path(multiscales) or "0"
+                dim_labels = _axes_to_dim_labels(multiscales[0].get("axes", []))
+                # Fall back to the plate source's axes (populated from the first
+                # field, see _parse_hcs_plate_structure) when THIS field's
+                # multiscales omits its own -- fields in a plate share axis
+                # structure, so the source axes carry the right units. Passing the
+                # field's own (possibly empty) axes here would make it a no-op.
+                physical_scale = _physical_scale_from_multiscales(
+                    multiscales, self.axes
                 )
+        except Exception:
+            logger.debug(
+                "ome-zarr HCS: field .zattrs unreadable for %s/%s",
+                well_name,
+                field_path,
+                exc_info=True,
+            )
 
         # Open the field's resolution array
-        arr_path = os.path.join(
-            store_path, well_path.rstrip("/"), field_path.rstrip("/"), resolution_path
+        arr = zarr.open_array(
+            self._field_array_path(well_path, field_path, resolution_path), mode="r"
         )
-
-        arr = zarr.open_array(arr_path, mode="r")
 
         # Create adapter for this field, carrying the field's own physical scale
         # (the plate level has none -- biopb/biopb#272).
@@ -1013,52 +951,13 @@ class OmeZarrAdapter(ZarrAdapter):
             source_id=self.source_id,
             dim_labels=dim_labels or self.dim_labels,
             physical_scale=physical_scale,
+            field_metadata=field_metadata,
         )
 
         # Set tensor name for array_id computation
         field_adapter._tensor_name = f"{well_name}/{field_idx}"
 
         return field_adapter
-
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
-        """Return read plan for requested scale.
-
-        Supports "precompute" method to use precomputed pyramid levels.
-        Falls back to virtual scaling for other methods.
-        """
-        # Extract parameters from request_desc (scale_hint/reduction_method are now direct fields)
-        slice_hint = (
-            request_desc.slice_hint if request_desc.HasField("slice_hint") else None
-        )
-
-        # Compute scale_hint directly from TensorDescriptor
-        base_desc = self.get_tensor_descriptor()
-        base_shape = tuple(int(dim) for dim in base_desc.shape)
-        from biopb_tensor_server.core.chunk import normalized_scale_hint
-
-        scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
-
-        reduction_method = normalize_reduction_method(request_desc.reduction_method)
-
-        # "precompute" method: use precomputed level if exact match
-        if reduction_method == "precompute" and scale_hint is not None:
-            level_path = self._find_level_for_scale(scale_hint)
-
-            if level_path is None:
-                raise ValueError(
-                    f"No precomputed level matching scale_hint {tuple(scale_hint)}."
-                )
-
-            # Get scale for slice conversion
-            level_scale = self._get_level_scale(level_path)
-
-            # Convert slice from base coords to level coords
-            level_slice = self._convert_slice_to_level(slice_hint, level_scale)
-
-            return self._plan_from_precomputed(level_path, level_slice)
-
-        # Other methods: use default virtual scaling
-        return super().get_read_plan(request_desc)
 
     def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[str]:
         """Find precomputed level with exact scale match."""
@@ -1089,66 +988,33 @@ class OmeZarrAdapter(ZarrAdapter):
 
         return ()
 
-    def _convert_slice_to_level(
-        self,
-        slice_hint: Optional[SliceHint],
-        level_scale: Tuple[int, ...],
-    ) -> Optional[SliceHint]:
-        """Convert slice from base coordinates to level coordinates."""
-        if slice_hint is None:
-            return None
+    def _level_downsample_factors(self, level: str) -> List[int]:
+        """Downsample factors for level ``level`` -- its NGFF ``scale`` transform.
 
-        level_start = [
-            s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)
-        ]
-        level_stop = [
-            s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)
-        ]
-        return SliceHint(start=level_start, stop=level_stop)
-
-    def _plan_from_precomputed(
-        self,
-        level_path: str,
-        level_slice: Optional[SliceHint],
-    ) -> TensorReadPlan:
-        """Create read plan from precomputed level.
-
-        Delegates to base class get_read_plan() with no scale_hint.
+        The base precompute routing (biopb/biopb#557) uses these to translate a
+        base-coordinate slice into the level's grid.
         """
-        level_adapter = self.get_level_adapter(level_path)
+        return list(self._get_level_scale(level))
 
-        # Create request descriptor with slice_hint but NO scale_hint (no downsampling)
-        level_desc = level_adapter.get_tensor_descriptor()
-        request_desc = TensorDescriptor(
-            array_id=self.array_id,  # Use original array_id, not level's
-            dim_labels=level_desc.dim_labels,
-            shape=list(level_desc.shape),
-            chunk_shape=list(level_desc.chunk_shape),
-            dtype=level_desc.dtype,
-        )
+    def get_level_adapter(self, path: str) -> Optional[ZarrAdapter]:
+        """Get adapter for a specific precomputed level (single-image only).
 
-        # Set slice_hint if provided
-        if level_slice is not None:
-            request_desc.slice_hint.start[:] = level_slice.start
-            request_desc.slice_hint.stop[:] = level_slice.stop
-
-        # Delegate to base class get_read_plan (no scale_hint means no downsampling)
-        read_plan = level_adapter.get_read_plan(request_desc)
-
-        # Override array_id in the returned descriptor to match original request
-        read_plan.descriptor.array_id = self.array_id
-
-        return read_plan
-
-    def get_level_adapter(self, path: str) -> ZarrAdapter:
-        """Get adapter for a specific precomputed level.
+        Returns ``None`` for an HCS plate: a plate has no native pyramid, so a
+        within-source suffix on one of its chunks is a ``well/field`` tensor id,
+        not a level path. Returning ``None`` routes the server's chunk dispatch
+        back to :meth:`get_tensor_adapter` (the field adapter) instead of trying
+        to open a non-existent level store (biopb/biopb#557).
 
         Args:
             path: Level path (e.g., "0", "1", "2" for OME-Zarr)
 
         Returns:
-            ZarrAdapter for the level array with tensor context set
+            ZarrAdapter for the level array with tensor context set, or ``None``
+            for an HCS plate.
         """
+        if self._is_hcs_plate:
+            return None
+
         if path in self._level_adapters:
             return self._level_adapters[path]
 
@@ -1163,7 +1029,6 @@ class OmeZarrAdapter(ZarrAdapter):
         )
         # Set tensor name for multi-tensor context
         level_adapter._tensor_name = path
-        level_adapter._tensor_context = True
 
         self._level_adapters[path] = level_adapter
         return level_adapter

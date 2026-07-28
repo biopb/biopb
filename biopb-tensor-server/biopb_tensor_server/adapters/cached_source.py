@@ -28,11 +28,11 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     CHUNK_WIRE_SCHEMA,
     TensorAdapter,
 )
-from biopb_tensor_server.core.chunk import encode_chunk_id
+from biopb_tensor_server.core.chunk import encode_chunk_id, wrap_content_version
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -50,8 +50,6 @@ class CachedSourceAdapter(TensorAdapter):
 
     Cache-backed sources allow arbitrary chunk bounds (no uniformity enforcement).
     """
-
-    _single_tensor_source = True
 
     @classmethod
     def create_from_config(
@@ -75,6 +73,7 @@ class CachedSourceAdapter(TensorAdapter):
         ome_metadata: Optional[dict] = None,
         physical_scale: Optional[List[float]] = None,
         physical_unit: Optional[List[str]] = None,
+        content_version: Optional[bytes] = None,
     ):
         """Initialize cache-backed source adapter.
 
@@ -89,6 +88,12 @@ class CachedSourceAdapter(TensorAdapter):
                 1:1 with ``dim_labels`` (as the uploader sent it).
             physical_unit: Optional per-dimension unit string for
                 ``physical_scale``, aligned 1:1 with ``dim_labels``.
+            content_version: Optional per-upload generation token (biopb/biopb#178).
+                cache: sources have deterministic ids, so a re-upload reuses the id;
+                wrapping every written chunk_id with this token gives the new upload a
+                fresh cache namespace instead of colliding with the prior upload's
+                chunks (which ``CacheManager.put`` would decline to overwrite,
+                serving stale data). None leaves the source unversioned (legacy bytes).
         """
         self.source_id = source_id
         # Optional per-source capability token. When set, the Flight server
@@ -110,6 +115,12 @@ class CachedSourceAdapter(TensorAdapter):
 
         # Track actually-written chunks: start coords -> full bounds
         self._written_chunks: Dict[bytes, ChunkBounds] = {}
+
+        # Per-upload generation token folded into every written chunk_id so a
+        # re-upload under the same (deterministic) source_id lands in a fresh
+        # cache namespace (biopb/biopb#178). The base read plan folds the same
+        # token into minted endpoints, so reads and writes agree.
+        self._content_version = content_version
 
         # Required fields for the adapter interface
         self._source_url = f"cache://{source_id}"
@@ -212,6 +223,13 @@ class CachedSourceAdapter(TensorAdapter):
             raise RuntimeError("Cache not initialized")
 
         chunk_id = encode_chunk_id(self.source_id, bounds)
+        if self._content_version is not None:
+            # Store under the same version-wrapped id the base read plan mints, so
+            # the client's echoed chunk_id resolves here and a prior upload's
+            # (differently-versioned) chunks are never served. For an unscaled
+            # chunk cache_key_for_chunk_id(wrapped) == wrapped, so the file-cache
+            # locate path (server._handle_chunk_locate) keys identically too.
+            chunk_id = wrap_content_version(chunk_id, self._content_version)
 
         if isinstance(data, pa.ChunkedArray):
             data = data.combine_chunks()
@@ -236,13 +254,11 @@ class CachedSourceAdapter(TensorAdapter):
             schema=CHUNK_WIRE_SCHEMA,
         )
 
-        entry, is_owner = cache_manager.start_compute(
-            chunk_id,
-            metadata={"bounds": bounds.SerializeToString()},
-        )
-        if is_owner:
-            cache_manager.complete_entry(chunk_id, batch, size_bytes)
+        cache_manager.put(chunk_id, batch, size_bytes)
 
+        # Recorded even when put() declined (the chunk is already cached under
+        # this id): resolve_chunk_data gates reads on this map, so a re-upload of
+        # an existing chunk must still be readable.
         self._written_chunks[chunk_id] = bounds
 
         logger.debug(
@@ -285,7 +301,6 @@ class CachedSourceAdapter(TensorAdapter):
         entry = cache_manager.get_or_acquire(
             chunk_id,
             lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
-            metadata={"array_id": self.source_id},
         )
         data = entry.data
         cache_manager.release(chunk_id)

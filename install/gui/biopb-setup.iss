@@ -418,7 +418,8 @@ begin
   if CurPageID = wpFinished then
   begin
     Msg := 'biopb is installed. Start your AI agent (Claude Code/Desktop, Cursor,' + #13#10 +
-           'opencode) and a napari window opens with it.';
+           'opencode), then prompt it: "start biopb and report status" - that' + #13#10 +
+           'brings up the napari viewer and the data plane.';
     if ResWebapp then
       Msg := Msg + #13#10#13#10 + 'Web interface: http://localhost:8814';
     if ResConfig <> '' then

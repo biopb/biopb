@@ -36,16 +36,6 @@ def _log_timing(start_time: float) -> None:
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
-def _normalize_location(location: str) -> str:
-    """Normalize location URI for Arrow Flight.
-
-    Converts grpcs:// to grpc+tls:// (Arrow Flight's TLS scheme).
-    """
-    if location.startswith("grpcs://"):
-        return "grpc+tls://" + location[8:]
-    return location
-
-
 def _create_flight_client(
     location: str,
     cache_bytes: int,
@@ -53,9 +43,10 @@ def _create_flight_client(
 ) -> TensorFlightClient:
     """Create a Flight client, with user-friendly error handling."""
     try:
-        normalized = _normalize_location(location)
+        # TensorFlightClient.__init__ normalizes the location (grpcs:// ->
+        # grpc+tls://) itself, so no pre-normalization is needed here.
         return TensorFlightClient(
-            location=normalized, cache_bytes=cache_bytes, token=token
+            location=location, cache_bytes=cache_bytes, token=token
         )
     except Exception as exc:
         stderr_console.print(

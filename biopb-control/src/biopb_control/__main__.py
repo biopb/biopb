@@ -68,7 +68,17 @@ def main(argv: list[str] | None = None) -> int:
     # process command line (biopb/biopb#414). `biopb control start` exports
     # BIOPB_TENSOR_TOKEN into this child; --token stays honored for a direct
     # `python -m biopb_control run` invocation.
-    token = args.token or os.environ.get("BIOPB_TENSOR_TOKEN")
+    #
+    # Strip surrounding whitespace at this single resolution point so every
+    # consumer carries the *same* bytes: the middleware compares requests against
+    # `spec.token` un-touched, the supervisor exports it to the tensor server, and
+    # the credential handoff writes it to a file that `read_credential` reads back
+    # `.strip()`ed. Without this, a token sourced with a trailing newline
+    # (`BIOPB_TENSOR_TOKEN=$(cat tokenfile)`) would be enforced with the newline
+    # but read back without it, so a local client's credential-derived token would
+    # 401 against the very control that wrote it. A whitespace-only value collapses
+    # to `None` (tokenless) rather than a bogus empty credential.
+    token = (args.token or os.environ.get("BIOPB_TENSOR_TOKEN") or "").strip() or None
 
     # Defaults for the control endpoint come from the shared core-SDK module so a
     # bare `python -m biopb_control run` and the CLI agree on 8813. Remote mode

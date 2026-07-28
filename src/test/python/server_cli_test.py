@@ -288,6 +288,34 @@ class TestControlStatus:
             assert cmd in res.output
 
 
+class TestRejectLegacyToml:
+    """`control start` / `run` refuse a pre-#34 `biopb.toml` up front.
+
+    Every config probe further in is best-effort (`_read_flight_host` fails
+    *closed* to a public bind on an unreadable config), so without this gate a
+    legacy config surfaces as an unrelated "public bind needs a token" refusal
+    -- or as a plane serving defaults instead of the user's data.
+    """
+
+    def test_legacy_toml_exits_with_the_migration_command(self, tmp_path, capsys):
+        legacy = tmp_path / "biopb.toml"
+        legacy.write_text("[server]\nport = 8815\n")
+        with pytest.raises(typer.Exit) as exc:
+            cli._reject_legacy_toml(legacy)
+        assert exc.value.exit_code == 1
+        assert "migrate-config" in capsys.readouterr().out
+
+    def test_json_config_passes(self, tmp_path):
+        config = tmp_path / "biopb.json"
+        config.write_text('{"server": {"port": 8815}}')
+        cli._reject_legacy_toml(config)  # no raise
+
+    def test_absent_toml_passes(self, tmp_path):
+        # find_config hands back the canonical name when nothing exists; a
+        # never-created .toml path must not be mistaken for a legacy install.
+        cli._reject_legacy_toml(tmp_path / "biopb.toml")
+
+
 class TestControlRunArgv:
     """`_control_run_argv` must never put the access token on the child command
     line -- a process command line is world-readable via `ps` / Task Manager,
@@ -451,7 +479,7 @@ class TestMigrateConfig:
 
     def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
         # The actual migration reuses biopb_tensor_server.core.config (save_config /
-        # _read_config_file). That package ships only with the full installer,
+        # read_legacy_toml). That package ships only with the full installer,
         # not on PyPI, so it is absent from the lightweight `biopb[test,tensor]`
         # CI env -- skip there; the command's own "unavailable" fallback is what
         # runs in that case.
@@ -577,11 +605,10 @@ class TestDashboardCommand:
 
 
 class TestVersionCommand:
-    """`biopb version` reports the release-v* deployment version (from the
-    installer's marker file) plus each of the three bundled wheels, resolved
-    independently so an absent one shows 'not installed' rather than breaking
-    the command. The release line is deliberately NOT any single wheel's
-    version."""
+    """`biopb version` reports the two version lines: the product deployment
+    (`release`, from the installer's marker file — the shared release-v* version
+    of tensor-server / mcp / control / web) and the `biopb` SDK (its own v* line).
+    The release line is deliberately NOT any single wheel's version."""
 
     @staticmethod
     def _labels(output: str) -> dict:
@@ -594,27 +621,30 @@ class TestVersionCommand:
                 out[label.strip()] = value.strip()
         return out
 
-    def test_reports_release_and_bundled_packages(self, monkeypatch, tmp_path):
-        # Release version comes from the installer's marker file, not a package.
+    def test_reports_release_and_sdk(self, monkeypatch, tmp_path):
+        # Two lines only: the product deployment (marker) and the biopb SDK.
         marker = tmp_path / "release.version"
         marker.write_text("1.2.3\n")
         monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
-        # A stand-in metadata lookup: two of the triple installed, one absent.
-        installed = {"biopb": "1.2.3.dev9+gabc", "biopb-tensor-server": "1.2.3"}
         monkeypatch.setattr(
-            cli, "_package_version", lambda name: installed.get(name, "not installed")
+            cli,
+            "_package_version",
+            lambda name: {"biopb": "0.9.3"}.get(name, "not installed"),
         )
 
         res = CliRunner().invoke(cli.app, ["version"])
 
         assert res.exit_code == 0, res.output
         labels = self._labels(res.output)
-        # Deployment version is the marker's contents, distinct from biopb's own.
+        # Deployment version is the marker's contents (the release-v* product
+        # line), distinct from the biopb SDK's own v* version.
         assert labels["release"] == "1.2.3"
-        assert labels["biopb"] == "1.2.3.dev9+gabc"
-        assert labels["biopb-tensor-server"] == "1.2.3"
-        # The absent third wheel is reported, not silently dropped.
-        assert labels["biopb-mcp"] == "not installed"
+        assert labels["biopb"] == "0.9.3"
+        # The product wheels are no longer listed individually — they all share
+        # the release version, so the marker stands in for the set.
+        assert set(labels) == {"release", "biopb"}
+        assert "biopb-tensor-server" not in labels
+        assert "biopb-mcp" not in labels
 
     def test_release_version_unknown_when_marker_absent(self, monkeypatch, tmp_path):
         # A dev checkout / non-installer setup has no marker: report 'unknown',

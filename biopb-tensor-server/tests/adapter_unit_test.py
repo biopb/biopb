@@ -143,6 +143,18 @@ class TestTensorConfig:
         )
         assert config.claim_generic_images is True
 
+    def test_handle_reaper_ttl_defaults_to_150(self):
+        config = parse_config({"server": {}, "sources": []})
+        assert config.handle_reaper_ttl == 150.0
+
+    def test_parse_handle_reaper_ttl(self):
+        # Carried and coerced to float; 0 is the documented "disable" sentinel.
+        config = parse_config({"server": {"handle_reaper_ttl": 45}, "sources": []})
+        assert config.handle_reaper_ttl == 45.0
+        assert (
+            parse_config({"server": {"handle_reaper_ttl": 0}}).handle_reaper_ttl == 0.0
+        )
+
 
 class TestReductionMethodNormalization:
     """Tests for normalize_reduction_method and the deprecated linear alias."""
@@ -185,7 +197,7 @@ class TestReductionMethodNormalization:
 class TestAdvisoryReductionCacheKey:
     """reduction_method is advisory: excluded from the cache key (biopb#76)."""
 
-    def test_cache_key_strips_method(self):
+    def test_scaled_cache_key_is_identity(self):
         from biopb_tensor_server.core.chunk import (
             cache_key_for_chunk_id,
             encode_chunk_id,
@@ -193,19 +205,25 @@ class TestAdvisoryReductionCacheKey:
         )
 
         bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
-        nearest_id = encode_chunk_id_with_scale("arr", bounds, (4, 4), "nearest")
-        area_id = encode_chunk_id_with_scale("arr", bounds, (4, 4), "area")
-        other_scale = encode_chunk_id_with_scale("arr", bounds, (2, 2), "area")
+        # reduction_method left the chunk_id (#178), so a scaled chunk_id is pure
+        # identity and its cache key is itself; a different scale is a different key.
+        scaled = encode_chunk_id_with_scale("arr", bounds, (4, 4))
+        other_scale = encode_chunk_id_with_scale("arr", bounds, (2, 2))
 
-        assert cache_key_for_chunk_id(nearest_id) == cache_key_for_chunk_id(area_id)
-        assert cache_key_for_chunk_id(nearest_id) != cache_key_for_chunk_id(other_scale)
+        assert cache_key_for_chunk_id(scaled) == scaled
+        assert cache_key_for_chunk_id(scaled) != cache_key_for_chunk_id(other_scale)
 
         raw_id = encode_chunk_id("arr", bounds)
         assert cache_key_for_chunk_id(raw_id) == raw_id
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_cache_hit_across_reduction_methods(self):
-        """A chunk warmed under one method serves a request for another."""
+    def test_cache_hit_on_repeated_scaled_read(self):
+        """A warmed scaled chunk serves a repeat read from cache.
+
+        The scaled chunk_id is method-independent (reduction_method left the wire
+        format, #178), so every read at the same bounds/scale maps to one entry --
+        the read plan mints an identical chunk_id regardless of requested method.
+        """
         import zarr
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
@@ -222,21 +240,17 @@ class TestAdvisoryReductionCacheKey:
             cache_manager = CacheManager(CacheConfig(backend="memory"))
 
             bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
-            area_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4), "area")
-            nearest_id = encode_chunk_id_with_scale(
-                "test-array", bounds, (4, 4), "nearest"
-            )
+            scaled_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4))
 
-            first = adapter.resolve_chunk_data(area_id, cache_manager)
+            first = adapter.resolve_chunk_data(scaled_id, cache_manager)
             stats = cache_manager.stats()
             assert stats.misses == 1
 
-            second = adapter.resolve_chunk_data(nearest_id, cache_manager)
+            second = adapter.resolve_chunk_data(scaled_id, cache_manager)
             stats = cache_manager.stats()
             assert stats.misses == 1
             assert stats.hits == 1
 
-            # The advisory method means the warmed (area) data is served.
             assert first.column("data").to_pylist() == second.column("data").to_pylist()
 
 
@@ -317,7 +331,7 @@ class TestEmptyChunkShapeFallback:
     the full-rank shape, so every read of such a source raised IndexError.
     """
 
-    from biopb_tensor_server.core.base import TensorAdapter
+    from biopb_tensor_server.core.adapter_base import TensorAdapter
 
     class _StubTensorAdapter(TensorAdapter):
         """Minimal tensor adapter whose descriptor carries no chunk_shape."""
@@ -777,15 +791,13 @@ class TestGetPhysicalScale:
 
     def test_ndtiff_physical_scale_from_summary(self):
         """NDTiff PixelSize_um / z-step map onto x/y/z; p/t/c zeroed."""
-        import types
-
         from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
 
         a = NdTiffAdapter.__new__(NdTiffAdapter)
         a.dim_labels = ["p", "t", "c", "z", "y", "x"]
-        a._dataset = types.SimpleNamespace(
-            summary_metadata={"PixelSize_um": 0.16, "z-step_um": 0.5}
-        )
+        # Summary is snapshotted at registration (biopb/biopb#71), so
+        # _physical_scale reads _summary_metadata, not a live self._dataset.
+        a._summary_metadata = {"PixelSize_um": 0.16, "z-step_um": 0.5}
         scale, unit = a._physical_scale()
         assert scale == [0.0, 0.0, 0.0, 0.5, 0.16, 0.16]
         assert unit == ["", "", "", "µm", "µm", "µm"]
@@ -1402,54 +1414,89 @@ class TestOmeZarrPrecompute:
 class TestSliceConversion:
     """Tests for slice coordinate conversion."""
 
-    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_convert_slice_to_level(self):
-        """Test slice conversion from base to level coordinates."""
-        import json
+        """Base->level slice conversion is a pure transform (needs no adapter)."""
+        from biopb_tensor_server.core.adapter_base import _convert_slice_to_level
 
+        level_slice = _convert_slice_to_level(
+            SliceHint(start=[10, 20], stop=[50, 60]), [4, 2]
+        )
+
+        assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
+        assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
+
+    def test_convert_slice_to_level_none_passthrough(self):
+        from biopb_tensor_server.core.adapter_base import _convert_slice_to_level
+
+        assert _convert_slice_to_level(None, [4, 2]) is None
+
+
+class TestGetLevelAdapterContract:
+    """``get_level_adapter`` is a TensorAdapter contract, not a sniffed method.
+
+    The server's chunk dispatch asks every source adapter for a native pyramid
+    level; a non-native adapter answers ``None`` and the read falls back to the
+    tensor field. This replaces the old ``hasattr(adapter, "get_level_adapter")``
+    duck-typing, whose mere-presence test mis-routed an HCS ``well/field`` chunk
+    to a (non-existent) level store (biopb/biopb#557).
+    """
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_plain_tensor_adapter_returns_none(self):
+        """A format with no native pyramid uses the base default (None)."""
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            arr = zarr.open_array(
+                os.path.join(tmpdir, "plain.zarr"),
+                mode="w",
+                shape=(8, 8),
+                chunks=(4, 4),
+                dtype="uint8",
+            )
+            adapter = ZarrAdapter(arr, "plain", ["y", "x"])
+            assert adapter.get_level_adapter("1") is None
 
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(25, 50), chunks=(12, 25), dtype="uint8")
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_plate_returns_none(self):
+        """An HCS plate has no native pyramid: a suffix is a field id, not a level."""
+        from biopb_tensor_server.core.config import SourceConfig
 
-            zattrs = {
-                "multiscales": [
-                    {
-                        "datasets": [
-                            {
-                                "path": "0",
-                                "coordinateTransformations": [
-                                    {"type": "scale", "scale": [1, 1]}
-                                ],
-                            },
-                            {
-                                "path": "1",
-                                "coordinateTransformations": [
-                                    {"type": "scale", "scale": [4, 2]}
-                                ],
-                            },
-                        ]
-                    }
-                ]
-            }
-            with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
-                json.dump(zattrs, f)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = TestGetPhysicalScale._make_hcs_plate(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            assert plate._is_hcs_plate
+            assert plate.get_level_adapter("A/1/0") is None
 
-            root = zarr.open_group(zarr_path, mode="r")
-            base_arr = root["0"]
-            adapter = OmeZarrAdapter(base_arr, "test")
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_field_chunk_routes_to_field_adapter(self):
+        """An HCS field chunk resolves to the field adapter, not a level store.
 
-            # Test slice conversion
-            level_slice = adapter._convert_slice_to_level(
-                SliceHint(start=[10, 20], stop=[50, 60]), (4, 2)
+        Regression: under the old ``hasattr`` dispatch this landed on
+        ``get_level_adapter("well/field")`` and failed to open a level.
+        """
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plate_path = TestGetPhysicalScale._make_hcs_plate(tmpdir)
+            plate = OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
+            )
+            field_id = plate.list_tensor_descriptors()[0].array_id
+            field = plate.get_tensor_adapter(field_id)
+            chunk_id = (
+                field.get_read_plan(field.get_tensor_descriptor())
+                .chunk_endpoints[0]
+                .chunk_id
             )
 
-            assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
-            assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
+            server = TensorFlightServer("grpc://localhost:0")
+            server.register_source("plate", plate)
+            resolved = server._get_adapter_for_chunk(chunk_id)
+            assert resolved.get_tensor_descriptor().array_id == field_id
 
 
 class TestGetData:

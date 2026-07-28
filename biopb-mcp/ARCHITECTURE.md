@@ -265,8 +265,12 @@ and URL/token resolution + persistence.
 - **Fallback resolution** (`resolve_from_config`, used only on that no-control
   path — the control's endpoint wins whenever it answers): env
   (`BIOPB_TENSOR_URL`/`BIOPB_TENSOR_TOKEN`) → config (`tensor_browser.server_url`)
-  → default `grpc://localhost:8815`. Only the URL is persisted; the token is read
-  from the environment.
+  → default `grpc://localhost:8815`. Only the URL is persisted. The token is
+  `BIOPB_TENSOR_TOKEN` if set, else the control's local credential file
+  (`biopb._credentials`, **#470**) — the filesystem handoff that lets an
+  agent-spawned biopb-mcp authenticate a token-gated local plane without the env
+  var. The control writes that file (owner-only) at start-up and carries the same
+  token on its own gated `/api/data_plane/ensure` POST.
 - **Self-healing catalog** (`start_source_watch`, **#44**): a catalog cached at
   connect can be *partial* (the server reports `SERVING` before it finishes
   enumerating scenes). A daemon thread `health_check()`s and re-lists on any
@@ -416,8 +420,9 @@ default. Sections are **flat / top-level** (each maps 1:1 to a section dataclass
   cluster down after this long with **no kernel attached**, 0 disables). The
   session child owns the cluster (see Lifecycle).
 - **`tensor`** — `health_poll_min/max_interval` (the #44 source watcher's backoff;
-  min ≤ 0 disables). (The localhost client-cache decision lives in the tensor
-  client — `_resolve_cache_bytes`, off by default, `BIOPB_CACHE_LOCAL=1` to opt in.)
+  min ≤ 0 disables). (The tensor client always caches now: mmap views weakly —
+  free, no budget — and do_get/over-budget copies strongly under
+  `_resolve_cache_bytes`; the old localhost `BIOPB_CACHE_LOCAL` gate was removed.)
 - **`viewer`** — `compute_scheduler` (default `threads`; pins the viewer's *serial*
   slice reads to a single-process scheduler so they share one main-process chunk
   cache instead of scattering across per-worker caches — **#8**; `_viewer_compute.

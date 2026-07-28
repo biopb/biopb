@@ -102,6 +102,35 @@ def scale_by_label(
     return scale, units
 
 
+def axes_scale(axes, dim_labels) -> Optional[Tuple[List[float], List[str]]]:
+    """Fold rsciio-style per-axis ``{"scale", "units"}`` dicts onto ``dim_labels``.
+
+    The EM readers (MRC, EMD) hand back one axis dict per dimension already in
+    ``dim_labels`` order, each carrying ``scale`` (voxel size) and ``units``.
+    Reads them positionally: a positive, parseable ``scale`` keeps its size and
+    unit; every other axis gets ``0.0`` / ``""``. Returns ``None`` when the axis
+    count doesn't match ``dim_labels`` or no axis carries a positive size, so the
+    descriptor fields are left clear rather than advertising an empty calibration.
+    """
+    labels = list(dim_labels)
+    scale: List[float] = []
+    unit: List[str] = []
+    for ax in axes:
+        try:
+            v = float(ax.get("scale") or 0.0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            scale.append(v)
+            unit.append(str(ax.get("units")) if ax.get("units") else "")
+        else:
+            scale.append(0.0)
+            unit.append("")
+    if len(scale) != len(labels) or not any(scale):
+        return None
+    return scale, unit
+
+
 def mm_summary_scale(summary, dim_labels) -> Optional[Tuple[List[float], List[str]]]:
     """MicroManager summary metadata -> per-dim physical scale, in µm.
 

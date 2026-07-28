@@ -1,10 +1,12 @@
-# Config format: TOML → JSON (coexistence)
+# Config format: TOML → JSON
 
-**Status:** shipped — read-side JSON/TOML coexistence, warn-level value
-validation, installer writing `biopb.json`, and the JSON Schema emitter are all
-in. Still design: the `.toml` read path is not yet dropped and `$schema` is not
-yet embedded in generated configs (see Not done / future). Touches
-`biopb-tensor-server` (config), the `biopb` umbrella CLI, and `biopb-mcp`.
+**Status:** complete — JSON is the only format read, value validation runs on one
+shared checker (clamp at load, reject at the strict surfaces), the installers
+write `biopb.json`, and the JSON Schema emitter is in. The
+coexistence window (dual-format read + warn-level validation) ran from the
+initial migration to the read-path removal; what remains of TOML is the one-way
+door out of it: `biopb server migrate-config` and the installers' automatic
+conversion. Touches `biopb-tensor-server` (config) and the `biopb` umbrella CLI.
 
 ## Why
 
@@ -29,44 +31,69 @@ untouched, and one read-side change covers every code path that loads a config.
 ```
 load_config(path)
   └── _read_config_file(path)        ← the ONLY format-aware step
-        ├── .json  → json.load
-        ├── .toml  → tomllib.load  (+ deprecation warning)
-        └── other  → sniff: JSON first, then TOML
+        ├── .toml  → refuse: "run `biopb server migrate-config`"
+        └── other  → json.load  (an odd extension is still read as JSON)
   └── parse_config(dict)             ← unchanged, format-agnostic
+
+read_legacy_toml(path)               ← the last TOML reader, off the load path:
+                                       migrate-config's input side only
 ```
 
 ## Architecture (shipped)
 
-**Dual-format reader.** `core.config.load_config` dispatches on file extension
-(content sniff for extension-less paths). Reading TOML logs a one-line
-deprecation warning naming `biopb.json` as canonical; an invalid file raises
-`ValueError` naming the path.
+**JSON-only reader.** `core.config.load_config` reads JSON. A `.toml` path is
+rejected *without parsing*, and a JSON syntax error (which is what TOML bytes
+under a `.json` name produce) carries the same hint — a parse error is the only
+place a user learns the format changed, so both name
+`biopb server migrate-config`.
 
-**JSON-preferred default-path resolution — one shared impl.** `find_config(dir)`
-returns the first of `biopb.json` → `biopb.toml` that exists, else the canonical
-`biopb.json`. When both exist the legacy TOML is silently shadowed, so it warns
-naming the ignored file. It lives once in **`biopb._locations`** (stdlib-only
-module in the core `biopb` package — no heavy adapter/discovery imports, cheap to
-import per CLI invocation) and all three consumers call it: `core.config`
-re-exports it (`find_config` + name constants), `biopb.cli` sets
-`DEFAULT_CONFIG = find_config()`, and `biopb_mcp._connection` sets
-`DEFAULT_SERVER_CONFIG = find_config()`. All three already depend on core `biopb`,
-so there is no per-consumer twin to drift. CLI help text reads "config file (JSON
-or TOML)". Back-compat is total: an existing `biopb.toml` still loads and is still
-picked up (it only loses to a `biopb.json` beside it).
+**Default-path resolution — one shared impl.** `find_config(dir)` returns the
+first of `biopb.json` → `biopb.toml` that exists, else the canonical
+`biopb.json`. It still *sees* a legacy file, warning in both cases: shadowed by a
+JSON beside it, or returned as the only config present. Returning the real file
+rather than the (absent) canonical name is deliberate — every downstream config
+probe is best-effort (`_read_flight_host` even fails *closed* to a public bind on
+an unreadable config), so "no config at all" would surface as an unrelated
+token/bind refusal or a plane quietly serving defaults. `biopb control start`
+/ `run` therefore reject a `.toml` up front (`_reject_legacy_toml`) with the
+migration command. `find_config` lives once in **`biopb._locations`**
+(stdlib-only module in the core `biopb` package — no heavy adapter/discovery
+imports, cheap to import per CLI invocation); `core.config` re-exports it
+(`find_config` + name constants) and `biopb.cli` sets
+`DEFAULT_CONFIG = find_config()`.
 
-**Value validation.** Out-of-range / bad-enum knobs used to be accepted silently
-and blow up later on the request path (`downscale_factor=0` → `ZeroDivisionError`
-in `GetFlightInfo`; `pixel_budget_cubic_root<=0` → infinite loop in the precache
-worker; `reduction_method="bogus"` → read-time error; `downscale_factor=1` → a
-silent single-level pyramid). A single declarative `_CONSTRAINTS` table
-(`_Range` / `_Enum` per field) is enforced in each config dataclass's
-`__post_init__`, so **every** construction path — both file formats and direct
-dataclass construction — is covered; messages name section, key, value, and
-accepted range/enum. Severity is **warn** during the deprecation window
-(`_STRICT_VALIDATION = False`): a config that loaded before must not become a hard
-startup failure on upgrade. The disable sentinel `full_rescan_interval <= 0` is
-intentionally not constrained.
+**Value validation — one scheme, shared with biopb-mcp and the control.**
+Out-of-range / bad-enum knobs used to be accepted silently and blow up later on
+the request path (`downscale_factor=0` → `ZeroDivisionError` in `GetFlightInfo`;
+`pixel_budget_cubic_root<=0` → infinite loop in the precache worker;
+`reduction_method="bogus"` → read-time error; `downscale_factor=1` → a silent
+single-level pyramid). The rules are a single declarative `_CONSTRAINTS` table
+(`_Range` / `_Enum` per field); the *checking* is `biopb._config_validate`, the
+one walker every biopb config surface calls. See that module's docstring for the
+policy; in short:
+
+- **At the read step** (`parse_config` → `_clamp_invalid`), a violation is
+  **warned and replaced with the dataclass default**. The bad value never reaches
+  the request path — the actual requirement — and the server still starts. It is
+  a control-plane child restarted on crash with capped backoff, so refusing to
+  load would turn one bad number into a permanent restart loop reported as "the
+  data plane keeps dying". biopb-mcp clamps for the mirror-image reason (a raise
+  there is a dead MCP client and no viewer).
+- **At the strict surfaces**, the same check *reports* instead:
+  `validate_config_dict` → `PUT /api/config` (422, every problem, per field, so
+  the form highlights them) and `biopb-tensor-server validate` (exit 1). A human
+  is there to act on it, so it is not clamped away.
+
+Validation lives at the read step, not in `__post_init__`: every value that can
+be wrong arrives from a file or an HTTP body, both of which funnel through it,
+and one check point is what lets biopb-mcp — whose runtime form is a merged dict,
+never a constructed dataclass — share the same code. Direct dataclass
+construction in server code is therefore unvalidated by design (a programming
+error, not a runtime input).
+
+Two values that *look* out of range are sentinels and stay legal:
+`full_rescan_interval <= 0` disables the periodic full scan, and `server.port = 0`
+binds an OS-assigned ephemeral port.
 
 **Installer writes JSON.** All four front-ends — `install/install.sh` (POSIX),
 `install/biopb-engine.ps1` (Windows engine), `install/install.ps1`, and
@@ -105,9 +132,10 @@ enum would reject values it accepts; the accepted set rides in the property
 `_CONSTRAINTS` gate the server runs at load, exposed as structured `{path,
 message}` problems on the schema's on-disk paths (via
 `config_schema.ondisk_location`) so the two dedupe by path. `validate_config_dict`
-shares its core (`_config_problems`) with load-time `_validate_config` and is
-independent of the warn/raise `_STRICT_VALIDATION` policy — one rule set behind
-both surfaces. A config the form accepts is therefore always one the server loads.
+runs the same `_config_problems` the load path runs — it just builds the config
+with `_build_config` (unclamped) so there is still something to report, where
+`parse_config` would already have substituted the defaults. One rule set behind
+both surfaces, so a config the form accepts is always one the server loads.
 See `tensor-server-admin-endpoint.md`.
 
 ## Gotchas
@@ -117,25 +145,23 @@ See `tensor-server-admin-endpoint.md`.
   instead of `max_entries`) derives its known-section / known-key sets by walking
   `build_config_schema()`'s properties (`config_schema.known_config_keys`); the old
   hardcoded `_KNOWN_*` tables were deleted. The schema is the single source for the
-  key set too. Runtime behavior is unchanged (warn-only), and the published schema
-  stays `additionalProperties: true` so editor autocomplete doesn't error on
-  unknown keys during the window.
+  key set too. An unknown key stays **warn-and-ignore** — like a bad *value*,
+  which is warned and defaulted, a config written by a newer tool must never be a
+  startup failure — and the published schema stays
+  `additionalProperties: true` so editor autocomplete doesn't error on it.
 - **Case-insensitive enums carry no `enum`** — see the admin-endpoint pairing
   above; a schema-only check at save-time would accept a `log_level` /
   `reduction_method` the server then refuses at load.
-- **Both formats produce a byte-identical `ServerConfig`** — covered by
-  `tests/config_format_test.py`; schema drift-guards in `tests/config_schema_test.py`
+- **A legacy TOML fails loudly, not silently** — `tests/config_format_test.py`
+  covers the refusal, the migration hint on both failure shapes, `find_config`
+  handing back the legacy file, and `read_legacy_toml` still parsing for
+  migrate-config; schema drift-guards in `tests/config_schema_test.py`
   assert every `_CONSTRAINTS` entry and every scalar dataclass field is reflected,
   that the runtime warning uses the schema-derived sets, and that the schema
   accepts the installer default while rejecting each known-bad value.
 
 ## Not done / future
 
-- **Drop the `.toml` read path and flip validation warn → raise.** The end state:
-  remove `tomllib` dispatch from `_read_config_file`, make `find_config` return
-  only `biopb.json`, and flip `_STRICT_VALIDATION → True` so an out-of-range knob
-  is a hard startup failure. Gated on new installs being JSON-native and old TOML
-  installs having migrated (they migrate the next time they change data folders).
 - **Embed `$schema` in generated configs.** Have the writer emit a `"$schema"`
   pointer so editors validate out of the box. **Resolution path:** the planned
   `save_config` writer (`tensor-server-admin-endpoint.md`) drops a sibling
@@ -145,6 +171,9 @@ See `tensor-server-admin-endpoint.md`.
   `https://biopb.org/schemas/tensor-server-config.json`) once it is published.
 
 ## Equivalent configs
+
+What `biopb server migrate-config` produces — the shape mapping, if you ever
+need to read an old file by eye.
 
 ```toml
 [server]
@@ -168,4 +197,5 @@ dim_labels = ["z", "y", "x"]
 }
 ```
 
-Both produce a byte-identical `ServerConfig`.
+The two produced a byte-identical `ServerConfig` while both were readable; only
+the JSON form loads now.

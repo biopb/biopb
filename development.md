@@ -33,7 +33,7 @@ external.
 
 | Repo / component | Role |
 |------|------|
-| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the clients, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), the **agent client** (`biopb-mcp/`, the napari plugin + MCP server), the **control plane** (`biopb-control/`, the single web origin that supervises the data plane and serves the browser UI), and the **browser front end** (`web/`, one Vite + React SPA — dataviewer, admin, dashboard, observe — served by the control). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`); `web/` is a separate **pnpm workspace**. Versioning is **three lines, three tags**: the **SDK** (`biopb` Python→PyPI + Java→Maven Central, and `biopb-image-base` Docker) is tagged `v*`; the **tensor-server Docker image** has its own line tagged `server-v*`; and the **product bundle** (tensor-server wheel, mcp, control, web bundle → the GitHub release) is tagged `release-v*`. Docker images ship on `v*`/`server-v*` (their own CI workflows), not from `release.yaml`. See `docs/release-model.md`. |
+| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the clients, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), the **agent client** (`biopb-mcp/`, the napari plugin + MCP server), the **control plane** (`biopb-control/`, the single web origin that supervises the data plane and serves the browser UI), and the **browser front end** (`web/`, one Vite + React SPA — dataviewer, admin, dashboard, observe — served by the control). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`); `web/` is a separate **pnpm workspace**. Versioning is **two lines, two tags**: the **SDK** (`biopb` Python→PyPI + Java→Maven Central, and `biopb-image-base` Docker) is tagged `v*`; and the **product** (the `biopb-tensor-server` wheel **and** its Docker image, plus mcp, control, and the web bundle → the GitHub release) is tagged `release-v*`. Docker images are built by their own CI workflows (image-base on `v*`, tensor-server on `release-v*`), not from `release.yaml`. See `docs/release-model.md`. |
 | **`biopb-server`** | Concrete algorithm servers implementing the compute plane: `cellpose`, `cellpose-sam`, `lacss`, `samcell`, `ucell`. Each is a thin model wrapper on the shared image-runtime base, shipped as a container. |
 
 The intended deployment is **personal or small-lab** use, on localhost or a
@@ -47,8 +47,9 @@ tensor HTTP sidecar 8814, flight gRPC 8815) binds loopback — the single-machin
 90% case. Local mode is tokenless by default (no unlock step), but a token is
 **optional**: pass `--token` / `BIOPB_TENSOR_TOKEN` and it is enforced across the
 loopback listeners too (the browser then gates behind the unlock page, exactly as
-in remote). A local token is **provisional** — see the caveats below before
-relying on it. `biopb control start
+in remote). A local token is a supported mode — the control hands its credential
+to local clients on the filesystem (see the credential handoff below); one
+residual UI gap is noted there. `biopb control start
 --remote` runs **remote mode**: the control's browser UI *and* the flight server
 bind publicly behind a **required** token (supplied via `--token` /
 `BIOPB_TENSOR_TOKEN`, else generated and printed), the sidecar stays on loopback
@@ -63,27 +64,30 @@ policy lives in the stdlib-only `biopb._web_auth` predicates that the control an
 the sidecar both bind to (so they cannot drift); there is no separate "dev-mode"
 token bypass.
 
-**Caveats on an optional local token** (biopb/biopb#470 tracks the fix). The token
-gates the listeners as described, but three places still read "a token is
-enforced" as a proxy for "this deployment is remote", because that was exact until
-the two were decoupled:
+**The local credential handoff** (biopb/biopb#470). Credential distribution is off
+the HTTP API and on the filesystem, the standard local-daemon pattern (Jupyter's
+runtime JSON, Docker): the control writes the resolved data-plane token to an
+owner-only file in the user's state dir (`state/biopb/tensor-server.token`) when it
+starts serving, and removes it on a clean stop. `_control_client` and `_connection`
+read it there (via `biopb._credentials`), with `BIOPB_TENSOR_TOKEN` kept as an
+explicit override. The endpoint never returns the token, so a loopback-reachable,
+unauthenticated control is not a token oracle. The boundary is filesystem
+permissions: `0600` on POSIX, and on Windows a DACL granting only the current user
+with inheritance disabled (the faithful `0600` analogue — `os.chmod` can't express
+owner-only there). This defends against *other uids* on a shared host, not a
+same-uid process (neither does an env var, which additionally leaks via
+`/proc/<pid>/environ`, `ps e`, and every inherited child).
 
-- **biopb-mcp cannot reach a token-gated local plane on its own.** The control's
-  ensure reply carries the plane's endpoint but no credential, so biopb-mcp learns
-  the token only from its own `BIOPB_TENSOR_TOKEN`. An agent spawning it over
-  stdio does not pass one. Recover by exporting `BIOPB_TENSOR_TOKEN` into the
-  agent's environment, or by entering the token in the napari Tensor Browser.
-- **The admin UI's server-side file chooser disappears** (`/api/admin/browse`
-  404s): the sidecar reports `local: token is None`, so a loopback plane behind a
-  token looks remote to it. Fails closed.
-- **`POST /api/data_plane/ensure` stays unauthenticated** — it is biopb-mcp's only
-  tokenless way to bring the plane up. On a shared host, loopback is reachable by
-  every uid, so another local user can drive this one idempotent, non-destructive
-  route on a deployment you asked to gate.
+With the handoff in place, biopb-mcp authenticates to a token-gated local plane on
+its own (no env var needed), and `POST /api/data_plane/ensure` is gated like every
+other `/api/*` route (the client carries the token; the old unauthenticated-state-
+change exemption, #424 item 2, is gone).
 
-So an optional local token is real defense-in-depth against *other users reading
-your data*, but it is not yet a fully-supported mode: prefer it where the browser
-UI is the workload, and expect the agent path to need the env var.
+One residual, tracked in #470 and separately fixable: **the admin UI's server-side
+file chooser disappears** on a token-gated local plane (`/api/admin/browse` 404s)
+because the sidecar computes `local: token is None`, so a loopback plane behind a
+token looks remote to it. It should derive `local` from the bind instead; it fails
+closed in the meantime.
 
 ---
 
@@ -383,11 +387,38 @@ editing the code.
   already holds every decoded chunk as an Arrow IPC message in a segment file,
   so instead of re-sending those bytes through the loopback `do_get` socket the
   client asks for the chunk's on-disk byte range (`locate_entry`), `mmap`s the
-  segment, reads just that message, copies it out, and releases the mapping.
+  segment, reads just that message, and hands out a **zero-copy view** onto the
+  mapping (Option C, `biopb/biopb#571`): the client closes its own
+  `MemoryMappedFile` handle at once, but Arrow refcounts the mapping so the
+  returned array keeps it alive (`ndarray → pyarrow.Buffer → MemoryMappedFile`),
+  and untouched chunk pages are never faulted in (a partial read is nearly free).
   This beats the socket because the bytes are already warm in the page cache
   (the server wrote them for caching anyway) and it skips the loopback gRPC
-  overhead. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
-  segment `unlink` — `biopb/biopb#5` — so Windows clients use `do_get`); the
+  overhead — and it now also skips the whole-chunk copy the socket cannot
+  (`.copy()` there fell off glibc's 32 MiB `mmap`-threshold cliff at a 64 MB
+  chunk; both paths now return a **read-only** view, the uniform mutability
+  contract). The view's safety rests on the server never truncating a mapped
+  segment inode: segment ids are strictly monotonic and eviction only `unlink`s,
+  so the one truncating `"wb"` open always targets a fresh path — an NFS
+  `cache_dir` would break that and wants an explicit gate. The view's *cost* is a
+  disk-leak: while a client holds it the server can't reclaim that segment's
+  blocks even after eviction `unlink`s it (the inode survives to last close), so
+  a client pinning many segments keeps the server's `cache_dir` above budget.
+  The client bounds that leak with **pinned-segment accounting** (still
+  `biopb/biopb#571`): it tracks the on-disk size of the distinct segments it
+  keeps mapped (refcounted by inode, released by a `weakref.finalize` on the
+  backing Arrow buffer) and, once over `BIOPB_CACHEFILE_PIN_LIMIT`
+  (**off by default** — a size like `16GiB` enables it), copies the chunk out and
+  drops the mapping instead of pinning
+  another segment — still off the warm mmap, no `do_get`. The hot path stays
+  cheap: the gate is a lock-free int compare, the segment size reuses the
+  `stat` the fast path already does, and only the view branch pays a lock + one
+  finalizer. Runs on **all platforms, not just POSIX** (`biopb/biopb#582`): the
+  old gate assumed a client mmap blocks the server's segment `unlink`, but the
+  client keeps only a mapped *view* (not an open handle), so Windows removes the
+  name at once and the view keeps the pages valid until munmap — delete-on-last-
+  close, exactly as on POSIX (the `biopb/biopb#5` concern was about an open
+  *handle*). The
   client honors `BIOPB_CACHEFILE_TRANSFER_DISABLED=1` to force the socket, and
   falls back to `do_get` whenever a chunk can't be located (memory backend, old
   server, evicted segment). Replaces the old `/dev/shm` `shm_transfer` path,
@@ -417,21 +448,27 @@ editing the code.
   read grid from the 64 MB transfer cap (client-selectable granularity) is the
   structural fix — `biopb/biopb#8`.
 
-- **The localhost client chunk cache is off by default, and locality-sensitive
-  under distributed dask.** On localhost the per-process client cache
-  (`biopb.tensor.client`, gated by `_resolve_cache_bytes` / `BIOPB_CACHE_LOCAL`)
-  is disabled: the server already caches, and under `biopb-mcp`'s default
-  *multi-process distributed* dask a per-process cache is replicated per worker.
-  `biopb-mcp` bounds it with a cluster-wide `dask_cache_budget` (split
-  `budget // n_workers` by a worker-init plugin; localhost still resolves to 0
-  unless `BIOPB_CACHE_LOCAL=1` is set). **Caveat measured:**
-  even with the cache on, the viewer's *serial* plane reads scatter across workers
-  — dask's locality scheduler keys on tracked task *dependencies*, not the opaque
-  per-worker cache side-effect, so repeated reads of the same chunk round-robin
-  onto different workers (≈25% hit, N× redundant copies). The clean viewer fix is
-  to compute its slices on a single-process scheduler (one shared cache) —
-  `biopb/biopb-mcp#8`; the per-worker cache helps mainly when paired with that or
-  with deterministic chunk→home-worker sharding.
+- **The client chunk cache is two-tier, split by what a chunk actually costs.**
+  The read path (`biopb.tensor._pool`, `_fetch_chunk_distributed`) routes each
+  fetched chunk to one of two per-process caches: an mmap **view** from the
+  localhost fast path (shared OS page-cache pages, ~0 private RAM, but it pins a
+  server segment on disk) goes in a **weak** `WeakValueDictionary` — free,
+  uncounted, and self-evicting (GC releases the entry and the pin the instant the
+  last real holder drops the array); a **copy** (`do_get` result or an
+  over-pin-budget copy — real private RAM) goes in the **strong** `cachey` cache,
+  bounded by `_resolve_cache_bytes` (the requested size, `0` to disable). This is
+  why there is no longer a localhost "off by default" gate (`BIOPB_CACHE_LOCAL`
+  was removed): the old objection — a redundant second RAM copy replicated per
+  dask worker — never applied to weak views (shared page cache, nothing
+  replicated), and copies (rare on localhost) are what the budget bounds.
+  `biopb-mcp` sizes the copy budget cluster-wide via `dask_cache_budget` (split
+  `budget // n_workers` by a worker-init plugin). The weak cache dedups
+  *overlapping-lifetime* reads of one chunk; a chunk re-read after it was fully
+  dropped simply misses and re-runs the cheap (~1 ms) localhost fast path. **Caveat
+  measured (viewer):** the viewer's *serial* plane reads scatter across workers —
+  dask's locality scheduler keys on tracked task *dependencies*, not an opaque
+  per-worker cache side-effect — so the clean viewer fix is a single-process
+  scheduler (one shared cache) — `biopb/biopb-mcp#8`.
 
 - **The standard Flight verbs are extended with custom `do_action` types** on
   the tensor server: `health`, `create_source`, `upload_status`, `chunk_locate`

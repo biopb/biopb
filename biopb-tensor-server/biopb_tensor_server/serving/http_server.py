@@ -719,7 +719,7 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         # Read all data from the stream. do_get returns the unified binary chunk
         # schema (biopb/biopb#293); decode it, then ensure native byte order +
         # C-contiguous layout for the browser.
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         table = reader.read_all()
         arr = _normalize_array(unpack_chunk_array(table.to_batches()[0]))

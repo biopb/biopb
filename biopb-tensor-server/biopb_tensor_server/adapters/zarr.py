@@ -11,7 +11,8 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -167,6 +168,11 @@ class ZarrAdapter(TensorAdapter):
             if hasattr(zarr_array.store, "path")
             else str(zarr_array.store)
         )
+        # Cheap content_version from the store directory's stat signature (#178):
+        # O(1) dir mtime, which flips on member add/remove/rename. A remote store
+        # path (S3/GCS) can't be stat'd -> None -> the source stays unversioned.
+        # Inherited by OmeZarrAdapter / _HcsFieldAdapter via super().__init__.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -182,10 +188,7 @@ class ZarrAdapter(TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
     def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:

@@ -262,6 +262,137 @@ class TestNdTiffClose:
             adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
 
 
+class _FakeDask:
+    def __init__(self, data):
+        self._data = data
+
+    @property
+    def shape(self):
+        return self._data.shape
+
+    @property
+    def dtype(self):
+        return self._data.dtype
+
+    def __getitem__(self, slices):
+        return _FakeComputable(self._data[slices])
+
+
+class _FakeComputable:
+    def __init__(self, arr):
+        self._arr = arr
+
+    def compute(self):
+        return self._arr
+
+
+class _FakeDataset:
+    """A stand-in NDTiffDataset that records opens/closes without touching disk."""
+
+    def __init__(self, data, opens):
+        self._data = data
+        self.axes = {"channel": None, "row": None, "column": None}
+        self.summary_metadata = {"PixelSize_um": 0.1}
+        self.closed = False
+        opens.append(self)
+
+    def as_array(self):
+        return _FakeDask(self._data)
+
+    def close(self):
+        self.closed = True
+
+
+class TestNdTiffReaperReopen:
+    """The reaper releases an idle acquisition and the next read reopens it.
+
+    NDTiff keeps a persistent handle (a reopen-per-read would reopen the whole
+    acquisition per plane), so steady-state fd pinning is bounded by an idle
+    reaper rather than by teardown alone (biopb/biopb#71).
+    """
+
+    @staticmethod
+    def _adapter():
+        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
+
+        data = np.arange(3 * 8 * 8, dtype=np.uint8).reshape(3, 8, 8)
+        opens = []
+        reopen = lambda: _FakeDataset(data, opens)  # noqa: E731
+        adapter = NdTiffAdapter(
+            dataset=reopen(),
+            source_id="ndtiff-reaper",
+            source_url="/acq",
+            reopen=reopen,
+        )
+        return adapter, data, opens
+
+    def test_reopen_capable_adapter_registers_with_the_reaper(self):
+        from biopb_tensor_server.adapters import ndtiff as nd
+
+        adapter, _, _ = self._adapter()
+        assert adapter in list(nd._dataset_reaper._adapters)
+
+    def test_bare_dataset_adapter_is_not_reaped(self):
+        # A caller that hands in a dataset it cannot rebuild (reopen=None) keeps
+        # the handle: it must not be registered, and a read after close fails.
+        from biopb_tensor_server.adapters import ndtiff as nd
+        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
+
+        data = np.zeros((3, 8, 8), dtype=np.uint8)
+        adapter = NdTiffAdapter(
+            dataset=_FakeDataset(data, []),
+            source_id="bare",
+            source_url="/acq",
+        )
+        assert adapter not in list(nd._dataset_reaper._adapters)
+        adapter.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+
+    def test_release_then_read_reopens_the_acquisition(self):
+        from biopb_tensor_server.adapters import ndtiff as nd
+
+        adapter, data, opens = self._adapter()
+        assert len(opens) == 1  # opened once at construction
+
+        # Simulate what the reaper does when the source has gone idle.
+        with adapter._io_lock:
+            adapter._release_persistent_handle()
+        assert opens[0].closed is True
+        assert adapter._dataset is None and adapter._dask_arr is None
+        assert adapter not in list(nd._dataset_reaper._adapters)
+
+        # The next read transparently reopens and re-arms the reaper.
+        out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+        np.testing.assert_array_equal(out, data[0:1, 0:8, 0:8])
+        assert len(opens) == 2  # reopened
+        assert adapter._dataset is not None
+        assert adapter in list(nd._dataset_reaper._adapters)
+
+    def test_metadata_survives_a_reaper_close(self):
+        # get_metadata is served from the snapshot, so it stands even while the
+        # dataset is closed between reads.
+        adapter, _, _ = self._adapter()
+        with adapter._io_lock:
+            adapter._release_persistent_handle()
+        assert adapter._dataset is None
+        assert adapter.get_metadata() == {"PixelSize_um": 0.1}
+
+    def test_reaper_sweep_closes_this_adapter_when_idle(self, monkeypatch):
+        # End-to-end through the reaper's own sweep, on a fresh short-TTL reaper.
+        from biopb_tensor_server.adapters import ndtiff as nd
+        from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
+
+        fresh = IdleHandleReaper(ttl_seconds=10.0, thread_name="ndtiff-test")
+        monkeypatch.setattr(nd, "_dataset_reaper", fresh)
+        adapter, _, opens = self._adapter()
+        # Backdate last access so the sweep sees it as idle, then drive one sweep.
+        adapter._persistent_last_access -= 100
+        fresh._sweep()
+        assert opens[0].closed is True
+        assert adapter._dataset is None
+
+
 @pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")
 class TestNdTiffServerClient:
     """Integration tests for NDTiff adapter with server/client."""

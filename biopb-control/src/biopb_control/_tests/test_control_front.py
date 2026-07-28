@@ -474,10 +474,11 @@ def test_control_api_requires_token_when_configured(tokened_control):
     assert status == 200
 
 
-def test_ensure_verb_is_exempt_from_token(tmp_path, upstream):
-    # biopb-mcp's _control_client POSTs ensure with no token; it stays open even
-    # on a tokened control (idempotent, spawns the already-owned plane). Spy the
-    # supervisor so the gate is exercised without actually launching a plane.
+def test_ensure_verb_is_token_gated(tmp_path, upstream):
+    # /api/data_plane/ensure is gated like every other /api/* route now that the
+    # credential handoff (biopb/biopb#470) lets _control_client carry the token: no
+    # token -> 401, correct token -> 200. Spy the supervisor so the gate is
+    # exercised without actually launching a plane.
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_port=_free_port(),
@@ -492,13 +493,19 @@ def test_ensure_verb_is_exempt_from_token(tmp_path, upstream):
     server, _thread = serve_control_api(
         "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
     )
+    url = f"http://127.0.0.1:{api_port}/api/data_plane/ensure"
     try:
+        # No token -> 401.
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(
+                urllib.request.Request(url, data=b"", method="POST"), timeout=5
+            )
+        assert exc.value.code == 401
+        # Correct token -> 200 (the header also clears the CSRF gate on the POST).
         req = urllib.request.Request(
-            f"http://127.0.0.1:{api_port}/api/data_plane/ensure",
-            data=b"",
-            method="POST",
+            url, data=b"", method="POST", headers={"X-Biopb-Token": _TOKEN}
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:  # no token -> 200
+        with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
     finally:
         server.shutdown()
@@ -759,7 +766,7 @@ def test_agent_action_error_is_400(control, monkeypatch):
 
 def test_api_agents_is_token_gated(tokened_control, monkeypatch):
     monkeypatch.setattr("biopb._agents.statuses", list)
-    # No token -> 401 (it is /api/*, not exempt like /api/data_plane/ensure).
+    # No token -> 401 (every /api/* route is gated).
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{tokened_control}/api/agents")
     assert exc.value.code == 401
@@ -1132,10 +1139,16 @@ def test_mcp_config_put_rejects_unhashable_enum_value_as_422_not_500(control, mc
 
 
 def test_mcp_config_put_rejects_inverted_health_poll(control, mcp_home):
+    # The cross-field rule is declared once, in biopb-mcp, and reaches this
+    # endpoint through the shared checker -- this handler restates nothing, so a
+    # rule added there cannot silently pass here (biopb/biopb#34).
     status, payload = _put(
         f"{control}/api/mcp_config",
         {"tensor": {"health_poll_min_interval": 90, "health_poll_max_interval": 10}},
     )
     assert status == 422, payload
     paths = {tuple(e["path"]) for e in payload["errors"]}
+    # Both ends of the range are flagged, so the form can highlight the pair the
+    # user has to reconcile (and the load path clamps both).
     assert ("tensor", "health_poll_min_interval") in paths
+    assert ("tensor", "health_poll_max_interval") in paths

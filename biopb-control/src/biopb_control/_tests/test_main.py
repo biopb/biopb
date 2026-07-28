@@ -59,6 +59,26 @@ def test_no_token_anywhere_is_none():
     assert spec.token is None
 
 
+def test_token_surrounding_whitespace_is_stripped():
+    # A token sourced with a trailing newline (BIOPB_TENSOR_TOKEN=$(cat file)) must
+    # be normalized at this single resolution point, so the enforced spec.token,
+    # the tensor-server env, and the credential file (read back .strip()ed) all
+    # carry the same bytes — otherwise a local client's credential-derived token
+    # would 401 against the control that wrote it (biopb/biopb#470).
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": "s3cret\n"})
+    assert rc == 0
+    assert spec.token == "s3cret"
+
+
+def test_whitespace_only_token_collapses_to_none():
+    # A blank/whitespace-only value is not a real credential: it collapses to None
+    # (tokenless) rather than becoming a truthy spec.token that would gate on — and
+    # write a bogus empty credential for — the empty string.
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": "   \n"})
+    assert rc == 0
+    assert spec.token is None
+
+
 def test_local_mode_binds_control_loopback():
     """Default (no --remote): the control listener is not bound publicly."""
     rc, _, kwargs = _capture(_BASE_ARGV, {})

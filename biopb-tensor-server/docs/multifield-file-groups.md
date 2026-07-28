@@ -442,7 +442,7 @@ many tensors. The field-vs-axis modeling decides who is affected:
 
 | Adapter | Model | Typical field count | Hit by scaling concern? |
 |---|---|---|---|
-| MicroManager, NDTiff | **one tensor, position = axis** (`_single_tensor_source`) | 1 | No — immune by construction |
+| MicroManager, NDTiff | **one tensor, position = axis** (single-tensor source) | 1 | No — immune by construction |
 | OME-Zarr regular image | one tensor | 1 | No |
 | **OME-Zarr HCS plate** (`ome_zarr.py:432`) | many tensors (well × FOV) | hundreds–**thousands** | **Yes, today** |
 | **aicsimageio scenes** (CZI/LIF/ND2) (`aicsimageio.py:520`) | many tensors (scene) | tens–**thousands** | **Yes, today** |

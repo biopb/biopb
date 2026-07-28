@@ -65,10 +65,9 @@ class TestRegisterCachePlugin:
         assert mk.call_args.args[2] == 400_000_000
 
     def test_localhost_is_not_special_cased(self):
-        # The plugin no longer special-cases localhost: it splits the budget the
-        # same as for a remote URL. The localhost no-cache rule is applied
-        # authoritatively per worker by the tensor client
-        # (_resolve_cache_bytes), which clamps this budget to 0 on localhost.
+        # The plugin splits the budget the same for localhost and remote URLs --
+        # it never special-cases the host. (_resolve_cache_bytes no longer clamps
+        # localhost to 0 either; localhost caches copies like any other host.)
         dc = _fake_dask_client(8)
         with patch.object(_bootstrap, "_make_cache_plugin") as mk:
             mk.return_value = MagicMock()
@@ -118,7 +117,7 @@ class TestMakeCachePlugin:
         plugin = _bootstrap._make_cache_plugin(loc, None, 777)
         try:
             plugin.setup(worker=None)  # what dask calls on each worker
-            assert tclient._CACHE_POOL[(loc, None)][1].available_bytes == 777
+            assert tclient._CACHE_POOL[(loc, None)].available_bytes == 777
         finally:
             tclient._CACHE_POOL.clear()
 

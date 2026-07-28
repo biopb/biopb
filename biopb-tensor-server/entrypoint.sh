@@ -1,33 +1,42 @@
 #!/bin/bash
 set -e
 
+# Headless data-plane entrypoint. Runs `biopb-tensor-server launch` (Arrow Flight
+# server + FastAPI HTTP sidecar) in the foreground as PID 1. There is no control
+# plane and no bundled webapp in this image.
+#
 # Configuration via environment variables:
-# CONFIG_FILE    - Path to JSON (or legacy TOML) config file (if set and exists,
+# CONFIG_FILE    - Path to a JSON config file (if set and exists,
 #                  uses this file). Otherwise generates JSON config from env vars below
 # DATA_DIR       - Directory to monitor (default: /data)
 # MONITOR        - Enable live fs monitoring (default: true)
 # BIOPB_BASE_PORT - Base port for all services (default: 8810)
-#                  HTTP=BASE+4, gRPC=BASE+5
-# COMPUTE_BACKEND - auto/cpu/gpu
-# BIOPB_TENSOR_TOKEN - Access token for webapp and gRPC (auto-generated if not set)
+#                  HTTP sidecar=BASE+4, gRPC Flight=BASE+5
+# BIOPB_TENSOR_TOKEN - Access token for the sidecar and gRPC (auto-generated if not set)
+# BIOPB_TENSOR_ALLOW_NO_TOKEN - Set truthy (1/true/yes/on, case-insensitive) to serve
+#                  the data API WITHOUT a token even on the public 0.0.0.0 bind
+#                  (insecure; trusted networks only). Ignored when BIOPB_TENSOR_TOKEN is set.
 # BIOPB_BIND_LOCALHOST - Set to "true" to bind both HTTP and gRPC to localhost only (Singularity/HPC only)
-# BIOPB_EXTERNAL_HOST - External hostname/IP for webapp URL (auto-detected if not set)
+# BIOPB_EXTERNAL_HOST - External hostname/IP shown in the printed endpoint URLs only;
+#                  display-only, does not affect binding (auto-detected if not set)
+# BIOPB_CORS_ORIGINS - Space-separated extra CORS origins (→ launch --cors,
+#                  repeatable). The sidecar's own origin is always allowed;
+#                  set this to allow a browser SPA served from a different
+#                  origin (e.g. "http://localhost:5173 http://my.host:8813").
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
-# CACHE_MAX_SEGMENT_MB - Max segment size for file cache (default: 256)
+# CACHE_MAX_SEGMENT_MB - Max segment size for file cache (unset: server default, ~64 MB)
 # CACHE_MAX_TOTAL_GB   - Max total size for file cache (default: 16)
 
 # Single base port env var - all ports derived from it
 # Default 8810 → HTTP=8814, gRPC=8815
 BIOPB_BASE_PORT="${BIOPB_BASE_PORT:-8810}"
 
-CONTROL_PORT=$((BIOPB_BASE_PORT + 3))
 HTTP_PORT=$((BIOPB_BASE_PORT + 4))
 GRPC_PORT=$((BIOPB_BASE_PORT + 5))
 
-# CONTROL_PORT is the single public web origin (the control plane). HTTP_PORT is
-# the tensor sidecar, now PRIVATE (loopback) behind the control. GRPC_PORT (Flight)
-# stays public for SDK clients. See mcp-dedaemonization-migration.md §6.1.
-echo "Ports: CONTROL(web)=$CONTROL_PORT  HTTP(sidecar, private)=$HTTP_PORT  gRPC=$GRPC_PORT"
+# HTTP_PORT is the public data-plane API (the FastAPI sidecar). GRPC_PORT (Flight)
+# is the direct Arrow Flight endpoint for SDK clients. Both are token-authenticated.
+echo "Ports: HTTP(sidecar)=$HTTP_PORT  gRPC=$GRPC_PORT"
 
 # Create unique temp directory prefix to avoid multi-user collisions on shared /tmp
 # Use USER env var if available, else use PID as unique identifier
@@ -49,19 +58,22 @@ if [ "${BIOPB_BIND_LOCALHOST}" = "true" ] || [ "${BIOPB_BIND_LOCALHOST}" = "1" ]
     fi
 fi
 
-# Use existing config file if provided, otherwise generate from env vars.
-# NOTE: a supplied CONFIG_FILE owns [server].host/port, and the control probes the
-# data plane's liveness at 127.0.0.1:$GRPC_PORT (BIOPB_BASE_PORT+5). Keep
-# [server].port == BASE+5 and [server].host reachable over loopback (0.0.0.0 or
-# 127.0.0.1); a config that binds Flight elsewhere leaves the control unable to
-# see the plane as "serving" (the sidecar HTTP port is overridden to $HTTP_PORT
-# regardless). The generated config below already satisfies this.
+# Use existing config file if provided, otherwise generate from env vars. A
+# supplied CONFIG_FILE owns [server].host/port (the Flight bind); keep
+# [server].port == BASE+5 so the published gRPC port matches. The sidecar's own
+# HTTP port is set by --web-port below regardless of the config.
 if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     echo "Using config file: $CONFIG_FILE"
 else
     echo "Generating runtime config from environment variables"
     DATA_DIR="${DATA_DIR:-/data}"
     MONITOR="${MONITOR:-true}"
+    # Segment cap: omit the key unless explicitly set, so the server's built-in
+    # default (64 MB) applies. Set CACHE_MAX_SEGMENT_MB only to override it.
+    SEGMENT_CFG=""
+    if [ -n "$CACHE_MAX_SEGMENT_MB" ]; then
+        SEGMENT_CFG="    \"file_max_segment_mb\": ${CACHE_MAX_SEGMENT_MB},"
+    fi
     cat > "$BIOPB_TMP/runtime-config.json" << EOF
 {
   "server": {
@@ -71,11 +83,8 @@ else
   },
   "cache": {
     "backend": "file",
-    "file_max_segment_mb": ${CACHE_MAX_SEGMENT_MB:-256},
+${SEGMENT_CFG}
     "file_max_total_gb": ${CACHE_MAX_TOTAL_GB:-16}
-  },
-  "compute": {
-    "backend": "${COMPUTE_BACKEND:-auto}"
   },
   "sources": [
     {
@@ -88,7 +97,7 @@ EOF
     CONFIG_FILE="$BIOPB_TMP/runtime-config.json"
 fi
 
-# Construct best-effort external URL for webapp access
+# Construct best-effort external host for the printed endpoint URLs
 # Priority: env var override > hostname > IP from default route > localhost
 if [ -n "$BIOPB_EXTERNAL_HOST" ]; then
     WEB_HOST="$BIOPB_EXTERNAL_HOST"
@@ -104,16 +113,33 @@ else
     WEB_HOST="localhost"
 fi
 
-# Resolve the tensor-server access token. The control forwards the browser's
-# Bearer token to the (private) sidecar, which re-validates; the Flight gRPC port
-# re-validates it too. A public bind with no token would be open, so generate one
-# (mirroring `biopb server start`); a loopback-only bind may skip enforcement.
+# Resolve the tensor-server access token. `launch` re-validates the token on both
+# the Flight gRPC port and the HTTP sidecar. A public bind with no token would be
+# open, so generate one; a loopback-only bind (BIOPB_BIND_LOCALHOST) runs in local
+# mode with no token. `launch` also enforces this fail-closed, but generating here
+# keeps the token in the logs (and the env) deterministically.
+# Normalize BIOPB_TENSOR_ALLOW_NO_TOKEN exactly like the Python predicate
+# _allow_no_token_from_env() (strip + lowercase, accept 1/true/yes/on), so the two
+# never diverge: e.g. "yes"/"on"/"TRUE" must skip generation here too, else this
+# generates a token and passes --token, silently overriding an opt-out `launch`
+# would have honored.
+_allow_no_token="${BIOPB_TENSOR_ALLOW_NO_TOKEN#"${BIOPB_TENSOR_ALLOW_NO_TOKEN%%[![:space:]]*}"}"
+_allow_no_token="${_allow_no_token%"${_allow_no_token##*[![:space:]]}"}"
+_allow_no_token="${_allow_no_token,,}"
+
 TOKEN_ARGS=()
 if [ -n "$BIOPB_TENSOR_TOKEN" ]; then
     TOKEN_ARGS=(--token "$BIOPB_TENSOR_TOKEN")
 elif [ "$BIND_ADDR" = "127.0.0.1" ]; then
     # Loopback-only bind (Singularity BIOPB_BIND_LOCALHOST): local mode, no token.
     # Every listener is same-machine, so no token is enforced -- pass nothing.
+    TOKEN_ARGS=()
+elif [ "$_allow_no_token" = "1" ] || [ "$_allow_no_token" = "true" ] || [ "$_allow_no_token" = "yes" ] || [ "$_allow_no_token" = "on" ]; then
+    # Deliberate insecure opt-out: run tokenless even on the public 0.0.0.0 bind
+    # (e.g. a host-loopback-published container on a trusted machine). Pass no
+    # --token and skip generation; `launch` honors the same env var and serves the
+    # data API OPEN. The var is already in the container env (-e), so launch sees it.
+    echo "WARNING: BIOPB_TENSOR_ALLOW_NO_TOKEN set -- serving the data API WITHOUT a token. Trusted networks only."
     TOKEN_ARGS=()
 else
     GEN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
@@ -122,35 +148,27 @@ else
     TOKEN_ARGS=(--token "$GEN_TOKEN")
 fi
 
-# Run the control plane in the foreground (container PID 1). It is the single
-# public web origin on $CONTROL_PORT: it serves the web/ SPA bundle (/app/webapp,
-# passed via --static-dir above) at its root (dashboard /, dataviewer /viewer,
-# per-session observe), supervises the tensor server as a PRIVATE loopback
-# subprocess (sidecar on 127.0.0.1:$HTTP_PORT, never exposed), and reverse-proxies
-# its data API under /data_plane. The Flight gRPC port stays directly exposed for
-# SDK clients.
+# Run `biopb-tensor-server launch` in the foreground (container PID 1). It starts
+# the Arrow Flight server (binds [server].host/port from the config) and the
+# FastAPI HTTP sidecar (--web-host/--web-port) in a single process. This is a
+# headless data plane — no webapp is served. CORS is configurable via
+# BIOPB_CORS_ORIGINS (→ repeated --cors) for a browser SPA served from a
+# different origin; otherwise launch defaults to localhost variants.
 #
-# PID 1 note: run_control installs SIGTERM/SIGINT handlers so `docker stop` tears
-# down gracefully, and the supervisor reaps its own tensor-server child. But PID 1
-# does not reap *unrelated* orphaned grandchildren -- run the container with
-# `docker run --init` (or a tini shim) if you want a reaping init as PID 1.
-#   --control-host $BIND_ADDR : bind the public origin (0.0.0.0 -> reachable via -p)
-#   --grpc-host 127.0.0.1     : the liveness-probe CONNECT address; the server BINDs
-#                               server.host from the config (0.0.0.0 above), so
-#                               Flight itself stays public
-#   --web-host 127.0.0.1      : bind the sidecar privately (only the control reaches it)
-CONTROL_ARGS=(
+# PID 1 note: launch installs a SIGTERM handler so `docker stop` tears down
+# gracefully (releasing the file-cache process lock). PID 1 does not reap
+# *unrelated* orphaned grandchildren -- run the container with `docker run --init`
+# (or a tini shim) if you want a reaping init as PID 1.
+LAUNCH_ARGS=(
     --config "$CONFIG_FILE"
-    --control-host "$BIND_ADDR"
-    --control-port "$CONTROL_PORT"
-    --grpc-host 127.0.0.1
-    --grpc-port "$GRPC_PORT"
-    --web-host 127.0.0.1
+    --web-host "$BIND_ADDR"
     --web-port "$HTTP_PORT"
 )
-if [ -d "/app/webapp" ]; then
-    CONTROL_ARGS+=(--static-dir /app/webapp)
+if [ -n "$BIOPB_CORS_ORIGINS" ]; then
+    for origin in $BIOPB_CORS_ORIGINS; do
+        LAUNCH_ARGS+=(--cors "$origin")
+    done
 fi
 
-echo "Web origin (control): http://${WEB_HOST}:${CONTROL_PORT}   Flight gRPC: ${WEB_HOST}:${GRPC_PORT}"
-exec python -m biopb_control run "${CONTROL_ARGS[@]}" "${TOKEN_ARGS[@]}"
+echo "HTTP sidecar: http://${WEB_HOST}:${HTTP_PORT}   Flight gRPC: ${WEB_HOST}:${GRPC_PORT}"
+exec biopb-tensor-server launch "${LAUNCH_ARGS[@]}" "${TOKEN_ARGS[@]}"

@@ -2,10 +2,10 @@
 # `release-v*` tag. See docs/release-model.md. Produces, from the tagged commit,
 # the GitHub release: wheel set + mcp sdist + webapp + samples + installers — the
 # installer's single source of truth.
-# Docker images are NOT built here: biopb-tensor-server ships on its own
-# `server-v*` tag (tensor-server-ci) and biopb-image-base on the SDK `v*` tag
-# (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI on its
-# own `v*` tag (biopb-mcp is no longer on PyPI; it ships only as the wheel set here).
+# Docker images are NOT built here: biopb-tensor-server's image is built by
+# tensor-server-ci on this same `release-v*` tag, and biopb-image-base on the SDK
+# `v*` tag (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI
+# on its own `v*` tag (biopb-mcp is no longer on PyPI; it ships only as the wheel set here).
 name: Release (deployment)
 
 on:
@@ -278,9 +278,11 @@ jobs:
             PRERELEASE=true
           fi
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          # The tensor server has its own version line (server-v*), so its wheel
-          # version can differ from REL; read it off the built wheel for the
-          # versions.json manifest rather than assuming it equals REL.
+          # The tensor server now tracks `release-v*` too, so on a real tag its
+          # wheel version equals REL. Still read it off the built wheel (rather
+          # than assuming) so the versions.json manifest carries the true wheel
+          # version — including on a dry run, where REL is "dryrun" but the wheel
+          # gets a setuptools_scm dev version.
           tver=$(ls release-wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
           # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
@@ -299,8 +301,9 @@ jobs:
           # versions.json — the installer-readable release-attribute manifest. The
           # installer reads `napari` (pins the tested Qt binding) and `release`
           # (the update baseline); `tensor_server` reports the shipped wheel's
-          # version (its own server-v* line). Docker versions are NOT here — the
-          # images ship on their own tags (server-v* / v*), not from this bundle.
+          # version (now the same `release-v*` line, so == release on a real tag).
+          # Docker versions are NOT here — the tensor-server image ships on this
+          # same `release-v*` tag (tensor-server-ci), image-base on the SDK `v*`.
           cat > release-wheels/versions.json <<EOF
           { "release": "$REL", "tensor_server": "$tver", "napari": "$nver" }
           EOF
@@ -407,9 +410,10 @@ jobs:
               will warn "Unknown publisher" until a signing cert is provisioned)
 
             ### Docker
-            The Docker images ship on their own tags, not from this release:
-            `biopb-tensor-server` on `server-v*` (tensor-server-ci) and
-            `biopb-image-base` on the SDK `v*` tag (image-runtime-ci).
+            The Docker images are built by their own CI workflows, not by this
+            release job: `biopb-tensor-server` on this same `release-v*` tag
+            (tensor-server-ci) and `biopb-image-base` on the SDK `v*` tag
+            (image-runtime-ci).
         env:
           GITHUB_TOKEN: ${{ github.token }}
 

@@ -30,7 +30,9 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.adapters._scale import axes_scale
+from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -48,8 +50,6 @@ class EmdAdapter(TensorAdapter):
     - source-level (``signal_index=None``): lists all signals as tensors.
     - tensor-level (``signal_index=int``): reads one signal's data.
     """
-
-    _single_tensor_source = False
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -123,6 +123,10 @@ class EmdAdapter(TensorAdapter):
         self._tensor_adapters: dict = {}
 
         self._source_url = source_url if source_url else url
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. None (unresolved / non-file url) leaves the source unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "emd"
 
         if signal_index is not None:
@@ -227,40 +231,36 @@ class EmdAdapter(TensorAdapter):
         if self.signal_index is None:
             raise ValueError("Cannot get data from source-level EMD adapter")
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._data[slices].compute()
-
-    def metadata_covers_all_tensors(self) -> bool:
-        """EMD metadata is per-signal, not one tree for the whole source."""
-        return False
 
     def _physical_scale(self) -> Optional[tuple]:
         """Voxel size + unit per dimension, from this signal's axis scales."""
         if self._axes is None:
             return None
-        scale: List[float] = []
-        unit: List[str] = []
-        for ax in self._axes:
-            try:
-                v = float(ax.get("scale") or 0.0)
-            except (TypeError, ValueError):
-                v = 0.0
-            if v > 0:
-                scale.append(v)
-                unit.append(str(ax.get("units")) if ax.get("units") else "")
-            else:
-                scale.append(0.0)
-                unit.append("")
-        if len(scale) != len(self.dim_labels or []) or not any(scale):
-            return None
-        return scale, unit
+        return axes_scale(self._axes, self.dim_labels or [])
 
     def get_metadata(self) -> dict:
-        """Signal-level EMD metadata (original_metadata), JSON-safe."""
+        """Source-level EMD metadata, JSON-safe.
+
+        EMD metadata is genuinely per-signal, and the source-level adapter
+        (``signal_index is None``) has no bound signal, so this is the bare
+        ``{"format": "emd"}`` header stored in the catalog row. Each signal's
+        own ``original_metadata`` is served per-tensor via
+        :meth:`get_tensor_metadata` (biopb/biopb#253).
+        """
         if self._original_metadata is None:
             return {"format": "emd"}
         return {"format": "emd", "original_metadata": self._original_metadata}
+
+    def get_tensor_metadata(self) -> Optional[dict]:
+        """This signal's ``original_metadata`` as the delta over the source row.
+
+        Per-signal, merged over the source-level ``{"format": "emd"}`` catalog row
+        (so ``"format"`` is not repeated here). ``None`` when this signal carries
+        no ``original_metadata``, or on the source-level adapter (no bound signal).
+        """
+        if self.signal_index is None or self._original_metadata is None:
+            return None
+        return {"original_metadata": self._original_metadata}

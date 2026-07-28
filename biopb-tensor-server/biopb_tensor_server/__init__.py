@@ -50,7 +50,7 @@ from biopb_tensor_server.cache import (
     EntryState,
     MemoryCacheBackend,
 )
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
     TensorReadPlan,

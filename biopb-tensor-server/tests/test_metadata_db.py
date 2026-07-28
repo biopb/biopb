@@ -474,8 +474,12 @@ class TestGetMetadataJson:
             "nested": {"a": 1, "b": 2},
         }
 
-    def test_none_on_read_error(self):
-        """A DuckDB read failure degrades to None (serve falls back), not raise."""
+    def test_raises_on_read_error(self):
+        """A DuckDB read failure propagates: the catalog is the mandatory,
+        authoritative metadata source (no adapter fallback), so a read error must
+        surface as a failed request rather than be masked as 'no metadata'."""
+        import pytest
+
         db = MetadataDatabase()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
@@ -485,9 +489,10 @@ class TestGetMetadataJson:
             def execute(self, *a, **k):
                 raise RuntimeError("duckdb read boom")
 
-        # Force the read to raise; the method must swallow it and return None.
+        # Force the read to raise; the method must propagate, not swallow.
         db._get_cursor = lambda: _BoomCursor()
-        assert db.get_metadata_json("s1") is None
+        with pytest.raises(RuntimeError, match="duckdb read boom"):
+            db.get_metadata_json("s1")
 
     def test_none_on_corrupt_json(self):
         """A non-JSON stored value degrades to None rather than propagating."""

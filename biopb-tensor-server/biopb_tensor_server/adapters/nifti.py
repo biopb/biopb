@@ -10,7 +10,8 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -160,6 +161,10 @@ class NiftiAdapter(TensorAdapter):
             self._source_url = files[0] if files else ""
         else:
             self._source_url = ""
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. None (unresolved / non-file url) leaves the source unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "nifti"
 
         # Get shape and dtype from header
@@ -253,10 +258,7 @@ class NiftiAdapter(TensorAdapter):
             RuntimeError: If the source has been closed.
         """
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Take the image reference once, then check it: close() races a read only
         # by nulling this attribute, and the read of a reference is atomic under
@@ -396,11 +398,7 @@ class NiftiAdapter(TensorAdapter):
         # pixdim[0] is qfac, pixdim[1-7] are actual dimensions
         pixdim = self.header.get("pixdim", None)
         if pixdim is not None:
-            # Convert to list if it's a numpy array
-            if isinstance(pixdim, np.ndarray):
-                pixdim_list = list(pixdim)
-            else:
-                pixdim_list = list(pixdim)
+            pixdim_list = list(pixdim)
             if len(pixdim_list) >= 4:
                 metadata["spatial"]["voxel_size_mm"] = pixdim_list[1:4]
                 if len(pixdim_list) >= 5 and pixdim_list[4] > 0:

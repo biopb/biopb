@@ -20,6 +20,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from biopb import _credentials
+
 from ._control import serve_control_api
 from ._supervisor import DataPlaneSpec, DataPlaneSupervisor
 
@@ -101,6 +103,22 @@ def run_control(
         )
         return 1
 
+    # Hand the data-plane token off to local clients on the filesystem, keyed to
+    # this control's lifetime (biopb/biopb#470). Written *after* the bind succeeds
+    # (so a failed start that hits the `return 1` above never clobbers a running
+    # control's credential) and *before* the plane comes up, since a client must
+    # be able to authenticate the very `/api/data_plane/ensure` POST that starts
+    # it. Only when a token is actually enforced: a tokenless local plane needs no
+    # credential and the gate falls back to a loopback-`Host` check. Owner-only
+    # perms are applied by the writer (0600 / an equivalent Windows DACL).
+    if spec.token:
+        try:
+            _credentials.write_credential(spec.token)
+        except OSError as exc:
+            # Best-effort: a client that then can't find the credential degrades to
+            # an actionable auth error, which is better than failing control startup.
+            logger.warning("could not write the local credential file: %s", exc)
+
     if data_plane:
         logger.info("Bringing up the data plane")
         supervisor.ensure()
@@ -142,4 +160,8 @@ def run_control(
     logger.info("shutting down")
     server.shutdown()
     supervisor.stop()
+    # Retract the credential we published so a stopped control leaves no readable
+    # token behind (a crash can't run this; the next control start overwrites it).
+    if spec.token:
+        _credentials.remove_credential()
     return 0

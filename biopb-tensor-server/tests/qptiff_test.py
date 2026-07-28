@@ -272,7 +272,7 @@ class TestQptiffAdapter:
         # OME-Zarr's ZarrAdapter level), not a partial TensorAdapter that
         # hardcodes array_id -- so code treating it as a full backend (metadata-DB
         # sync, source-level ops) finds source_id/array_id/source_url.
-        from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+        from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"

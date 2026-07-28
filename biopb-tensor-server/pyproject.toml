@@ -15,6 +15,13 @@ dependencies = [
   # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
   # tree, so this floor is documentation for any non-workspace install path.
   "biopb >= 0.7.0",
+  # Floor verified for the file cache's Windows zero-copy segment read (#572):
+  # the cache hands out batches that alias the segment mmap and unlinks the file
+  # (on eviction) while a caller still holds one. That is safe only if
+  # MemoryMappedFile.close() releases the OS handle while the mapped view stays
+  # alive for outstanding buffers -- which holds on pyarrow >= 14 (measured 14
+  # through 24). Below it, the batch could pin the handle and unlink would fail
+  # with WinError 32. Do not lower without re-running the version sweep.
   "pyarrow >= 14.0.0",
   "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port. See docs/aicsimageio-to-bioio-migration.md
   "dask[array] >= 2024.0.0",
@@ -135,20 +142,20 @@ dependencies = [
 where = ["."]
 include = ["biopb_tensor_server*"]
 
-# Version derived from git tags (server-vX.Y.Z tensor-server tag)
+# Version derived from git tags (the product `release-vX.Y.Z` tag)
 [tool.setuptools_scm]
 version_file = "biopb_tensor_server/_version.py"
 root = ".."
-# The tensor server has its OWN version line, keyed to the per-package tag
-# `server-v*` — its Docker image is cut on that tag by tensor-server-ci, on its
-# own cadence, independent of the product `release-v*` bundle and the SDK `v*`
-# line. `.+` so a prerelease (`server-v0.11.0rc1`) is captured, not just X.Y.Z.
+# The tensor server tracks the product `release-v*` line (like biopb-mcp and
+# biopb-control): its wheel is bundled into the GitHub release and its Docker
+# image is cut on the same tag by tensor-server-ci — no separate `server-v*`
+# line. `.+` so a prerelease (`release-v0.11.0rc1`) is captured, not just X.Y.Z.
 # The `--match` below keeps `git describe` from grabbing the nearest tag of
-# another prefix (`release-v*` / the SDK's `v*`) and mis-versioning the wheel.
-tag_regex = "^server-v(?P<version>.+)$"
+# the SDK's `v*` prefix and mis-versioning the wheel.
+tag_regex = "^release-v(?P<version>.+)$"
 
 [tool.setuptools_scm.scm.git]
-describe_command = "git describe --tags --match 'server-v*'"
+describe_command = "git describe --tags --match 'release-v*'"
 
 # Lint/format config lives at the monorepo root [tool.ruff] (issue #82).
 

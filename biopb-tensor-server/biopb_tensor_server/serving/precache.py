@@ -304,7 +304,7 @@ class PrecacheWorker:
         # has_native_pyramid(), so a pyramidal upstream would be warmed at a
         # computed coarse level the upstream already serves natively -- caching
         # chunks the native-pyramid skip below is meant to avoid.
-        from biopb_tensor_server.core.discovery import is_remote_url
+        from biopb_tensor_server.core.remote import is_remote_url
 
         if is_remote_url(source_adapter.source_url or ""):
             logger.debug(

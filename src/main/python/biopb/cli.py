@@ -107,17 +107,13 @@ CONTROL_PID_FILE = _locations.control_pid_file()
 
 
 # The installer records the release-v* deployment version it pulled the wheels
-# from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
-# auto-updater's baseline. This is the *deployment* version and is distinct from
-# any single package's version: one release bundles the mutually-paired
-# biopb / biopb-tensor-server / biopb-mcp / biopb-control set. Kept in sync with
+# from in this marker file -- a clean PEP 440 string (e.g. "0.11.0"), the
+# auto-updater's baseline. This is the *product* version: one release-v* tag
+# versions the mutually-paired biopb-tensor-server / biopb-mcp / biopb-control /
+# web set together, so the marker represents them all. (The biopb SDK ships on
+# its own v* line, so its wheel version differs.) Kept in sync with
 # CONFIG_DIR/release.version in install/install.sh.
 _RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
-
-# The wheels the installer bundles in one release-v* deployment (see
-# install/install.sh). `biopb version` reports each separately so a version skew
-# within the installed set is visible; any may be absent, hence "not installed".
-_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp", "biopb-control")
 
 
 def _read_release_version() -> str:
@@ -159,9 +155,16 @@ def _package_version(dist_name: str) -> str:
 
 @app.command()
 def version():
-    """Show the installed release version and each bundled package's version."""
-    rows = [("release", _read_release_version())]
-    rows += [(name, _package_version(name)) for name in _RELEASE_PACKAGES]
+    """Show the two version lines: the product deployment and the biopb SDK."""
+    rows = [
+        # The product line (release-v*): biopb-tensor-server / mcp / control / web
+        # all share this version, so the installer's deployment marker stands in
+        # for the whole set -- no need to list each wheel separately.
+        ("release", _read_release_version()),
+        # The SDK line (v*): biopb ships to PyPI/Maven on its own tag, so its
+        # version is independent of the product bundle it is also packaged into.
+        ("biopb", _package_version("biopb")),
+    ]
 
     # Left-align the labels so the versions line up in a readable column.
     width = max(len(name) for name, _ in rows) + 1  # +1 for the trailing ':'
@@ -335,6 +338,26 @@ def _tail_and_follow(
     finally:
         f.close()
     raise typer.Exit(0)
+
+
+def _reject_legacy_toml(config: Path) -> None:
+    """Refuse to start on a pre-#34 ``biopb.toml``, naming the migration command.
+
+    The server no longer reads TOML (biopb/biopb#34), and every config probe on
+    the start path is best-effort (an unreadable config silently falls back to
+    defaults -- ``_read_flight_host`` even fails *closed* to a public bind). So a
+    legacy config would otherwise surface as an unrelated "public bind needs a
+    token" refusal, or as a plane that starts on defaults and serves none of the
+    user's data. Check it once, up front, where the user can act on it.
+    """
+    if config and config.suffix.lower() == ".toml" and config.exists():
+        console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
+        console.print(
+            "JSON is the only supported format. Convert it with "
+            "[bold]biopb server migrate-config[/bold] (settings are preserved "
+            "and the old file is backed up), then retry."
+        )
+        raise typer.Exit(1)
 
 
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
@@ -547,7 +570,7 @@ def _render_cache_stats(stats: dict) -> None:
 @server_app.command("cache-stats")
 def cache_stats(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
+        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (biopb.json)"
     ),
     token: Optional[str] = typer.Option(
         None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"
@@ -593,12 +616,12 @@ def migrate_config(
 ):
     """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
 
-    JSON is the canonical on-disk format (biopb/biopb#34); TOML stays readable
-    through a deprecation window. This converts a legacy TOML config in place --
-    reading the raw table (so advanced/unknown keys survive) and writing the
-    sibling ``biopb.json`` (plus its schema sidecar), then backing the old TOML
-    up to ``biopb.toml.bak``. Settings are preserved verbatim, so a running
-    server need not be restarted.
+    JSON is the only format the server reads (biopb/biopb#34), so this command
+    is the upgrade path for a pre-#34 install. It converts a legacy TOML config
+    in place -- reading the raw table (so advanced/unknown keys survive) and
+    writing the sibling ``biopb.json`` (plus its schema sidecar), then backing
+    the old TOML up to ``biopb.toml.bak``. Settings are preserved verbatim, so a
+    running server need not be restarted.
     """
     from ._locations import (
         CANONICAL_CONFIG_NAME,
@@ -648,8 +671,10 @@ def migrate_config(
         raise typer.Exit(0)
 
     # The migration case: TOML only. Read the raw table and write canonical JSON.
+    # `read_legacy_toml` is the last TOML reader in the tree -- the server's own
+    # load path no longer parses TOML at all (biopb/biopb#34).
     try:
-        from biopb_tensor_server.core.config import _read_config_file, save_config
+        from biopb_tensor_server.core.config import read_legacy_toml, save_config
     except Exception as exc:  # noqa: BLE001 - optional dependency
         console.print(
             "[red]Config migration is unavailable:[/red] "
@@ -659,7 +684,7 @@ def migrate_config(
         raise typer.Exit(1)
 
     try:
-        data = _read_config_file(toml_path)
+        data = read_legacy_toml(toml_path)
     except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
         console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
         raise typer.Exit(1)
@@ -1043,7 +1068,7 @@ def _control_run_argv(
 @control_app.command("start")
 def control_start(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -1100,6 +1125,7 @@ def control_start(
     """
     _require_biopb_control()
     _ensure_dirs()
+    _reject_legacy_toml(config)
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
     # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
@@ -1340,7 +1366,7 @@ def control_logs(
 @control_app.command("run")
 def control_run(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -1382,6 +1408,7 @@ def control_run(
     """
     _require_biopb_control()
     _ensure_dirs()
+    _reject_legacy_toml(config)
     from biopb_control import run_control
     from biopb_control._supervisor import DataPlaneSpec
 

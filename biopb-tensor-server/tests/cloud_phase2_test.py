@@ -21,6 +21,7 @@ from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     DiscoveryState,
+    LiveLocalContext,
     SourceClaim,
     should_skip_walk_entry,
 )
@@ -127,10 +128,13 @@ class TestShouldSkipAdmit:
 # --------------------------------------------------------------------------- #
 
 
-class _RaisingReadCtx(ClaimContext):
-    """A ClaimContext whose content reads explode, proving claim() never reads."""
+class _RaisingReadCtx(LiveLocalContext):
+    """A local ClaimContext whose content reads explode, proving claim() never reads."""
 
     def read_text(self, subpath: str = "") -> str:
+        raise AssertionError("claim() must not read content for this adapter")
+
+    def open(self, mode: str = "rb") -> object:
         raise AssertionError("claim() must not read content for this adapter")
 
 
@@ -398,6 +402,29 @@ class TestUnresolvedProxy:
 
     def test_close_on_unresolved_proxy_is_a_noop(self):
         self._make_proxy("/data/cloud/x.zarr").close()  # does not raise
+
+    def test_get_level_adapter_forwards_to_the_resolved_adapter(self):
+        """The proxy forwards native-level lookup, like ``close`` (biopb/biopb#557).
+
+        A resolved cloud native-pyramid source serves its ``precompute`` chunks
+        through the level adapter; without this forward the server's chunk
+        dispatch would mis-route a level chunk to ``get_tensor_adapter``.
+        """
+        proxy = self._make_proxy("/data/cloud/x.zarr")
+        # Unresolved: no tensors yet, so no level -- None falls back to the
+        # tensor path (which raises the "resolve first" error).
+        assert proxy.get_level_adapter("1") is None
+
+        calls = []
+
+        class _Inner:
+            def get_level_adapter(self, path):
+                calls.append(path)
+                return "level-adapter"
+
+        proxy._resolved = _Inner()
+        assert proxy.get_level_adapter("1") == "level-adapter"
+        assert calls == ["1"]
 
     def test_serve_surface_refuses_until_resolved(self):
         # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
@@ -1256,7 +1283,7 @@ class TestCloudRootFlag:
                 return None
 
         registry = AdapterRegistry()
-        registry.register_with_type("recorder", _Recorder)
+        registry.register(_Recorder, "recorder")
 
         cloud_dir = str(tmp_path / "cloud")
         plain_dir = str(tmp_path / "plain")

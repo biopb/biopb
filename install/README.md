@@ -77,15 +77,17 @@ are produced.
   default browser. Set `BIOPB_INSTALL_SHORTCUT=0` to skip creating it. You can
   run `biopb dashboard` from a terminal at any time instead.
 - The installer also registers the biopb MCP server with any detected agent
-  (Claude Code/Desktop, Cursor, opencode, Hermes) and can install opencode if
+  (Claude Code/Desktop, Cursor, opencode) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
-  `biopb-mcp --transport stdio` itself (which opens the napari window and brings
-  up the data plane) — there is no separate server to start by hand.
+  `biopb-mcp --transport stdio` itself — there is no separate server to start by
+  hand. The napari viewer does not open with it: it comes up on the first
+  `start_kernel` call, so prompt the agent (e.g. "start biopb and report
+  status") to bring up the viewer and the data plane.
 
 ## Config & data locations
 
 - Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
-  legacy `biopb.toml` still loads and is migrated to JSON on rerun — via
+  legacy `biopb.toml` is no longer read and must be migrated to JSON — via
   `biopb server migrate-config`, or automatically when you pick a new data
   folder)
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`

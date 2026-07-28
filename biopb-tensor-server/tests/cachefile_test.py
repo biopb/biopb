@@ -11,8 +11,11 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
 """
 
 import dataclasses
+import hashlib
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,13 +26,17 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
+from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
+    CACHE_FILE_FORMAT_VERSION,
+    FORMAT_VERSION_MARKER,
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
 )
-from biopb_tensor_server.core.base import pack_chunk_batch, unpack_chunk_array
+from biopb_tensor_server.core.adapter_base import pack_chunk_batch, unpack_chunk_array
+from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -64,6 +71,27 @@ def _read_via_location(loc: ChunkLocation) -> np.ndarray:
         return unpack_chunk_array(batch)
     finally:
         mm.close()
+
+
+def _reset_client_pools(location: str) -> None:
+    """Wipe the process-global client caches/accounting for a clean fetch test."""
+    import biopb.tensor._pool as pool
+
+    pool._CACHE_POOL.clear()
+    pool._VIEW_CACHE.clear()
+    with pool._cachefile_support_lock:
+        pool._cachefile_support.clear()
+    with pool._pinned_lock:
+        pool._pinned_segments.clear()
+    pool._pinned_total = 0
+
+
+def _first_chunk(client, array_id: str):
+    """(chunk_id, start, stop) of a tensor's first chunk, from its endpoint list."""
+    pb = client.get_tensor_pb(array_id)
+    ep = pb.endpoints[0]
+    b = ep.chunk_bounds
+    return ep.ticket.chunk_id, tuple(b.start), tuple(b.stop)
 
 
 @pytest.fixture
@@ -399,6 +427,185 @@ class TestLocateEntry:
             be2.close()
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_segment_files_are_never_truncated_in_place(self):
+        """Load-bearing invariant for the localhost mmap fast path (Option C,
+        biopb/biopb#571): a client hands out a zero-copy *view* onto a segment
+        mapping, so a segment inode must never be truncated or recreated in place
+        while it could still be mapped -- that would SIGBUS the remote reader far
+        from the read that produced the array.
+
+        The guard is strictly-monotonic segment ids (``_next_segment_id``, boot
+        max+1, only incremented): the sole truncating open,
+        ``pa.OSFile(path, "wb")``, must target a fresh path every time, even
+        across rotation and eviction. Spy on that open and assert no segment path
+        is ever opened for write twice.
+        """
+        import re
+
+        d = tempfile.mkdtemp()
+        cfg = ArrowFileConfig(
+            cache_dir=Path(d),
+            max_segment_bytes=64 * 1024,  # tiny -> frequent rotation
+            max_total_bytes=256 * 1024,  # tiny -> frequent eviction
+        )
+        seg_re = re.compile(r"seg_\d+\.arrow$")
+        opened_for_write: list[str] = []
+        real_osfile = pa.OSFile
+
+        def spy_osfile(path, mode="rb", *a, **k):
+            if "w" in mode and seg_re.search(str(path)):
+                opened_for_write.append(str(path))
+            return real_osfile(path, mode, *a, **k)
+
+        be = ArrowFileBackend(cfg)
+        try:
+            with patch.object(pa, "OSFile", spy_osfile):
+                for i in range(200):
+                    a = ((np.arange(4000, dtype=np.uint16) + i) % 509).astype(np.uint16)
+                    key = f"k-{i}".encode()
+                    be.get_or_acquire(
+                        key, (lambda a=a: (_make_typed_batch(a), a.nbytes))
+                    )
+                    be.release(key)
+        finally:
+            be.close()
+            shutil.rmtree(d, ignore_errors=True)
+
+        # The workload must actually rotate (else the test proves nothing)...
+        assert len(opened_for_write) > 1, "test did not rotate segments"
+        # ...and no segment path was ever truncated/recreated in place.
+        assert len(opened_for_write) == len(set(opened_for_write)), (
+            "a segment path was opened 'wb' twice -- a mapped inode could be "
+            "truncated under a remote reader (Option C invariant broken)"
+        )
+
+
+class TestFormatVersionEnforcement:
+    """CACHE_FILE_FORMAT_VERSION is enforced with an on-disk marker + wipe.
+
+    The version marks the segment message layout / cache-key encoding contract.
+    Segments written under an incompatible version must be dropped at boot rather
+    than indexed and served (mis-decoded / stale). Covers: the marker is stamped
+    on init; a matching marker preserves the cache across restart; and a missing
+    (pre-enforcement), mismatched, or torn marker wipes the segments + WAL.
+    """
+
+    CFG = {"max_segment_bytes": 8 * 1024 * 1024, "max_total_bytes": 256 * 1024 * 1024}
+
+    def _seed(self, d, key=b"k0"):
+        """Write one entry into a fresh backend at ``d`` and close it."""
+        be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+        a = (np.arange(2000, dtype=np.uint16) % 500).astype(np.uint16)
+        be.get_or_acquire(key, (lambda: (_make_typed_batch(a), a.nbytes)))
+        be.release(key)
+        be.close()
+        return a
+
+    def test_marker_written_on_init(self):
+        d = tempfile.mkdtemp()
+        try:
+            be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            be.close()
+            marker = Path(d) / FORMAT_VERSION_MARKER
+            assert marker.exists()
+            assert int(marker.read_text().strip()) == CACHE_FILE_FORMAT_VERSION
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_matching_marker_preserves_cache(self):
+        """A restart at the same version keeps the segments (no wipe)."""
+        d = tempfile.mkdtemp()
+        try:
+            a = self._seed(d)
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                loc = be2.locate_entry(b"k0")
+                assert loc is not None
+                assert np.array_equal(_read_via_location(loc), a)
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_missing_marker_wipes_preexisting_cache(self):
+        """A pre-enforcement dir (segments, no marker) is wiped on next boot."""
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            marker = Path(d) / FORMAT_VERSION_MARKER
+            marker.unlink()  # simulate a cache written before enforcement shipped
+            assert list((Path(d) / "segments").glob("seg_*.arrow"))
+
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None  # wiped
+                assert not list((Path(d) / "segments").glob("seg_*.arrow"))
+                # marker re-stamped at the current version
+                assert int(marker.read_text().strip()) == CACHE_FILE_FORMAT_VERSION
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_mismatched_marker_wipes_cache(self):
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            marker = Path(d) / FORMAT_VERSION_MARKER
+            marker.write_text(f"{CACHE_FILE_FORMAT_VERSION + 1}\n")
+
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+                assert int(marker.read_text().strip()) == CACHE_FILE_FORMAT_VERSION
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_torn_marker_wipes_cache(self):
+        """An unparseable marker (torn write) is treated as a mismatch."""
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            (Path(d) / FORMAT_VERSION_MARKER).write_text("not-an-int")
+
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_partial_wipe_fails_closed(self):
+        """If the wipe leaves a segment behind, init raises instead of serving it.
+
+        ``rmtree(ignore_errors=True)`` can silently leave files (NFS unlink
+        error, held handle). A surviving ``seg_*.arrow`` would be re-indexed as
+        if current, so construction must fail rather than serve incompatible
+        bytes. Simulated by neutering ``rmtree`` so the segments survive.
+        """
+        d = tempfile.mkdtemp()
+        try:
+            self._seed(d)
+            (Path(d) / FORMAT_VERSION_MARKER).write_text(
+                f"{CACHE_FILE_FORMAT_VERSION + 1}\n"
+            )
+            with patch("biopb_tensor_server.cache.file_backend.shutil.rmtree"):
+                with pytest.raises(RuntimeError, match="survived the wipe"):
+                    ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+
+            # The aborted init must not leave the process lock held: a retry
+            # (now with rmtree working) acquires cleanly and wipes.
+            be2 = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
+            try:
+                assert be2.locate_entry(b"k0") is None
+            finally:
+                be2.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 class TestLocateViaManager:
     def test_memory_backend_returns_none(self):
@@ -429,6 +636,58 @@ class TestChunkLocateAction:
         finally:
             server.shutdown()
 
+    def test_locate_counts_as_flight_activity(self):
+        """A locate is in-flight *while it runs*, so precache parks (#548).
+
+        The fast path replaces do_get, so if the handler is untracked the server
+        looks idle for the whole of a localhost read and the precache worker
+        warms straight through it.
+        """
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            observed = []
+
+            class _Probe:
+                source_id = "z"
+
+                def resolve_chunk_data(self, chunk_id, cache_manager):
+                    # Called on a cold miss -- the heaviest work in the handler.
+                    observed.append(server.flight_idle_for(0.0))
+                    raise ValueError("no data")
+
+            chunk_id = encode_chunk_id("z", ChunkBounds(start=[0, 0], stop=[8, 8]))
+            with patch.object(server, "_get_adapter_for_chunk", return_value=_Probe()):
+                with pytest.raises(flight.FlightError):
+                    server._handle_chunk_locate(chunk_id)
+
+            assert observed == [False], "server reported idle mid-locate"
+            # ...and the stamp advances on the way out, so the debounce window
+            # starts from the end of the read rather than from process start.
+            assert server.activity._last_active > 0.0
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
+    def test_locate_releases_the_activity_slot_on_error(self):
+        """A failing locate must not leak an in-flight count (precache would
+        then never run again)."""
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            # No source registered -> the adapter lookup raises straight out of
+            # the tracked block.
+            ghost = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[8, 8]))
+            with pytest.raises(flight.FlightError):
+                server._handle_chunk_locate(ghost)
+            assert server.activity._inflight == 0
+            assert server.flight_idle_for(0.0) is True
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
 
 # ==============================================================================
 # Client helpers
@@ -439,32 +698,32 @@ class TestLocalhostDetection:
     """Localhost detection (still used to gate the cache-file fast path)."""
 
     def test_localhost_explicit(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://localhost:8815") is True
 
     def test_127_0_0_1(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://127.0.0.1:8815") is True
 
     def test_ipv6_loopback(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://[::1]:8815") is True
 
     def test_grpc_tls_scheme(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc+tls://localhost:8815") is True
 
     def test_not_localhost_remote_ip(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://192.168.1.100:8815") is False
 
     def test_not_localhost_remote_hostname(self):
-        from biopb.tensor.client import _is_localhost_location
+        from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://example.com:8815") is False
 
@@ -493,50 +752,286 @@ class TestExtractSchemaMetadata:
 
 class TestShouldTryCachefile:
     def setup_method(self):
-        import biopb.tensor.client as c
+        import biopb.tensor._pool as c
 
         c._cachefile_support.clear()
 
-    def test_enabled_on_posix_localhost(self):
-        from biopb.tensor.client import _should_try_cachefile
+    def test_enabled_on_localhost(self):
+        from biopb.tensor._pool import _should_try_cachefile
 
-        if os.name != "posix":
-            pytest.skip("POSIX-only path")
+        # Enabled on every platform now, Windows included (biopb/biopb#582).
         assert _should_try_cachefile("grpc://localhost:8815") is True
 
     def test_disabled_by_env(self):
-        from biopb.tensor.client import _should_try_cachefile
+        from biopb.tensor._pool import _should_try_cachefile
 
         with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
             assert _should_try_cachefile("grpc://localhost:8815") is False
 
     def test_disabled_for_remote(self):
-        from biopb.tensor.client import _should_try_cachefile
+        from biopb.tensor._pool import _should_try_cachefile
 
         assert _should_try_cachefile("grpc://192.168.1.100:8815") is False
 
-    def test_disabled_on_non_posix(self):
-        import biopb.tensor.client as c
+    def test_not_gated_by_os_name(self):
+        """The fast path is no longer gated on os.name (biopb/biopb#582): a
+        Windows host still takes the localhost path, so the copy on read the
+        POSIX gate used to protect is not needed."""
+        import biopb.tensor._pool as c
 
         with patch.object(os, "name", "nt"):
-            assert c._should_try_cachefile("grpc://localhost:8815") is False
+            assert c._should_try_cachefile("grpc://localhost:8815") is True
 
     def test_skips_after_unsupported_memoized(self):
-        import biopb.tensor.client as c
+        import biopb.tensor._pool as c
 
         c._set_cachefile_supported("grpc://localhost:8815", False)
         assert c._should_try_cachefile("grpc://localhost:8815") is False
 
 
+# Worker run in a SEPARATE process: maps a segment, decodes the fast path's
+# zero-copy *view*, closes its MemoryMappedFile handle (as _try_cachefile_transfer
+# does), signals READY, then -- after the parent has unlinked the file -- reads
+# the view for the first time and reports its sha256. Kept as a `-c` payload so
+# the cross-process case needs no on-disk helper file.
+_VIEW_WORKER = r"""
+import sys, hashlib
+import pyarrow as pa
+import biopb.tensor._pool as pool
+
+def emit(s):
+    sys.stdout.write(s + "\n"); sys.stdout.flush()
+
+try:
+    seg = sys.argv[1]
+    mm = pa.memory_map(seg, "r")
+    batch = pa.ipc.open_stream(mm).read_next_batch()
+    arr, buf = pool._decode_unified_batch(batch)  # a view onto the mapping
+    del batch
+    mm.close()                                    # release the file HANDLE
+    assert not arr.flags.owndata                  # a view, not a copy
+    emit("READY")
+    sys.stdin.readline()                          # block; parent unlinks meanwhile
+    # First full read of the view happens HERE, after the parent's unlink:
+    emit("SHA " + hashlib.sha256(arr.tobytes()).hexdigest())
+except Exception as e:  # noqa: BLE001
+    emit("ERR " + repr(e)); sys.exit(1)
+"""
+
+
+class TestClientViewSurvivesServerUnlink:
+    """The genuinely cross-process guarantee the #582 gate removal rests on: a
+    fast-path mmap *view* held in ONE process does not block ANOTHER process
+    unlinking that segment, and stays valid across the delete.
+
+    A child process maps the segment, decodes the view, and closes its handle
+    (mirroring _try_cachefile_transfer); the parent -- a stand-in for the server
+    -- then unlinks it. On Windows an open *handle* would block that with
+    WinError 32, but a *view* does not: the name is removed at once, a new file
+    can take the freed name, and the child's view still reads the original bytes
+    (delete-on-last-close, like POSIX). A pyarrow that pinned the handle through
+    the view, or a platform that blocked the cross-process unlink, fails here.
+    """
+
+    def _write_segment(self, path: Path) -> tuple[np.ndarray, str]:
+        arr = (np.arange(4 * 1024 * 1024, dtype=np.int64) & 0xFF).astype(np.uint8)
+        batch = _make_typed_batch(arr.reshape(2048, 2048))
+        with pa.OSFile(str(path), "wb") as sink:
+            w = pa.RecordBatchStreamWriter(sink, batch.schema)
+            w.write_batch(batch)
+            w.close()
+        return arr, hashlib.sha256(arr.tobytes()).hexdigest()
+
+    def test_view_in_subprocess_survives_parent_unlink(self):
+        d = Path(tempfile.mkdtemp())
+        proc = None
+        try:
+            seg = d / "seg_0001.arrow"
+            _src, want = self._write_segment(seg)
+
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _VIEW_WORKER, str(seg)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            ready = proc.stdout.readline().strip()
+            assert ready == "READY", f"worker failed to map+hold the view: {ready!r}"
+
+            # The PARENT (stand-in server) unlinks the segment the CHILD is
+            # viewing -- the real cross-process case, not a same-process sim.
+            os.unlink(seg)
+            assert not seg.exists()  # name removed at once, across processes
+
+            # The freed name is reusable while another process holds the view;
+            # write DIFFERENT bytes so a view bound to the new file would mismatch.
+            with open(seg, "wb") as f:
+                f.write(b"a-different-new-segment")
+            assert seg.exists()
+
+            proc.stdin.write("go\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline().strip()
+            assert line.startswith("SHA "), f"worker view read failed: {line!r}"
+            # The child's view is bound to the unlinked inode, not the name: it
+            # still reads the ORIGINAL bytes though a new file now owns the name.
+            assert line.split(" ", 1)[1] == want
+            assert proc.wait(timeout=30) == 0
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestArrayFromUnifiedBatch:
     def test_decode_matches_source(self):
-        from biopb.tensor.client import _array_from_unified_batch
+        from biopb.tensor._pool import _array_from_unified_batch
 
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
         unified = _make_typed_batch(a)  # already the unified binary schema
         got = _array_from_unified_batch(unified)
         assert got.dtype == np.uint16 and got.shape == (8, 15)
         assert np.array_equal(got, a)
+
+    def test_view_decode_matches_source(self):
+        from biopb.tensor._pool import _array_from_unified_batch
+
+        a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
+        got = _array_from_unified_batch(_make_typed_batch(a), copy=False)
+        assert got.dtype == np.uint16 and got.shape == (8, 15)
+        assert np.array_equal(got, a)
+
+    def test_both_paths_return_readonly(self):
+        # The mutability contract is uniform across the do_get view path
+        # (copy=False) and the mmap fast path (copy=True) -- biopb/biopb#571.
+        from biopb.tensor._pool import _array_from_unified_batch
+
+        a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
+        for copy in (True, False):
+            got = _array_from_unified_batch(_make_typed_batch(a), copy=copy)
+            assert not got.flags.writeable
+            with pytest.raises(ValueError):
+                got[0, 0] = 1
+
+    def test_copy_owns_its_bytes(self):
+        # copy=True must not alias the batch's Arrow buffer: the mmap fast path
+        # closes its segment mapping the instant the helper returns.
+        from biopb.tensor._pool import _array_from_unified_batch
+
+        a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
+        got = _array_from_unified_batch(_make_typed_batch(a), copy=True)
+        assert got.flags.owndata
+
+    def test_view_shares_and_survives_source(self):
+        # copy=False is a zero-copy view kept alive through the buffer protocol:
+        # it must stay valid after every intermediate Arrow ref is dropped.
+        import gc
+
+        from biopb.tensor._pool import _array_from_unified_batch
+
+        a = (np.arange(4000, dtype=np.uint32) % 251).astype(np.uint32).reshape(40, 100)
+        batch = _make_typed_batch(a)
+        got = _array_from_unified_batch(batch, copy=False)
+        assert not got.flags.owndata  # a view, not an owned copy
+        del batch
+        gc.collect()
+        assert np.array_equal(got, a)
+
+
+class TestPinnedSegmentAccounting:
+    """Client-side pinned-segment accounting (disk-leak workaround, #571).
+
+    A fast-path view keeps its segment's mmap alive, pinning the server's disk
+    against reclamation. The client caps the total mapped-segment size and copies
+    the chunk out once over budget, so the leak is bounded.
+    """
+
+    def setup_method(self):
+        import biopb.tensor._pool as pool
+
+        pool._pinned_total = 0
+        pool._pinned_segments.clear()
+
+    teardown_method = setup_method
+
+    def test_refcounted_by_inode(self):
+        import biopb.tensor._pool as pool
+
+        class _Anchor:
+            pass
+
+        a1, a2, a3 = _Anchor(), _Anchor(), _Anchor()
+        # Two chunks from one segment (same inode) pin its disk exactly once.
+        pool._register_segment_pin(100, 64_000_000, a1)
+        pool._register_segment_pin(100, 64_000_000, a2)
+        pool._register_segment_pin(200, 32_000_000, a3)
+        assert pool._pinned_total == 96_000_000
+        assert pool._pinned_segments[100].refs == 2
+        assert pool._pinned_segments[200].refs == 1
+
+    def test_last_holder_unpins_segment(self):
+        import gc
+
+        import biopb.tensor._pool as pool
+
+        class _Anchor:
+            pass
+
+        a1, a2 = _Anchor(), _Anchor()
+        pool._register_segment_pin(100, 64_000_000, a1)
+        pool._register_segment_pin(100, 64_000_000, a2)
+
+        del a1
+        gc.collect()
+        # Still one holder of inode 100 -> segment stays pinned.
+        assert pool._pinned_segments[100].refs == 1
+        assert pool._pinned_total == 64_000_000
+
+        del a2
+        gc.collect()
+        # Last holder gone -> the finalizer un-pins and reclaims the account.
+        assert 100 not in pool._pinned_segments
+        assert pool._pinned_total == 0
+
+    def test_gate_default_and_env_override(self):
+        import biopb.tensor._pool as pool
+        from biopb.tensor._pool import _pin_budget_exhausted, _pin_limit_bytes
+
+        # Default is -1 == no cap: nothing is ever "exhausted", not even a huge
+        # pinned total -> the fast path pins without bound.
+        assert pool._PIN_LIMIT_DEFAULT == -1
+        assert _pin_budget_exhausted() is False
+        pool._pinned_total = 10**15
+        assert _pin_budget_exhausted() is False
+        pool._pinned_total = 0
+
+        # A bare byte count still works, and enforces at the limit (>=).
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "1000"}):
+            assert _pin_limit_bytes() == 1000
+            pool._pinned_total = 999
+            assert _pin_budget_exhausted() is False
+            pool._pinned_total = 1000  # at the limit -> exhausted (>=)
+            assert _pin_budget_exhausted() is True
+
+        # Human-friendly units parse via dask.utils.parse_bytes.
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "2GiB"}):
+            assert _pin_limit_bytes() == 2 * 1024**3
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "512 MB"}):
+            assert _pin_limit_bytes() == 512 * 1000**2
+
+        # 0 disables the view handoff outright (always copy).
+        pool._pinned_total = 0
+        with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "0"}):
+            assert _pin_budget_exhausted() is True
+
+        # Unparseable / negative / empty resolve to the default (-1 == no cap),
+        # so the budget check stays disabled even with a large pinned total.
+        pool._pinned_total = 10**15
+        for bad in ("garbage", "-1", ""):
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": bad}):
+                assert _pin_limit_bytes() == pool._PIN_LIMIT_DEFAULT
+                assert _pin_budget_exhausted() is False
+        pool._pinned_total = 0
 
 
 # ==============================================================================
@@ -569,7 +1064,7 @@ class TestCachefileIntegration:
         return server, src
 
     def test_cachefile_path_matches_source_and_is_exercised(self):
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -581,13 +1076,9 @@ class TestCachefileIntegration:
             client = TensorFlightClient(loc, cache_bytes=0)
             got = client.get_tensor("z").compute(scheduler="threads")
             assert np.array_equal(got, src)
-            if os.name == "posix":
-                # The fast path was actually used (chunk_locate succeeded).
-                assert cmod._cachefile_support.get(loc) is True
-            else:
-                # Windows: the cache-file path is gated off (biopb/biopb#5),
-                # so do_get is used and the probe cache stays untouched.
-                assert cmod._cachefile_support.get(loc) is None
+            # The fast path was actually used (chunk_locate succeeded), on every
+            # platform now including Windows (biopb/biopb#582).
+            assert cmod._cachefile_support.get(loc) is True
             client.close()
         finally:
             server.shutdown()
@@ -595,7 +1086,7 @@ class TestCachefileIntegration:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_do_get_fallback_when_disabled(self):
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -617,7 +1108,7 @@ class TestCachefileIntegration:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_memory_backend_falls_back_but_data_correct(self):
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -634,11 +1125,10 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @pytest.mark.skipif(os.name != "posix", reason="cache-file fast path is POSIX-only")
     def test_newer_segment_format_falls_back(self):
         """A server segment format newer than the client understands declines
         the fast path (and is memoized off), but data is still correct via do_get."""
-        import biopb.tensor.client as cmod
+        import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
@@ -655,6 +1145,289 @@ class TestCachefileIntegration:
                 got = client.get_tensor("z").compute(scheduler="threads")
                 assert np.array_equal(got, src)  # correct via do_get fallback
                 assert cmod._cachefile_support.get(loc) is False  # declined + memoized
+                client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_view_is_weak_cached_not_copy_cached(self):
+        """A fast-path mmap view lands in the weak view cache (free; dedups a live
+        reference) and never the strong copy cache, and it self-evicts when the
+        last holder is dropped. Runs on every platform -- the fast path is no
+        longer OS-gated (biopb/biopb#582)."""
+        import gc
+
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, _src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            _reset_client_pools(loc)
+            client = TensorFlightClient(loc, cache_bytes=10_000_000)
+            # Warm the server's on-disk cache so chunks are locatable, then let
+            # the transient warm-time views drop.
+            client.get_tensor("z").compute(scheduler="threads")
+            gc.collect()
+            cid, start, stop = _first_chunk(client, "z")
+
+            arr = pool._fetch_chunk_distributed(loc, None, cid, start, stop, 10_000_000)
+            assert pool._cachefile_supported(loc) is True  # fast path was used
+            assert not arr.flags.writeable  # read-only view contract
+            info = client.cache_info()
+            assert info["size_bytes"] == 0  # strong copy cache untouched
+            assert info["view_items"] >= 1  # view cached weakly
+
+            # Re-fetch while we still hold `arr`: a view-cache hit -> same object,
+            # no second chunk_locate.
+            again = pool._fetch_chunk_distributed(
+                loc, None, cid, start, stop, 10_000_000
+            )
+            assert again is arr
+
+            # Drop every holder -> the weak entry (and the segment pin) self-evicts.
+            del arr, again
+            gc.collect()
+            assert client.cache_info()["view_items"] == 0
+            assert pool._pinned_total == 0  # pin released with the last view
+            # A subsequent fetch is a fresh miss served correctly by the fast path.
+            fresh = pool._fetch_chunk_distributed(
+                loc, None, cid, start, stop, 10_000_000
+            )
+            assert fresh is not None and not fresh.flags.writeable
+            del fresh
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_copy_is_strong_cached_not_weak_cached(self):
+        """A do_get copy (fast path disabled) lands in the strong RAM cache, not
+        the weak view cache."""
+        import biopb.tensor._pool as pool
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, _src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            _reset_client_pools(loc)
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
+                client = TensorFlightClient(loc, cache_bytes=10_000_000)
+                cid, start, stop = _first_chunk(client, "z")
+                arr = pool._fetch_chunk_distributed(
+                    loc, None, cid, start, stop, 10_000_000
+                )
+                info = client.cache_info()
+                assert info["size_bytes"] > 0  # copy cached strongly
+                assert info["view_items"] == 0  # nothing weak-cached
+                # Re-fetch hits the strong cache: same cached object.
+                assert (
+                    pool._fetch_chunk_distributed(
+                        loc, None, cid, start, stop, 10_000_000
+                    )
+                    is arr
+                )
+                client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _one_endpoint(self, client):
+        """A real (chunk_id, start, stop) triple for source "z"'s first chunk."""
+        ctx = client._get_tensor_context("z")
+        chunk_id, bounds = ctx.endpoints[0]
+        return chunk_id, tuple(bounds.start), tuple(bounds.stop)
+
+    def test_fetched_block_is_read_only_fast_path(self):
+        """End-to-end read contract: a chunk pulled through the real fetch leaf
+        via the localhost mmap fast path is read-only, and mutating it raises."""
+        import biopb.tensor._pool as cmod
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            # Warm the server's file cache so chunk_locate can find the chunk.
+            client.get_tensor("z").compute(scheduler="threads")
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+            assert cmod._cachefile_support.get(loc) is True  # fast path was used
+            assert block.shape == (48, 48)
+            assert not block.flags.writeable
+            with pytest.raises(ValueError):
+                block[0, 0] = 0
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fast_path_hands_out_mmap_view_that_outlives_close(self):
+        """Option C (biopb/biopb#571): the fast path returns a zero-copy *view*
+        onto the segment mapping, not an owned copy. The leaf closes its
+        MemoryMappedFile handle before returning, so this also proves Arrow keeps
+        the mapping alive for the array's lifetime -- the block still decodes the
+        correct bytes after the handle is gone and every intermediate ref is
+        dropped and gc'd."""
+        import biopb.tensor._pool as cmod
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            client.get_tensor("z").compute(scheduler="threads")  # warm cache
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+            assert cmod._cachefile_support.get(loc) is True
+            # A view, not an owned copy: this is the whole point of Option C.
+            assert not block.flags.owndata
+            # The mmap handle was already closed inside the leaf; force a gc to
+            # drop any stray decode intermediates, then read through the mapping.
+            import gc
+
+            gc.collect()
+            expected = src[start[0] : stop[0], start[1] : stop[1]]
+            assert np.array_equal(block, expected)
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fast_path_view_pins_segment_and_unpins_on_gc(self):
+        """A fast-path view charges its segment against the pinned-disk budget
+        and releases the charge when the block (and its backing buffer) is gc'd
+        -- the accounting that lets the client bound the server disk-leak (#571)."""
+        import gc
+
+        import biopb.tensor._pool as pool
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            pool._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            client.get_tensor("z").compute(scheduler="threads")  # warm cache
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            # Reset accounting after the warm compute so we measure this one fetch.
+            gc.collect()
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+
+            block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+            assert pool._cachefile_support.get(loc) is True  # fast path used
+            assert not block.flags.owndata  # a view, not a copy
+            # The segment is now pinned for as long as the block references it.
+            assert pool._pinned_total > 0
+            assert len(pool._pinned_segments) == 1
+
+            del block
+            gc.collect()
+            # Block gone -> the finalizer un-pins the segment; budget reclaimed.
+            assert pool._pinned_total == 0
+            assert not pool._pinned_segments
+            client.close()
+        finally:
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fast_path_copies_when_over_pin_budget(self):
+        """Over the pinned-segment budget the fast path copies the chunk out and
+        releases the mapping instead of handing out another view -- so it pins no
+        further server disk (the disk-leak bound, #571). It still reads off the
+        warm mmap (fast path used), it just owns its bytes and is still
+        read-only."""
+        import biopb.tensor._pool as pool
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            pool._cachefile_support.clear()
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            client.get_tensor("z").compute(scheduler="threads")  # warm cache
+            chunk_id, start, stop = self._one_endpoint(client)
+
+            # limit 0 -> always over budget -> always copy.
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_PIN_LIMIT": "0"}):
+                pool._pinned_total = 0
+                pool._pinned_segments.clear()
+                block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+
+            assert pool._cachefile_support.get(loc) is True  # still the mmap path
+            assert block.flags.owndata  # copied out, does not alias the mapping
+            assert not block.flags.writeable  # uniform read-only contract
+            # No segment was pinned -- the whole point over budget.
+            assert pool._pinned_total == 0
+            assert not pool._pinned_segments
+            expected = src[start[0] : stop[0], start[1] : stop[1]]
+            assert np.array_equal(block, expected)
+            client.close()
+        finally:
+            pool._pinned_total = 0
+            pool._pinned_segments.clear()
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fetched_block_is_read_only_do_get(self):
+        """End-to-end read contract on the do_get path (fast path disabled): the
+        zero-copy view is read-only on every platform, and still decodes right."""
+        import biopb.tensor._pool as cmod
+        from biopb.tensor._pool import _fetch_chunk_distributed
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        try:
+            cmod._cachefile_support.clear()
+            with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
+                client = TensorFlightClient(loc, cache_bytes=0)
+                chunk_id, start, stop = self._one_endpoint(client)
+
+                block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
+                # Fast path was never probed -- this is the do_get view path.
+                assert cmod._cachefile_support.get(loc) is None
+                assert not block.flags.writeable
+                # The view holds the correct chunk bytes for its bounds.
+                expected = src[start[0] : stop[0], start[1] : stop[1]]
+                assert np.array_equal(block, expected)
+                with pytest.raises(ValueError):
+                    block[0, 0] = 0
                 client.close()
         finally:
             server.shutdown()
@@ -746,3 +1519,82 @@ class TestDirectSeekRead:
         file_backend.clear()
         assert not file_backend._segment_schemas
         assert not file_backend._segment_mmaps
+
+
+class TestZeroCopySurvivesUnlink:
+    """A cache hit hands out a batch that aliases the segment mmap, and that
+    batch stays valid after the segment file is unlinked while the caller still
+    holds it -- the POSIX delete-on-last-close guarantee that #572 dropped the
+    Windows per-hit copy to rely on.
+
+    This is the guardrail for that decision. The copy was removed on the basis
+    that (a) every unlink path closes the server's own pa.memory_map before
+    deleting, and (b) MemoryMappedFile.close() releases the OS handle while the
+    mapped view stays alive for outstanding buffers -- true on pyarrow >= 14,
+    the pinned floor. On a pyarrow where the batch instead pinned the file
+    handle, the unlink below would raise WinError 32 on Windows; on any platform
+    a decode-time copy would show up as an allocation. Both are asserted, so a
+    pyarrow bump that regresses either fails here rather than in production.
+    """
+
+    def _seal_segment_with(self, backend, n=6):
+        """Write n ~64 KiB chunks into one segment and seal it mmap-readable."""
+        arrs = {}
+        for i in range(n):
+            a = ((np.arange(32768, dtype=np.uint16) + i * 11) % 509).astype(np.uint16)
+            key = f"z{i}".encode()
+            arrs[key] = a
+            backend.get_or_acquire(key, (lambda a=a: (_make_typed_batch(a), a.nbytes)))
+            backend.release(key)
+        segment_id = backend._metadata[b"z0"].segment_id
+        backend._close_segment(segment_id)
+        # Drop any in-RAM mirror so the read must come off the mmap, not a copy.
+        for key in arrs:
+            backend._entries.pop(key, None)
+        return arrs, segment_id
+
+    def test_read_is_zero_copy(self, file_backend):
+        """Decoding a ~64 KiB chunk off the segment allocates ~nothing."""
+        arrs, _ = self._seal_segment_with(file_backend)
+        # pa.total_allocated_bytes() is the process-wide default-pool counter, so
+        # this before/after delta only isolates this call's allocation while the
+        # suite runs serially. Keep tensor-server tests single-process (no
+        # pytest-xdist ``-n``) or a concurrent test's allocation would leak in
+        # and make this flaky.
+        before = pa.total_allocated_bytes()
+        batch = file_backend._read_batch_from_segment(b"z0")
+        allocated = pa.total_allocated_bytes() - before
+        assert batch is not None
+        # A full copy would allocate the whole ~64 KiB payload; a zero-copy
+        # alias allocates only tiny bookkeeping, well under a quarter of it.
+        assert allocated < arrs[b"z0"].nbytes // 4
+        assert np.array_equal(unpack_chunk_array(batch), arrs[b"z0"])
+
+    def test_batch_survives_segment_eviction(self, file_backend):
+        """Evicting a segment out from under a live batch unlinks the file and
+        leaves the batch's bytes intact -- the core #572 guarantee."""
+        arrs, segment_id = self._seal_segment_with(file_backend)
+        batch = file_backend._read_batch_from_segment(b"z0")
+        assert batch is not None
+
+        seg_path = file_backend._segment_path(segment_id)
+        assert seg_path.exists()
+
+        # Eviction closes the server mmap, then unlinks. Must not raise (a
+        # regressed pyarrow would raise WinError 32 on Windows) ...
+        with file_backend._lock:
+            file_backend._do_evict_segment(segment_id)
+        assert not seg_path.exists()  # ... and must actually remove the file.
+
+        # The batch the caller is still holding reads correctly after the delete.
+        assert np.array_equal(unpack_chunk_array(batch), arrs[b"z0"])
+
+    def test_batch_survives_clear(self, file_backend):
+        """clear() unlinks every segment; a batch held across it stays valid."""
+        arrs, _ = self._seal_segment_with(file_backend)
+        batch = file_backend._read_batch_from_segment(b"z1")
+        assert batch is not None
+
+        file_backend.clear()  # unlinks all segments while `batch` is live
+
+        assert np.array_equal(unpack_chunk_array(batch), arrs[b"z1"])

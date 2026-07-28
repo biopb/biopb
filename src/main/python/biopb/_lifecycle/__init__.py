@@ -29,9 +29,12 @@ Shared by both patterns:
 * :mod:`biopb._lifecycle.proc` -- process liveness + create-time identity, the
   primitive that lets a pidfile owner tell its own child from an unrelated
   process that later inherited a reused PID.
-* :mod:`biopb._lifecycle.file_lock` -- a cross-process advisory lock that
-  serializes an otherwise-racy check-then-act (e.g. ``control start``) across
-  independent owners.
+* :mod:`biopb._lifecycle.file_lock` -- a cross-process advisory lock, in two
+  scopes: ``file_lock`` for a block that must not race another owner (e.g.
+  ``control start``), and ``ExclusiveFileLock`` for single-ownership held across
+  a process lifetime (the tensor server's cache directory). Both put exclusion
+  on an open descriptor, so a holder's death releases it with nothing left to
+  reap -- which is why neither needs the pid-identity logic below.
 
 The *keepalive* (restart-on-crash) loop is deliberately **not** here -- it is the
 supervisor's concern, layered on top of an owned child, and only the tensor

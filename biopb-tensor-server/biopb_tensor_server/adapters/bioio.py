@@ -33,7 +33,8 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -108,11 +109,9 @@ MICROSCOPY_EXTENSIONS = frozenset(
     ]
 )
 
-# Full curated set (microscopy + generic). Retained for back-compat with callers
-# that reference the union; the actual claim scope is decided per-call by
-# :func:`_claim_extensions`, which honors the generic-images opt-in.
+# Full curated set (microscopy + generic). The actual claim scope is decided
+# per-call by :func:`_claim_extensions`, which honors the generic-images opt-in.
 CORE_IMAGE_EXTENSIONS = MICROSCOPY_EXTENSIONS | GENERIC_IMAGE_EXTENSIONS
-AICS_EXTENSIONS = CORE_IMAGE_EXTENSIONS
 
 
 # Whether recursive directory discovery may claim GENERIC_IMAGE_EXTENSIONS. Off
@@ -164,9 +163,6 @@ class _BioioAdapterBase(TensorAdapter):
 
     # Class-level source type (override in subclasses)
     SOURCE_TYPE: str = "aics"
-
-    # Multi-tensor source: has multiple scenes
-    _single_tensor_source = False
 
     @classmethod
     def create_from_config(
@@ -247,6 +243,11 @@ class _BioioAdapterBase(TensorAdapter):
             self._source_url = str(bio_image.source.path)
         else:
             self._source_url = ""
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. Detached-header formats (.mhd/.hdr) stat only the master --
+        # a documented blind spot. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
 
         self._dask_data = None  # scene-level dask array, bound below
@@ -283,10 +284,7 @@ class _BioioAdapterBase(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._dask_data[slices].compute()
 

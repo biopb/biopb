@@ -13,7 +13,7 @@ Include in your pom.xml
     <dependency>
         <groupId>io.github.jiyuuchc</groupId>
         <artifactId>biopb</artifactId>
-        <version>0.1.2</version>
+        <version>CURRENT_VERSION</version>
     </dependency>
-</dependencies>    
+</dependencies>
 ```

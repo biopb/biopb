@@ -12,7 +12,6 @@ import os
 import secrets
 import signal
 import threading
-import webbrowser
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -20,9 +19,11 @@ import typer
 from biopb import _web_auth
 from biopb._lifecycle import deathwatch as _deathwatch
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
+from biopb_tensor_server.adapters._handle_reaper import set_handle_reaper_ttl
 from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
@@ -30,9 +31,12 @@ from biopb_tensor_server.core.config import (
     CacheConfig,
     ServerConfig,
     SourceConfig,
+    _read_config_file,
     load_config,
     resolve_all_sources,
+    validate_config_dict,
 )
+from biopb_tensor_server.core.fs_detect import unsafe_cache_dir_reason
 from biopb_tensor_server.core.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -66,52 +70,119 @@ def _host_is_public(host: str) -> bool:
     return host not in _LOOPBACK_HOSTS
 
 
+def _allow_no_token_from_env() -> bool:
+    """Whether ``BIOPB_TENSOR_ALLOW_NO_TOKEN`` opts out of token enforcement.
+
+    The default is fail-closed (a public bind auto-generates a token; the launcher
+    refuses a public sidecar with none). A truthy value here forces **tokenless**
+    operation even on a public bind — the deliberate, insecure escape hatch for a
+    trusted network. It only matters when no token is otherwise supplied.
+    """
+    return os.environ.get("BIOPB_TENSOR_ALLOW_NO_TOKEN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _resolve_flight_token(
+    server_host: str,
+    token: Optional[str],
+    env_token: str,
+    allow_no_token: bool = False,
+) -> Optional[str]:
+    """Resolve the token the Flight (gRPC) server enforces, fail-closed on a
+    public bind.
+
+    The flight bind (config ``server.host``, or a ``--host`` override) is the mode
+    switch: a loopback bind is **local mode** (tokenless, same-machine only); any
+    public bind is **remote mode** and MUST carry a token, so a public bind with
+    none supplied auto-generates one rather than serving the data API open.
+
+    ``allow_no_token`` (from ``BIOPB_TENSOR_ALLOW_NO_TOKEN``) is the deliberate,
+    insecure escape hatch: it forces **tokenless** operation even on a public bind
+    -- for a host-loopback-published Docker container (or any trusted network)
+    where the token is pure friction. It only takes effect when no token is
+    otherwise supplied; a real ``--token`` / env token still wins. Off by default,
+    so the fail-closed guarantee is unchanged unless it is explicitly set.
+
+    Shared by ``serve`` and ``launch``; ``launch`` layers its sidecar fail-closed
+    check on top of the returned token (see ``_resolve_launch_token``).
+
+    Returns the effective token (``None`` = local mode).
+    """
+    if token and _web_auth.valid_token(token):
+        return token.strip()
+    if env_token and _web_auth.valid_token(env_token):
+        return env_token.strip()
+    if _host_is_public(server_host):
+        if allow_no_token:
+            console.print(
+                "[bold red]WARNING: token enforcement disabled "
+                "(BIOPB_TENSOR_ALLOW_NO_TOKEN) on a public flight bind "
+                f"(server.host={server_host}). The data API is served OPEN — "
+                "only do this on a trusted network.[/bold red]"
+            )
+            return None
+        generated = secrets.token_urlsafe(32)
+        console.print(
+            "[yellow]Auto-generated secure access token "
+            f"(server.host={server_host} is a public bind).[/yellow]"
+        )
+        return generated
+    # Loopback flight bind, no token supplied: local mode.
+    return None
+
+
 def _resolve_launch_token(
     server_host: str,
     web_host: str,
     token: Optional[str],
     env_token: str,
+    allow_no_token: bool = False,
 ) -> Optional[str]:
     """Decide the token ``launch`` enforces, fail-closed on every public listener.
 
-    The flight bind (config ``server.host``) is the single mode switch: a loopback
-    bind is **local mode** (tokenless); any public bind is **remote mode** and MUST
-    carry a token, so a public bind with none supplied auto-generates one rather
-    than serving data open.
+    Builds on :func:`_resolve_flight_token` (the flight bind is the mode switch),
+    then adds the sidecar check: the HTTP sidecar has its own, independent bind
+    (``--web-host``). Because it re-exposes the whole data API, a **public sidecar
+    with no enforced token** is exactly the "public + unauthenticated" combination
+    the model makes unrepresentable — so it is refused rather than served open.
+    (This is the ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the
+    token would otherwise resolve to ``None`` and the data API would bind public
+    and open.)
 
-    The HTTP sidecar has its own, independent bind (``--web-host``). Because it
-    re-exposes the whole data API, a **public sidecar with no enforced token** is
-    exactly the "public + unauthenticated" combination the model makes
-    unrepresentable — so it is refused rather than served open. (This is the
-    ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the token would
-    otherwise resolve to ``None`` and the data API would bind public and open.)
+    ``allow_no_token`` (from ``BIOPB_TENSOR_ALLOW_NO_TOKEN``) is the same deliberate
+    escape hatch as in :func:`_resolve_flight_token`: it turns the public-sidecar
+    refusal into a loud warning instead, so an operator can knowingly serve the data
+    API open on a trusted network. Off by default — the refusal stands unless it is
+    explicitly set.
 
     Returns the effective token (``None`` = local mode). Raises ``typer.Exit(1)``
-    if the sidecar would bind public without a token.
+    if the sidecar would bind public without a token (unless ``allow_no_token``).
     """
-    if token and _web_auth.valid_token(token):
-        effective_token: Optional[str] = token.strip()
-    elif env_token and _web_auth.valid_token(env_token):
-        effective_token = env_token.strip()
-    elif _host_is_public(server_host):
-        effective_token = secrets.token_urlsafe(32)
-        console.print(
-            "[yellow]Auto-generated secure access token "
-            f"(server.host={server_host} is a public bind).[/yellow]"
-        )
-    else:
-        # Loopback flight bind, no token supplied: local mode. Every listener is
-        # same-machine only, so no token is enforced.
-        effective_token = None
+    effective_token = _resolve_flight_token(
+        server_host, token, env_token, allow_no_token
+    )
 
     if effective_token is None and _host_is_public(web_host):
+        if allow_no_token:
+            console.print(
+                "[bold red]WARNING: token enforcement disabled "
+                "(BIOPB_TENSOR_ALLOW_NO_TOKEN); binding the HTTP sidecar public "
+                f"(--web-host {web_host}) with no token. The data API is served "
+                "OPEN — only do this on a trusted network.[/bold red]"
+            )
+            return None
         console.print(
             "[red]Refusing to bind the HTTP sidecar to a public address "
             f"(--web-host {web_host}) with no access token.[/red]\n"
             "The sidecar re-exposes the data API, so this would serve it "
             "unauthenticated to the network. Either bind it to loopback "
-            "(--web-host 127.0.0.1), or make the flight server public "
-            "(server.host) so a token is enforced across both listeners."
+            "(--web-host 127.0.0.1), make the flight server public "
+            "(server.host) so a token is enforced across both listeners, or "
+            "set BIOPB_TENSOR_ALLOW_NO_TOKEN=1 to serve it open deliberately."
         )
         raise typer.Exit(1)
 
@@ -428,6 +499,10 @@ def _setup_flight_server(
     # Off by default so recursive scans don't register screenshots/icons/movies.
     set_claim_generic_images(server_config.claim_generic_images)
 
+    # Apply the idle-handle reaper TTL to the opt-in adapters (OME-TIFF, NDTiff)
+    # before any source registers, so it fully takes effect (biopb/biopb#71).
+    set_handle_reaper_ttl(server_config.handle_reaper_ttl)
+
     # Initialize cache manager for virtual chunks
     cache_config = server_config.cache
     if cache_config.backend == "memory":
@@ -440,23 +515,42 @@ def _setup_flight_server(
         )
         console.print("[green]Raw chunk cache: OS page cache[/green]")
     elif cache_config.backend == "file":
-        try:
-            manager = CacheManager.initialize(cache_config)
-        except OSError as e:
-            # Cache dir not writable (e.g. read-only HPC scratch). Fall back to
-            # the in-memory backend so the server still starts; the localhost
-            # cache-file fast path (issue #9) is simply unavailable.
+
+        def _memory_fallback() -> CacheConfig:
+            return CacheConfig(
+                backend="memory",
+                memory_max_entries=cache_config.memory_max_entries,
+                memory_max_bytes=cache_config.memory_max_bytes,
+            )
+
+        # The file cache mmaps its segments and assumes local-POSIX semantics
+        # (unlinked-but-mapped inodes stay alive, mapped pages never vanish). A
+        # network mount (NFS/CIFS) can SIGBUS/ESTALE a mapping to an evicted
+        # segment, and a cloud Files-On-Demand folder recalls a dehydrated
+        # segment on mmap read -- so classify the cache dir once and fall back to
+        # memory rather than serve unsafe reads (biopb/biopb#571 follow-up). This
+        # also disables the localhost client fast path for free: a memory backend
+        # never locates a chunk, so clients use do_get.
+        unsafe = unsafe_cache_dir_reason(cache_config.file_cache_dir)
+        if unsafe:
             console.print(
-                f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
-                f"({e}); falling back to in-memory cache.[/yellow]"
+                f"[yellow]File cache dir {cache_config.file_cache_dir} is on "
+                f"{unsafe}; the mmap-based file cache is unsafe there, falling "
+                f"back to in-memory cache.[/yellow]"
             )
-            manager = CacheManager.initialize(
-                CacheConfig(
-                    backend="memory",
-                    memory_max_entries=cache_config.memory_max_entries,
-                    memory_max_bytes=cache_config.memory_max_bytes,
+            manager = CacheManager.initialize(_memory_fallback())
+        else:
+            try:
+                manager = CacheManager.initialize(cache_config)
+            except OSError as e:
+                # Cache dir not writable (e.g. read-only HPC scratch). Fall back
+                # to the in-memory backend so the server still starts; the
+                # localhost cache-file fast path (issue #9) is simply unavailable.
+                console.print(
+                    f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
+                    f"({e}); falling back to in-memory cache.[/yellow]"
                 )
-            )
+                manager = CacheManager.initialize(_memory_fallback())
         if isinstance(manager.backend, ArrowFileBackend):
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] "
@@ -704,6 +798,24 @@ def _create_source_adapter(source: SourceConfig, registry=None):
     return adapter_cls.create_from_config(source)
 
 
+def _load_config_or_exit(config: Path) -> ServerConfig:
+    """Load *config*, turning a bad file into a one-line refusal, not a traceback.
+
+    Config errors are the user's to fix -- a bad knob, an unmigrated TOML, a
+    JSON typo -- and this is where the server fails fast on them
+    (biopb/biopb#34). A traceback buries that message, and under the control
+    plane it lands in ``tensor-server.log`` where it reads as a crash rather
+    than as "your config says downscale_factor=0".
+    """
+    try:
+        return load_config(config)
+    except (ValueError, FileNotFoundError) as e:
+        # Escaped: a validation message names its section as "[pyramid]", which
+        # rich would otherwise eat as a style tag and print as nothing.
+        console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def serve(
     config: Path = typer.Option(
@@ -711,7 +823,7 @@ def serve(
         "--config",
         "-c",
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -741,24 +853,61 @@ def serve(
         "--writable",
         help="Enable write mode for source creation and data upload",
     ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="Access token (required when the flight bind is non-loopback; "
+        "auto-generated if blank on a public bind)",
+        hide_input=True,
+    ),
+    log_file: Optional[str] = typer.Option(
+        None,
+        "--log-file",
+        help="Path to rotating log file (e.g. /var/log/biopb.log). Rotates at 10MB by default.",
+    ),
 ):
     """Start the TensorFlight server.
 
     Example:
-        biopb-tensor-server serve --config biopb-tensor.toml
-        biopb-tensor-server serve -c config.toml --port 9000
-        biopb-tensor-server serve -c config.toml --log-level DEBUG
+        biopb-tensor-server serve --config biopb.json
+        biopb-tensor-server serve -c config.json --port 9000
+        biopb-tensor-server serve -c config.json --log-level DEBUG
     """
-    server_config = load_config(config)
+    server_config = _load_config_or_exit(config)
 
     # Setup logging with priority: CLI > env > config > default
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
-    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
+    setup_logging(
+        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+    )
 
-    # Token from env var only (no auto-gen for serve - it's non-interactive)
-    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
+    # The flight bind is the mode switch; --host overrides config, so resolve the
+    # token against the effective host. A public bind with no token auto-generates
+    # one (fail-closed) rather than serving the data API open.
+    effective_host = host or server_config.host
+    effective_token = _resolve_flight_token(
+        effective_host,
+        token,
+        os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+        _allow_no_token_from_env(),
+    )
+
+    if effective_token is not None:
+        console.print(
+            "\n[bold green]Access token (shown once — do not share):[/bold green]"
+        )
+        # The gRPC client sends this as an `authorization: Bearer <token>` header
+        # (there is no `?token=` URL form for the flight plane), so print the bare
+        # token. soft_wrap keeps it on one line in a narrow/non-TTY log; markup
+        # False so nothing in it is read as Rich markup.
+        console.print(effective_token, soft_wrap=True, markup=False)
+        console.print()
+    else:
+        console.print(
+            "[yellow]Local mode: no access token (loopback-only bind).[/yellow]"
+        )
 
     # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
     # cache process lock -- on EVERY exit path, not just a clean serve() return.
@@ -772,12 +921,10 @@ def serve(
             host=host,
             port=port,
             writable=writable,
-            token=token,
+            token=effective_token,
         )
 
-        location = _grpc_location(
-            host or server_config.host, port or server_config.port
-        )
+        location = _grpc_location(effective_host, port or server_config.port)
         console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
         console.print("Press Ctrl+C to stop\n")
 
@@ -800,14 +947,31 @@ def validate(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
 ):
     """Validate a config file.
 
     Example:
-        biopb-tensor-server validate biopb-tensor.toml
+        biopb-tensor-server validate biopb.json
     """
+    # The strict end of the validation scheme (biopb/biopb#34): loading would
+    # clamp a bad knob to its default and carry on -- right for a supervised
+    # start, wrong here, where a human is explicitly asking whether the file is
+    # good. Report every problem and fail. Kept out of the try below so the exit
+    # isn't swallowed by its catch-all and re-reported as an error.
+    try:
+        problems = validate_config_dict(_read_config_file(config))
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
+        raise typer.Exit(1)
+    if problems:
+        console.print("[red]✗ Config invalid[/red]")
+        for problem in problems:
+            where = ".".join(problem["path"]) or "config"
+            console.print(f"  {where}: {_rich_escape(problem['message'])}")
+        raise typer.Exit(1)
+
     try:
         server_config = load_config(config)
         sources = resolve_all_sources(server_config)
@@ -832,7 +996,9 @@ def validate(
             console.print(f"    - {source.source_id} ({source.type}: {source.url})")
 
     except Exception as e:
-        console.print(f"[red]✗ Config invalid: {e}[/red]")
+        # Escaped: a validation message names its section as "[pyramid]", which
+        # rich would otherwise eat as a style tag and print as nothing.
+        console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
 
 
@@ -841,13 +1007,13 @@ def list_tensors(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
 ):
     """List data sources and tensors defined in a config file.
 
     Example:
-        biopb-tensor-server list biopb-tensor.toml
+        biopb-tensor-server list biopb.json
     """
     try:
         server_config = load_config(config)
@@ -894,7 +1060,7 @@ def list_tensors(
         console.print(table)
 
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        console.print(f"[red]Error: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
 
 
@@ -954,7 +1120,7 @@ def launch(
         "--config",
         "-c",
         exists=True,
-        help="Path to config file (JSON or TOML)",
+        help="Path to config file (biopb.json)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -966,6 +1132,23 @@ def launch(
         True,
         "--log-scope-biopb/--log-scope-all",
         help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+    ),
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        "-h",
+        help="Flight server host (overrides config)",
+    ),
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Flight server port (overrides config)",
+    ),
+    writable: bool = typer.Option(
+        False,
+        "--writable",
+        help="Enable write mode for source creation and data upload",
     ),
     web_port: int = typer.Option(
         8816,
@@ -984,20 +1167,11 @@ def launch(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
-    open_browser: bool = typer.Option(
-        False,
-        "--open",
-        help="Open browser to the web app after startup",
-    ),
-    web_url: str = typer.Option(
-        "http://localhost:5173",
-        "--web-url",
-        help="Base URL of the running web app (used for --open and CORS)",
-    ),
     cors_origins: Optional[List[str]] = typer.Option(
         None,
         "--cors",
-        help="Extra CORS origin to allow (repeatable). Defaults to --web-url variants.",
+        help="CORS origin to allow (repeatable). Required to reach the sidecar "
+        "from a browser app on another origin; defaults to loopback only.",
     ),
     log_file: Optional[str] = typer.Option(
         None,
@@ -1011,16 +1185,17 @@ def launch(
       1. The Arrow Flight server (data access)
       2. The FastAPI HTTP sidecar (browser-friendly API)
 
-    Run the web app separately with ``pnpm --filter=web dev``,
-    or point --web-url to a production deployment.
+    The web app is not part of this package; run and serve it separately, and
+    pass its origin with ``--cors`` so the browser can reach this sidecar.
 
     Example:
-        biopb-tensor-server launch --config biopb-tensor.toml
-        biopb-tensor-server launch -c config.toml --web-port 9000
-        biopb-tensor-server launch -c config.toml --log-level DEBUG
+        biopb-tensor-server launch --config biopb.json
+        biopb-tensor-server launch -c config.json --web-port 9000
+        biopb-tensor-server launch -c config.json --host 0.0.0.0 --writable
+        biopb-tensor-server launch -c config.json --log-level DEBUG
     """
     # --- Load server config and setup logging ---
-    server_config = load_config(config)
+    server_config = _load_config_or_exit(config)
 
     # Setup logging with priority: CLI > env > config > default
     effective_log_level = (
@@ -1048,27 +1223,38 @@ def launch(
     _deathwatch.install()
 
     # --- Token management ---
-    # The flight bind (server.host) is the mode switch; the sidecar's own bind
-    # (--web-host) must never be public-and-unauthenticated. _resolve_launch_token
-    # decides the enforced token fail-closed (and refuses a public sidecar with no
-    # token). There is no separate dev flag.
+    # The flight bind (server.host, or a --host override) is the mode switch; the
+    # sidecar's own bind (--web-host) must never be public-and-unauthenticated.
+    # _resolve_launch_token decides the enforced token fail-closed (and refuses a
+    # public sidecar with no token). There is no separate dev flag.
+    effective_host = host or server_config.host
     effective_token = _resolve_launch_token(
-        server_config.host,
+        effective_host,
         web_host,
         token,
         os.environ.get("BIOPB_TENSOR_TOKEN", ""),
+        _allow_no_token_from_env(),
     )
 
     if effective_token is not None:
+        # The web app lives outside this package, so we can only show the token
+        # against the sidecar's own origin; a browser app appends it there (or
+        # carries it however that app expects). Normalize a wildcard bind to a
+        # dialable loopback host for display.
+        _display_host = web_host
+        if _display_host in ("0.0.0.0", ""):
+            _display_host = "127.0.0.1"
+        elif _display_host == "::":
+            _display_host = "[::1]"
         console.print(
-            "\n[bold green]Access URL (shown once — do not share):[/bold green]"
+            "\n[bold green]Access token (shown once — do not share):[/bold green]"
         )
         # soft_wrap keeps the URL on one line so the token stays copy-pasteable
         # even in a narrow / non-TTY log (e.g. `docker logs`, where Rich would
         # otherwise hard-wrap to width 80 and split the token). markup=False so
         # nothing in the URL is interpreted as Rich markup.
         console.print(
-            f"{web_url}/?token={effective_token}",
+            f"http://{_display_host}:{web_port}/?token={effective_token}",
             soft_wrap=True,
             markup=False,
         )
@@ -1091,7 +1277,11 @@ def launch(
     flight_server = source_manager = watcher = precache_worker = None
     try:
         flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
-            server_config, token=effective_token
+            server_config,
+            host=host,
+            port=port,
+            writable=writable,
+            token=effective_token,
         )
 
         # The HTTP sidecar is co-located with the Flight server and reaches it over
@@ -1100,25 +1290,26 @@ def launch(
         # match the address family: the IPv4 wildcard maps to 127.0.0.1, the IPv6
         # wildcard to ::1. (A `::`-bound server with IPV6_V6ONLY set — the default
         # on some hosts — would refuse an IPv4 127.0.0.1 connection.)
-        _flight_connect_host = server_config.host
+        _flight_connect_host = effective_host
         if _flight_connect_host in ("0.0.0.0", ""):
             _flight_connect_host = "127.0.0.1"
         elif _flight_connect_host == "::":
             _flight_connect_host = "::1"
-        flight_location = _grpc_location(_flight_connect_host, server_config.port)
+        flight_location = _grpc_location(
+            _flight_connect_host, port or server_config.port
+        )
         flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
         flight_thread.start()
-
-        if open_browser:
-            url = web_url
-            threading.Timer(1.5, webbrowser.open, args=(url,)).start()
 
         # --- Build effective CORS origins ---
         if cors_origins:
             effective_cors = list(cors_origins)
         else:
-            # Derive CORS origins, expanding loopback aliases for any local
-            # hostname
+            # No web app is bundled here, so there is no frontend origin to derive
+            # by default. The control front reaches this sidecar over loopback for
+            # the data API + /ws/render, so allow all loopback variants of the
+            # server's own address; a browser app on any other origin must be
+            # allowed explicitly via --cors.
             from urllib.parse import urlparse as _urlparse
 
             _loopback_aliases: dict = {
@@ -1139,14 +1330,7 @@ def launch(
                     origins.append(f"{scheme}://{alias}{port_suffix}")
                 return origins
 
-            effective_cors = _expand_origin(web_url)
-
-            # The control front reaches this sidecar over loopback for the data API
-            # + /ws/render, so allow all loopback variants of the server's own
-            # address.
-            for origin in _expand_origin(f"http://{web_host}:{web_port}"):
-                if origin not in effective_cors:
-                    effective_cors.append(origin)
+            effective_cors = _expand_origin(f"http://{web_host}:{web_port}")
 
         # --- Start HTTP sidecar (blocks) ---
         console.print(

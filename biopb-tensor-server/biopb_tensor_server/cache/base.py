@@ -9,6 +9,7 @@ Reference counting prevents eviction of entries being actively served.
 
 from __future__ import annotations
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -17,9 +18,38 @@ from typing import Callable, Dict, Optional, Tuple
 
 import pyarrow as pa
 
+logger = logging.getLogger(__name__)
+
 # Chunk splitting threshold - 64MB for parallel Flight transfers
 # (Arrow IPC can handle larger, but we split for throughput optimization)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
+
+
+def estimate_batch_bytes(batch: pa.RecordBatch) -> int:
+    """In-memory size of a cached batch: the sum of its columns' buffers.
+
+    One definition shared by every backend and every index path, so a chunk's
+    recorded size cannot depend on which code path recorded it.
+    """
+    return sum(col.nbytes for col in batch.columns)
+
+
+@dataclass
+class ChunkLocation:
+    """On-disk location of a cached chunk's Arrow IPC message.
+
+    Returned by :meth:`CacheBackend.locate_entry` for the localhost cache-file
+    handoff (issue #9): a client on the same host mmaps ``segment_path`` and
+    reads the single record-batch message at
+    ``[byte_offset, byte_offset + byte_length)``. ``generation_id`` is the
+    segment file's inode at locate time, so a client can detect a segment that
+    was evicted and recreated at the same path.
+    """
+
+    segment_path: str
+    byte_offset: int
+    byte_length: int
+    generation_id: int
 
 
 class EntryState(Enum):
@@ -42,7 +72,6 @@ class CacheEntry:
         ref_count: Number of active references (prevents eviction)
         created_at: Creation timestamp
         size_bytes: Data size in bytes
-        metadata: Additional metadata
     """
 
     data: Optional[pa.RecordBatch] = None
@@ -52,7 +81,6 @@ class CacheEntry:
     ref_count: int = 0
     created_at: float = 0.0
     size_bytes: int = 0
-    metadata: dict = field(default_factory=dict)
 
     def acquire(self) -> None:
         """Increment reference count to prevent eviction."""
@@ -129,7 +157,7 @@ class CacheBackend(ABC):
     - Reference counting to prevent eviction of active entries
     - Thread-safe operations
 
-    The key method is get_or_compute() which implements the future/promise
+    The key method is get_or_acquire() which implements the future/promise
     pattern for safe concurrent access.
     """
 
@@ -138,7 +166,6 @@ class CacheBackend(ABC):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-        metadata: Optional[dict] = None,
     ) -> CacheEntry:
         """Get existing entry or create pending entry for computation.
 
@@ -153,10 +180,25 @@ class CacheBackend(ABC):
         Args:
             key: Cache key bytes
             compute_fn: Function to compute data, returns (RecordBatch, size_bytes)
-            metadata: Optional metadata for new entries
 
         Returns:
             CacheEntry with ref_count >= 1, state READY
+        """
+
+    @abstractmethod
+    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
+        """Reserve the key without computing: returns (entry, is_owner).
+
+        The check-cache half of get_or_acquire, split out for a caller that
+        already holds the data (CacheManager.put) rather than a compute_fn. The
+        returned entry is acquired either way; is_owner=True means it is PENDING
+        and this caller must complete_entry() or fail_entry() it.
+
+        Args:
+            key: Cache key bytes
+
+        Returns:
+            (CacheEntry with ref_count >= 1, is_owner)
         """
 
     @abstractmethod
@@ -229,26 +271,39 @@ class CacheBackend(ABC):
         (memory) inherit this no-op default; the file backend overrides it.
         """
 
+    def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
+        """Return the on-disk location of a cached chunk, or None.
 
-def get_or_compute_with_context(
-    backend: CacheBackend,
-    key: bytes,
-    compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
-    metadata: Optional[dict] = None,
-) -> Tuple[CacheEntry, bool]:
-    """Helper for get-or-compute that returns entry and owns_compute flag.
+        Backs the localhost cache-file handoff (issue #9), where a same-host
+        client mmaps the segment instead of streaming the chunk over do_get.
+        Declared here -- rather than sniffed with ``getattr`` -- because the
+        manager drives it on *every* backend, so a backend that cannot locate
+        (the memory backend has no segment files) should say so through the
+        interface. None means "fall back to do_get", the designed floor of the
+        whole path.
+        """
+        return None
 
-    This allows the caller to know whether they should call complete_entry()
-    or fail_entry() if computation fails.
+    def _skip_if_oversized(
+        self, key: bytes, data: pa.RecordBatch, size_bytes: int
+    ) -> bool:
+        """Handle a chunk too large to cache; True if the caller should stop.
 
-    Args:
-        backend: Cache backend
-        key: Cache key bytes
-        compute_fn: Compute function
-        metadata: Optional metadata
-
-    Returns:
-        (CacheEntry, is_owner) where is_owner indicates if caller should
-        call complete_entry/fail_entry
-    """
-    # Implementation in concrete backend
+        An oversized chunk is still handed to the threads waiting on it -- the
+        entry goes READY in memory -- it just is not stored. Shared by both
+        backends, which supply the ``_lock`` / ``_entries`` / ``_oversized_skips``
+        state this reads.
+        """
+        if size_bytes <= MAX_ARROW_BATCH_BYTES:
+            return False
+        self._oversized_skips += 1
+        logger.warning(
+            "Skipping cache for oversized chunk: %d bytes > %d",
+            size_bytes,
+            MAX_ARROW_BATCH_BYTES,
+        )
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry.state == EntryState.PENDING:
+                entry.set_ready(data, size_bytes)
+        return True

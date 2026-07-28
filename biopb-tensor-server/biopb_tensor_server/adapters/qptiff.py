@@ -40,14 +40,14 @@ import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
-from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.base import TensorAdapter, TensorReadPlan
-from biopb_tensor_server.core.chunk import normalized_scale_hint
+from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
-from biopb_tensor_server.core.downsample import normalize_reduction_method
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,6 @@ class QptiffAdapter(TensorAdapter):
     """
 
     SOURCE_TYPE = "qptiff"
-    _single_tensor_source = True
 
     # ---- claim --------------------------------------------------------------
 
@@ -142,6 +141,10 @@ class QptiffAdapter(TensorAdapter):
         self.source_id = source_id
         self._url = url or ""
         self._source_url = url or ""
+        # Cheap content_version from the file's stat signature (#178): O(1),
+        # folded into minted chunk_ids so a re-saved file gets a fresh cache
+        # namespace. None (unresolved / non-file url) leaves the source unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
         # One lock serialises the open/cache and metadata paths over the single
         # tifffile handle; reads run lock-free (see _read_level). RLock keeps it
@@ -199,10 +202,7 @@ class QptiffAdapter(TensorAdapter):
             return tuple(int(x) for x in self._open().levels[level].shape)
 
     def _read_level(self, level: int, bounds: ChunkBounds) -> np.ndarray:
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
         # _level_store takes the lock only for the lazy open + cache; the read
         # itself runs WITHOUT our lock so parallel do_get chunk reads decode
         # concurrently. tifffile already makes this safe: its aszarr store
@@ -328,32 +328,6 @@ class QptiffAdapter(TensorAdapter):
             )
         return levels or None
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
-        """Route a ``precompute`` + ``scale_hint`` read to the matching level store.
-
-        Other reduction methods (and full-res reads) fall through to the base
-        uniform-grid planner, which reads level 0 and downsamples on the fly.
-        """
-        base_desc = self.get_tensor_descriptor()
-        base_shape = tuple(int(d) for d in base_desc.shape)
-        scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
-        reduction_method = normalize_reduction_method(request_desc.reduction_method)
-        slice_hint = (
-            request_desc.slice_hint if request_desc.HasField("slice_hint") else None
-        )
-
-        if reduction_method == "precompute" and scale_hint is not None:
-            level = self._find_level_for_scale(scale_hint)
-            if level is None:
-                raise ValueError(
-                    f"No precomputed level matching scale_hint {tuple(scale_hint)}."
-                )
-            level_scale = self._scale_for(base_shape, self._level_shape(level))
-            level_slice = self._convert_slice_to_level(slice_hint, level_scale)
-            return self._plan_from_precomputed(level, level_slice)
-
-        return super().get_read_plan(request_desc)
-
     def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[int]:
         base = self._level_shape(0)
         target = tuple(scale_hint)
@@ -362,50 +336,20 @@ class QptiffAdapter(TensorAdapter):
                 return i
         return None
 
-    def _convert_slice_to_level(
-        self, slice_hint: Optional[SliceHint], level_scale: List[int]
-    ) -> Optional[SliceHint]:
-        if slice_hint is None:
-            return None
-        level_start = [
-            s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)
-        ]
-        level_stop = [
-            s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)
-        ]
-        return SliceHint(start=level_start, stop=level_stop)
+    def _level_downsample_factors(self, level: int) -> List[int]:
+        """Downsample factors for ``level`` -- its shape ratio vs level 0.
 
-    def _plan_from_precomputed(
-        self, level: int, level_slice: Optional[SliceHint]
-    ) -> TensorReadPlan:
-        """Build a read plan whose chunks target one native level's store.
-
-        The level adapter's descriptor carries ``array_id = source_id/{level}``, so
-        the base planner encodes that into every chunk_id and ``DoGet`` dispatches
-        back through ``get_level_adapter``. The returned descriptor's ``array_id``
-        is reset to the base so the client still sees one tensor.
+        The base precompute routing (biopb/biopb#557) uses these to translate a
+        base-coordinate slice into the level's grid.
         """
-        level_adapter = self.get_level_adapter(str(level))
-        level_desc = level_adapter.get_tensor_descriptor()
-        request = TensorDescriptor(
-            array_id=level_desc.array_id,
-            dim_labels=level_desc.dim_labels,
-            shape=list(level_desc.shape),
-            chunk_shape=list(level_desc.chunk_shape),
-            dtype=level_desc.dtype,
-        )
-        if level_slice is not None:
-            request.slice_hint.start[:] = level_slice.start
-            request.slice_hint.stop[:] = level_slice.stop
-        read_plan = level_adapter.get_read_plan(request)
-        read_plan.descriptor.array_id = self.array_id
-        return read_plan
+        return self._scale_for(self._level_shape(0), self._level_shape(level))
 
     def get_level_adapter(self, path: str) -> ZarrAdapter:
         """Full backend adapter for a native level, keyed by its integer index.
 
         Reached by ``DoGet`` for ``precompute`` chunks (``array_id`` suffix
-        ``/{level}``) via the server's duck-typed ``get_level_adapter`` dispatch.
+        ``/{level}``) via the ``get_level_adapter`` contract on ``TensorAdapter``
+        (biopb/biopb#557).
 
         Each level's ``aszarr`` store is already a real ``zarr`` array, so -- like
         ``OmeZarrAdapter`` -- the level adapter is a bare ``ZarrAdapter`` over it
@@ -469,22 +413,15 @@ class QptiffAdapter(TensorAdapter):
                 return None
 
             labels = self.get_tensor_descriptor().dim_labels
-            per_um = {
-                "x": _density("XResolution"),
-                "y": _density("YResolution"),
+            sizes = {
+                axis: d * um_per_unit
+                for axis, d in (
+                    ("x", _density("XResolution")),
+                    ("y", _density("YResolution")),
+                )
+                if d and d > 0
             }
-            scale, unit = [], []
-            for lab in labels:
-                d = per_um.get(str(lab).lower())
-                if d and d > 0:
-                    scale.append(d * um_per_unit)
-                    unit.append("µm")
-                else:
-                    scale.append(0.0)
-                    unit.append("")
-            if not any(scale):
-                return None
-            return scale, unit
+            return scale_by_label(labels, sizes, MICRON)
         except Exception:
             logger.debug("qptiff: physical scale unavailable", exc_info=True)
             return None

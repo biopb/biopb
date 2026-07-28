@@ -39,13 +39,12 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.activity import ActivityTracker
-from biopb_tensor_server.core.base import (
+from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
-    decode_chunk_id,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.chunk import cache_key_for_chunk_id
+from biopb_tensor_server.core.chunk import cache_key_for_chunk_id, routing_array_id
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
@@ -487,29 +486,73 @@ class TensorFlightServer(flight.FlightServerBase):
 
         return source_adapter.get_tensor_adapter(tensor_id)
 
-    def _get_adapter_for_chunk(self, chunk_id: bytes) -> Optional[TensorAdapter]:
-        """Get adapter for a specific chunk based on its chunk_id.
+    def _get_adapter_for_chunk(self, chunk_id: bytes) -> TensorAdapter:
+        """Get the adapter responsible for a chunk, by its chunk_id.
+
+        Raises rather than returning None, and maps a lookup failure itself, so
+        every verb that resolves a chunk -- ``do_get`` and the cache-file locate
+        path -- reports a miss identically without restating the mapping
+        (biopb/biopb#378):
+
+        - a lookup failure (unresolved source, a ticket naming a field the source
+          no longer has, a legacy adapter raising) goes through
+          :func:`_adapter_lookup_error`: retriable "open to resolve", or terminal
+          NOT_FOUND / INVALID_ARGUMENT *with a code* -- never a bare exception,
+          which Flight would surface as INTERNAL.
+        - a stale ticket whose source is no longer registered -> terminal
+          NOT_FOUND with ``reason="unknown_source"``, matching
+          ``get_flight_info``'s tensor_adapter-is-None sibling.
 
         Args:
             chunk_id: The chunk identifier bytes
 
         Returns:
-            TensorAdapter responsible for the chunk, or None if not found
+            The TensorAdapter responsible for the chunk
+
+        Raises:
+            flight.FlightError: mapped per the taxonomy above
         """
-        array_id, *_ = decode_chunk_id(chunk_id)
-        source_id, *rest = array_id.split("/")
-        rest = "/".join(rest) if rest else None
+        try:
+            # routing_array_id handles both a plain/versioned chunk_id and a proxy
+            # envelope (whose route token IS the local array_id) without decoding an
+            # opaque envelope inner (biopb/biopb#178 W1).
+            array_id = routing_array_id(chunk_id)
+            source_id, *rest = array_id.split("/")
+            rest = "/".join(rest) if rest else None
 
-        source_adapter = self.sources.get(source_id)
-        if source_adapter is None:
-            return None
+            adapter = None
+            source_adapter = self.sources.get(source_id)
+            if source_adapter is not None:
+                # A within-source suffix names either a native pyramid level
+                # (OME-Zarr / QPTIFF precompute) or a tensor field (an HCS
+                # well/field, a multi-scene file). Ask through the contract, not
+                # by sniffing for the method (biopb/biopb#557): a native-pyramid
+                # adapter returns the level's backend; every other adapter (and a
+                # bare suffix) returns None and the read routes to the tensor field.
+                if rest is not None:
+                    adapter = source_adapter.get_level_adapter(rest)
+                if adapter is None:
+                    adapter = source_adapter.get_tensor_adapter(rest)
+        except (
+            SourceUnresolvedError,
+            TensorResolutionError,
+            ValueError,
+            KeyError,
+            AttributeError,
+            TypeError,
+        ) as e:
+            raise _adapter_lookup_error(
+                e, f"Tensor not found for chunk {chunk_id[:16]!r}"
+            ) from e
 
-        # Check for level adapter (OME-Zarr) only when there's an explicit level path
-        if rest is not None and hasattr(source_adapter, "get_level_adapter"):
-            return source_adapter.get_level_adapter(rest)
-
-        # Otherwise get tensor adapter (for virtual scaling or single-tensor sources)
-        return source_adapter.get_tensor_adapter(rest)
+        if adapter is None:
+            raise to_flight_error(
+                TensorNotFound(
+                    f"Adapter not found for chunk_id: {chunk_id[:16]!r}",
+                    reason="unknown_source",
+                )
+            )
+        return adapter
 
     def list_actions(
         self,
@@ -593,7 +636,7 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
-            source_id = decode_chunk_id(ticket.chunk_id)[0].split("/")[0]
+            source_id = routing_array_id(ticket.chunk_id).split("/")[0]
             self._authorize_source(context, source_id)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
@@ -1234,30 +1277,26 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
-                # Prefer the catalog's stored metadata_json (biopb/biopb#253):
-                # computed once at registration, read back with a cheap local
-                # SELECT -- no adapter recompute, and for a remote proxy no
-                # upstream RPC (read the local mirror row directly, never
-                # adapter.get_metadata()). Fall back to the adapter only when
-                # there is no DB, or get_metadata_json returns None -- an absent/
-                # NULL row (empty metadata, or an unresolved source whose real row
-                # isn't written yet), unparseable JSON, or a catalog read error
-                # (it parses and degrades internally, never raising).
-                #
-                # Escape hatch: the catalog row is source-level, so read it only
-                # when the source's metadata covers every tensor. HCS plates hold
-                # per-field metadata (the row is the plate .zattrs, not a field's
-                # OME metadata), so they fall through to the per-tensor adapter --
-                # preserving the field-level answer (biopb/biopb#253).
-                raw_metadata = None
-                if (
-                    self._metadata_db is not None
-                    and source_adapter is not None
-                    and source_adapter.metadata_covers_all_tensors()
-                ):
-                    raw_metadata = self._metadata_db.get_metadata_json(source_id)
-                if raw_metadata is None:
-                    raw_metadata = tensor_adapter.get_metadata()
+                # One scheme (biopb/biopb#253): the source-level metadata is
+                # computed once at registration and read back from the catalog --
+                # the cache -- never recomputed on the adapter. The catalog is
+                # mandatory: a DB-less server (the embedded image-base cache) has
+                # no metadata to serve, so a metadata request fails closed. A DB
+                # read error propagates (no fallback); a NULL row is a legitimate
+                # "no metadata" (empty base).
+                if self._metadata_db is None:
+                    raise flight.FlightInternalError(
+                        f"Metadata requested for {source_id} but this server "
+                        "has no metadata catalog"
+                    )
+                raw_metadata = self._metadata_db.get_metadata_json(source_id) or {}
+                # Overlay the tensor adapter's cheap per-tensor delta -- fields the
+                # source-level row cannot carry (an OME-Zarr HCS field's own OME
+                # metadata; an EMD signal's original_metadata). Merged over the
+                # cached row so per-tensor metadata needs no catalog row of its own.
+                tensor_extra = tensor_adapter.get_tensor_metadata()
+                if tensor_extra:
+                    raw_metadata = {**raw_metadata, **tensor_extra}
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter.source_type,
@@ -1337,37 +1376,10 @@ class TensorFlightServer(flight.FlightServerBase):
             tensor_ticket = self._parse_ticket(ticket)
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-            source_id = decode_chunk_id(tensor_ticket.chunk_id)[0].split("/")[0]
+            source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
             self._authorize_source(context, source_id)
 
-            try:
-                adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
-            except (
-                SourceUnresolvedError,
-                TensorResolutionError,
-                ValueError,
-                KeyError,
-                AttributeError,
-                TypeError,
-            ) as e:
-                # Same resolution mapping as get_flight_info: a ticket naming a
-                # field the source no longer has -> terminal NOT_FOUND with a code
-                # (never a bare exception -> INTERNAL), an unresolved source ->
-                # retriable "open to resolve" (issue #378).
-                raise _adapter_lookup_error(
-                    e, f"Tensor not found for chunk {tensor_ticket.chunk_id[:16]!r}"
-                ) from e
-            if adapter is None:
-                # Same taxonomy as get_flight_info's tensor_adapter-is-None sibling:
-                # a stale ticket whose source is no longer registered -> terminal
-                # NOT_FOUND *with a code*, not a bare FlightServerError (issue #378).
-                raise to_flight_error(
-                    TensorNotFound(
-                        f"Adapter not found for chunk_id: "
-                        f"{tensor_ticket.chunk_id[:16]!r}",
-                        reason="unknown_source",
-                    )
-                )
+            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
 
             # Get cache manager singleton (if initialized)
             cache_manager = CacheManager.get_instance()
@@ -1402,66 +1414,54 @@ class TensorFlightServer(flight.FlightServerBase):
         ``{"available": false}`` when the chunk can't be located (memory backend,
         oversized/uncached chunk, or any resolve/locate failure) so the client
         falls back to do_get. (issue #9)
+
+        **Counts as Flight activity** (``activity.serving_request``) so the
+        background precache worker parks while a localhost client is reading.
+        This path *replaces* ``do_get`` rather than accompanying it, so without
+        the wrapper the server observes nothing for the whole of such a read
+        (biopb/biopb#548). It is also where a cold miss decodes the chunk. A warm
+        locate is cheap and gets counted anyway -- over-reporting a read is the
+        safe direction for a debounce, and the client's mmap read that follows is
+        real I/O the server cannot see at all.
         """
         cache_manager = CacheManager.get_instance()
         if cache_manager is None:
             return json.dumps({"available": False})
 
-        try:
+        with self.activity.serving_request():
             adapter = self._get_adapter_for_chunk(chunk_id)
-        except (
-            SourceUnresolvedError,
-            TensorResolutionError,
-            ValueError,
-            KeyError,
-            AttributeError,
-            TypeError,
-        ) as e:
-            # Same resolution mapping as get_flight_info / do_get (issue #378).
-            raise _adapter_lookup_error(
-                e, f"Tensor not found for chunk {chunk_id[:16]!r}"
-            ) from e
-        if adapter is None:
-            # Same taxonomy as get_flight_info / do_get: an unregistered source ->
-            # terminal NOT_FOUND with a code, not a bare FlightServerError (#378).
-            raise to_flight_error(
-                TensorNotFound(
-                    f"Adapter not found for chunk_id: {chunk_id[:16]!r}",
-                    reason="unknown_source",
-                )
-            )
 
-        # Entries are stored under the method-stripped canonical key
-        # (biopb/biopb#76); locate with the same key or a warm chunk cached
-        # under a different reduction_method is never found.
-        cache_key = cache_key_for_chunk_id(chunk_id)
-        try:
-            # If the chunk is already cached, just locate it. Resolving first
-            # would, on a chunk whose in-RAM entry has been trimmed, re-read the
-            # whole chunk from its segment server-side for nothing. Only
-            # materialize (same path as do_get) on a genuine cold miss.
-            location = cache_manager.locate_entry(cache_key)
-            if location is None:
-                adapter.resolve_chunk_data(chunk_id, cache_manager)
+            # Entries are stored under the method-stripped canonical key
+            # (biopb/biopb#76); locate with the same key or a warm chunk cached
+            # under a different reduction_method is never found.
+            cache_key = cache_key_for_chunk_id(chunk_id)
+            try:
+                # If the chunk is already cached, just locate it. Resolving first
+                # would, on a chunk whose in-RAM entry has been trimmed, re-read the
+                # whole chunk from its segment server-side for nothing. Only
+                # materialize (same path as do_get) on a genuine cold miss.
                 location = cache_manager.locate_entry(cache_key)
-        except (OSError, ValueError) as e:
-            raise flight.FlightInternalError(
-                f"I/O error locating chunk data: {e}"
-            ) from e
+                if location is None:
+                    adapter.resolve_chunk_data(chunk_id, cache_manager)
+                    location = cache_manager.locate_entry(cache_key)
+            except (OSError, ValueError) as e:
+                raise flight.FlightInternalError(
+                    f"I/O error locating chunk data: {e}"
+                ) from e
 
-        if location is None:
-            return json.dumps({"available": False})
+            if location is None:
+                return json.dumps({"available": False})
 
-        return json.dumps(
-            {
-                "available": True,
-                "format_version": CACHE_FILE_FORMAT_VERSION,
-                "segment_path": location.segment_path,
-                "byte_offset": location.byte_offset,
-                "byte_length": location.byte_length,
-                "generation_id": location.generation_id,
-            }
-        )
+            return json.dumps(
+                {
+                    "available": True,
+                    "format_version": CACHE_FILE_FORMAT_VERSION,
+                    "segment_path": location.segment_path,
+                    "byte_offset": location.byte_offset,
+                    "byte_length": location.byte_length,
+                    "generation_id": location.generation_id,
+                }
+            )
 
     def do_put(
         self,

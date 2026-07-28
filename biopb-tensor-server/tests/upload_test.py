@@ -16,8 +16,33 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.chunk import encode_chunk_id, get_bounds_from_chunk_id
+from biopb_tensor_server.core.chunk import (
+    content_version_of,
+    encode_chunk_id,
+    get_bounds_from_chunk_id,
+    wrap_content_version,
+)
 from biopb_tensor_server.core.config import CacheConfig
+
+
+def _read_cached_batch(cache_manager: CacheManager, chunk_id: bytes) -> pa.RecordBatch:
+    """The batch stored under ``chunk_id``, or fail if it is not cached.
+
+    Reads it the way production does (``CachedSourceAdapter.resolve_chunk_data``):
+    ``get_or_acquire`` with a compute_fn that must never fire, then release. Do
+    not peek with ``backend.start_compute`` -- that hands back a *referenced*
+    entry, and forgetting to release it is the leak this pattern replaces
+    (biopb/biopb#545).
+    """
+
+    def _must_not_compute():
+        raise AssertionError(f"chunk {chunk_id!r} was not in the cache")
+
+    entry = cache_manager.get_or_acquire(chunk_id, _must_not_compute)
+    try:
+        return entry.data
+    finally:
+        cache_manager.release(chunk_id)
 
 
 class TestCachedSourceAdapter:
@@ -141,18 +166,43 @@ class TestCachedSourceAdapter:
         # Verify chunk is in cache
         chunk_id = encode_chunk_id("test", bounds)
 
-        entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
-        assert entry.state.name == "READY"
+        batch = _read_cached_batch(CacheManager.get_instance(), chunk_id)
 
         # Verify batch schema: [data: list<dtype>, shape: list<int64>, dtype: string]
-        batch = entry.data
         assert batch.schema.names == ["data", "shape", "dtype"]
 
         # Verify data shape via the list array
         flat_data = batch.column("data").to_pylist()[0]
         assert len(flat_data) == 50 * 50
 
-        CacheManager.get_instance().release(chunk_id)
+        CacheManager.reset()
+
+    def test_write_chunk_leaves_no_cache_reference(self):
+        """An uploaded chunk is not pinned in memory (biopb/biopb#545).
+
+        write_chunk_arrow used to drive start_compute/complete_entry itself and
+        keep the reservation's reference, so every chunk ever uploaded stayed
+        mirrored in RAM for the life of the process -- unevictable, and not
+        bounded by the *disk* cache budget.
+        """
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+
+        adapter = CachedSourceAdapter(
+            source_id="test",
+            shape=[100, 100],
+            dtype="uint8",
+            chunk_shape=[50, 50],
+        )
+        bounds = ChunkBounds(start=[0, 0], stop=[50, 50])
+        adapter.write_chunk(bounds, np.ones((50, 50), dtype=np.uint8))
+
+        chunk_id = encode_chunk_id("test", bounds)
+        entry = CacheManager.get_instance().backend._entries[chunk_id]
+        assert entry.ref_count == 0
+        assert entry.is_evictable()
+        assert CacheManager.get_instance().remove(chunk_id) is True
+
         CacheManager.reset()
 
     def test_resolve_chunk_data_memory_backend(self):
@@ -185,7 +235,7 @@ class TestCachedSourceAdapter:
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
         # Verify data matches - the chunk is the unified binary schema now.
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         arr = unpack_chunk_array(batch)
         np.testing.assert_array_equal(arr, test_data)
@@ -214,9 +264,7 @@ class TestCachedSourceAdapter:
         # Verify chunk is stored
         chunk_id = encode_chunk_id("test", bounds)
 
-        entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
-        assert entry.state.name == "READY"
-        CacheManager.get_instance().release(chunk_id)
+        _read_cached_batch(CacheManager.get_instance(), chunk_id)
         CacheManager.reset()
 
     def test_write_chunk_arrow_rejects_list_wrapper(self):
@@ -286,7 +334,7 @@ class TestCachedSourceAdapter:
             assert pa.types.is_binary(batch.column("data").type)
 
             # Verify data can be reconstructed
-            from biopb_tensor_server.core.base import unpack_chunk_array
+            from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
             reconstructed = unpack_chunk_array(batch)
             assert reconstructed.shape == data.shape
@@ -888,23 +936,23 @@ class TestChunkUpload:
 
         server.uploads.write_chunk(upload, MockReader())
 
+        # create_source assigns a per-upload content_version (#178), so the chunk
+        # is stored under the version-wrapped id the read plan also mints.
+        adapter = server.sources.get(source_id)
         chunk_id = encode_chunk_id(source_id, bounds)
+        if adapter.content_version is not None:
+            chunk_id = wrap_content_version(chunk_id, adapter.content_version)
         cache_manager = CacheManager.get_instance()
-        entry, is_owner = cache_manager.start_compute(chunk_id)
-        assert entry.state.name == "READY"
-        assert not is_owner
-
-        stored_batch = entry.data
+        stored_batch = _read_cached_batch(cache_manager, chunk_id)
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
-        from biopb_tensor_server.core.base import unpack_chunk_array
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
 
         reconstructed = unpack_chunk_array(stored_batch)
         assert reconstructed.shape == data.shape
         assert np.array_equal(reconstructed, data)
 
-        cache_manager.release(chunk_id)
         CacheManager.reset()
 
     def test_upload_chunk_missing_source(self):
@@ -1065,3 +1113,137 @@ class TestBuildMinimalOmeMetadata:
         assert axes[1]["type"] == "space"  # 'z' detected as space
         assert axes[2]["type"] == "space"  # 'y' detected as space
         assert axes[3]["type"] == "space"  # 'x' detected as space
+
+
+class TestCachedSourceContentVersion:
+    """Per-upload generation token folded into cache keys (biopb/biopb#178).
+
+    cache: sources have deterministic ids, so a re-upload reuses the id. The
+    generation token gives each upload a fresh cache namespace; without it
+    ``CacheManager.put`` would decline to overwrite the prior upload's
+    chunk and serve stale data.
+    """
+
+    def _adapter(self, cv):
+        return CachedSourceAdapter(
+            source_id="cache_v",
+            shape=[4, 4],
+            dtype="uint8",
+            chunk_shape=[4, 4],
+            content_version=cv,
+        )
+
+    def test_versioned_write_read_roundtrip(self):
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        try:
+            cv = b"gen:1"
+            adapter = self._adapter(cv)
+            data = np.arange(16, dtype=np.uint8).reshape(4, 4)
+            bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+            adapter.write_chunk(bounds, data)
+
+            # The base read plan mints version-wrapped chunk_ids; the client echoes
+            # one back on read -> it must resolve to the written data.
+            wrapped = wrap_content_version(encode_chunk_id("cache_v", bounds), cv)
+            assert content_version_of(wrapped) == cv
+            batch = adapter.resolve_chunk_data(wrapped, CacheManager.get_instance())
+            np.testing.assert_array_equal(unpack_chunk_array(batch), data)
+
+            # A legacy unwrapped id for the same bounds is a different namespace and
+            # must NOT resolve on a versioned source.
+            with pytest.raises(flight.FlightServerError):
+                adapter.resolve_chunk_data(
+                    encode_chunk_id("cache_v", bounds), CacheManager.get_instance()
+                )
+        finally:
+            CacheManager.reset()
+
+    def test_reupload_new_generation_serves_fresh_data(self):
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=50))
+        try:
+            bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+            old = np.zeros((4, 4), dtype=np.uint8)
+            new = np.full((4, 4), 7, dtype=np.uint8)
+
+            a1 = self._adapter(b"gen:1")
+            a1.write_chunk(bounds, old)
+
+            # Re-upload: same deterministic source_id, new generation, new bytes.
+            a2 = self._adapter(b"gen:2")
+            a2.write_chunk(bounds, new)
+
+            # Without the version namespace, a2's start_compute would find gen:1's
+            # entry and keep the STALE bytes. The fresh namespace serves the new data.
+            id2 = wrap_content_version(encode_chunk_id("cache_v", bounds), b"gen:2")
+            batch2 = a2.resolve_chunk_data(id2, CacheManager.get_instance())
+            np.testing.assert_array_equal(unpack_chunk_array(batch2), new)
+
+            # The prior generation's chunk is a distinct entry, still intact.
+            id1 = wrap_content_version(encode_chunk_id("cache_v", bounds), b"gen:1")
+            batch1 = a1.resolve_chunk_data(id1, CacheManager.get_instance())
+            np.testing.assert_array_equal(unpack_chunk_array(batch1), old)
+        finally:
+            CacheManager.reset()
+
+    def test_unversioned_adapter_is_legacy(self):
+        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        try:
+            adapter = CachedSourceAdapter(
+                source_id="cache_legacy",
+                shape=[4, 4],
+                dtype="uint8",
+                chunk_shape=[4, 4],
+            )
+            assert adapter.content_version is None
+            data = np.ones((4, 4), dtype=np.uint8)
+            bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+            adapter.write_chunk(bounds, data)
+            # Unversioned -> legacy unwrapped id resolves, byte-identical to pre-#178.
+            batch = adapter.resolve_chunk_data(
+                encode_chunk_id("cache_legacy", bounds), CacheManager.get_instance()
+            )
+            np.testing.assert_array_equal(unpack_chunk_array(batch), data)
+        finally:
+            CacheManager.reset()
+
+    def test_upload_manager_generation_monotonic_and_distinct(self):
+        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.serving.upload_manager import UploadManager
+
+        mgr = UploadManager(SourceRegistry(), None, None)
+        tokens = [mgr._next_content_version() for _ in range(5)]
+        assert all(t.startswith(b"gen:") for t in tokens)
+        assert len(set(tokens)) == 5  # all distinct
+        gens = [int(t.split(b":")[1]) for t in tokens]
+        assert gens == sorted(gens)  # strictly increasing even under a rapid loop
+
+    def test_create_source_reupload_bumps_generation(self):
+        """Re-creating the same-named cache source reuses the id but bumps the gen."""
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer(location="grpc://localhost:0", writable=True)
+        req = TensorDescriptor(
+            array_id="cache:reupload",
+            shape=[8, 8],
+            dtype="uint8",
+            chunk_shape=[8, 8],
+            dim_labels=["y", "x"],
+        )
+        r1 = server.uploads.create_source(req)
+        cv1 = server.sources.get(r1.array_id).content_version
+        r2 = server.uploads.create_source(req)
+        cv2 = server.sources.get(r2.array_id).content_version
+
+        assert r1.array_id == r2.array_id  # deterministic id -> same source
+        assert cv1 is not None and cv2 is not None
+        assert cv1.startswith(b"gen:") and cv2.startswith(b"gen:")
+        assert cv1 != cv2  # a fresh namespace per upload session

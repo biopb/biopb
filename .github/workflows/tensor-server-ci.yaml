@@ -1,18 +1,19 @@
 name: Tensor Server CI
 
 # Test/build on branch pushes & PRs; PUBLISH the tensor-server Docker image on a
-# `server-v*` tag. The tensor server has its own version line (docs/release-model.md):
-# the wheel bundle + GitHub release is still cut by release.yaml on `release-v*`,
-# but the Docker image is this workflow's job, on its own `server-v*` cadence.
-# (Path filters are not evaluated for tag pushes, so a `server-v*` tag triggers
-# this regardless of the pull_request `paths` below.)
+# FINAL `release-vX.Y.Z` tag (an rc/a/b prerelease tag tests + builds but publishes
+# nothing). The tensor server tracks the product line (docs/release-model.md):
+# the same `release-v*` tag cuts the wheel bundle + GitHub release (release.yaml)
+# and builds the Docker image here — this workflow owns the image build, not
+# release.yaml. (Path filters are not evaluated for tag pushes, so a `release-v*`
+# tag triggers this regardless of the pull_request `paths` below.)
 on:
   push:
     branches:
       - main
       - dev
     tags:
-      - 'server-v*'
+      - 'release-v*'
   pull_request:
     branches:
       - main
@@ -118,9 +119,12 @@ jobs:
       - name: Run Python tests
         run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/
 
-  # CI build: verify the webapp + wheels + Docker image compile. Never pushes —
-  # the actual publish is release.yaml on `release-v*`. The uploaded artifacts
-  # are a convenience for inspecting a run, not a release input.
+  # CI build: verify the wheels + Docker image compile. Never pushes — the actual
+  # publish is the publish job below on `release-v*`. The uploaded artifacts are a
+  # convenience for inspecting a run, not a release input. The image is a headless
+  # data plane (Flight + HTTP sidecar via `biopb-tensor-server launch`): no control
+  # plane, no bundled webapp, so no pnpm/webapp build here. The webapp compiles in
+  # web-ci.yaml.
   build:
     needs: [js-test, test]
     runs-on: ubuntu-latest
@@ -128,39 +132,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          # The JS workspace lives in web/; the repo root has no package.json, so
-          # pin pnpm here (matches web/package.json's packageManager).
-          version: 9.12.3
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: 'pnpm'
-          cache-dependency-path: web/pnpm-lock.yaml
-
-      - name: Install dependencies
-        run: pnpm -C web install --frozen-lockfile
-
-      - name: Sync JS versions
-        run: pnpm -C web run sync-version
-
-      - name: Build packages
-        run: pnpm -C web --filter @biopb/tensor-flight-client build
-
-      - name: Build webapp
-        # The control front is the single web origin: it serves this bundle at
-        # its root and proxies the data API + WS under /data_plane. Base is "/";
-        # VITE_TENSOR_API points the viewer at the proxied data plane.
-        run: VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
-
-      - name: Create webapp tarball
-        run: tar -czf webapp.tar.gz -C web/packages/app dist
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -173,16 +144,13 @@ jobs:
           setup_only: true
           github_token: ${{ github.token }}
 
+      # The image ships two wheels: core biopb (the tensor server depends on it)
+      # and biopb-tensor-server. No control-plane wheel.
       - name: Build biopb wheel
         run: pip wheel . --no-deps -w wheels/
 
       - name: Build biopb_tensor_server wheel
         run: pip wheel ./biopb-tensor-server --no-deps -w wheels/
-
-      - name: Build biopb_control wheel
-        # The image runs the control as its web origin, so the Dockerfile installs
-        # this wheel too (its ASGI deps resolve from PyPI at image-build time).
-        run: pip wheel ./biopb-control --no-deps -w wheels/
 
       - name: Set up Docker Buildx
         if: github.event_name != 'pull_request'
@@ -192,8 +160,8 @@ jobs:
         # Skipped on pull_request: the buildx multi-stage image build is the slow
         # part of this workflow and rarely breaks from a normal PR. It still runs
         # on every push to main/dev (one build per merged PR) and on
-        # workflow_dispatch, so the image is verified before any release.yaml
-        # publish. Wheels/webapp above still build on PRs.
+        # workflow_dispatch, so the image is verified before any publish. Wheels
+        # above still build on PRs.
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
@@ -211,19 +179,53 @@ jobs:
         with:
           name: release-artifacts
           path: |
-            webapp.tar.gz
             wheels/biopb*.whl
           retention-days: 1
 
-  # Publish the tensor-server Docker image on a `server-v*` tag (ghcr.io + Docker
-  # Hub jiyuuchc/). The image's version IS the tag (biopb-tensor-server's
-  # setuptools_scm reads `server-v*`); a clean X.Y.Z also moves :latest, an
-  # rc/a/b prerelease publishes only its pinned tag. Idempotent: an already-
-  # published version is skipped, so re-running a tag is a noop. This is the ONLY
-  # place the tensor-server image is published — release.yaml no longer builds it.
+  # Gate: only a FINAL `release-vX.Y.Z` tag publishes an image. A PEP 440
+  # prerelease (`…rc1`/`a1`/`b1`) still runs the full test + build matrix above —
+  # that is what an rc tag is for — but pushes NOTHING to a registry. Registry
+  # tags are permanent and public: every rc left a `biopb-tensor-server:X.Y.ZrcN`
+  # tag sitting next to the real releases, and the RCs are cut off `dev` (they are
+  # exempt from release.yaml's on-main guard by design), so those images were
+  # published straight from unmerged code. Nothing consumes them — the installer
+  # skips prereleases and docs/deploy examples pull `:latest` or a pinned X.Y.Z.
+  #
+  # A tiny separate job because GitHub's `if:` expressions have no regex, so
+  # "tag is X.Y.Z and not X.Y.ZrcN" cannot be written inline (and `contains(…,
+  # 'a')` would match "release-v" itself). Deciding here rather than per-step also
+  # means an rc never builds wheels or logs into Docker Hub, and the skip is
+  # visible in the run graph.
+  guard:
+    if: startsWith(github.ref, 'refs/tags/release-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Decide whether to publish
+        id: decide
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF#refs/tags/release-v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "final release $VER -> publish the image"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::prerelease $VER -> no image published (only a final release-vX.Y.Z tag publishes the tensor-server image)"
+          fi
+
+  # Publish the tensor-server Docker image on a FINAL `release-vX.Y.Z` tag
+  # (ghcr.io + Docker Hub jiyuuchc/). The image's version IS the tag
+  # (biopb-tensor-server's setuptools_scm reads `release-v*`) and it always moves
+  # :latest, since prereleases are filtered out by `guard` above. Idempotent: an
+  # already-published version is skipped, so re-running a tag is a noop. This is
+  # the ONLY place the tensor-server image is published — release.yaml never
+  # builds it.
   publish:
-    needs: [js-test, test]
-    if: startsWith(github.ref, 'refs/tags/server-v')
+    needs: [js-test, test, guard]
+    if: needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -243,55 +245,29 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.12.3
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: 'pnpm'
-          cache-dependency-path: web/pnpm-lock.yaml
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # The tensor-server Dockerfile COPYs biopb-*.whl + biopb_tensor_server-*.whl
-      # + biopb_control-*.whl (the image runs the control as its single web
-      # origin) plus the built webapp. Build all four inputs here.
+      # The tensor-server Dockerfile COPYs biopb-*.whl + biopb_tensor_server-*.whl.
+      # The image is a headless data plane — no control-plane wheel, no webapp.
       - name: Build wheels
         run: |
           uv build --package biopb --wheel --out-dir wheels
           uv build --package biopb-tensor-server --wheel --out-dir wheels
-          uv build --package biopb-control --wheel --out-dir wheels
-
-      - name: Build webapp
-        run: |
-          pnpm -C web install --frozen-lockfile
-          pnpm -C web run sync-version
-          pnpm -C web --filter @biopb/tensor-flight-client build
-          # Base "/"; the control serves this bundle at its root and proxies the
-          # data API + WS under /data_plane.
-          VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
 
       - name: Compute version + tags
         id: ver
         run: |
           set -euo pipefail
-          # server-v* tag -> the tensor server's version (== its wheel version).
-          VER="${GITHUB_REF#refs/tags/server-v}"
+          # release-v* tag -> the product version (== the tensor server's wheel version).
+          VER="${GITHUB_REF#refs/tags/release-v}"
+          # Belt-and-braces: `guard` already proved this is a final X.Y.Z, so a
+          # prerelease reaching here means the gate was mis-wired -- fail loudly
+          # rather than quietly move :latest onto an rc image.
+          [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::expected a final release-vX.Y.Z tag, got $VER"; exit 1; }
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          # PEP 440 prerelease (a/b/rc) does NOT move :latest.
-          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            PRERELEASE=false
-          else
-            PRERELEASE=true
-          fi
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          # VER is the tag name suffix (this job only runs on refs/tags/server-v*),
+          # VER is the tag name suffix (this job only runs on refs/tags/release-v*),
           # so it is a clean version with no setuptools_scm '+local' segment and is
           # already a valid Docker reference -- no sanitization needed (matches
           # image-runtime-ci, which uses its tag name directly too).
@@ -300,13 +276,11 @@ jobs:
             echo "tags<<TAGS_EOF"
             echo "ghcr.io/$owner/biopb-tensor-server:$VER"
             echo "docker.io/jiyuuchc/biopb-tensor-server:$VER"
-            if [[ "$PRERELEASE" == "false" ]]; then
-              echo "ghcr.io/$owner/biopb-tensor-server:latest"
-              echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
-            fi
+            echo "ghcr.io/$owner/biopb-tensor-server:latest"
+            echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "tensor-server $VER (prerelease=$PRERELEASE)"
+          echo "tensor-server $VER (final release; moves :latest)"
 
       - name: Login to ghcr.io
         uses: docker/login-action@v3

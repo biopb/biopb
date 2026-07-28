@@ -22,7 +22,8 @@ from biopb_tensor_server.adapters._scale import (
     scale_by_label,
     unit_to_um,
 )
-from biopb_tensor_server.core.base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.chunk import content_version_from_path
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -394,8 +395,6 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     - (num_files, pages, Y, X) for multi-page files -> ['i', 'z', 'y', 'x']
     """
 
-    _single_tensor_source = True
-
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim directories holding several plain TIFFs (stack-all, #215).
@@ -526,6 +525,10 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self.directory = Path(directory)
         self.source_id = source_id
         self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file sequence. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "tiff-sequence"
         # Per-file read locks (see _PerFileTiffLockMixin): reads of the same TIFF
         # serialize while reads of different files run in parallel, so one slow
@@ -744,10 +747,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; only the per-file read below is
         # synchronized, and per file -- so a slow read of one frame no longer
@@ -929,8 +929,6 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     Uses TiffFile().aszarr() for true tile-level lazy reading.
     """
 
-    _single_tensor_source = True
-
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim directories with MicroManager metadata files.
@@ -1105,6 +1103,10 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self.directory = Path(directory)
         self.source_id = source_id
         self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file dataset. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
         self._source_type = "micromanager-legacy"
         # Per-file read locks (see _PerFileTiffLockMixin): a stalled read of one
         # plane holds only its own file's lock, not every plane's.
@@ -1298,10 +1300,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
+        slices = self._bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; all state read below is immutable
         # after __init__. Only the per-file read is synchronized, and per file --

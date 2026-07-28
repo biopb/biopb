@@ -22,9 +22,9 @@ from biopb_tensor_server.core.discovery import (
     discover_sources,
     discover_sources_from_entries,
     generate_source_id,
-    is_remote_url,
     resolve_local_path,
 )
+from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
 from biopb_tensor_server.sources.watcher import (
