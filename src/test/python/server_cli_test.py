@@ -963,9 +963,11 @@ class TestBasePort:
         the port its own --base-port names.
         """
         monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
-        # XDG_STATE_HOME, not BIOPB_STATE_HOME -- see endpoints_test's fixture:
-        # the wrong name writes the record into the real state dir instead of
-        # failing, and every client then discovers a dead port.
+        # XDG_STATE_HOME is what relocates the state tree; there is no
+        # BIOPB_STATE_HOME. Setting a name biopb does not read leaves the tree
+        # where it was, so the record lands in the developer's real state dir
+        # and every client then discovers a dead port -- silently, since the
+        # test still passes. See endpoints_test's fixture.
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         cli._endpoints.write_runtime_record("127.0.0.1", 9999, 4242)
         assert cli._control_endpoint()[1] == 9999  # discovery follows it
