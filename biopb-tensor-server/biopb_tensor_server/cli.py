@@ -1147,6 +1147,38 @@ def serve(
         _graceful_shutdown(source_manager, watcher, server, precache_worker)
 
 
+def _unreadable_trust_anchors(server_config) -> List[str]:
+    """Every credentials profile whose ``tls_ca_file`` cannot be read, described.
+
+    ``resolve_all_sources`` resolves an upstream's credentials only when it has
+    to expand a bare-host ``grpc://host:port`` entry; the single-source form
+    ``grpc://host:port/<id>`` returns before that, and a profile no source
+    references yet is never touched at all. So a typo'd trust anchor could pass
+    ``validate`` and then fail at serve -- which is the wrong end of the run to
+    find out that the anchor you asked for is not the one being used
+    (biopb/biopb#608).
+
+    Checked with the reader the serve path itself uses, so "readable" has one
+    definition rather than two that can drift apart. This is a deliberate
+    filesystem probe and therefore answers for *this* machine and user: it
+    belongs to ``validate`` (which already walks source paths), not to the pure
+    ``validate_config_dict`` that backs the admin config form.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import _read_upstream_ca
+    from biopb_tensor_server.core.errors import UpstreamConfigError
+
+    credentials = getattr(server_config, "credentials", None)
+    problems: List[str] = []
+    for profile in getattr(credentials, "profiles", None) or []:
+        if not getattr(profile, "tls_ca_file", None):
+            continue
+        try:
+            _read_upstream_ca(profile, getattr(profile, "name", None))
+        except UpstreamConfigError as exc:
+            problems.append(str(exc))
+    return problems
+
+
 @app.command()
 def validate(
     config: Path = typer.Argument(
@@ -1180,30 +1212,36 @@ def validate(
     try:
         server_config = load_config(config)
         sources = resolve_all_sources(server_config)
-
-        console.print("[green]✓ Config valid[/green]")
-        console.print(f"  Cache: backend={server_config.cache.backend}, ")
-        if server_config.cache.backend == "memory":
-            console.print(
-                f"    max_entries={server_config.cache.memory_max_entries}, "
-                f"max_bytes={server_config.cache.memory_max_bytes // (1024 * 1024)}MB"
-            )
-        elif server_config.cache.backend == "file":
-            console.print(
-                f"    cache_dir={server_config.cache.file_cache_dir}, "
-                f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
-                f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
-            )
-        console.print(f"  Sources: {len(sources)} data source(s)")
-
-        for source in sources:
-            console.print(f"    - {source.source_id} ({source.type}: {source.url})")
-
+        trust_problems = _unreadable_trust_anchors(server_config)
     except Exception as e:
         # Escaped: a validation message names its section as "[pyramid]", which
         # rich would otherwise eat as a style tag and print as nothing.
         console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
+
+    if trust_problems:
+        console.print("[red]✗ Config invalid[/red]")
+        for message in trust_problems:
+            console.print(f"  credentials.profiles: {_rich_escape(message)}")
+        raise typer.Exit(1)
+
+    console.print("[green]✓ Config valid[/green]")
+    console.print(f"  Cache: backend={server_config.cache.backend}, ")
+    if server_config.cache.backend == "memory":
+        console.print(
+            f"    max_entries={server_config.cache.memory_max_entries}, "
+            f"max_bytes={server_config.cache.memory_max_bytes // (1024 * 1024)}MB"
+        )
+    elif server_config.cache.backend == "file":
+        console.print(
+            f"    cache_dir={server_config.cache.file_cache_dir}, "
+            f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
+            f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
+        )
+    console.print(f"  Sources: {len(sources)} data source(s)")
+
+    for source in sources:
+        console.print(f"    - {source.source_id} ({source.type}: {source.url})")
 
 
 @app.command()

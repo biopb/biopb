@@ -1262,6 +1262,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             region=profile_data.get("region", None),
             token=profile_data.get("token", None),
             endpoint_url=profile_data.get("endpoint_url", None),
+            # Per-upstream TLS trust (biopb/biopb#604 item 4). Both were added to
+            # CredentialProfile and read by resolve_upstream_credentials, but
+            # never parsed here -- so a configured anchor was dropped on load and
+            # every `grpcs://` upstream silently fell back to TOFU pinning, which
+            # is precisely the silent degradation that design set out to prevent.
+            # They are *known* keys (config_schema derives them from the
+            # dataclass), so nothing warned either.
+            tls_ca_file=profile_data.get("tls_ca_file", None),
+            tls_fingerprint=profile_data.get("tls_fingerprint", None),
         )
         if profile.name:
             credentials_profiles.append(profile)
