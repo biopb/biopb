@@ -47,9 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--remote",
         action="store_true",
-        help="the deployment is public (the flight plane is bound off-box), so "
-        "require a token. Does NOT publish this control listener -- it binds "
-        "loopback either way; use --control-host to override that deliberately.",
+        help="deprecated and redundant: a public --grpc-host already says the "
+        "deployment is public. Kept as an extra token-required trigger; it does "
+        "NOT publish this control listener (use --control-host for that).",
     )
     run.add_argument(
         "--no-data-plane",
@@ -102,19 +102,31 @@ def main(argv: list[str] | None = None) -> int:
 
     resolved_control_host = args.control_host or control_host()
 
-    # Fail-closed: a control listener reachable off-box MUST carry a token. Without
-    # one, its /api/* gate falls back to only a loopback-`Host` check, which a
-    # non-browser client trivially spoofs (`Host: 127.0.0.1`) to drive the
-    # stop/restart/session verbs. Key the guard on the *resolved bind*, not on
-    # `--remote`: an explicit public `--control-host` (or BIOPB_CONTROL_HOST) is
-    # just as exposed. `--remote` is kept as a second trigger because it means the
-    # *data plane* is public, which requires a token regardless of this bind.
+    # Fail-closed: no listener reachable off-box may run token-less. Two of them
+    # can be, and each is checked on its *resolved bind* rather than on a mode
+    # flag:
+    #
+    #   - this control listener. Without a token its /api/* gate falls back to a
+    #     loopback-`Host` check, which a non-browser client trivially spoofs
+    #     (`Host: 127.0.0.1`) to drive the stop/restart/session verbs. Public only
+    #     via an explicit --control-host / BIOPB_CONTROL_HOST.
+    #   - the data plane. A public --grpc-host serves pixels and the whole data
+    #     API off-box, so it must be authenticated even though *this* listener is
+    #     loopback. Deriving it from the address the parent already passes means
+    #     the two layers read one fact through one predicate and cannot disagree
+    #     about it (biopb/biopb#614).
+    #
+    # `--remote` is redundant now that --grpc-host carries this, but stays honored
+    # so a direct invocation that still passes it is never accepted token-less.
     control_is_public = _web_auth.host_is_public_bind(resolved_control_host)
-    if not token and (args.remote or control_is_public):
+    plane_is_public = _web_auth.host_is_public_bind(args.grpc_host)
+    if not token and (args.remote or control_is_public or plane_is_public):
+        exposed = "control API" if control_is_public else "data plane"
         print(
-            "biopb-control: a network-reachable control bind requires an access "
-            "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --control-host to "
-            "loopback (127.0.0.1) for a tokenless local deployment.",
+            f"biopb-control: a network-reachable {exposed} bind requires an access "
+            "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --grpc-host and "
+            "--control-host to loopback (127.0.0.1) for a tokenless local "
+            "deployment.",
             file=sys.stderr,
         )
         return 2

@@ -41,41 +41,79 @@ trusted intranet. Hardening for untrusted networks (TLS, authn/z, k8s) is
 expected to be handled by a separately-documented reverse proxy in front of the
 services, so the services themselves stay simple.
 
-**Two deployment modes** (the deliberately-small security surface). `biopb
-control start` runs **local mode** by default: every listener (control 8813,
-tensor HTTP sidecar 8814, flight gRPC 8815) binds loopback — the single-machine
-90% case. Local mode is tokenless by default (no unlock step), but a token is
-**optional**: pass `--token` / `BIOPB_TENSOR_TOKEN` and it is enforced across the
-loopback listeners too (the browser then gates behind the unlock page, exactly as
-in remote). A local token is a supported mode — the control hands its credential
-to local clients on the filesystem (see the credential handoff below); one
-residual UI gap is noted there. `biopb control start
---remote` runs **remote mode**: the **flight server** binds publicly behind a
-**required** token (supplied via `--token` / `BIOPB_TENSOR_TOKEN`, else generated
-and printed), and the browser UI gates itself behind an unlock page (driven by
-the control's `GET /health` → `auth_required`). Token enforcement is thus
-**independent** of the network mode; what `--remote` fixes is the *bind address*.
-The one invariant is **fail-closed** — a public listener is never left
-unauthenticated: `--remote` refuses to run without a token, and the flight bind
-follows the flag alone (not `biopb.json`), so "public + unauthenticated" is
-unrepresentable rather than validated against. The one policy lives in the
-stdlib-only `biopb._web_auth` predicates that the control and the sidecar both
-bind to (so they cannot drift); there is no separate "dev-mode" token bypass.
+**Two knobs, not two modes** (the deliberately-small security surface). `biopb
+control start` takes one number and one address, and everything else follows.
+
+**`--base-port`** (default 8810) places all three listeners: control/browser UI =
+base+3, tensor HTTP sidecar = base+4, flight gRPC = base+5 — so the default is the
+familiar 8813/8814/8815. The offsets are the *container's* (`entrypoint.sh`'s
+`BIOPB_BASE_PORT`), deliberately one convention rather than two that would agree
+at their defaults and diverge the moment either base moved. Moving the base moves
+the whole deployment, which is what lets two users run side by side on one host
+(each also needs its own `XDG_STATE_HOME`, since the pid / credential / runtime
+records are per-state-dir).
+
+**`--grpc-bind`** (default `127.0.0.1`) decides exposure, and it is the *only*
+listener that is ever published. Loopback is the single-machine 90% case,
+tokenless by default (no unlock step) but a token is **optional**: pass `--token`
+/ `BIOPB_TENSOR_TOKEN` and it is enforced across the loopback listeners too (the
+browser then gates behind the unlock page). A public address — `0.0.0.0`, or one
+interface's IP — serves the data plane off-box, and then a token is **required**
+(supplied, else generated and printed) and **TLS is on by default**. `--remote`
+survives as a deprecated alias for `--grpc-bind 0.0.0.0`.
+
+Everything downstream reads that one address through the stdlib-only
+`biopb._web_auth.host_is_public_bind`, which the core CLI, the control's own bind
+guard, and the tensor `launch` all share, so the three cannot drift. The
+invariant is **fail-closed** — a public listener is never left unauthenticated —
+and it now holds by *construction*: the bind is the CLI's, not `biopb.json`'s, so
+"public + unauthenticated" is unrepresentable rather than validated against.
+There is no "dev-mode" token bypass.
+
+**The bind drives TLS, not the reverse.** Tying it this way keeps each flag's
+name matching its own effect, and makes the dangerous combination the one you
+must ask for by name: `--grpc-bind 0.0.0.0 --no-tls` puts the token and every
+pixel on the wire in cleartext (it warns, and stays possible — a trusted
+intranet is a real deployment). `--tls` alone therefore still means "encrypted,
+loopback only", which is what exercising the TOFU pinning and SAN-verification
+paths needs. `--tls` needs the opt-in `[tls]` extra, checked before anything
+spawns.
 
 **Only the flight plane is ever published** (biopb/biopb#614). The tensor HTTP
 sidecar stays on loopback (the control proxies it), and so does the *control*
-itself — in remote mode too. The control has no TLS support at all, so publishing
-it would send the data-plane token — which unlocks the whole data *and* admin API
-— in cleartext, re-introducing exactly the client class `--remote`'s TLS work
-(#604) set out to remove: the browser should only ever talk to its own loopback
-origin and never need to trust the remote's cert. To open the UI from another
-machine, tunnel it — `ssh -L 8813:localhost:8813 <host>`, encrypted and
+itself — with a public bind too. The control has no TLS support at all, so
+publishing it would send the data-plane token — which unlocks the whole data
+*and* admin API — in cleartext, re-introducing exactly the client class the TLS
+work (#604) set out to remove: the browser should only ever talk to its own
+loopback origin and never need to trust the remote's cert. To open the UI from
+another machine, tunnel it — `ssh -L 8813:localhost:8813 <host>`, encrypted and
 authenticated for free, no new listener, the pattern Jupyter users already know —
-which `control start --remote` prints at startup. Publishing the UI anyway is
-still possible for someone fronting it with their own TLS proxy, but only as the
-deliberate, named act of passing a public `--control-host` (or
+which `control start` prints whenever the plane goes public. Publishing the UI
+anyway is still possible for someone fronting it with their own TLS proxy, but
+only as the deliberate, named act of passing a public `--control-host` (or
 `BIOPB_CONTROL_HOST`) to `python -m biopb_control run`; that path is fail-closed
 on the *resolved bind*, so it too refuses to come up token-less.
+
+**`start` and `run` are the same deployment.** Identical flags — literally the
+same `typer.Option` objects, so their `--help` cannot drift — identical binds,
+identical port derivation, identical pre-flight port guards. Only process
+ownership differs: `start` daemonizes and writes `control.pid`; `run` blocks the
+terminal for a systemd/launchd unit or for debugging, and deliberately writes no
+pid file because the service manager owns it.
+
+**The runtime (discovery) record** (`state/biopb/control.json`). Once
+`--base-port` could move the control off 8813, a client that only knew 8813 would
+look in the wrong place — so a serving control publishes the endpoint it actually
+bound. Written by whoever bound the socket (`biopb_control._run`, the one path
+both `start` and `run` go through), beside the credential file and on the same
+publish-on-serve / retract-on-clean-stop lifetime. Readers resolve
+`BIOPB_CONTROL_*` → this record → 8813; *binders* never consult it, or a crashed
+control's stale record would dictate where the next one listens. Not a secret, so
+no owner-only perms, and written even for a tokenless plane. It carries the
+serving pid, which is how `control status` reports a live foreground `run` (no
+pid file) honestly instead of calling it "not running" — and how `control stop`
+can name the owner it declines to signal. A crash leaves it behind, so it is a
+*hint*: every consumer probes.
 
 **The local credential handoff** (biopb/biopb#470). Credential distribution is off
 the HTTP API and on the filesystem, the standard local-daemon pattern (Jupyter's

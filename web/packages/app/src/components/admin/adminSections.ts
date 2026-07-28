@@ -95,7 +95,7 @@ export const ADMIN_NAV: AdminNavItem[] = [
     description:
       "Logging, write mode, and how the server watches source folders for " +
       "changes. The network bind (host, port, TLS) is chosen when the server is " +
-      "started, not here — see `biopb control start --remote / --tls`.",
+      "started, not here — see `biopb control start --grpc-bind / --tls`.",
     kind: "fields",
     section: "server",
     commonFields: ["log_level", "writable"],

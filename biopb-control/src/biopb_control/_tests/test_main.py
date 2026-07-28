@@ -116,6 +116,37 @@ def test_remote_without_token_is_fail_closed():
     assert spec is None  # run_control never reached
 
 
+def test_public_grpc_host_without_token_is_fail_closed():
+    """A public *data plane* must carry a token even though this listener is loopback.
+
+    This is what replaced `--remote` as the signal (biopb/biopb#614): the parent
+    already passes the flight bind, so the child derives "is this deployment
+    public?" from that address through the same shared predicate. Two layers, one
+    fact, no boolean that can disagree with it.
+    """
+    rc, spec, _ = _capture(_BASE_ARGV + ["--grpc-host", "0.0.0.0"], {})
+    assert rc == 2
+    assert spec is None
+
+
+def test_public_grpc_host_with_token_starts():
+    rc, spec, kwargs = _capture(
+        _BASE_ARGV + ["--grpc-host", "0.0.0.0"], {"BIOPB_TENSOR_TOKEN": "s3cret"}
+    )
+    assert rc == 0
+    assert spec.grpc_host == "0.0.0.0"
+    # ...and the control still stays on loopback.
+    assert not _web_auth.host_is_public_bind(kwargs["control_host"])
+
+
+def test_specific_public_grpc_ip_also_fail_closed():
+    """Not just the wildcard -- `host_is_public_bind` is fail-closed on anything
+    it does not recognize as loopback, so binding one interface counts too."""
+    rc, spec, _ = _capture(_BASE_ARGV + ["--grpc-host", "10.0.0.5"], {})
+    assert rc == 2
+    assert spec is None
+
+
 def test_public_control_host_without_token_is_fail_closed():
     """An explicit public --control-host (no --remote, no token) must also refuse:
     the guard keys on the resolved bind, not on --remote, so a token-less public

@@ -31,17 +31,24 @@ biopb control run        # run in the foreground (Ctrl-C to stop)
 
 `biopb control start` brings the data plane up by default; pass `--no-data-plane`
 to run the control as an adopt-only supervisor (it will only monitor / restart a
-tensor server that is already running, not spawn one).
+tensor server that is already running, not spawn one). `start` and `run` take the
+*same* flags and stand up the same deployment — only process ownership differs.
+
+**Ports** come from `--base-port` (default 8810): control = base+3, sidecar =
+base+4, flight = base+5, the container's convention. A control that moved off
+8813 publishes where it landed in `state/biopb/control.json`, so `status` /
+`logs` and biopb-mcp follow it; `stop` and the bind path deliberately do not, so
+a stale record can never dictate the next bind.
 
 The supervisor exposes the control API and serves the browser UI on
-`127.0.0.1:8813` — **in both modes**. `--remote` publishes the *flight* plane
-(TLS-capable, token-gated), not this listener: the control is plaintext HTTP with
-no TLS support, so publishing it would put the data-plane token on the wire in
-the clear (biopb/biopb#614). Reach the UI from another machine over a tunnel,
-`ssh -L 8813:localhost:8813 <host>`, which `control start --remote` prints. To
-publish it anyway (behind your own TLS proxy), pass an explicit
-`--control-host 0.0.0.0` to `python -m biopb_control run`; that bind is
-fail-closed and refuses to come up without a token.
+`127.0.0.1:<base+3>` — **with either bind**. `--grpc-bind` publishes the *flight*
+plane (TLS-capable, token-gated), never this listener: the control is plaintext
+HTTP with no TLS support, so publishing it would put the data-plane token on the
+wire in the clear (biopb/biopb#614). Reach the UI from another machine over a
+tunnel, `ssh -L 8813:localhost:8813 <host>`, which `control start` prints
+whenever the plane goes public. To publish it anyway (behind your own TLS proxy),
+pass an explicit `--control-host 0.0.0.0` to `python -m biopb_control run`; that
+bind is fail-closed and refuses to come up without a token.
 
 Clients use the API to ask "is the data plane up, and bring it up if not" — this
 is what replaced `biopb-mcp` shelling out `biopb server start`.
