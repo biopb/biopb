@@ -24,6 +24,7 @@ from biopb_tensor_server.core.discovery import (
     generate_source_id,
     resolve_local_path,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
@@ -154,6 +155,9 @@ class SourceManager:
         # Upstreams (by url) whose last re-list failed -- a status signal (the fast
         # retry itself is driven by the period reset above).
         self._failed_upstreams: Set[str] = set()
+        # Last reported config error per upstream url, so a permanent
+        # misconfiguration is reported once rather than every re-list (#608).
+        self._upstream_config_errors: Dict[str, str] = {}
         self._dim_labels = dim_labels
         self._stability_window = stability_window
         self._probe_open_files = probe_open_files
@@ -870,11 +874,44 @@ class SourceManager:
                     self._initial_scan_done = True
                     self._fire_initial_scan_complete()
 
+    def _log_upstream_config_error(self, url: str, exc: Exception) -> None:
+        """Report a broken upstream config once, until it changes or clears.
+
+        A config error repeats identically on every re-list, so logging it each
+        pass would bury the (actionable) first report under noise -- but staying
+        silent forever hides a *different* breakage introduced by the next edit.
+        Keying the suppression on the message re-reports whenever the operator
+        changes something without fixing it (biopb/biopb#608).
+        """
+        message = str(exc)
+        if self._upstream_config_errors.get(url) == message:
+            logger.debug("upstream %s still misconfigured: %s", url, message)
+            return
+        self._upstream_config_errors[url] = message
+        logger.error(
+            "Upstream %s is MISCONFIGURED, not unreachable: %s. Its catalog is "
+            "kept as-is and re-listing continues at the slow cadence, but it "
+            "cannot succeed until the configuration is corrected.",
+            url,
+            message,
+        )
+
     def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
         """Re-list one upstream and set its next-due period from the outcome."""
         state = self._upstream_relist[upstream.url]
         try:
             changed = self._reconciler._reconcile_one_upstream(upstream)
+        except UpstreamConfigError as exc:
+            # Config, not connectivity: the fast cadence exists so a *recovering*
+            # upstream is picked up within a tick, and nothing about an unreadable
+            # trust anchor recovers on its own. Back all the way off instead of
+            # re-reading the same broken file every tick (biopb/biopb#608); a
+            # fixed config is still picked up, one slow tick later.
+            self._failed_upstreams.add(upstream.url)
+            state["period"] = self._upstream_max_period
+            state["countdown"] = state["period"]
+            self._log_upstream_config_error(upstream.url, exc)
+            return
         except Exception:
             # Failure (unreachable): retry on the fast cadence next tick.
             self._failed_upstreams.add(upstream.url)
@@ -888,6 +925,7 @@ class SourceManager:
             )
             return
         self._failed_upstreams.discard(upstream.url)
+        self._upstream_config_errors.pop(upstream.url, None)
         if changed:
             state["period"] = 1  # the catalog moved -> stay fast
         else:
@@ -909,6 +947,9 @@ class SourceManager:
         for upstream in upstreams:
             try:
                 self._reconciler._reconcile_one_upstream(upstream)
+            except UpstreamConfigError as exc:
+                self._failed_upstreams.add(upstream.url)
+                self._log_upstream_config_error(upstream.url, exc)
             except Exception:
                 self._failed_upstreams.add(upstream.url)
                 logger.warning(
@@ -919,6 +960,7 @@ class SourceManager:
                 )
             else:
                 self._failed_upstreams.discard(upstream.url)
+                self._upstream_config_errors.pop(upstream.url, None)
 
     def add_local_source(
         self,

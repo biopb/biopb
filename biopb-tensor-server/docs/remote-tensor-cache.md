@@ -189,13 +189,23 @@ generalizes the filesystem rescan into a periodic **upstream re-list** in
 `sources/reconciler.py`: `_reconcile_due_upstreams` runs each rescan tick (default
 30 s) with an **adaptive per-upstream cadence counted in ticks** — every tick while
 an upstream is changing or failing, spacing **doubling per unchanged re-list** up to
-`_UPSTREAM_RELIST_MAX_TICKS` (120 ≈ 1 h). Any change *or* failure resets to
-every-tick, so a new/recovered upstream is mirrored within ~one tick.
+`_UPSTREAM_RELIST_MAX_TICKS` (120 ≈ 1 h). Any change *or* connectivity failure
+resets to every-tick, so a new/recovered upstream is mirrored within ~one tick.
 `_reconcile_one_upstream` diffs the alias-namespaced desired set against
 currently-mirrored claims and applies adds/removes through the **same**
 `_commit_add_claim` / `_commit_remove_source` primitives as the filesystem
 reconcile. Best-effort: an unreachable upstream keeps its mirrored sources and
 retries.
+
+**Misconfiguration is not unreachability** (#608). An `UpstreamConfigError`
+(`core/errors.py`) — raised when a credentials profile's `tls_ca_file` cannot be
+read or is empty — is the one failure the fast cadence must *not* apply to: it
+will fail identically until an operator edits the config, so re-reading the same
+broken file every tick is pure waste under a log line that says "unreachable".
+It backs the upstream off to the maximum period instead, and is reported once
+(re-reported when the error text changes) as a config error. The serve-path
+expansion (`resolve_all_sources(tolerant=True)`) and the adapter-build site
+likewise still skip the source, but name it as configuration.
 
 **Unreachable upstream.** A proxy "resolve" is a cheap reconnect, not a cloud
 download, so recovery is **transparent** (no `UnresolvedSourceAdapter` consent

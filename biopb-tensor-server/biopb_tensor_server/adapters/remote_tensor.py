@@ -62,6 +62,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     peel_proxy_envelope,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -976,6 +977,10 @@ def _read_upstream_ca(profile: Any, profile_name: Optional[str]) -> Optional[byt
     configured an explicit anchor asked for *stronger* trust than the default, so
     silently substituting the weaker one -- on a typo'd path, at that -- would
     quietly undo the thing they configured.
+
+    It raises ``UpstreamConfigError`` (a ``ValueError``) so the reconcile paths
+    can tell this apart from an upstream that is merely down (biopb/biopb#608):
+    only an operator edit fixes it, so it must not drive the fast retry cadence.
     """
     ca_file = getattr(profile, "tls_ca_file", None) if profile is not None else None
     if not ca_file:
@@ -983,12 +988,12 @@ def _read_upstream_ca(profile: Any, profile_name: Optional[str]) -> Optional[byt
     try:
         pem = Path(ca_file).expanduser().read_bytes()
     except OSError as exc:
-        raise ValueError(
+        raise UpstreamConfigError(
             f"credentials profile {profile_name!r} sets tls_ca_file={ca_file!r}, "
             f"which could not be read: {exc}"
         ) from exc
     if not pem.strip():
-        raise ValueError(
+        raise UpstreamConfigError(
             f"credentials profile {profile_name!r} sets tls_ca_file={ca_file!r}, "
             f"which is empty"
         )

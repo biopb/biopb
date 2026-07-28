@@ -123,6 +123,22 @@ class UnknownResolutionError(TensorResolutionError):
     grpc_code = "UNKNOWN"
 
 
+class UpstreamConfigError(ValueError):
+    """An upstream's *configuration* is broken, not the upstream itself.
+
+    Raised when resolving a tensor-server upstream's credentials fails on the
+    config -- e.g. a credentials profile whose ``tls_ca_file`` cannot be read or
+    is empty. The distinction matters because the reconcile paths otherwise read
+    every failure as "the upstream is down" and pin the fast retry cadence to it:
+    an unreachable upstream recovers on its own, so retrying every tick is right,
+    while a file that cannot be read will fail identically forever
+    (biopb/biopb#608).
+
+    Subclasses ``ValueError`` so callers written before the type -- including the
+    ``except ValueError`` guards around source resolution -- still catch it.
+    """
+
+
 class WriteNotSupportedError(Exception):
     """The source format has no write contract (it is read-only).
 

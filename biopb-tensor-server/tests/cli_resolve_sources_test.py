@@ -320,6 +320,46 @@ class TestResolveAllSourcesOverrides:
         with pytest.raises(ValueError):
             resolve_all_sources(cfg, tolerant=False)
 
+    def test_a_broken_trust_anchor_is_reported_as_config_not_a_missing_path(
+        self, tmp_path, caplog
+    ):
+        """The tolerant path still skips, but says what actually happened (#608).
+
+        A configured trust anchor that cannot be read means the server is coming
+        up WITHOUT the stronger trust the operator asked for -- worth an error,
+        not the same warning a missing static file gets.
+        """
+        from biopb_tensor_server.core.remote import CredentialProfile, CredentialsConfig
+
+        good = tmp_path / "good.tif"
+        _write_tiff(str(good))
+        good_src = SourceConfig(url=str(good))
+        # Bare-host form: the credentials resolve happens while expanding it.
+        upstream = SourceConfig(
+            url="grpcs://lab-store:8815", credentials_profile="lab-store"
+        )
+        cfg = ServerConfig(
+            sources=[upstream, good_src],
+            credentials=CredentialsConfig(
+                default_profile=None,
+                profiles=[
+                    CredentialProfile(
+                        name="lab-store",
+                        storage_type="biopb-tensor",
+                        tls_ca_file=str(tmp_path / "typo.pem"),
+                    )
+                ],
+            ),
+        )
+
+        with caplog.at_level("ERROR"):
+            resolved = resolve_all_sources(cfg, tolerant=True)
+
+        # The healthy source is still served; the broken one is named loudly.
+        assert [s.local_path for s in resolved] == [good.resolve()]
+        assert "NOT SERVING" in caplog.text
+        assert "tls_ca_file" in caplog.text
+
 
 class TestAliasTreeRoot:
     """A local source's ``alias`` re-roots it (and everything under a configured
