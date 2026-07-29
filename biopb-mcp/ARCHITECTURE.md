@@ -133,15 +133,20 @@ launch re-spins it.
 
 `TensorConnection` is a **GUI-independent** data-access service — it imports
 neither Qt nor napari — so the `TensorBrowserWidget` and the headless MCP kernel
-share one implementation. It owns the tensor Flight client, the source catalog, and
-URL/token resolution.
+share one implementation. It owns the tensor Flight client and the source catalog.
+It resolves no endpoint from config and persists nothing.
 
-Its connect policy is **control-first**: it asks the control to ensure the data
-plane (which brings the plane up if down and returns the *authoritative* gRPC
-endpoint), and only when no control answers falls back to a direct connect on a
-locally-resolved `(url, token)`. It is a **pure client** — it never starts a server
-itself. Because `connect()` blocks on I/O it must be driven off the caller's main
-thread.
+Its connect policy: the **control is the only source of a data plane** (#628). One
+`ensure_data_plane` call both brings the plane up if it is down and returns the
+*authoritative* gRPC endpoint; no control answering means there is no plane to
+connect to, recorded as an actionable "run `biopb control start`" rather than a
+guess at an address. `$BIOPB_TENSOR_URL` is the one escape hatch, for a plane
+nothing supervises — it bypasses the control entirely, so pointing elsewhere never
+spawns a local plane as a side effect. Because there is no configured URL and no
+persisted last-endpoint, no endpoint the control did not name can arise at all. It
+is a **pure client** — it starts neither the plane (the control's job) nor the
+control (the stdio shim's job, and only its). Because `connect()` blocks on I/O it
+must be driven off the caller's main thread.
 
 Two policies worth knowing: a **local TLS plane is trusted from disk, never
 pinned** (its cert is already on this machine; a remote plane still TOFU-pins), and
@@ -182,3 +187,12 @@ two places:
   **only** authentication there — and `/mcp` itself is deliberately never proxied,
   reachable only by the shim that owns the child. Both are enforced control-side:
   [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE.md).
+
+One credential rule follows from the connect policy above: **the control's
+credential file never leaves the plane it belongs to** (#626/#628). The token the
+control writes to disk at start-up is *this machine's* credential for the plane the
+control owns, so it travels only to an endpoint the control itself named — the
+filesystem handoff that lets an agent-spawned session authenticate a token-gated
+local plane having inherited none of the control's environment. An address from
+`$BIOPB_TENSOR_URL` routed around the control on purpose, possibly to someone
+else's server, and is dialed with `$BIOPB_TENSOR_TOKEN` or with nothing.

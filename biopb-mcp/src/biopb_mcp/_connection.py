@@ -1,9 +1,21 @@
 """Standalone tensor data-access service.
 
-Owns the :class:`~biopb.tensor.TensorFlightClient`, the source catalog, and the
-server URL/token resolution + persistence. Both the napari ``TensorBrowserWidget``
-and the MCP kernel *consume* this service rather than the widget owning the
-client.
+Owns the :class:`~biopb.tensor.TensorFlightClient` and the source catalog. Both
+the napari ``TensorBrowserWidget`` and the MCP kernel *consume* this service
+rather than the widget owning the client.
+
+**The data plane comes from the control, or not at all** (biopb/biopb#628). There
+is no configured endpoint here, and nothing is persisted: :meth:`auto_connect`
+asks the control where the plane is, and a machine with no control running has no
+data plane to offer — an actionable status, not a guess at an address. The one
+exception is ``$BIOPB_TENSOR_URL``, which bypasses the control entirely and is
+dialed with ``$BIOPB_TENSOR_TOKEN`` or nothing.
+
+That shape is what keeps the control's credential file off endpoints it never
+named. It used to be resolved once, from a config/env fallback URL, and then
+presented to whichever endpoint the connect happened to reach (#626); the fix is
+not to gate the file per endpoint but to stop having endpoints the control did
+not name.
 
 This module deliberately imports **no Qt and no napari** so it can be used (and
 unit-tested) without a GUI — only ``biopb.tensor`` and the local config module.
@@ -23,13 +35,13 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Tuple
+from typing import Dict
 
 from biopb import _data_plane
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from ._config import CONFIG, get_setting
+from ._config import CONFIG
 from ._control_client import ensure_data_plane
 
 logger = logging.getLogger(__name__)
@@ -86,6 +98,16 @@ _local_ca = _data_plane.local_ca
 LocalTrustError = _data_plane.LocalTrustError
 
 
+# The whole answer when no control answers: since #628 the control is the only
+# source of a data plane, so this is not one branch of a fallback chain but the
+# terminal state -- and the user's next action is a single command. Shared with
+# `biopb mcp view`, which refuses to start rather than opening a viewer that can
+# reach no data (biopb.cli).
+NO_CONTROL_MESSAGE = (
+    "No biopb control plane is running, so there is no data plane to connect to. "
+    "Run `biopb control start`."
+)
+
 # Substrings (lowercased) that mark a connect failure as an authentication
 # problem across the Flight/gRPC stacks, vs a plain "server is down".
 _AUTH_ERROR_MARKERS = (
@@ -105,15 +127,22 @@ _UNREACHABLE_MARKERS = (
 )
 
 
-def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
+def connect_error_message(
+    exc: Exception, url: str, token: str | None, *, from_env: bool = False
+) -> str:
     """A human-readable reason for a failed :meth:`TensorConnection.connect`.
 
     Read by the widget's status label and the MCP ``server_status`` tool, which
     used to show a *blank* error here (issue #86 secondary). The common cause of
-    the silent failure was an auth problem — a token needed but missing or wrong
-    (e.g. a GUI-entered token lost across a kernel restart) — so that case names
-    the fix; an unreachable server gets a friendly hint; anything else echoes the
-    underlying error so nothing is hidden.
+    the silent failure was an auth problem — a token needed but missing or wrong —
+    so that case names the fix; an unreachable server gets a friendly hint;
+    anything else echoes the underlying error so nothing is hidden.
+
+    ``from_env`` marks a dial to ``$BIOPB_TENSOR_URL``, where the auth advice has
+    to say what it does *not* do: that endpoint bypassed the control, so the
+    control's credential file is deliberately not read for it (#628). Without
+    that, a user who knows a credential exists on this machine debugs the file
+    instead of setting the variable that would actually be used.
 
     Classification is by substring, which is why anything with an *exact* signal
     is matched by type first (see :class:`LocalTrustError`) -- an errno string
@@ -132,9 +161,20 @@ def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
             return (
                 f"Authentication failed: the tensor server at {url} rejected the token."
             )
+        if from_env:
+            return (
+                f"Authentication required: the tensor server at {url} needs a token. "
+                f"Set ${_data_plane.ENV_TOKEN}. This endpoint came from "
+                f"${_data_plane.ENV_URL}, so it bypassed the control plane and the "
+                "control's local credential file was not used for it."
+            )
+        # The control named this endpoint, so the token should have come from the
+        # credential file it writes at start-up -- an empty one is the anomaly to
+        # point at, ahead of the env-var workaround.
         return (
-            f"Authentication required: the tensor server at {url} needs a token. "
-            "Enter it in the Tensor Browser (or set BIOPB_TENSOR_TOKEN)."
+            f"Authentication required: the tensor server at {url} needs a token, "
+            "but the control plane's credential file held none. Restart the "
+            f"control (`biopb control start`), or set ${_data_plane.ENV_TOKEN}."
         )
     if any(m in low for m in _UNREACHABLE_MARKERS):
         return f"Cannot reach the tensor server at {url} — is it running?"
@@ -146,7 +186,7 @@ def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
 class TensorConnection:
     """Owns the tensor client, source catalog, and connection settings."""
 
-    def __init__(self, config: dict | None = None) -> None:
+    def __init__(self) -> None:
         self.client: TensorFlightClient | None = None
         self.sources: Dict[str, DataSourceDescriptor] = {}
         self.use_server_query: bool = False
@@ -164,12 +204,14 @@ class TensorConnection:
         # progressive-discovery freshness fields on an older server.
         self.last_health: dict | None = None
 
-        cfg = config if config is not None else CONFIG.as_dict()
-        # This is only the *fallback* endpoint: the data-plane URL's source of
-        # truth is the control (#413), asked for at connect time via
-        # ``ensure_data_plane`` in :meth:`auto_connect`. ``self.url`` starts at the
-        # config/env value and is overwritten with the live endpoint once connected.
-        self.url, self.token = self.resolve_from_config(cfg)
+        # Where we are dialed, and with what -- both unknown until a connect
+        # succeeds. The endpoint's source of truth is the control (#413), asked at
+        # connect time by :meth:`auto_connect`; nothing here is read from config
+        # and nothing is written back to it. ``token`` is simply the credential the
+        # live connection uses, published for the dask cache plugin (via
+        # ``on_connect``) and the ``server_status`` tool.
+        self.url: str | None = None
+        self.token: str | None = None
 
         # Optional callback invoked after every successful connect with the
         # final (url, token). Lets a caller react once the connection params are
@@ -192,43 +234,23 @@ class TensorConnection:
         self._watch_stop = threading.Event()
         self._watch_lock = threading.Lock()
 
-    @staticmethod
-    def resolve_from_config(config: dict) -> Tuple[str, str | None]:
-        """Resolve the *fallback* tensor-server URL and the token.
-
-        Since #413 the data-plane endpoint's single source of truth is the
-        control (see :meth:`auto_connect`); this resolves only the fallback used
-        when no control is reachable. Fallback order for the URL:
-        ``BIOPB_TENSOR_URL`` env -> ``tensor_browser.server_url`` config ->
-        default.
-
-        The token comes from ``BIOPB_TENSOR_TOKEN`` if set (an explicit override,
-        e.g. for a remote plane whose token the user supplies out of band),
-        otherwise from the local credential file the control writes to the user's
-        state dir (biopb/biopb#470). That file is what closes the gap for a *local
-        plane behind an optional token*: an agent spawns biopb-mcp over stdio with
-        none of the control's environment, so the token never arrived via
-        ``BIOPB_TENSOR_TOKEN`` — but the control handed it off on the filesystem
-        instead. ``None`` (a tokenless local plane, or no control has written a
-        credential) leaves us unauthenticated, which is correct for that case.
-        """
-        url = os.environ.get(_data_plane.ENV_URL) or get_setting(
-            config, "tensor_browser.server_url"
-        )
-        return url, _data_plane.resolve_token()
-
     @property
     def is_connected(self) -> bool:
         return self.client is not None
 
     def connect(
-        self, url: str, token: str | None = None
+        self, url: str, token: str | None = None, *, from_env: bool = False
     ) -> Dict[str, DataSourceDescriptor]:
         """Connect to *url* and list available sources.
 
-        Updates ``client``/``sources``/``url``/``token``/``use_server_query`` and
-        persists the URL to config. On failure, resets ``client``/``sources`` and
-        re-raises so the caller can drive its own error display.
+        Updates ``client``/``sources``/``url``/``token``/``use_server_query``. On
+        failure, resets ``client``/``sources`` and re-raises so the caller can
+        drive its own error display. Nothing is persisted: the endpoint comes from
+        the control (or ``$BIOPB_TENSOR_URL``) on every connect, so writing it back
+        to config would only create a stale second answer (#628).
+
+        ``from_env`` marks an ``$BIOPB_TENSOR_URL`` dial, and only sharpens the
+        failure message (see :func:`connect_error_message`).
 
         Before trusting the catalog, a best-effort health probe gates on the
         server being ready: the server binds its port *before* finishing its
@@ -272,7 +294,6 @@ class TensorConnection:
             self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
             self.last_status = "connected"
             self.last_message = ""
-            self.persist_url()
             if self.on_connect is not None:
                 try:
                     self.on_connect(self.url, self.token)
@@ -289,7 +310,9 @@ class TensorConnection:
             # Populate the reason (issue #86 secondary): the disconnect used to
             # surface as a blank error, hiding the common "token required/wrong"
             # cause behind a kernel restart.
-            self.last_message = connect_error_message(exc, url, token)
+            self.last_message = connect_error_message(
+                exc, url, token, from_env=from_env
+            )
             raise
 
     def refresh(self) -> Dict[str, DataSourceDescriptor]:
@@ -385,8 +408,11 @@ class TensorConnection:
         filesystem path, meaningful to the server only when they share a
         filesystem, so the drop affordance is enabled only for a localhost
         server. Cheap and GUI-free so the widget can call it on every drag.
+
+        ``False`` while disconnected: there is no endpoint to judge until a
+        connect resolves one, and no drop can succeed without a client anyway.
         """
-        return is_local_url(self.url)
+        return bool(self.url) and is_local_url(self.url)
 
     def add_source(
         self,
@@ -568,16 +594,6 @@ class TensorConnection:
             raise RuntimeError("Not connected")
         return self.client.query_sources(sql)
 
-    def persist_url(self) -> None:
-        """Save the current URL via the config singleton.
-
-        A targeted ``CONFIG.set`` touches only ``tensor_browser.server_url``;
-        keys this service does not own (e.g.
-        ``services.process_image_servers``) are preserved in the cached
-        merged config and re-persisted intact.
-        """
-        CONFIG.set("tensor_browser.server_url", self.url)
-
     def health(self):
         """Return the server health check result, or ``None`` if not connected."""
         return self.client.health_check() if self.client else None
@@ -610,6 +626,8 @@ class TensorConnection:
         timeout: float = 60.0,
         poll_interval: float = 0.5,
         max_interval: float = 5.0,
+        *,
+        from_env: bool = False,
     ) -> Dict[str, DataSourceDescriptor]:
         """Connect to a server we just launched, waiting it through boot.
 
@@ -624,7 +642,7 @@ class TensorConnection:
         last_exc: Exception | None = None
         while True:
             try:
-                return self.connect(url, token)
+                return self.connect(url, token, from_env=from_env)
             except ServerStarting as exc:
                 last_exc = exc
             # Just-launched server: tolerate connection failures and keep
@@ -643,23 +661,32 @@ class TensorConnection:
         return CONFIG.get("transport.server_start_timeout")
 
     def auto_connect(self) -> None:
-        """Connect to the data plane, bringing it up through the control if needed.
+        """Connect to the data plane the control owns, or record why we cannot.
 
         The single connect policy shared by **both** faces (MCP kernel + widget).
         The control (control plane) is the single source of truth for the data
-        plane since #413, so we ask it **first**: one :func:`ensure_data_plane`
+        plane since #413, so it is the *only* source: one :func:`ensure_data_plane`
         call both brings the plane up if it is down (idempotent when already
-        serving) and returns the authoritative gRPC endpoint. Only when no control
-        answers do we fall back to the config/env URL and a direct connect — the
-        standalone / pre-control case.
+        serving) and returns the authoritative gRPC endpoint. No control answering
+        means there is no data plane to connect to — an actionable "start the
+        control" status, not a guess at an address (#628). There is deliberately no
+        configured URL and no persisted last-endpoint to fall back to: a guessed
+        endpoint is how this machine's credential ended up being offered to servers
+        the control never named (#626).
+
+        ``$BIOPB_TENSOR_URL`` is the one way out, for a plane nothing supervises (a
+        dev server, another machine's). It **bypasses the control entirely** —
+        matching the core resolver's precedence (biopb/biopb#615) and, more
+        importantly, not spawning a local plane as a side effect of pointing
+        somewhere else. It authenticates from ``$BIOPB_TENSOR_TOKEN`` or not at
+        all; the control's credential file is never read for it.
 
         ``_connection`` is a **pure client** since the de-daemonization
-        (ARCHITECTURE.md, Lifecycle): it
-        never spawns a server itself, so the dependent no longer starts its
-        dependency (the bootstrap loop). The control is the durable root that
-        owns the data plane; here we only *ask* it to ensure the plane. If no
-        control is running, we record an actionable "start the control" status and
-        return — best-effort, no exception out.
+        (ARCHITECTURE.md, Lifecycle): it never spawns a server itself, so the
+        dependent no longer starts its dependency (the bootstrap loop). Nor does it
+        start the *control* — that is the stdio shim's job, and only the shim's,
+        because it is the one entry point with no human to ask (see
+        ``_control_client.start_control_detached``).
 
         Lives here, on the GUI-independent service, rather than in the MCP
         bootstrap or the widget so the policy is unit-testable without Qt/napari
@@ -678,50 +705,73 @@ class TensorConnection:
         ``last_message`` already record the outcome for ``server_status`` and the
         widget's error label), so a propagated error never aborts the caller.
         """
-        token = self.token
         timeout = self.server_start_timeout()
 
-        # Ask the control first (single source of truth, #413): this one POST both
-        # ensures the plane is up (idempotent when already serving) and returns the
-        # endpoint it actually bound. `None` => no control is running, so fall
-        # through to the standalone path. The control *owns* the plane and may bind
-        # it off-loopback (a lab intranet), so locality is never the gate -- if a
-        # control answered, its endpoint is authoritative.
+        override = os.environ.get(_data_plane.ENV_URL, "").strip()
+        if override:
+            self._connect_override(override, timeout)
+            return
+
+        # The control both ensures the plane is up and reports where it bound it.
+        # `None` => no control is running (or it failed to bring the plane up).
+        # The control *owns* the plane and may bind it off-loopback (a lab
+        # intranet), so locality is never the gate -- if a control answered, its
+        # endpoint is authoritative.
         # NOTE: `timeout` is spent on BOTH the ensure and the connect_when_booted
         # below, so the worst-case wall wait is ~2x it (see the
         # `transport.server_start_timeout` config note).
         snapshot = ensure_data_plane(timeout=timeout)
-        if isinstance(snapshot, dict):
-            # Control answered: it ensured the plane and reports where it bound it.
-            # Trust that endpoint (a real snapshot always carries it); fall back to
-            # our current url only if it somehow omitted it. Wait it through boot.
-            url = self.url = snapshot.get("grpc_url") or self.url
-            try:
-                self.connect_when_booted(url, token, timeout=timeout)
-            except Exception:  # noqa: BLE001 - best-effort; status already recorded
-                logger.exception(
-                    "auto_connect: data plane did not become ready after control ensure"
-                )
+        if not isinstance(snapshot, dict):
+            self.last_status = "error"
+            self.last_message = NO_CONTROL_MESSAGE
+            logger.info("auto_connect: no control plane reachable")
             return
 
-        # No control answered -> standalone / pre-control fallback: connect to the
-        # config/env URL (or the last endpoint we used) directly. We never spawn a
-        # server ourselves (the bootstrap loop the control-plane model removes), and
-        # there is no control to defer to, so an unreachable URL is a terminal,
-        # actionable error rather than something to wait on.
-        url = self.url
+        # A real snapshot always names the endpoint. If one somehow does not, there
+        # is nothing to dial -- and nothing the control named, so the credential
+        # file would not be ours to send anyway. Say so instead of guessing.
+        url = snapshot.get("grpc_url")
+        if not url:
+            self.last_status = "error"
+            self.last_message = (
+                "The biopb control plane is running but did not report a data-plane "
+                "endpoint. Check `biopb control status`."
+            )
+            logger.warning("auto_connect: control snapshot carried no grpc_url")
+            return
+
+        self.url = url
+        # The endpoint is the control's own, so its credential file is exactly the
+        # right token for it -- the #470 handoff an agent-spawned biopb-mcp depends
+        # on, having inherited none of the control's environment.
+        token = _data_plane.resolve_token()
         try:
-            self.connect(url, token)
+            self.connect_when_booted(url, token, timeout=timeout)
+        except Exception:  # noqa: BLE001 - best-effort; status already recorded
+            logger.exception(
+                "auto_connect: data plane did not become ready after control ensure"
+            )
+
+    def _connect_override(self, url: str, timeout: float) -> None:
+        """Dial the ``$BIOPB_TENSOR_URL`` escape hatch (see :meth:`auto_connect`).
+
+        The credential file is off the table here: this endpoint bypassed the
+        control, so the only token that may travel with it is one the user named
+        explicitly (#626/#628). Unlike the control path there is nothing to wait on
+        boot for — nobody promised to start this server — so an unreachable address
+        is terminal, and only a server that answers ``STARTING`` is waited through.
+        """
+        self.url = url
+        token = _data_plane.resolve_token(allow_credential_file=False)
+        try:
+            self.connect(url, token, from_env=True)
         except ServerStarting:
             # Up but still scanning its data folder: wait it through to SERVING.
             try:
-                self.connect_when_booted(url, token, timeout=timeout)
+                self.connect_when_booted(url, token, timeout=timeout, from_env=True)
             except Exception:  # noqa: BLE001
                 logger.exception("auto_connect: %s did not finish starting", url)
-        except Exception:  # noqa: BLE001
-            self.last_status = "error"
-            self.last_message = (
-                "No data plane, and no biopb control (control plane) to start one. "
-                "Run `biopb control start`."
+        except Exception:  # noqa: BLE001 - connect() recorded the reason
+            logger.info(
+                "auto_connect: %s (from $%s) unreachable", url, _data_plane.ENV_URL
             )
-            logger.info("auto_connect: no data plane and no control reachable")

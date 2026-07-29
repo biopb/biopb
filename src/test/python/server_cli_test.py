@@ -78,6 +78,74 @@ class TestMcpGate:
         assert "biopb-mcp" in res.output and "not installed" in res.output
 
 
+class TestViewRequiresControl:
+    """`mcp view` needs a control plane to have any data to show (#628).
+
+    The check runs *before* the child spawns, so the user meets the error in this
+    terminal rather than after napari's multi-second import. Unlike the stdio
+    shim, `view` never starts the control itself -- a person is at this terminal.
+
+    The probe is `_query_control_health`, shared with `control status`, so these
+    stub that rather than urllib: "a control answered" has one definition and the
+    gate must not grow a second one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_env_url(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
+
+    def test_passes_when_control_answers(self, monkeypatch):
+        monkeypatch.setattr(
+            cli, "_query_control_health", lambda *_a, **_k: {"control": "ok"}
+        )
+        cli._require_control_for_view()  # no raise
+
+    def test_exits_when_no_control(self, monkeypatch):
+        # None is what the shared probe returns for unreachable/unparseable.
+        monkeypatch.setattr(cli, "_query_control_health", lambda *_a, **_k: None)
+        with pytest.raises(typer.Exit) as ei:
+            cli._require_control_for_view()
+        assert ei.value.exit_code == 1
+
+    def test_probes_the_discovered_control_endpoint(self, monkeypatch):
+        # Follow a control on a non-default --base-port: the gate must ask where
+        # a control actually is, not assume 8813 (`_control_endpoint`).
+        monkeypatch.setattr(cli, "_control_endpoint", lambda: ("10.0.0.5", 9913))
+        seen = []
+
+        def _probe(host, port, *_a, **_k):
+            seen.append((host, port))
+            return {"control": "ok"}
+
+        monkeypatch.setattr(cli, "_query_control_health", _probe)
+        cli._require_control_for_view()
+
+        assert seen == [("10.0.0.5", 9913)]
+
+    def test_env_url_bypasses_the_check(self, monkeypatch):
+        # $BIOPB_TENSOR_URL names a plane directly and skips the control, so it
+        # must skip this gate too -- otherwise the escape hatch never reaches view.
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:7")
+
+        def _never(*_a, **_k):
+            raise AssertionError("control must not be probed")
+
+        monkeypatch.setattr(cli, "_query_control_health", _never)
+        cli._require_control_for_view()  # no raise
+
+    def test_view_refuses_to_spawn_without_control(self, monkeypatch):
+        monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
+        monkeypatch.setattr(cli, "_query_control_health", lambda *_a, **_k: None)
+        popen = MagicMock()
+        monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+        res = CliRunner().invoke(cli.app, ["mcp", "view"])
+
+        assert res.exit_code == 1
+        assert "biopb control start" in res.output
+        popen.assert_not_called()
+
+
 class TestAwaitListening:
     """Readiness probe: did the daemon actually bind, not just stay alive."""
 

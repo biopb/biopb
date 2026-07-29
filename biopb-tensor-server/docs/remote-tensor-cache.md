@@ -269,13 +269,12 @@ cache, no unification, a second connection). So the client moved **proxy-first**
 the tensor browser talks to **one** server (the local one), and remote data is
 reached by adding a `tensor-server` source. The inline "connect to any server" form
 (Server URL / Token fields + Connect button) is removed; **kept** are Refresh, the
-source tree, the server-side `query_sources` path, the background source-watcher,
-and `TensorConnection.auto_connect()`'s auto-start-a-local-server fallback. The
-endpoint is still *resolved* (`TensorConnection.resolve_from_config`:
-`BIOPB_TENSOR_URL` → `tensor_browser.server_url` config → `grpc://localhost:8815`) —
-load-bearing because bootstrap points the client at its managed proxy on a
-non-default port — only in-widget *editing* goes away. The lost "I have data on a
-remote server" workflow redirects to an "add a proxied source" affordance.
+source tree, the server-side `query_sources` path, and the background
+source-watcher. The endpoint is *resolved* at connect time by asking the control
+plane, which owns the data plane and knows the port it bound
+(`TensorConnection.auto_connect`, biopb/biopb#628) — load-bearing because the
+managed proxy may sit on a non-default port. The lost "I have data on a remote
+server" workflow redirects to an "add a proxied source" affordance.
 
 ## Local-tensor-server config editing
 

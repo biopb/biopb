@@ -37,7 +37,7 @@ from biopb_mcp._connection import TensorConnection
 from biopb_mcp.mcp._process_ops import build_ops
 
 config = load_config()
-_conn = TensorConnection(config)
+_conn = TensorConnection()
 _conn.auto_connect()          # synchronous best-effort connect (audit; no async service)
 client = _conn.client
 
@@ -168,9 +168,10 @@ _INTRO = (
     "*do* carry across cells. Cells whose header reads `interrupted` / `error` "
     "are kept verbatim — re-running one may re-trigger the same hang or "
     "failure, so skip or edit it. Only the most recent jobs are retained, so a "
-    "long session may be missing its start. `auto_connect()` persists the server "
-    "URL to your config; under a headless `nbconvert --execute` the `viewer` "
-    "becomes `None` and viewer cells fail."
+    "long session may be missing its start. `auto_connect()` asks the control "
+    "plane where the data plane is, so a re-run needs a running control "
+    "(`biopb control start`) or `$BIOPB_TENSOR_URL`; under a headless "
+    "`nbconvert --execute` the `viewer` becomes `None` and viewer cells fail."
 )
 
 

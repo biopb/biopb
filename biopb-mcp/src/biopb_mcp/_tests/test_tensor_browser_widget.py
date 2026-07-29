@@ -272,8 +272,10 @@ class TestConnect:
         w._auto_connect()
         workers.pop(0)()
 
+        # The fallback names no endpoint: without a recorded reason there is no
+        # resolved address to name either (#628).
         assert w._message_level == "error"
-        assert "Cannot reach tensor server" in w._message_label.text()
+        assert "Could not reach the biopb data plane" in w._message_label.text()
 
     def test_empty_catalog_shows_error(self, widget):
         w, conn, workers = widget
@@ -318,17 +320,17 @@ class TestConnect:
         assert w._refresh_button.isEnabled()
         assert "SQL filter" in w._filter_input.placeholderText()
 
-    def test_connect_button_applies_token_and_reconnects(self, widget):
-        w, conn, workers = widget
-        # The data-plane URL is no longer user-editable (#413): the control owns
-        # it and auto_connect resolves it. The Connect button only picks up the
-        # typed token and reconnects; there is no Server URL field to type into.
+    def test_connect_button_is_a_plain_retry(self, widget):
+        w, _conn, workers = widget
+        # Neither the URL nor the token is user-editable any more (#413/#628):
+        # the control owns the endpoint and hands off its credential on disk, so
+        # auto_connect resolves both and Connect is just "try again" -- which is
+        # what a user needs after starting the control.
         assert not hasattr(w, "_server_input")
-        w._token_input.setText("secret")
+        assert not hasattr(w, "_token_input")
 
         w._on_connect_clicked()
 
-        assert conn.token == "secret"
         assert len(workers) == 1  # a connect worker was started
 
 

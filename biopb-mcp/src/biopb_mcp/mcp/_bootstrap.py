@@ -231,37 +231,6 @@ def _install_window_close_hook(viewer):
         logger.exception("Failed to install napari window-close hook")
 
 
-def _make_token_report_hook():
-    """Return a ``(url, token) -> None`` callback that reports the connection to
-    the launcher, or ``None`` when no report pipe is configured.
-
-    The launcher inherits the *write* end of a pipe via ``BIOPB_TOKEN_REPORT_FD``
-    (set by ``KernelHost._launch``, name = ``_kernel.ENV_TOKEN_REPORT_FD``) and
-    caches the latest token in the MCP-server process so it can re-inject it into
-    the next kernel's env — persisting a token the user entered in the Tensor
-    Browser across ``restart_kernel`` without it ever touching disk (issue #86).
-    Wired into ``TensorConnection.on_connect`` so it fires on every successful
-    connect. One ``url\\ttoken`` line per connect (a single small write, atomic
-    under PIPE_BUF). Fully best-effort: a missing fd or any IO error is swallowed.
-    """
-    fd_str = os.environ.get("BIOPB_TOKEN_REPORT_FD")
-    if not fd_str:
-        return None
-    try:
-        fd = int(fd_str)
-    except ValueError:
-        return None
-
-    def _report(url, token):
-        line = f"{url or ''}\t{token or ''}\n".encode()
-        try:
-            os.write(fd, line)
-        except OSError:
-            pass
-
-    return _report
-
-
 def _start_update_check(viewer, config):
     """Kick off the kernel-start update reminder (issue #87), GUI branch only.
 
@@ -554,7 +523,7 @@ def _bootstrap_impl():
     # 2. Data-access service (dask-free), shared by the widget and the agent
     #    namespace. Created before dask so the viewer can come up without waiting
     #    on the distributed Client attach below.
-    conn = TensorConnection(config)
+    conn = TensorConnection()
 
     # 3. Attach dask on a background thread so the viewer opens immediately. The
     #    cluster is session-child-owned and may still be registering workers, and
@@ -596,18 +565,12 @@ def _bootstrap_impl():
         _register_cache_plugin(client, _dask_state["url"], _dask_state["token"], config)
 
     # on_connect fires (in the kernel) after every successful connect with the
-    # final (url, token): it bounds the dask chunk cache (token only known
-    # post-connect) and reports the token up to the launcher so it survives a
-    # kernel restart (issue #86). The report hook is None when no report pipe is
-    # configured (Windows, or a bare unit test).
-    _report_token = _make_token_report_hook()
-
+    # final (url, token), which is what bounds the dask chunk cache -- the token is
+    # only known post-connect.
     def _on_connect(url, token):
         with _dask_lock:
             _dask_state.update(url=url, token=token, connected=True)
             _register_cache_if_ready()
-        if _report_token is not None:
-            _report_token(url, token)
 
     conn.on_connect = _on_connect
 
