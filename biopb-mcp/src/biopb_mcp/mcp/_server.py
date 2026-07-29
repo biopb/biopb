@@ -90,8 +90,21 @@ _BASE_INSTRUCTIONS = (
 _SKILLS_INSTRUCTIONS = (
     "At the start of a task, call `find_skills` to check for a curated workflow "
     "before improvising; read the matching `skill://<id>` resource for the "
-    "steps. After accomplishing a task, ask the user whether a new skill should "
-    "be generated and added to the agent's toolbox for future use."
+    "steps. Results marked `origin: local` are the user's own unreviewed skills "
+    "from ~/.config/biopb/skills; prefer a curated one when both fit. After "
+    "accomplishing a task, ask the user whether a new skill should be generated "
+    "and added to the agent's toolbox for future use.\n"
+    "\n"
+    "Skills name three checkpoint types in their steps; honor them:\n"
+    "- confirm-input: ask before computing, but only for facts the data cannot "
+    "give you (voxel spacing, which channel is which, expected object size).\n"
+    "- visual check: put the intermediate on the viewer and report two or three "
+    "numbers with it -- never a screenshot alone, and report the numbers alone "
+    "when the session is headless or the data too large to show usefully.\n"
+    "- validate-and-gate: stop and get the user's agreement before anything "
+    "expensive or hard to walk back.\n"
+    "Destructive steps always ask first, whatever a skill says: restarting the "
+    "kernel, interrupting a running job, overwriting a layer, or writing files."
 )
 
 # Appended to _BASE_INSTRUCTIONS when the session is headless. Phrased to fire

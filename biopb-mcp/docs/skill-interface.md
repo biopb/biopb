@@ -1,10 +1,12 @@
 # Skill Interface — Curated Agent Workflows Sourced from biopb.org
 
 **Status:** Partly implemented. P0 contract delivered in `biopb-site` (schema,
-builder/validator, 3 example skills, generated `catalog.json` — see Appendices
-A/B); **P2 (MCP retrieval) shipped** — the `find_skills` tool, the
-`skill://{skill_id}` resource, and the `services.skills_*` config are live in
-`biopb-mcp` (`mcp/_skills.py`, `mcp/_server.py`). P1 and P3–P4 not started.
+builder/validator, generated `catalog.json` — see Appendices A/B), which now also
+enforces the required body sections and carries the catalog's scope and authoring
+rules in `skills/ROADMAP.md`; **P2 (MCP retrieval) shipped** — the `find_skills`
+tool, the `skill://{skill_id}` resource, the `services.skills_*` config, and the
+local skills directory (§3f) are live in `biopb-mcp` (`mcp/_skills.py`,
+`mcp/_server.py`). P1 and P3–P4 not started.
 **Component:** `biopb-mcp` (discovery + retrieval), `biopb-site` (authoring + publishing)
 **Related:** the MCP `guide://*` resources and `find_skills`-style discovery, the
 `mcp.services` config block, the fail-open remote fetch in
@@ -152,8 +154,9 @@ Serving falls out of the current deploy:
 **CI wiring** (`.github/workflows/`):
 
 - `docs-check.yml` (PR): run `python scripts/build_skills_catalog.py --check`.
-  Malformed frontmatter, duplicate ids, unknown tags → **fail the PR**. This *is*
-  the curation gate — the author gets the error, never the runtime agent.
+  Malformed frontmatter, duplicate ids, a missing required section → **fail the
+  PR**. This *is* the curation gate — the author gets the error, never the
+  runtime agent. Tags are *not* gated: see §5.1.
 - `deploy.yml` (push to main): run `python scripts/build_skills_catalog.py`
   **before** the landing rsync, so the generated `catalog.json` is in-tree at
   rsync time. The landing rsync already uploads repo root; add `PyYAML` to
@@ -205,7 +208,9 @@ the body from `url`, verifies `sha256`, and caches it.
 
 - `httpx` GET the catalog with a short timeout. On **any** error
   (offline/DNS/TLS/HTTP/parse) degrade to: on-disk cache → **bundled snapshot**
-  shipped in the package. Never raise into bootstrap.
+  shipped in the package. Never raise into bootstrap. (The snapshot carries the
+  meta-skill, so an install that has never reached the network still knows how to
+  author one; refreshing it is a data drop, not a code change.)
 - Cache catalog + bodies under the biopb cache dir with a TTL; `sha256` is the
   body cache key.
 - Guard on `catalog_version`; an unknown future version keeps the last-good /
@@ -225,15 +230,47 @@ machinery):
     "skills_enabled": True,  # on by default
     "skills_catalog_url": "https://biopb.org/skills/catalog.json",
     "skills_cache_ttl": 3600,
+    "skills_local_dir": "",  # empty -> ~/.config/biopb/skills
 }
 ```
 
-`skills_enabled` is **on by default** — a default install discovers skills. That
-rests on the fail-open resolution in 3c: the bundled snapshot ships in the
-package, so `find_skills` answers even with no network and the switch never
-depends on reaching biopb.org. Set it false to keep the subsystem dormant:
-`find_skills` returns nothing, no catalog fetch is attempted, and the agent is
-not told to consult skills.
+`skills_enabled` is **on by default** — a default install discovers skills — and
+it is the switch for the *whole* subsystem: false means no fetch, no local scan,
+an empty `find_skills`, and no skills directive in the handshake.
+
+`skills_local_dir` is the **personal tier** (§3f). It is deliberately governed by
+the same switch: a user who turns skills off is turning the feature off, not just
+the network half.
+
+### 3f. Local (user-authored) skills
+
+`~/.config/biopb/skills/*.md` (`biopb._locations.mcp_skill_dir()`) are merged
+into the catalog beside the curated entries. The distinction that matters: the
+§3c chain is three copies of *one* catalog, so first-one-wins is right there;
+local files are a **second source** and therefore union, with local winning a
+shared id (a user editing their own copy of a published skill expects theirs).
+
+- **Read on every call, not TTL-cached** — a personal skill is usually one the
+  user is still editing, and an authoring loop that needs a restart to see a
+  draft is unusable. Deleting the file retracts the skill just as immediately.
+- **Body comes from disk**, with no `sha256` and no body cache: the file *is* the
+  source of truth, so there is nothing to verify it against.
+- **Consumer stays lenient** (the §"variation is a publisher problem" principle):
+  a ~25-line frontmatter reader, no PyYAML in this stdlib-only module, `id`
+  inferred from the filename and `description` from the first H1/prose line, so a
+  bare markdown file with no frontmatter still loads. Strictness — required
+  sections — stays at the publish boundary in `biopb-site`,
+  which is the only place with the tooling. A second copy of those rules in the
+  install would be a constant to drift, not a safeguard.
+- **Fail-open per file**: one unreadable or malformed file is skipped, never
+  fatal; a leading `_` marks a file private, as in the kernel-plugin loader.
+- **Provenance travels**: every entry carries `origin` (`local`/`catalog`), and
+  `find_skills` returns it so the agent can tell a personal draft from a
+  reviewed one rather than presenting both as curated.
+
+The three sharing tiers are then: **personal** = this directory, **lab** =
+`skills_catalog_url` pointed at a self-hosted catalog, **public** = biopb.org.
+Nothing else needs a sync mechanism.
 
 ### 3e. Instructions
 
@@ -254,7 +291,7 @@ switches skills off is never pointed at a catalog that would come back empty.
 1. Author (often the agent, per the existing close-out prompt) drafts
    `skills/<id>.md` with frontmatter.
 2. PR to `biopb-site` → `docs-check.yml` runs
-   `build_skills_catalog.py --check` (schema / uniqueness / tag validation) +
+   `build_skills_catalog.py --check` (schema / uniqueness / required sections) +
    `mkdocs build --strict`.
 3. Human review → merge to `main` → `deploy.yml` regenerates `catalog.json` and
    publishes. Live within one deploy.
@@ -279,7 +316,7 @@ strict and uniform. Field policy:
 | `id` | **Inferable** — default to filename stem; if the author supplies one it *must* equal the stem (reject mismatch → avoids drift). |
 | `description` | **Required — hard-reject if missing.** The one field discovery actually needs. |
 | `title` | Fallback chain: frontmatter → first `#` H1 → humanized `id` (warn). |
-| `tags` | Coerce `str → [str]`, lowercase, validate against a controlled vocabulary (unknown tag → fail, keeps the taxonomy curated). |
+| `tags` | Coerce `str → [str]` and lowercase. **Not** validated against a fixed vocabulary: a closed set needs an edit for every new topic and fails the PR introducing it, to enforce a judgment the reviewer curating the catalog is making anyway. |
 | `version` | Require semver, else default `0.0.0`. |
 | `updated` | **Ignore any author value**; always derive from `git log -1` — authors forget to bump it. |
 | `requires` | Optional; coerce to list. |
@@ -364,8 +401,9 @@ appears.
 3. **Skill home** — sources live in **biopb-site** (matches "pulled from
    biopb.org"). Alternative: keep them in the biopb monorepo and have the site build
    fetch them — more moving parts; not recommended.
-4. **Tag vocabulary** — start with a small controlled list validated in `--check`,
-   or allow free tags initially and tighten later.
+4. **Tag vocabulary** — resolved: free tags, curated by review. A controlled list
+   was tried and removed; enforcement bought nothing the reviewer wasn't already
+   doing, and cost an edit per new topic.
 
 ### 7.5 Local skills — resolved: a local *source*, not a parallel mechanism
 
@@ -470,20 +508,20 @@ standing cost.
 ## Appendix A — canonical frontmatter contract (shipped)
 
 Implemented as **stdlib-only** in `biopb-site/scripts/skill_schema.py` — no pydantic,
-so the docs toolchain needs only PyYAML. Holds the version constants, the controlled
-tag vocabulary, the `CatalogEntry` dataclass (what the build emits), and the
+so the docs toolchain needs only PyYAML. Holds the version constants, the required
+body sections, the `CatalogEntry` dataclass (what the build emits), and the
 `coerce_list` helper. Excerpt:
 
 ```python
 CATALOG_VERSION = 1            # schema of catalog.json; server guards, fails open
 CURRENT_SPEC_VERSION = 1       # current authoring dialect (migrate() up-converts older)
 
-# Unknown tags fail --check, keeping the taxonomy curated. Grow deliberately via PR.
-ALLOWED_TAGS = {
-    "segmentation", "detection", "restoration", "super-resolution",
-    "measurement", "io", "visualization", "annotation", "ops", "tensor",
-    "cellpose", "workflow",
-}
+# Body structure every skill must carry, as normalized H2 headings. Order is free,
+# extra sections allowed. Tags are coerced but deliberately NOT gated.
+REQUIRED_SECTIONS = (
+    "when to use", "when not to use", "parameters",
+    "steps", "failure modes", "next steps",
+)
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 KEBAB = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -525,7 +563,7 @@ point — one pass per file:
 2. **migrate** the dialect to `CURRENT_SPEC_VERSION`.
 3. **infer / coerce** (tolerant read): `id` defaults to the stem and must match it;
    `title` falls back to the first H1 then a humanized id (warn); `tags` coerced +
-   lowercased + checked against `ALLOWED_TAGS`; `version` checked semver; `updated`
+   lowercased (not gated); `version` checked semver; `updated`
    taken from `git log -1` (author value ignored); `description` required.
 4. **emit** a canonical `CatalogEntry` with `sha256` of the raw file, or `None` on
    any error.

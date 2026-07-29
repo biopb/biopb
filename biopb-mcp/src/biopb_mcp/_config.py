@@ -395,6 +395,14 @@ class ServicesConfig:
         "Seconds a fetched skills catalog is reused before re-fetching. A stale "
         "on-disk cache is still used past this if the network is down.",
     )
+    skills_local_dir: str = _h(
+        "",
+        "Directory of user-authored skill files (*.md) merged into the catalog "
+        "beside the curated one; empty -> ~/.config/biopb/skills. Personal and "
+        "unreviewed (find_skills reports them as origin=local), re-read on every "
+        "discovery so an edit is live without a restart. Off with skills_enabled "
+        "like the rest of the subsystem.",
+    )
     namespace_enabled: bool = _h(
         True,
         "Load user 'bring your own tool' plugins into the agent kernel namespace at "
