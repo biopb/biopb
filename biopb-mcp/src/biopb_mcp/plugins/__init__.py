@@ -20,7 +20,8 @@ Conventions:
 - The module docstring's first line is the summary shown in the control
   dashboard's kernel-plugin panel.
 
-See ``rolling_ball.py`` in this directory for a worked example — a fast ImageJ
-port of rolling-ball background subtraction — that biopb-mcp ships as its
-reference plugin.
+Two plugins ship here. ``rolling_ball.py`` is the worked example — a fast ImageJ
+port of rolling-ball background subtraction — and ``segmentation_qc.py`` backs the
+``segmentation-qc-metrics`` skill, whose body carries the call signature while the
+matching itself stays here where it is unit-tested.
 """
