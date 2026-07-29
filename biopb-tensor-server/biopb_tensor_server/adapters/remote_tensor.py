@@ -232,6 +232,18 @@ def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
         return ids, False
 
 
+# Transport failures, as opposed to "this upstream has no SQL catalog". The
+# id-only fallback dials the same endpoint and fails identically, so these mean
+# the upstream is down -- which the re-list scheduler already reports, on a
+# window. Logging them here too only doubles an already-repeating traceback.
+_UNREACHABLE_ERRORS = (
+    flight.FlightUnavailableError,
+    flight.FlightTimedOutError,
+    flight.FlightUnauthenticatedError,
+    OSError,
+)
+
+
 def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]], bool]:
     """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
 
@@ -265,7 +277,8 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
         )
         return rows, True
     except Exception as exc:
-        logger.warning(
+        logger.log(
+            logging.DEBUG if isinstance(exc, _UNREACHABLE_ERRORS) else logging.WARNING,
             "upstream %s bulk catalog fetch failed (%s); falling back to id-only "
             "enumeration + per-source sync",
             location,
