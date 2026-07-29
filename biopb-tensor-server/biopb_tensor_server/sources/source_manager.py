@@ -172,27 +172,23 @@ class SourceManager:
         # Thread management
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        # Background precache hook: called with a source_id when a source is
-        # committed *after* the initial scan completes. Gated on
-        # ``_initial_scan_done`` so the (possibly large) startup set is routed to
-        # the slow precache *backlog* instead of the prompt enqueue -- only
-        # sources discovered live (later rescans) warm promptly. See
-        # ``_commit_add_claim``.
+        # Background precache hook: called with a source_id when a user's own
+        # runtime addition is committed -- gated on ``_initial_scan_done`` so the
+        # (possibly large) startup set routes to the slow precache *backlog*
+        # instead. See ``_notify_source_committed`` for the full routing table.
         self._on_source_committed: Optional[Callable[[str], None]] = None
+        # Its backlog-tier counterpart, for sources an upstream re-list commits.
+        self._on_source_committed_backlog: Optional[Callable[[str], None]] = None
         # Flipped True at the end of the first successful full rescan. Under
         # progressive discovery that scan runs in the event loop *after* start(),
         # so this -- not "are we past start()" -- is the correct startup/runtime
         # boundary for the precache gate.
         self._initial_scan_done = False
-        # Set only for the duration of the boot-tick upstream re-list, when the
-        # local walk earlier in the *same* rescan already flipped
-        # ``_initial_scan_done`` True (see ``_handle_rescan``). It keeps the
-        # startup upstream mirror -- committed after that flip -- routed to the
-        # slow backlog instead of the prompt enqueue, exactly as the startup set
-        # is meant to be (the mirror is part of the startup catalog regardless of
-        # which half of the tick registers it). Event-loop thread only, so a plain
-        # flag is safe.
-        self._suppress_live_precache = False
+        # Set for the duration of every upstream re-list: sources it commits are a
+        # bulk mirror, so they route to precache's slow backlog rather than its
+        # live tier, whichever tick registers them (biopb/biopb#637). Event-loop
+        # thread only, so a plain flag is safe.
+        self._precache_route_to_backlog = False
         # Best-effort callback fired once, when the first full scan completes
         # (from the event-loop thread). The launcher uses it to seed the precache
         # backlog with the startup set at the moment the catalog is established.
@@ -280,6 +276,18 @@ class SourceManager:
         first full scan flips the startup boundary -- see ``_commit_add_claim``.
         """
         self._on_source_committed = callback
+
+    def set_source_committed_backlog_hook(
+        self, callback: Optional[Callable[[str], None]]
+    ) -> None:
+        """Register the hook called with a ``source_id`` when an *upstream re-list*
+        commits a source.
+
+        The launcher wires this to the precache worker's backlog enqueue: a mirrored
+        catalog is bulk work whatever tick it lands on, so it must not compete with
+        serving on the live tier. See ``_notify_source_committed``.
+        """
+        self._on_source_committed_backlog = callback
 
     def set_initial_scan_complete_hook(
         self, callback: Optional[Callable[[], None]]
@@ -405,33 +413,31 @@ class SourceManager:
         re-list ran first, so on the boot tick local sources surfaced only after
         every upstream source had been registered, minutes later.)
 
-        Precache routing subtlety: on the boot tick the local walk flips
-        ``_initial_scan_done`` True *before* the upstream re-list runs, which
-        would otherwise make ``_commit_add_claim`` prompt-enqueue the entire
-        startup upstream mirror at the precache worker's un-idle-gated live tier
-        (hundreds of upstream chunk fetches competing with serving -- the very
-        thing this reorder protects the local catalog from). The whole tick is a
-        startup tick if the scan had not completed when it began, so the upstream
-        mirror it registers is startup set and must route to the slow backlog. We
-        suppress the live enqueue across just that re-list.
+        Precache routing: an upstream re-list mirrors somebody else's catalog, so
+        every source it commits is bulk work and belongs in precache's backlog tier
+        -- bounded by cache headroom and deferred behind live reads -- never in the
+        live tier, which exists for the source a user just added here. Which tick
+        registers a mirrored source says nothing about that (an upstream's adaptive
+        backoff spreads the startup mirror across many ticks, and the boot tick
+        flips ``_initial_scan_done`` mid-re-list for an upstream-only config), so we
+        route on provenance and hold the flag across the whole re-list. Routing on
+        commit *timing* instead is what made a 349-source mirror warm at live
+        priority, hauling chunks over the network into an already-full cache
+        (biopb/biopb#637).
         """
         # Serialize the whole pass against a concurrent runtime add_local_source
         # (Flight thread) so the two never mutate the confirmed catalog at once.
         with self._catalog_lock:
-            startup_tick = not self._initial_scan_done
             self._rescan_monitored_dirs()
             # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
             # cadence -- fast (every tick) while changing/failing, backing off toward
             # full_rescan_interval while a source set stays stable. Runs AFTER the
             # local walk (see docstring).
-            if startup_tick:
-                self._suppress_live_precache = True
-                try:
-                    self._reconcile_due_upstreams()
-                finally:
-                    self._suppress_live_precache = False
-            else:
+            self._precache_route_to_backlog = True
+            try:
                 self._reconcile_due_upstreams()
+            finally:
+                self._precache_route_to_backlog = False
 
     def _rescan_monitored_dirs(self) -> None:
         """Walk the monitored directories and reconcile the discovered catalog.
@@ -746,25 +752,36 @@ class SourceManager:
         """Precache routing gate for a freshly committed source (injected into
         the Reconciler as ``notify_source_committed``).
 
-        Only live additions -- those committed after the initial scan completes,
-        and outside the boot-tick upstream re-list guarded by
-        ``_suppress_live_precache`` -- are prompt-enqueued; the startup set routes
-        to the slow backlog instead. This manager owns the startup/suppress state
-        that decides that, so the gate lives here rather than in the Reconciler.
-        Best-effort: a hook failure must never abort a source commit.
+        Three routes, decided by how the source arrived:
+
+        - Committed by an upstream re-list (``_precache_route_to_backlog``): bulk
+          mirror -> backlog tier, regardless of the startup gate. Mirrored sources
+          have no local mtime, so the launcher's startup seed cannot reach them and
+          this is their only path into precache at all (biopb/biopb#637).
+        - Committed live, after the initial scan: a user's own runtime addition ->
+          prompt enqueue.
+        - Committed before the initial scan completes: startup set -> dropped here,
+          then seeded into the backlog wholesale by the first-scan hook.
+
+        This manager owns the state behind that decision, so the gate lives here
+        rather than in the Reconciler. Best-effort: a hook failure must never abort
+        a source commit.
         """
-        if (
-            self._initial_scan_done
-            and not self._suppress_live_precache
-            and self._on_source_committed is not None
-        ):
-            try:
-                self._on_source_committed(source_id)
-            except Exception:
-                logger.exception(
-                    "precache on_source_committed hook failed for %s",
-                    source_id,
-                )
+        if self._precache_route_to_backlog:
+            hook = self._on_source_committed_backlog
+        elif self._initial_scan_done:
+            hook = self._on_source_committed
+        else:
+            return
+        if hook is None:
+            return
+        try:
+            hook(source_id)
+        except Exception:
+            logger.exception(
+                "precache on_source_committed hook failed for %s",
+                source_id,
+            )
 
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.

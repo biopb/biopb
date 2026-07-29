@@ -82,6 +82,14 @@ far)": the napari tensor-browser widget and the webapp `SourceTree`.
   `start()`, so `_runtime_phase` would already be true and wrongly prompt-enqueue
   every startup source. Streamed first-scan adds route to the backlog; live
   additions after boot prompt-enqueue.
+- **Provenance beats timing for upstream mirrors.** That boundary is about *local*
+  discovery. An upstream re-list mirrors somebody else's catalog over the network,
+  in slices spread across many ticks by the per-upstream backoff, so no arrival
+  time marks it as bulk: `_handle_rescan` holds `_precache_route_to_backlog` across
+  every re-list and those commits take the backlog unconditionally
+  (`set_source_committed_backlog_hook`). Mirrored sources also have no local mtime,
+  so the first-scan seed (`iter_local_source_mtimes`) cannot see them — that hook is
+  their only route into precache at all (biopb/biopb#637).
 - **The stability gate holds for streamed adds.** Unstable / recent-mtime entries
   (the "0 sources on fresh data" artifact) are deferred by the claim phase, so they
   are never claimed and never streamed; the next steady-state rescan picks them up.

@@ -699,7 +699,7 @@ def _setup_flight_server(
     # first scan -- both before this line. No separate initial_sync is needed.
 
     # Background precache worker: warm the file cache for sources added live.
-    # Wire the commit hook BEFORE source_manager.start(). Under progressive
+    # Wire the commit hooks BEFORE source_manager.start(). Under progressive
     # discovery the startup set is committed by the *background* scan (after
     # start); the manager gates it out of the prompt enqueue via
     # _initial_scan_done and seeds it into the backlog through the first-scan
@@ -710,6 +710,13 @@ def _setup_flight_server(
             server, server_config.precache, server_config.pyramid
         )
         source_manager.set_source_committed_hook(precache_worker.enqueue)
+        # Mirrored sources an upstream re-list commits take the backlog tier
+        # instead (#637). Left unwired when the backlog is off, which is what
+        # backlog_enabled=false asks for: bulk catalog work is not precached.
+        if server_config.precache.backlog_enabled:
+            source_manager.set_source_committed_backlog_hook(
+                precache_worker.enqueue_backlog
+            )
         # Residency gate (#174): let the worker re-check, at warm time, that a
         # cloud-root source's files are still resident before reading them, so a
         # backlog/live pass never recalls bytes OneDrive has re-dehydrated since

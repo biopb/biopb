@@ -8,11 +8,13 @@ what the client requests on open.
 
 It serves two tiers, in strict priority order:
 
-- **Live tier (primary).** Sources added to the catalog *after* startup, fed by
-  ``SourceManager``'s commit hook (``enqueue``). Always warmed.
-- **Backlog tier (secondary).** Local sources already present at startup, seeded
-  once via ``seed_backlog`` and ordered newest-mtime-first. Drained only when the
-  live queue is empty, and bounded so it never evicts live data (see below).
+- **Live tier (primary).** Sources a user added at runtime -- a local add or an
+  upload -- fed by ``SourceManager``'s commit hook (``enqueue``). Always warmed.
+- **Backlog tier (secondary).** Bulk catalog work: local sources already present
+  at startup (seeded via ``seed_backlog``) plus mirrored sources an upstream
+  re-list registers as it goes (``enqueue_backlog``). Ordered newest-mtime-first,
+  drained only when the live queue is empty, and bounded so it never evicts live
+  data (see below).
 
 Design constraints (all best-effort, never fatal to the server):
 
@@ -148,6 +150,25 @@ class PrecacheWorker:
             added,
             len(items),
         )
+
+    def enqueue_backlog(self, source_id: str, mtime: float = 0.0) -> None:
+        """Queue one source for *backlog*-tier warming (non-blocking, deduped).
+
+        For bulk catalog work that arrives outside the startup seed -- an upstream
+        mirror re-listed in the background, whose sources reach us one commit at a
+        time and have no local mtime to order by (biopb/biopb#637). The 0.0 default
+        sorts them behind every seeded local source, which is the priority we want:
+        a mirrored source nobody has opened yet is the last thing worth warming.
+        """
+        with self._seen_lock:
+            if source_id in self._seen:
+                return
+        with self._backlog_lock:
+            if source_id in self._backlog_ids:
+                return
+            self._backlog_seq += 1
+            heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
+            self._backlog_ids.add(source_id)
 
     # -- worker loop -------------------------------------------------------
 

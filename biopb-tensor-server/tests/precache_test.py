@@ -448,13 +448,14 @@ class TestRuntimePhaseGating:
         finally:
             server.shutdown()
 
-    def test_suppress_live_precache_overrides_the_gate(self, monkeypatch):
-        """A commit during the boot-tick upstream re-list stays off the prompt
-        enqueue even though the initial scan is already done.
+    def test_upstream_relist_commit_routes_to_the_backlog_hook(self, monkeypatch):
+        """A commit from an upstream re-list takes the backlog tier, never the
+        prompt enqueue -- whatever the startup gate says (biopb/biopb#637).
 
-        On the both-present boot tick the local walk flips _initial_scan_done
-        True before the upstream re-list runs; _suppress_live_precache keeps that
-        startup upstream mirror routed to the slow backlog (see _handle_rescan)."""
+        A mirrored catalog is bulk work: the live tier is ungated on cache fill,
+        so routing a whole mirror there hauls chunks over the network in
+        competition with serving. The backlog is also a mirrored source's *only*
+        path into precache, since the startup seed can only see local mtimes."""
         from types import SimpleNamespace
 
         server, sm = self._bare_source_manager()
@@ -474,21 +475,34 @@ class TestRuntimePhaseGating:
                 sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
             )
 
-            fired = []
-            sm.set_source_committed_hook(fired.append)
-            sm._initial_scan_done = True
+            live = []
+            backlog = []
+            sm.set_source_committed_hook(live.append)
+            sm.set_source_committed_backlog_hook(backlog.append)
             claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
 
-            # Suppressed: initial scan done, but this is the boot-tick upstream
-            # re-list -> backlog, not prompt enqueue.
-            sm._suppress_live_precache = True
+            # Inside a re-list, startup gate already open (boot tick, or any
+            # steady-state tick): backlog, not prompt enqueue.
+            sm._initial_scan_done = True
+            sm._precache_route_to_backlog = True
             assert sm._reconciler._commit_add_claim(claim) is True
-            assert fired == []
+            assert live == []
+            assert backlog == ["up1"]
 
-            # Not suppressed (a later live delta): the hook fires as usual.
-            sm._suppress_live_precache = False
+            # Inside a re-list, startup gate still closed (upstream-only config,
+            # where the gate flips mid-re-list): still the backlog, where before
+            # the commit was dropped and the mirror went unwarmed entirely.
+            sm._initial_scan_done = False
             assert sm._reconciler._commit_add_claim(claim) is True
-            assert fired == ["up1"]
+            assert live == []
+            assert backlog == ["up1", "up1"]
+
+            # Outside a re-list, gate open: a user's own runtime addition is live.
+            sm._precache_route_to_backlog = False
+            sm._initial_scan_done = True
+            assert sm._reconciler._commit_add_claim(claim) is True
+            assert live == ["up1"]
+            assert backlog == ["up1", "up1"]
         finally:
             server.shutdown()
 
@@ -727,6 +741,24 @@ class TestBacklogSeeding:
         # Resumes at the front (still the newest among remaining).
         assert worker._pop_backlog()[1] == "b"
         assert worker._pop_backlog()[1] == "a"
+
+    def test_enqueue_backlog_sorts_behind_seeded_local_sources(self):
+        """A mirrored source has no mtime, so it warms after every local one."""
+        worker = PrecacheWorker(None, PrecacheConfig())
+        worker.enqueue_backlog("mirrored")
+        worker.seed_backlog([("local_old", 100.0)])
+        assert worker._pop_backlog()[1] == "local_old"
+        assert worker._pop_backlog()[1] == "mirrored"
+        assert worker._pop_backlog() is None
+
+    def test_enqueue_backlog_dedups_and_yields_to_live(self):
+        worker = PrecacheWorker(None, PrecacheConfig())
+        worker.enqueue_backlog("a")
+        worker.enqueue_backlog("a")  # already queued -> ignored
+        worker.enqueue("b")  # live tier
+        worker.enqueue_backlog("b")  # already live -> stays live only
+        assert worker._pop_backlog()[1] == "a"
+        assert worker._pop_backlog() is None
 
 
 class TestIterLocalSourceMtimes:

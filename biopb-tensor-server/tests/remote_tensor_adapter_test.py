@@ -1186,11 +1186,13 @@ def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):
     assert order == ["local", "upstream"]
 
 
-def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path):
-    """On the boot tick the local walk flips _initial_scan_done True before the
-    upstream re-list; _handle_rescan suppresses the live-precache enqueue across
-    that re-list so the startup upstream mirror routes to the slow backlog, not
-    the un-idle-gated prompt tier. Steady-state ticks never suppress."""
+def test_handle_rescan_routes_every_upstream_relist_to_precache_backlog(tmp_path):
+    """_handle_rescan flags the whole upstream re-list as backlog-tier precache
+    work, on every tick -- not just the boot tick (biopb/biopb#637).
+
+    An upstream's adaptive backoff spreads the startup mirror across many ticks,
+    so arrival time cannot decide the tier; provenance does. The local walk is
+    outside the flag: its sources are this server's own and warm live."""
     from unittest.mock import MagicMock
 
     from biopb_tensor_server.adapters import get_default_registry
@@ -1212,26 +1214,27 @@ def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path)
 
     # The local walk flips the gate mid-tick, exactly as the first full scan does.
     def _walk():
-        seen["during_local"] = manager._suppress_live_precache
+        seen["during_local"] = manager._precache_route_to_backlog
         manager._initial_scan_done = True
 
     manager._rescan_monitored_dirs = _walk
     manager._reconcile_due_upstreams = lambda: seen.update(
-        during_upstream=manager._suppress_live_precache
+        during_upstream=manager._precache_route_to_backlog
     )
 
     # Boot tick: initial scan not yet done at tick start.
     manager._initial_scan_done = False
     manager._handle_rescan()
-    assert seen["during_local"] is False  # local walk is not suppressed
-    assert seen["during_upstream"] is True  # startup upstream mirror is
-    assert manager._suppress_live_precache is False  # reset after the re-list
+    assert seen["during_local"] is False  # local sources warm live
+    assert seen["during_upstream"] is True  # the mirror does not
+    assert manager._precache_route_to_backlog is False  # reset after the re-list
 
-    # Steady-state tick: initial scan already done at tick start -> no suppression.
+    # Steady-state tick: the mirror is still bulk work, so still the backlog.
     seen.clear()
     manager._handle_rescan()
-    assert seen["during_upstream"] is False
-    assert manager._suppress_live_precache is False
+    assert seen["during_local"] is False
+    assert seen["during_upstream"] is True
+    assert manager._precache_route_to_backlog is False
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
