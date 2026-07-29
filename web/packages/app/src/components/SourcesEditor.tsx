@@ -44,6 +44,16 @@ function str(v: unknown): string {
   return typeof v === "string" ? v : v == null ? "" : String(v);
 }
 
+// The schemes the server types as "tensor-server" (core/config.py
+// `_type_from_url`); all three must be matched here or a TLS upstream typed into
+// the URL box flips the row back to the local layout mid-edit.
+const GRPC_SCHEMES = ["grpc://", "grpc+tls://", "grpcs://"];
+
+function isGrpcUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  return GRPC_SCHEMES.some((scheme) => lower.startsWith(scheme));
+}
+
 export function SourcesEditor({
   sources,
   onChange,
@@ -81,12 +91,12 @@ export function SourcesEditor({
     setAddOpen(false);
   }
 
-  // A remote (tensor-server proxy) source is identified by its grpc:// URL or an
-  // explicit tensor-server type -- NOT by `alias`, which is also valid on a local
-  // source (there it is the catalog tree root), so keying on it mislabels a local
-  // dir as remote.
+  // A remote (tensor-server proxy) source is identified by its grpc(+tls):// URL
+  // or an explicit tensor-server type -- NOT by `alias`, which is also valid on a
+  // local source (there it is the catalog tree root), so keying on it mislabels a
+  // local dir as remote.
   const isRemote = (s: SourceEntry) =>
-    str(s.url).startsWith("grpc://") || str(s.type) === "tensor-server";
+    isGrpcUrl(str(s.url)) || str(s.type) === "tensor-server";
 
   // Canonical per-entry display title, numbered within its kind.
   let localN = 0;
