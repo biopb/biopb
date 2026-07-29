@@ -46,11 +46,8 @@ logic), which may expose multiple tensors (e.g., multi-field) from one source.
 
 The `biopb_tensor_server` package is organized into layered subpackages:
 
-- **`core/`** — foundational primitives and contracts: `adapter_base` (adapter
-  ABCs), `config` / `config_schema`, `discovery`, `chunk`, `downsample`,
-  `errors`, `remote`, `activity`, `logging_config`, and the low-level
-  `source_registry` / `metadata_db` stores. Depends only on itself plus
-  `adapters` / `cache`.
+- **`core/`** — foundational primitives and contracts: adapter ABCs, `config`,
+  and the low-level `source_registry` / `metadata_db` stores.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`. Builds on `core`.
 - **`sources/`** — source lifecycle: `source_manager` + `tree_scanner` +
@@ -59,33 +56,30 @@ The `biopb_tensor_server` package is organized into layered subpackages:
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk
   cache.
 
-`cli`, `__main__`, `__init__` (the public-API re-exports), and `_version` stay
-at the package root.
-
 ---
 
 ## TensorFlightServer
 
-**Module:** `biopb_tensor_server.serving.server` **Class:**
-`TensorFlightServer(flight.FlightServerBase)` **Default location:**
-`grpc://0.0.0.0:8815`
+- **Module:** `biopb_tensor_server.serving.server`
+- **Class:** `TensorFlightServer(flight.FlightServerBase)`
+- **Default location:** `grpc://0.0.0.0:8815`
 
 `TensorFlightServer` is a thin Flight protocol handler; its mutable state lives
-in three collaborators it composes (biopb/biopb#278 item A):
+in three collaborators it composes:
 
-| Collaborator | Module | Owns |
+| Collaborator | Class | Owns |
 |---|---|---|
-| `server.sources` (`SourceRegistry`) | `source_registry.py` | the `source_id → SourceAdapter` map, the registration chokepoint (slash-free id validation), and adapter-lifecycle cleanup (close on unregister/shutdown) |
-| `server.activity` (`ActivityTracker`) | `activity.py` | in-flight heavy-read counters + last-active stamp (the precache idle signal) and the warm-in-progress guard set. Fed by every heavy read — `do_get`, `warm`, **and `chunk_locate`**: the localhost fast path *replaces* `do_get`, so leaving it untracked made the server look idle for the whole of a localhost read (biopb/biopb#548) |
-| `server.uploads` (`UploadManager`) | `upload_manager.py` | the writable-server DoPut path: source creation (`cache:`/`ome_zarr:`), polymorphic chunk writes, and the per-source upload-progress state machine |
+| `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
+| `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
+| `server.uploads` | `UploadManager` | The writable-server DoPut path: source creation (`cache:`/`ome_zarr:`), polymorphic chunk writes, and upload-progress state machine |
 
 ### Flight methods
 
 | Method | Description |
 |--------|-------------|
 | `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: leaves `TensorDescriptor.pyramid` and `metadata_json` empty |
-| `GetFlightInfo` | Returns chunk endpoints or metadata query ticket. The former respects `TensorReadOptions` in FlightCmd and optionally fills `TensorDescriptor.pyramid` or `metadata_json` when requested |
-| `DoGet` | Fetches a single chunk identified by a `TensorTicket` or metadata query results; returns a `RecordBatch` stream |
+| `GetFlightInfo` | Returns query ticket for real data (pixel or metadata). Pixel data request respects `TensorReadOptions` and optionally fills `TensorDescriptor.pyramid` or `metadata_json` when asked |
+| `DoGet` | Fetches data by ticket, either a single pixel chunk or metadata query results; returns a `RecordBatch` stream |
 
 Custom `do_action` verbs extend these: `health`, `create_source`,
 `upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
@@ -94,12 +88,11 @@ and `remove_source` (below).
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 
 `GetFlightInfo` fills `pyramid` with an ordered list of `PyramidLevel`
-(`scale_hint`, `reduction_method`, logical `shape`, `native`); level 0 is full
-resolution.
+(`scale_hint`, `reduction_method`, logical `shape`, `native`).
 
-Two sources of levels (`TensorFlightServer._advertised_pyramid`):
+Two sources of pyramid specs (`TensorFlightServer._advertised_pyramid`):
 
-- **Native** — adapters that ship a real on-disk pyramid override
+- **Native** — data formats that ship a real on-disk pyramid override
   `TensorAdapter.get_native_pyramid_levels()` (`OmeZarrAdapter` and
   `QptiffAdapter`) to return one `native=True`, `reduction_method="precompute"`
   level per on-disk resolution.
@@ -122,15 +115,13 @@ Every concrete format adapter subclasses `TensorAdapter` and fills both roles in
 one object. The lone source-only adapter is `UnresolvedSourceAdapter`, which has
 no tensors until it resolves.
 
-All adapters implement:
-
 | Method | Returns |
 |--------|---------|
 | `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors |
 | `get_source_descriptor()` | `DataSourceDescriptor` proto |
 | `get_tensor_descriptor()` | `TensorDescriptor` proto |
 | `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
-| `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native on-disk levels (default `None`; `OmeZarrAdapter` overrides) |
+| `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native pyramid levels |
 
 ### Adapter file-handle policy (biopb/biopb#71)
 
@@ -141,8 +132,8 @@ justified by open cost.
 
 | Open cost | Policy | Adapters |
 |---|---|---|
-| O(1) in file size (~0.05–0.1 ms, <0.3% of a 64 MB chunk read) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
-| O(IFD count) or O(file count) — unbounded, never amortises | persistent handle + `close()`, and a shared idle reaper closes the handle between reads so the pin is *bounded*, not lifetime-long (TTL from `[server] handle_reaper_ttl`, default 150 s) | `ome-tiff`, `qptiff`, `ndtiff` |
+| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
+| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, `qptiff`, `ndtiff` |
 
 ---
 
@@ -156,8 +147,8 @@ Two implementations:
 - Persisted file cache transcoding chunk data to Flight IPC format
   (`cache/file_backend.py`).
 
-The *client* half of this — the mmap fast path, its pinned-segment accounting,
-and the two-tier chunk cache it feeds — is in
+The file cache is _strongly_ preferred: it serves a localhost client over an
+mmap fast path, bypassing the round trip through a socket. See
 **[../docs/localhost-fast-path.md](../docs/localhost-fast-path.md)**.
 
 ---
@@ -171,10 +162,8 @@ each). `AdapterRegistry.get_claims_for_path` returns claims in **registration
 order** (`adapters/__init__.py::get_default_registry`), highest-specificity
 first. Notably,
 
-- *OME-TIFF before TIFF-sequence* — OmeTiffAdapter *file*-claims an `.ome.tif`
-  (consuming multi-file siblings via the OME-XML file list) while
-  TiffSequenceAdapter *dir*-claims plain stacks and **excludes** OME-named
-  files.
+- *OME-TIFF before TIFF-sequence* — OmeTiffAdapter *file*-claims a set of
+  `.ome.tif` files while TiffSequenceAdapter claims a dir.
 - *OME-Zarr before plain Zarr* — both can claim a `.zarr`, so the specific one
   must win.
 
@@ -183,54 +172,41 @@ A `SourceClaim` (`__slots__`) carries `source_type` / `primary_path` /
 holds the `source_id <-> path` maps and the `on_source_added` /
 `on_source_removed` callbacks the `SourceManager` wires.
 
-**Progressive discovery (biopb/biopb#212).** `mark_ready()` / `SERVING` means
-"up and serving the **possibly-still-populating** catalog," *not* "the data
-folder scan finished." The CLI launcher reaches `SERVING` immediately and runs
-the monitored bootstrap scan in the background (the watcher fires its first
-rescan at once); the catalog grows *within* that scan as each source is claimed
-(see Directory Monitoring below). See
-**[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
+**Progressive discovery (biopb/biopb#212).** The CLI launcher reaches `SERVING`
+ASAP and runs the monitored bootstrap scan in the background; the catalog grows
+*within* that scan as each source is claimed (see Directory Monitoring below).
+See **[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
 
 ### Directory monitoring (`sources.watcher`, `sources.source_manager`)
 
 `PeriodicRescanWatcher` emits a `RESCAN` on a fixed interval; per rescan the
-`SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a pure
-producer that skips subtrees until they pass the stability window, returning an
-immutable `ScanSnapshot`), runs discovery on the snapshot's stable paths, and
-diffs the result against the confirmed catalog. Server mutations are
-lock-serialized on the main process; reconciliation is snapshot-diff, not
-per-file events. Only local directories can be monitored (`{ "url": ".../",
-"monitor": true }`).
+`SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a fs
+walker gated on stability window, returning an immutable `ScanSnapshot`), runs
+discovery on the snapshot's paths, and diffs the result against the confirmed
+catalog.
 
-**Moves** within a monitored dir preserve `source_id`; a move out is a delete, a
-move in a create.
+**Moves** within a monitored dir preserve `source_id`; a move out is a delete,
+a move in a create.
 
 ### Cloud / synced-folder sources (`cloud = true`)
 
-On a synced folder (OneDrive/Dropbox/iCloud "Files-On-Demand") content is
-*dehydrated* until read, and reading one byte recalls the **whole** file — so
-discovery **skips offline placeholders** by default. `cloud = true` opts one
-root into the **phase-2** model:
-
-Full model — the residency/recall rules, the resolve state machine, and the
-"transcode monoliths to OME-Zarr at archive time" guidance — in
+On a cloud-synced folder (OneDrive/Dropbox/iCloud "Files-On-Demand") content is
+*dehydrated* until read. Discovery **skips offline placeholders**, unless the
+`cloud = true` switch is set in source configuration, in which case the
+dehydrated sources are registered as `unresolved` and are resolved on demand
+(pulling the full file content down from the cloud). See
 **[docs/cloud-storage-support.md](docs/cloud-storage-support.md)**.
 
 ### Runtime source registration (`add_source`)
 
 The `add_source` Flight action registers an existing path on the **server's**
-filesystem as a served source at runtime, without editing config or restarting —
-the wire entrypoint behind the napari tensor-browser's drag-and-drop. It routes
-the dropped path through the same claim → adapter → catalog pipeline the
-directory watcher uses (`SourceManager.add_local_source`), so a dropped file or
-dataset-dir registers one source and a plain folder is walked recursively and
-may register several. The `TensorFlightServer` holds no `SourceManager`
-reference, so the launcher injects the entrypoint via
-`set_add_source_handler(...)`.
+filesystem at runtime — the wire entrypoint behind the tensor-browser's
+drag-and-drop. It routes the dropped path through the same claim → adapter →
+catalog pipeline the watcher uses, so a folder may register several sources.
 
 ---
 
-## CLI Launcher
+## CLI Launcher / lifecycle
 
 **Command:** `biopb-tensor-server launch`
 
@@ -244,49 +220,68 @@ biopb-tensor-server serve --config biopb.json [--host 127.0.0.1] [--port 8815] [
 biopb-tensor-server cert init [--force] [--san NAME]
 ```
 
-`serve` and `launch` share the Flight-server flags
-(`--host`/`--port`/`--writable` / `--token`/`--log-level`/`--log-file`) and the
-same fail-closed token resolution (`_resolve_flight_token`). `launch` adds the
-HTTP sidecar (`--web-host`/`--web-port`/`--cors`) and layers the sidecar
-fail-closed check on top (`_resolve_launch_token`).
+### Startup sequence
 
-### Startup sequence (`launch`):
+`serve` and `launch` share the prologue and the flight-server bring-up
+(`_setup_flight_server`); they differ only in what blocks at the end. The
+network bind is **CLI-only** — `host`/`port`/`tls`/`tls_cert`/`tls_key` were
+retired from `[server]` config (biopb/biopb#604), so *what to serve* is config
+and *where to expose it* is the launch command.
 
-1. Decide whether a token is enforced from the effective flight bind (`--host`
-   `--host`, loopback by default): a loopback bind runs tokenless (**local
-   mode**); a public bind (`0.0.0.0`/`::`/a real IP) **requires** a token
-   (**remote mode**).
-2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var →
-   `secrets.token_urlsafe(32)` auto-generated (public flight bind only; local
-   mode uses no token). No interactive prompt. `launch` then refuses a public
-   `--web-host` when the resolved token is `None`.
-3. Print the one-time access token (remote mode only).
-4. Load `biopb.json` config; instantiate adapters and register sources.
-5. Resolve TLS material CLI-over-config (`_merge_tls_options` →
-   `_resolve_tls_material`): a BYO cert/key pair read off disk, else the
-   self-signed state-dir cert, else plaintext.
-6. Start `TensorFlightServer` in a **daemon thread**, serving TLS when step 5
-   produced a cert.
-7. Build CORS origins: loopback variants of the sidecar's own address by default
-   (no web app is bundled here), plus any explicit `--cors` origins for a
-   browser app served elsewhere.
-8. Call `run_http_server(...)` — **blocking** uvicorn call. Under TLS it gets a
-   `grpcs://` flight location plus the served cert as `tls_ca_pem`. The sidecar
-   is API-only; it serves no static assets (the control plane serves the browser
-   UI).
+**Prologue (both commands)**
+
+1. Load `biopb.json`; set up logging (CLI > env > config).
+2. Decide whether a token is enforced from the effective flight bind: a loopback
+   bind runs tokenless; a public bind (`0.0.0.0`/`::`/a real IP) **requires** a
+   token. `BIOPB_TENSOR_ALLOW_NO_TOKEN` overrides. Resolve it `--token` flag →
+   `BIOPB_TENSOR_TOKEN` env var → auto-generate (`secrets.token_urlsafe(32)`, on
+   a public bind only), and print it once. `launch` layers its own check on top:
+   it refuses a public `--web-host` when the resolved token is `None`.
+3. Resolve TLS material (`_resolve_tls_material`): a BYO `--tls-cert`/`--tls-key`
+   pair read off disk, else — under `--tls` — the self-signed state-dir cert
+   (auto-minted on first use), else plaintext.
+
+**Flight server (`_setup_flight_server`)**
+
+4. Initialize the chunk cache. A `file` backend degrades to memory when the
+   cache dir cannot be mmapped safely (network mount, cloud-synced folder) or
+   isn't writable — the localhost fast path goes with it, but the server serves.
+5. Resolve config sources into *static* and *monitored* sets, and build the
+   metadata DB (mandatory — it backs `query_sources`). An empty catalog is a
+   valid state and boots: sources can still arrive via `add_source`, DoPut, or a
+   monitored dir that fills later.
+6. Construct `TensorFlightServer` (token, writable, TLS material) — built, not
+   yet serving.
+7. Build the watcher + `SourceManager`; wire the runtime `add_source` /
+   `remove_source` handlers and the precache worker's commit hook **before**
+   starting either, then start watcher, manager, and worker.
+8. `mark_ready()` — health reports `SERVING` on a **possibly-still-populating**
+   catalog; the bootstrap scan runs in the background (progressive discovery).
+   Catalog freshness is carried by the health action's `full_scan_in_progress` /
+   `last_full_scan_finished_at`, not by `SERVING`.
+
+**Blocking call**
+
+9. `serve` calls `flight_server.serve()` on the main thread.
+   `launch` puts it in a **daemon thread** and blocks in `run_http_server(...)`
+   (uvicorn) instead. The sidecar dials the flight plane over loopback —
+   resolving a wildcard bind to the matching loopback family, `grpcs://` plus
+   the served cert as `tls_ca_pem` under TLS. CORS defaults to the loopback
+   variants of the sidecar's own address; `--cors` adds a browser app served
+   elsewhere.
+
+Both install the SIGTERM handler and the control deathwatch before blocking, so
+the shutdown below runs on a supervised stop instead of being signal-killed.
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
 ### Shutdown sequence (`_graceful_shutdown`)
 
-Runs from `launch`'s `finally`, once the blocking uvicorn call returns. **The
-order is load-bearing** (biopb/biopb#300): a `restart` force-kills the process
-after a bounded graceful window, so the cheap upstream-independent work must
-happen *before* anything that can block on an unresponsive upstream. Each step
-is isolated — a failure in one still lets the rest run.
+Runs from `launch`'s `finally`, once the blocking uvicorn call returns. A
+`restart` force-kills the process after a bounded graceful window.
 
 1. Stop the precache worker — no new warm writes.
-2. Release the file-cache process lock and clear the WAL, **immediately**. Cheap
+2. Release the file-cache process lock and clear the WAL **immediately**. Cheap
    and upstream-independent, so after this even a mid-teardown SIGKILL leaves no
    stale lock for the next boot to crash-recover. Segment writers/mmaps are left
    **open** — closing them here would race the in-flight `do_get` reads step 3
@@ -295,8 +290,7 @@ is isolated — a failure in one still lets the rest run.
 3. Drain the Flight server, **bounded**. `FlightServerBase.shutdown()` takes no
    timeout and can block forever on a stream gated by a dead upstream, so it
    runs in a daemon thread joined with a short bound (3 s); on timeout, proceed
-   — the process is exiting and the OS reclaims the sockets. Never
-   `flight_server.wait()`.
+   and the OS reclaims the sockets.
 4. Close the cache fully — writers and mmaps — but **only on a clean drain**,
    for proper finalization (which matters on Windows). Skipped if step 3 timed
    out, since a stuck `do_get` may still touch an mmap; the essential work
@@ -376,13 +370,12 @@ names no credentials profile.
 
 ---
 
-## Per-upstream credentials (mounting a remote plane)
+## A remote biopb-tensor-server as a source
 
-A server that mirrors a remote plane as a `tensor-server` source is a *client*
+A server that mirrors a remote server as a `tensor-server` source is a *client*
 of that plane, and the local filesystem token handoff cannot reach across hosts
 — so the upstream's credentials are explicit config, bound **per source** rather
-than globally, since one server may mount several upstreams owned by different
-groups. The carrier is the existing credentials profile (`storage_type:
+than globally. The carrier is the existing credentials profile (`storage_type:
 "biopb-tensor"`), which holds the bearer `token` and, for a `grpcs://` upstream,
 optional TLS trust (`tls_fingerprint` / `tls_ca_file`; unset means TOFU).
 
@@ -399,20 +392,13 @@ Full config surface and behavior:
 
 ## Container shape (Flight-only by default)
 
-The published image is a **pure gRPC data-plane endpoint**: `entrypoint.sh` runs
-`biopb-tensor-server serve`, so the container has **one** listener (Flight 8815)
-and no HTTP surface at all — no browser origin, no CORS, no unlock page
-(biopb/biopb#604 item 3). The sidecar is still installed and returns with
-`BIOPB_ENABLE_HTTP_SIDECAR=1`; only the *default* changed.
+By default, the published image is a **pure gRPC data-plane endpoint** without
+HTTP endpoints. The http sidecar is still installed in the image and can be re-
+enabled with `BIOPB_ENABLE_HTTP_SIDECAR=1`.
 
 Browsing containerized data is a *downstream* concern: a machine running the
 full stack adds `grpc://`/`grpcs://<host>:8815` as a remote source, and its
-browser talks only to its own loopback control. That is what makes remote TLS
-cheap — no browser ever has to trust the container's cert.
-
-Both opt-in extras are installed in the image. `[tls]` is opt-in on PyPI only
-because of a missing Intel-macOS `cryptography` wheel (biopb/biopb#355) — a
-source-install problem this linux image never has.
+browser talks only to its own loopback control.
 
 Deployment, TLS, cert persistence, and worked examples:
 **[containerize.md](containerize.md)**.

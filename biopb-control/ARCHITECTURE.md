@@ -3,7 +3,7 @@
 ## Role
 
 The control plane is the **durable root** of a biopb deployment — a small
-always-on Starlette/uvicorn app that does exactly three things:
+always-on Starlette/uvicorn app that does three things:
 
 - **supervises the durable planes** as subprocesses (the data plane today, the
   algorithm plane pending),
@@ -50,20 +50,16 @@ pipe** on POSIX (the plane self-terminates as a contained group-kill), a
 control dies **uncatchably** — SIGKILL, OOM, crash, logout.
 
 That binding is **orthogonal to the graceful stop** path — SIGTERM on POSIX, a
-sentinel file on Windows — which still runs the plane's orderly shutdown, releasing
-its file-cache process lock, whenever the control is alive to ask. The binding is
-only the backstop for when it is not. The cost is a brief data-serving gap across a
-control restart; keeping the control lean and crash-only-restartable bounds it.
+sentinel file on Windows — which still runs the plane's orderly shutdown. The
+binding is only the backstop for when it is not.
 
 ## The single web origin
 
-Two problems make one origin the right shape. A session's `observe` UI lives on a
-**dynamic port**, so N sessions would otherwise mean N bookmarks — a single origin
-needs an owner that discovers sessions at request time. And the data plane, the
-control, and each session all expose an `/api/*` namespace, which would collide at
-the root.
-
-So the control serves **one base-`/` SPA** and gives every target its own prefix:
+A session's `observe` UI lives on a **dynamic port**, so N sessions would otherwise
+mean N bookmarks — a single origin needs an owner that discovers sessions at request
+time. And the data plane, the control, and each session all expose an `/api/*`
+namespace, which would collide at the root. So the control serves
+**one base-`/` SPA** and gives every target its own prefix:
 
 | Path | Target | Hop |
 |---|---|---|
@@ -83,9 +79,7 @@ prefix mounts — no root catch-all — keep the static `/`-fallback from swallo
 the session and data-plane prefixes.
 
 Because the data plane is the control's child, clients ask the control to *ensure*
-it rather than starting one themselves. This is what broke the old bootstrap cycle,
-where a session depended on the data plane yet its own data layer started it — a
-cycle with no clean owner.
+it rather than starting one themselves.
 
 ## Security model
 
