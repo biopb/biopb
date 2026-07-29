@@ -521,20 +521,20 @@ def _require_control_for_view() -> None:
     watching napari load only to meet an empty Tensor Browser. The env override
     names a plane directly and deliberately bypasses the control, so it must also
     bypass this check — otherwise the escape hatch would not reach `view` at all.
-    """
-    import urllib.request
 
+    "Answered" is :func:`_query_control_health`, the module's one definition of a
+    responding control API (``control status`` reports the same probe), so the two
+    can never disagree about whether a control is up. Its 2s budget is deliberate:
+    ``/health`` takes the supervisor lock and does a blocking TCP liveness probe,
+    so a control busy in an ``ensure`` answers late — and here a false negative is
+    a hard exit, not a degraded reading.
+    """
     from . import _data_plane
 
     if os.environ.get(_data_plane.ENV_URL, "").strip():
         return
-    url = f"{_endpoints.control_base_url()}/health"
-    try:
-        with urllib.request.urlopen(url, timeout=1.0) as resp:
-            if resp.status == 200:
-                return
-    except Exception:  # noqa: BLE001 - any failure means "no control answered"
-        pass
+    if _query_control_health(*_control_endpoint()) is not None:
+        return
     console.print(
         "[red]No biopb control plane is running,[/red] so there is no data plane "
         "for the viewer to read.\n"

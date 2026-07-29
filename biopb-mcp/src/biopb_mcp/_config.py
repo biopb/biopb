@@ -237,9 +237,10 @@ class TransportConfig:
     )
     server_start_timeout: float = _h(
         60.0,
-        "Give-up budget (seconds) applied twice by auto_connect's down-plane "
-        "fallback (control-ensure, then boot wait), so the worst-case wall wait is "
-        "~2x this. The normal path (plane already up) has no timeout.",
+        "Give-up budget (seconds) applied twice on auto_connect's control path "
+        "(control-ensure, then boot wait), so the worst-case wall wait is ~2x "
+        "this. The $BIOPB_TENSOR_URL path spends it once, on a STARTING server. "
+        "The normal path (plane already up) has no timeout.",
     )
 
 
