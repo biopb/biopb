@@ -154,8 +154,9 @@ Serving falls out of the current deploy:
 **CI wiring** (`.github/workflows/`):
 
 - `docs-check.yml` (PR): run `python scripts/build_skills_catalog.py --check`.
-  Malformed frontmatter, duplicate ids, unknown tags → **fail the PR**. This *is*
-  the curation gate — the author gets the error, never the runtime agent.
+  Malformed frontmatter, duplicate ids, a missing required section → **fail the
+  PR**. This *is* the curation gate — the author gets the error, never the
+  runtime agent. Tags are *not* gated: see §5.1.
 - `deploy.yml` (push to main): run `python scripts/build_skills_catalog.py`
   **before** the landing rsync, so the generated `catalog.json` is in-tree at
   rsync time. The landing rsync already uploads repo root; add `PyYAML` to
@@ -258,7 +259,7 @@ shared id (a user editing their own copy of a published skill expects theirs).
   a ~25-line frontmatter reader, no PyYAML in this stdlib-only module, `id`
   inferred from the filename and `description` from the first H1/prose line, so a
   bare markdown file with no frontmatter still loads. Strictness — required
-  sections, the tag vocabulary — stays at the publish boundary in `biopb-site`,
+  sections — stays at the publish boundary in `biopb-site`,
   which is the only place with the tooling. A second copy of those rules in the
   install would be a constant to drift, not a safeguard.
 - **Fail-open per file**: one unreadable or malformed file is skipped, never
@@ -290,7 +291,7 @@ switches skills off is never pointed at a catalog that would come back empty.
 1. Author (often the agent, per the existing close-out prompt) drafts
    `skills/<id>.md` with frontmatter.
 2. PR to `biopb-site` → `docs-check.yml` runs
-   `build_skills_catalog.py --check` (schema / uniqueness / tag validation) +
+   `build_skills_catalog.py --check` (schema / uniqueness / required sections) +
    `mkdocs build --strict`.
 3. Human review → merge to `main` → `deploy.yml` regenerates `catalog.json` and
    publishes. Live within one deploy.
@@ -315,7 +316,7 @@ strict and uniform. Field policy:
 | `id` | **Inferable** — default to filename stem; if the author supplies one it *must* equal the stem (reject mismatch → avoids drift). |
 | `description` | **Required — hard-reject if missing.** The one field discovery actually needs. |
 | `title` | Fallback chain: frontmatter → first `#` H1 → humanized `id` (warn). |
-| `tags` | Coerce `str → [str]`, lowercase, validate against a controlled vocabulary (unknown tag → fail, keeps the taxonomy curated). |
+| `tags` | Coerce `str → [str]` and lowercase. **Not** validated against a fixed vocabulary: a closed set needs an edit for every new topic and fails the PR introducing it, to enforce a judgment the reviewer curating the catalog is making anyway. |
 | `version` | Require semver, else default `0.0.0`. |
 | `updated` | **Ignore any author value**; always derive from `git log -1` — authors forget to bump it. |
 | `requires` | Optional; coerce to list. |
@@ -400,8 +401,9 @@ appears.
 3. **Skill home** — sources live in **biopb-site** (matches "pulled from
    biopb.org"). Alternative: keep them in the biopb monorepo and have the site build
    fetch them — more moving parts; not recommended.
-4. **Tag vocabulary** — start with a small controlled list validated in `--check`,
-   or allow free tags initially and tighten later.
+4. **Tag vocabulary** — resolved: free tags, curated by review. A controlled list
+   was tried and removed; enforcement bought nothing the reviewer wasn't already
+   doing, and cost an edit per new topic.
 
 ### 7.5 Local skills — resolved: a local *source*, not a parallel mechanism
 
@@ -506,20 +508,20 @@ standing cost.
 ## Appendix A — canonical frontmatter contract (shipped)
 
 Implemented as **stdlib-only** in `biopb-site/scripts/skill_schema.py` — no pydantic,
-so the docs toolchain needs only PyYAML. Holds the version constants, the controlled
-tag vocabulary, the `CatalogEntry` dataclass (what the build emits), and the
+so the docs toolchain needs only PyYAML. Holds the version constants, the required
+body sections, the `CatalogEntry` dataclass (what the build emits), and the
 `coerce_list` helper. Excerpt:
 
 ```python
 CATALOG_VERSION = 1            # schema of catalog.json; server guards, fails open
 CURRENT_SPEC_VERSION = 1       # current authoring dialect (migrate() up-converts older)
 
-# Unknown tags fail --check, keeping the taxonomy curated. Grow deliberately via PR.
-ALLOWED_TAGS = {
-    "segmentation", "detection", "restoration", "super-resolution",
-    "measurement", "io", "visualization", "annotation", "ops", "tensor",
-    "cellpose", "workflow",
-}
+# Body structure every skill must carry, as normalized H2 headings. Order is free,
+# extra sections allowed. Tags are coerced but deliberately NOT gated.
+REQUIRED_SECTIONS = (
+    "when to use", "when not to use", "parameters",
+    "steps", "failure modes", "next steps",
+)
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 KEBAB = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -561,7 +563,7 @@ point — one pass per file:
 2. **migrate** the dialect to `CURRENT_SPEC_VERSION`.
 3. **infer / coerce** (tolerant read): `id` defaults to the stem and must match it;
    `title` falls back to the first H1 then a humanized id (warn); `tags` coerced +
-   lowercased + checked against `ALLOWED_TAGS`; `version` checked semver; `updated`
+   lowercased (not gated); `version` checked semver; `updated`
    taken from `git log -1` (author value ignored); `description` required.
 4. **emit** a canonical `CatalogEntry` with `sha256` of the raw file, or `None` on
    any error.
