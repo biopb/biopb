@@ -139,6 +139,14 @@ exclude = [
     "_build", "buck-out", "build", "dist", "node_modules", "venv",
     "*vendored*", "*_vendor*",
     "_version.py",  # setuptools_scm-generated, per package
+    # Skill bundles are content-addressed: the catalog records a sha256 of each
+    # file's bytes and `test_bundle_body_sha_matches_catalog` checks it, so ANY
+    # rewrite of one -- including a purely cosmetic reformat -- breaks the suite
+    # until the catalog is regenerated. ruff 0.16 began formatting Python code
+    # blocks inside markdown, which reaches these files; the pinned 0.15.15 does
+    # not. Excluded by path so the answer does not depend on the version: a ruff
+    # bump should not silently invalidate a hash.
+    "biopb-mcp/src/biopb_mcp/mcp/_skills_bundle",
 ]
 
 [tool.ruff.lint]
