@@ -6,48 +6,21 @@ option java_multiple_files = true;
 option java_package = "biopb.tensor";
 
 // ============================================================================
-// Tensor identity policy (authoritative; mirrored in the root CLAUDE.md
-// "Tensor identity" note). Every server, SDK, and CLI MUST adhere to this.
+// Tensor identity policy
 //
 // A tensor is identified by its array_id ALONE. array_id is GLOBALLY UNIQUE
-// across the whole server, so it -- not a (source, tensor) pair -- is the
-// primary key.
+// across the whole server.
 //
 // CONSTRUCTION. array_id is always built from the source and an optional
 // within-source field name:
 //   * single-tensor source: array_id = source_id           (e.g. "zarr_a3f2")
 //   * multi-tensor source:  array_id = source_id "/" field  (e.g.
 //                           "aics_7f3/Image:0", or an HCS "plate_x/A01/0")
-// It is the SAME value as TensorReadOption.tensor_id; the two fields are
-// synonyms (one names a descriptor, the other a request).
+// The source_id cannot contain a '/' (it is the prefix before the first '/'),
+// but the field part MAY contain '/'.
 //
-// source_id IS A DERIVED PROJECTION, not independent identity. Because
-// source_id is globally unique AND slash-free (it MUST NOT contain '/'), it is
-// always recoverable as the prefix before the first '/':
-//       source_id = array_id.split('/', 1)[0]
-// source_id is still carried on the wire (FlightCmd.source_id) as a routing
-// convenience, but array_id is AUTHORITATIVE; when both are present they MUST
-// be consistent. The field part MAY contain '/' (a hierarchical handle, e.g.
-// an HCS "well/field"); the source boundary is always the FIRST '/', which is
-// why source_id must be slash-free. Enforce slash-free source_id at the
-// mint/register boundary (auto-generated ids already comply; caller-supplied
-// ids must be validated).
-//
-// ONE FORM EVERYWHERE. The same array_id appears identically in the wire
-// TensorDescriptor.array_id, the TensorReadOption.tensor_id, the chunk_id
-// encoding, and every descriptor cache key. There is NO separate "bare handle"
-// vs "source-qualified" form. Collapsing that former dual-form to a single
-// identifier is what removes the translation seam that caused cross-source
-// descriptor-cache collisions (biopb/biopb#45) and the upload path's
-// array_id/source_id conflation.
-//
-// REQUEST RESOLUTION. A read request's tensor_id is normally the array_id. The
-// server resolves the within-source tensor by stripping the source_id prefix
-// (split on the first '/'); a single-tensor source has no field. For backward
-// compatibility the server ALSO accepts a bare field name, the source_id
-// itself, or an unset/empty tensor_id (-> the source's default/first tensor,
-// biopb/biopb#44). The canonical form it echoes back is always the full
-// array_id.
+// source_id is carried on the wire as a routing convenience, but array_id is
+// AUTHORITATIVE; when both are present they MUST be consistent.
 //
 // INVARIANTS every producer/consumer upholds:
 //   * For a given tensor the array_id is IDENTICAL across ListFlights
@@ -185,12 +158,9 @@ message MetadataQueryOption {
 // Flattened structure - no nested messages for read options.
 // Used in FlightCmd.tensor_read branch.
 message TensorReadOption {
-  // Which tensor to read -- normally the globally-unique array_id (see the
-  // tensor identity policy at the top of this file); the same value as
-  // TensorDescriptor.array_id. The server strips the source_id prefix (split on
-  // the first '/') to resolve the within-source tensor. For back-compat it also
-  // accepts a bare field name or the source_id; unset/empty means "the source's
-  // default (first) tensor" and is resolved server-side (#44).
+  // Which tensor to read -- can be either: the globally-unique array_id, a bare field name,
+  // or unset/empty (means "the source's default (first) tensor").
+  // Resolved server-side (#44).
   string tensor_id = 1;
 
   // Optional sub-region to read
@@ -206,23 +176,9 @@ message TensorReadOption {
   // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
   string reduction_method = 4;
 
-  // Field masks over the GetFlightInfo response (biopb/biopb#563). A tensor
-  // *describe* (the stable per-tensor facts: shape/dtype/dim_labels/chunk_shape,
-  // the resolution pyramid, physical_scale, metadata_json) and a *read plan*
-  // (the per-request O(chunks) endpoints) are welded into one call; these three
-  // bools -- with_metadata, with_pyramid, with_read_plan -- select which parts
-  // the server computes and returns, so a client can ask for a cheap describe
-  // without paying for a plan it discards.
-
   // If true, server populates metadata_json with wrapped metadata.
   // Wrapped structure: {"type": source_type, "dim_label": [...], "metadata": {...}}
   bool with_metadata = 5;
-
-  // 6 was compact_grid_ok, the opt-in to a compact-grid read plan
-  // (biopb/biopb#346); removed when the chunk_id codec was made a strictly
-  // server-side concern. Reserved so the field number/name are never reused.
-  reserved 6;
-  reserved "compact_grid_ok";
 
   // If true, server advertises the resolution pyramid on the response
   // descriptor (TensorDescriptor.pyramid). Opt-in (default false): advertising a
@@ -240,6 +196,12 @@ message TensorReadOption {
   // an empty endpoint list, skipping the plan. `optional` so the *unset* default
   // is true (a proto3 bool would default false).
   optional bool with_read_plan = 8;
+
+  // 6 was compact_grid_ok, the opt-in to a compact-grid read plan
+  // (biopb/biopb#346); removed when the chunk_id codec was made a strictly
+  // server-side concern. Reserved so the field number/name are never reused.
+  reserved 6;
+  reserved "compact_grid_ok";
 }
 
 // Client command for GetFlightInfo requests.

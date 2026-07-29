@@ -74,9 +74,33 @@ one segment cache.
   `storage_type="biopb-tensor"` profile carrying `token` — one token per upstream,
   no bespoke `SourceConfig.token`. The same profile also carries per-upstream TLS
   trust for a `grpcs://` upstream (`tls_fingerprint` / `tls_ca_file`, both
-  optional; unset falls back to TOFU pinning) — see *Per-upstream credentials* in
-  `../ARCHITECTURE.md`. The single-upstream `BIOPB_UPSTREAM_TENSOR_TOKEN` env var
-  remains as a convenience fallback for the token only.
+  optional; unset falls back to TOFU pinning). The single-upstream
+  `BIOPB_UPSTREAM_TENSOR_TOKEN` env var remains as a convenience fallback for the
+  token only.
+
+  | Key | Meaning |
+  |---|---|
+  | `token` | Bearer token for the upstream. Beats the `BIOPB_UPSTREAM_TENSOR_TOKEN` env fallback. |
+  | `tls_fingerprint` | Expected SHA-256 of the upstream's cert (colon-grouped or bare hex, as `cert init` prints it). Verified on every connect. The light form — paste what the server printed. |
+  | `tls_ca_file` | Path to a PEM to trust — a private CA, or the upstream's own leaf. |
+
+  **TLS trust is optional, and unset means TOFU.** The zero-config default already
+  works; configuring an anchor buys the one thing TOFU cannot — rejecting an
+  impostor in the path at *first* contact, where there is no prior use to trust.
+  Both keys set → **the CA wins, with a warning**, so an operator is never left
+  believing a fingerprint is enforced when it isn't. An unreadable `tls_ca_file`
+  **raises** rather than degrading to TOFU (see *Misconfiguration is not
+  unreachability* below) — silently undoing explicitly configured trust over a
+  typo'd path would be worse than failing. The env var stays token-only: TLS trust
+  never grew an env twin, since anything worth overriding about it is inherently
+  per-upstream.
+
+  `resolve_upstream_credentials()` (`adapters/remote_tensor.py`) produces one
+  frozen `UpstreamCredentials` from the source + config, and **all three** dial
+  sites use it: the adapter's pooled client, the reconciler's bulk catalog fetch,
+  and the bare-host expansion in `core/config.py`. The latter two dial directly,
+  outside the adapter pool, so leaving either on the old token-only path would
+  have TOFU-pinned a `grpcs://` upstream whose CA was configured.
 
 **Scheme/type plumbing.** `core.remote.is_remote_url` accepts the `grpc*`
 schemes (else `Path("grpc://…").resolve()` mangles the url);

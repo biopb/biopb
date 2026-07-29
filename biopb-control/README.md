@@ -13,9 +13,10 @@ of a biopb deployment. It
 
 It is deliberately *not* a compute host: no napari, Qt, dask, kernel, or import
 of `biopb-tensor-server` / `biopb-mcp`. Everything heavy is a supervised
-subprocess. See `biopb-mcp/ARCHITECTURE.md` for the full
-architecture (the control is the root of the dependency tree; MCP sessions are
-ephemeral, shim-owned clients that *use* the planes and never start them).
+subprocess. See [ARCHITECTURE.md](ARCHITECTURE.md) for the supervision model, the
+invariants, the web-origin routing table, and the session registry; and
+`biopb-mcp/ARCHITECTURE.md` for the sessions themselves (ephemeral, shim-owned
+clients that *use* the planes and never start them).
 
 ## Usage
 
