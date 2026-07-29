@@ -33,9 +33,10 @@ _promote_after: float = 10.0
 _headless: bool = False
 
 # Whether the curated-skills catalog is advertised to the agent (mirrors
-# `services.skills_enabled`, off by default). Set by the launcher
+# `services.skills_enabled`, on by default). Set by the launcher
 # (set_skills_enabled); gates the _SKILLS_INSTRUCTIONS fragment in the handshake.
-_skills_enabled: bool = False
+# test_mcp_server pins this literal to the config default so the two can't drift.
+_skills_enabled: bool = True
 
 # This process's logfile path (set by the launcher), surfaced by server_status so
 # an agent can find its own log. None when output goes to a terminal (foreground
@@ -82,9 +83,10 @@ _BASE_INSTRUCTIONS = (
 )
 
 # Appended to _BASE_INSTRUCTIONS only when the skills catalog is enabled
-# (`services.skills_enabled`, off by default). Kept out of the base so a default
-# install neither points the agent at `find_skills` (which would return nothing)
-# nor prompts it to author skills — set_skills_enabled owns the field.
+# (`services.skills_enabled`, on by default). Kept out of the base so an install
+# that switches skills off neither points the agent at `find_skills` (which would
+# return nothing) nor prompts it to author skills — set_skills_enabled owns the
+# field.
 _SKILLS_INSTRUCTIONS = (
     "At the start of a task, call `find_skills` to check for a curated workflow "
     "before improvising; read the matching `skill://<id>` resource for the "
@@ -357,8 +359,9 @@ def set_headless(headless: bool):
 
 def set_skills_enabled(enabled: bool):
     """Advertise (or hide) the curated-skills catalog in the agent's initialize
-    ``instructions``. Off by default, so a default install never points the
-    agent at ``find_skills`` (which would return nothing)."""
+    ``instructions``. On by default; switching skills off also drops the
+    directive, so the agent is never pointed at ``find_skills`` when it would
+    return nothing."""
     global _skills_enabled
     _skills_enabled = bool(enabled)
     _recompose_instructions()

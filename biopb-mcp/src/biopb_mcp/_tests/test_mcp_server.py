@@ -191,16 +191,23 @@ class TestSetHeadless:
         # resource -- see also execute_code's docstring.
         assert 'format="pandas"' in base
         assert "source_url" in base
-        # Skills are opt-in: the base guidance must not point the agent at
-        # find_skills, which returns nothing unless the catalog is enabled.
+        # Skills stay a separate fragment: the base guidance must not point the
+        # agent at find_skills, which returns nothing once the catalog is off.
         assert "find_skills" not in base
         # And they are advertised when visible (no headless / skills directive).
         _server.set_headless(False)
         _server.set_skills_enabled(False)
         assert _server.mcp._mcp_server.instructions == base
 
+    def test_module_default_mirrors_config_default(self):
+        # The launcher always sets this from config, but the module literal is a
+        # restated default -- pin it, since that is how it diverged once before.
+        from biopb_mcp._config import DEFAULT_CONFIG
+
+        assert _server._skills_enabled is DEFAULT_CONFIG["services"]["skills_enabled"]
+
     def test_skills_directive_gated_on_enable(self):
-        # Off (default): no find_skills mention in the handshake.
+        # Off: no find_skills mention in the handshake.
         _server.set_headless(False)
         _server.set_skills_enabled(False)
         assert "find_skills" not in _server.mcp._mcp_server.instructions
@@ -236,7 +243,9 @@ class TestSetHeadless:
     def test_visible_keeps_base_drops_headless_directive(self):
         # A flip headless -> visible must not leave the HEADLESS directive in
         # the handshake, but must retain the always-on base guidance
-        # (set_headless owns the field in both directions).
+        # (set_headless owns the field in both directions). Skills off, so the
+        # comparison isolates the headless dimension.
+        _server.set_skills_enabled(False)
         _server.set_headless(True)
         assert "HEADLESS" in _server.mcp._mcp_server.instructions
         _server.set_headless(False)
