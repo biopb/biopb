@@ -513,6 +513,36 @@ def _require_biopb_mcp() -> None:
         raise typer.Exit(1)
 
 
+def _require_control_for_view() -> None:
+    """Exit(1) unless a control plane answers — or ``$BIOPB_TENSOR_URL`` is set.
+
+    The viewer's data comes from the plane the control owns (biopb/biopb#628), so
+    without one there is nothing to browse; failing here keeps the user from
+    watching napari load only to meet an empty Tensor Browser. The env override
+    names a plane directly and deliberately bypasses the control, so it must also
+    bypass this check — otherwise the escape hatch would not reach `view` at all.
+    """
+    import urllib.request
+
+    from . import _data_plane
+
+    if os.environ.get(_data_plane.ENV_URL, "").strip():
+        return
+    url = f"{_endpoints.control_base_url()}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as resp:
+            if resp.status == 200:
+                return
+    except Exception:  # noqa: BLE001 - any failure means "no control answered"
+        pass
+    console.print(
+        "[red]No biopb control plane is running,[/red] so there is no data plane "
+        "for the viewer to read.\n"
+        "[yellow]Start it first: biopb control start[/yellow]"
+    )
+    raise typer.Exit(1)
+
+
 def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
     """Whether a TCP connection to (host, port) succeeds - a cheap liveness probe
     for the daemon's HTTP listener (it binds before serving)."""
@@ -565,8 +595,14 @@ def mcp_view(
     this terminal's stdio and process group, so Ctrl-C reaches it directly (its
     own SIGINT handler reaps the kernel/viewer). This CLI stays free of the heavy
     napari/Qt import — it only launches and waits.
+
+    Requires a running control plane (biopb/biopb#628), checked here rather than
+    after the child's multi-second napari import: the control is the only source
+    of a data plane, so a viewer started without one could open nothing. Unlike
+    the stdio shim we do not start it — a person is at this terminal and can.
     """
     _require_biopb_mcp()
+    _require_control_for_view()
     resolved_port = 0 if port is None else port
     cmd = [
         sys.executable,

@@ -47,10 +47,10 @@ def _report_port(path, port):
     that file for the real port to build its bridge URL. Written atomically
     (temp + ``os.replace``) so the shim never reads a half-written value.
 
-    A cross-platform file rather than the inherited-pipe handshake used for the
-    kernel token (``BIOPB_TOKEN_REPORT_FD``): that pipe pattern is POSIX-only
-    here (``_kernel`` gates it on ``os.name == 'posix'`` — fd inheritance across
-    a Windows spawn is fragile), whereas a file is uniform. Best-effort: a write
+    A cross-platform file rather than the inherited-pipe handshake ``_kernel``
+    uses for its death/window signals: that pipe pattern is POSIX-only there (fd
+    inheritance across a Windows spawn is fragile), whereas a file is uniform.
+    Best-effort: a write
     failure only costs the shim its port (it times out; the client sees EOF),
     never the server.
     """

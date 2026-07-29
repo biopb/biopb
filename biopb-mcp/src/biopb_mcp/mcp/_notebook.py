@@ -37,7 +37,7 @@ from biopb_mcp._connection import TensorConnection
 from biopb_mcp.mcp._process_ops import build_ops
 
 config = load_config()
-_conn = TensorConnection(config)
+_conn = TensorConnection()
 _conn.auto_connect()          # synchronous best-effort connect (audit; no async service)
 client = _conn.client
 

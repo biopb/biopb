@@ -18,9 +18,15 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
 the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
-widgets (``image_processing/``); ``tensor_browser`` / ``pyramid`` are
-GUI-independent data-plane knobs read by the headless kernel too; ``timeout`` /
-``grpc`` / ``memory`` are compute-plane knobs shared by the widgets and ``ops``.
+widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
+headless kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
+shared by the widgets and ``ops``.
+
+There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
+control plane owns the data plane and is asked for its address at connect time,
+so a configured URL could only be a second, staler answer -- and was how this
+machine's credential reached endpoints the control never named (#626). A legacy
+``tensor_browser`` section in an existing file is simply ignored by the merge.
 
 Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` so
 call sites never duplicate a default literal.
@@ -128,25 +134,14 @@ class GridConfig:
 
 
 @dataclass
-class TensorBrowserConfig:
-    """Data-plane connection, read by the GUI-independent TensorConnection.
-
-    Not under ``widget`` on purpose: the headless MCP kernel uses it too.
-    """
-
-    server_url: str = _h(
-        "grpc://localhost:8815", "Arrow Flight tensor-server URL for the data plane."
-    )
-
-
-@dataclass
 class PyramidConfig:
     """Multiscale pyramid construction for large tensors.
 
     Shared by the Tensor Browser widget and MCP ``add_tensor`` (both call
-    ``_tensor_utils.build_pyramid_levels``). GUI-independent, like
-    ``tensor_browser``. The numeric bounds are the identical rows the tensor
-    server enforces (PYRAMID_CONSTRAINTS), so the two cannot drift.
+    ``_tensor_utils.build_pyramid_levels``), so it is GUI-independent and lives at
+    the top level rather than under ``widget``. The numeric bounds are the
+    identical rows the tensor server enforces (PYRAMID_CONSTRAINTS), so the two
+    cannot drift.
     """
 
     threshold: int = _h(
@@ -462,7 +457,6 @@ class McpConfig:
     widget: WidgetConfig = field(default_factory=WidgetConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     grid: GridConfig = field(default_factory=GridConfig)
-    tensor_browser: TensorBrowserConfig = field(default_factory=TensorBrowserConfig)
     pyramid: PyramidConfig = field(default_factory=PyramidConfig)
     timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
     grpc: GrpcConfig = field(default_factory=GrpcConfig)

@@ -2,25 +2,38 @@
 
 ## Connecting to a tensor server
 
-The Tensor Browser connects to a [biopb tensor server](https://github.com/biopb/biopb)
-over Arrow Flight. The server URL is resolved in this order:
+The Tensor Browser reads image data from a
+[biopb tensor server](https://github.com/biopb/biopb) (the *data plane*) over
+Arrow Flight. **The control plane decides where that server is**, so there is no
+server URL to configure: at connect time the client asks the control, which brings
+the plane up if it is down and reports the address it bound.
 
-1. `BIOPB_TENSOR_URL` (and `BIOPB_TENSOR_TOKEN`) environment variables
-2. the saved `tensor_browser.server_url` in your config
-3. the default `grpc://localhost:8815`
+So if the browser says **"No biopb control plane is running"**, start one:
 
-### Auto-starting a local tensor server
+```
+biopb control start
+```
 
-If the initial connection fails and the URL is local, the client asks the
-**control plane** to bring the data plane up for you — it launches
-`biopb control start`, which supervises the tensor server as a subprocess. If the
-`biopb` command-line tool is **not** installed, this is skipped silently —
-install the full [biopb](https://github.com/biopb/biopb) system, or point
-`BIOPB_TENSOR_URL` at a server that is already running.
+then press **Connect** in the Tensor Browser (or restart the kernel). An agent
+launching biopb-mcp over stdio gets this for free — its shim starts the control
+automatically — but a plain `napari` session or `biopb mcp view` expects you to
+have started it, and `biopb mcp view` refuses to open at all without one.
+
+### Pointing at a server the control does not own
+
+To use a tensor server nothing supervises — a dev server, or one on another
+machine — set `BIOPB_TENSOR_URL` (plus `BIOPB_TENSOR_TOKEN` if it needs a token).
+That bypasses the control completely: it is not consulted, and no local data plane
+is started as a side effect.
+
+Note that the control's own credential — the token file it writes for the plane it
+owns — is **never** sent to such a server. If one needs authentication, say so with
+`BIOPB_TENSOR_TOKEN`; the error message will tell you the same thing.
 
 ### Startup failures
 
-When auto-start fails, the browser shows the underlying cause inline; the full
+When the data plane fails to come up, the browser shows the underlying cause
+inline; the full
 server output is written to `~/.local/state/biopb/logs/` (the MCP session's own
 log is under `~/.local/state/biopb/mcp/`). Common causes:
 
