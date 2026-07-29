@@ -222,15 +222,18 @@ machinery):
 
 ```python
 "services": {
-    "skills_enabled": False,  # opt-in: off by default
+    "skills_enabled": True,  # on by default
     "skills_catalog_url": "https://biopb.org/skills/catalog.json",
     "skills_cache_ttl": 3600,
 }
 ```
 
-`skills_enabled` is **off by default** — the subsystem is present but dormant
-until a deployment opts in. When off, `find_skills` returns nothing, no catalog
-fetch is attempted, and the agent is not told to consult skills.
+`skills_enabled` is **on by default** — a default install discovers skills. That
+rests on the fail-open resolution in 3c: the bundled snapshot ships in the
+package, so `find_skills` answers even with no network and the switch never
+depends on reaching biopb.org. Set it false to keep the subsystem dormant:
+`find_skills` returns nothing, no catalog fetch is attempted, and the agent is
+not told to consult skills.
 
 ### 3e. Instructions
 
@@ -241,8 +244,8 @@ fetch is attempted, and the agent is not told to consult skills.
 > accomplishing a task, ask the user whether a new skill should be generated…"
 
 It is **appended to `_BASE_INSTRUCTIONS` only when `skills_enabled` is true**
-(`set_skills_enabled`, wired from config in the launcher), so a default install
-never points the agent at a catalog that would come back empty.
+(`set_skills_enabled`, wired from config in the launcher), so an install that
+switches skills off is never pointed at a catalog that would come back empty.
 
 ---
 
