@@ -208,9 +208,9 @@ the body from `url`, verifies `sha256`, and caches it.
 
 - `httpx` GET the catalog with a short timeout. On **any** error
   (offline/DNS/TLS/HTTP/parse) degrade to: on-disk cache → **bundled snapshot**
-  shipped in the package. Never raise into bootstrap. (The snapshot ships *empty*
-  today — local skills and the cached published catalog cover the offline case —
-  but the path stays wired so a refresh is a data drop, not a code change.)
+  shipped in the package. Never raise into bootstrap. (The snapshot carries the
+  meta-skill, so an install that has never reached the network still knows how to
+  author one; refreshing it is a data drop, not a code change.)
 - Cache catalog + bodies under the biopb cache dir with a TTL; `sha256` is the
   body cache key.
 - Guard on `catalog_version`; an unknown future version keeps the last-good /

@@ -23,10 +23,10 @@ carries ``origin``). They are read on every call rather than TTL-cached: a
 personal skill is usually one the user is still editing.
 
 The bundled snapshot under ``_skills_bundle/`` is a *point-in-time copy* of the
-biopb-site ``skills/`` tree, regenerated from that repo. It ships **empty** today
--- the offline floor now matters less than it did, since a user's own skills
-resolve from disk and the published catalog is cached after first contact -- but
-the path stays wired so a refresh is a data drop, not a code change.
+biopb-site ``skills/`` tree (``catalog.json`` + bodies), regenerated from that
+repo -- a refresh is a data drop, not a code change. It carries the meta-skill
+(``write-a-skill``), so an install that has never reached the network still knows
+how to author one, and the network copy supersedes it whenever reachable.
 """
 
 import hashlib

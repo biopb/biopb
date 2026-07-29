@@ -17,6 +17,12 @@ from biopb_mcp.mcp import _skills
 
 CATALOG_URL = "https://example.test/skills/catalog.json"
 
+# The shipped snapshot is data that changes on its own schedule (a refresh is a
+# data drop, not a code change), so it is patched out by default and restored
+# only for the tests that are *about* it -- otherwise every exact-id assertion
+# would break the next time a skill is bundled.
+_REAL_BUNDLE_TEXT = _skills._bundle_text
+
 
 @pytest.fixture
 def mock_home(monkeypatch, tmp_path):
@@ -48,9 +54,16 @@ def skills_cfg(monkeypatch, tmp_path):
         return cfg.get(path.rsplit(".", 1)[1], default)
 
     monkeypatch.setattr(_skills, "_setting", fake_setting)
+    monkeypatch.setattr(_skills, "_bundle_text", lambda name: None)
     _skills._cache["skills"] = None
     _skills._cache["at"] = 0.0
     return cfg
+
+
+@pytest.fixture
+def real_bundle(skills_cfg, monkeypatch):
+    """Restore the shipped snapshot, for the tests that are about it."""
+    monkeypatch.setattr(_skills, "_bundle_text", _REAL_BUNDLE_TEXT)
 
 
 @pytest.fixture
@@ -121,9 +134,8 @@ def test_strip_frontmatter():
 def test_find_skills_empty_when_every_source_is_empty(
     mock_home, skills_cfg, monkeypatch
 ):
-    # Network down, no catalog URL, empty bundle, no local dir: discovery returns
-    # nothing rather than raising. The bundle ships empty, so this is the real
-    # cold-start shape, not a degenerate case.
+    # Network down, no catalog URL, no bundle, no local dir: discovery returns
+    # nothing rather than raising.
     _offline(monkeypatch)
     assert _skills.find_skills("") == []
 
@@ -204,14 +216,26 @@ def test_ttl_cache_avoids_refetch(mock_home, skills_cfg, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Body retrieval
 # --------------------------------------------------------------------------- #
-def test_bundle_ships_empty_but_stays_parseable(mock_home, skills_cfg, monkeypatch):
-    # The snapshot is empty on purpose (local skills + the cached published
-    # catalog cover the offline case), but the path must stay wired so a refresh
-    # is a data drop rather than a code change.
+def test_bundle_gives_a_fresh_offline_install_the_meta_skill(
+    mock_home, skills_cfg, real_bundle, monkeypatch
+):
+    # An install that has never reached the network still gets the skill that
+    # teaches skill-writing -- which is also what makes the local-skills dir
+    # discoverable to a user who has no other skills yet.
     _offline(monkeypatch)
-    raw = _skills._bundle_text("catalog.json")
-    assert raw is not None
-    assert _skills._accept_catalog(raw.encode()) == []
+    assert [s["id"] for s in _skills.find_skills("")] == ["write-a-skill"]
+    body = _skills.get_skill_body("write-a-skill")
+    assert body.startswith("# Write a new biopb skill file")
+    assert not body.lstrip().startswith("---")  # frontmatter stripped
+
+
+def test_bundle_body_sha_matches_its_catalog(mock_home, skills_cfg, real_bundle):
+    # The snapshot is refreshed by copying files in; a body updated without its
+    # catalog entry (or vice versa) would ship a sha that verifies nothing.
+    for entry in _skills.load_catalog():
+        raw = _skills._bundle_text(f"{entry['id']}.md")
+        assert raw is not None, f"{entry['id']} in bundle catalog but no body"
+        assert hashlib.sha256(raw.encode()).hexdigest() == entry["sha256"]
 
 
 def test_get_body_unknown_id(mock_home, skills_cfg, monkeypatch):
