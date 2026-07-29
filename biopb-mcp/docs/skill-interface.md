@@ -1,10 +1,12 @@
 # Skill Interface — Curated Agent Workflows Sourced from biopb.org
 
 **Status:** Partly implemented. P0 contract delivered in `biopb-site` (schema,
-builder/validator, 3 example skills, generated `catalog.json` — see Appendices
-A/B); **P2 (MCP retrieval) shipped** — the `find_skills` tool, the
-`skill://{skill_id}` resource, and the `services.skills_*` config are live in
-`biopb-mcp` (`mcp/_skills.py`, `mcp/_server.py`). P1 and P3–P4 not started.
+builder/validator, generated `catalog.json` — see Appendices A/B), which now also
+enforces the required body sections and carries the catalog's scope and authoring
+rules in `skills/ROADMAP.md`; **P2 (MCP retrieval) shipped** — the `find_skills`
+tool, the `skill://{skill_id}` resource, the `services.skills_*` config, and the
+local skills directory (§3f) are live in `biopb-mcp` (`mcp/_skills.py`,
+`mcp/_server.py`). P1 and P3–P4 not started.
 **Component:** `biopb-mcp` (discovery + retrieval), `biopb-site` (authoring + publishing)
 **Related:** the MCP `guide://*` resources and `find_skills`-style discovery, the
 `mcp.services` config block, the fail-open remote fetch in
@@ -205,7 +207,9 @@ the body from `url`, verifies `sha256`, and caches it.
 
 - `httpx` GET the catalog with a short timeout. On **any** error
   (offline/DNS/TLS/HTTP/parse) degrade to: on-disk cache → **bundled snapshot**
-  shipped in the package. Never raise into bootstrap.
+  shipped in the package. Never raise into bootstrap. (The snapshot ships *empty*
+  today — local skills and the cached published catalog cover the offline case —
+  but the path stays wired so a refresh is a data drop, not a code change.)
 - Cache catalog + bodies under the biopb cache dir with a TTL; `sha256` is the
   body cache key.
 - Guard on `catalog_version`; an unknown future version keeps the last-good /
@@ -225,15 +229,47 @@ machinery):
     "skills_enabled": True,  # on by default
     "skills_catalog_url": "https://biopb.org/skills/catalog.json",
     "skills_cache_ttl": 3600,
+    "skills_local_dir": "",  # empty -> ~/.config/biopb/skills
 }
 ```
 
-`skills_enabled` is **on by default** — a default install discovers skills. That
-rests on the fail-open resolution in 3c: the bundled snapshot ships in the
-package, so `find_skills` answers even with no network and the switch never
-depends on reaching biopb.org. Set it false to keep the subsystem dormant:
-`find_skills` returns nothing, no catalog fetch is attempted, and the agent is
-not told to consult skills.
+`skills_enabled` is **on by default** — a default install discovers skills — and
+it is the switch for the *whole* subsystem: false means no fetch, no local scan,
+an empty `find_skills`, and no skills directive in the handshake.
+
+`skills_local_dir` is the **personal tier** (§3f). It is deliberately governed by
+the same switch: a user who turns skills off is turning the feature off, not just
+the network half.
+
+### 3f. Local (user-authored) skills
+
+`~/.config/biopb/skills/*.md` (`biopb._locations.mcp_skill_dir()`) are merged
+into the catalog beside the curated entries. The distinction that matters: the
+§3c chain is three copies of *one* catalog, so first-one-wins is right there;
+local files are a **second source** and therefore union, with local winning a
+shared id (a user editing their own copy of a published skill expects theirs).
+
+- **Read on every call, not TTL-cached** — a personal skill is usually one the
+  user is still editing, and an authoring loop that needs a restart to see a
+  draft is unusable. Deleting the file retracts the skill just as immediately.
+- **Body comes from disk**, with no `sha256` and no body cache: the file *is* the
+  source of truth, so there is nothing to verify it against.
+- **Consumer stays lenient** (the §"variation is a publisher problem" principle):
+  a ~25-line frontmatter reader, no PyYAML in this stdlib-only module, `id`
+  inferred from the filename and `description` from the first H1/prose line, so a
+  bare markdown file with no frontmatter still loads. Strictness — required
+  sections, the tag vocabulary — stays at the publish boundary in `biopb-site`,
+  which is the only place with the tooling. A second copy of those rules in the
+  install would be a constant to drift, not a safeguard.
+- **Fail-open per file**: one unreadable or malformed file is skipped, never
+  fatal; a leading `_` marks a file private, as in the kernel-plugin loader.
+- **Provenance travels**: every entry carries `origin` (`local`/`catalog`), and
+  `find_skills` returns it so the agent can tell a personal draft from a
+  reviewed one rather than presenting both as curated.
+
+The three sharing tiers are then: **personal** = this directory, **lab** =
+`skills_catalog_url` pointed at a self-hosted catalog, **public** = biopb.org.
+Nothing else needs a sync mechanism.
 
 ### 3e. Instructions
 

@@ -131,6 +131,20 @@ def mcp_plugin_dir() -> Path:
     return config_dir() / "kernel"
 
 
+def mcp_skill_dir() -> Path:
+    """User skills dir (``~/.config/biopb/skills``).
+
+    ``*.md`` files here are merged into the agent's skills catalog beside the
+    curated one -- the personal tier of the same "drop a file in a config dir"
+    path as :func:`mcp_plugin_dir` (lab-wide sharing is a self-hosted
+    ``skills_catalog_url``; public is biopb.org). Config-tree (user-authored),
+    resolved at call time for test isolation and **not created on access**:
+    absence is the normal no-local-skills case, and a bare read must not
+    materialize an empty dir.
+    """
+    return config_dir() / "skills"
+
+
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     """Resolve the config file in *config_dir*: ``biopb.json``, else a legacy
     ``biopb.toml`` that must be migrated.

@@ -15,11 +15,18 @@ resolves *sha-keyed cache → network → bundled snapshot*. Nothing here raises
 a tool call or the bootstrap; failures are debug-logged and surface to the agent
 as an empty result or a short explanatory string.
 
+**Two sources, not four.** That fallback chain is three copies of *one* curated
+catalog, so first-one-wins is right for it. User-authored skills in
+``~/.config/biopb/skills/*.md`` are a separate source and therefore **merge**
+with whatever the chain resolved (local wins a shared id, and every entry
+carries ``origin``). They are read on every call rather than TTL-cached: a
+personal skill is usually one the user is still editing.
+
 The bundled snapshot under ``_skills_bundle/`` is a *point-in-time copy* of the
-biopb-site ``skills/`` tree (``catalog.json`` + bodies), regenerated from that
-repo. It is the last-resort floor so discovery and retrieval still work fully
-offline / before the catalog is first published; the network copy supersedes it
-whenever reachable.
+biopb-site ``skills/`` tree, regenerated from that repo. It ships **empty** today
+-- the offline floor now matters less than it did, since a user's own skills
+resolve from disk and the published catalog is cached after first contact -- but
+the path stays wired so a refresh is a data drop, not a code change.
 """
 
 import hashlib
@@ -31,6 +38,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from datetime import date
 from importlib import resources
 from pathlib import Path
 
@@ -52,6 +60,21 @@ _BUNDLE_DIR = "_skills_bundle"
 _USER_AGENT = "biopb-mcp-skills"
 
 _FRONTMATTER = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
+
+# Local (user-authored) skills: `~/.config/biopb/skills/*.md`, merged into the
+# catalog beside the curated entries. Origin travels with every entry so the
+# agent can tell a personal draft from a reviewed one.
+_ORIGIN_LOCAL = "local"
+_ORIGIN_CATALOG = "catalog"
+
+# Frontmatter reader for local files only. Deliberately weaker than the site's
+# (§"variation is a publisher problem"): scalars and inline `[a, b]` lists, no
+# YAML dependency in this stdlib-only module, and anything it can't parse is
+# ignored rather than fatal. A personal skill must never need a validator the
+# user doesn't have -- id and description are inferred when absent, so a bare
+# markdown file with no frontmatter at all still loads.
+_FM_BLOCK = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+_FM_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$")
 
 # Module cache for the resolved catalog (skills list). Guarded by _lock; TTL from
 # config. Bodies are cached on disk (sha-keyed), not here — they are larger and
@@ -178,7 +201,157 @@ def _normalize_entry(entry) -> dict | None:
         "updated": str(entry.get("updated") or ""),
         "url": str(entry.get("url") or ""),
         "sha256": str(entry.get("sha256") or ""),
+        "origin": _ORIGIN_CATALOG,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Local skills (user-authored, ~/.config/biopb/skills)
+# --------------------------------------------------------------------------- #
+def _parse_frontmatter(text: str) -> dict:
+    """Read a leading ``--- … ---`` block into a flat dict of strings/lists.
+
+    Understands ``key: value`` and ``key: [a, b]``; quotes are stripped. Lines it
+    doesn't understand (nesting, block lists, folded scalars) are skipped, since
+    every field has a fallback and half a parse still beats none.
+    """
+    m = _FM_BLOCK.match(text)
+    if not m:
+        return {}
+    out: dict = {}
+    for line in m.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[:1].isspace():
+            continue  # indented: part of a nested block this reader doesn't do
+        fields = _FM_LINE.match(line.strip())
+        if not fields:
+            continue
+        key, value = fields.group(1).lower(), fields.group(2).strip()
+        if value.startswith("[") and value.endswith("]"):
+            out[key] = [
+                item.strip().strip("\"'")
+                for item in value[1:-1].split(",")
+                if item.strip()
+            ]
+        else:
+            out[key] = value.strip("\"'")
+    return out
+
+
+def _first_h1(body: str) -> str:
+    for line in body.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return ""
+
+
+def _first_prose(body: str) -> str:
+    """First non-heading, non-empty line — the description fallback."""
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.startswith(("#", ">", "-", "*", "|", "`")):
+            return line[:300]
+    return ""
+
+
+def _local_dir() -> Path | None:
+    """Configured local-skills dir, else the standard one. Never created here."""
+    configured = (_setting("services.skills_local_dir", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        from biopb._locations import mcp_skill_dir
+
+        return mcp_skill_dir()
+    except Exception:  # pragma: no cover - core SDK always present in practice
+        logger.debug("skills: no local dir resolvable", exc_info=True)
+        return None
+
+
+def _local_entry(path: Path) -> dict | None:
+    """One local file → a catalog-shaped entry, or ``None`` if unusable."""
+    raw = path.read_text(encoding="utf-8")
+    fm = _parse_frontmatter(raw)
+    body = _strip_frontmatter(raw)
+
+    skill_id = str(fm.get("id") or path.stem).strip()
+    if not skill_id:
+        return None
+    title = str(fm.get("title") or _first_h1(body) or skill_id).strip()
+    description = str(fm.get("description") or _first_prose(body) or title).strip()
+    if not description:
+        return None
+
+    tags = fm.get("tags")
+    tags = [str(t) for t in tags] if isinstance(tags, list) else []
+    requires = fm.get("requires")
+    requires = [str(r) for r in requires] if isinstance(requires, list) else []
+
+    try:
+        updated = date.fromtimestamp(path.stat().st_mtime).isoformat()
+    except OSError:
+        updated = ""
+
+    return {
+        "id": skill_id,
+        "title": title,
+        "description": description,
+        "tags": tags,
+        "version": str(fm.get("version") or ""),
+        "requires": requires,
+        "updated": updated,
+        # No url/sha256: the file on disk *is* the source of truth, so there is
+        # nothing to fetch and nothing to verify it against.
+        "url": "",
+        "sha256": "",
+        "origin": _ORIGIN_LOCAL,
+        "_path": str(path),
+    }
+
+
+def _scan_local() -> list[dict]:
+    """All readable ``*.md`` in the local dir. Fail-open per file (one bad skill
+    never sinks discovery) and per directory (missing dir is the normal case)."""
+    directory = _local_dir()
+    if directory is None:
+        return []
+    try:
+        paths = sorted(p for p in directory.glob("*.md") if p.is_file())
+    except OSError:
+        logger.debug("skills: local dir unreadable (fail-open)", exc_info=True)
+        return []
+
+    out = []
+    for path in paths:
+        if path.stem.startswith("_"):  # private, like the kernel-plugin loader
+            continue
+        try:
+            entry = _local_entry(path)
+        except Exception:
+            logger.debug("skills: skipping local %s", path.name, exc_info=True)
+            continue
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def _merge_local(curated: list[dict]) -> list[dict]:
+    """Union the curated catalog with local skills; local wins a shared id.
+
+    Local skills are a *source*, not another copy of the catalog, so they merge
+    rather than participate in the network → cache → bundle fallback. A user
+    iterating on their own version of a published skill expects to get theirs.
+    """
+    local = _scan_local()
+    if not local:
+        return curated
+    merged = {entry["id"]: entry for entry in curated}
+    for entry in local:
+        if entry["id"] in merged:
+            logger.debug("skills: local %s shadows the catalog entry", entry["id"])
+        merged[entry["id"]] = entry
+    return list(merged.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -224,12 +397,16 @@ def load_catalog(*, force: bool = False) -> list[dict]:
             and _cache["skills"] is not None
             and (time.time() - _cache["at"]) < ttl
         ):
-            return _cache["skills"]
+            curated = _cache["skills"]
+        else:
+            curated = _resolve_catalog(url)
+            _cache["skills"] = curated
+            _cache["at"] = time.time()
 
-        skills = _resolve_catalog(url)
-        _cache["skills"] = skills
-        _cache["at"] = time.time()
-        return skills
+    # Outside the lock and outside the TTL: local files are a handful of small
+    # reads, and re-scanning every call is what makes an edit live immediately --
+    # the authoring loop would be unusable if a draft needed a restart to appear.
+    return _merge_local(curated)
 
 
 def _resolve_catalog(url: str) -> list[dict]:
@@ -292,6 +469,9 @@ def find_skills(query: str = "") -> list[dict]:
                 "version": s["version"],
                 "updated": s["updated"],
                 "requires": s["requires"],
+                # "local" = the user's own file, unreviewed. The agent should be
+                # able to say so rather than let a draft pass as curated.
+                "origin": s.get("origin", _ORIGIN_CATALOG),
                 "uri": f"skill://{s['id']}",
             }
         )
@@ -312,6 +492,17 @@ def get_skill_body(skill_id: str) -> str:
             f"No skill '{skill_id}' in the catalog. "
             "Call find_skills to list available skills."
         )
+
+    # Local skill: the file is the source of truth, so read it fresh every time
+    # (an edit shows up immediately) and skip the sha/cache machinery entirely --
+    # there is no remote copy to verify it against.
+    local_path = entry.get("_path")
+    if local_path:
+        try:
+            return _strip_frontmatter(Path(local_path).read_text(encoding="utf-8"))
+        except OSError:
+            logger.debug("skills: local body unreadable %s", local_path, exc_info=True)
+            return f"Local skill '{skill_id}' could not be read from {local_path}."
 
     sha = entry.get("sha256") or ""
     body_dir = _cache_dir() / "bodies"
