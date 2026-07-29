@@ -80,48 +80,39 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 
 ### Shim-owned MCP sessions
 
-The MCP server process **is http-only** (loopback streamable-http). `--transport
-stdio` — still the default, so installer-seeded client configs keep working — no
-longer serves MCP from the launcher; it runs the **shim**, which
+Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, which
 
-1. **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
+1. Start-and-forget the control plane; writes a session registry at the state dir,
+   so the control can see it.
+2. **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
    on a **dynamic OS-assigned port**,
-2. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin,
-   replaying the child's initialize result **verbatim** — including `instructions`,
-   the field the generic `mcp-proxy` drops, which is why the bridge is vendored,
-3. **reaps** the child and its kernel grandchild on the way out.
-
-There is **no probe-and-reuse, no shared daemon, no fixed port**: each stdio client
-spawns and owns its own session, so N clients get N independent sessions (N
-viewers), by design. The child **inherits the shim's live environment** (so the
-agent's viewer lands on the human's real display — the #98 fix), **registers with
-the control** on startup, and is **reaped as a tree** (POSIX process group +
-parent-death pipe; Windows Job Object, #403).
-
-Native http skips the shim entirely and is preferred where the client supports it.
+3. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin,
+   replaying the child's initialize result **verbatim** — including `instructions`.
+4. **reaps** the child and its kernel grandchild as a tree (POSIX process group +
+   parent-death pipe; Windows Job Object, #403) on the way out.
 
 ### The kernel
 
-The session child owns a **single child Jupyter kernel** hosting the napari viewer,
+The session owns a **single child Jupyter kernel** hosting the napari viewer,
 dask, and the tensor client. Agent code runs *in that kernel*, not on the MCP
 thread or napari's Qt loop — so a runaway execution can be interrupted or
 hard-restarted without killing the MCP server. A single `RLock` serializes access,
 held only for *quick* snippets, never during long compute.
 
 The kernel is **launched lazily, not at boot**, so a long-running server binds
-cheaply and never pops a viewer with nobody connected; kernel-dependent tools
-return a structured not-ready status until then. **Closing the napari window tears
-the kernel back down to idle**, and `start_kernel` rebuilds it.
+cheaply and never pops a napari viewer until user requested it; kernel-dependent
+tools return a structured not-ready status until then. **Closing the napari window
+tears the kernel back down to idle**, and `start_kernel` rebuilds it.
 
-Two consequences of running agent code off the main thread shape the kernel's
-internals: jobs run in a background thread so the Qt loop stays free to service
-screenshots and status mid-job, and the agent-facing `viewer` is a **main-thread
-marshaling proxy** over the real `napari.Viewer`, because an off-main napari
-mutation can segfault the kernel (#100).
+Because napari viewer is launched within the jupyter kernel, agents' jobs are run
+in a background thread, so the Qt loop stays free to respond to user and agent inputs
+alike. The agent-facing `viewer` object is a **main-thread marshaling proxy** over
+the real `napari.Viewer`, because an off-main napari mutation can segfault the kernel
+(#100).
 
 ### dask cluster
 
-The **session child** — not the kernel — owns the dask `LocalCluster`, so it
+The **mcp server** — not the kernel — owns the dask `LocalCluster`, so it
 survives kernel restart/respawn/window-close with no cold worker re-spawn per
 restart (the dominant restart cost on Windows). The kernel attaches via an injected
 scheduler address; worker/memory changes therefore need a *session* restart, not
@@ -138,45 +129,28 @@ It resolves no endpoint from config and persists nothing.
 
 Its connect policy: the **control is the only source of a data plane** (#628). One
 `ensure_data_plane` call both brings the plane up if it is down and returns the
-*authoritative* gRPC endpoint; no control answering means there is no plane to
-connect to, recorded as an actionable "run `biopb control start`" rather than a
-guess at an address. `$BIOPB_TENSOR_URL` is the one escape hatch, for a plane
-nothing supervises — it bypasses the control entirely, so pointing elsewhere never
-spawns a local plane as a side effect. Because there is no configured URL and no
-persisted last-endpoint, no endpoint the control did not name can arise at all. It
-is a **pure client** — it starts neither the plane (the control's job) nor the
-control (the stdio shim's job, and only its). Because `connect()` blocks on I/O it
-must be driven off the caller's main thread.
-
-Two policies worth knowing: a **local TLS plane is trusted from disk, never
-pinned** (its cert is already on this machine; a remote plane still TOFU-pins), and
-the catalog is **self-healing** — a catalog cached at connect can be partial,
-because the server reports `SERVING` before it finishes enumerating scenes, so a
-daemon thread re-lists on any source-count change.
+*authoritative* gRPC endpoint. `$BIOPB_TENSOR_URL` is the one escape hatch, for
+connecting to a data-server _not_ supervised by the control. A local TLS data server
+is trusted from disk (its cert is already on this machine).
 
 ### Extending the kernel namespace
 
-The agent's capability surface **is** the kernel namespace (`viewer`, `client`,
-`ops`, `np`/`da`), so a lab adds capability by *putting objects in scope*, not by
-extending a protocol. Two paths feed it: `*.py` files in a user kernel dir, exec'd
-with IPython `startup/` semantics, and `biopb_mcp.namespace` entry points for
-published plugin packages. Both are **fail-open per unit** (one bad plugin is
-skipped, never aborting the bootstrap) and pass a **reserved-name guard** so a
-plugin cannot overwrite a load-bearing handle. There is deliberately **no generated
-enumeration** — the agent discovers plugins with `dir()`/`inspect_object`, so code
-and doc cannot drift.
+The agent's capability surface **is** the kernel namespace (e.g., `viewer`, `client`,
+`ops`, `np`/`da`), so a user adds capability by simply *putting objects in scope*.
+Two paths feed it: `*.py` files in a user kernel dir, exec'd with IPython `startup/`
+semantics, and `biopb_mcp.namespace` entry points for published plugin packages. Both
+are **fail-open per unit** (one bad plugin is skipped without aborting the bootstrap)
+and gated with **reserved-name guard**, so a plugin cannot overwrite the default names.
+The agent discovers plugins with `dir()`/`inspect_object`, not from a "generated
+enumeration", so code and doc cannot drift.
 
 ---
 
 ## Security model
 
 **The kernel is a real IPython kernel with imports allowed — `execute_code` is
-arbitrary code execution by design.** Do not describe it as sandboxed. The system
-assumes a **localhost / trusted-intranet** deployment; untrusted-network exposure
-is expected to be fronted by a separately-documented reverse proxy.
-
-Everything the session exposes is therefore an RCE surface, and it is protected in
-two places:
+arbitrary code execution by design.** Everything the session exposes is therefore an RCE
+threat, and it is protected in two places:
 
 - **Its own listener** binds loopback only and enforces an `Origin`/`Host`
   allowlist, so a malicious page in the user's browser is rejected before it
@@ -187,12 +161,3 @@ two places:
   **only** authentication there — and `/mcp` itself is deliberately never proxied,
   reachable only by the shim that owns the child. Both are enforced control-side:
   [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE.md).
-
-One credential rule follows from the connect policy above: **the control's
-credential file never leaves the plane it belongs to** (#626/#628). The token the
-control writes to disk at start-up is *this machine's* credential for the plane the
-control owns, so it travels only to an endpoint the control itself named — the
-filesystem handoff that lets an agent-spawned session authenticate a token-gated
-local plane having inherited none of the control's environment. An address from
-`$BIOPB_TENSOR_URL` routed around the control on purpose, possibly to someone
-else's server, and is dialed with `$BIOPB_TENSOR_TOKEN` or with nothing.
