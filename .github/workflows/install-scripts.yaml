@@ -1,5 +1,6 @@
-# Publish the bootstrap install scripts to biopb.org on every change to them on
-# main. These are served at the canonical one-liner URLs:
+# Check the installer on every PR that touches it, and publish the bootstrap
+# scripts to biopb.org when they land on main. These are served at the canonical
+# one-liner URLs:
 #   - install/install.sh       -> biopb.org/install.sh
 #   - install/install.ps1      -> biopb.org/install.ps1
 #   - install/biopb-engine.ps1 -> biopb.org/biopb-engine.ps1
@@ -10,11 +11,26 @@
 # SDK API docs use for /docs/api/ (see api-docs.yaml). This replaced an nginx
 # proxy_pass to raw.githubusercontent.com, which was hitting HTTP 429.
 #
-# workflow_dispatch is a dry run: it syntax-checks the scripts but never touches
-# SSH or the server.
-name: Install scripts (publish)
+# The checks exist because until now NOTHING ran on a PR touching install/: the
+# lint workflow is filtered to '**/*.py', and the only verification here fired on
+# push-to-main, i.e. after the merge. A broken .iss was discoverable solely by
+# cutting a release. These jobs are static (parse/compile/lint) -- executing
+# installer logic is tracked separately in the installer test-suite issue.
+#
+# workflow_dispatch is a dry run: it checks everything but never touches SSH or
+# the server.
+name: Install scripts
 
 on:
+  # Checks. Broad path net: the .iss and the docs live under install/ too, and a
+  # PR that changes only the GUI still needs the compile job below.
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'install/**'
+      - '.github/workflows/install-scripts.yaml'
+  # Publish. Narrow to exactly the three served files -- a change to the .iss or
+  # the README is not a reason to rsync.
   push:
     branches: [main]
     paths:
@@ -24,29 +40,93 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: install-scripts
+  # Keyed by ref so PRs never queue behind each other; two pushes to main still
+  # share a group, which is what keeps concurrent rsyncs from interleaving.
+  group: install-scripts-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  publish:
+  check:
+    name: Scripts parse and lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify scripts
+      - name: Parse install.sh
+        run: bash -n install/install.sh
+
+      - name: Lint install.sh
         run: |
-          # Bash parse check on the POSIX installer; presence check on the
-          # PowerShell scripts (no pwsh tokenizer on the runner by default).
-          bash -n install/install.sh
-          test -s install/install.ps1
-          test -s install/biopb-engine.ps1
+          # The four excluded codes are this file's 7 pre-existing findings (no
+          # errors among them). Excluding beats fixing them in whatever PR adds
+          # this gate: the check is green on arrival and every OTHER shellcheck
+          # rule -- unquoted expansions, always-true tests, dead branches -- is
+          # live from now on. Ratcheting the exclusions off is tracked in the
+          # installer test-suite issue.
+          shellcheck -e SC2155,SC2034,SC2059,SC2015 install/install.sh
+
+      - name: Parse the PowerShell scripts
+        shell: pwsh
+        run: |
+          # A real tokenizer, not `test -s`: ubuntu-latest ships PowerShell 7, so
+          # the parser that would reject these on a user's machine is available
+          # here for free. This is the only check the two .ps1 files get -- the
+          # engine is 1700 lines that no test executes.
+          $bad = $false
+          foreach ($f in 'install/install.ps1', 'install/biopb-engine.ps1') {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                  (Resolve-Path $f), [ref]$null, [ref]$errors) | Out-Null
+              if ($errors) {
+                  $bad = $true
+                  Write-Host "::error file=$f::$($errors.Count) parse error(s)"
+                  $errors | ForEach-Object {
+                      Write-Host "  line $($_.Extent.StartLineNumber): $($_.Message)"
+                  }
+              } else {
+                  Write-Host "OK: $f"
+              }
+          }
+          if ($bad) { exit 1 }
+
+  gui:
+    name: GUI installer compiles
+    # Skipped on the push-to-main publish run, whose paths cannot include the
+    # .iss anyway. Dispatch runs it so the dry run stays a full check.
+    if: github.event_name != 'push'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same compile release.yaml runs, moved to where it can still block a
+      # merge. The .iss packages only ..\biopb-engine.ps1 -- already in the
+      # checkout -- so this needs no build steps ahead of it, and AppVersion
+      # self-defaults to 0.0.0-dev when CI does not inject a release tag.
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile biopb-setup.iss
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc /O"$env:RUNNER_TEMP" install\gui\biopb-setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+
+  publish:
+    name: Publish to biopb.org
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Set up SSH key
-        if: github.event_name == 'push'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
@@ -54,7 +134,6 @@ jobs:
           ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
 
       - name: Publish install scripts with rsync
-        if: github.event_name == 'push'
         run: |
           # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
