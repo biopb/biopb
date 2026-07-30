@@ -52,6 +52,7 @@ from biopb_tensor_server.core.discovery import (
     resolve_local_path,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
@@ -886,6 +887,12 @@ class Reconciler:
 
         registered = False
         try:
+            # Normalize the axis order here rather than leaning on what
+            # register_source hands back (biopb/biopb#596): the catalog row
+            # below must describe the same tensors the serve path will hand
+            # out, and the wrap is idempotent, so the registry re-applying it
+            # is a no-op.
+            adapter = normalize_adapter(adapter)
             self._server.register_source(claim.source_id, adapter)
             registered = True
 

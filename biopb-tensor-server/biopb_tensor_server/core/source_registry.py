@@ -19,6 +19,7 @@ import threading
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
+from biopb_tensor_server.core.normalize import normalize_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +49,25 @@ class SourceRegistry:
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
 
-    def register(self, source_id: str, adapter: SourceAdapter) -> None:
-        """Register a data source.
+    def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
+        """Register a data source, in canonical axis order.
+
+        Being the single registration chokepoint, this is also where the
+        canonical-axis-order guarantee is applied (biopb/biopb#596): the adapter
+        is passed through :func:`normalize_adapter`, which wraps it only if its
+        axes are not already canonical. **Returns the registered adapter** --
+        the same object in the overwhelmingly common compliant case, the wrapper
+        otherwise. Callers that keep using the adapter after registering it (to
+        sync the catalog row, say) must use the return value, or the catalog
+        would describe a different axis order than the serve path.
 
         Args:
             source_id: Unique identifier for the data source. Must be non-empty
                 and slash-free (see Raises).
             adapter: Source adapter for the data source
+
+        Returns:
+            The adapter as registered -- normalized if it needed it.
 
         Raises:
             ValueError: If *source_id* is empty or contains ``"/"``. The tensor
@@ -75,9 +88,11 @@ class SourceRegistry:
                 f"{source_id!r}); the chunk-route id source_id/array_id decodes "
                 f"by splitting on the first '/'."
             )
+        adapter = normalize_adapter(adapter)
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
+        return adapter
 
     def unregister(self, source_id: str) -> Optional[SourceAdapter]:
         """Remove a source and release its adapter's resources.

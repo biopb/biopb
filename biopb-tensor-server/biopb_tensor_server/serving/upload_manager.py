@@ -37,6 +37,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.core.axes import canonical_permutation
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
@@ -179,6 +180,32 @@ class UploadManager:
 
     # -- write path ------------------------------------------------------------
 
+    @staticmethod
+    def _require_canonical_axes(req_desc: TensorDescriptor) -> None:
+        """Reject an upload whose declared axis order is not canonical (#596).
+
+        A writable source is the one place the axis order is *declared* rather
+        than read out of a file, and both ends of it belong to the same client:
+        ``physical_scale`` and ``chunk_shape`` come in aligned to these labels,
+        and ``put_chunk`` writes in this order. So the server refuses the order
+        up front instead of permuting reads behind the uploader's back, which
+        would desynchronize what it reads back from what it wrote. Transposing
+        before upload is the client-side fix, and it is a cheap one.
+
+        This keeps the canonical-order guarantee unconditional -- it holds for
+        uploaded sources too -- at zero cost on the write data path.
+        """
+        perm = canonical_permutation(req_desc.dim_labels, req_desc.shape)
+        if perm is None:
+            return
+        labels = list(req_desc.dim_labels)
+        raise flight.FlightServerError(
+            f"create_source: dim_labels {labels} are not in canonical "
+            f"[..., Z, Y, X, S] order (expected {[labels[p] for p in perm]}). "
+            f"The data plane advertises canonical order on every source "
+            f"(biopb/biopb#596); transpose the array before uploading."
+        )
+
     def create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:
         """Create a source from a TensorDescriptor, return its resolved descriptor.
 
@@ -189,6 +216,7 @@ class UploadManager:
         - "ome_zarr:" → zarr-backed with server-generated name
         """
         array_id = req_desc.array_id
+        self._require_canonical_axes(req_desc)
 
         # Physical calibration is echoed on the response only for cache sources:
         # they store it in the adapter AND re-serve it verbatim on the read hot

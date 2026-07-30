@@ -378,7 +378,14 @@ class SourceConfig:
     )
     dim_labels: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Dimension labels applied to all tensors in the source."},
+        metadata={
+            "help": "Dimension labels applied to all tensors in the source. This "
+            "is how a store that carries no axis semantics of its own (plain "
+            "zarr, HDF5 -- which otherwise report dim0, dim1, ...) gets them: "
+            "the server reorders labelled axes into canonical [..., z, y, x, s] "
+            "order, but never invents a label it was not given "
+            "(biopb/biopb#596)."
+        },
     )
     dataset: Optional[str] = field(
         default=None,
