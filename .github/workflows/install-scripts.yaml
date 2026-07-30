@@ -61,12 +61,10 @@ jobs:
 
       - name: Lint install.sh
         run: |
-          # The four excluded codes are this file's 7 pre-existing findings (no
-          # errors among them). Excluding beats fixing them in whatever PR adds
-          # this gate: the check is green on arrival and every OTHER shellcheck
-          # rule -- unquoted expansions, always-true tests, dead branches -- is
-          # live from now on. Ratcheting the exclusions off is tracked in #653.
-          shellcheck -e SC2155,SC2034,SC2059,SC2015 install/install.sh
+          # No exclusions: the 7 findings this gate arrived with are fixed (#653
+          # item 5). Keep it that way -- an exclusion added here to land a PR is
+          # a rule switched off for every future one.
+          shellcheck install/install.sh
 
       - name: Parse the PowerShell scripts
         shell: pwsh

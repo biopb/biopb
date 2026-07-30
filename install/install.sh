@@ -253,7 +253,7 @@ _install_opencode() {
     echo ""
     _info "opencode needs an API key to talk to an LLM (free with opencode zen):"
     _info "  1. Open ${BOLD}https://opencode.ai/auth${RESET}, sign in, create a new API key, and copy it."
-    printf "  ${DIM}Paste the API key (or press Enter to skip): ${RESET}" >/dev/tty
+    printf '  %sPaste the API key (or press Enter to skip): %s' "$DIM" "$RESET" >/dev/tty
     # Read silently but echo a "*" per character so the user gets visual
     # confirmation their paste registered (plain `read -s` shows nothing, which
     # makes it hard to tell whether a paste worked).
@@ -959,8 +959,10 @@ install_biopb() {
     # config tree, portable assets (webapp/samples) in the data tree, and logs /
     # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
     # conventional dirs, so writer (installer) and reader (code) never disagree.
+    # The state tree is derived at each point of use rather than here: the two
+    # readers are functions that run outside this one, and uninstall_biopb never
+    # executes it at all.
     CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/biopb"
-    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
     local data_base="${XDG_DATA_HOME:-$HOME/.local/share}/biopb"
     WEBAPP_DIR="$data_base/webapp"
     SAMPLES_DIR="$data_base/samples"
@@ -1245,10 +1247,14 @@ install_biopb() {
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
     trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
-    local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
-    local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
-    local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
-    local control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
+    # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
+    # status, so a failing _urldecode/basename would sail past `set -e` and leave
+    # a truncated path to curl into.
+    local mcp_whl sdk_whl tensor_whl control_whl
+    mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
+    sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
+    tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+    control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
@@ -1856,8 +1862,14 @@ PY
         local c
         for c in "${cache_dirs[@]}"; do
             if [ -e "$c" ]; then
-                rm -rf "$c" 2>/dev/null && _ok "Removed cache $c" \
-                    || _info "Could not remove cache $c (left in place)"
+                # if/else, not `A && B || C`: with the latter a failing _ok (a
+                # closed stdout is enough) runs C, reporting a removal that
+                # actually succeeded as one that could not be done.
+                if rm -rf "$c" 2>/dev/null; then
+                    _ok "Removed cache $c"
+                else
+                    _info "Could not remove cache $c (left in place)"
+                fi
             fi
         done
 
