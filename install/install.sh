@@ -288,6 +288,39 @@ _install_opencode() {
     fi
 }
 
+# Read the user's extra packages for the shared environment into EXTRA_PACKAGES.
+#
+# The one environment this installer builds is a uv tool env, and every upgrade
+# rebuilds it with `uv tool install --force` from the requirement list assembled
+# below. So a package the user added by hand -- into the very interpreter the
+# napari kernel runs, which is where an optional dependency like basicpy has to
+# live -- is silently dropped at the next upgrade, and the loss shows up later as
+# an import that used to work. Replaying a user-owned list makes those packages
+# part of the requirement set, so they are reinstalled along with everything else.
+#
+# One PEP 508 requirement per line ("basicpy", "m2stitch==0.9.0"); `#` comments
+# and blank lines ignored. The file is the user's, never written by the installer.
+#
+# EXTRA_PACKAGES_COUNT, not ${#EXTRA_PACKAGES[@]}, gates every expansion of the
+# array: macOS still ships bash 3.2, where expanding an *empty* array under
+# `set -u` is an unbound-variable error.
+_read_extra_packages() {
+    EXTRA_PACKAGES=()
+    EXTRA_PACKAGES_COUNT=0
+    EXTRA_PACKAGES_FILE="$CONFIG_DIR/extra-packages.txt"
+    [ -f "$EXTRA_PACKAGES_FILE" ] || return 0
+    local line
+    # `|| [ -n "$line" ]` so a final line without a trailing newline is not lost.
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line=$(printf '%s' "$line" | tr -d '\r' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ -n "$line" ] || continue
+        EXTRA_PACKAGES+=("$line")
+        EXTRA_PACKAGES_COUNT=$((EXTRA_PACKAGES_COUNT + 1))
+    done < "$EXTRA_PACKAGES_FILE"
+}
+
 # Detect installed agent systems and register the biopb MCP server with each.
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
@@ -1296,8 +1329,36 @@ install_biopb() {
     _info "Stopping any running biopb services before upgrade..."
     _stop_all_biopb_services
 
+    # User-added packages, replayed as part of the requirement set (see
+    # _read_extra_packages). Held in their own array so the install can be retried
+    # without them.
+    _read_extra_packages
+    local with_extras=()
+    if [ "$EXTRA_PACKAGES_COUNT" -gt 0 ]; then
+        local pkg
+        for pkg in "${EXTRA_PACKAGES[@]}"; do
+            with_extras+=(--with "$pkg")
+        done
+        _info "  including your extra packages: ${EXTRA_PACKAGES[*]}"
+    fi
+
     _info "Installing biopb into one shared environment..."
-    uv tool install "${install_args[@]}"
+    if [ "$EXTRA_PACKAGES_COUNT" -gt 0 ]; then
+        # Fail-soft. A user requirement joins the same resolve as the release's own
+        # pins (napari is pinned exactly), so one bad line could otherwise block the
+        # whole upgrade over a package the deployment does not need. Retry without
+        # them and name what was dropped: the deployment lands, and the user is told
+        # which line to fix rather than finding out at the next import.
+        if ! uv tool install "${install_args[@]}" "${with_extras[@]}"; then
+            EXTRAS_DROPPED="${EXTRA_PACKAGES[*]}"
+            _warn "Could not resolve your extra packages: $EXTRAS_DROPPED"
+            _warn "Installing biopb without them — fix or remove the offending line in"
+            _warn "  $EXTRA_PACKAGES_FILE"
+            uv tool install "${install_args[@]}"
+        fi
+    else
+        uv tool install "${install_args[@]}"
+    fi
     # The wheel download dir (if any) is removed by the EXIT trap set above.
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
@@ -1537,6 +1598,16 @@ install_biopb() {
     if [ "$WEBAPP_OK" = "0" ]; then
         _warn "Web interface not installed (download failed)"
         _info "  the dashboard won't work until you rerun this script to fetch it"
+        echo ""
+    fi
+
+    # A dropped extra is the one failure a user would otherwise meet as a missing
+    # import weeks later, so it is repeated here rather than only at the (long)
+    # install step it happened in.
+    if [ -n "${EXTRAS_DROPPED:-}" ]; then
+        _warn "Your extra packages were NOT installed: $EXTRAS_DROPPED"
+        _info "  they could not be resolved with this release's own pins"
+        _info "  fix or remove the line, then rerun: ${CYAN}$EXTRA_PACKAGES_FILE${RESET}"
         echo ""
     fi
 
