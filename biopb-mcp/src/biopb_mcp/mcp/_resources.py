@@ -18,22 +18,68 @@ GUIDE = """\
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 | `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result (no-op on the main thread). Rarely needed — the `viewer` already auto-marshals every mutation. Use it only to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
 
-* The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`, the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
-* Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
-* **Server data, viewer data and your own arrays are three different things** —
+- The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every
+  mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
+  the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate
+  it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main
+  thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to
+  apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
+- Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
+- **Server data, viewer data and your own arrays are three different things** —
   different axis order, different resolution levels, different laziness. Read
   `guide://data` before writing code that reads pixels off a layer.
-* `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
+- `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
-**User plugins may add more names** beyond this table (biopb-mcp#92): top-level
+## Kernel plugins
+**User plugins may add more names** beyond this table: top-level
 definitions from `*.py` files in `~/.config/biopb/kernel/`, and installed
 `biopb_mcp.namespace` packages, are loaded into this namespace at kernel start.
-They're lab-specific helpers, not built-ins — so if you see an unfamiliar name,
-it's likely one of these. Discover and read them by introspection:
+They're lab-specific helpers, not built-ins — so an unfamiliar name is likely one
+of these. Two questions, two different answers:
+
+* **Which plugins loaded** — `server_status`, section `## Kernel plugins`. It
+  lists the files and the packages that actually loaded; the loader is fail-open
+  per unit, so a `*.py` sitting in that directory but missing from the report
+  failed on load and the session log says why. The section reads
+  `(disabled — services.namespace_enabled)` where plugins are switched off.
+* **What names they contribute** — introspection. A plugin file contributes its
+  *functions*, not its own name, so the report cannot answer this:
 ```python
 [n for n in dir() if not n.startswith("_")]   # everything actually in scope
 inspect_object("<name>")                        # its signature + docstring
 ```
+
+## Long-running jobs
+A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
+watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
+(best-effort, raises KeyboardInterrupt into the job and cancels in-flight dask tasks) or
+`restart_kernel` (guaranteed, kills the kernel). Notes:
+* **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
+  dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
+* **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
+  raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
+* **Progress on a big graph:** submit with the distributed client
+  (`_dask_client`, present only under the distributed scheduler) and consume results as
+  they land — this gives a live processed count via `poll_job`:
+  ```python
+  from dask.distributed import as_completed
+  futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
+  done = []
+  for fut in as_completed(futs):
+      done.append(fut.result())
+      print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
+  ```
+
+Reading pixels, moving them between the server / a layer / your own variables,
+and the round trip for data too large to hold: `guide://data`.
+"""
+
+# Appended to GUIDE only when the skills catalog is enabled
+# (``services.skills_enabled``, on by default; see _server.get_kernel_guide).
+# An install with skills off has no `requires:` lists to resolve and no
+# `find_skills` to get them from, so this section would describe a tool the
+# agent cannot call -- the same reasoning as _SKILLS_INSTRUCTIONS.
+SKILL_REQUIREMENTS = """\
 
 ## Skill requirements
 A curated skill from `find_skills` carries a `requires:` list. **Resolve it before you start
@@ -100,30 +146,6 @@ to the user as "no data" rather than "not connected".
 covers the same need — but **ask before substituting** an op the skill didn't name, since a
 different model is a different result. Otherwise the user adds a server to
 `services.process_image_servers`.
-
-## Long-running jobs
-A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
-watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
-(best-effort, raises KeyboardInterrupt into the job and cancels in-flight dask tasks) or
-`restart_kernel` (guaranteed, kills the kernel). Notes:
-* **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
-  dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
-* **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
-  raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
-* **Progress on a big graph:** submit with the distributed client
-  (`_dask_client`, present only under the distributed scheduler) and consume results as
-  they land — this gives a live processed count via `poll_job`:
-  ```python
-  from dask.distributed import as_completed
-  futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
-  done = []
-  for fut in as_completed(futs):
-      done.append(fut.result())
-      print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
-  ```
-
-Reading pixels, moving them between the server / a layer / your own variables,
-and the round trip for data too large to hold: `guide://data`.
 """
 
 DATA = """\

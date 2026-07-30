@@ -153,6 +153,30 @@ class TestResources:
         assert "failed to load" in section
         assert "biopb-mcp-seed-plugins" in section
 
+    def test_guide_skill_section_gated_on_the_catalog_switch(self):
+        # With the catalog off there is no find_skills to hand back a
+        # `requires:` list, so the section documents a tool the agent cannot
+        # call -- the gate the handshake instructions already use.
+        _server.set_skills_enabled(False)
+        off = _server.get_kernel_guide()
+        assert "## Skill requirements" not in off
+        _server.set_skills_enabled(True)
+        on = _server.get_kernel_guide()
+        assert "## Skill requirements" in on
+        # Everything else is the same guide, in both directions (no stale copy).
+        assert on.startswith(off)
+        _server.set_skills_enabled(False)
+        assert _server.get_kernel_guide() == off
+
+    def test_guide_points_at_server_status_for_which_plugins_loaded(self):
+        # The loader is fail-open, so "file on disk" != "plugin loaded"; the
+        # report is the only place that distinction is readable.
+        content = _server.get_kernel_guide()
+        assert "## Kernel plugins" in content
+        assert "services.namespace_enabled" in content
+        # ...and introspection remains the answer to the other question.
+        assert "inspect_object" in content
+
     def test_viewer_resource_mentions_layers(self):
         content = _server.get_viewer_guide()
         assert "viewer.layers" in content

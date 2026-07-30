@@ -503,7 +503,15 @@ def _format_job_status(snap: dict) -> str:
 
 @mcp.resource("guide://kernel")
 def get_kernel_guide() -> str:
-    """Overview: available namespaces, helper functions, resource URIs."""
+    """Overview: available namespaces, helper functions, resource URIs.
+
+    The skill-requirements section is appended only when the catalog is enabled
+    (``services.skills_enabled``): with it off there is no ``find_skills`` to
+    return a ``requires:`` list, so the section would document an unreachable
+    tool -- the same gate the handshake instructions use.
+    """
+    if _skills_enabled:
+        return _resources.GUIDE + _resources.SKILL_REQUIREMENTS
     return _resources.GUIDE
 
 
