@@ -32,6 +32,23 @@ it's likely one of these. Discover and read them by introspection:
 inspect_object("<name>")                        # its signature + docstring
 ```
 
+## Skill requirements
+A curated skill from `find_skills` carries a `requires:` list (`viewer`, `tensor`, `dask`,
+`ops:<name>`, `plugin:<name>`, `pkg:<name>` with an optional version). **Resolve it before
+you start the skill** — one that assumes a plugin or package it doesn't have fails partway
+through, after the user has already waited. `server_status` answers all but `pkg:`: the
+viewer (and whether its window is still open), the tensor connection, the dask scheduler,
+the `ops` on offer, and — under **Kernel plugins** — which plugins actually loaded, which is
+the only place `plugin:<name>` can be read (a file contributes its function names, not its
+own name, and one that failed to load is still on disk). `pkg:biopb-mcp>=X` — a skill saying
+it needs a release that carries some plugin — is answered by **Versions**, which reports the
+version installed in this kernel's own interpreter, the one that will run the skill; for any
+other `pkg:` token just import it: `import skimage; skimage.__version__`.
+
+A gap is **the user's call, not yours** — installing a package, seeding a plugin and
+restarting the kernel all need their consent, and naming the gap usually beats abandoning
+the skill.
+
 ## Long-running jobs
 A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
 watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`

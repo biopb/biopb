@@ -640,6 +640,56 @@ class TestServerStatus:
         assert "starting" in result.lower()
         server_with_host.execute.assert_not_called()
 
+    def test_kernel_snippet_reports_ops_and_plugins(self):
+        # The snippet runs *in* the kernel, so run it against a stand-in namespace:
+        # it is what an agent resolves a skill's `ops:` / `plugin:` against, and
+        # every section has to survive the same exec.
+        import contextlib
+        import io
+
+        from biopb_mcp.mcp import _requires
+
+        _requires.record_loaded_plugins(["rolling_ball"], ["labshop_tools"])
+        ns = {
+            "_dask_client": None,
+            "_dask_attach_done": True,
+            "_conn": MagicMock(client=None, last_status="", last_message=""),
+            "viewer": None,  # headless: no window to report
+            "ops": {"segmentation": object(), "restoration": object()},
+            "_jobs": MagicMock(jobs_summary=list),
+        }
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(_server._STATUS_SNIPPET, ns)  # noqa: S102 - the canned snippet
+        report = out.getvalue()
+
+        assert "## Ops\n  restoration, segmentation" in report
+        assert "## Kernel plugins" in report
+        assert "files: rolling_ball" in report
+        assert "packages: labshop_tools" in report
+        # `pkg:biopb-mcp>=X` (a skill needing a release-carried plugin) is
+        # answered here, from the kernel's own interpreter, not by an import.
+        import biopb_mcp
+
+        assert "biopb-mcp: " + biopb_mcp.__version__ in report
+
+    def test_kernel_snippet_names_the_config_key_when_no_ops(self):
+        import contextlib
+        import io
+
+        ns = {
+            "_dask_client": None,
+            "_dask_attach_done": True,
+            "_conn": MagicMock(client=None, last_status="", last_message=""),
+            "viewer": None,
+            "ops": {},
+            "_jobs": MagicMock(jobs_summary=list),
+        }
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(_server._STATUS_SNIPPET, ns)  # noqa: S102 - the canned snippet
+        assert "services.process_image_servers" in out.getvalue()
+
     def test_idle_kernel_reports_not_started(self, server_with_host):
         # Not alive and not ready (never started / torn down): point the agent
         # at start_kernel, don't query the kernel.

@@ -6,7 +6,8 @@ enforces the required body sections and carries the catalog's scope and authorin
 rules in `skills/ROADMAP.md`; **P2 (MCP retrieval) shipped** — the `find_skills`
 tool, the `skill://{skill_id}` resource, the `services.skills_*` config, and the
 local skills directory (§3f) are live in `biopb-mcp` (`mcp/_skills.py`,
-`mcp/_server.py`). P1 and P3–P4 not started.
+`mcp/_server.py`), and `requires:` is resolvable at runtime (§3g). P1 and P3–P4
+not started.
 **Component:** `biopb-mcp` (discovery + retrieval), `biopb-site` (authoring + publishing)
 **Related:** the MCP `guide://*` resources and `find_skills`-style discovery, the
 `mcp.services` config block, the fail-open remote fetch in
@@ -81,7 +82,7 @@ are fetched lazily and separately, keeping the catalog small and discovery cheap
       "tags": ["segmentation", "cellpose", "ops"],
       "version": "1.2.0",                  // author-owned semver of the skill's content
       "spec_version": 1,                   // body/frontmatter dialect; enables migrations
-      "requires": ["viewer", "ops:segmentation"],  // optional capability hints for ranking/gating
+      "requires": ["viewer", "ops:segmentation"],  // capability tokens the agent resolves (§3g)
       "updated": "2026-06-20",             // derived from git log, NOT the author
       "url": "https://biopb.org/skills/cell-segmentation-cellpose.md",
       "sha256": "e3b0c4…"                  // body integrity + client cache key
@@ -283,6 +284,54 @@ Nothing else needs a sync mechanism.
 It is **appended to `_BASE_INSTRUCTIONS` only when `skills_enabled` is true**
 (`set_skills_enabled`, wired from config in the launcher), so an install that
 switches skills off is never pointed at a catalog that would come back empty.
+
+### 3g. `requires:` — resolved by the agent, against `server_status`
+
+`requires:` shipped as metadata nothing could act on: emitted by `find_skills`,
+answerable nowhere. A skill naming a kernel plugin the install doesn't have read
+as available and dead-ended partway through its own steps, and skill bodies
+compensated with hand-rolled prose checks — a `dir()` dance in one, a `find_spec`
+in another.
+
+The resolution is the agent's, not a function's: it reads `server_status` (which
+it already calls before heavy work) and, for a `pkg:` token, tries the import.
+
+| token | resolved from |
+|---|---|
+| `viewer` | `## Viewer` — including the **window: CLOSED** case, where the Python handle survives but mutations no-op and `screenshot` raises |
+| `tensor` | `## Tensor Server` — connected, plus the verbatim connect error when not |
+| `dask` | `## Dask`. `da` is always bound, so this never fails; the scheduler behind it (distributed vs. in-process threads) is a *performance* property, and reporting it is more useful than a met/unmet verdict on it |
+| `ops:<kind>` | `## Ops` — and what the servers *do* offer falls out of the same line |
+| `plugin:<name>` | `## Kernel plugins` — the file stem (`plugin:rolling_ball` ↔ `rolling_ball.py`) or an entry-point name, reported apart |
+| `pkg:<name>[>=v]` | `## Versions` for `pkg:biopb-mcp` (the token authors actually reach for — see below — so the report carries it), otherwise `import <name>` in `execute_code`: a real ImportError or a real `__version__`, with none of the dev-build/`skimage`-vs-`scikit-image` guesswork a version comparator has to hard-code |
+
+**Why the kernel plugin line has to be reported, not derived.** Every other token
+is legible from handles the agent already holds; this one is not, and the
+temptation is to answer it by scanning `~/.config/biopb/kernel/` for `<name>.py`.
+That is wrong: the loader is **fail-open per file**, so a plugin that raises on
+`exec` — or loses a name to the reserved-name guard — is on disk and *not* in the
+namespace. Nor does the namespace show it: a plugin *file* contributes its
+top-level function names, not its own name, so `dir()` never says
+`segmentation_qc`. Only the loader knows which happened, so it **reports what
+survived** (`_requires.record_loaded_plugins`, called from
+`_load_namespace_plugins`) and `server_status` prints that record — held in module
+state, not `user_ns`, where a plugin could clobber the record of itself.
+
+Guidance lives in the `find_skills` docstring and `guide://kernel`, at the two
+moments it is needed, rather than in the handshake instructions (a per-session
+context tax for something that matters only once a skill is retrieved).
+
+**It informs, it never gates.** Nothing filters a skill out of `find_skills`, and
+no return value invites `if not ok: bail`. Every fix — installing a package,
+seeding a plugin, restarting the kernel — needs the user's consent, so the agent's
+job is to name the gap and ask, not to decide.
+
+The consequence for authoring: `pkg:biopb-mcp>=X` makes a skill safe to publish
+*ahead of* the release that carries the plugin it needs — an older install is told
+so up front instead of failing halfway through. That makes it the one `pkg:` token
+common enough to report rather than import, and `## Versions` reports it from the
+**kernel's** interpreter, which is the one that will run the skill and need not be
+the server process's env.
 
 ---
 

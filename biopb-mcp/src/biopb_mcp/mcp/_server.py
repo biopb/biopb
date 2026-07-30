@@ -252,6 +252,20 @@ else:
 """
 
 _STATUS_SNIPPET = """
+# This kernel's interpreter -- the one a skill's `pkg:` requirement is about, and
+# not necessarily the server process's env (the kernelspec need not be it). The
+# common such token is `pkg:biopb-mcp>=X`, how a skill says it needs a release
+# that carries some plugin, so report that one instead of making the agent import.
+print("## Versions")
+try:
+    import biopb_mcp as _bm
+    print("  biopb-mcp: " + str(getattr(_bm, "__version__", "unknown")))
+except Exception as _e:
+    print("  biopb-mcp: unknown (" + str(_e) + ")")
+import sys as _sys
+print("  python: " + _sys.version.split()[0])
+
+print("")
 print("## Dask")
 try:
     import dask as _dask
@@ -306,6 +320,28 @@ else:
     for _layer in list(viewer.layers)[:10]:
         _shape = getattr(_layer.data, "shape", "?")
         print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+
+print("")
+print("## Ops")
+_ops = globals().get("ops")
+if _ops:
+    print("  " + ", ".join(sorted(_ops)))
+else:
+    print("  (none configured -- services.process_image_servers -- or unreachable)")
+
+print("")
+# What the plugin loader actually loaded, which neither the kernel dir (fail-open:
+# a file that raised is on disk and not loaded) nor dir() (a file contributes its
+# function names, not its own name) can tell the agent. It reads this to resolve a
+# skill's `plugin:<name>` requirement.
+print("## Kernel plugins")
+try:
+    from biopb_mcp.mcp import _requires as _req
+
+    for _line in _req.plugin_status_lines():
+        print(_line)
+except Exception as _e:
+    print("  error: " + str(_e))
 
 print("")
 print("## Jobs")
@@ -517,6 +553,14 @@ def find_skills(query: str = "") -> list:
     labels"). `query` filters by title/description/tags; empty returns all.
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
+
+    A result's `requires` lists what the skill needs (`viewer`, `tensor`, `dask`,
+    `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
+    skill: `server_status` answers every token except a third-party `pkg:` — it
+    does carry biopb-mcp's own version — and for those, import the package in
+    `execute_code` and read its `__version__`. A gap is the user's call —
+    installing, seeding a plugin, restarting the kernel all need their consent —
+    but naming it up front beats failing halfway through.
 
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.
@@ -785,8 +829,10 @@ def server_status() -> str:
     """Report server health, system load, and resource usage.
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
-    queried from the kernel — dask scheduler info, tensor server
-    connectivity, and viewer layer count. Use before heavy computation.
+    queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
+    tensor server connectivity, viewer layer count, the available `ops`, and which
+    kernel plugins loaded. Use before heavy computation, and to resolve a skill's
+    `requires:` list.
     """
     import psutil
 

@@ -207,6 +207,87 @@ class TestLoadStartupFiles:
         # A non-existent dir must not raise.
         _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path / "nope")
 
+    def test_only_the_files_that_survived_are_reported_as_loaded(self, tmp_path):
+        # The record `server_status` reports a skill's `plugin:<name>` from. It
+        # cannot be a directory listing: this loader is fail-open, so a file that
+        # raised is on disk and *not* in the namespace -- the distinction the
+        # record exists to get right.
+        (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "bad.py").write_text(
+            'raise RuntimeError("boom")\n', encoding="utf-8"
+        )
+        (tmp_path / "_priv.py").write_text("x = 1\n", encoding="utf-8")
+        loaded = _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path)
+        assert loaded == ["good"]
+
+
+class TestPluginRecordReachesServerStatus:
+    """The loader -> `_requires` record -> `server_status` handoff.
+
+    What a skill's `plugin:<name>` is resolved against: not the kernel dir (this
+    loader is fail-open) and not `dir()` (a file contributes its function names,
+    not its own name).
+    """
+
+    def test_a_file_that_failed_to_load_is_absent_from_the_report(
+        self, tmp_path, monkeypatch
+    ):
+        from biopb_mcp.mcp import _requires
+
+        (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "bad.py").write_text(
+            'raise RuntimeError("boom")\n', encoding="utf-8"
+        )
+        monkeypatch.setattr("biopb._locations.mcp_plugin_dir", lambda: tmp_path)
+        _bootstrap._load_namespace_plugins(_FakeIP(_seeded_ns()), {})
+
+        report = "\n".join(_requires.plugin_status_lines())
+        assert "good" in report
+        assert "bad" not in report
+        assert "session log" in report  # where the load failure is explained
+
+    def test_the_disabled_switch_is_recorded_not_inferred(self, tmp_path, monkeypatch):
+        from biopb_mcp.mcp import _requires
+
+        (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        monkeypatch.setattr("biopb._locations.mcp_plugin_dir", lambda: tmp_path)
+        config = {"services": {"namespace_enabled": False}}
+        _bootstrap._load_namespace_plugins(_FakeIP(_seeded_ns()), config)
+
+        # Same empty record as "nothing seeded", but a different reason: seeding a
+        # file would not help while the switch is off.
+        (line,) = _requires.plugin_status_lines()
+        assert "services.namespace_enabled" in line
+        assert "seed" not in line
+
+    def test_files_and_entry_points_are_reported_apart(self):
+        from biopb_mcp.mcp import _requires
+
+        # A `plugin:<name>` matches either, but only a *file* has the "on disk yet
+        # missing here" story, so the two are not merged into one list.
+        _requires.record_loaded_plugins(["rolling_ball"], ["labshop_tools"])
+        report = "\n".join(_requires.plugin_status_lines())
+        assert "files: rolling_ball" in report
+        assert "packages: labshop_tools" in report
+
+    def test_no_plugins_points_at_the_seeder(self):
+        from biopb_mcp.mcp import _requires
+
+        report = "\n".join(_requires.plugin_status_lines())
+        assert "biopb-mcp-seed-plugins" in report
+
+    def test_both_lines_print_even_when_empty(self):
+        from biopb_mcp.mcp import _requires
+
+        # An omitted line would make "my plugin isn't listed" ambiguous: absent
+        # because it didn't load, or because that half of the report was skipped?
+        # The agent resolving `plugin:<name>` has to be able to tell.
+        _requires.record_loaded_plugins(["rolling_ball"])
+        report = "\n".join(_requires.plugin_status_lines())
+        assert "files: rolling_ball" in report
+        assert "packages: (none" in report
+        assert "biopb_mcp.namespace" in report  # what a "package" plugin even is
+
 
 class TestPublicNamesAndMerge:
     def test_public_names_honors_all_and_drops_modules(self):
