@@ -129,82 +129,65 @@ and the round trip for data too large to hold: `guide://data`.
 DATA = """\
 # Where array data lives, and what it actually is
 
-Three places in this session hold pixels, and they are **not interchangeable**.
-Most of the wrong answers this session can produce start with code that treats
-them as if they were — a napari habit that is right in a plain napari script and
-wrong here, because the arrays come off a tensor server, lazily, in a pyramid.
+Three places hold pixels here, and they are **not interchangeable**. Treating
+them as one is the common source of wrong answers — a plain-napari habit that
+breaks because these arrays come off a tensor server, lazily, in a pyramid.
 
 | Source | You get it with | What you get |
 |---|---|---|
-| **Tensor server** | `client.get_tensor(array_id)` | A lazy dask array. **Source axis order** (the tensor's `dim_labels`), full resolution, nothing materialized yet |
-| **Viewer layer** | `layer.data` | Whatever napari is *displaying*: possibly a **list** of pyramid levels, each a proxy rather than a dask array, in **display order** `[..., Z, Y, X]` |
-| **Kernel** | your own variables | Exactly what you made — numpy if you computed it, dask if you didn't. It carries no physical scale unless you carried it |
+| **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **source axis order** (`dim_labels`), full resolution |
+| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, in **display order** `[..., Z, Y, X]` |
+| **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
 
-`viewer.add_tensor(source_id)` is a *conversion between the first two*, not a
-window onto the first. Everything below follows from that.
+`viewer.add_tensor()` is a *conversion between the first two*, not a window onto
+the first. The traps follow from that.
 
 ## The traps
 
-**1. `layer.data` is a list when the layer is multiscale.** `add_tensor` builds a
-resolution pyramid for anything large, and then `layer.data` is
-`[full_res, half, quarter, ...]`. `layer.data.shape` raises `AttributeError`,
-`np.asarray(layer.data)` tries to stack levels of different shapes, and anything
-that "works" on it is working on the wrong thing. Always branch:
+**1. `layer.data` is a list when `layer.multiscale`** — `[full_res, half,
+quarter, ...]`, so `layer.data.shape` raises and anything that appears to work
+on the list is working on the wrong thing. Branch, take level 0 unless you mean
+otherwise, and never pair arrays from two different levels:
 
 ```python
-arr = layer.data[0] if layer.multiscale else layer.data   # level 0 = full res
+arr = layer.data[0] if layer.multiscale else layer.data
 ```
 
-**2. Level 0 is not the only level, and the others are different data.** A
-measurement taken on level 2 is off by the downsample factor, silently and
-plausibly. Never pair arrays from two different levels (a label layer's level 0
-with an image layer's level 1 is the common version of this).
+**2. Layer data is not a dask array.** Each level is wrapped in a `_ViewerArray`
+proxy that pins napari's slice reads to a single-process scheduler (issue #8).
+It behaves like a dask array — `.shape`, `.compute()`, slicing, ufuncs — so
+ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, and a
+bare `np.asarray(arr)` materializes the **whole** array in the main process
+instead of on the cluster. Slice first, or `.compute()` explicitly.
 
-**3. `layer.data` is not a dask array.** `add_tensor` wraps each level in a
-`_ViewerArray` proxy that pins napari's own slice reads to a single-process
-scheduler (issue #8). It behaves like a dask array — `.shape`, `.dtype`,
-`.compute()`, slicing, `arr > 0`, ufuncs — and operators return plain dask, so
-ordinary work is unaffected. Two things do differ: `isinstance(arr, da.Array)` is
-`False` (test for `da.Array` on `client.get_tensor` output, not on layer data),
-and a bare `np.asarray(arr)` materializes the **whole** array in the main process
-rather than on the cluster. Slice first, or `.compute()` explicitly.
+**3. The viewer's axes are not the source's axes.** Levels are canonicalized to
+`[..., Z, Y, X]` (plus a trailing samples axis for interleaved RGB) however the
+source is laid out. So `client.get_physical_scale()` — **source** order — pairs
+with `client.get_tensor()`, while `layer.scale` — **layer** order — pairs with
+`layer.data` and is what `regionprops(..., spacing=)` wants. Crossing them
+transposes the spacing onto the wrong axes: every number changes, no shape does.
 
-**4. The viewer's axes are not the source's axes.** Levels are canonicalized to
-`[..., Z, Y, X]` (plus a trailing samples axis for interleaved RGB) regardless of
-how the source is laid out. So:
+**4. A 2-D source is 3-D in the viewer.** Canonicalization *inserts* a singleton
+Z, so `[Y, X]` loads as `[1, Y, X]` with a 3-element `layer.scale`. Read `ndim`
+off the array you are about to use, not off the source.
 
-* `client.get_physical_scale(array_id)` is in **source** order — it pairs with
-  `client.get_tensor(array_id)`, never with `layer.data`.
-* `layer.scale` is in **layer** order — it pairs with `layer.data`, and it is
-  what `regionprops(..., spacing=)` wants.
+**5. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
+while the pixels are not there yet; a scikit-image call, `np.asarray`, or a
+`for` loop over the array materializes all of it at once, unchunked and without
+progress — which is how a session allocates a volume it cannot hold. Crop first,
+keep the chain lazy, `.compute()` once; past `promote_after` that compute is a
+job you can watch and cancel (`guide://kernel`).
 
-Mixing the two transposes your spacing onto the wrong axes, which changes every
-number without changing any shape.
+**6. A layer you built carries no geometry.** `add_labels(arr)` /
+`add_image(arr)` store exactly that array: no pyramid, `scale` all ones. A
+segmentation added beside a calibrated image measures in pixels until you copy
+the image's `scale` onto it.
 
-**5. A 2-D source is 3-D in the viewer.** Canonicalization *inserts* a singleton
-Z when the tensor has none, so a `[Y, X]` source loads as `[1, Y, X]`, with a
-3-element `layer.scale`. Read `ndim` off the array you are actually about to use;
-do not infer it from the source.
-
-**6. Lazy means the bill arrives at the end.** Everything from the server is
-lazy, so `.shape` and `.dtype` are free while the pixels are not there yet. A
-scikit-image call, `np.asarray`, or a plain `for` loop over the array
-materializes it in full, in one go, with no progress and no chunking — which is
-how a session ends up allocating a volume it cannot hold. Crop or slice first,
-keep the lazy chain, and `.compute()` once at the end; past `promote_after` that
-compute is a job you can watch and cancel (`guide://kernel`).
-
-**7. A layer you built yourself carries no geometry.** `add_labels(np_array)` /
-`add_image(np_array)` store exactly that array, with `scale` defaulting to all
-ones and no pyramid. A segmentation added beside a calibrated image therefore
-measures in pixels unless you copy the image layer's `scale` onto it.
-
-**8. Upload does not carry labels or physical size.** `client.upload_array(arr,
-"cache:name")` takes a **dask** array (wrap numpy with `da.from_array`) and
-stores shape, dtype and chunks. Axis labels and pixel size travel only if you
-pass `dim_labels=` / `ome_metadata=` — otherwise the round trip through the
-server quietly drops them, and `add_tensor` on the result gives an uncalibrated
-layer.
+**7. Upload does not carry labels or physical size.** `client.upload_array`
+takes a **dask** array (wrap numpy with `da.from_array`) and stores shape, dtype
+and chunks; axis labels and pixel size travel only via `dim_labels=` /
+`ome_metadata=`. Otherwise the round trip drops them and `add_tensor` gives back
+an uncalibrated layer.
 
 ## Reading a layer safely
 
@@ -215,16 +198,15 @@ print([(l.name, type(l).__name__, l.multiscale,
         (l.data[0] if l.multiscale else l.data).shape) for l in viewer.layers])
 
 layer = viewer.layers[NAME]
-arr = layer.data[0] if layer.multiscale else layer.data   # traps 1, 2
+arr = layer.data[0] if layer.multiscale else layer.data   # trap 1
 print(arr.shape, arr.dtype, layer.scale)
-sub = arr[0, 100:600, 100:600].compute()                  # traps 3, 6: crop, then compute
+sub = arr[0, 100:600, 100:600].compute()                  # traps 2, 5: crop, then compute
 ```
 
 ## The round trip, for data too large to hold
 
-Server -> kernel -> server -> viewer. Nothing is materialized until step 3, and
-step 3 never holds the whole result at once, so this works on data far larger
-than memory:
+Nothing is materialized until step 3, and step 3 never holds the whole result at
+once, so this works on data far larger than memory:
 
 ```python
 # 1. Off the server: lazy, nothing read yet
@@ -240,10 +222,9 @@ source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 layer_name = viewer.add_tensor(source_id)
 ```
 
-Uploading is also what makes a result *shareable* — an array sitting in the
-kernel is visible to nothing else, and dies with the kernel. `guide://client`
-has the upload arguments, including the ones that carry axis labels and pixel
-size (trap 8).
+Uploading is also what makes a result *shareable* — an array in the kernel is
+visible to nothing else and dies with it. `guide://client` has the upload
+arguments, including the ones that carry axis labels and pixel size (trap 7).
 """
 
 VIEWER = """\
@@ -321,7 +302,7 @@ Use `inspect_object("viewer.add_image")` for full signatures.
 ## Annotation layers (Labels, Points, Shapes)
 A layer you build here holds exactly the array you pass — no pyramid, and
 `scale` defaults to all ones, so it does **not** inherit the geometry of the
-image it was derived from (`guide://data`, trap 7). Copy the source layer's
+image it was derived from (`guide://data`, trap 6). Copy the source layer's
 `scale` across, or every measurement off it comes out in pixels.
 
 ```python
