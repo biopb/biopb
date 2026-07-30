@@ -43,9 +43,26 @@ _fail() { printf '  \033[0;31mFAIL\033[0m  %s\n' "$1"; FAILURES=$((FAILURES + 1)
 _phase() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
 # check <description> <command...>
+#
+# A failing check prints what the command said. Silence here costs a whole
+# scenario run to diagnose: the first real run of this file reported "config is
+# valid JSON with a source" as failed and gave no hint that the cause was a
+# missing `python3` rather than a malformed config.
 check() {
-    local what="$1"; shift
-    if "$@" >/dev/null 2>&1; then _pass "$what"; else _fail "$what"; fi
+    local what="$1" out
+    shift
+    if out=$("$@" 2>&1); then
+        _pass "$what"
+    else
+        _fail "$what"
+        if [ -n "$out" ]; then
+            # Indented and capped at 5 lines: enough to name the cause without
+            # burying the rest of the report under one command's stack trace.
+            while IFS= read -r line; do
+                printf '          | %s\n' "$line"
+            done <<<"$out" | head -5
+        fi
+    fi
 }
 
 # The interpreter of the shared uv tool environment -- the one the napari kernel
@@ -64,6 +81,20 @@ check_marker() {
     local py
     py=$(tool_python) || { _fail "$1 (no uv tool dir)"; return; }
     check "$1" "$py" -c "import $MARKER_PKG"
+}
+
+# check_config_json <description> -- does the written config parse, and does it
+# point the server at something? Same interpreter as check_marker, for the same
+# reason: it is the one Python guaranteed to exist after a successful install.
+check_config_json() {
+    local py
+    py=$(tool_python) || { _fail "$1 (no uv tool dir)"; return; }
+    check "$1" "$py" -c "
+import json
+cfg = json.load(open('$CONFIG_JSON'))
+assert cfg['sources'], 'sources is empty'
+assert cfg['sources'][0]['url'], 'first source has no url'
+"
 }
 
 run_install() {
@@ -121,12 +152,11 @@ check "biopb-tensor-server runs" biopb-tensor-server version
 
 CONFIG_JSON="$CONFIG_DIR/biopb.json"
 check "config written: biopb.json" test -f "$CONFIG_JSON"
-check "config is valid JSON with a source" python3 -c "
-import json, sys
-cfg = json.load(open('$CONFIG_JSON'))
-assert cfg['sources'], 'sources is empty'
-assert cfg['sources'][0]['url'], 'source has no url'
-"
+# Validated with the TOOL ENV's interpreter, not a system python3: the clean
+# image is ubuntu:22.04 plus curl/git/ca-certificates, and that base ships no
+# python3 at all. The installer does not care -- its _py falls back to uv's
+# managed interpreter -- and neither should its tests.
+check_config_json "config is valid JSON with a source"
 check_marker "extra package reached the environment"
 
 _phase "3/5  Rerun -- the --force rebuild"
