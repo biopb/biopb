@@ -1613,6 +1613,12 @@ function Invoke-BiopbInstall {
     if ($Mode -eq 'gui') {
         if ($result.WebappInstalled) { Emit-Gui "::biopb::RESULT|webapp|1" }
         if ($result.McpNeedsManual)  { Emit-Gui "::biopb::RESULT|mcp_manual|1" }
+        # Carries the list, not a flag: the finish page names the packages, and the
+        # Report-Warn that said so scrolled out of the log long ago (this is the end
+        # of a multi-minute install). Without this record the field above is dead on
+        # the gui path -- the one failure the user has to act on, and the only front
+        # end that never mentions it.
+        if ($result.ExtrasDropped) { Emit-Gui "::biopb::RESULT|extras_dropped|$($result.ExtrasDropped)" }
         Emit-Gui "::biopb::RESULT|config|$($result.ConfigFile)"
         Emit-Gui "::biopb::DONE|0"
     }

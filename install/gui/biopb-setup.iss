@@ -110,6 +110,7 @@ var
   ResWebapp:    Boolean;
   ResMcpManual: Boolean;
   ResConfig:    String;
+  ResExtras:    String;
 
 { Win32 millisecond tick counter -- not a built-in Inno identifier. }
 function GetTickCount: DWord;
@@ -259,9 +260,10 @@ end;
 
 procedure HandleResult(const Key, Val: String);
 begin
-  if      Key = 'webapp'     then ResWebapp := True
-  else if Key = 'mcp_manual' then ResMcpManual := True
-  else if Key = 'config'     then ResConfig := Val;
+  if      Key = 'webapp'        then ResWebapp := True
+  else if Key = 'mcp_manual'    then ResMcpManual := True
+  else if Key = 'config'        then ResConfig := Val
+  else if Key = 'extras_dropped' then ResExtras := Val;
 end;
 
 { Parse one line of the structured log. Tagged records are ::biopb::TAG|fields;
@@ -427,6 +429,14 @@ begin
     if ResMcpManual then
       Msg := Msg + #13#10#13#10 + 'NOTE: no MCP client was detected -- register biopb manually' + #13#10 +
              'using ' + ExpandConstant('{userappdata}') + '\..\.config\biopb\mcp.json';
+    { biopb still installed -- but a package the user asked for did not, and they
+      would otherwise meet that weeks later as an import that used to work. }
+    if ResExtras <> '' then
+      Msg := Msg + #13#10#13#10 + 'NOTE: your extra packages were NOT installed:' + #13#10 +
+             '  ' + ResExtras + #13#10 +
+             'They could not be resolved with this release''s own pins. Fix or' + #13#10 +
+             'remove the line, then rerun setup:' + #13#10 +
+             '  ' + ExpandConstant('{userappdata}') + '\..\.config\biopb\extra-packages.txt';
     WizardForm.FinishedLabel.Caption := Msg;
   end;
 end;
