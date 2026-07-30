@@ -41,9 +41,9 @@ viewer (and whether its window is still open), the tensor connection, the dask s
 the `ops` on offer, and — under **Kernel plugins** — which plugins actually loaded, which is
 the only place `plugin:<name>` can be read (a file contributes its function names, not its
 own name, and one that failed to load is still on disk). `pkg:biopb-mcp>=X` — a skill saying
-it needs a release that carries some plugin — is answered by **Versions**, which reports this
-kernel's own interpreter; for any other `pkg:` token just import it:
-`import skimage; skimage.__version__`.
+it needs a release that carries some plugin — is answered by **Versions**, which reports the
+version installed in this kernel's own interpreter, the one that will run the skill; for any
+other `pkg:` token just import it: `import skimage; skimage.__version__`.
 
 A gap is **the user's call, not yours** — installing a package, seeding a plugin and
 restarting the kernel all need their consent, and naming the gap usually beats abandoning

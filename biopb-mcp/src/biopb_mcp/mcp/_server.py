@@ -556,10 +556,11 @@ def find_skills(query: str = "") -> list:
 
     A result's `requires` lists what the skill needs (`viewer`, `tensor`, `dask`,
     `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
-    skill: `server_status` answers all of them but a third-party `pkg:` (it does
-    carry biopb-mcp's own version) — import anything else it doesn't. A gap is
-    the user's call — installing, seeding a plugin, restarting the kernel all need
-    their consent — but naming it up front beats failing halfway through.
+    skill: `server_status` answers every token except a third-party `pkg:` — it
+    does carry biopb-mcp's own version — and for those, import the package in
+    `execute_code` and read its `__version__`. A gap is the user's call —
+    installing, seeding a plugin, restarting the kernel all need their consent —
+    but naming it up front beats failing halfway through.
 
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.
