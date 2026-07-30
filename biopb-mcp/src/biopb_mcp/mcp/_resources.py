@@ -79,8 +79,9 @@ these have a fix worth offering.
 3. **The skill's degraded path**, if it names one. Often the right answer for a one-off run:
    nothing to undo, and it is the option that survives an upgrade.
 
-   In a uv-managed env (`## Versions` says so) also mention `~/.config/biopb/extra-packages.txt`
-   — an install there is otherwise lost at the next biopb upgrade.
+Whichever of the first two they pick, if `## Versions` says the env is uv-managed, say so and
+name `~/.config/biopb/extra-packages.txt`: the install lands now but is gone at the next biopb
+upgrade unless the requirement is in that file.
 
 **`viewer` — two different failures.** *Headless* means no window exists this session: run
 the skill's numeric checks and report numbers, never a screenshot. *`window: CLOSED`* means

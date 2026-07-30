@@ -134,6 +134,15 @@ class TestResources:
         # looked -- guidance that skips this reads as "the install didn't work".
         assert "invalidate_caches" in section
 
+    def test_extras_file_is_advice_about_installing_not_about_not_installing(self):
+        # The durability note belongs to the two options that install something.
+        # Indented under option 3 -- the one where nothing is installed -- it reads
+        # as a non-sequitur, so pin it as its own unindented paragraph.
+        section = _server.get_kernel_guide()
+        section = section[section.index("### When something is missing") :]
+        (line,) = [ln for ln in section.splitlines() if "extra-packages.txt" in ln]
+        assert not line.startswith(" "), line
+
     def test_guide_separates_the_three_missing_plugin_causes(self):
         # Seeding cannot fix an install that predates the plugin, and a file that
         # failed to load is not a file that is absent -- different fixes, so the
