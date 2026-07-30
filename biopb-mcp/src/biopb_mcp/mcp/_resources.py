@@ -122,33 +122,8 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `in
       print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
   ```
 
-## Quick Examples
-```python
-# Check what data is on the viewer
-print([(l.name, type(l).__name__, type(l.data).__name__) for l in viewer.layers])
-
-# Get data from the catalog and convert to np.ndarray
-dask_arr = client.get_tensor("my_source_id") # lazy, thread-safe, picklable
-np_arr = dask_arr.compute() # in memory
-
-# Take action then screenshot to verify (mutations auto-marshal — call directly)
-viewer.dims.ndisplay = 3
-```
-
-## Iterative Workflow for _very_ large data
-```python
-# 1. Load source data as dask array (lazy)
-arr = client.get_tensor("raw_data_id")
-
-# 2. Process
-mask_arr = arr > 0.5
-
-# 3. Upload. Calls compute() chunk by chunk under the hood.
-source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
-
-# 4. Display in viewer for user inspection and approval before next step
-layer_name = viewer.add_tensor(source_id)
-```
+Reading pixels, moving them between the server / a layer / your own variables,
+and the round trip for data too large to hold: `guide://data`.
 """
 
 DATA = """\
@@ -234,15 +209,41 @@ layer.
 ## Reading a layer safely
 
 ```python
+# What is on the viewer, and in what shape -- worth running before planning any
+# work off it.
+print([(l.name, type(l).__name__, l.multiscale,
+        (l.data[0] if l.multiscale else l.data).shape) for l in viewer.layers])
+
 layer = viewer.layers[NAME]
 arr = layer.data[0] if layer.multiscale else layer.data   # traps 1, 2
-print(arr.shape, arr.dtype, layer.scale, layer.multiscale)
-sub = arr[0, 100:600, 100:600].compute()                  # trap 3, 6: crop, then compute
+print(arr.shape, arr.dtype, layer.scale)
+sub = arr[0, 100:600, 100:600].compute()                  # traps 3, 6: crop, then compute
 ```
 
-`print([(l.name, type(l).__name__, l.multiscale, l.data[0].shape if l.multiscale
-else l.data.shape) for l in viewer.layers])` is the one-liner worth running
-before you plan any work off the viewer.
+## The round trip, for data too large to hold
+
+Server -> kernel -> server -> viewer. Nothing is materialized until step 3, and
+step 3 never holds the whole result at once, so this works on data far larger
+than memory:
+
+```python
+# 1. Off the server: lazy, nothing read yet
+arr = client.get_tensor("raw_data_id")
+
+# 2. Build the graph: still lazy, still nothing read
+mask_arr = arr > 0.5
+
+# 3. Upload -- the eager step. Computes and sends chunk by chunk.
+source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
+
+# 4. Back onto the viewer for the user to check (pyramid-shaped again: trap 1)
+layer_name = viewer.add_tensor(source_id)
+```
+
+Uploading is also what makes a result *shareable* — an array sitting in the
+kernel is visible to nothing else, and dies with the kernel. `guide://client`
+has the upload arguments, including the ones that carry axis labels and pixel
+size (trap 8).
 """
 
 VIEWER = """\
@@ -306,11 +307,47 @@ viewer.dims.set_point(axis=0, value=50)
 
 # Get current position (read)
 print(viewer.dims.point)    # tuple of current positions
+
+# 2-D <-> 3-D rendering
+viewer.dims.ndisplay = 3
 ```
 
 ## Layer types
 Image, Labels, Points, Shapes, Vectors, Surface, Tracks
 Use `inspect_object("viewer.add_image")` for full signatures.
+
+## Annotation layers (Labels, Points, Shapes)
+A layer you build here holds exactly the array you pass — no pyramid, and
+`scale` defaults to all ones, so it does **not** inherit the geometry of the
+image it was derived from (`guide://data`, trap 7). Copy the source layer's
+`scale` across, or every measurement off it comes out in pixels.
+
+```python
+# Empty labels layer for the user to paint into, matched to an image layer.
+# The branch is on the *image*: that one came off the server and may be a
+# pyramid. What you add is plain.
+img = viewer.layers["image_name"]
+arr = img.data[0] if img.multiscale else img.data
+lab = viewer.add_labels(np.zeros(arr.shape[-2:], dtype=np.int32), name="annotations")
+lab.scale = img.scale[-2:]                             # else measurements are in pixels
+
+# Labels from a mask you computed
+viewer.add_labels((image_data > threshold).astype(np.int32), name="segmentation")
+
+# Read back what the user painted -- a plain array, no branch needed
+print(f"Labels present: {np.unique(viewer.layers['annotations'].data)}")
+```
+
+The exception is a segmentation that made the round trip — uploaded, then
+reloaded with `add_tensor`. That one is a server layer like any other, pyramid
+and all, so branch on `multiscale` whenever you did not add the array yourself.
+
+Points and shapes follow the same shape; read the signatures rather than
+guessing them:
+```python
+inspect_object("viewer.add_points")
+inspect_object("viewer.add_shapes")
+```
 
 ## Canvas mouse events
 You can detect user clicks/drags/moves on the canvas — this works reliably in
@@ -442,30 +479,6 @@ Use `"cache:my_result"` as destination for ephemeral results that don't
 need to be persisted long-term.
 ```python
 source_id = client.upload_array(arr, "cache:my_result")
-```
-"""
-
-ANNOTATIONS = """\
-## Labels
-```python
-# Create empty labels layer for painting
-shape = viewer.layers["image_name"].data.shape[-2:]  # match y,x of image
-viewer.add_labels(np.zeros(shape, dtype=np.int32), name="annotations")
-
-# Create labels from mask
-mask = (image_data > threshold).astype(np.int32)
-viewer.add_labels(mask, name="segmentation")
-
-# Read labels
-labels_data = viewer.layers["annotations"].data
-unique_labels = np.unique(labels_data)
-print(f"Labels present: {unique_labels}")
-```
-For points, shapes, and other layer types use `inspect_object` to discover
-the full API:
-```python
-inspect_object("viewer.add_points")
-inspect_object("viewer.add_shapes")
 ```
 """
 

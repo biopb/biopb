@@ -51,12 +51,12 @@ _session_log_path: str | None = None
 _BASE_INSTRUCTIONS = (
     "This biopb-mcp session drives a live napari viewer through a child IPython "
     "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
-    "for detail before non-trivial work: guide://kernel (namespace, examples, "
-    "long-running jobs & cancellation), guide://data (how arrays are "
+    "for detail before non-trivial work: guide://kernel (namespace, skill "
+    "requirements, long-running jobs & cancellation), guide://data (how arrays are "
     "represented here -- pyramids, laziness, axis order -- and the traps), "
     "guide://client (the `client` handle: catalog, load, upload), "
-    "guide://viewer (layers/camera/dims), guide://annotations "
-    "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
+    "guide://viewer (layers/camera/dims, annotation layers), "
+    "guide://ops (server-side image-processing ops).\n"
     "\n"
     "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
     "start of the session (and again to recover after a failure or after the "
@@ -523,12 +523,6 @@ def get_viewer_guide() -> str:
 def get_client_guide() -> str:
     """The `client` handle: listing sources, loading, uploading."""
     return _resources.CLIENT
-
-
-@mcp.resource("guide://annotations")
-def get_annotations_guide() -> str:
-    """Annotation: points, shapes, labels creation/editing."""
-    return _resources.ANNOTATIONS
 
 
 @mcp.resource("guide://ops")

@@ -161,9 +161,12 @@ class TestResources:
         content = _server.get_client_guide()
         assert "client" in content
 
-    def test_annotations_resource_mentions_points(self):
-        content = _server.get_annotations_guide()
+    def test_viewer_resource_absorbed_the_annotation_guide(self):
+        # guide://annotations was folded in here: one handle, one guide.
+        content = _server.get_viewer_guide()
+        assert "add_labels" in content
         assert "add_points" in content
+        assert not hasattr(_server, "get_annotations_guide")
 
 
 # -----------------------------------------------------------------------
