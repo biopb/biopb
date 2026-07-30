@@ -42,6 +42,8 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
+from . import _requires
+
 logger = logging.getLogger(__name__)
 
 # Highest catalog.json schema this consumer understands. A network catalog
@@ -460,21 +462,26 @@ def find_skills(query: str = "") -> list[dict]:
         ]
     out = []
     for s in sorted(skills, key=lambda s: s["title"].lower()):
-        out.append(
-            {
-                "id": s["id"],
-                "title": s["title"],
-                "description": s["description"],
-                "tags": s["tags"],
-                "version": s["version"],
-                "updated": s["updated"],
-                "requires": s["requires"],
-                # "local" = the user's own file, unreviewed. The agent should be
-                # able to say so rather than let a draft pass as curated.
-                "origin": s.get("origin", _ORIGIN_CATALOG),
-                "uri": f"skill://{s['id']}",
-            }
-        )
+        entry = {
+            "id": s["id"],
+            "title": s["title"],
+            "description": s["description"],
+            "tags": s["tags"],
+            "version": s["version"],
+            "updated": s["updated"],
+            "requires": s["requires"],
+            # "local" = the user's own file, unreviewed. The agent should be
+            # able to say so rather than let a draft pass as curated.
+            "origin": s.get("origin", _ORIGIN_CATALOG),
+            "uri": f"skill://{s['id']}",
+        }
+        # Requirements this session definitely can't meet, so a skill naming a
+        # missing kernel plugin says so here instead of dead-ending mid-workflow.
+        # Absent when everything is met or undecidable -- see _requires.
+        gaps = _requires.unmet(s["requires"])
+        if gaps:
+            entry["unmet"] = gaps
+        out.append(entry)
     return out
 
 

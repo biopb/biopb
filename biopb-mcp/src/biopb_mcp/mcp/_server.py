@@ -370,6 +370,12 @@ def set_headless(headless: bool):
     _recompose_instructions()
 
 
+def is_headless() -> bool:
+    """Whether this session has no viewer. Read by ``_requires`` to resolve a
+    skill's ``viewer`` requirement without reaching into module state."""
+    return _headless
+
+
 def set_skills_enabled(enabled: bool):
     """Advertise (or hide) the curated-skills catalog in the agent's initialize
     ``instructions``. On by default; switching skills off also drops the
@@ -517,6 +523,14 @@ def find_skills(query: str = "") -> list:
     labels"). `query` filters by title/description/tags; empty returns all.
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
+
+    A result may carry `unmet`: requirements this session does not meet, each as
+    "token — why". Tell the user what is missing before starting such a skill —
+    it will otherwise fail partway through — and never act on the fix yourself
+    (installing, seeding, or restarting the kernel all need their consent). The
+    key is absent when nothing is known to be missing; requirements that cannot
+    be checked before the kernel starts are not reported, so its absence is not
+    a guarantee.
 
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.

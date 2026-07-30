@@ -23,6 +23,17 @@ CATALOG_URL = "https://example.test/skills/catalog.json"
 # would break the next time a skill is bundled.
 _REAL_BUNDLE_TEXT = _skills._bundle_text
 
+# Likewise, requires resolution reads *this machine's* session (headless flag,
+# kernel-plugin dir): held live it would leak into the default suite the moment a
+# bundled or catalog entry grows a `plugin:` token. Stubbed out by default and
+# restored by the `session` fixture for the tests that are about it.
+_REAL_UNMET = _skills._requires.unmet
+
+
+@pytest.fixture(autouse=True)
+def no_requires_annotation(monkeypatch):
+    monkeypatch.setattr(_skills._requires, "unmet", lambda requires: [])
+
 
 @pytest.fixture
 def mock_home(monkeypatch, tmp_path):
@@ -479,3 +490,104 @@ def test_corrupt_cached_body_is_not_trusted_and_refetched(
     assert fetches["body"] == 1  # the corrupt cache was rejected, so it refetched
     # ...and the cache was repaired with the correct bytes.
     assert (bodies / f"{sha}.md").read_bytes() == raw_body
+
+
+# --------------------------------------------------------------------------- #
+# `requires:` resolution at the find_skills boundary
+#
+# Unit coverage of the resolver itself lives in test_requires.py; what matters
+# here is the shape of the tool result: the annotation is *additive* and never a
+# filter, because a skill whose prerequisite is one command away is still the
+# right skill to read.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def session(monkeypatch):
+    """The real resolver over a pinned session: viewer up, one plugin seeded."""
+    from biopb_mcp.mcp import _requires
+
+    monkeypatch.setattr(_requires, "unmet", _REAL_UNMET)
+    monkeypatch.setattr(_requires, "_is_headless", lambda: False)
+    monkeypatch.setattr(_requires, "_namespace_enabled", lambda: True)
+    monkeypatch.setattr(_requires, "_available_plugins", lambda: {"rolling_ball"})
+    return _requires
+
+
+def _requiring(*tokens):
+    return _catalog_bytes(
+        [{"id": "qc", "title": "QC", "description": "score it", "requires": tokens}]
+    )
+
+
+def test_unmet_names_the_token_and_the_fix(mock_home, skills_cfg, session, monkeypatch):
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
+    monkeypatch.setattr(
+        _skills, "_http_get", lambda url, timeout: _requiring("plugin:segmentation_qc")
+    )
+    (found,) = _skills.find_skills("")
+    (gap,) = found["unmet"]
+    assert gap.startswith("plugin:segmentation_qc — ")
+    assert "biopb-mcp-seed-plugins" in gap
+    # Additive: the declaration itself still reaches the agent verbatim.
+    assert found["requires"] == ["plugin:segmentation_qc"]
+
+
+def test_an_unmet_skill_is_still_returned(mock_home, skills_cfg, session, monkeypatch):
+    # Not a filter. Hiding it would leave the agent improvising the workflow the
+    # skill describes, when the gap is one seed command away.
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
+    monkeypatch.setattr(
+        _skills, "_http_get", lambda url, timeout: _requiring("plugin:nope")
+    )
+    assert [s["id"] for s in _skills.find_skills("score")] == ["qc"]
+
+
+def test_met_and_undecidable_requirements_add_no_key(
+    mock_home, skills_cfg, session, monkeypatch
+):
+    # Absence of the key is not a guarantee -- tensor/dask/ops/third-party pkgs
+    # are kernel-side and simply unknown here, so they must stay silent.
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
+    monkeypatch.setattr(
+        _skills,
+        "_http_get",
+        lambda url, timeout: _requiring(
+            "viewer",
+            "plugin:rolling_ball",
+            "tensor",
+            "dask",
+            "ops:segmentation",
+            "pkg:basicpy",
+        ),
+    )
+    (found,) = _skills.find_skills("")
+    assert "unmet" not in found
+
+
+def test_local_skill_requirements_are_resolved_too(
+    local_skills, mock_home, skills_cfg, session, monkeypatch
+):
+    # A user's own draft is the most likely place to name a plugin that isn't
+    # installed, so the local source gets the same annotation as the catalog.
+    _offline(monkeypatch)
+    (local_skills / "mine.md").write_text(
+        "---\ndescription: mine\nrequires: [plugin:not_seeded]\n---\n\n# Mine\n",
+        encoding="utf-8",
+    )
+    (found,) = _skills.find_skills("")
+    assert found["origin"] == "local"
+    assert found["unmet"] and "plugin:not_seeded" in found["unmet"][0]
+
+
+def test_a_broken_check_costs_the_annotation_not_the_skill(
+    mock_home, skills_cfg, session, monkeypatch
+):
+    def boom():
+        raise RuntimeError("plugin dir unreadable")
+
+    monkeypatch.setattr(session, "_available_plugins", boom)
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
+    monkeypatch.setattr(
+        _skills, "_http_get", lambda url, timeout: _requiring("plugin:segmentation_qc")
+    )
+    (found,) = _skills.find_skills("")
+    assert found["id"] == "qc" and "unmet" not in found

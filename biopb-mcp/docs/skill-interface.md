@@ -81,7 +81,7 @@ are fetched lazily and separately, keeping the catalog small and discovery cheap
       "tags": ["segmentation", "cellpose", "ops"],
       "version": "1.2.0",                  // author-owned semver of the skill's content
       "spec_version": 1,                   // body/frontmatter dialect; enables migrations
-      "requires": ["viewer", "ops:segmentation"],  // optional capability hints for ranking/gating
+      "requires": ["viewer", "ops:segmentation"],  // capability tokens; resolved at discovery (§3g)
       "updated": "2026-06-20",             // derived from git log, NOT the author
       "url": "https://biopb.org/skills/cell-segmentation-cellpose.md",
       "sha256": "e3b0c4…"                  // body integrity + client cache key
@@ -189,6 +189,46 @@ def find_skills(query: str = "") -> list[dict]:
     metadata including the skill://<id> resource URI to read for the full
     workflow. Prefer an existing skill over improvising."""
 ```
+
+### 3g. Requirement resolution — report the decidable, stay silent otherwise
+
+`requires:` was inert metadata at first: passed through to the agent, checked by
+nobody. That let a skill naming a kernel plugin the install doesn't have read as
+available and dead-end partway through its own steps. **`biopb_mcp/mcp/_requires.py`**
+turns it into a discovery-time signal: `find_skills` adds an `unmet` list of
+`"token — why"` strings to an entry, and omits the key otherwise.
+
+The check is **deliberately asymmetric**. `find_skills` runs in the MCP server
+process and is normally called *before* `start_kernel`, so the kernel namespace, the
+tensor connection, the dask cluster and `ops` are not knowable — and the kernel need
+not even be the same interpreter (the `python3` kernelspec is not necessarily the
+tool env). A token that cannot be decided there is left alone: a wrong "missing"
+argues the agent out of a skill that would have worked.
+
+| token | decidable | source |
+|---|---|---|
+| `viewer` | yes | the launcher's headless flag |
+| `plugin:<name>` | yes | static scan of the kernel plugin dir + `biopb_mcp.namespace` entry points, never importing either |
+| `pkg:biopb-mcp[>=v]` | yes | installed metadata — this *is* biopb-mcp |
+| `tensor` / `dask` | no | kernel/connection state |
+| `ops:<kind>` | no | built in the kernel from configured servers |
+| `pkg:<other>` | no | the kernel's interpreter may differ, and a package-tier skill carries its own import check and degraded path anyway |
+
+Two consequences worth stating outright, because both are load-bearing:
+
+- **`unmet` annotates, it never filters.** A skill whose prerequisite is one
+  `biopb-mcp-seed-plugins` away is still the right skill to read, and the fix needs
+  the user's consent (installing, seeding, and restarting the kernel all do) — so the
+  reason string names the fix and the agent asks.
+- **Version comparison is on the *release* tuple, not full PEP 440 ordering**, so a
+  pre-release of the required version counts as meeting it (`0.12.0rc8.dev32`
+  satisfies `>=0.12.0`). A strict compare ranks every rc *below* its own final
+  release and would tell anyone on a dev build to upgrade to what they are running.
+  Only `>=` and `==` are understood; anything else is undecidable.
+
+This is also what makes `pkg:biopb-mcp>=X` usable as an authoring tool: a skill can
+be published *ahead of* the release that carries the plugin it needs, because an
+older install is told so instead of failing halfway through.
 
 ### 3b. Full skill files — a dynamic resource list
 
