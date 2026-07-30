@@ -249,10 +249,41 @@ class TestDegenerateInputs:
         actual = _ds.downsample_block(data, (1, 1, 1, 4, 4), "nearest")
         assert np.array_equal(actual, expected)
 
-    def test_output_never_aliases_the_input(self):
-        """resolve_chunk_data caches what this returns, so a view over adapter
-        memory would be a lifetime hazard (see the handle reaper)."""
+
+class TestZeroCopyContract:
+    """``downsample_block`` may return a view; the packer materializes it.
+
+    Copying inside ``downsample_block`` would be wasted work: ``pack_chunk_batch``
+    runs ``np.ascontiguousarray`` on whatever it is given, and a decimated view is
+    never contiguous -- so the strided path hands back a view and lets the one
+    copy that has to happen happen there.
+
+    Both halves are asserted because neither is safe alone. A decimated view
+    keeps its full-resolution base alive, so one reaching the chunk cache would
+    hold far more memory than its shape suggests.
+    """
+
+    def test_nearest_returns_a_view(self):
         data = _sample("uint16", (8, 8), seed=13)
-        out = _ds.downsample_block(data, (1, 1), "area")
-        assert np.array_equal(out, data)
-        assert not np.shares_memory(out, data)
+        out = _ds.downsample_block(data, (2, 2), "nearest")
+        assert np.shares_memory(out, data)
+
+    def test_packing_a_view_copies_it_out(self):
+        """The half that keeps the view from reaching the cache.
+
+        ``resolve_chunk_data`` caches ``pack_chunk_batch(result)``, so this is
+        what actually bounds a cached chunk's memory. Drop the contiguity pass in
+        the packer and only this test notices.
+        """
+        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+
+        data = _sample("uint16", (8, 8), seed=13)
+        view = _ds.downsample_block(data, (2, 2), "nearest")
+
+        batch = pack_chunk_batch(view)
+        packed = np.frombuffer(
+            batch.column("data").buffers()[2], dtype=data.dtype
+        ).reshape(view.shape)
+
+        assert not np.shares_memory(packed, data)
+        assert np.array_equal(packed, view)
