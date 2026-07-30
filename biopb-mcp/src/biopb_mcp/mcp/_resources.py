@@ -345,8 +345,8 @@ do **not** instrument vispy to investigate (that is the trap, see point 2):
 3. **Window not focused** — click once to focus it, then interact.
 """
 
-TENSOR = """\
-# Tensor Data Operations
+CLIENT = """\
+# The `client` Handle: Catalog and Tensor Data
 
 Arrays from here are lazy dask arrays in the tensor's own axis order, and a
 tensor loaded into the viewer stops being either of those — see `guide://data`

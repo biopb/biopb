@@ -54,7 +54,7 @@ _BASE_INSTRUCTIONS = (
     "for detail before non-trivial work: guide://kernel (namespace, examples, "
     "long-running jobs & cancellation), guide://data (how arrays are "
     "represented here -- pyramids, laziness, axis order -- and the traps), "
-    "guide://tensor (data access/upload), "
+    "guide://client (the `client` handle: catalog, load, upload), "
     "guide://viewer (layers/camera/dims), guide://annotations "
     "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
     "\n"
@@ -519,10 +519,10 @@ def get_viewer_guide() -> str:
     return _resources.VIEWER
 
 
-@mcp.resource("guide://tensor")
-def get_tensor_guide() -> str:
-    """Tensor data: listing sources, loading, uploading."""
-    return _resources.TENSOR
+@mcp.resource("guide://client")
+def get_client_guide() -> str:
+    """The `client` handle: listing sources, loading, uploading."""
+    return _resources.CLIENT
 
 
 @mcp.resource("guide://annotations")
@@ -649,7 +649,7 @@ def execute_code(python_code: str) -> str:
     use it to batch many mutations into one main-thread hop, or to touch raw Qt
     (viewer.window), which still requires the main thread.
 
-    * data access (see guide://tensor for more details):
+    * data access (see guide://client for more details):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,

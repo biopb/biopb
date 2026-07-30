@@ -157,8 +157,8 @@ class TestResources:
         content = _server.get_viewer_guide()
         assert "viewer.layers" in content
 
-    def test_tensor_resource_mentions_client(self):
-        content = _server.get_tensor_guide()
+    def test_client_resource_mentions_client(self):
+        content = _server.get_client_guide()
         assert "client" in content
 
     def test_annotations_resource_mentions_points(self):
