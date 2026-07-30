@@ -284,7 +284,6 @@ _RESERVED_NAMES = frozenset(
         "da",
         "ops",
         "run_on_main",
-        "check_skill_requirements",
         "_conn",
         "_jobs",
         "_dask_client",
@@ -448,29 +447,29 @@ def _load_namespace_plugins(ip, config) -> None:
     Called after the built-in handles exist (step 7) so plugins can reference them.
     Gated by ``services.namespace_enabled``.
 
-    What loaded is reported to :mod:`._requires`, so ``check_skill_requirements``
-    can answer ``plugin:<name>`` from the load's actual outcome instead of from the
-    presence of a file this fail-open loader may have skipped.
+    What loaded is reported to :mod:`._requires` and printed by ``server_status``,
+    so a skill's ``plugin:<name>`` is answered from the load's actual outcome
+    instead of from the presence of a file this fail-open loader may have skipped.
     """
     from .._config import get_setting
     from . import _requires
 
     if not get_setting(config, "services.namespace_enabled", True):
         logger.info("kernel plugins disabled (services.namespace_enabled=false)")
-        _requires.record_loaded_plugins([], enabled=False)
+        _requires.record_loaded_plugins(enabled=False)
         return
     from biopb._locations import mcp_plugin_dir
 
-    loaded = []
+    files, entry_points = [], []
     try:
-        loaded += _load_startup_files(ip, mcp_plugin_dir())
+        files = _load_startup_files(ip, mcp_plugin_dir())
     except Exception:
         logger.exception("kernel plugin: startup-file load failed")
     try:
-        loaded += _load_entry_point_plugins(ip)
+        entry_points = _load_entry_point_plugins(ip)
     except Exception:
         logger.exception("kernel plugin: entry-point load failed")
-    _requires.record_loaded_plugins(loaded)
+    _requires.record_loaded_plugins(files, entry_points)
 
 
 # Sentinel for "key absent" in the entry-point snapshot diff (a plugin may bind a
@@ -720,7 +719,6 @@ def _bootstrap_impl():
     #    attach can finish before this runs).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
-    from . import _requires
     from ._helpers import resync_view_for_capture, viewer_window_alive
 
     ip.user_ns.update(
@@ -733,9 +731,6 @@ def _bootstrap_impl():
             "_conn": conn,
             "_jobs": _jobs,
             "run_on_main": _jobs.run_on_main,
-            # Bound to this namespace dict, so it resolves a skill's requires:
-            # against the handles as they are at *call* time (see _requires).
-            "check_skill_requirements": _requires.make_checker(ip.user_ns),
             "_viewer_window_alive": lambda: viewer_window_alive(viewer),
             "_resync_view": lambda: resync_view_for_capture(viewer),
         }

@@ -308,6 +308,28 @@ else:
         print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
 
 print("")
+print("## Ops")
+_ops = globals().get("ops")
+if _ops:
+    print("  " + ", ".join(sorted(_ops)))
+else:
+    print("  (none configured -- services.process_image_servers -- or unreachable)")
+
+print("")
+# What the plugin loader actually loaded, which neither the kernel dir (fail-open:
+# a file that raised is on disk and not loaded) nor dir() (a file contributes its
+# function names, not its own name) can tell the agent. It reads this to resolve a
+# skill's `plugin:<name>` requirement.
+print("## Kernel plugins")
+try:
+    from biopb_mcp.mcp import _requires as _req
+
+    for _line in _req.plugin_status_lines():
+        print(_line)
+except Exception as _e:
+    print("  error: " + str(_e))
+
+print("")
 print("## Jobs")
 try:
     _js = _jobs.jobs_summary()
@@ -518,11 +540,11 @@ def find_skills(query: str = "") -> list:
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
 
-    A result's `requires` lists what the skill needs (a plugin, a package, a
-    viewer, an op). Once the kernel is up, resolve it with
-    `check_skill_requirements(requires)` in the kernel namespace rather than
-    assuming — see `guide://kernel`. A skill that assumes a missing plugin or
-    package fails partway through, after the user has already waited.
+    A result's `requires` lists what the skill needs (`viewer`, `tensor`, `dask`,
+    `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
+    skill: `server_status` reports all but `pkg:` (just import that one). A gap is
+    the user's call — installing, seeding a plugin, restarting the kernel all need
+    their consent — but naming it up front beats failing halfway through.
 
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.
@@ -791,8 +813,9 @@ def server_status() -> str:
     """Report server health, system load, and resource usage.
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
-    queried from the kernel — dask scheduler info, tensor server
-    connectivity, and viewer layer count. Use before heavy computation.
+    queried from the kernel — dask scheduler info, tensor server connectivity,
+    viewer layer count, the available `ops`, and which kernel plugins loaded.
+    Use before heavy computation, and to resolve a skill's `requires:` list.
     """
     import psutil
 

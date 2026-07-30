@@ -169,8 +169,9 @@ class TestSeeding:
 
     def test_a_skill_can_name_the_seeded_plugin_by_file_stem(self, tmp_path):
         # The token↔file contract a skill author relies on: `plugin:rolling_ball`
-        # in frontmatter resolves against `rolling_ball.py`, not against the names
-        # the file happens to export (subtract_background, …).
+        # in frontmatter is answered by `rolling_ball.py` appearing in the
+        # server_status report, not by the names the file happens to export
+        # (subtract_background, …) — those are all the namespace ever shows.
         from biopb_mcp.mcp import _bootstrap, _requires
         from biopb_mcp.plugins._seed import seed_kernel_plugins
 
@@ -182,7 +183,7 @@ class TestSeeding:
 
         ip = IP()
         _requires.record_loaded_plugins(_bootstrap._load_startup_files(ip, dest))
-        assert _requires.check(["plugin:rolling_ball"], ip.user_ns)["ok"]
+        assert "rolling_ball" in "\n".join(_requires.plugin_status_lines())
 
     def test_static_inspector_lists_seeded_file(self, tmp_path):
         # The dashboard reads the kernel dir statically (parse, no exec).

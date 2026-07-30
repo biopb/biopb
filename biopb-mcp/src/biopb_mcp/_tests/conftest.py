@@ -40,12 +40,12 @@ def _isolate_loaded_plugins():
 
     ``mcp/_requires.py`` holds what the plugin loader loaded in module state (one
     kernel, one record — see its docstring), so any test that drives a load leaks
-    into the next one's ``plugin:`` answers.
+    into the next one's ``server_status`` report.
     """
     from biopb_mcp.mcp import _requires
 
     def clear():
-        _requires.record_loaded_plugins([])
+        _requires.record_loaded_plugins()
 
     clear()
     yield
