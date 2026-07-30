@@ -7,6 +7,7 @@ exercise the server-side formatting/extraction without a real kernel.
 
 import base64
 import json
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -102,6 +103,55 @@ class TestResources:
         content = _server.get_kernel_guide()
         assert "biopb-mcp" in content
         assert "execute_code" in content
+
+    def test_guide_routes_every_requires_token_to_a_status_section(self):
+        # The guide is where a skill's `requires:` is resolved, so every token
+        # kind must name the section that answers it -- a token with no route is
+        # one the agent will guess at.
+        guide = _server.get_kernel_guide()
+        section = guide[guide.index("## Skill requirements") :]
+        for token, where in [
+            ("`viewer`", "## Viewer"),
+            ("`tensor`", "## Tensor Server"),
+            ("`dask`", "## Dask"),
+            ("`ops:<kind>`", "## Ops"),
+            ("`plugin:<name>`", "## Kernel plugins"),
+            ("`pkg:biopb-mcp`", "## Versions"),
+        ]:
+            assert token in section and where in section
+
+    def test_guide_gives_a_missing_package_three_options(self):
+        # The choice is the user's, so all three have to be on the table: the
+        # agent installing is one option among them, not the default, and the
+        # degraded path is the one that survives a managed-env upgrade.
+        section = _server.get_kernel_guide()
+        section = section[section.index("### When something is missing") :]
+        assert "They install it" in section
+        assert "You install it for them" in section
+        assert "only after they say yes" in section
+        assert "degraded path" in section
+        # A newly installed package is invisible to an interpreter that already
+        # looked -- guidance that skips this reads as "the install didn't work".
+        assert "invalidate_caches" in section
+
+    def test_extras_file_is_advice_about_installing_not_about_not_installing(self):
+        # The durability note belongs to the two options that install something.
+        # Indented under option 3 -- the one where nothing is installed -- it reads
+        # as a non-sequitur, so pin it as its own unindented paragraph.
+        section = _server.get_kernel_guide()
+        section = section[section.index("### When something is missing") :]
+        (line,) = [ln for ln in section.splitlines() if "extra-packages.txt" in ln]
+        assert not line.startswith(" "), line
+
+    def test_guide_separates_the_three_missing_plugin_causes(self):
+        # Seeding cannot fix an install that predates the plugin, and a file that
+        # failed to load is not a file that is absent -- different fixes, so the
+        # guide must not collapse them into "run the seeder".
+        section = _server.get_kernel_guide()
+        section = section[section.index("### When something is missing") :]
+        assert "predates the plugin" in section
+        assert "failed to load" in section
+        assert "biopb-mcp-seed-plugins" in section
 
     def test_viewer_resource_mentions_layers(self):
         content = _server.get_viewer_guide()
@@ -672,6 +722,12 @@ class TestServerStatus:
         import biopb_mcp
 
         assert "biopb-mcp: " + biopb_mcp.__version__ in report
+        # The interpreter, not just its version: a bare `pip install` targets the
+        # user's active env, which need not be this one. Which command is right is
+        # decided in _requires (tested there for both env shapes); here, only that
+        # the section reaches the report at all.
+        assert sys.executable in report
+        assert "add a package" in report
 
     def test_kernel_snippet_names_the_config_key_when_no_ops(self):
         import contextlib

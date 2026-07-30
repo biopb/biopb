@@ -95,7 +95,43 @@ are produced.
 - Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools
   to the agent's namespace; the installer seeds a `rolling_ball.py` example there,
   never clobbering your edits)
+- Extra Python packages: `~/.config/biopb/extra-packages.txt` (see below)
 - Webapp: `~/.local/share/biopb/webapp`
+
+### Extra Python packages
+
+Everything installs into **one** `uv` tool environment, and that environment is
+what the agent's napari kernel runs in — so an optional dependency a workflow
+needs (`basicpy`, `m2stitch`, a newer `scikit-image`) has to live there too.
+
+Every rerun of the installer rebuilds that environment from the release's own
+requirement list, which means a package you add by hand is **dropped at the next
+upgrade** — usually noticed much later, as an import that used to work. To keep
+one, name it in `~/.config/biopb/extra-packages.txt`, one
+[PEP 508](https://peps.python.org/pep-0508/) requirement per line:
+
+```
+basicpy
+m2stitch==0.9.0
+# a direct reference works too; its URL fragment is left intact
+segmentation-zoo @ git+https://github.com/example/zoo@main#subdirectory=pkg
+```
+
+Blank lines are ignored, and so is a `#` comment — but only one that starts a line
+or follows whitespace, the same rule `pip` applies to a `requirements.txt`. A `#`
+elsewhere belongs to the requirement (a `#subdirectory=` or `#sha256=` URL
+fragment) and is kept.
+
+The installer replays that list on every run, so the packages are reinstalled
+with everything else. If one of them can't be resolved alongside the release's
+own pins, the install **does not fail**: it retries without your extras, says
+which were dropped, and points back at this file — biopb still upgrades, and you
+fix the offending line at your leisure.
+
+To install one for the current session only, use the exact command
+`server_status` prints under `## Versions` (it names this environment's
+interpreter); a bare `pip install` targets whatever environment your shell has
+active, which is usually not this one.
 
 ### Unattended / unmanned upgrades
 

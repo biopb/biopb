@@ -312,6 +312,80 @@ function Assert-LastExit {
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
 }
 
+# Run one `uv tool install`, with a heartbeat while it works and uv's own output
+# replayed afterwards. Records uv's exit code in $script:LastUvExit and does NOT
+# throw on failure: the caller decides, because one failure mode (a user's extra
+# package that will not resolve) is retried rather than fatal.
+#
+# The exit code is recorded in a script variable rather than returned, because in
+# GUI mode the Report-* helpers write to the output stream (Emit-Gui), so a
+# returned value would arrive mixed in with every progress record this emits.
+function Invoke-UvToolInstall {
+    param([string[]]$InstallArgs, [string]$OutLog, [string]$ErrLog)
+
+    # uv only animates its progress bar on a TTY, and it goes SILENT for
+    # minutes during the prepare/link phase (no per-line output there) -- which
+    # reads as a frozen console, worst on Windows where Defender real-time-scans
+    # every file uv unpacks/links (see biopb/biopb#384). --verbose does NOT help:
+    # it front-loads a burst during the ~seconds-long resolve, then is just as
+    # silent through the ~minute of prepare+install.
+    #
+    # So run uv detached with its output redirected to a log, emit our OWN
+    # heartbeat while it works, then replay the log through the reporter so uv's
+    # full detail (the "Installed N packages" summary, or the real error on
+    # failure) still lands in the console/GUI/diagnostic transcript. Start-Process
+    # is given a single pre-quoted argument line, not an -ArgumentList array:
+    # the requirement specs are PEP 508 direct refs containing spaces
+    # ("biopb[tensor] @ file:///..."), which an array would split under Windows
+    # PowerShell 5.1. Only spaces/quotes need quoting here (no embedded quotes).
+    $uvExe = (Get-Command uv -ErrorAction Stop).Source
+    $argLine = ($InstallArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+
+    $proc = Start-Process -FilePath $uvExe -ArgumentList $argLine -NoNewWindow -PassThru `
+        -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog
+    # Touch .Handle so the Process object retains the native handle; without
+    # this, Start-Process -PassThru discards it on exit and $proc.ExitCode
+    # comes back $null -- which Assert-LastExit would misread as a failure.
+    $null = $proc.Handle
+    # Wait in 1s slices so we notice a fast (warm-cache) exit promptly, but
+    # only emit a heartbeat every ~10s so a slow install shows steady life
+    # without spamming. WaitForExit(ms) returns true the instant uv exits.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastTick = 0
+    while (-not $proc.WaitForExit(1000)) {
+        $elapsed = [int]$sw.Elapsed.TotalSeconds
+        if (($elapsed - $lastTick) -ge 10) {
+            $lastTick = $elapsed
+            Report-Detail "  ...still installing (${elapsed}s elapsed)"
+        }
+    }
+    # The timed WaitForExit above returns the instant uv signals exit, which can
+    # be before .NET has cached the process's exit code; the parameterless
+    # overload blocks until the process is fully reaped so $proc.ExitCode is
+    # reliably populated below (belt-and-suspenders with the .Handle touch above).
+    $proc.WaitForExit()
+
+    # Replay captured output (after exit, so the streams are flushed/closed).
+    # -Encoding UTF8: uv writes UTF-8, but Windows PowerShell 5.1 Get-Content
+    # defaults to ANSI and would mangle any non-ASCII in the replayed summary /
+    # error lines (mojibake in the console + diagnostic transcript).
+    foreach ($f in @($OutLog, $ErrLog)) {
+        if (Test-Path -LiteralPath $f) {
+            Get-Content -LiteralPath $f -Encoding UTF8 | ForEach-Object {
+                if ($_ -ne '') { Report-Detail "$_" }
+            }
+        }
+    }
+    # Guard a null ExitCode -- it would make `-ne 0` true and false-fail a good
+    # install -- as an explicit, legible error rather than a phantom
+    # "failed (exit code )". An anomaly of the run, not a resolvable requirement,
+    # so it throws here instead of being retried.
+    if ($null -eq $proc.ExitCode) { throw "biopb install: uv exit code unavailable" }
+    $script:LastUvExit = $proc.ExitCode
+}
+
 # Force-terminate any process running from a biopb uv tool environment so its
 # locked binaries under <tooldir>\biopb\Scripts can be deleted. The graceful
 # `biopb control stop` only reaches the control-owned data plane; a data server
@@ -1172,71 +1246,65 @@ function Invoke-BiopbInstall {
         "--with-executables-from", "biopb-control"
     )
 
+    # User-added packages for this shared environment, replayed as part of the
+    # requirement set. `uv tool install --force` rebuilds the env from these args
+    # on every upgrade, so a package the user added by hand -- into the very
+    # interpreter the napari kernel runs, where an optional dependency like basicpy
+    # has to live -- is dropped at the next upgrade, surfacing later as an import
+    # that used to work. One PEP 508 requirement per line; blank lines and `#`
+    # comments ignored. The file is the user's; the installer only ever reads it.
+    #
+    # A `#` is a comment only at line start or after whitespace -- pip's
+    # requirements.txt rule, and the reason it has that rule: a PEP 508 direct
+    # reference carries load-bearing data in the URL fragment
+    # ("git+https://host/r@main#subdirectory=sub", "...whl#sha256=..."), so
+    # stripping from the first `#` anywhere truncates the requirement into one that
+    # still resolves -- to the repo root instead of the subdirectory, with no hash
+    # checked and nothing to warn about.
+    $extraArgs = @()
+    $extraNames = @()
+    $extrasFile = Join-Path $ConfigDir "extra-packages.txt"
+    if (Test-Path -LiteralPath $extrasFile) {
+        foreach ($line in (Get-Content -LiteralPath $extrasFile -Encoding UTF8)) {
+            $req = ($line -replace '^\s*#.*$', '' -replace '\s#.*$', '').Trim()
+            if ($req) { $extraArgs += @("--with", $req); $extraNames += $req }
+        }
+    }
+    if ($extraNames.Count -gt 0) {
+        Report-Info "including your extra packages: $($extraNames -join ', ')"
+    }
+
     Report-Info "Installing biopb into one shared environment (first run can take several minutes; on Windows, antivirus scans every file uv writes)..."
     $uvOutLog = Join-Path $env:TEMP "biopb-uv-install.out.log"
     $uvErrLog = Join-Path $env:TEMP "biopb-uv-install.err.log"
     try {
-        # uv only animates its progress bar on a TTY, and it goes SILENT for
-        # minutes during the prepare/link phase (no per-line output there) -- which
-        # reads as a frozen console, worst on Windows where Defender real-time-scans
-        # every file uv unpacks/links (see biopb/biopb#384). --verbose does NOT help:
-        # it front-loads a burst during the ~seconds-long resolve, then is just as
-        # silent through the ~minute of prepare+install.
+        Invoke-UvToolInstall -InstallArgs ($installArgs + $extraArgs) `
+            -OutLog $uvOutLog -ErrLog $uvErrLog
+        # Fail-soft on the extras only. A user requirement joins the same resolve as
+        # the release's own pins (napari is pinned exactly), so one bad line would
+        # otherwise block the whole upgrade over a package the deployment does not
+        # need. Retry without them and name what was dropped: the deployment lands,
+        # and the user is told which line to fix rather than finding out at the next
+        # import. A failure with no extras present is a real failure -- not retried.
         #
-        # So run uv detached with its output redirected to a log, emit our OWN
-        # heartbeat while it works, then replay the log through the reporter so uv's
-        # full detail (the "Installed N packages" summary, or the real error on
-        # failure) still lands in the console/GUI/diagnostic transcript. Start-Process
-        # is given a single pre-quoted argument line, not an -ArgumentList array:
-        # the requirement specs are PEP 508 direct refs containing spaces
-        # ("biopb[tensor] @ file:///..."), which an array would split under Windows
-        # PowerShell 5.1. Only spaces/quotes need quoting here (no embedded quotes).
-        $uvExe = (Get-Command uv -ErrorAction Stop).Source
-        $argLine = ($installArgs | ForEach-Object {
-            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-        }) -join ' '
-
-        $proc = Start-Process -FilePath $uvExe -ArgumentList $argLine -NoNewWindow -PassThru `
-            -RedirectStandardOutput $uvOutLog -RedirectStandardError $uvErrLog
-        # Touch .Handle so the Process object retains the native handle; without
-        # this, Start-Process -PassThru discards it on exit and $proc.ExitCode
-        # comes back $null -- which Assert-LastExit would misread as a failure.
-        $null = $proc.Handle
-        # Wait in 1s slices so we notice a fast (warm-cache) exit promptly, but
-        # only emit a heartbeat every ~10s so a slow install shows steady life
-        # without spamming. WaitForExit(ms) returns true the instant uv exits.
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $lastTick = 0
-        while (-not $proc.WaitForExit(1000)) {
-            $elapsed = [int]$sw.Elapsed.TotalSeconds
-            if (($elapsed - $lastTick) -ge 10) {
-                $lastTick = $elapsed
-                Report-Detail "  ...still installing (${elapsed}s elapsed)"
+        # The retry is what *identifies* the cause, so the extras are only accused
+        # after it succeeds. A failure this install has nothing to do with them --
+        # no network, a full disk, a bad release pin -- fails the retry too, and
+        # Assert-LastExit below throws on uv's own error with no wrong diagnosis
+        # printed above it. Hence the hedge in the first warning and the verdict in
+        # the second.
+        if ($script:LastUvExit -ne 0 -and $extraNames.Count -gt 0) {
+            Report-Warn "Install failed; retrying without your extra packages to see whether they are the cause: $($extraNames -join ', ')"
+            Invoke-UvToolInstall -InstallArgs $installArgs -OutLog $uvOutLog -ErrLog $uvErrLog
+            if ($script:LastUvExit -eq 0) {
+                $script:ExtrasDropped = ($extraNames -join ', ')
+                Report-Warn "Could not resolve your extra packages: $($script:ExtrasDropped)"
+                Report-Warn "  fix or remove the offending line in $extrasFile"
             }
         }
-        # The timed WaitForExit above returns the instant uv signals exit, which can
-        # be before .NET has cached the process's exit code; the parameterless
-        # overload blocks until the process is fully reaped so $proc.ExitCode is
-        # reliably populated below (belt-and-suspenders with the .Handle touch above).
-        $proc.WaitForExit()
-
-        # Replay captured output (after exit, so the streams are flushed/closed).
-        # -Encoding UTF8: uv writes UTF-8, but Windows PowerShell 5.1 Get-Content
-        # defaults to ANSI and would mangle any non-ASCII in the replayed summary /
-        # error lines (mojibake in the console + diagnostic transcript).
-        foreach ($f in @($uvOutLog, $uvErrLog)) {
-            if (Test-Path -LiteralPath $f) {
-                Get-Content -LiteralPath $f -Encoding UTF8 | ForEach-Object {
-                    if ($_ -ne '') { Report-Detail "$_" }
-                }
-            }
-        }
-        # Start-Process leaves $LASTEXITCODE untouched, so set it from the process
-        # object for the shared Assert-LastExit gate. Guard a null ExitCode -- it
-        # would make `$LASTEXITCODE -ne 0` true and false-fail a good install -- as an
-        # explicit, legible error rather than a phantom "failed (exit code )".
-        if ($null -eq $proc.ExitCode) { throw "biopb install: uv exit code unavailable" }
-        $global:LASTEXITCODE = $proc.ExitCode
+        # Start-Process leaves $LASTEXITCODE untouched, so set it from the recorded
+        # exit code for the shared Assert-LastExit gate.
+        $global:LASTEXITCODE = $script:LastUvExit
         Assert-LastExit "biopb install"
     } finally {
         Remove-Item -LiteralPath $uvOutLog, $uvErrLog -Force -ErrorAction SilentlyContinue
@@ -1543,6 +1611,10 @@ function Invoke-BiopbInstall {
         ConfigDir      = $ConfigDir
         WebappInstalled = $WebappOk
         McpNeedsManual = $script:McpNeedsManual
+        # Non-empty when the user's extra-packages.txt could not be resolved and
+        # the install fell back without it — the one failure that would otherwise
+        # be met weeks later as a missing import.
+        ExtrasDropped  = $script:ExtrasDropped
     }
 
     # The gui protocol (RESULT + the terminal DONE record) is emitted HERE, while
@@ -1551,6 +1623,12 @@ function Invoke-BiopbInstall {
     if ($Mode -eq 'gui') {
         if ($result.WebappInstalled) { Emit-Gui "::biopb::RESULT|webapp|1" }
         if ($result.McpNeedsManual)  { Emit-Gui "::biopb::RESULT|mcp_manual|1" }
+        # Carries the list, not a flag: the finish page names the packages, and the
+        # Report-Warn that said so scrolled out of the log long ago (this is the end
+        # of a multi-minute install). Without this record the field above is dead on
+        # the gui path -- the one failure the user has to act on, and the only front
+        # end that never mentions it.
+        if ($result.ExtrasDropped) { Emit-Gui "::biopb::RESULT|extras_dropped|$($result.ExtrasDropped)" }
         Emit-Gui "::biopb::RESULT|config|$($result.ConfigFile)"
         Emit-Gui "::biopb::DONE|0"
     }

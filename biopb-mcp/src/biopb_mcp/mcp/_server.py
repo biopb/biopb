@@ -256,14 +256,15 @@ _STATUS_SNIPPET = """
 # not necessarily the server process's env (the kernelspec need not be it). The
 # common such token is `pkg:biopb-mcp>=X`, how a skill says it needs a release
 # that carries some plugin, so report that one instead of making the agent import.
+# The interpreter, and how to install into it, come from _requires (which decides
+# the command from the env's shape) rather than being composed here.
 print("## Versions")
 try:
-    import biopb_mcp as _bm
-    print("  biopb-mcp: " + str(getattr(_bm, "__version__", "unknown")))
+    from biopb_mcp.mcp import _requires as _req
+    for _line in _req.versions_status_lines():
+        print(_line)
 except Exception as _e:
-    print("  biopb-mcp: unknown (" + str(_e) + ")")
-import sys as _sys
-print("  python: " + _sys.version.split()[0])
+    print("  error: " + str(_e))
 
 print("")
 print("## Dask")

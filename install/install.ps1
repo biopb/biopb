@@ -237,6 +237,13 @@ function Show-Summary {
         Write-Inf "  register it manually using $ConfigDir\mcp.json"
         Write-Host ""
     }
+
+    if ($Result.ExtrasDropped) {
+        Write-Warn2 "Your extra packages were NOT installed: $($Result.ExtrasDropped)"
+        Write-Inf "  they could not be resolved with this release's own pins"
+        Write-Inf "  fix or remove the line, then rerun: $ConfigDir\extra-packages.txt"
+        Write-Host ""
+    }
 }
 
 # ============================================================================
