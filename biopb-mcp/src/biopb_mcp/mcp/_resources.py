@@ -33,21 +33,69 @@ inspect_object("<name>")                        # its signature + docstring
 ```
 
 ## Skill requirements
-A curated skill from `find_skills` carries a `requires:` list (`viewer`, `tensor`, `dask`,
-`ops:<name>`, `plugin:<name>`, `pkg:<name>` with an optional version). **Resolve it before
-you start the skill** — one that assumes a plugin or package it doesn't have fails partway
-through, after the user has already waited. `server_status` answers all but `pkg:`: the
-viewer (and whether its window is still open), the tensor connection, the dask scheduler,
-the `ops` on offer, and — under **Kernel plugins** — which plugins actually loaded, which is
-the only place `plugin:<name>` can be read (a file contributes its function names, not its
-own name, and one that failed to load is still on disk). `pkg:biopb-mcp>=X` — a skill saying
-it needs a release that carries some plugin — is answered by **Versions**, which reports the
-version installed in this kernel's own interpreter, the one that will run the skill; for any
-other `pkg:` token just import it: `import skimage; skimage.__version__`.
+A curated skill from `find_skills` carries a `requires:` list. **Resolve it before you start
+the skill** — one that assumes a plugin or package it doesn't have fails partway through,
+after the user has already waited.
 
-A gap is **the user's call, not yours** — installing a package, seeding a plugin and
-restarting the kernel all need their consent, and naming the gap usually beats abandoning
-the skill.
+One `server_status` call answers every token but a third-party `pkg:`:
+
+| token | read it from | if it's missing |
+|---|---|---|
+| `viewer` | `## Viewer` | see **headless / closed window** below |
+| `tensor` | `## Tensor Server` | the section names the reason; see below |
+| `dask` | `## Dask` | never missing — `da` is always bound; the scheduler is a performance property, not a blocker |
+| `ops:<kind>` | `## Ops` | see below |
+| `plugin:<name>` | `## Kernel plugins` | see below — this is the **only** place it can be read |
+| `pkg:biopb-mcp` | `## Versions` — the version installed in **this kernel's** interpreter, the one that will run the skill | the install is older than the skill; the fix is upgrading biopb |
+| `pkg:<other>` | `import <name>` (`import skimage; skimage.__version__`) | see below |
+
+`plugin:<name>` has no other source: a plugin file contributes its function names, not its
+own name, so `dir()` can't answer it, and a file that failed to load is still on disk, so a
+directory listing can't either. The report is the loader's own record of what survived.
+
+### When something is missing
+**Diagnose, tell the user, let them choose.** Installing, seeding and restarting are all
+theirs to authorize — but a named gap usually beats abandoning the skill, and several of
+these have a fix worth offering.
+
+**`plugin:<name>` — three different causes, in this order:**
+1. **Is `pkg:biopb-mcp>=X` in the same `requires:` also unmet?** Then this install simply
+   predates the plugin. Seeding cannot conjure it — say so, and point at upgrading biopb
+   (rerun the installer). Stop there.
+2. **Else check the file:** `ls ~/.config/biopb/kernel/<name>.py`. Present, but absent from
+   the report → **it failed to load.** The traceback is in the session log (`log_file:` in
+   `## System`). Show the user the error; this is a bug to report, not something to retry.
+3. **Absent → never seeded.** `biopb-mcp-seed-plugins` installs the built-ins, then the
+   kernel must restart to load them. **Ask before restarting** — it takes the namespace and
+   every layer with it.
+
+**`pkg:<name>` — offer three options and let the user pick:**
+1. **They install it** — quote the exact command `## Versions` prints (it names *this*
+   interpreter). Never a bare `pip install`: it targets whatever env their shell has active,
+   which can succeed while the import here still fails.
+2. **You install it for them** — same command, run from `execute_code` via `subprocess`,
+   **only after they say yes.** Then `importlib.invalidate_caches()` and import again; if the
+   module was already half-imported, `restart_kernel` (ask — layers are lost).
+3. **The skill's degraded path**, if it names one. Often the right answer for a one-off run:
+   nothing to undo, and it is the option that survives an upgrade.
+
+   In a uv-managed env (`## Versions` says so) also mention `~/.config/biopb/extra-packages.txt`
+   — an install there is otherwise lost at the next biopb upgrade.
+
+**`viewer` — two different failures.** *Headless* means no window exists this session: run
+the skill's numeric checks and report numbers, never a screenshot. *`window: CLOSED`* means
+data and compute still work but nothing displays; `restart_kernel` restores it (ask — layers
+are lost). Neither is a reason to stop if the skill's results are numbers.
+
+**`tensor`.** The section names the cause (not connected / auth / still starting). Check
+`biopb control status` with the user, or point at `$BIOPB_TENSOR_URL` if the data lives on a
+server the control doesn't own. Do **not** proceed as if the catalog were empty — that reads
+to the user as "no data" rather than "not connected".
+
+**`ops:<kind>`.** `## Ops` lists what the servers *do* offer, so say whether one of them
+covers the same need — but **ask before substituting** an op the skill didn't name, since a
+different model is a different result. Otherwise the user adds a server to
+`services.process_image_servers`.
 
 ## Long-running jobs
 A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
