@@ -153,17 +153,44 @@ class TestResources:
         assert "failed to load" in section
         assert "biopb-mcp-seed-plugins" in section
 
+    def test_guide_skill_section_gated_on_the_catalog_switch(self):
+        # With the catalog off there is no find_skills to hand back a
+        # `requires:` list, so the section documents a tool the agent cannot
+        # call -- the gate the handshake instructions already use.
+        _server.set_skills_enabled(False)
+        off = _server.get_kernel_guide()
+        assert "## Skill requirements" not in off
+        _server.set_skills_enabled(True)
+        on = _server.get_kernel_guide()
+        assert "## Skill requirements" in on
+        # Everything else is the same guide, in both directions (no stale copy).
+        assert on.startswith(off)
+        _server.set_skills_enabled(False)
+        assert _server.get_kernel_guide() == off
+
+    def test_guide_points_at_server_status_for_which_plugins_loaded(self):
+        # The loader is fail-open, so "file on disk" != "plugin loaded"; the
+        # report is the only place that distinction is readable.
+        content = _server.get_kernel_guide()
+        assert "## Kernel plugins" in content
+        assert "services.namespace_enabled" in content
+        # ...and introspection remains the answer to the other question.
+        assert "inspect_object" in content
+
     def test_viewer_resource_mentions_layers(self):
         content = _server.get_viewer_guide()
         assert "viewer.layers" in content
 
-    def test_tensor_resource_mentions_client(self):
-        content = _server.get_tensor_guide()
+    def test_client_resource_mentions_client(self):
+        content = _server.get_client_guide()
         assert "client" in content
 
-    def test_annotations_resource_mentions_points(self):
-        content = _server.get_annotations_guide()
+    def test_viewer_resource_absorbed_the_annotation_guide(self):
+        # guide://annotations was folded in here: one handle, one guide.
+        content = _server.get_viewer_guide()
+        assert "add_labels" in content
         assert "add_points" in content
+        assert not hasattr(_server, "get_annotations_guide")
 
 
 # -----------------------------------------------------------------------
@@ -863,3 +890,46 @@ class TestRun:
         # http binds loopback on the requested port.
         assert _server.mcp.settings.host == "127.0.0.1"
         assert _server.mcp.settings.port == 9999
+
+
+# -----------------------------------------------------------------------
+# guide://data
+# -----------------------------------------------------------------------
+
+
+class TestDataGuide:
+    """The data-representation guide, and the places that must point at it.
+
+    Layer data here is a pyramid of proxies in display axis order, none of which
+    a napari-shaped habit expects -- so the guide has to be discoverable from the
+    handshake and from every guide whose examples touch pixels.
+    """
+
+    def test_registered_and_advertised_in_the_handshake(self):
+        import asyncio
+
+        uris = {str(r.uri) for r in asyncio.run(_server.mcp.list_resources())}
+        assert "guide://data" in uris
+        # Pull-only resources are read on demand, so the instructions are the
+        # only place the agent learns this one exists.
+        assert "guide://data" in _server._BASE_INSTRUCTIONS
+
+    def test_names_all_three_sources_of_array_data(self):
+        guide = _server._resources.DATA
+        assert "client.get_tensor" in guide  # the server
+        assert "layer.data" in guide  # the viewer
+        assert "multiscale" in guide  # ...which may be a list of levels
+
+    def test_pairs_each_scale_with_the_array_it_belongs_to(self):
+        # Crossing these transposes the spacing onto the wrong axes, which
+        # changes every measurement without changing any shape.
+        guide = _server._resources.DATA
+        assert "get_physical_scale" in guide
+        assert "layer.scale" in guide
+
+    def test_viewer_guide_reads_layer_data_the_safe_way(self):
+        # The layer-listing example is the snippet most likely to be copied;
+        # a bare `layer.data.shape` breaks on every multiscale layer.
+        viewer_guide = _server._resources.VIEWER
+        assert "layer.data.shape" not in viewer_guide
+        assert "layer.multiscale" in viewer_guide

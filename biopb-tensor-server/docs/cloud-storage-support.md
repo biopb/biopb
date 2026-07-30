@@ -129,7 +129,7 @@ read methods short-circuit on a zero-tensor descriptor, so "first read resolves"
 never fires through them. `TensorFlightClient.resolve(source_id, *, on_progress,
 should_cancel)` is the explicit trigger — a thin blocking façade over the resolve
 stream that returns the full multi-field descriptor; an unresolved-source error
-is **directive**, pointing at it, and a `guide://tensor` stanza teaches the agent.
+is **directive**, pointing at it, and a `guide://client` stanza teaches the agent.
 The napari browser gets the human twin: double-click / "Resolve…" → modal
 **download warning** → consented, blocking resolve on a worker thread (which can
 consume the heartbeats for progress/cancel) → repopulate. `warm()` (the

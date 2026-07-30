@@ -51,10 +51,12 @@ _session_log_path: str | None = None
 _BASE_INSTRUCTIONS = (
     "This biopb-mcp session drives a live napari viewer through a child IPython "
     "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
-    "for detail before non-trivial work: guide://kernel (namespace, examples, "
-    "long-running jobs & cancellation), guide://tensor (data access/upload), "
-    "guide://viewer (layers/camera/dims), guide://annotations "
-    "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
+    "for detail before non-trivial work: guide://kernel (namespace, skill "
+    "requirements, long-running jobs & cancellation), guide://data (how arrays are "
+    "represented here -- pyramids, laziness, axis order -- and the traps), "
+    "guide://client (the `client` handle: catalog, load, upload), "
+    "guide://viewer (layers/camera/dims, annotation layers), "
+    "guide://ops (server-side image-processing ops).\n"
     "\n"
     "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
     "start of the session (and again to recover after a failure or after the "
@@ -501,8 +503,22 @@ def _format_job_status(snap: dict) -> str:
 
 @mcp.resource("guide://kernel")
 def get_kernel_guide() -> str:
-    """Overview: available namespaces, helper functions, resource URIs."""
+    """Overview: available namespaces, helper functions, resource URIs.
+
+    The skill-requirements section is appended only when the catalog is enabled
+    (``services.skills_enabled``): with it off there is no ``find_skills`` to
+    return a ``requires:`` list, so the section would document an unreachable
+    tool -- the same gate the handshake instructions use.
+    """
+    if _skills_enabled:
+        return _resources.GUIDE + _resources.SKILL_REQUIREMENTS
     return _resources.GUIDE
+
+
+@mcp.resource("guide://data")
+def get_data_guide() -> str:
+    """How array data is represented here: the three sources, and their traps."""
+    return _resources.DATA
 
 
 @mcp.resource("guide://viewer")
@@ -511,16 +527,10 @@ def get_viewer_guide() -> str:
     return _resources.VIEWER
 
 
-@mcp.resource("guide://tensor")
-def get_tensor_guide() -> str:
-    """Tensor data: listing sources, loading, uploading."""
-    return _resources.TENSOR
-
-
-@mcp.resource("guide://annotations")
-def get_annotations_guide() -> str:
-    """Annotation: points, shapes, labels creation/editing."""
-    return _resources.ANNOTATIONS
+@mcp.resource("guide://client")
+def get_client_guide() -> str:
+    """The `client` handle: listing sources, loading, uploading."""
+    return _resources.CLIENT
 
 
 @mcp.resource("guide://ops")
@@ -641,7 +651,7 @@ def execute_code(python_code: str) -> str:
     use it to batch many mutations into one main-thread hop, or to touch raw Qt
     (viewer.window), which still requires the main thread.
 
-    * data access (see guide://tensor for more details):
+    * data access (see guide://client for more details):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
@@ -653,6 +663,11 @@ def execute_code(python_code: str) -> str:
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
       (auto-handles the multiscale pyramid). client.get_tensor(array_id)
       returns a lazy dask array without adding a layer.
+    - reading pixels back off a layer is not plain napari: layer.data is a
+      *list* of pyramid levels when layer.multiscale, in display axis order
+      ([..., Z, Y, X], singleton Z inserted for 2-D sources), and lazy. Use
+      `layer.data[0] if layer.multiscale else layer.data`, and read
+      guide://data before measuring or computing from a layer.
     """
     host = _kernel_host
     if host is None:

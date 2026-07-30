@@ -18,19 +18,68 @@ GUIDE = """\
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 | `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result (no-op on the main thread). Rarely needed — the `viewer` already auto-marshals every mutation. Use it only to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
 
-* The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`, the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
-* Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
-* `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
+- The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every
+  mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
+  the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate
+  it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main
+  thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to
+  apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
+- Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
+- **Server data, viewer data and your own arrays are three different things** —
+  different axis order, different resolution levels, different laziness. Read
+  `guide://data` before writing code that reads pixels off a layer.
+- `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
-**User plugins may add more names** beyond this table (biopb-mcp#92): top-level
+## Kernel plugins
+**User plugins may add more names** beyond this table: top-level
 definitions from `*.py` files in `~/.config/biopb/kernel/`, and installed
 `biopb_mcp.namespace` packages, are loaded into this namespace at kernel start.
-They're lab-specific helpers, not built-ins — so if you see an unfamiliar name,
-it's likely one of these. Discover and read them by introspection:
+They're lab-specific helpers, not built-ins — so an unfamiliar name is likely one
+of these. Two questions, two different answers:
+
+* **Which plugins loaded** — `server_status`, section `## Kernel plugins`. It
+  lists the files and the packages that actually loaded; the loader is fail-open
+  per unit, so a `*.py` sitting in that directory but missing from the report
+  failed on load and the session log says why. The section reads
+  `(disabled — services.namespace_enabled)` where plugins are switched off.
+* **What names they contribute** — introspection. A plugin file contributes its
+  *functions*, not its own name, so the report cannot answer this:
 ```python
 [n for n in dir() if not n.startswith("_")]   # everything actually in scope
 inspect_object("<name>")                        # its signature + docstring
 ```
+
+## Long-running jobs
+A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
+watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
+(best-effort, raises KeyboardInterrupt into the job and cancels in-flight dask tasks) or
+`restart_kernel` (guaranteed, kills the kernel). Notes:
+* **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
+  dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
+* **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
+  raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
+* **Progress on a big graph:** submit with the distributed client
+  (`_dask_client`, present only under the distributed scheduler) and consume results as
+  they land — this gives a live processed count via `poll_job`:
+  ```python
+  from dask.distributed import as_completed
+  futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
+  done = []
+  for fut in as_completed(futs):
+      done.append(fut.result())
+      print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
+  ```
+
+Reading pixels, moving them between the server / a layer / your own variables,
+and the round trip for data too large to hold: `guide://data`.
+"""
+
+# Appended to GUIDE only when the skills catalog is enabled
+# (``services.skills_enabled``, on by default; see _server.get_kernel_guide).
+# An install with skills off has no `requires:` lists to resolve and no
+# `find_skills` to get them from, so this section would describe a tool the
+# agent cannot call -- the same reasoning as _SKILLS_INSTRUCTIONS.
+SKILL_REQUIREMENTS = """\
 
 ## Skill requirements
 A curated skill from `find_skills` carries a `requires:` list. **Resolve it before you start
@@ -97,55 +146,107 @@ to the user as "no data" rather than "not connected".
 covers the same need — but **ask before substituting** an op the skill didn't name, since a
 different model is a different result. Otherwise the user adds a server to
 `services.process_image_servers`.
+"""
 
-## Long-running jobs
-A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
-watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
-(best-effort, raises KeyboardInterrupt into the job and cancels in-flight dask tasks) or
-`restart_kernel` (guaranteed, kills the kernel). Notes:
-* **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
-  dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
-* **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
-  raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
-* **Progress on a big graph:** submit with the distributed client
-  (`_dask_client`, present only under the distributed scheduler) and consume results as
-  they land — this gives a live processed count via `poll_job`:
-  ```python
-  from dask.distributed import as_completed
-  futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
-  done = []
-  for fut in as_completed(futs):
-      done.append(fut.result())
-      print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
-  ```
+DATA = """\
+# Where array data lives, and what it actually is
 
-## Quick Examples
+Three places hold pixels here, and they are **not interchangeable**. Treating
+them as one is the common source of wrong answers — a plain-napari habit that
+breaks because these arrays come off a tensor server, lazily, in a pyramid.
+
+| Source | You get it with | What you get |
+|---|---|---|
+| **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **source axis order** (`dim_labels`), full resolution |
+| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, in **display order** `[..., Z, Y, X]` |
+| **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
+
+`viewer.add_tensor()` is a *conversion between the first two*, not a window onto
+the first. The traps follow from that.
+
+## The traps
+
+**1. `layer.data` is a list when `layer.multiscale`** — `[full_res, half,
+quarter, ...]`, so `layer.data.shape` raises and anything that appears to work
+on the list is working on the wrong thing. Branch, take level 0 unless you mean
+otherwise, and never pair arrays from two different levels:
+
 ```python
-# Check what data is on the viewer
-print([(l.name, type(l).__name__, type(l.data).__name__) for l in viewer.layers])
-
-# Get data from the catalog and convert to np.ndarray
-dask_arr = client.get_tensor("my_source_id") # lazy, thread-safe, picklable
-np_arr = dask_arr.compute() # in memory
-
-# Take action then screenshot to verify (mutations auto-marshal — call directly)
-viewer.dims.ndisplay = 3
+arr = layer.data[0] if layer.multiscale else layer.data
 ```
 
-## Iterative Workflow for _very_ large data
+**2. Layer data is not a dask array.** Each level is wrapped in a `_ViewerArray`
+proxy that pins napari's slice reads to a single-process scheduler (issue #8).
+It behaves like a dask array — `.shape`, `.compute()`, slicing, ufuncs — so
+ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, and a
+bare `np.asarray(arr)` materializes the **whole** array in the main process
+instead of on the cluster. Slice first, or `.compute()` explicitly.
+
+**3. The viewer's axes are not the source's axes.** Levels are canonicalized to
+`[..., Z, Y, X]` (plus a trailing samples axis for interleaved RGB) however the
+source is laid out. So `client.get_physical_scale()` — **source** order — pairs
+with `client.get_tensor()`, while `layer.scale` — **layer** order — pairs with
+`layer.data` and is what `regionprops(..., spacing=)` wants. Crossing them
+transposes the spacing onto the wrong axes: every number changes, no shape does.
+
+**4. A 2-D source is 3-D in the viewer.** Canonicalization *inserts* a singleton
+Z, so `[Y, X]` loads as `[1, Y, X]` with a 3-element `layer.scale`. Read `ndim`
+off the array you are about to use, not off the source.
+
+**5. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
+while the pixels are not there yet; a scikit-image call, `np.asarray`, or a
+`for` loop over the array materializes all of it at once, unchunked and without
+progress — which is how a session allocates a volume it cannot hold. Crop first,
+keep the chain lazy, `.compute()` once; past `promote_after` that compute is a
+job you can watch and cancel (`guide://kernel`).
+
+**6. A layer you built carries no geometry.** `add_labels(arr)` /
+`add_image(arr)` store exactly that array: no pyramid, `scale` all ones. A
+segmentation added beside a calibrated image measures in pixels until you copy
+the image's `scale` onto it.
+
+**7. Upload does not carry labels or physical size.** `client.upload_array`
+takes a **dask** array (wrap numpy with `da.from_array`) and stores shape, dtype
+and chunks; axis labels and pixel size travel only via `dim_labels=` /
+`ome_metadata=`. Otherwise the round trip drops them and `add_tensor` gives back
+an uncalibrated layer.
+
+## Reading a layer safely
+
 ```python
-# 1. Load source data as dask array (lazy)
+# What is on the viewer, and in what shape -- worth running before planning any
+# work off it.
+print([(l.name, type(l).__name__, l.multiscale,
+        (l.data[0] if l.multiscale else l.data).shape) for l in viewer.layers])
+
+layer = viewer.layers[NAME]
+arr = layer.data[0] if layer.multiscale else layer.data   # trap 1
+print(arr.shape, arr.dtype, layer.scale)
+sub = arr[0, 100:600, 100:600].compute()                  # traps 2, 5: crop, then compute
+```
+
+## The round trip, for data too large to hold
+
+Nothing is materialized until step 3, and step 3 never holds the whole result at
+once, so this works on data far larger than memory:
+
+```python
+# 1. Off the server: lazy, nothing read yet
 arr = client.get_tensor("raw_data_id")
 
-# 2. Process
+# 2. Build the graph: still lazy, still nothing read
 mask_arr = arr > 0.5
 
-# 3. Upload. Calls compute() chunk by chunk under the hood.
+# 3. Upload -- the eager step. Computes and sends chunk by chunk.
 source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 
-# 4. Display in viewer for user inspection and approval before next step
+# 4. Back onto the viewer for the user to check (pyramid-shaped again: trap 1)
 layer_name = viewer.add_tensor(source_id)
 ```
+
+Uploading is also what makes a result *shareable* — an array in the kernel is
+visible to nothing else and dies with it. `guide://client` has the upload
+arguments, including the ones that carry axis labels and pixel size (trap 7).
 """
 
 VIEWER = """\
@@ -166,11 +267,17 @@ return the same. Call `start_kernel` to rebuild the viewer. (Briefly, before
 the teardown completes, a tool may instead see `window: CLOSED` with a note to
 `restart_kernel` — either recovers it.)
 
+**Layer data is not a plain array.** A layer loaded by `add_tensor` holds a
+pyramid (`layer.data` is a *list*), in display axis order, wrapped so napari's
+slice reads stay in-process. `guide://data` has the full set of traps; the rule
+of thumb is `layer.data[0] if layer.multiscale else layer.data`.
+
 ## Layers
 ```python
 # List all layers (read)
 for layer in viewer.layers:
-    print(f"{layer.name}: {type(layer).__name__} {layer.data.shape} {layer.data.dtype}")
+    arr = layer.data[0] if layer.multiscale else layer.data   # multiscale => list
+    print(f"{layer.name}: {type(layer).__name__} {arr.shape} {arr.dtype}")
 
 # Get specific layer (read)
 layer = viewer.layers["image_name"]
@@ -178,8 +285,10 @@ layer = viewer.layers["image_name"]
 # Remove layer (auto-marshaled — call directly)
 viewer.layers.remove(viewer.layers["name"])
 
-# Load data to viewer; auto-handles pyramid. Accepts any valid source_id.
-layer_name = viewer.add_tensor(source_id="source_id", tensor_id=None, name=None)
+# Load a source as a layer; auto-handles the pyramid. Returns the layer name.
+# tensor_id is only needed for a multi-tensor source; name defaults from the URL.
+layer_name = viewer.add_tensor("source_id")
+layer_name = viewer.add_tensor("source_id", tensor_id="t1", name="my_layer")
 
 # Layer properties (auto-marshaled — set directly; each runs on the main thread)
 layer = viewer.layers["name"]
@@ -203,11 +312,47 @@ viewer.dims.set_point(axis=0, value=50)
 
 # Get current position (read)
 print(viewer.dims.point)    # tuple of current positions
+
+# 2-D <-> 3-D rendering
+viewer.dims.ndisplay = 3
 ```
 
 ## Layer types
 Image, Labels, Points, Shapes, Vectors, Surface, Tracks
 Use `inspect_object("viewer.add_image")` for full signatures.
+
+## Annotation layers (Labels, Points, Shapes)
+A layer you build here holds exactly the array you pass — no pyramid, and
+`scale` defaults to all ones, so it does **not** inherit the geometry of the
+image it was derived from (`guide://data`, trap 6). Copy the source layer's
+`scale` across, or every measurement off it comes out in pixels.
+
+```python
+# Empty labels layer for the user to paint into, matched to an image layer.
+# The branch is on the *image*: that one came off the server and may be a
+# pyramid. What you add is plain.
+img = viewer.layers["image_name"]
+arr = img.data[0] if img.multiscale else img.data
+lab = viewer.add_labels(np.zeros(arr.shape[-2:], dtype=np.int32), name="annotations")
+lab.scale = img.scale[-2:]                             # else measurements are in pixels
+
+# Labels from a mask you computed
+viewer.add_labels((image_data > threshold).astype(np.int32), name="segmentation")
+
+# Read back what the user painted -- a plain array, no branch needed
+print(f"Labels present: {np.unique(viewer.layers['annotations'].data)}")
+```
+
+The exception is a segmentation that made the round trip — uploaded, then
+reloaded with `add_tensor`. That one is a server layer like any other, pyramid
+and all, so branch on `multiscale` whenever you did not add the array yourself.
+
+Points and shapes follow the same shape; read the signatures rather than
+guessing them:
+```python
+inspect_object("viewer.add_points")
+inspect_object("viewer.add_shapes")
+```
 
 ## Canvas mouse events
 You can detect user clicks/drags/moves on the canvas — this works reliably in
@@ -242,8 +387,12 @@ do **not** instrument vispy to investigate (that is the trap, see point 2):
 3. **Window not focused** — click once to focus it, then interact.
 """
 
-TENSOR = """\
-# Tensor Data Operations
+CLIENT = """\
+# The `client` Handle: Catalog and Tensor Data
+
+Arrays from here are lazy dask arrays in the tensor's own axis order, and a
+tensor loaded into the viewer stops being either of those — see `guide://data`
+before moving pixels between the server, a layer, and your own variables.
 
 ## Check Connection
 ```python
@@ -335,30 +484,6 @@ Use `"cache:my_result"` as destination for ephemeral results that don't
 need to be persisted long-term.
 ```python
 source_id = client.upload_array(arr, "cache:my_result")
-```
-"""
-
-ANNOTATIONS = """\
-## Labels
-```python
-# Create empty labels layer for painting
-shape = viewer.layers["image_name"].data.shape[-2:]  # match y,x of image
-viewer.add_labels(np.zeros(shape, dtype=np.int32), name="annotations")
-
-# Create labels from mask
-mask = (image_data > threshold).astype(np.int32)
-viewer.add_labels(mask, name="segmentation")
-
-# Read labels
-labels_data = viewer.layers["annotations"].data
-unique_labels = np.unique(labels_data)
-print(f"Labels present: {unique_labels}")
-```
-For points, shapes, and other layer types use `inspect_object` to discover
-the full API:
-```python
-inspect_object("viewer.add_points")
-inspect_object("viewer.add_shapes")
 ```
 """
 
