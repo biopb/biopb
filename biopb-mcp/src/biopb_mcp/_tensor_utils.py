@@ -160,6 +160,58 @@ def _resolve_axes(
     return y_idx, x_idx, z_idx, s_idx
 
 
+def _canonical_axis_plan(
+    ndim: int, y_idx: int, x_idx: int, z_idx: int | None, s_idx: int | None
+) -> Tuple[Tuple[int, ...], int | None]:
+    """How to canonicalize a source's axes to ``[..., Z, Y, X]`` / ``[..., Z, Y, X, S]``.
+
+    Returns ``(perm, z_insert_tail)``: the transpose permutation, and -- when the
+    tensor carries no z axis -- how many axes the inserted singleton Z sits ahead
+    of (Y, X, and a samples axis when there is one), or ``None`` when z is real.
+    Z goes ahead of Y/X so it stays third-from-last among the spatial axes, and
+    ahead of S so S stays strictly last.
+
+    :func:`build_pyramid_levels` applies the plan to the level arrays and
+    :func:`canonical_dim_labels` applies it to the labels, so the arrays and the
+    names describing them cannot drift apart.
+    """
+    trailing = ([z_idx] if z_idx is not None else []) + [y_idx, x_idx]
+    if s_idx is not None:
+        trailing.append(s_idx)
+    perm = tuple([i for i in range(ndim) if i not in trailing] + trailing)
+    z_insert_tail = None if z_idx is not None else (3 if s_idx is not None else 2)
+    return perm, z_insert_tail
+
+
+def canonical_dim_labels(tensor_desc, source_desc=None) -> List[str] | None:
+    """Per-axis labels for the array :func:`build_pyramid_levels` returns.
+
+    The source's own labels put through the same canonicalization as the pixels
+    -- reordered by the transpose, with a ``"z"`` spliced in where the singleton
+    Z is inserted -- so the result names the *layer's* axes rather than the
+    source's. Lowercased, both because the spliced ``"z"`` would otherwise clash
+    with an upper-case source convention and because that is the NGFF axis-name
+    convention this feeds (``_writers._axis_dict``).
+
+    The length matches the array's rank, not napari's ``layer.ndim``: an
+    interleaved samples axis is a real array axis (napari just doesn't count it),
+    and the OME-Zarr writer sees the raw array.
+
+    Returns ``None`` when the source declares no usable labels -- there is then
+    nothing to name the leading axes with, and the caller keeps its own fallback.
+    """
+    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
+    shape = list(tensor_desc.shape)
+    if not dim_labels or len(dim_labels) != len(shape):
+        return None
+    y_idx, x_idx, z_idx, s_idx = _resolve_axes(shape, dim_labels)
+    perm, z_insert_tail = _canonical_axis_plan(len(shape), y_idx, x_idx, z_idx, s_idx)
+    labels = [str(dim_labels[i]).lower() for i in perm]
+    if z_insert_tail is not None:
+        labels.insert(len(labels) - z_insert_tail, "z")
+    return labels
+
+
 def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
     """The server-advertised pyramid: per-level ``scale_hint`` + ``reduction_method``.
 
@@ -335,19 +387,11 @@ def build_pyramid_levels(
     # second pass over the labels). Transpose moves X/Y/Z into place; a missing
     # Z is inserted as a singleton so the output rank and trailing axes are
     # uniform for every tensor. Both ops are lazy on dask arrays.
-    trailing = ([z_idx] if z_idx is not None else []) + [y_idx, x_idx]
-    if s_idx is not None:
-        trailing.append(s_idx)
-    perm = tuple([i for i in range(ndim) if i not in trailing] + trailing)
+    perm, z_insert_tail = _canonical_axis_plan(ndim, y_idx, x_idx, z_idx, s_idx)
     if perm != tuple(range(ndim)):
         levels = [level.transpose(perm) for level in levels]
-    if z_idx is None:
-        # Singleton Z goes ahead of Y/X -- and ahead of the samples axis too when
-        # there is one, so Z stays third-from-last among the spatial axes and S
-        # stays strictly last.
-        expand = (Ellipsis, None, slice(None), slice(None))
-        if s_idx is not None:
-            expand += (slice(None),)
+    if z_insert_tail is not None:
+        expand = (Ellipsis, None) + (slice(None),) * z_insert_tail
         levels = [level[expand] for level in levels]
 
     return levels
@@ -494,8 +538,10 @@ def add_tensor_layer(
     reads to a single-process scheduler so the serial viewer shares the
     main-process chunk cache (issue #8; no-op standalone), attach the source's
     OME physical pixel size as ``scale`` + ``metadata['ome_physical_size']`` so
-    the agent's areas/volumes come out in physical units, then ``add_image``
-    (``multiscale=True`` when there is more than one level).
+    the agent's areas/volumes come out in physical units, attach the
+    canonicalized axis names as ``metadata['dim_labels']`` (the only way a
+    writer, which sees just ``(path, data, meta)``, can name the axes), then
+    ``add_image`` (``multiscale=True`` when there is more than one level).
 
     Source resolution, layer *name*, and any cursor/logging/error handling stay
     with the caller; everything from building levels through ``add_image`` is
@@ -548,8 +594,18 @@ def add_tensor_layer(
     )
     if scale is not None:
         add_kwargs["scale"] = scale
+    metadata = {}
     if phys is not None:
-        add_kwargs["metadata"] = {"ome_physical_size": phys}
+        metadata["ome_physical_size"] = phys
+    # Name the layer's axes for the OME-Zarr writer (biopb/biopb#651): it is
+    # handed only napari's (path, data, meta), so with no labels there it falls
+    # back to a positional guess that mislabels every leading pair that isn't
+    # (C, T) -- writing a TCZYX source with T and C swapped.
+    labels = canonical_dim_labels(tensor_desc, source_desc=source_desc)
+    if labels:
+        metadata["dim_labels"] = labels
+    if metadata:
+        add_kwargs["metadata"] = metadata
 
     with _origin_initial_view(viewer):
         if len(levels) > 1:

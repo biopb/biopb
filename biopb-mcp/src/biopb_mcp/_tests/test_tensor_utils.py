@@ -13,6 +13,7 @@ from biopb_mcp._tensor_utils import (
     add_tensor_layer,
     build_layer_scale,
     build_pyramid_levels,
+    canonical_dim_labels,
     get_samples_dim_index,
     get_xy_dim_indices,
     get_z_dim_index,
@@ -408,6 +409,59 @@ class TestBuildPyramidCanonicalOrder:
         assert levels[0].shape == (3, 1, 64, 32)
 
 
+class TestCanonicalDimLabels:
+    """The source's labels put through the same canonicalization as the pixels,
+    so they name the *layer's* axes (biopb/biopb#651)."""
+
+    def test_tczyx_passes_through_unswapped(self):
+        # The bug case: the leading pair is (T, C), not the (C, T) the writer's
+        # positional fallback guesses.
+        desc = _make_tensor_desc([2, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+        assert canonical_dim_labels(desc) == ["t", "c", "z", "y", "x"]
+
+    def test_follows_the_transpose(self):
+        # [Y, X, C] -> [C, Z(=1), Y, X]: reordered, with the inserted Z named.
+        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+        assert canonical_dim_labels(desc) == ["c", "z", "y", "x"]
+
+    def test_names_the_inserted_singleton_z(self):
+        desc = _make_tensor_desc([64, 64], ["y", "x"])
+        assert canonical_dim_labels(desc) == ["z", "y", "x"]
+
+    def test_samples_axis_stays_last_after_the_inserted_z(self):
+        # [S, Y, X] -> [Z(=1), Y, X, S]: Z is spliced ahead of Y/X, not of S.
+        desc = _make_tensor_desc([3, 64, 32], ["s", "y", "x"])
+        assert canonical_dim_labels(desc) == ["z", "y", "x", "s"]
+
+    def test_matches_the_level_rank_and_order(self):
+        # Lockstep with the arrays: same length, same axis in every slot.
+        desc = _make_tensor_desc([2, 64, 32, 3], ["t", "y", "x", "s"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((2, 64, 32, 3))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        labels = canonical_dim_labels(desc)
+        assert labels == ["t", "z", "y", "x", "s"]
+        assert len(labels) == levels[0].ndim
+
+    def test_none_without_labels(self):
+        # Nothing to name the leading axes with -- the caller keeps its fallback.
+        assert canonical_dim_labels(_make_tensor_desc([3, 64, 32])) is None
+
+    def test_none_on_a_length_mismatch(self):
+        assert canonical_dim_labels(_make_tensor_desc([3, 64, 32], ["y", "x"])) is None
+
+    def test_falls_back_to_the_source_descriptor(self):
+        desc = _make_tensor_desc([64, 32, 3], None)
+        source_desc = MagicMock(dim_labels=["y", "x", "c"])
+        assert canonical_dim_labels(desc, source_desc=source_desc) == [
+            "c",
+            "z",
+            "y",
+            "x",
+        ]
+
+
 class TestSamplesDimIndex:
     """Interleaved RGB(A) samples axis detection -- label-gated on size 3/4, and
     deliberately without a positional fallback (biopb/biopb#596)."""
@@ -570,10 +624,42 @@ class TestAddTensorLayer:
 
     def test_single_level_omits_multiscale_and_scale(self):
         viewer = MagicMock()
-        # No physical sizes -> no scale/metadata kwargs.
+        # No physical sizes -> no scale kwarg, and metadata carries the axis
+        # names alone.
         client = _make_physical_client(None)
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+
+        _, kwargs = viewer.add_image.call_args
+        assert kwargs == {"name": "lyr", "metadata": {"dim_labels": ["z", "y", "x"]}}
+
+    def test_attaches_canonical_dim_labels(self):
+        # The layer is the only place the OME-Zarr writer can learn its axis
+        # names from (biopb/biopb#651) -- they must describe the *layer*, so
+        # [Y, X, C] arrives as [C, Z, Y, X], not as the source's order.
+        viewer = MagicMock()
+        client = _make_physical_client([0.25, 0.5, 0.0], ["µm", "µm", ""])
+        client.get_tensor.return_value = da.zeros((64, 32, 3))
+        desc = _make_tensor_desc([64, 32, 3], ["Y", "X", "C"])
+
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+
+        arr = viewer.add_image.call_args[0][0]
+        _, kwargs = viewer.add_image.call_args
+        assert kwargs["metadata"]["dim_labels"] == ["c", "z", "y", "x"]
+        assert len(kwargs["metadata"]["dim_labels"]) == arr.ndim
+        # The physical size stays alongside, not replaced by the labels.
+        assert "ome_physical_size" in kwargs["metadata"]
+
+    def test_no_dim_labels_when_the_source_declares_none(self):
+        # Unlabeled source -> nothing to name the leading axes with; the writer
+        # keeps its positional fallback rather than being handed a guess.
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((256, 256))
+        desc = _make_tensor_desc([256, 256])
 
         add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 

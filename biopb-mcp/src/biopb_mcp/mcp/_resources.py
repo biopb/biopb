@@ -183,11 +183,13 @@ bare `np.asarray(arr)` materializes the **whole** array in the main process
 instead of on the cluster. Slice first, or `.compute()` explicitly.
 
 **3. The viewer's axes are not the source's axes.** Levels are canonicalized to
-`[..., Z, Y, X]` (plus a trailing samples axis for interleaved RGB) however the
-source is laid out. So `client.get_physical_scale()` — **source** order — pairs
-with `client.get_tensor()`, while `layer.scale` — **layer** order — pairs with
-`layer.data` and is what `regionprops(..., spacing=)` wants. Crossing them
-transposes the spacing onto the wrong axes: every number changes, no shape does.
+`...ZYX[S]` (stored in `layer.metadata['dim_labels']`), while the dask array
+from the server is in the source's own axis order (stored in
+`client.get_descriptor(array_id).dim_labels`). Similarly, the source's physical
+scale (`client.get_physical_scale()`) and the layer data's physical scale
+(`layer.scale`, what `regionprops(..., spacing=)` wants) can also be different.
+Crossing them transposes the spacing onto the wrong axes: every number changes,
+no shape does.
 
 **4. A 2-D source is 3-D in the viewer.** Canonicalization *inserts* a singleton
 Z, so `[Y, X]` loads as `[1, Y, X]` with a 3-element `layer.scale`. Read `ndim`
