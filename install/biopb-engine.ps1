@@ -1286,11 +1286,21 @@ function Invoke-BiopbInstall {
         # need. Retry without them and name what was dropped: the deployment lands,
         # and the user is told which line to fix rather than finding out at the next
         # import. A failure with no extras present is a real failure -- not retried.
+        #
+        # The retry is what *identifies* the cause, so the extras are only accused
+        # after it succeeds. A failure this install has nothing to do with them --
+        # no network, a full disk, a bad release pin -- fails the retry too, and
+        # Assert-LastExit below throws on uv's own error with no wrong diagnosis
+        # printed above it. Hence the hedge in the first warning and the verdict in
+        # the second.
         if ($script:LastUvExit -ne 0 -and $extraNames.Count -gt 0) {
-            $script:ExtrasDropped = ($extraNames -join ', ')
-            Report-Warn "Could not resolve your extra packages: $($script:ExtrasDropped)"
-            Report-Warn "Installing biopb without them - fix or remove the offending line in $extrasFile"
+            Report-Warn "Install failed; retrying without your extra packages to see whether they are the cause: $($extraNames -join ', ')"
             Invoke-UvToolInstall -InstallArgs $installArgs -OutLog $uvOutLog -ErrLog $uvErrLog
+            if ($script:LastUvExit -eq 0) {
+                $script:ExtrasDropped = ($extraNames -join ', ')
+                Report-Warn "Could not resolve your extra packages: $($script:ExtrasDropped)"
+                Report-Warn "  fix or remove the offending line in $extrasFile"
+            }
         }
         # Start-Process leaves $LASTEXITCODE untouched, so set it from the recorded
         # exit code for the shared Assert-LastExit gate.

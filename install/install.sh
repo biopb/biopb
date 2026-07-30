@@ -1356,12 +1356,20 @@ install_biopb() {
         # whole upgrade over a package the deployment does not need. Retry without
         # them and name what was dropped: the deployment lands, and the user is told
         # which line to fix rather than finding out at the next import.
+        #
+        # The retry is what *identifies* the cause, so the extras are only accused
+        # after it succeeds. A failure this install has nothing to do with them --
+        # no network, a full disk, a bad release pin -- fails the retry too, and
+        # `set -e` ends the run on uv's own error with no wrong diagnosis printed
+        # above it. Hence the hedge in the first warning and the verdict in the
+        # second.
         if ! uv tool install "${install_args[@]}" "${with_extras[@]}"; then
+            _warn "Install failed; retrying without your extra packages to see whether"
+            _warn "  they are the cause: ${EXTRA_PACKAGES[*]}"
+            uv tool install "${install_args[@]}"
             EXTRAS_DROPPED="${EXTRA_PACKAGES[*]}"
             _warn "Could not resolve your extra packages: $EXTRAS_DROPPED"
-            _warn "Installing biopb without them — fix or remove the offending line in"
-            _warn "  $EXTRA_PACKAGES_FILE"
-            uv tool install "${install_args[@]}"
+            _warn "  fix or remove the offending line in $EXTRA_PACKAGES_FILE"
         fi
     else
         uv tool install "${install_args[@]}"
