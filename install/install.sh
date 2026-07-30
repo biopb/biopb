@@ -1919,5 +1919,14 @@ main() {
     fi
 }
 
-# Only run if the script was fully downloaded (every function defined completely).
-main "$@"
+# Only run if the script was fully downloaded (every function defined completely):
+# a `curl | bash` cut off mid-transfer never reaches this line, so a half-written
+# installer defines some functions and then does nothing, rather than running with
+# the rest of itself missing. That property is why the call has to stay LAST --
+# keep it there.
+#
+# BIOPB_INSTALL_LIB=1 suppresses it so the test suite can source this file for its
+# helpers alone (install/test/test_install_sh.py). Deliberately checked with
+# `[ -n ... ]` rather than a value comparison: any non-empty value means "library",
+# and an unset variable -- the only state a real install is ever in -- installs.
+[ -n "${BIOPB_INSTALL_LIB:-}" ] || main "$@"
