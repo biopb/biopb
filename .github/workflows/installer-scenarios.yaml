@@ -22,6 +22,15 @@ name: Installer Scenarios
 # problem with the file. In the meantime `install/test/run.sh --assert all`
 # does the same thing on any machine with Docker.
 on:
+  # ==== TEMPORARY -- REVERT BEFORE MERGE ====================================
+  # A pull_request trigger runs the workflow file from the PR's merge ref, and
+  # carries no default-branch restriction -- so it is the only way to prove this
+  # layer actually works before it lands. Here to get one real container run on
+  # the PR that introduces it; the matrix below is pinned to `clean` for the
+  # same reason. Both come straight back out once it has run.
+  pull_request:
+    branches: [dev]
+  # ==========================================================================
   workflow_dispatch:
     inputs:
       scenario:
@@ -51,7 +60,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: ${{ fromJSON(inputs.scenario == 'all' && '["clean","uv-preinstalled","old-python","rerun","bioformats"]' || format('["{0}"]', inputs.scenario)) }}
+        # TEMPORARY -- REVERT BEFORE MERGE. The real line is below; `inputs` does
+        # not exist on a pull_request event, so it is pinned for the proof run.
+        scenario: ["clean"]
+        # scenario: ${{ fromJSON(inputs.scenario == 'all' && '["clean","uv-preinstalled","old-python","rerun","bioformats"]' || format('["{0}"]', inputs.scenario)) }}
     steps:
       - uses: actions/checkout@v4
 
