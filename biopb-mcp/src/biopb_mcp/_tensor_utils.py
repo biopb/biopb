@@ -540,8 +540,9 @@ def add_tensor_layer(
     OME physical pixel size as ``scale`` + ``metadata['ome_physical_size']`` so
     the agent's areas/volumes come out in physical units, attach the
     canonicalized axis names as ``metadata['dim_labels']`` (the only way a
-    writer, which sees just ``(path, data, meta)``, can name the axes), then
-    ``add_image`` (``multiscale=True`` when there is more than one level).
+    writer, which sees just ``(path, data, meta)``, can name the axes) and the
+    originating ``metadata['array_id']``, then ``add_image``
+    (``multiscale=True`` when there is more than one level).
 
     Source resolution, layer *name*, and any cursor/logging/error handling stay
     with the caller; everything from building levels through ``add_image`` is
@@ -594,7 +595,11 @@ def add_tensor_layer(
     )
     if scale is not None:
         add_kwargs["scale"] = scale
-    metadata = {}
+    # Where this layer came from. Nothing else on the layer records it -- the
+    # name is a display stem that the user can rename -- so without this a layer
+    # cannot be traced back to its tensor, and re-reading the full-resolution
+    # source-order array means guessing at the catalog.
+    metadata = {"array_id": tensor_id}
     if phys is not None:
         metadata["ome_physical_size"] = phys
     # Name the layer's axes for the OME-Zarr writer (biopb/biopb#651): it is
@@ -604,8 +609,7 @@ def add_tensor_layer(
     labels = canonical_dim_labels(tensor_desc, source_desc=source_desc)
     if labels:
         metadata["dim_labels"] = labels
-    if metadata:
-        add_kwargs["metadata"] = metadata
+    add_kwargs["metadata"] = metadata
 
     with _origin_initial_view(viewer):
         if len(levels) > 1:

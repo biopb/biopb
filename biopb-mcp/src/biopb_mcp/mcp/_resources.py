@@ -164,6 +164,12 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
 the first. The traps follow from that.
 
+The conversion is traceable in one direction: a layer it loaded records its
+origin as `layer.metadata['array_id']` — the same id `client.get_tensor()` takes,
+so you can always go back to the full-resolution source-order array (the layer
+*name* cannot be used for this; it is a display stem the user may rename). A
+layer the agent built with `add_image`/`add_labels` has no such entry.
+
 ## The traps
 
 **1. `layer.data` is a list when `layer.multiscale`** — `[full_res, half,

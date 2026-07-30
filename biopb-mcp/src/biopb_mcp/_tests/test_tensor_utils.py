@@ -633,7 +633,10 @@ class TestAddTensorLayer:
         add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
         _, kwargs = viewer.add_image.call_args
-        assert kwargs == {"name": "lyr", "metadata": {"dim_labels": ["z", "y", "x"]}}
+        assert kwargs == {
+            "name": "lyr",
+            "metadata": {"array_id": "t1", "dim_labels": ["z", "y", "x"]},
+        }
 
     def test_attaches_canonical_dim_labels(self):
         # The layer is the only place the OME-Zarr writer can learn its axis
@@ -664,7 +667,23 @@ class TestAddTensorLayer:
         add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
         _, kwargs = viewer.add_image.call_args
-        assert kwargs == {"name": "lyr"}
+        assert kwargs == {"name": "lyr", "metadata": {"array_id": "t1"}}
+
+    def test_records_the_originating_array_id(self):
+        # The layer's only record of where it came from: the name is a display
+        # stem the user can rename, so provenance has to live in metadata.
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((256, 256))
+        desc = _make_tensor_desc([256, 256], ["y", "x"])
+
+        add_tensor_layer(
+            viewer, client, "multi", "multi/Image:0", desc, name="lyr", config=_CFG
+        )
+
+        _, kwargs = viewer.add_image.call_args
+        # The qualified array_id client.get_tensor takes, not the routing prefix.
+        assert kwargs["metadata"]["array_id"] == "multi/Image:0"
 
     def test_misordered_axes_canonicalized_with_aligned_scale(self):
         viewer = MagicMock()
