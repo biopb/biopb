@@ -312,6 +312,50 @@ function Assert-LastExit {
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
 }
 
+# Read <ConfigDir>\extra-packages.txt into the requirement list to replay into the
+# shared environment. Returns the requirements in file order; nothing at all when
+# the file (or the directory) is absent, which is every machine until the user
+# creates it. The file is the user's -- the installer only ever reads it.
+#
+# Why it exists: `uv tool install --force` rebuilds the env from the arguments it
+# is given, so a package the user added by hand -- into the very interpreter the
+# napari kernel runs, where an optional dependency like basicpy has to live -- is
+# dropped at the next upgrade and surfaces later as an import that used to work.
+# Replaying this list makes those packages part of the requirement set.
+#
+# One PEP 508 requirement per line; blank lines and `#` comments ignored. A `#` is
+# a comment only at line start or after whitespace -- pip's requirements.txt rule,
+# and the reason it has that rule: a PEP 508 direct reference carries load-bearing
+# data in the URL fragment ("git+https://host/r@main#subdirectory=sub",
+# "...whl#sha256=..."), so stripping from the first `#` anywhere truncates the
+# requirement into one that still resolves -- to the repo root instead of the
+# subdirectory, with no hash checked and nothing to warn about.
+#
+# This is a function rather than a dozen lines inside Invoke-BiopbInstall so it
+# can be called by a test: it is the PowerShell half of a rule implemented twice
+# (install.sh::_read_extra_packages is the other), and the two are held to one
+# shared table of cases -- install/test/extras-contract.json, via
+# test_extras_contract.py -- precisely because they once drifted into the same
+# bug independently (biopb/biopb#648, #653).
+function Read-ExtraPackages {
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$ConfigDir)
+
+    $extrasFile = Join-Path $ConfigDir "extra-packages.txt"
+    if (-not (Test-Path -LiteralPath $extrasFile)) { return @() }
+
+    $reqs = @()
+    # An empty file makes Get-Content return $null, over which foreach iterates
+    # zero times -- so no guard is needed for it.
+    foreach ($line in (Get-Content -LiteralPath $extrasFile -Encoding UTF8)) {
+        $req = ($line -replace '^\s*#.*$', '' -replace '\s#.*$', '').Trim()
+        if ($req) { $reqs += $req }
+    }
+    # Returned unrolled (no leading comma), so callers wrap with @() and get an
+    # array for 0, 1 or many alike.
+    return $reqs
+}
+
 # Run one `uv tool install`, with a heartbeat while it works and uv's own output
 # replayed afterwards. Records uv's exit code in $script:LastUvExit and does NOT
 # throw on failure: the caller decides, because one failure mode (a user's extra
@@ -1247,29 +1291,13 @@ function Invoke-BiopbInstall {
     )
 
     # User-added packages for this shared environment, replayed as part of the
-    # requirement set. `uv tool install --force` rebuilds the env from these args
-    # on every upgrade, so a package the user added by hand -- into the very
-    # interpreter the napari kernel runs, where an optional dependency like basicpy
-    # has to live -- is dropped at the next upgrade, surfacing later as an import
-    # that used to work. One PEP 508 requirement per line; blank lines and `#`
-    # comments ignored. The file is the user's; the installer only ever reads it.
-    #
-    # A `#` is a comment only at line start or after whitespace -- pip's
-    # requirements.txt rule, and the reason it has that rule: a PEP 508 direct
-    # reference carries load-bearing data in the URL fragment
-    # ("git+https://host/r@main#subdirectory=sub", "...whl#sha256=..."), so
-    # stripping from the first `#` anywhere truncates the requirement into one that
-    # still resolves -- to the repo root instead of the subdirectory, with no hash
-    # checked and nothing to warn about.
-    $extraArgs = @()
-    $extraNames = @()
+    # requirement set (see Read-ExtraPackages for what the file means and why).
+    # @() so a one-line file arrives as a 1-element array rather than a bare
+    # string: .Count and foreach then mean the same thing for 0, 1 and many.
     $extrasFile = Join-Path $ConfigDir "extra-packages.txt"
-    if (Test-Path -LiteralPath $extrasFile) {
-        foreach ($line in (Get-Content -LiteralPath $extrasFile -Encoding UTF8)) {
-            $req = ($line -replace '^\s*#.*$', '' -replace '\s#.*$', '').Trim()
-            if ($req) { $extraArgs += @("--with", $req); $extraNames += $req }
-        }
-    }
+    $extraNames = @(Read-ExtraPackages -ConfigDir $ConfigDir)
+    $extraArgs = @()
+    foreach ($req in $extraNames) { $extraArgs += @("--with", $req) }
     if ($extraNames.Count -gt 0) {
         Report-Info "including your extra packages: $($extraNames -join ', ')"
     }
