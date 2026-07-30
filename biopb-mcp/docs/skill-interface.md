@@ -19,35 +19,34 @@ local skills directory (§3f) are live in `biopb-mcp` (`mcp/_skills.py`,
 
 ## Goal
 
-Give the agent a library of **curated, reusable workflows ("skills")** — e.g.
-"segment cells with Cellpose", "build a multiscale pyramid and load it", "measure
-labels and export a table". Each skill is a markdown file with YAML frontmatter,
-authored and reviewed through a **git workflow** in `biopb-site`, published on
-`https://biopb.org/`, and consumed at runtime by the `biopb-mcp` server through:
+Give the agent a library of **curated, reusable workflows ("skills")**. Each
+skill is a markdown file with YAML frontmatter, authored and reviewed through a
+**git workflow** in `biopb-site`, published on `https://biopb.org/`, and
+consumed at runtime by the `biopb-mcp` server through:
 
 1. a **discovery tool** (`find_skills`) that queries a catalog, and
 2. a **dynamic resource list** (`skill://<id>`) that returns the full workflow body.
 
+MCP server degrades gracefully with a cached copy when offline.
+
 This realizes the loop the server already gestures at in its instructions —
 *"after a task, ask whether a new skill should be generated and added to the
-agent's toolbox"* — where the toolbox is the curated catalog and "adding" is a PR.
-
-Two repos, **one contract**: the published `catalog.json`. The site owns
-*authoring + publishing*; the MCP server owns *discovery + retrieval* and degrades
-gracefully when offline.
+agent's toolbox"*. The user can already install and re-use the generated skills, but
+now they also have the option of merge the skill into the curated catalog and
+"adding" is a PR.
 
 ```
    biopb-site repo (curation = git)          biopb-mcp server (runtime)
-   ┌───────────────────────────┐             ┌────────────────────────────┐
-   │ skills/<id>.md (frontmtr)  │   CI build  │  find_skills(query) TOOL   │
+   ┌────────────────────────────┐             ┌─────────────────────────────┐
+   │ skills/<id>.md (frontmtr)  │   CI build  │  find_skills(query) TOOL    │
    │ scripts/build_catalog.py   │──generates─▶│    → queries catalog       │
-   │ skills/catalog.json (gen)  │   + rsync   │                            │
-   │ docs/skills.md (browser)   │             │  skill://<id> RESOURCES    │
-   └───────────────────────────┘             │    → lazy-fetch .md body    │
+   │ skills/catalog.json (gen)  │   + rsync   │                             │
+   │ docs/skills.md (browser)   │             │  skill://<id> RESOURCES     │
+   └────────────────────────────┘             │    → lazy-fetch .md body    │
             │ served at                       │  (dynamic list from catalog)│
-            ▼                                  └──────────┬─────────────────┘
+            ▼                                 └───────────┬─────────────────┘
    https://biopb.org/skills/catalog.json  ◀── httpx GET ──┘  fail-open:
-   https://biopb.org/skills/<id>.md       ◀── httpx GET ──┘  cache → bundled
+   https://biopb.org/skills/<id>.md       ◀── httpx GET ──┘  cache → Local bundled
 ```
 
 ---
@@ -99,40 +98,13 @@ and fetches `url`, verifying `sha256`.
 ### The skill file
 
 `skills/<id>.md` is a Claude-style skill: frontmatter + a markdown body written to
-drop into the agent's context.
-
-```markdown
----
-id: cell-segmentation-cellpose
-title: Segment cells with Cellpose
-description: Run Cellpose over the active image layer and load the labels.
-tags: [segmentation, cellpose, ops]
-version: 1.2.0
-requires: [viewer, "ops:segmentation"]
----
-
-# Segment cells with Cellpose
-
-**When to use.** The user has a 2D/3D fluorescence image loaded and wants
-instance labels for cells/nuclei.
-
-## Steps
-1. Confirm the active image layer and channel with the user.
-2. Call the `segmentation` op via `ops` (see `guide://ops`)…
-3. Load the returned labels with `viewer.add_labels(...)` for validation.
-
-## Guardrails
-- Prefer lazy dask; `.compute()` only the final result.
-- Put intermediate results on `viewer` at each step.
-```
-
-The `url`, `sha256`, `updated`, and `spec_version` fields in the catalog are
-**generated** — authors do not write them (see field policy in
-[§5.1](#51-frontmatter-tolerant-read-canonical-emit)).
+drop into the agent's context. The `url`, `sha256`, `updated`, and `spec_version`
+fields in the catalog are **generated** — authors do not write them (see field policy
+in [§5.1](#51-frontmatter-tolerant-read-canonical-emit)).
 
 ---
 
-## 2. biopb-site changes (authoring + publishing)
+## 2. biopb-site (authoring + publishing)
 
 New layout (skills live at repo root so the existing landing-page rsync serves
 them from `/var/www/biopb.org/skills/` — no new hosting):
@@ -193,16 +165,11 @@ def find_skills(query: str = "") -> list[dict]:
 
 ### 3g. `requires:` — resolved in the kernel, by the agent
 
-`requires:` shipped as inert metadata: emitted by `find_skills`, checked by nobody.
-A skill naming a kernel plugin the install doesn't have therefore read as
-*available* and dead-ended partway through its own steps. Worse, each skill body
-compensated with its own prose check — a `dir()` dance in one, a `find_spec` in
-another — N hand-written variants of one question, drifting apart and eating body
-budget that should go to the workflow.
-
-**`mcp/_requires.py` answers it once, as `check_skill_requirements()` in the agent's
-namespace.** The agent calls it after `start_kernel`, before starting the skill;
-`guide://kernel` documents it and the `find_skills` docstring points at it.
+Runtime requirements for each skill are specified in the `requires:` field as inert
+metadata, emitted by `find_skills`. The agent performs the check within the kernel by
+calling `check_skill_requirements()`, which is inserted into the kernel namespace during
+bootstrap (`mcp/_requires.py`). `guide://kernel` documents it and the `find_skills`
+docstring also points at it.
 
 ```python
 check_skill_requirements(["viewer", "plugin:segmentation_qc", "pkg:basicpy>=1.2"])
@@ -317,10 +284,6 @@ machinery):
 it is the switch for the *whole* subsystem: false means no fetch, no local scan,
 an empty `find_skills`, and no skills directive in the handshake.
 
-`skills_local_dir` is the **personal tier** (§3f). It is deliberately governed by
-the same switch: a user who turns skills off is turning the feature off, not just
-the network half.
-
 ### 3f. Local (user-authored) skills
 
 `~/.config/biopb/skills/*.md` (`biopb._locations.mcp_skill_dir()`) are merged
@@ -417,8 +380,6 @@ prose. Do not over-constrain it. But the build:
   branch on the dialect.
 
 ### 5.3 Versioning the contract
-
-Two independent knobs:
 
 - **`catalog_version`** — schema of `catalog.json`. The server guards on it and
   fails open (keeps last-good/bundled) on an unknown value.
