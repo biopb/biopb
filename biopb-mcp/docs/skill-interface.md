@@ -303,7 +303,7 @@ it already calls before heavy work) and, for a `pkg:` token, tries the import.
 | `dask` | `## Dask`. `da` is always bound, so this never fails; the scheduler behind it (distributed vs. in-process threads) is a *performance* property, and reporting it is more useful than a met/unmet verdict on it |
 | `ops:<kind>` | `## Ops` — and what the servers *do* offer falls out of the same line |
 | `plugin:<name>` | `## Kernel plugins` — the file stem (`plugin:rolling_ball` ↔ `rolling_ball.py`) or an entry-point name, reported apart |
-| `pkg:<name>[>=v]` | `import <name>` in `execute_code` — a real ImportError or a real `__version__`, with none of the dev-build/`skimage`-vs-`scikit-image` guesswork a version comparator has to hard-code |
+| `pkg:<name>[>=v]` | `## Versions` for `pkg:biopb-mcp` (the token authors actually reach for — see below — so the report carries it), otherwise `import <name>` in `execute_code`: a real ImportError or a real `__version__`, with none of the dev-build/`skimage`-vs-`scikit-image` guesswork a version comparator has to hard-code |
 
 **Why the kernel plugin line has to be reported, not derived.** Every other token
 is legible from handles the agent already holds; this one is not, and the
@@ -328,7 +328,10 @@ job is to name the gap and ask, not to decide.
 
 The consequence for authoring: `pkg:biopb-mcp>=X` makes a skill safe to publish
 *ahead of* the release that carries the plugin it needs — an older install is told
-so up front instead of failing halfway through.
+so up front instead of failing halfway through. That makes it the one `pkg:` token
+common enough to report rather than import, and `## Versions` reports it from the
+**kernel's** interpreter, which is the one that will run the skill and need not be
+the server process's env.
 
 ---
 

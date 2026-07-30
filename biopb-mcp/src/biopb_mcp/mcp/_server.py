@@ -252,6 +252,20 @@ else:
 """
 
 _STATUS_SNIPPET = """
+# This kernel's interpreter -- the one a skill's `pkg:` requirement is about, and
+# not necessarily the server process's env (the kernelspec need not be it). The
+# common such token is `pkg:biopb-mcp>=X`, how a skill says it needs a release
+# that carries some plugin, so report that one instead of making the agent import.
+print("## Versions")
+try:
+    import biopb_mcp as _bm
+    print("  biopb-mcp: " + str(getattr(_bm, "__version__", "unknown")))
+except Exception as _e:
+    print("  biopb-mcp: unknown (" + str(_e) + ")")
+import sys as _sys
+print("  python: " + _sys.version.split()[0])
+
+print("")
 print("## Dask")
 try:
     import dask as _dask
@@ -542,7 +556,8 @@ def find_skills(query: str = "") -> list:
 
     A result's `requires` lists what the skill needs (`viewer`, `tensor`, `dask`,
     `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
-    skill: `server_status` reports all but `pkg:` (just import that one). A gap is
+    skill: `server_status` answers all of them but a third-party `pkg:` (it does
+    carry biopb-mcp's own version) — import anything else it doesn't. A gap is
     the user's call — installing, seeding a plugin, restarting the kernel all need
     their consent — but naming it up front beats failing halfway through.
 
@@ -813,9 +828,10 @@ def server_status() -> str:
     """Report server health, system load, and resource usage.
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
-    queried from the kernel — dask scheduler info, tensor server connectivity,
-    viewer layer count, the available `ops`, and which kernel plugins loaded.
-    Use before heavy computation, and to resolve a skill's `requires:` list.
+    queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
+    tensor server connectivity, viewer layer count, the available `ops`, and which
+    kernel plugins loaded. Use before heavy computation, and to resolve a skill's
+    `requires:` list.
     """
     import psutil
 

@@ -667,6 +667,11 @@ class TestServerStatus:
         assert "## Kernel plugins" in report
         assert "files: rolling_ball" in report
         assert "packages: labshop_tools" in report
+        # `pkg:biopb-mcp>=X` (a skill needing a release-carried plugin) is
+        # answered here, from the kernel's own interpreter, not by an import.
+        import biopb_mcp
+
+        assert "biopb-mcp: " + biopb_mcp.__version__ in report
 
     def test_kernel_snippet_names_the_config_key_when_no_ops(self):
         import contextlib
