@@ -282,8 +282,10 @@ layer = viewer.layers["image_name"]
 # Remove layer (auto-marshaled — call directly)
 viewer.layers.remove(viewer.layers["name"])
 
-# Load data to viewer; auto-handles pyramid. Accepts any valid source_id.
-layer_name = viewer.add_tensor(source_id="source_id", tensor_id=None, name=None)
+# Load a source as a layer; auto-handles the pyramid. Returns the layer name.
+# tensor_id is only needed for a multi-tensor source; name defaults from the URL.
+layer_name = viewer.add_tensor("source_id")
+layer_name = viewer.add_tensor("source_id", tensor_id="t1", name="my_layer")
 
 # Layer properties (auto-marshaled — set directly; each runs on the main thread)
 layer = viewer.layers["name"]
