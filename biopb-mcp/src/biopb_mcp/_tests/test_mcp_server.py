@@ -863,3 +863,46 @@ class TestRun:
         # http binds loopback on the requested port.
         assert _server.mcp.settings.host == "127.0.0.1"
         assert _server.mcp.settings.port == 9999
+
+
+# -----------------------------------------------------------------------
+# guide://data
+# -----------------------------------------------------------------------
+
+
+class TestDataGuide:
+    """The data-representation guide, and the places that must point at it.
+
+    Layer data here is a pyramid of proxies in display axis order, none of which
+    a napari-shaped habit expects -- so the guide has to be discoverable from the
+    handshake and from every guide whose examples touch pixels.
+    """
+
+    def test_registered_and_advertised_in_the_handshake(self):
+        import asyncio
+
+        uris = {str(r.uri) for r in asyncio.run(_server.mcp.list_resources())}
+        assert "guide://data" in uris
+        # Pull-only resources are read on demand, so the instructions are the
+        # only place the agent learns this one exists.
+        assert "guide://data" in _server._BASE_INSTRUCTIONS
+
+    def test_names_all_three_sources_of_array_data(self):
+        guide = _server._resources.DATA
+        assert "client.get_tensor" in guide  # the server
+        assert "layer.data" in guide  # the viewer
+        assert "multiscale" in guide  # ...which may be a list of levels
+
+    def test_pairs_each_scale_with_the_array_it_belongs_to(self):
+        # Crossing these transposes the spacing onto the wrong axes, which
+        # changes every measurement without changing any shape.
+        guide = _server._resources.DATA
+        assert "get_physical_scale" in guide
+        assert "layer.scale" in guide
+
+    def test_viewer_guide_reads_layer_data_the_safe_way(self):
+        # The layer-listing example is the snippet most likely to be copied;
+        # a bare `layer.data.shape` breaks on every multiscale layer.
+        viewer_guide = _server._resources.VIEWER
+        assert "layer.data.shape" not in viewer_guide
+        assert "layer.multiscale" in viewer_guide

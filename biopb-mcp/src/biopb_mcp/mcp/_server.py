@@ -52,7 +52,9 @@ _BASE_INSTRUCTIONS = (
     "This biopb-mcp session drives a live napari viewer through a child IPython "
     "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
     "for detail before non-trivial work: guide://kernel (namespace, examples, "
-    "long-running jobs & cancellation), guide://tensor (data access/upload), "
+    "long-running jobs & cancellation), guide://data (how arrays are "
+    "represented here -- pyramids, laziness, axis order -- and the traps), "
+    "guide://tensor (data access/upload), "
     "guide://viewer (layers/camera/dims), guide://annotations "
     "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
     "\n"
@@ -505,6 +507,12 @@ def get_kernel_guide() -> str:
     return _resources.GUIDE
 
 
+@mcp.resource("guide://data")
+def get_data_guide() -> str:
+    """How array data is represented here: the three sources, and their traps."""
+    return _resources.DATA
+
+
 @mcp.resource("guide://viewer")
 def get_viewer_guide() -> str:
     """Viewer operations: layers, camera, dims, display."""
@@ -653,6 +661,11 @@ def execute_code(python_code: str) -> str:
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
       (auto-handles the multiscale pyramid). client.get_tensor(array_id)
       returns a lazy dask array without adding a layer.
+    - reading pixels back off a layer is not plain napari: layer.data is a
+      *list* of pyramid levels when layer.multiscale, in display axis order
+      ([..., Z, Y, X], singleton Z inserted for 2-D sources), and lazy. Use
+      `layer.data[0] if layer.multiscale else layer.data`, and read
+      guide://data before measuring or computing from a layer.
     """
     host = _kernel_host
     if host is None:
