@@ -23,6 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends imagemagick \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY ../install.sh /install.sh
+# The build context is install/ (run.sh passes $SCRIPT_DIR/..), so this path is
+# relative to THAT, not to this file. `../install.sh` only ever worked on the
+# legacy builder, which silently clamped it back into the context; BuildKit --
+# the default everywhere now, including CI -- rejects it outright.
+COPY install.sh /install.sh
 
 CMD ["/bin/bash"]

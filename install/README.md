@@ -169,6 +169,40 @@ registry, pids), and `~/.local/share/biopb` (webapp, samples). `uv` and any AI
 agent (e.g. opencode) are left installed.
 On Windows, uninstall through Add/Remove Programs instead.
 
+## Testing the installers
+
+Three layers, cheapest first. The first two run on every PR that touches
+`install/` (`.github/workflows/install-scripts.yaml`); the third is manual.
+
+```sh
+# 1. Static -- does it load?
+bash -n install/install.sh
+shellcheck install/install.sh install/test/run.sh install/test/assert.sh
+#    plus, in CI, a PowerShell [Parser]::ParseFile over both .ps1 files and an
+#    ISCC compile of the Inno wizard.
+
+# 2. Unit -- do its parsers return the right answer?
+pytest install/test          # needs bash; pwsh optional, and used when present
+
+# 3. End-to-end -- does the whole thing work?
+install/test/run.sh --assert clean     # one scenario, in Docker; minutes
+install/test/run.sh --assert all       # all five
+install/test/run.sh clean              # or drop into a shell and drive it by hand
+```
+
+The unit layer drives the installers by subprocess: `install.sh` sourced under
+`BIOPB_INSTALL_LIB=1` (which suppresses its trailing `main "$@"`), and
+`biopb-engine.ps1` dot-sourced. Both extras parsers — one per language,
+implemented independently — are held to the single table in
+`install/test/extras-contract.json`, so they cannot drift apart. **Add a case
+there, not to one language's tests.**
+
+The end-to-end layer is the only one that installs for real, and the only one
+that can check what `uv tool install --force` does to a package the user added by
+hand. It is also available as the `Installer Scenarios` workflow on
+`workflow_dispatch`. See `install/test/assert.sh` for the checks and
+biopb/biopb#653 for the reasoning.
+
 ## Notes
 
 - Release assets are read from the `biopb/biopb` GitHub Releases API; the latest
