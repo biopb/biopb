@@ -1,0 +1,56 @@
+name: Installer Scenarios
+
+# Manual / pre-release only -- deliberately NOT triggered on push or
+# pull_request. It actually installs biopb, twice over, inside each of the
+# scenario containers under install/test/ and asserts the post-conditions:
+# the shims exist, the config is written, and -- the one that cannot be checked
+# any cheaper -- a package from the user's extra-packages.txt is still in the
+# environment after `uv tool install --force` has rebuilt it. See
+# install/test/assert.sh for the full list and biopb/biopb#653 for why.
+#
+# Every scenario is a real install: network, a Python download, a wheel set, and
+# for bioformats a JVM. Minutes each, which is why this is dispatch and the
+# per-PR gates in install-scripts.yaml stay static. Run it before cutting a
+# release, or when a change to install.sh touches more than one function.
+#
+# Same posture as installer-wheel-coverage.yaml -- the other installer check
+# that is too slow to fire on every PR.
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Scenario to assert'
+        default: all
+        type: choice
+        options:
+          - all
+          - clean
+          - uv-preinstalled
+          - old-python
+          - rerun
+          - bioformats
+
+permissions:
+  contents: read
+
+jobs:
+  assert:
+    # One job per scenario rather than one job running run.sh with `all`: a
+    # failure then names itself in the checks list, and five real installs run in
+    # parallel instead of end to end. The fromJSON dance is how a dispatch input
+    # becomes a matrix -- "all" expands to the list, anything else to itself.
+    name: ${{ matrix.scenario }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'all' && '["clean","uv-preinstalled","old-python","rerun","bioformats"]' || format('["{0}"]', inputs.scenario)) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker is preinstalled on ubuntu-latest, so there is nothing to set up:
+      # run.sh builds the image and runs assert.sh in it, exiting nonzero on the
+      # first failed post-condition.
+      - name: Assert ${{ matrix.scenario }}
+        run: install/test/run.sh --assert ${{ matrix.scenario }}
