@@ -51,7 +51,9 @@ def plugin_status_lines() -> list[str]:
     Formatted here rather than in the status snippet so it is unit-testable
     without a kernel. A skill's ``plugin:<name>`` matches a name on either line;
     they are printed apart so the "not listed → it failed to load" reading is
-    only offered where it holds.
+    only offered where it holds. Both lines print unconditionally, so a name
+    absent from the report is absent because it did not load -- not because the
+    line it would have been on was left out.
     """
     if not _PLUGINS_ENABLED:
         return ["  (disabled — services.namespace_enabled)"]
@@ -69,4 +71,9 @@ def plugin_status_lines() -> list[str]:
     )
     if _LOADED_ENTRY_POINTS:
         lines.append("  packages: " + ", ".join(sorted(_LOADED_ENTRY_POINTS)))
+    else:
+        lines.append(
+            "  packages: (none — no installed package declares a "
+            "`biopb_mcp.namespace` entry point)"
+        )
     return lines

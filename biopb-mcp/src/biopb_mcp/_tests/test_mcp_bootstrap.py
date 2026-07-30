@@ -275,7 +275,18 @@ class TestPluginRecordReachesServerStatus:
 
         report = "\n".join(_requires.plugin_status_lines())
         assert "biopb-mcp-seed-plugins" in report
-        assert "packages:" not in report  # nothing to say, so nothing said
+
+    def test_both_lines_print_even_when_empty(self):
+        from biopb_mcp.mcp import _requires
+
+        # An omitted line would make "my plugin isn't listed" ambiguous: absent
+        # because it didn't load, or because that half of the report was skipped?
+        # The agent resolving `plugin:<name>` has to be able to tell.
+        _requires.record_loaded_plugins(["rolling_ball"])
+        report = "\n".join(_requires.plugin_status_lines())
+        assert "files: rolling_ball" in report
+        assert "packages: (none" in report
+        assert "biopb_mcp.namespace" in report  # what a "package" plugin even is
 
 
 class TestPublicNamesAndMerge:
