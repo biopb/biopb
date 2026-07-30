@@ -284,6 +284,7 @@ _RESERVED_NAMES = frozenset(
         "da",
         "ops",
         "run_on_main",
+        "check_skill_requirements",
         "_conn",
         "_jobs",
         "_dask_client",
@@ -329,7 +330,7 @@ def _merge_names(ip, names: dict, *, source: str) -> None:
         ns[key] = value
 
 
-def _load_startup_files(ip, plugin_dir) -> None:
+def _load_startup_files(ip, plugin_dir) -> list[str]:
     """Exec each ``*.py`` in *plugin_dir* directly in the kernel namespace.
 
     IPython ``startup/`` semantics: a file's top-level defs land beside ``viewer``/
@@ -338,13 +339,17 @@ def _load_startup_files(ip, plugin_dir) -> None:
     namespace), so ``client`` refreshed per-job is seen. Fail-open per file. Any
     load-bearing name the file overwrites is restored (warned); the two
     attach-thread-owned names are left untouched to avoid racing that thread.
+
+    Returns the stems that loaded, for ``_requires.record_loaded_plugins`` -- the
+    file being on disk is not the same fact, precisely because this is fail-open.
     """
     try:
         paths = sorted(plugin_dir.glob("*.py"))
     except OSError:
-        return
+        return []
     ns = ip.user_ns
     protect = _RESERVED_NAMES - _ATTACH_OWNED
+    loaded = []
     for path in paths:
         if path.name.startswith("_"):
             continue
@@ -353,6 +358,7 @@ def _load_startup_files(ip, plugin_dir) -> None:
             code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
             exec(code, ns)  # noqa: S102 - user plugin; this kernel is RCE by design
             logger.info("Loaded kernel plugin file: %s", path.name)
+            loaded.append(path.stem)
         except Exception:
             logger.exception("kernel plugin file %s failed to load", path.name)
         finally:
@@ -364,31 +370,35 @@ def _load_startup_files(ip, plugin_dir) -> None:
                         key,
                     )
                     ns[key] = value
+    return loaded
 
 
-def _load_entry_point_plugins(ip) -> None:
+def _load_entry_point_plugins(ip) -> list[str]:
     """Load ``biopb_mcp.namespace`` entry-point packages into the namespace.
 
     An entry point resolving to a ``register(namespace)`` callable is called with a
     read-through snapshot of the live namespace (it can inspect the handles and add
     names); one resolving to a module or mapping has its public names merged. All
     merges pass the reserved-name guard; fail-open per entry point.
+
+    Returns the entry-point names that loaded (see :func:`_load_startup_files`).
     """
     from biopb._kernel_plugins import NAMESPACE_ENTRY_POINT_GROUP
 
     try:
         from importlib.metadata import entry_points
     except ImportError:  # pragma: no cover - stdlib since 3.8
-        return
+        return []
     try:
         eps = list(entry_points(group=NAMESPACE_ENTRY_POINT_GROUP))
     except Exception:
         logger.debug("kernel plugin: entry-point discovery failed", exc_info=True)
-        return
+        return []
 
     import types
     from collections.abc import Mapping
 
+    loaded = []
     for ep in eps:
         try:
             obj = ep.load()
@@ -423,8 +433,10 @@ def _load_entry_point_plugins(ip) -> None:
                 )
                 continue
             logger.info("Loaded kernel plugin entry point: %s", ep.name)
+            loaded.append(ep.name)
         except Exception:
             logger.exception("kernel plugin entry point %r failed to load", ep.name)
+    return loaded
 
 
 def _load_namespace_plugins(ip, config) -> None:
@@ -435,22 +447,30 @@ def _load_namespace_plugins(ip, config) -> None:
     ``~/.config/biopb/kernel/`` and installed ``biopb_mcp.namespace`` entry points.
     Called after the built-in handles exist (step 7) so plugins can reference them.
     Gated by ``services.namespace_enabled``.
+
+    What loaded is reported to :mod:`._requires`, so ``check_skill_requirements``
+    can answer ``plugin:<name>`` from the load's actual outcome instead of from the
+    presence of a file this fail-open loader may have skipped.
     """
     from .._config import get_setting
+    from . import _requires
 
     if not get_setting(config, "services.namespace_enabled", True):
         logger.info("kernel plugins disabled (services.namespace_enabled=false)")
+        _requires.record_loaded_plugins([], enabled=False)
         return
     from biopb._locations import mcp_plugin_dir
 
+    loaded = []
     try:
-        _load_startup_files(ip, mcp_plugin_dir())
+        loaded += _load_startup_files(ip, mcp_plugin_dir())
     except Exception:
         logger.exception("kernel plugin: startup-file load failed")
     try:
-        _load_entry_point_plugins(ip)
+        loaded += _load_entry_point_plugins(ip)
     except Exception:
         logger.exception("kernel plugin: entry-point load failed")
+    _requires.record_loaded_plugins(loaded)
 
 
 # Sentinel for "key absent" in the entry-point snapshot diff (a plugin may bind a
@@ -700,6 +720,7 @@ def _bootstrap_impl():
     #    attach can finish before this runs).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
+    from . import _requires
     from ._helpers import resync_view_for_capture, viewer_window_alive
 
     ip.user_ns.update(
@@ -712,6 +733,9 @@ def _bootstrap_impl():
             "_conn": conn,
             "_jobs": _jobs,
             "run_on_main": _jobs.run_on_main,
+            # Bound to this namespace dict, so it resolves a skill's requires:
+            # against the handles as they are at *call* time (see _requires).
+            "check_skill_requirements": _requires.make_checker(ip.user_ns),
             "_viewer_window_alive": lambda: viewer_window_alive(viewer),
             "_resync_view": lambda: resync_view_for_capture(viewer),
         }

@@ -6,7 +6,8 @@ enforces the required body sections and carries the catalog's scope and authorin
 rules in `skills/ROADMAP.md`; **P2 (MCP retrieval) shipped** — the `find_skills`
 tool, the `skill://{skill_id}` resource, the `services.skills_*` config, and the
 local skills directory (§3f) are live in `biopb-mcp` (`mcp/_skills.py`,
-`mcp/_server.py`). P1 and P3–P4 not started.
+`mcp/_server.py`), as is `requires:` resolution in the kernel (§3g,
+`mcp/_requires.py`). P1 and P3–P4 not started.
 **Component:** `biopb-mcp` (discovery + retrieval), `biopb-site` (authoring + publishing)
 **Related:** the MCP `guide://*` resources and `find_skills`-style discovery, the
 `mcp.services` config block, the fail-open remote fetch in
@@ -81,7 +82,7 @@ are fetched lazily and separately, keeping the catalog small and discovery cheap
       "tags": ["segmentation", "cellpose", "ops"],
       "version": "1.2.0",                  // author-owned semver of the skill's content
       "spec_version": 1,                   // body/frontmatter dialect; enables migrations
-      "requires": ["viewer", "ops:segmentation"],  // optional capability hints for ranking/gating
+      "requires": ["viewer", "ops:segmentation"],  // capability tokens, resolved in the kernel (§3g)
       "updated": "2026-06-20",             // derived from git log, NOT the author
       "url": "https://biopb.org/skills/cell-segmentation-cellpose.md",
       "sha256": "e3b0c4…"                  // body integrity + client cache key
@@ -189,6 +190,84 @@ def find_skills(query: str = "") -> list[dict]:
     metadata including the skill://<id> resource URI to read for the full
     workflow. Prefer an existing skill over improvising."""
 ```
+
+### 3g. `requires:` — resolved in the kernel, by the agent
+
+`requires:` shipped as inert metadata: emitted by `find_skills`, checked by nobody.
+A skill naming a kernel plugin the install doesn't have therefore read as
+*available* and dead-ended partway through its own steps. Worse, each skill body
+compensated with its own prose check — a `dir()` dance in one, a `find_spec` in
+another — N hand-written variants of one question, drifting apart and eating body
+budget that should go to the workflow.
+
+**`mcp/_requires.py` answers it once, as `check_skill_requirements()` in the agent's
+namespace.** The agent calls it after `start_kernel`, before starting the skill;
+`guide://kernel` documents it and the `find_skills` docstring points at it.
+
+```python
+check_skill_requirements(["viewer", "plugin:segmentation_qc", "pkg:basicpy>=1.2"])
+# {'ok': False, 'met': ['viewer', 'pkg:basicpy>=1.2'],
+#  'unmet': ["plugin:segmentation_qc — kernel plugin 'segmentation_qc' did not load…"],
+#  'unknown': []}
+```
+
+**Why the kernel and not the MCP server process.** A server-side check was built
+first and thrown away, for two reasons that are worth keeping written down:
+
+1. **It can only reach a subset.** `find_skills` runs in the server process and is
+   normally called *before* `start_kernel`, so the namespace, the tensor
+   connection, the dask cluster and `ops` are not knowable — and the kernel need
+   not even be the same interpreter (the `python3` kernelspec is not necessarily
+   the tool env, which is exactly why plugins load as startup files rather than
+   through entry-point metadata). Reporting the subset and staying silent on the
+   rest means the agent must still check the remainder itself, so the check has
+   not actually been done anywhere.
+2. **It is wrong on the part it does reach.** The obvious server-side resolution
+   for `plugin:<name>` is to scan `~/.config/biopb/kernel/` for `<name>.py`. But
+   the loader is **fail-open per file**: a plugin that raises on `exec`, or loses a
+   name to the reserved-name guard, is on disk and *not* in the namespace. "File
+   present" is not "plugin loaded", and only the loader knows which happened.
+
+So the loader **reports what survived** (`_requires.record_loaded_plugins`, called
+from `_load_namespace_plugins`) and the check answers from that record, held in
+module state — not in `user_ns`, where a plugin could clobber the record of itself.
+
+| token | decided from |
+|---|---|
+| `viewer` | the handle (a headless kernel binds a falsy stand-in; matched by type, since a real viewer's truthiness is not ours to depend on) |
+| `tensor` | the live `_conn.client`, not the per-job `client` copy |
+| `dask` | the `da` handle — see below |
+| `ops:<kind>` | membership in the built `ops` dict; the reason names what the servers *do* offer |
+| `plugin:<name>` | the loader's record, keyed by file stem (`plugin:rolling_ball` ↔ `rolling_ball.py`) |
+| `pkg:<name>[>=v]` | this interpreter's metadata, falling back to `find_spec` (a token may name the import, `skimage`, not the distribution, `scikit-image`) |
+
+Three decisions inside that table:
+
+- **`dask` does not mean "a distributed cluster is attached."** `da` is always
+  usable; the scheduler behind it is a performance property that `server_status`
+  reports. A skill saying `dask` means "this works on lazy arrays", which never
+  stops being true — gating on the cluster would fail skills that run fine.
+- **Version comparison is on the release tuple**, not full PEP 440 ordering, so
+  `0.12.0rc8.dev32` satisfies `>=0.12.0`. A strict compare ranks every rc *below*
+  its own final release and would tell anyone on a dev build to upgrade to what
+  they are running. Only `>=` and `==` are understood; anything else is `unknown`,
+  including an operator smuggled into the name (`pkg:biopb-mcp~=0.1`).
+- **Three verdicts, not two.** `unknown` covers a token this version can't check —
+  a vocabulary that grew in `biopb-site`, an unreadable version, a check that
+  raised (the error text is included). Silently treating those as met would hide
+  exactly the requirement the publisher went out of their way to declare; the agent
+  reads a report, not a gate, and can use judgement. `ok` is `not unmet`, so an
+  `unknown` never blocks.
+
+**It informs, it never gates.** A gap is usually one command away and every fix —
+installing a package, seeding a plugin, restarting the kernel — needs the user's
+consent, so the reason strings name the fix and the docstring tells the agent to
+ask. Nothing filters a skill out of `find_skills`, and the reason strings avoid
+handing over a runnable `pip install`.
+
+The consequence for authoring: `pkg:biopb-mcp>=X` makes a skill safe to publish
+*ahead of* the release that carries the plugin it needs — an older install is told
+so up front instead of failing halfway through.
 
 ### 3b. Full skill files — a dynamic resource list
 

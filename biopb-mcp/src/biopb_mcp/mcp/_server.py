@@ -518,6 +518,12 @@ def find_skills(query: str = "") -> list:
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
 
+    A result's `requires` lists what the skill needs (a plugin, a package, a
+    viewer, an op). Once the kernel is up, resolve it with
+    `check_skill_requirements(requires)` in the kernel namespace rather than
+    assuming — see `guide://kernel`. A skill that assumes a missing plugin or
+    package fails partway through, after the user has already waited.
+
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.
     """

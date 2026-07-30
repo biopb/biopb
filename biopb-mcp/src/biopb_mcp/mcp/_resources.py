@@ -17,6 +17,7 @@ GUIDE = """\
 | `da` | module | dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 | `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result (no-op on the main thread). Rarely needed — the `viewer` already auto-marshals every mutation. Use it only to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
+| `check_skill_requirements` | callable | `check_skill_requirements(requires)` resolves a skill's `requires:` list against this session. See **Skill requirements** below. |
 
 * The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`, the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
 * Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
@@ -31,6 +32,21 @@ it's likely one of these. Discover and read them by introspection:
 [n for n in dir() if not n.startswith("_")]   # everything actually in scope
 inspect_object("<name>")                        # its signature + docstring
 ```
+
+## Skill requirements
+A curated skill from `find_skills` carries a `requires:` list (`viewer`, `tensor`, `dask`,
+`ops:<name>`, `plugin:<name>`, `pkg:<name>` with an optional `>=`/`==` version). **Resolve it
+here before you start the skill** — this kernel is the only place every token has a real
+answer, and a skill that assumes a plugin or package it doesn't have will fail partway
+through, after the user has already waited:
+```python
+check_skill_requirements(["viewer", "plugin:segmentation_qc", "pkg:basicpy>=1.2"])
+# -> {'ok': False, 'met': [...], 'unmet': ['plugin:segmentation_qc — …'], 'unknown': []}
+```
+When `ok` is False, **tell the user what is missing and let them decide.** Installing a
+package, seeding a plugin, and restarting the kernel all need their consent, and a gap is
+usually worth naming rather than a reason to abandon the skill. Tokens in `unknown` are ones
+this kernel can't check — judge those yourself.
 
 ## Long-running jobs
 A slow `execute_code` call runs in a background thread and returns a `job-N` handle;

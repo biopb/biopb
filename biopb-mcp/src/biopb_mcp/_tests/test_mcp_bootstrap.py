@@ -207,6 +207,52 @@ class TestLoadStartupFiles:
         # A non-existent dir must not raise.
         _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path / "nope")
 
+    def test_only_the_files_that_survived_are_reported_as_loaded(self, tmp_path):
+        # The record `check_skill_requirements` answers `plugin:<name>` from. It
+        # cannot be a directory listing: this loader is fail-open, so a file that
+        # raised is on disk and *not* in the namespace -- the distinction the
+        # kernel-side check exists to get right.
+        (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "bad.py").write_text(
+            'raise RuntimeError("boom")\n', encoding="utf-8"
+        )
+        (tmp_path / "_priv.py").write_text("x = 1\n", encoding="utf-8")
+        loaded = _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path)
+        assert loaded == ["good"]
+
+
+class TestPluginRecordFeedsTheRequiresCheck:
+    """The loader -> `_requires` handoff (`plugin:<name>` in a skill)."""
+
+    def test_a_file_that_failed_to_load_reads_as_unmet(self, tmp_path, monkeypatch):
+        from biopb_mcp.mcp import _requires
+
+        (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "bad.py").write_text(
+            'raise RuntimeError("boom")\n', encoding="utf-8"
+        )
+        monkeypatch.setattr("biopb._locations.mcp_plugin_dir", lambda: tmp_path)
+        ns = _seeded_ns()
+        _bootstrap._load_namespace_plugins(_FakeIP(ns), {})
+
+        assert _requires.check(["plugin:good"], ns)["ok"]
+        (gap,) = _requires.check(["plugin:bad"], ns)["unmet"]
+        assert "session log" in gap  # where the load failure is explained
+
+    def test_the_disabled_switch_is_recorded_not_inferred(self, tmp_path, monkeypatch):
+        from biopb_mcp.mcp import _requires
+
+        (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+        monkeypatch.setattr("biopb._locations.mcp_plugin_dir", lambda: tmp_path)
+        config = {"services": {"namespace_enabled": False}}
+        ns = _seeded_ns()
+        _bootstrap._load_namespace_plugins(_FakeIP(ns), config)
+
+        # Same empty record as "nothing seeded", but a different reason: seeding a
+        # file would not help while the switch is off.
+        (gap,) = _requires.check(["plugin:good"], ns)["unmet"]
+        assert "services.namespace_enabled" in gap
+
 
 class TestPublicNamesAndMerge:
     def test_public_names_honors_all_and_drops_modules(self):
