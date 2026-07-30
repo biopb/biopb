@@ -204,6 +204,65 @@ class TestPatchViewerAddTensor:
         assert name == "custom"
         viewer.add_image.assert_called_once_with(mock_arr, name="custom")
 
+    def test_qualified_array_id_selects_the_tensor(self, viewer, connection):
+        # One id, addressed exactly as client.get_tensor addresses it (#650):
+        # the slash-free prefix routes, the full id picks the tensor.
+        t1 = _make_tensor("src1/t1", [256, 256])
+        t2 = _make_tensor("src1/t2", [128, 128])
+        src = _make_source("http://server/data/multi", [t1, t2])
+        connection.client = MagicMock()
+        connection.client.get_physical_scale.return_value = None
+        connection.sources = {"src1": src}
+
+        with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
+            patch_viewer_add_tensor(viewer, connection)
+            name = viewer.add_tensor("src1/t2")
+
+        _, _, source_id, tensor_id, tensor_desc = add_layer.call_args[0]
+        assert (source_id, tensor_id) == ("src1", "src1/t2")
+        assert tensor_desc is t2
+        assert name == "multi/t2"
+
+    def test_qualified_array_id_when_source_uncached(self, viewer, connection):
+        # The descriptor fetch takes the full array_id, and the wrapped
+        # single-tensor source is keyed by the routing prefix.
+        client = MagicMock()
+        client.get_descriptor.return_value = TensorDescriptor(
+            array_id="remote_src/t2", shape=[128, 128], dtype="float32"
+        )
+        client.get_physical_scale.return_value = None
+        connection.client = client
+        connection.sources = {}
+
+        with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
+            patch_viewer_add_tensor(viewer, connection)
+            viewer.add_tensor("remote_src/t2")
+
+        client.get_descriptor.assert_called_once_with("remote_src/t2")
+        _, _, source_id, tensor_id, _ = add_layer.call_args[0]
+        assert (source_id, tensor_id) == ("remote_src", "remote_src/t2")
+
+    def test_legacy_source_id_keyword_still_accepted(self, viewer, connection):
+        tensor = _make_tensor("t1", [256, 256])
+        src = _make_source("http://server/data/my_image", [tensor])
+        connection.client = MagicMock()
+        connection.client.get_physical_scale.return_value = None
+        connection.sources = {"src1": src}
+
+        with patch(
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            return_value=[MagicMock()],
+        ):
+            patch_viewer_add_tensor(viewer, connection)
+            name = viewer.add_tensor(source_id="src1")
+
+        assert name == "my_image"
+
+    def test_requires_an_id(self, viewer, connection):
+        patch_viewer_add_tensor(viewer, connection)
+        with pytest.raises(TypeError, match="requires an array_id"):
+            viewer.add_tensor()
+
     def test_multiscale_pyramid(self, viewer, connection):
         tensor = _make_tensor("t1", [8192, 8192])
         src = _make_source("http://server/big", [tensor])
