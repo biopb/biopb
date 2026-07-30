@@ -108,13 +108,19 @@ Every rerun of the installer rebuilds that environment from the release's own
 requirement list, which means a package you add by hand is **dropped at the next
 upgrade** — usually noticed much later, as an import that used to work. To keep
 one, name it in `~/.config/biopb/extra-packages.txt`, one
-[PEP 508](https://peps.python.org/pep-0508/) requirement per line (`#` comments
-and blank lines ignored):
+[PEP 508](https://peps.python.org/pep-0508/) requirement per line:
 
 ```
 basicpy
 m2stitch==0.9.0
+# a direct reference works too; its URL fragment is left intact
+segmentation-zoo @ git+https://github.com/example/zoo@main#subdirectory=pkg
 ```
+
+Blank lines are ignored, and so is a `#` comment — but only one that starts a line
+or follows whitespace, the same rule `pip` applies to a `requirements.txt`. A `#`
+elsewhere belongs to the requirement (a `#subdirectory=` or `#sha256=` URL
+fragment) and is kept.
 
 The installer replays that list on every run, so the packages are reinstalled
 with everything else. If one of them can't be resolved alongside the release's

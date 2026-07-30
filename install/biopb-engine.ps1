@@ -1251,14 +1251,22 @@ function Invoke-BiopbInstall {
     # on every upgrade, so a package the user added by hand -- into the very
     # interpreter the napari kernel runs, where an optional dependency like basicpy
     # has to live -- is dropped at the next upgrade, surfacing later as an import
-    # that used to work. One PEP 508 requirement per line; `#` comments and blank
-    # lines ignored. The file is the user's; the installer only ever reads it.
+    # that used to work. One PEP 508 requirement per line; blank lines and `#`
+    # comments ignored. The file is the user's; the installer only ever reads it.
+    #
+    # A `#` is a comment only at line start or after whitespace -- pip's
+    # requirements.txt rule, and the reason it has that rule: a PEP 508 direct
+    # reference carries load-bearing data in the URL fragment
+    # ("git+https://host/r@main#subdirectory=sub", "...whl#sha256=..."), so
+    # stripping from the first `#` anywhere truncates the requirement into one that
+    # still resolves -- to the repo root instead of the subdirectory, with no hash
+    # checked and nothing to warn about.
     $extraArgs = @()
     $extraNames = @()
     $extrasFile = Join-Path $ConfigDir "extra-packages.txt"
     if (Test-Path -LiteralPath $extrasFile) {
         foreach ($line in (Get-Content -LiteralPath $extrasFile -Encoding UTF8)) {
-            $req = ($line -replace '#.*$', '').Trim()
+            $req = ($line -replace '^\s*#.*$', '' -replace '\s#.*$', '').Trim()
             if ($req) { $extraArgs += @("--with", $req); $extraNames += $req }
         }
     }

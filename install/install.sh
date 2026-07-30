@@ -298,8 +298,8 @@ _install_opencode() {
 # an import that used to work. Replaying a user-owned list makes those packages
 # part of the requirement set, so they are reinstalled along with everything else.
 #
-# One PEP 508 requirement per line ("basicpy", "m2stitch==0.9.0"); `#` comments
-# and blank lines ignored. The file is the user's, never written by the installer.
+# One PEP 508 requirement per line ("basicpy", "m2stitch==0.9.0"); blank lines and
+# `#` comments ignored. The file is the user's, never written by the installer.
 #
 # EXTRA_PACKAGES_COUNT, not ${#EXTRA_PACKAGES[@]}, gates every expansion of the
 # array: macOS still ships bash 3.2, where expanding an *empty* array under
@@ -312,9 +312,16 @@ _read_extra_packages() {
     local line
     # `|| [ -n "$line" ]` so a final line without a trailing newline is not lost.
     while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%%#*}"
+        # A `#` is a comment only at line start or after whitespace -- pip's
+        # requirements.txt rule, and the reason it has that rule: a PEP 508 direct
+        # reference carries load-bearing data in the URL fragment
+        # ("git+https://host/r@main#subdirectory=sub", "...whl#sha256=..."), so
+        # stripping from the first `#` anywhere truncates the requirement into one
+        # that still resolves -- to the repo root instead of the subdirectory, with
+        # no hash checked and nothing to warn about.
         line=$(printf '%s' "$line" | tr -d '\r' \
-            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            | sed -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' \
+                  -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         [ -n "$line" ] || continue
         EXTRA_PACKAGES+=("$line")
         EXTRA_PACKAGES_COUNT=$((EXTRA_PACKAGES_COUNT + 1))
