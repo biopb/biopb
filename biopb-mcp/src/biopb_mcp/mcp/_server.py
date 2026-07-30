@@ -660,9 +660,10 @@ def execute_code(python_code: str) -> str:
       (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
       predicate hides them; use `data_resident` to filter on residency on
       purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
-    - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
-      (auto-handles the multiscale pyramid). client.get_tensor(array_id)
-      returns a lazy dask array without adding a layer.
+    - viewer.add_tensor(array_id) loads a tensor as a layer (auto-handles the
+      multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
+      array without adding a layer. Both take the same id: "source_id/t1"
+      within a multi-tensor source, a bare "source_id" for a single-tensor one.
     - reading pixels back off a layer is not plain napari: layer.data is a
       *list* of pyramid levels when layer.multiscale, in display axis order
       ([..., Z, Y, X], singleton Z inserted for 2-D sources), and lazy. Use

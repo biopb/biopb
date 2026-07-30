@@ -285,10 +285,10 @@ layer = viewer.layers["image_name"]
 # Remove layer (auto-marshaled — call directly)
 viewer.layers.remove(viewer.layers["name"])
 
-# Load a source as a layer; auto-handles the pyramid. Returns the layer name.
-# tensor_id is only needed for a multi-tensor source; name defaults from the URL.
-layer_name = viewer.add_tensor("source_id")
-layer_name = viewer.add_tensor("source_id", tensor_id="t1", name="my_layer")
+# Load a tensor as a layer; auto-handles the pyramid. Returns the layer name.
+# Addressed by array_id, like client.get_tensor. name defaults from the URL.
+layer_name = viewer.add_tensor("source_id")                  # single-tensor source
+layer_name = viewer.add_tensor("source_id/t1", name="my_layer")
 
 # Layer properties (auto-marshaled — set directly; each runs on the main thread)
 layer = viewer.layers["name"]
@@ -469,13 +469,14 @@ client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT data_r
 ```
 
 ## Load into Viewer
+Both calls take the same `array_id`: `"source_id/t1"` for a tensor within a
+multi-tensor source, a bare `"source_id"` for a single-tensor one.
 ```python
-# Auto-handles the multiscale pyramid for large images.
-layer_name = viewer.add_tensor("source_id")                   # single-tensor source
-layer_name = viewer.add_tensor("source_id", tensor_id="t1")   # multi-tensor source
+# As a layer -- auto-handles the multiscale pyramid for large images.
+layer_name = viewer.add_tensor("source_id")
+layer_name = viewer.add_tensor("source_id/t1")
 
-# Or get a lazy dask array directly, without adding a layer (address it by its
-# array_id: "source_id/t1" for a multi-tensor source, "source_id" for a single one):
+# Or as a lazy dask array, without adding a layer:
 arr = client.get_tensor("source_id/t1")
 ```
 
