@@ -22,6 +22,11 @@ set -uo pipefail
 SCENARIO="${1:-clean}"
 export PATH="$HOME/.local/bin:$PATH"
 
+# Where run.sh mounts the installer. Overridable so this harness can itself be
+# smoke-tested outside a container -- a bug in a check here is otherwise only
+# discoverable by spending a full scenario run to find it.
+INSTALL_SH="${BIOPB_INSTALL_SH:-/install.sh}"
+
 # A package the biopb deployment does not depend on, so finding it in the
 # environment afterwards can only mean the extras replay put it there. Tiny, pure
 # Python, no dependencies of its own -- the check should time out on nothing.
@@ -68,7 +73,7 @@ run_install() {
     # BIOPB_INSTALL_SAMPLES=0: the sample bundle is a release asset download worth
     #   minutes, and every scenario below points the config somewhere explicit.
     env BIOPB_NONINTERACTIVE=1 BIOPB_NO_SERVER_START=1 BIOPB_INSTALL_SAMPLES=0 \
-        "$@" bash /install.sh 2>&1
+        "$@" bash "$INSTALL_SH" 2>&1
 }
 
 # Per-scenario install environment. An array, not a string, so "no override"

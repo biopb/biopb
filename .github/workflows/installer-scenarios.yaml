@@ -15,6 +15,12 @@ name: Installer Scenarios
 #
 # Same posture as installer-wheel-coverage.yaml -- the other installer check
 # that is too slow to fire on every PR.
+#
+# NOTE: GitHub only offers a workflow_dispatch workflow once its file is on the
+# DEFAULT branch, so this cannot be run from the PR that adds it, or from any
+# feature branch, until it has reached main. That is a platform rule, not a
+# problem with the file. In the meantime `install/test/run.sh --assert all`
+# does the same thing on any machine with Docker.
 on:
   workflow_dispatch:
     inputs:
