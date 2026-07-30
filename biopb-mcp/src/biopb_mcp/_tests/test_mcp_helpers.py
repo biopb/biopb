@@ -111,7 +111,9 @@ class TestPatchViewerAddTensor:
         client.get_descriptor.assert_called_once_with("remote_src")
         # No source_url on a descriptor-only fetch, so the layer name is the id.
         assert name == "remote_src"
-        viewer.add_image.assert_called_once_with(mock_arr, name="remote_src")
+        viewer.add_image.assert_called_once_with(
+            mock_arr, name="remote_src", metadata={"array_id": "remote_src"}
+        )
 
     def test_fallback_forwards_tensor_id(self, viewer, connection):
         # A within-source field is fetched by its qualified array_id.
@@ -148,7 +150,9 @@ class TestPatchViewerAddTensor:
             name = viewer.add_tensor("src1")
 
         assert name == "my_image"
-        viewer.add_image.assert_called_once_with(mock_arr, name="my_image")
+        viewer.add_image.assert_called_once_with(
+            mock_arr, name="my_image", metadata={"array_id": "t1"}
+        )
 
     def test_compute_scheduler_wraps_layer_array(self, viewer, connection):
         """With a scheduler set, the array passed to add_image is pinned to a
@@ -202,7 +206,9 @@ class TestPatchViewerAddTensor:
             name = viewer.add_tensor("src1", tensor_id="t2", name="custom")
 
         assert name == "custom"
-        viewer.add_image.assert_called_once_with(mock_arr, name="custom")
+        viewer.add_image.assert_called_once_with(
+            mock_arr, name="custom", metadata={"array_id": "t2"}
+        )
 
     def test_qualified_array_id_selects_the_tensor(self, viewer, connection):
         # One id, addressed exactly as client.get_tensor addresses it (#650):
@@ -278,7 +284,9 @@ class TestPatchViewerAddTensor:
             patch_viewer_add_tensor(viewer, connection)
             viewer.add_tensor("src1")
 
-        viewer.add_image.assert_called_once_with(levels, name="big", multiscale=True)
+        viewer.add_image.assert_called_once_with(
+            levels, name="big", multiscale=True, metadata={"array_id": "t1"}
+        )
 
     def test_raises_for_invalid_tensor_id(self, viewer, connection):
         tensor = _make_tensor("t1", [256, 256])

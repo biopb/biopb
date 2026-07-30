@@ -28,7 +28,9 @@ def test_default_dim_labels_canonical_zyx():
     assert _default_dim_labels(2) == ["y", "x"]
     assert _default_dim_labels(3) == ["z", "y", "x"]
     assert _default_dim_labels(4) == ["c", "z", "y", "x"]
-    assert _default_dim_labels(5) == ["c", "t", "z", "y", "x"]
+    # Leading axes are named as the tail of [T, C, ...] -- t first, which NGFF
+    # 0.4 requires (and ome-zarr-py enforces) of a time axis.
+    assert _default_dim_labels(5) == ["t", "c", "z", "y", "x"]
 
 
 def _read_multiscale(path):
@@ -74,6 +76,56 @@ def test_write_image_honors_explicit_dim_labels(tmp_path):
     ms, _ = _read_multiscale(out)
     assert [a["name"] for a in ms["axes"]] == ["c", "y", "x"]
     assert ms["axes"][0] == {"name": "c", "type": "channel"}
+
+
+def test_write_image_names_tczyx_axes_from_the_layer(tmp_path):
+    # biopb/biopb#651: a bioio-backed source loads as [T, C, Z, Y, X], and the
+    # positional guess named the leading pair (c, t) -- writing T and C swapped,
+    # which the round-trip through OmeZarrAdapter then makes permanent.
+    arr = np.zeros((2, 3, 1, 4, 5), dtype="uint8")
+    out = tmp_path / "tczyx.ome.zarr"
+
+    write_image_ome_zarr(
+        str(out), arr, {"metadata": {"dim_labels": ["t", "c", "z", "y", "x"]}}
+    )
+
+    ms, _ = _read_multiscale(out)
+    assert [a["name"] for a in ms["axes"]] == ["t", "c", "z", "y", "x"]
+    assert [a["type"] for a in ms["axes"]] == [
+        "time",
+        "channel",
+        "space",
+        "space",
+        "space",
+    ]
+
+
+def test_write_image_5d_without_labels_still_writes(tmp_path):
+    # The positional fallback must stay *writable*: ome-zarr-py rejects a time
+    # axis that isn't first, so the old (c, t) guess raised on every 5-D save.
+    arr = np.zeros((2, 3, 1, 4, 5), dtype="uint8")
+    out = tmp_path / "unlabeled5d.ome.zarr"
+
+    write_image_ome_zarr(str(out), arr, {"metadata": {}})
+
+    ms, _ = _read_multiscale(out)
+    assert [a["name"] for a in ms["axes"]] == ["t", "c", "z", "y", "x"]
+
+
+def test_write_image_rgb_names_the_samples_axis(tmp_path):
+    # An interleaved samples axis is a real array axis (napari just doesn't
+    # count it in layer.ndim) and the writer sees the raw array, so the labels
+    # must cover it -- untyped, which NGFF allows for exactly one axis.
+    arr = np.zeros((1, 4, 5, 3), dtype="uint8")
+    out = tmp_path / "rgb.ome.zarr"
+
+    write_image_ome_zarr(
+        str(out), arr, {"metadata": {"dim_labels": ["z", "y", "x", "s"]}}
+    )
+
+    ms, _ = _read_multiscale(out)
+    assert [a["name"] for a in ms["axes"]] == ["z", "y", "x", "s"]
+    assert "type" not in ms["axes"][-1]
 
 
 def test_write_labels_roundtrips_dtype_exact(tmp_path):

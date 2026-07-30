@@ -63,17 +63,24 @@ def _default_dim_labels(ndim: int) -> list[str]:
     """Positional fallback when no explicit labels are available.
 
     biopb-mcp layers are canonical ``[..., Z, Y, X]`` (see ``_tensor_utils``), so
-    the trailing dims are X, Y, Z; remaining leading dims get c, then t, then
-    generic ``dim{i}`` names.
+    the trailing dims are X, Y, Z. The leading dims are *named by position* --
+    the last names of the canonical ``[T, C, Z, Y, X]`` prefix, so one leading
+    axis reads as c and two as (t, c) -- then generic ``dim{i}`` names beyond
+    that. Only a guess, and only for a layer that carries no labels of its own:
+    anything loaded through ``_tensor_utils.add_tensor_layer`` names its axes
+    from the source descriptor instead (biopb/biopb#651).
+
+    T before C is not cosmetic. NGFF 0.4 requires a time axis to come first, so
+    ome-zarr-py *rejects* the other order outright -- a 5-D save used to raise
+    rather than write.
     """
     trailing = ["z", "y", "x"]
     n_trailing = min(ndim, len(trailing))
     leading = ndim - n_trailing
-    leading_names = ["c", "t"]
-    labels = [
-        leading_names[i] if i < len(leading_names) else f"dim{i}"
-        for i in range(leading)
-    ]
+    leading_names = ["t", "c"]
+    n_named = min(leading, len(leading_names))
+    labels = [f"dim{i}" for i in range(leading - n_named)]
+    labels.extend(leading_names[len(leading_names) - n_named :])
     labels.extend(trailing[len(trailing) - n_trailing :])
     return labels
 
@@ -81,9 +88,10 @@ def _default_dim_labels(ndim: int) -> list[str]:
 def _derive_dim_labels(ndim: int, meta: dict) -> list[str]:
     """Resolve per-axis labels for an OME multiscales ``axes`` block.
 
-    Prefer explicit labels stashed on the layer metadata (forward-compatible if
-    the tensor browser ever attaches them); otherwise fall back to the canonical
-    ``[..., Z, Y, X]`` positional mapping.
+    Prefer explicit labels stashed on the layer metadata -- ``add_tensor_layer``
+    attaches the source's own axis names there, canonicalized to the layer's
+    axes -- and fall back to the positional guess for a layer that has none (one
+    the agent built itself, say).
     """
     inner = meta.get("metadata") or {}
     for key in ("dim_labels", "axis_labels"):
