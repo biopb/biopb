@@ -148,6 +148,11 @@ class TestSeeding:
 
         dest = tmp_path / "kernel"
         seed_kernel_plugins(dest)
+        # Other seeded plugins have their own surface tests; drop them so this
+        # assertion stays an exact set for *this* file rather than a superset check.
+        for other in dest.glob("*.py"):
+            if other.name not in ("__init__.py", "rolling_ball.py"):
+                other.unlink()
 
         class IP:
             def __init__(self):
