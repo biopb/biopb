@@ -15,7 +15,7 @@
 # lint workflow is filtered to '**/*.py', and the only verification here fired on
 # push-to-main, i.e. after the merge. A broken .iss was discoverable solely by
 # cutting a release. These jobs are static (parse/compile/lint) -- executing
-# installer logic is tracked separately in the installer test-suite issue.
+# installer logic is tracked separately in #653.
 #
 # workflow_dispatch is a dry run: it checks everything but never touches SSH or
 # the server.
@@ -65,8 +65,7 @@ jobs:
           # errors among them). Excluding beats fixing them in whatever PR adds
           # this gate: the check is green on arrival and every OTHER shellcheck
           # rule -- unquoted expansions, always-true tests, dead branches -- is
-          # live from now on. Ratcheting the exclusions off is tracked in the
-          # installer test-suite issue.
+          # live from now on. Ratcheting the exclusions off is tracked in #653.
           shellcheck -e SC2155,SC2034,SC2059,SC2015 install/install.sh
 
       - name: Parse the PowerShell scripts
