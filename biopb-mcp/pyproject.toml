@@ -155,12 +155,24 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# The suite lives under src/ (biopb_mcp/_tests/), so without this it is packaged
+# like any other subpackage — it was 42% of the wheel by size. Nothing outside
+# the suite imports it; excluding it changes only what ships, not how tests run
+# (both local and CI collect from the checkout, never from an installed wheel).
+exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
 # Bundled skills snapshot (mcp/_skills_bundle/): last-resort offline fallback for
 # the curated catalog + bodies (see mcp/_skills.py).
 "biopb_mcp.mcp" = ["_skills_bundle/*.json", "_skills_bundle/*.md"]
+
+# Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
+# is no longer a package, setuptools reclassifies its files as *data* of the
+# parent biopb_mcp, and include-package-data = true (fed every git-tracked file
+# by setuptools_scm's file finder) ships them anyway. Both halves are required.
+[tool.setuptools.exclude-package-data]
+"biopb_mcp" = ["_tests/*", "_tests/**/*"]
 
 # Versioned off the shared monorepo git history. Product component: keyed to the
 # single product tag `release-v*` (not a per-package prefix), so mcp, the tensor
