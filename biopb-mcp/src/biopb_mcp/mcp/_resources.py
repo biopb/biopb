@@ -8,42 +8,51 @@ GUIDE = """\
 
 **Operation Guardrails** are in session `instructions`. Apply on every turn — follow them throughout.
 
+Kernel is the main execution context for the agent. It is a live Python interpreter with a napari
+viewer window, and it has access to the TensorFlightClient for browsing and retrieving image data.
+The kernel is **stateful**: variables, imports, and viewer state persist across turns. Agent code
+runs in a background thread to keep the main Qt thread responsive.
+
 ## Namespace
+
 | Name | Type | Description |
 |------|------|-------------|
-| `client` | TensorFlightClient or None | Connection to the data server for browsing/retrieving image data |
+| `client` | TensorFlightClient or None | Connection to the data server for browsing/retrieving image data. Marshaled and thread-safe. |
 | `viewer` | napari.Viewer | The active viewer instance that user sees and manipulates |
-| `np` | module | numpy |
-| `da` | module | dask.array |
+| `np/da` | module | imported packages: numpy and dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
-| `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result (no-op on the main thread). Rarely needed — the `viewer` already auto-marshals every mutation. Use it only to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
+| `run_on_main` | callable | runs `fn` on the Qt main thread and returns its result. Use it to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
 
-- The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every
-  mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
-  the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate
-  it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main
-  thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to
-  apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
-- Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
-- **Server data, viewer data and your own arrays are three different things** —
-  different rank, different resolution levels, different laziness. Read
-  `guide://data` before writing code that reads pixels off a layer.
+- The `viewer` is a live napari window, made **thread-safe** by marshaling known
+  mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
+  the `add_*()` family, …) to the Qt main thread. One caveat: raw Qt (`viewer.window`)
+  still requires the main thread — off-thread access raises a clear error, so wrap it in
+  `run_on_main()`. See `guide://viewer` for the full set of viewer operations, including
+  mouse events.
+- The `client` represents a `TensorFlightClient` instance. Data from the client are
+  lazy, thread-safe, picklable dask arrays. See `guide://client` for the full set of client
+  operations, including browsing sources, reading tensors, and uploading results.
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
+  The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
+  server. The callable can take either a numpy array (eager) or a tensor-server source_id string
+  (lazy). See `guide://ops` for details.
 
 ## Kernel plugins
-**User plugins may add more names** beyond this table: top-level
+
+**User plugins may add more names** beyond the table above: top-level
 definitions from `*.py` files in `~/.config/biopb/kernel/`, and installed
 `biopb_mcp.namespace` packages, are loaded into this namespace at kernel start.
 They're lab-specific helpers, not built-ins — so an unfamiliar name is likely one
 of these. Two questions, two different answers:
 
-* **Which plugins loaded** — `server_status`, section `## Kernel plugins`. It
+- **Which plugins loaded** — `server_status`, section `## Kernel plugins`. It
   lists the files and the packages that actually loaded; the loader is fail-open
   per unit, so a `*.py` sitting in that directory but missing from the report
   failed on load and the session log says why. The section reads
   `(disabled — services.namespace_enabled)` where plugins are switched off.
-* **What names they contribute** — introspection. A plugin file contributes its
+- **What names they contribute** — introspection. A plugin file contributes its
   *functions*, not its own name, so the report cannot answer this:
+
 ```python
 [n for n in dir() if not n.startswith("_")]   # everything actually in scope
 inspect_object("<name>")                        # its signature + docstring
@@ -86,21 +95,13 @@ A curated skill from `find_skills` carries a `requires:` list. **Resolve it befo
 the skill** — one that assumes a plugin or package it doesn't have fails partway through,
 after the user has already waited.
 
-One `server_status` call answers every token but a third-party `pkg:`:
-
-| token | read it from | if it's missing |
-|---|---|---|
-| `viewer` | `## Viewer` | see **headless / closed window** below |
-| `tensor` | `## Tensor Server` | the section names the reason; see below |
-| `dask` | `## Dask` | never missing — `da` is always bound; the scheduler is a performance property, not a blocker |
-| `ops:<kind>` | `## Ops` | see below |
-| `plugin:<name>` | `## Kernel plugins` | see below — this is the **only** place it can be read |
-| `pkg:biopb-mcp` | `## Versions` — the version installed in **this kernel's** interpreter, the one that will run the skill | the install is older than the skill; the fix is upgrading biopb |
-| `pkg:<other>` | `import <name>` (`import skimage; skimage.__version__`) | see below |
-
-`plugin:<name>` has no other source: a plugin file contributes its function names, not its
-own name, so `dir()` can't answer it, and a file that failed to load is still on disk, so a
-directory listing can't either. The report is the loader's own record of what survived.
+One `server_status` call answers every token but a third-party `pkg:`, which is the agent's
+responsibility to resolve. Each token names its section: `viewer` → `## Viewer`, `tensor` →
+`## Tensor Server`, `dask` → `## Dask`, `ops:<kind>` → `## Ops`, `plugin:<name>` →
+`## Kernel plugins` (the only place it can be read — a plugin file contributes its function
+names, not its own name, so `dir()` cannot answer it, and a file that failed to load is still
+on disk, so a directory listing cannot either), `pkg:biopb-mcp` → `## Versions` (the version
+in **this kernel's** interpreter, the one that will run the skill).
 
 ### When something is missing
 **Diagnose, tell the user, let them choose.** Installing, seeding and restarting are all
@@ -162,13 +163,12 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 | **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
 
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
-the first. The traps follow from that.
-
-The conversion is traceable in one direction: a layer it loaded records its
-origin as `layer.metadata['array_id']` — the same id `client.get_tensor()` takes,
-so you can always go back to the full-resolution source-order array (the layer
-*name* cannot be used for this; it is a display stem the user may rename). A
-layer the agent built with `add_image`/`add_labels` has no such entry.
+the first. The traps follow from that. The conversion is traceable in one direction:
+a layer it loaded records its origin as `layer.metadata['array_id']` — the same id
+`client.get_tensor()` takes, so you can always go back to the full-resolution
+source-order array (the layer *name* is not reliable for this; it is a display stem
+the user may rename). A layer the agent built with `add_image`/`add_labels` has no such
+entry.
 
 ## The traps
 
@@ -182,28 +182,48 @@ arr = layer.data[0] if layer.multiscale else layer.data
 ```
 
 **2. Layer data is not a dask array.** Each level is wrapped in a `_ViewerArray`
-proxy that pins napari's slice reads to a single-process scheduler (issue #8).
+proxy that pins napari's slice reads to a single-process scheduler.
 It behaves like a dask array — `.shape`, `.compute()`, slicing, ufuncs — so
 ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, and a
 bare `np.asarray(arr)` materializes the **whole** array in the main process
 instead of on the cluster. Slice first, or `.compute()` explicitly.
 
-**3. Same axis order, different rank — so align from the right.** The server
-guarantees everything it serves is `[..., Z, Y, X]`, with an interleaved colour
-axis `S` strictly last when there is one, so nothing is transposed on the way
-into a layer: `client.get_descriptor(array_id).dim_labels` and
-`layer.metadata['dim_labels']` describe the same order. What differs is the
-*count* — loading inserts a singleton Z when the source has none (trap 4), which
-shifts every leading axis by one. The same shift applies to the source's
-physical scale (`client.get_physical_scale()`) versus the layer's (`layer.scale`,
-what `regionprops(..., spacing=)` wants), so index spacing from the **end**, not
-the start. One extra wrinkle for interleaved colour: napari does not count `S` as
-a dimension, so `layer.scale[-1]` is X's spacing while the array's last axis is
-the colour count.
+**3. Same axis order, different rank.** The server guarantees everything it
+serves is `[..., Z, Y, X]`, with an interleaved colour axis `S` strictly last
+when there is one, so nothing is transposed on the way into a layer — the source
+and the layer describe their axes in the same order. What differs is the *count*:
+a source with no Z gains one (trap 4), so `layer.metadata['dim_labels']` is one
+longer than `client.get_descriptor(array_id).dim_labels`.
 
-**4. A 2-D source is 3-D in the viewer.** Loading *inserts* a singleton Z, so
-`[Y, X]` loads as `[1, Y, X]` with a 3-element `layer.scale`. Read `ndim` off the
-array you are about to use, not off the source.
+That shift is why the source's physical scale (`client.get_physical_scale()`) and
+the layer's (`layer.scale`, what `regionprops(..., spacing=)` wants) are not the
+same vector. **X and Y always line up from the right; nothing further in is
+guaranteed to.** Where a Z was inserted, `layer.scale[-3]` is that synthetic
+axis' `1.0` while the source's `[-3]` is its own leading axis:
+
+```
+source [T, C, Y, X]   get_physical_scale() -> [0.0, 0.0, 0.25, 0.5]
+layer  [T, C, Z, Y, X]        layer.scale  -> [1.0, 1.0, 1.0, 0.25, 0.5]
+                                    [-1] X  0.5  == 0.5   ✓
+                                    [-2] Y  0.25 == 0.25  ✓
+                                    [-3]    1.0  != 0.0   ← inserted Z vs C
+```
+
+Take X and Y off the end; take Z from `layer.scale[-3]` only when the source
+really has one. `'z' in layer.metadata['dim_labels']` does not settle that — the
+inserted axis is named `z` too. Compare ranks instead: the layer array one
+larger than `len(descriptor.shape)` means a Z was inserted. Leading axes carry no
+physical size on either side.
+
+One extra wrinkle for interleaved colour: napari does not count `S` as a
+dimension, so `layer.scale` is one shorter than the array and `layer.scale[-1]`
+is X's spacing while the array's last axis is the colour count.
+
+**4. A source without a Z gains a rank in the viewer.** Not just 2-D ones —
+loading *inserts* a singleton Z whenever the source has none, so `[Y, X]` becomes
+`[1, Y, X]`, `[C, Y, X]` becomes `[C, 1, Y, X]`, and `[T, C, Y, X]` becomes
+`[T, C, 1, Y, X]`. Only a source that already carries a Z keeps its rank. Read
+`ndim` off the array you are about to use, not off the source.
 
 **5. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
 while the pixels are not there yet; a scikit-image call, `np.asarray`, or a
