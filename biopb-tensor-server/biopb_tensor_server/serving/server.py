@@ -416,9 +416,14 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         self._remove_source_handler = handler
 
-    def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
-        """Register a data source with the server (delegates to ``sources``)."""
-        self.sources.register(source_id, adapter)
+    def register_source(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
+        """Register a data source with the server (delegates to ``sources``).
+
+        Returns the adapter as registered: the registry normalizes a
+        non-canonical axis order on the way in (biopb/biopb#596), so a caller
+        that keeps using the adapter afterwards must use the returned one.
+        """
+        return self.sources.register(source_id, adapter)
 
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source and drop any in-flight upload state."""

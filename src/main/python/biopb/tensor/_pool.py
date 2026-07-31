@@ -80,7 +80,14 @@ logger = logging.getLogger(__name__)
 # decline the fast path (fall back to do_get) for anything newer than this
 # rather than risk misreading the mmap. Bump in lockstep with the server when
 # this client learns to parse a newer format.
-_CACHEFILE_SUPPORTED_FORMAT = 1
+#
+# 2 (biopb/biopb#596): the server bumped its format because a non-canonical
+# source's cached bytes are now stored transposed into canonical axis order --
+# same segment layout, different content -- so nothing here had to learn a new
+# encoding. An older client sees 2 > 1, declines the fast path, and reads the
+# same normalized chunk over do_get, so the skew degrades to a slower read
+# rather than a wrong one.
+_CACHEFILE_SUPPORTED_FORMAT = 2
 
 # Per-location capability cache: dask workers are separate processes, so each
 # memoizes independently after its first probe. None = unknown, False = the

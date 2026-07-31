@@ -47,7 +47,8 @@ logic), which may expose multiple tensors (e.g., multi-field) from one source.
 The `biopb_tensor_server` package is organized into layered subpackages:
 
 - **`core/`** — foundational primitives and contracts: adapter ABCs, `config`,
-  and the low-level `source_registry` / `metadata_db` stores.
+  the `axes` vocabulary + its `normalize` seam, and the low-level
+  `source_registry` / `metadata_db` stores.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`. Builds on `core`.
 - **`sources/`** — source lifecycle: `source_manager` + `tree_scanner` +
@@ -122,6 +123,45 @@ no tensors until it resolves.
 | `get_tensor_descriptor()` | `TensorDescriptor` proto |
 | `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
 | `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native pyramid levels |
+
+### Canonical axis order (biopb/biopb#596)
+
+Adapters read whatever axis order their upstream reader emits. The server
+normalizes that at the adapter seam, so the wire carries a guarantee instead of
+each consumer re-deriving "which axis is Y/X/Z/S" with its own vocabulary:
+
+> **Z, Y, X and S appear last, in that relative order**; every other axis — T, C,
+> and any unrecognized label — keeps its relative order ahead of them.
+
+Relative order, not index: `[z, dimq, y, x]` normalizes to `[dimq, z, y, x]` —
+`dimq` moved relative to nothing, but a trailing axis moved out from in front of
+it. And only Z/Y/X/S count as trailing; T and C classify through the same
+vocabulary but have no canonical place, so they ride with the unlabeled.
+
+The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` is the
+seam that applies it, and `SourceRegistry.register` — the single registration
+chokepoint — is where it attaches. An already-canonical adapter is returned
+**unchanged** (same object, same cost), which is nearly all of them: `bioio`
+fixes `TCZYXS` upstream, and OME-TIFF / QPTIFF / TIFF-sequence / ndtiff / DICOM
+are compliant by construction. `nifti` (which emits X before Y) is the one
+family whose behavior actually changes.
+
+| | |
+|---|---|
+| **Not in scope** | Unlabeled stores (`zarr`, `hdf5`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting `build_axis_map`'s positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Give such a source semantics with `dim_labels` in its config. |
+| **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture `serving/renderer.py` already takes toward adapter-supplied labels. |
+| **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
+| **Cache** | The transpose happens *before* the cache store, so a segment holds what the client is served and the localhost mmap fast path stays valid. `CACHE_FILE_FORMAT_VERSION` was bumped to `2` for that (same layout, reordered content); an older client declines the fast path and reads the same normalized chunk over `do_get`. |
+| **Plans** | `plan_flight_info` / `get_read_plan` are delegated and their answer permuted, not re-derived — which is what keeps the native-pyramid `precompute` routing working underneath. |
+
+An order this server does not own is **refused, not permuted** — permuting works
+only where the server owns the whole read path, and two seams don't. Both report
+through the shared `core/axes.py::noncanonical_order`:
+
+| | |
+|---|---|
+| **Writes** | `create_source` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
+| **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy opts out of wrapping (`_normalizable_axes = False`) and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
 
 ### Adapter file-handle policy (biopb/biopb#71)
 

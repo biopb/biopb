@@ -86,7 +86,14 @@ CACHE_KEY_FIELD = "__biopb_cache_key__"
 # data/shape/dtype/cache_key encoding changes in a way an older client can't
 # parse; the server reports it in chunk_locate and a client declines the fast
 # path (falls back to do_get) for any version it doesn't understand.
-CACHE_FILE_FORMAT_VERSION = 1
+#
+# v2 (biopb/biopb#596): the segment *layout* is unchanged, but for a source whose
+# native axis order is not canonical the server now serves -- and therefore
+# caches -- the transposed array under the same chunk_id. A v1 segment holds the
+# pre-transpose bytes, so reusing it would serve axes in the wrong order, and the
+# localhost fast path would do so with the server no longer in the loop to
+# correct it. Wipe instead.
+CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and
 # ``wal.json``) recording the CACHE_FILE_FORMAT_VERSION the segments were written
