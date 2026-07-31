@@ -8,10 +8,11 @@ proportionally small ball on it, and **bilinearly enlarge** the background back,
 cutting the work by the shrink factor to the fourth power (``~256×`` at radius 50).
 That is the whole reason ImageJ is dramatically faster, and this reproduces it.
 
-biopb-mcp ships this as a built-in example kernel plugin (#92): the installer
+biopb-mcp ships this as a built-in example kernel plugin: the installer
 seeds a copy into ``~/.config/biopb/kernel/`` so it loads into the agent kernel
 namespace at startup and is visible/editable as a worked "bring your own tool"
-example. Two callables land in the namespace:
+example. Two callables, reached through the module the agent gets bound
+(``rolling_ball``):
 
 - ``subtract_background(image, radius=50, ...)`` — the background-subtracted image.
 - ``rolling_ball_background(image, radius=50, ...)`` — just the estimated background.
@@ -34,7 +35,7 @@ immaterial to the interior background estimate.
 # `inspect_object("rolling_ball")` shows the agent two callables rather than every
 # scipy/skimage handle this file imported. Style, not protection: as a kernel
 # plugin this module is bound under one name, so nothing here can reach the
-# agent's namespace (#664).
+# agent's namespace.
 import math as _math
 
 import numpy as np

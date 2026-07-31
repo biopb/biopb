@@ -42,7 +42,7 @@ they return.
 # Private aliases keep the module's own surface to its public API, so
 # `inspect_object("segmentation_qc")` shows the agent the three callables rather
 # than every pandas/scipy handle this file imported. Style, not protection: as a
-# kernel plugin this module is bound under one name (#664).
+# kernel plugin this module is bound under one name.
 import warnings as _warnings
 from dataclasses import dataclass as _dataclass, field as _dc_field
 

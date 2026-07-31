@@ -1,13 +1,14 @@
-"""biopb-mcp kernel plugins — extend the agent's Python namespace (#92).
+"""biopb-mcp kernel plugins — extend the agent's Python namespace.
 
 Every ``*.py`` file in this directory is imported at kernel start and bound in the
 agent's namespace **under its own name** — ``rolling_ball.py`` becomes
 ``rolling_ball``, and the agent calls ``rolling_ball.subtract_background(...)``.
 This is the low-friction "bring your own tool" path: drop a file, no packaging
-required. (A lab can also distribute plugins as a ``biopb_mcp.namespace``
-entry-point package; see biopb-mcp's ARCHITECTURE.md.)
+required. To ship plugins as an installable package instead, expose them on the
+``biopb_mcp.namespace`` entry-point group: each entry point resolves to a module,
+bound under the entry-point name exactly as a file is.
 
-One file, one name (#664). Your helpers, constants and imports stay on the module
+One file, one name. Your helpers, constants and imports stay on the module
 where they belong; only the module itself joins ``viewer`` / ``client`` / ``np`` /
 ``da`` / ``ops`` in the namespace, so a plugin cannot collide with a built-in
 handle, with the agent's own variables, or with another plugin.
@@ -35,10 +36,13 @@ Conventions:
           from IPython import get_ipython
           client = get_ipython().user_ns["client"]
 
-  (A small accessor API is planned to replace this; see #664.)
+  (A small accessor API is planned to replace this.)
 
 Two plugins ship here. ``rolling_ball.py`` is the worked example — a fast ImageJ
 port of rolling-ball background subtraction — and ``segmentation_qc.py`` backs the
 ``segmentation-qc-metrics`` skill, whose body carries the call signature while the
-matching itself stays here where it is unit-tested.
+matching itself stays here where it is unit-tested. Both are yours to edit: the
+installer seeds them once and never overwrites a file that already exists.
+
+Project and issue tracker: https://github.com/biopb/biopb
 """
