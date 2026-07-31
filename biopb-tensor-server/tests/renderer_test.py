@@ -45,12 +45,26 @@ class TestPlaneAxes:
     def test_samples_needs_room_for_y_and_x(self):
         assert plane_axes(["Y", "S"], (8, 3)) == (0, 1, None)
 
-    def test_degenerate_labels_cannot_collide(self):
-        # The property that replaced the old collision handling: indices come
-        # from the rank, so no label set can repeat an axis.
-        for labels in (["Y", "Y", "Y"], ["X", "Y"], [], ["Q", "W"]):
-            y, x, s = plane_axes(labels, (4, 5, 6)[: max(2, len(labels))])
-            assert y != x and s is None or s not in (y, x)
+    @pytest.mark.parametrize(
+        "labels,shape",
+        [
+            (["Y", "Y", "Y"], (4, 5, 6)),  # the same axis claimed three times
+            (["X", "Y"], (4, 5)),  # an order the server does not serve
+            ([], (4, 5)),  # no labels at all
+            (["Q", "W"], (4, 5)),  # all-unknown labels
+            (["Y", "Y", "S"], (4, 5, 3)),  # samples beside a duplicated Y
+            (["S", "S", "S"], (3, 3, 3)),  # samples claimed everywhere
+        ],
+    )
+    def test_degenerate_labels_cannot_collide(self, labels, shape):
+        # The property that replaced the old collision handling: the indices come
+        # from the rank, so no label set can repeat an axis or run out of range.
+        y, x, s = plane_axes(labels, shape)
+        assert y != x
+        assert {y, x} <= set(range(len(shape)))
+        if s is not None:
+            assert s not in (y, x)
+            assert s in range(len(shape))
 
 
 class TestSamplesAxis:
