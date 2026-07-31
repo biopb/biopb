@@ -82,7 +82,7 @@ def _resolve_axes(
     Unlabeled ``dimN`` stores (plain zarr, HDF5) are the case the contract
     deliberately leaves alone: nothing is placed, so a tensor with no labels at
     all falls back to the positional ``[..., Z, Y, X]`` reading the server's own
-    ``build_axis_map`` uses.
+    ``plane_axes`` uses.
 
     Raises:
         ValueError: fewer than two non-samples axes -- not a displayable image.

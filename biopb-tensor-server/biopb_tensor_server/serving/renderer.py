@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from biopb_tensor_server.core.axes import build_axis_map, samples_axis
+from biopb_tensor_server.core.axes import plane_axes
 
 logger = logging.getLogger(__name__)
 
@@ -178,10 +178,11 @@ def resolve_color(
     return PRESET_COLOR_MULTIPLIERS.get(color.lower(), (1.0, 1.0, 1.0))
 
 
-# Axis mapping (the AXIS_*_LABELS sets, samples_axis, build_axis_map) now lives in
+# Axis resolution (the AXIS_*_LABELS sets, samples_axis, plane_axes) lives in
 # core.axes so the render path and the core.chunk pyramid helpers share one axis
-# vocabulary; build_axis_map / samples_axis are imported at the top of this module
-# and re-exported here for callers that import them from renderer.
+# vocabulary. This module now needs only plane_axes from it -- the samples
+# lookup moved inside that resolver, since where a samples axis may sit is part
+# of the wire order rather than a question the render path answers for itself.
 
 
 # ---------------------------------------------------------------------------
@@ -264,47 +265,6 @@ def normalize_and_colorize(
     return rgb
 
 
-def _resolve_plane_axes(
-    ndim: int,
-    dim_labels: list[str],
-    shape: Tuple[int, ...],
-) -> Tuple[int, int, Optional[int]]:
-    """Pick distinct ``(y_idx, x_idx, s_idx)`` axes for the display plane.
-
-    Robust to malformed/degenerate label sets (a defensive requirement -- the
-    labels are attacker/adapter-supplied, not trusted). Guarantees ``y_idx`` and
-    ``x_idx`` are two *distinct*, in-range axes and ``s_idx`` (if not ``None``)
-    is a third distinct axis, so the caller's transpose can never see a repeated
-    axis. The interleaved-samples axis is honored only when it does not shadow a
-    labeled Y/X and at least two other axes remain to serve as Y and X -- so a
-    malformed ``"CYS"`` or ``"YS"`` degrades to a plain grayscale plane instead
-    of crashing. Assumes ``ndim >= 2`` (the caller guards ``ndim < 2``).
-    """
-    axis_map = build_axis_map(dim_labels)
-    y_lbl = axis_map["y"]
-    x_lbl = axis_map["x"]
-
-    s_idx = samples_axis(dim_labels, shape)
-    # Drop a samples axis that collides with a labeled Y/X, or that would leave
-    # fewer than two axes for the Y/X plane.
-    if s_idx is not None and (s_idx in (y_lbl, x_lbl) or ndim < 3):
-        s_idx = None
-
-    non_samples = [i for i in range(ndim) if i != s_idx]
-
-    # X: labeled X if usable, else the trailing non-samples axis.
-    x_idx = x_lbl if x_lbl is not None and x_lbl in non_samples else non_samples[-1]
-
-    # Y: labeled Y if usable and distinct from X, else the trailing non-samples
-    # axis that is not X.
-    if y_lbl is not None and y_lbl in non_samples and y_lbl != x_idx:
-        y_idx = y_lbl
-    else:
-        y_idx = next((i for i in reversed(non_samples) if i != x_idx), x_idx)
-
-    return y_idx, x_idx, s_idx
-
-
 def extract_yx_slice(
     arr: np.ndarray,
     dim_labels: list[str],
@@ -312,33 +272,28 @@ def extract_yx_slice(
     """Reduce a multi-dimensional array to the plane the renderer displays.
 
     Returns a 2-D ``[Y, X]`` array, or a 3-D ``[Y, X, S]`` array when an
-    interleaved RGB(A) samples axis is present (see :func:`samples_axis`). Every
-    other axis (T, Z, C, ...) is reduced to its first index -- the slice request
-    has already pinned those to a single plane -- and the kept axes are ordered
-    ``[Y, X]`` (+ trailing samples), ready for the renderer.
+    interleaved RGB(A) samples axis is present. Every other axis (T, Z, C, ...)
+    is reduced to its first index -- the slice request has already pinned those
+    to a single plane.
+
+    No transpose: the axes the server serves are canonical (biopb/biopb#596), so
+    the kept axes are already in ``[Y, X, (S)]`` relative order. Malformed labels
+    can no longer produce a repeated or negative transpose axis either, because
+    :func:`~biopb_tensor_server.core.axes.plane_axes` derives the plane from the
+    rank rather than from where a label sits.
     """
     # Below 2-D there is no Y/X plane to reduce to; promote to a 2-D (1 x N)
-    # strip so the renderer always gets at least a plane and never a repeated /
-    # negative transpose axis from _resolve_plane_axes.
+    # strip so the renderer always gets at least a plane.
     if arr.ndim < 2:
         return arr.reshape((1,) * (2 - arr.ndim) + arr.shape)
 
-    y_idx, x_idx, s_idx = _resolve_plane_axes(arr.ndim, dim_labels, arr.shape)
+    y_idx, x_idx, s_idx = plane_axes(dim_labels, arr.shape)
 
-    # Keep Y, X and (if any) the samples axis; reduce every other axis to index
-    # 0. Integer indexing drops the reduced axes; the kept axes keep their
-    # relative order, which the transpose below normalizes to [Y, X, (S)]. The
-    # three kept indices are distinct by construction, so the transpose is safe.
-    keep = [y_idx, x_idx] + ([s_idx] if s_idx is not None else [])
-    index = tuple(slice(None) if i in keep else 0 for i in range(arr.ndim))
-    reduced = arr[index]
-
-    survivors = [i for i in range(arr.ndim) if i in keep]
-    new_pos = {orig: p for p, orig in enumerate(survivors)}
-    order = [new_pos[y_idx], new_pos[x_idx]]
-    if s_idx is not None:
-        order.append(new_pos[s_idx])
-    return np.transpose(reduced, order)
+    # Keep Y, X and (if any) the trailing samples axis; reduce every other axis
+    # to index 0. Integer indexing drops the reduced axes and the kept ones keep
+    # their relative order -- already [Y, X, (S)].
+    keep = {y_idx, x_idx} | ({s_idx} if s_idx is not None else set())
+    return arr[tuple(slice(None) if i in keep else 0 for i in range(arr.ndim))]
 
 
 def normalize_rgb_samples(

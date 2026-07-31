@@ -4,20 +4,19 @@ One source of truth for "which dimension is T/Z/C/Y/X". Three resolvers classify
 labels through :func:`canonical_axis`, so the synonym vocabulary can never drift
 between them:
 
-- :func:`build_axis_map` -- the render/client-facing resolver, with a positional
-  fallback that assigns *every* unmapped x/y/z from the trailing axes.
-- :func:`labeled_axis_index` -- label-only (no positional fallback), used by the
-  pyramid helpers in ``core.chunk`` where an unlabeled leading axis (possibly T/C)
-  must never be downsampled as if it were depth.
 - :func:`canonical_permutation` -- the wire-contract resolver (biopb/biopb#596):
   the permutation that reorders an adapter's native axes into the canonical
   trailing order the server advertises. See ``core.normalize``.
+- :func:`labeled_axis_index` -- label-only (no positional fallback), used by the
+  pyramid helpers in ``core.chunk`` where an unlabeled leading axis (possibly T/C)
+  must never be downsampled as if it were depth.
+- :func:`plane_axes` -- the render-facing resolver: which axes the HTTP sidecar
+  displays. A *consumer* of the wire contract rather than a party to it, so it
+  reads the plane off the canonical order positionally.
 
 :func:`noncanonical_order` states the same rule as a refusal rather than a
 transform, for the seams that validate an order they do not own (an upload's
 declared order, a remote upstream's advertised one).
-
-Mirrors the frontend ``buildAxisMap`` in ``@biopb/tensor-flight-client``.
 """
 
 from __future__ import annotations
@@ -59,9 +58,9 @@ def canonical_axis(label: str) -> Optional[str]:
 def labeled_axis_index(dim_labels: Sequence[str], axis: str) -> Optional[int]:
     """Index of the first axis whose label maps to ``axis``, or None.
 
-    Label-only: unlike :func:`build_axis_map` there is no positional fallback, so a
-    hit means the axis is actually named (possibly by synonym). Duplicate matches
-    resolve to the first occurrence.
+    Label-only: there is no positional fallback, so a hit means the axis is
+    actually named (possibly by synonym). Duplicate matches resolve to the first
+    occurrence.
     """
     for i, label in enumerate(dim_labels):
         if canonical_axis(label) == axis:
@@ -104,10 +103,11 @@ _SAMPLES_RANK = 4
 # no canonical place, so they ride in the leading group with the unlabeled.
 #
 # It is NOT "every axis is labeled". An all-``dimN`` tensor (plain zarr / HDF5)
-# has no axis with a canonical place, so its permutation is the identity and the positional
-# fallback in :func:`build_axis_map` keeps doing the work -- relabeling ``dimN``
-# to z/y/x would promote a documented *guess* into a wire *assertion*, and that
-# assertion is wrong for e.g. a [y, x, c] array stored unlabeled.
+# has no axis with a canonical place, so its permutation is the identity and the
+# consumers' positional reading (:func:`plane_axes` here, ``_resolve_axes`` in
+# biopb-mcp) keeps doing the work -- relabeling ``dimN`` to z/y/x would promote a
+# documented *guess* into a wire *assertion*, and that assertion is wrong for
+# e.g. a [y, x, c] array stored unlabeled.
 CANONICAL_TRAILING_ORDER = ("z", "y", "x", "s")
 
 
@@ -205,34 +205,36 @@ def noncanonical_order(
     )
 
 
-def build_axis_map(dim_labels: list[str]) -> dict[str, Optional[int]]:
-    """Map semantic axis names to dimension indices.
+def plane_axes(
+    dim_labels: Sequence[str], shape: Sequence[int]
+) -> Tuple[int, int, Optional[int]]:
+    """``(y_idx, x_idx, s_idx)`` for the 2-D plane the render path displays.
 
-    Mirrors frontend buildAxisMap() in tensor-flight-client.
+    The consumer-side resolver for the order :func:`canonical_permutation`
+    guarantees: Y and X are the last two axes, sitting behind an interleaved
+    RGB(A) samples axis when there is one. Labels are read for exactly one
+    question -- is the *trailing* axis samples -- because that is the only thing
+    position cannot answer. :func:`samples_axis` supplies the size-3/4 gate, so a
+    3-channel ``[C, Y, X]`` stack is never composited as false color; an ``S``
+    found anywhere but last is ignored, since that is not an order this server
+    serves.
+
+    Requires ``len(shape) >= 2`` (callers guard, or accept the negative index a
+    sub-2-D tensor yields, exactly as the positional fallback here always did).
+
+    The three indices are distinct and in range **by construction**, which is
+    what lets this stay short where the label-matching resolver it replaced
+    needed explicit collision handling: nothing is derived from where a label
+    *sits*, so a duplicate ``y``, an ``S`` shadowing ``X``, or an all-unknown
+    label set cannot produce a repeated transpose axis. They simply leave the
+    plane where the wire order says it is.
+
+    Mirrors ``buildAxisMap`` in the frontend ``@biopb/tensor-flight-client``,
+    which resolves the same plane the same way (it keeps a label lookup for the
+    T/C slider axes, which the canonical order does not position).
     """
-    result: dict[str, Optional[int]] = {
-        "t": None,
-        "z": None,
-        "c": None,
-        "y": None,
-        "x": None,
-    }
-
-    unassigned = []
-    for i, label in enumerate(dim_labels):
-        canonical = canonical_axis(label)
-        if canonical is None:
-            unassigned.append(i)
-        else:
-            result[canonical] = i
-
-    # Positional fallback for unmapped axes: last → X, second-last → Y,
-    # third-last → Z.
-    if result["x"] is None and unassigned:
-        result["x"] = unassigned.pop()  # last
-    if result["y"] is None and unassigned:
-        result["y"] = unassigned.pop()  # second-last
-    if result["z"] is None and unassigned:
-        result["z"] = unassigned.pop()  # third-last
-
-    return result
+    ndim = len(shape)
+    trailing_samples = samples_axis(list(dim_labels), tuple(shape)) == ndim - 1
+    s_idx = ndim - 1 if (ndim >= 3 and trailing_samples) else None
+    x_idx = ndim - 1 if s_idx is None else ndim - 2
+    return x_idx - 1, x_idx, s_idx

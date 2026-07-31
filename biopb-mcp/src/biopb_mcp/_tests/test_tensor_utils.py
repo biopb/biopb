@@ -126,7 +126,7 @@ class TestResolveAxes:
 
     def test_no_labels_is_positional(self):
         # Nothing to read: fall back to the positional [..., Z, Y, X] reading
-        # the server's own build_axis_map uses.
+        # the server's own plane_axes uses.
         assert _resolve_axes([20, 512, 512], None) == (1, 2, 0, None)
         assert _resolve_axes([512, 512], None) == (0, 1, None, None)
 

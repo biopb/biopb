@@ -1066,14 +1066,15 @@ async def _ws_render_one(
         if not dim_labels:
             dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
 
-        # Case-insensitive Y/X lookup (descriptor labels are uppercase "TCZYXS").
-        # A raw dim_labels.index("y") misses "Y" and, for a 6-D RGB TCZYXS
-        # layout, its positional fallback would pick X/S as Y/X.
-        from .renderer import build_axis_map
+        # The same plane the renderer will reduce to, resolved the same way --
+        # this crop and that reduction must agree on which axis is Y, or the
+        # request and the picture disagree silently. Sharing plane_axes is what
+        # makes that structural; it also covers the samples axis, which the
+        # hand-rolled fallback here did not (a 6-D RGB TCZYXS with unrecognized
+        # labels picked X/S as Y/X).
+        from biopb_tensor_server.core.axes import plane_axes
 
-        _axis_map = build_axis_map(dim_labels)
-        y_idx = _axis_map["y"] if _axis_map["y"] is not None else len(dim_labels) - 2
-        x_idx = _axis_map["x"] if _axis_map["x"] is not None else len(dim_labels) - 1
+        y_idx, x_idx, _ = plane_axes(dim_labels, dask_arr.shape)
 
         # Slice to the originally requested bounds (except y/x) before computing.
         dask_arr = _ws_crop_to_request(dask_arr, cctx, y_idx, x_idx)

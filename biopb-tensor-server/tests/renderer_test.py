@@ -10,13 +10,47 @@ axis by indexing the Y axis, rendering a 512x3 strip instead of the image.
 
 import numpy as np
 import pytest
+from biopb_tensor_server.core.axes import plane_axes, samples_axis
 from biopb_tensor_server.serving.renderer import (
     extract_yx_slice,
     render_array_to_image_bytes,
-    samples_axis,
 )
 
 RGB_LABELS = ["T", "C", "Z", "Y", "X", "S"]
+
+
+class TestPlaneAxes:
+    """The render plane is read off the canonical wire order (biopb/biopb#596):
+    Y and X are the last two axes, behind a trailing samples axis."""
+
+    def test_trailing_yx(self):
+        assert plane_axes(["T", "C", "Z", "Y", "X"], (1, 3, 1, 8, 10)) == (3, 4, None)
+
+    def test_samples_pushes_yx_forward(self):
+        assert plane_axes(RGB_LABELS, (1, 1, 1, 8, 10, 3)) == (3, 4, 5)
+
+    def test_2d(self):
+        assert plane_axes(["Y", "X"], (8, 10)) == (0, 1, None)
+
+    def test_samples_only_where_the_canonical_order_puts_it(self):
+        # An S that is not last is not an order this server serves, so it is
+        # ignored rather than hunted down -- it reduces to index 0 like any
+        # other leading axis.
+        assert plane_axes(["S", "Y", "X"], (3, 8, 10)) == (1, 2, None)
+
+    def test_size_gate(self):
+        # A trailing "S" that is not 3 or 4 wide is not interleaved colour.
+        assert plane_axes(RGB_LABELS, (1, 1, 1, 8, 10, 5)) == (4, 5, None)
+
+    def test_samples_needs_room_for_y_and_x(self):
+        assert plane_axes(["Y", "S"], (8, 3)) == (0, 1, None)
+
+    def test_degenerate_labels_cannot_collide(self):
+        # The property that replaced the old collision handling: indices come
+        # from the rank, so no label set can repeat an axis.
+        for labels in (["Y", "Y", "Y"], ["X", "Y"], [], ["Q", "W"]):
+            y, x, s = plane_axes(labels, (4, 5, 6)[: max(2, len(labels))])
+            assert y != x and s is None or s not in (y, x)
 
 
 class TestSamplesAxis:
@@ -71,24 +105,26 @@ class TestExtractYxSlice:
 
 
 class TestExtractYxSliceMalformed:
-    """Defensive: attacker/adapter-supplied labels must never crash the render.
+    """Defensive: adapter-supplied labels must never crash the render.
 
-    Degenerate label sets can map the samples axis onto Y/X, leave Y/X with no
-    distinct axis, or under-rank the array -- all of which previously produced a
-    repeated / negative transpose axis (ValueError / KeyError).
+    These used to need explicit collision handling -- a degenerate set could map
+    the samples axis onto Y/X or leave Y/X with no distinct axis, producing a
+    repeated / negative transpose axis (ValueError / KeyError). Resolving the
+    plane from the rank instead makes that unrepresentable, so these now assert a
+    property that holds by construction rather than one defended case by case.
     """
 
     @pytest.mark.parametrize(
         "labels,shape",
         [
-            (["C", "Y", "S"], (3, 8, 10)),  # S claimed as X by fallback + samples
-            (["C", "Y"], (3, 8)),  # X falls back onto Y's axis
+            (["C", "Y", "S"], (3, 8, 10)),  # trailing S, but not 3/4 wide
+            (["C", "Y"], (3, 8)),  # no X label at all
             (["Y", "S"], (8, 3)),  # samples but too few spatial axes
             (["S"], (3,)),  # 1-D
             (["X"], ()),  # 0-D
             ([], (4, 5)),  # no labels
             (["Q", "W"], (6, 7)),  # all-unknown labels
-            (["X", "Y"], (6, 7)),  # swapped order
+            (["X", "Y"], (6, 7)),  # an order the server does not serve
         ],
     )
     def test_no_crash_and_valid_plane(self, labels, shape):
