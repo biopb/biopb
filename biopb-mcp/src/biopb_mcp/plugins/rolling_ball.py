@@ -8,10 +8,11 @@ proportionally small ball on it, and **bilinearly enlarge** the background back,
 cutting the work by the shrink factor to the fourth power (``~256×`` at radius 50).
 That is the whole reason ImageJ is dramatically faster, and this reproduces it.
 
-biopb-mcp ships this as a built-in example kernel plugin (#92): the installer
+biopb-mcp ships this as a built-in example kernel plugin: the installer
 seeds a copy into ``~/.config/biopb/kernel/`` so it loads into the agent kernel
 namespace at startup and is visible/editable as a worked "bring your own tool"
-example. Two callables land in the namespace:
+example. Two callables, reached through the module the agent gets bound
+(``rolling_ball``):
 
 - ``subtract_background(image, radius=50, ...)`` — the background-subtracted image.
 - ``rolling_ball_background(image, radius=50, ...)`` — just the estimated background.
@@ -30,15 +31,11 @@ is scipy's edge-replicate, a minor rim approximation vs ImageJ's roll-past-edge 
 immaterial to the interior background estimate.
 """
 
-# No ``from __future__ import annotations``: as a startup file this exec's into
-# the agent namespace, and that import would leak the name ``annotations`` there.
-# The 3.10+ signatures below don't need it (no ``X | Y`` unions).
-
-# Imported under private aliases so that when this file is loaded as a kernel
-# startup plugin (exec'd directly into the agent namespace, IPython startup/
-# semantics) it contributes only its public API — subtract_background,
-# rolling_ball_background, DEFAULT_RADIUS — and not scipy/skimage handles. np is
-# left public but the loader's reserved-name guard restores the kernel's own.
+# Private aliases keep the module's own surface to its public API, so
+# `inspect_object("rolling_ball")` shows the agent two callables rather than every
+# scipy/skimage handle this file imported. Style, not protection: as a kernel
+# plugin this module is bound under one name, so nothing here can reach the
+# agent's namespace.
 import math as _math
 
 import numpy as np

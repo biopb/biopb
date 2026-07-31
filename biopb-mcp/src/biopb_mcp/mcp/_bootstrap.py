@@ -273,9 +273,9 @@ def _start_update_check(viewer, config):
     threading.Thread(target=_worker, name="biopb-update-check", daemon=True).start()
 
 
-# Load-bearing namespace names a user plugin (#92) must not shadow. The merge
-# guard skips any of these; the startup-file save/restore protects all except the
-# two owned by the background dask-attach thread (below), which it must not race.
+# Load-bearing namespace names a user plugin (#92) must not shadow. A plugin now
+# contributes exactly one binding -- its module -- so this is a single check per
+# plugin rather than a sweep over everything it happened to define (#664).
 _RESERVED_NAMES = frozenset(
     {
         "viewer",
@@ -292,16 +292,18 @@ _RESERVED_NAMES = frozenset(
         "_resync_view",
     }
 )
-# Written only by the daemon attach thread (its sole-writer invariant, step 3), so
-# a plugin exec must NOT snapshot+restore them — that would race the attach and
-# could revert a just-attached Client.
-_ATTACH_OWNED = frozenset({"_dask_client", "_dask_attach_done"})
+# Plugin modules live under this prefix in ``sys.modules``, never under their bare
+# stem: a user file named ``skimage.py`` must not be able to claim
+# ``sys.modules["skimage"]`` for everything imported after it. The prefix is a key,
+# not an importable package — nothing imports it, and by-value pickling (see
+# _bind_by_value) means no unpickler ever resolves the name either.
+_PLUGIN_MODULE_PREFIX = "biopb_kernel_plugins"
 
 
 def _public_names(mapping: dict) -> dict:
-    """The names a module/mapping plugin contributes: ``__all__`` if declared, else
-    every public (non-``_``) name that is not itself an imported module (so a
-    plugin's ``import numpy as np`` doesn't leak ``np`` into the namespace)."""
+    """The names a mapping plugin contributes: ``__all__`` if declared, else every
+    public (non-``_``) name that is not itself an imported module (so a plugin's
+    ``import numpy as np`` doesn't leak ``np`` into the namespace)."""
     import types
 
     declared = mapping.get("__all__")
@@ -329,58 +331,110 @@ def _merge_names(ip, names: dict, *, source: str) -> None:
         ns[key] = value
 
 
-def _load_startup_files(ip, plugin_dir) -> list[str]:
-    """Exec each ``*.py`` in *plugin_dir* directly in the kernel namespace.
+def _bind_one(ip, name: str, value, *, source: str) -> bool:
+    """Bind a plugin's single contributed *name*, refusing a reserved one."""
+    if name in _RESERVED_NAMES:
+        logger.warning(
+            "kernel plugin %s would shadow reserved name %r; skipped", source, name
+        )
+        return False
+    ip.user_ns[name] = value
+    logger.info("Loaded kernel plugin: %s (from %s)", name, source)
+    return True
 
-    IPython ``startup/`` semantics: a file's top-level defs land beside ``viewer``/
-    ``client``/``ops``, and its functions resolve those live handles as globals at
-    call time -- exactly like agent ``execute_code`` (which also runs in this
-    namespace), so ``client`` refreshed per-job is seen. Fail-open per file. Any
-    load-bearing name the file overwrites is restored (warned); the two
-    attach-thread-owned names are left untouched to avoid racing that thread.
 
-    Returns the stems that loaded, for ``_requires.record_loaded_plugins`` -- the
+def _pickle_by_value(mod) -> None:
+    """Make *mod*'s functions pickle by value, so they survive the trip to a dask
+    worker.
+
+    The old exec-into-the-namespace loader got this for free: a function defined in
+    ``user_ns`` reports ``__module__ == "__main__"``, which cloudpickle always
+    serializes by value. A function reached through an imported module pickles by
+    *reference* instead -- a few bytes naming a module no worker can import, since
+    the plugin dir is on no ``sys.path`` but this kernel's. ``dask.scheduler``
+    defaults to distributed and the guides steer the agent toward dask, so without
+    this a plugin function inside a ``da.map_blocks`` would fail at compute time,
+    far from the load that caused it. Fail-open: in-process use still works.
+    """
+    try:
+        import cloudpickle
+    except ImportError:  # no distributed stack → nothing ships to a worker
+        return
+    try:
+        cloudpickle.register_pickle_by_value(mod)
+    except Exception:
+        logger.warning(
+            "kernel plugin %s: could not register for by-value pickling; its "
+            "functions will not run on a dask worker",
+            getattr(mod, "__name__", mod),
+            exc_info=True,
+        )
+
+
+def _load_plugin_files(ip, plugin_dir) -> list[str]:
+    """Import each ``*.py`` in *plugin_dir* as a module, bound under its stem.
+
+    A plugin contributes exactly **one** name -- its module -- so its helpers and
+    imports stay on the module instead of landing in the agent's namespace (#664).
+    ``dir()`` then names the plugin rather than its parts, and
+    ``inspect_object("<stem>")`` prints the module docstring plus every public
+    callable with its signature.
+
+    Loaded from the path, not by import: the kernel's interpreter need not be the
+    tool env, so the plugin dir is reachable where installed-package metadata is
+    not. Fail-open per file.
+
+    Returns the stems that bound, for ``_requires.record_loaded_plugins`` -- the
     file being on disk is not the same fact, precisely because this is fail-open.
     """
     try:
         paths = sorted(plugin_dir.glob("*.py"))
     except OSError:
         return []
-    ns = ip.user_ns
-    protect = _RESERVED_NAMES - _ATTACH_OWNED
+    import importlib.util
+    import sys
+
     loaded = []
     for path in paths:
         if path.name.startswith("_"):
             continue
-        saved = {k: ns[k] for k in protect if k in ns}
+        module_name = f"{_PLUGIN_MODULE_PREFIX}.{path.stem}"
         try:
-            code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
-            exec(code, ns)  # noqa: S102 - user plugin; this kernel is RCE by design
-            logger.info("Loaded kernel plugin file: %s", path.name)
-            loaded.append(path.stem)
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"no import machinery for {path}")
+            mod = importlib.util.module_from_spec(spec)
+            # Registered before exec so a plugin that re-imports itself (directly
+            # or via pickle/dataclass machinery) resolves this same object rather
+            # than executing the file a second time.
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
         except Exception:
+            sys.modules.pop(module_name, None)
             logger.exception("kernel plugin file %s failed to load", path.name)
-        finally:
-            for key, value in saved.items():
-                if ns.get(key) is not value:
-                    logger.warning(
-                        "kernel plugin %s overwrote reserved name %r; restored",
-                        path.name,
-                        key,
-                    )
-                    ns[key] = value
+            continue
+        if _bind_one(ip, path.stem, mod, source=path.name):
+            _pickle_by_value(mod)
+            loaded.append(path.stem)
+        else:
+            sys.modules.pop(module_name, None)
     return loaded
 
 
 def _load_entry_point_plugins(ip) -> list[str]:
     """Load ``biopb_mcp.namespace`` entry-point packages into the namespace.
 
-    An entry point resolving to a ``register(namespace)`` callable is called with a
-    read-through snapshot of the live namespace (it can inspect the handles and add
-    names); one resolving to a module or mapping has its public names merged. All
-    merges pass the reserved-name guard; fail-open per entry point.
+    A module or mapping entry point binds **one** name -- the entry-point name --
+    like a plugin file does (#664); a mapping is wrapped in a namespace object so
+    its members are reached the same way. A ``register(namespace)`` callable stays
+    the escape hatch for a plugin that must bind several names itself: it is called
+    with a read-through snapshot of the namespace and only its new bindings are
+    merged, each past the reserved-name guard. That snapshot is taken at load time,
+    when ``client`` is still the ``None`` seeded at step 7 -- a hook wanting the
+    live client must read it per call (see ``plugins/__init__.py``).
 
-    Returns the entry-point names that loaded (see :func:`_load_startup_files`).
+    Fail-open per entry point. Returns the names that loaded (see
+    :func:`_load_plugin_files`).
     """
     from biopb._kernel_plugins import NAMESPACE_ENTRY_POINT_GROUP
 
@@ -406,12 +460,17 @@ def _load_entry_point_plugins(ip) -> list[str]:
             continue
         try:
             if isinstance(obj, types.ModuleType):
-                _merge_names(ip, _public_names(vars(obj)), source=ep.name)
+                if not _bind_one(ip, ep.name, obj, source=ep.name):
+                    continue
+                _pickle_by_value(obj)
             elif isinstance(obj, Mapping):
-                # A returned mapping is a namespace-like source (like a module), so
-                # filter it the same way: public names / honor __all__, drop the
-                # odd dunder. (A register() hook, by contrast, writes literally.)
-                _merge_names(ip, _public_names(dict(obj)), source=ep.name)
+                # Wrapped, not merged: a mapping is a namespace-like source, so it
+                # binds one name like a module does. Filtered the same way too —
+                # public names / honor __all__, drop the odd dunder. (A register()
+                # hook, by contrast, writes literally.)
+                holder = types.SimpleNamespace(**_public_names(dict(obj)))
+                if not _bind_one(ip, ep.name, holder, source=ep.name):
+                    continue
             elif callable(obj):
                 # A read-through snapshot: register() sees the live handles, and we
                 # merge only what it newly bound (guarded) rather than let it write
@@ -424,6 +483,11 @@ def _load_entry_point_plugins(ip) -> list[str]:
                     if ip.user_ns.get(k, _MISSING) is not v
                 }
                 _merge_names(ip, writes, source=ep.name)
+                logger.info(
+                    "Loaded kernel plugin entry point: %s (register hook, %d name(s))",
+                    ep.name,
+                    len(writes),
+                )
             else:
                 logger.warning(
                     "kernel plugin entry point %r is not a register()/module/mapping;"
@@ -431,7 +495,6 @@ def _load_entry_point_plugins(ip) -> list[str]:
                     ep.name,
                 )
                 continue
-            logger.info("Loaded kernel plugin entry point: %s", ep.name)
             loaded.append(ep.name)
         except Exception:
             logger.exception("kernel plugin entry point %r failed to load", ep.name)
@@ -462,9 +525,9 @@ def _load_namespace_plugins(ip, config) -> None:
 
     files, entry_points = [], []
     try:
-        files = _load_startup_files(ip, mcp_plugin_dir())
+        files = _load_plugin_files(ip, mcp_plugin_dir())
     except Exception:
-        logger.exception("kernel plugin: startup-file load failed")
+        logger.exception("kernel plugin: plugin-file load failed")
     try:
         entry_points = _load_entry_point_plugins(ip)
     except Exception:

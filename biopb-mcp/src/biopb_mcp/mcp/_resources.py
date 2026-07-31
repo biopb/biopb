@@ -45,24 +45,30 @@ runs in a background thread to keep the main Qt thread responsive.
 
 ## Kernel plugins
 
-**User plugins may add more names** beyond the table above: top-level
-definitions from `*.py` files in `~/.config/biopb/kernel/`, and installed
-`biopb_mcp.namespace` packages, are loaded into this namespace at kernel start.
-They're lab-specific helpers, not built-ins — so an unfamiliar name is likely one
-of these. Two questions, two different answers:
+**User plugins may add more names** beyond the table above: each `*.py` file in
+`~/.config/biopb/kernel/`, and each installed `biopb_mcp.namespace` package, is
+loaded at kernel start and bound as **one module, named after the file** —
+`rolling_ball.py` becomes `rolling_ball`, and its functions are called as
+`rolling_ball.subtract_background(...)`. They're lab-specific helpers, not
+built-ins, so an unfamiliar module is likely one of these.
 
 - **Which plugins loaded** — `server_status`, section `## Kernel plugins`. It
   lists the files and the packages that actually loaded; the loader is fail-open
   per unit, so a `*.py` sitting in that directory but missing from the report
   failed on load and the session log says why. The section reads
-  `(disabled — services.namespace_enabled)` where plugins are switched off.
-- **What names they contribute** — introspection. A plugin file contributes its
-  *functions*, not its own name, so the report cannot answer this:
+  `(disabled — services.namespace_enabled)` where plugins are switched off. The
+  name it reports is the name bound in the namespace.
+- **What a plugin offers** — introspection. `inspect_object` on the module prints
+  its docstring plus every public callable with its signature and summary line:
 
 ```python
 [n for n in dir() if not n.startswith("_")]   # everything actually in scope
-inspect_object("<name>")                        # its signature + docstring
+inspect_object("rolling_ball")                 # the module: docstring + callables
 ```
+
+A plugin function works inside `da.map_blocks` / `client.submit` like any other —
+plugin modules are registered for by-value pickling, so a dask worker does not
+need the plugin dir.
 
 ## Long-running jobs
 A slow `execute_code` call runs in a background thread and returns a `job-N` handle;

@@ -33,17 +33,16 @@ the matching is the part that is easy to get subtly wrong and cheap to unit-test
 prediction too, and excluding one side only is the most common way these numbers
 end up not comparable to a published figure.
 
-Three callables land in the agent namespace: ``match_labels`` (one operating
-point), ``f1_at_thresholds`` (the sweep, as a DataFrame), and the ``SegQCResult``
-record they return.
+Three public callables, reached through the module the agent gets bound
+(``segmentation_qc``): ``match_labels`` (one operating point),
+``f1_at_thresholds`` (the sweep, as a DataFrame), and the ``SegQCResult`` record
+they return.
 """
 
-# No ``from __future__ import annotations``: as a startup file this exec's into
-# the agent namespace, and that import would leak the name ``annotations`` there.
-
-# Imported under private aliases so the startup exec contributes only this
-# module's public API. np is left public — the loader's reserved-name guard
-# restores the kernel's own handle.
+# Private aliases keep the module's own surface to its public API, so
+# `inspect_object("segmentation_qc")` shows the agent the three callables rather
+# than every pandas/scipy handle this file imported. Style, not protection: as a
+# kernel plugin this module is bound under one name.
 import warnings as _warnings
 from dataclasses import dataclass as _dataclass, field as _dc_field
 

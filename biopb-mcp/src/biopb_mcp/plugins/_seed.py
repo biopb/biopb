@@ -3,10 +3,9 @@
 The installer runs this (``biopb-mcp-seed-plugins``) so the bundled plugins —
 ``rolling_ball.py``, ``segmentation_qc.py``, plus the namespace ``__init__.py``
 doc — land in ``~/.config/biopb/kernel/``. Delivering them as **files there**, rather
-than only as an installed module, makes it visible/editable to the user and loads
-it through the startup-file path, which is robust to the kernel interpreter's
-entry-point metadata view (the ``python3`` kernelspec need not be the biopb-mcp
-tool env).
+than only as an installed module, makes them visible/editable to the user and loads
+them from a path, which is robust to the kernel interpreter's entry-point metadata
+view (the ``python3`` kernelspec need not be the biopb-mcp tool env).
 
 Seeding is **idempotent and never clobbers**: an existing file is left untouched
 (the user may have edited it), mirroring how the installer preserves an existing
