@@ -23,7 +23,7 @@ import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorReadOption
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.axes import canonical_permutation
+from biopb_tensor_server.core.axes import canonical_axis, canonical_permutation
 from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
 from biopb_tensor_server.core.normalize import (
     NormalizingAdapter,
@@ -110,6 +110,24 @@ class TestCanonicalPermutation:
         labels = ["c", "t", "dimq", "x", "y"]
         perm = canonical_permutation(labels, [2, 3, 4, 5, 6])
         assert [labels[p] for p in perm] == ["c", "t", "dimq", "y", "x"]
+
+    def test_an_unrecognized_label_keeps_its_order_not_its_index(self):
+        """The precise claim, which is easy to overstate: ``dimq`` moved relative
+        to nothing, but a trailing axis moved out from in front of it, so its
+        index changed. The guarantee is about relative order, not position."""
+        labels = ["z", "dimq", "y", "x"]
+        perm = canonical_permutation(labels, [2, 3, 4, 5])
+        assert [labels[p] for p in perm] == ["dimq", "z", "y", "x"]
+        assert perm.index(1) == 0  # dimq: was axis 1, now leads
+
+    def test_t_and_c_are_recognized_but_have_no_canonical_place(self):
+        """The other half of the wording: ``canonical_axis`` classifies T and C,
+        yet neither is part of ``[..., Z, Y, X, S]`` -- they ride in the leading
+        group with the unlabeled rather than sorting into the tail."""
+        assert canonical_axis("channel") == "c" and canonical_axis("frame") == "t"
+        labels = ["z", "t", "c", "y", "x"]
+        perm = canonical_permutation(labels, [2, 3, 4, 5, 6])
+        assert [labels[p] for p in perm] == ["t", "c", "z", "y", "x"]
 
     # -- Decision 1: unlabeled stores are out of scope --------------------------
 
@@ -388,6 +406,45 @@ class TestNormalizedDescriptorAndData:
                 adapter.put_chunk(
                     ChunkBounds(start=[0, 0, 0], stop=[1, 1, 1]), None, (1, 1, 1), "u2"
                 )
+
+    def test_the_permutation_is_re_derived_not_frozen(self):
+        """``perm`` reads the inner adapter's labels every time.
+
+        A memoized permutation cannot notice that its source's labels changed,
+        and would keep transposing against a store that no longer needs it. The
+        adapter family that actually mutates its descriptors in place -- the
+        remote proxy -- is refused rather than wrapped, so nothing today can hit
+        this; re-deriving keeps it true for whatever is wrapped next.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            inner = _zarr_adapter(tmp, np.zeros((2, 3, 4), np.uint8), ["x", "y", "z"])
+            wrapper = normalize_adapter(inner)
+            assert wrapper.perm == (2, 1, 0)
+
+            inner.dim_labels = ["z", "y", "x"]
+            assert wrapper.perm is None
+            desc = wrapper.get_tensor_descriptor()
+            assert list(desc.dim_labels) == ["z", "y", "x"]
+            assert list(desc.shape) == [2, 3, 4]
+
+    def test_an_undescribable_source_reports_no_permutation(self):
+        """A descriptor that cannot be fetched degrades to identity -- and, since
+        nothing is cached, the source normalizes normally once it can be."""
+        with tempfile.TemporaryDirectory() as tmp:
+            inner = _zarr_adapter(tmp, np.zeros((2, 3, 4), np.uint8), ["x", "y", "z"])
+            wrapper = normalize_adapter(inner)
+            broken = {"raise": True}
+            real = inner.get_tensor_descriptor
+
+            def flaky():
+                if broken["raise"]:
+                    raise RuntimeError("upstream down")
+                return real()
+
+            inner.get_tensor_descriptor = flaky
+            assert wrapper.perm is None  # outage -> identity, not a crash
+            broken["raise"] = False
+            assert wrapper.perm == (2, 1, 0)  # recovered, not stranded
 
     def test_delegated_identity_fields_are_not_shadowed(self):
         """The wrapper inherits SourceAdapter's per-source class attributes, so

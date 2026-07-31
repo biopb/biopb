@@ -130,8 +130,13 @@ Adapters read whatever axis order their upstream reader emits. The server
 normalizes that at the adapter seam, so the wire carries a guarantee instead of
 each consumer re-deriving "which axis is Y/X/Z/S" with its own vocabulary:
 
-> **Recognized** axes appear in canonical relative order `[…, Z, Y, X, S]`;
-> unrecognized labels hold their positions.
+> **Z, Y, X and S appear last, in that relative order**; every other axis — T, C,
+> and any unrecognized label — keeps its relative order ahead of them.
+
+Relative order, not index: `[z, dimq, y, x]` normalizes to `[dimq, z, y, x]` —
+`dimq` moved relative to nothing, but a trailing axis moved out from in front of
+it. And only Z/Y/X/S count as trailing; T and C classify through the same
+vocabulary but have no canonical place, so they ride with the unlabeled.
 
 The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` is the
 seam that applies it, and `SourceRegistry.register` — the single registration

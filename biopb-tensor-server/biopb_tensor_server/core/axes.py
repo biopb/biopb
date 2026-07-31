@@ -93,11 +93,18 @@ _SAMPLES_RANK = 4
 
 # What the guarantee actually says, and what it deliberately does not:
 #
-#   RECOGNIZED axes appear in canonical relative order [..., Z, Y, X, S];
-#   unrecognized labels hold their positions.
+#   Z, Y, X and S appear last, in that relative order; every other axis -- T, C,
+#   and any unrecognized label -- keeps its relative order ahead of them.
+#
+# Note what the second clause does NOT say: an unrecognized label keeps its
+# relative order, not its *index*. [z, dimq, y, x] normalizes to
+# [dimq, z, y, x] -- dimq did not move relative to anything, but a trailing axis
+# moved out from in front of it. Only "recognized" in the [..., Z, Y, X, S]
+# sense counts as trailing: T and C classify through the same vocabulary but have
+# no canonical place, so they ride in the leading group with the unlabeled.
 #
 # It is NOT "every axis is labeled". An all-``dimN`` tensor (plain zarr / HDF5)
-# has no recognized axis, so its permutation is the identity and the positional
+# has no axis with a canonical place, so its permutation is the identity and the positional
 # fallback in :func:`build_axis_map` keeps doing the work -- relabeling ``dimN``
 # to z/y/x would promote a documented *guess* into a wire *assertion*, and that
 # assertion is wrong for e.g. a [y, x, c] array stored unlabeled.
@@ -123,7 +130,7 @@ def canonical_permutation(
     when
 
     - the labels are absent or their count does not match ``shape``;
-    - no axis is recognized at all (the unlabeled ``dimN`` case -- Decision 1 of
+    - no axis has a canonical place (the unlabeled ``dimN`` case -- Decision 1 of
       biopb/biopb#596: out of scope, and provably a no-op here);
     - two axes claim the same canonical role (duplicate ``y``, say), so there is
       no one right answer;
@@ -160,10 +167,10 @@ def canonical_permutation(
         )
         return None
     if not trailing:
-        return None  # nothing recognized -- unlabeled store, identity by design
+        return None  # nothing placed -- unlabeled store, identity by design
 
     # Stable sort: the rank-0 leading group (T, C, dimN, ...) keeps its relative
-    # order, and the recognized axes land in Z, Y, X, S order behind it.
+    # order, and the placed axes land in Z, Y, X, S order behind it.
     perm = tuple(sorted(range(len(labels)), key=lambda i: ranks[i]))
     return None if perm == tuple(range(len(labels))) else perm
 

@@ -4,8 +4,8 @@ Adapters advertise ``dim_labels`` in whatever order their upstream reader emits.
 This module turns that into a **wire guarantee** so no consumer has to re-derive
 "which axis is Y/X/Z/S" for itself:
 
-    RECOGNIZED axes appear in canonical relative order ``[..., Z, Y, X, S]``;
-    unrecognized labels hold their positions.
+    Z, Y, X and S appear last, in that relative order; every other axis -- T, C,
+    and any unrecognized label -- keeps its relative order ahead of them.
 
 The rule lives in :func:`biopb_tensor_server.core.axes.canonical_permutation`;
 this module is the *seam* that applies it. :func:`normalize_adapter` wraps a
@@ -106,8 +106,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_UNSET = object()
-
 
 # --- pure permutation helpers ------------------------------------------------
 
@@ -207,7 +205,6 @@ class NormalizingAdapter(TensorAdapter):
 
     def __init__(self, inner: SourceAdapter) -> None:
         self._inner = inner
-        self._perm_cache: Any = _UNSET
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"NormalizingAdapter({self._inner!r})"
@@ -293,25 +290,24 @@ class NormalizingAdapter(TensorAdapter):
     def perm(self) -> Optional[Tuple[int, ...]]:
         """This tensor's native -> canonical permutation, or None for identity.
 
-        Derived from the wrapped adapter's own descriptor and memoized on
-        success. A failure to fetch the descriptor is **not** memoized: a source
-        can be legitimately undescribable now and describable later (an
-        unresolved cloud source before ``resolve``, a remote proxy whose upstream
-        is briefly unreachable), and caching the identity we inferred from that
-        outage would strand it un-normalized for the process's lifetime.
-        """
-        if self._perm_cache is _UNSET:
-            try:
-                desc = self._inner.get_tensor_descriptor()
-            except Exception:
-                return None
-            self._perm_cache = canonical_permutation(desc.dim_labels, desc.shape)
-        return self._perm_cache
+        Derived from the wrapped adapter's own descriptor, every time, and
+        deliberately **not** memoized. An adapter's advertised labels are not
+        immutable -- a source can be undescribable now and describable later, or
+        describable differently later -- and a cached permutation cannot notice.
+        Freezing one is how a mirror of a legacy upstream kept transposing after
+        that upstream upgraded; the proxy no longer takes this path at all (it
+        refuses instead, see the module docstring), so nothing today can go
+        stale, and re-deriving keeps it that way for whatever is added next.
 
-    def _to_native(self, values: Sequence[Any]) -> List[Any]:
-        """Reorder a canonical-order per-axis vector back into native order."""
-        perm = self.perm
-        return list(values) if perm is None else _permute(values, _invert(perm))
+        Cheap enough to prefer that: ``canonical_permutation`` is O(ndim) over a
+        descriptor the wrapper's caller is generally building anyway, and callers
+        that need it twice pass it down rather than asking twice.
+        """
+        try:
+            desc = self._inner.get_tensor_descriptor()
+        except Exception:
+            return None
+        return canonical_permutation(desc.dim_labels, desc.shape)
 
     # --- source role ----------------------------------------------------------
 
@@ -437,15 +433,20 @@ class NormalizingAdapter(TensorAdapter):
 
     # --- planning (delegate, then permute) -----------------------------------
 
-    def _permute_plan(self, plan: TensorReadPlan) -> TensorReadPlan:
+    def _permute_plan(
+        self, plan: TensorReadPlan, perm: Optional[Tuple[int, ...]]
+    ) -> TensorReadPlan:
         """Rewrite a native-order read plan into canonical order.
 
         The descriptor's per-axis fields and each endpoint's logical ``bounds``
         are permuted; ``chunk_id`` is carried verbatim, since it is the wrapped
         adapter's own opaque key and ``resolve_chunk_data`` hands it straight
         back.
+
+        Takes ``perm`` rather than reading :attr:`perm` again: its caller already
+        derived one to build the native request, and the two must be the same
+        permutation or the round trip does not close.
         """
-        perm = self.perm
         if perm is None:
             return plan
         plan.descriptor = _permute_descriptor(plan.descriptor, perm)
@@ -460,7 +461,7 @@ class NormalizingAdapter(TensorAdapter):
         if perm is None:
             return self._inner.get_read_plan(request_desc)
         native_request = _permute_descriptor(request_desc, _invert(perm))
-        return self._permute_plan(self._inner.get_read_plan(native_request))
+        return self._permute_plan(self._inner.get_read_plan(native_request), perm)
 
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
@@ -478,7 +479,7 @@ class NormalizingAdapter(TensorAdapter):
             _permute_repeated(native_opt.slice_hint.start, inverse)
             _permute_repeated(native_opt.slice_hint.stop, inverse)
         return self._permute_plan(
-            self._inner.plan_flight_info(native_opt, pyramid_config)
+            self._inner.plan_flight_info(native_opt, pyramid_config), perm
         )
 
     # --- chunk serving --------------------------------------------------------
