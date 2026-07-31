@@ -537,11 +537,13 @@ PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 512
 
 
 def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
-    """(y_idx, x_idx), matching biopb-mcp's get_xy_dim_indices.
+    """(y_idx, x_idx), agreeing with biopb-mcp's ``_resolve_axes``.
 
     Prefers a y/x-labeled axis (by synonym, via :func:`core.axes.labeled_axis_index`);
     falls back to the ``[..., Y, X]`` convention (X last, Y second-to-last) when
-    either is unlabeled.
+    either is unlabeled. The client reads the same two axes purely positionally
+    now that the served order is canonical (biopb/biopb#596) -- for an order this
+    server advertises, a labeled y/x *is* at that position, so the two agree.
     """
     ndim = len(shape)
     if dim_labels:
@@ -555,7 +557,7 @@ def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
 
 
 def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
-    """Index of the z axis or None, matching biopb-mcp's get_z_dim_index.
+    """Index of the z axis or None, agreeing with biopb-mcp's ``_resolve_axes``.
 
     Prefers a z-labeled axis (by synonym; absent label => no depth axis, never a
     positional guess -- an unlabeled leading axis may be T/C and must not be

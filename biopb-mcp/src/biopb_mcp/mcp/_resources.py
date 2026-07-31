@@ -26,7 +26,7 @@ GUIDE = """\
   apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
 - Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
 - **Server data, viewer data and your own arrays are three different things** —
-  different axis order, different resolution levels, different laziness. Read
+  different rank, different resolution levels, different laziness. Read
   `guide://data` before writing code that reads pixels off a layer.
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
@@ -157,8 +157,8 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 
 | Source | You get it with | What you get |
 |---|---|---|
-| **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **source axis order** (`dim_labels`), full resolution |
-| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, in **display order** `[..., Z, Y, X]` |
+| **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **canonical order** `[..., Z, Y, X]` (`S` last for interleaved colour), full resolution |
+| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, in that same order plus a singleton Z if the source had none |
 | **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
 
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
@@ -188,18 +188,22 @@ ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, and a
 bare `np.asarray(arr)` materializes the **whole** array in the main process
 instead of on the cluster. Slice first, or `.compute()` explicitly.
 
-**3. The viewer's axes are not the source's axes.** Levels are canonicalized to
-`...ZYX[S]` (stored in `layer.metadata['dim_labels']`), while the dask array
-from the server is in the source's own axis order (stored in
-`client.get_descriptor(array_id).dim_labels`). Similarly, the source's physical
-scale (`client.get_physical_scale()`) and the layer data's physical scale
-(`layer.scale`, what `regionprops(..., spacing=)` wants) can also be different.
-Crossing them transposes the spacing onto the wrong axes: every number changes,
-no shape does.
+**3. Same axis order, different rank — so align from the right.** The server
+guarantees everything it serves is `[..., Z, Y, X]`, with an interleaved colour
+axis `S` strictly last when there is one, so nothing is transposed on the way
+into a layer: `client.get_descriptor(array_id).dim_labels` and
+`layer.metadata['dim_labels']` describe the same order. What differs is the
+*count* — loading inserts a singleton Z when the source has none (trap 4), which
+shifts every leading axis by one. The same shift applies to the source's
+physical scale (`client.get_physical_scale()`) versus the layer's (`layer.scale`,
+what `regionprops(..., spacing=)` wants), so index spacing from the **end**, not
+the start. One extra wrinkle for interleaved colour: napari does not count `S` as
+a dimension, so `layer.scale[-1]` is X's spacing while the array's last axis is
+the colour count.
 
-**4. A 2-D source is 3-D in the viewer.** Canonicalization *inserts* a singleton
-Z, so `[Y, X]` loads as `[1, Y, X]` with a 3-element `layer.scale`. Read `ndim`
-off the array you are about to use, not off the source.
+**4. A 2-D source is 3-D in the viewer.** Loading *inserts* a singleton Z, so
+`[Y, X]` loads as `[1, Y, X]` with a 3-element `layer.scale`. Read `ndim` off the
+array you are about to use, not off the source.
 
 **5. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
 while the pixels are not there yet; a scikit-image call, `np.asarray`, or a
@@ -398,9 +402,10 @@ do **not** instrument vispy to investigate (that is the trap, see point 2):
 CLIENT = """\
 # The `client` Handle: Catalog and Tensor Data
 
-Arrays from here are lazy dask arrays in the tensor's own axis order, and a
-tensor loaded into the viewer stops being either of those — see `guide://data`
-before moving pixels between the server, a layer, and your own variables.
+Arrays from here are lazy dask arrays in the canonical `[..., Z, Y, X]` axis
+order the server guarantees, and a tensor loaded into the viewer stops being
+lazy and may gain a singleton Z — see `guide://data` before moving pixels
+between the server, a layer, and your own variables.
 
 ## Check Connection
 ```python

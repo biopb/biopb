@@ -53,7 +53,7 @@ _BASE_INSTRUCTIONS = (
     "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
     "for detail before non-trivial work: guide://kernel (namespace, skill "
     "requirements, long-running jobs & cancellation), guide://data (how arrays are "
-    "represented here -- pyramids, laziness, axis order -- and the traps), "
+    "represented here -- pyramids, laziness, axis order and rank -- and the traps), "
     "guide://client (the `client` handle: catalog, load, upload), "
     "guide://viewer (layers/camera/dims, annotation layers), "
     "guide://ops (server-side image-processing ops).\n"

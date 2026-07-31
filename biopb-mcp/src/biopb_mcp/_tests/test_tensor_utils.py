@@ -10,13 +10,11 @@ from biopb_mcp._config import get_default_config, get_setting
 from biopb_mcp._tensor_utils import (
     _advertised_pyramid_levels,
     _origin_initial_view,
+    _resolve_axes,
     add_tensor_layer,
     build_layer_scale,
     build_pyramid_levels,
     canonical_dim_labels,
-    get_samples_dim_index,
-    get_xy_dim_indices,
-    get_z_dim_index,
 )
 
 
@@ -69,7 +67,7 @@ def _scaling_side_effect(shape):
     downsample rounding isn't part of the API), so multi-level pyramid tests
     must hand back arrays whose shape actually shrinks with the scale hint. Use
     this for tests that only inspect the ``scale_hint`` call args -- the
-    canonicalizing transpose/expand at the end is a harmless no-op on mocks."""
+    singleton-Z expand at the end is a harmless no-op on mocks."""
 
     def _get_tensor(array_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
@@ -82,8 +80,8 @@ def _scaling_side_effect(shape):
 
 def _dask_scaling_side_effect(shape):
     """Like ``_scaling_side_effect`` but returns real dask arrays, so the
-    canonicalizing transpose/singleton-insert produce real output shapes and a
-    real ``.ndim`` (needed wherever the test inspects the returned levels)."""
+    singleton-Z insert produces real output shapes and a real ``.ndim`` (needed
+    wherever the test inspects the returned levels)."""
 
     def _get_tensor(array_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
@@ -93,46 +91,102 @@ def _dask_scaling_side_effect(shape):
     return _get_tensor
 
 
-class TestGetXyDimIndices:
-    def test_uses_dim_labels(self):
-        assert get_xy_dim_indices([10, 512, 512], ["z", "y", "x"]) == (1, 2)
+class TestResolveAxes:
+    """``(y, x, z, s)`` read off the canonical [..., Z, Y, X, S] wire order the
+    data plane guarantees (biopb/biopb#596). X and Y are positions; the labels
+    answer only the two presence questions position cannot."""
+
+    def test_zyx(self):
+        assert _resolve_axes([10, 512, 512], ["z", "y", "x"]) == (1, 2, 0, None)
 
     def test_case_insensitive_labels(self):
-        assert get_xy_dim_indices([512, 512], ["Y", "X"]) == (0, 1)
+        assert _resolve_axes([512, 512], ["Y", "X"]) == (0, 1, None, None)
 
-    def test_fallback_last_two_dims(self):
-        # Standard [..., Y, X]: Y is second-to-last, X is last.
-        assert get_xy_dim_indices([3, 100, 200]) == (1, 2)
+    def test_2d_has_no_z(self):
+        assert _resolve_axes([100, 200], ["y", "x"]) == (0, 1, None, None)
 
-    def test_2d_no_labels(self):
-        # [Y, X]: Y first, X last.
-        assert get_xy_dim_indices([100, 200]) == (0, 1)
+    def test_a_leading_axis_that_is_not_z(self):
+        # [C, Y, X] is 3-D but not volumetric -- the depth slot is empty.
+        assert _resolve_axes([3, 512, 512], ["c", "y", "x"]) == (1, 2, None, None)
 
-    def test_labels_without_xy_falls_back(self):
-        # Labels present but no x/y -> positional [..., Y, X] fallback.
-        assert get_xy_dim_indices([10, 512, 512], ["z", "r", "c"]) == (1, 2)
+    def test_z_synonym(self):
+        assert _resolve_axes([10, 512, 512], ["plane", "y", "x"]) == (1, 2, 0, None)
+
+    def test_only_the_slot_ahead_of_y_can_hold_z(self):
+        # [T, Z, Y, X]: canonical, so z is exactly where the order says.
+        assert _resolve_axes([5, 10, 64, 64], ["t", "z", "y", "x"]) == (2, 3, 1, None)
+        # [Z, C, Y, X] is an order the server does not serve -- it normalizes to
+        # [C, Z, Y, X]. No search is made for the buried z.
+        assert _resolve_axes([10, 3, 64, 64], ["z", "c", "y", "x"]) == (
+            2,
+            3,
+            None,
+            None,
+        )
+
+    def test_no_labels_is_positional(self):
+        # Nothing to read: fall back to the positional [..., Z, Y, X] reading
+        # the server's own build_axis_map uses.
+        assert _resolve_axes([20, 512, 512], None) == (1, 2, 0, None)
+        assert _resolve_axes([512, 512], None) == (0, 1, None, None)
+
+    def test_dimn_labels_leave_the_depth_slot_empty(self):
+        # A plain zarr's dimN labels place nothing, but they are labels, and
+        # none of them says depth -- so no axis is claimed as z.
+        assert _resolve_axes([20, 512, 512], ["dim0", "dim1", "dim2"]) == (
+            1,
+            2,
+            None,
+            None,
+        )
+
+    def test_label_count_mismatch_falls_back_to_positional(self):
+        assert _resolve_axes([3, 64, 32], ["y", "x"]) == (1, 2, 0, None)
 
     def test_under_2d_raises(self):
         # A 1-D tensor is not a displayable image; fail loud rather than
         # return a bogus (0, 0).
         with pytest.raises(ValueError):
-            get_xy_dim_indices([100])
+            _resolve_axes([100], ["x"])
 
+    def test_detects_interleaved_rgb(self):
+        assert _resolve_axes([1, 1, 1, 8, 8, 3], ["T", "C", "Z", "Y", "X", "S"]) == (
+            3,
+            4,
+            2,
+            5,
+        )
 
-class TestGetZDimIndex:
-    def test_label_z_wins_over_position(self):
-        assert get_z_dim_index([10, 5, 512, 512], ["z", "c", "y", "x"]) == 0
+    def test_detects_rgba(self):
+        assert _resolve_axes([1, 1, 1, 8, 8, 4], ["T", "C", "Z", "Y", "X", "S"]) == (
+            3,
+            4,
+            2,
+            5,
+        )
 
-    def test_labels_without_z_is_none(self):
-        # Labels present but no z -> not volumetric (e.g. [C, Y, X]).
-        assert get_z_dim_index([3, 512, 512], ["c", "y", "x"]) is None
+    def test_samples_synonym(self):
+        assert _resolve_axes([2, 8, 8, 3], ["z", "y", "x", "samples"]) == (1, 2, 0, 3)
 
-    def test_no_labels_3d_positional(self):
-        # No labels -> assume [..., Z, Y, X]; z is third-from-last.
-        assert get_z_dim_index([20, 512, 512]) == 0
+    def test_ignores_a_samples_axis_of_the_wrong_size(self):
+        # An "S" of 5 is not colour, so it stays an ordinary trailing axis --
+        # the same labels the server refuses to reorder for the same reason.
+        assert _resolve_axes([1, 1, 1, 8, 8, 5], ["T", "C", "Z", "Y", "X", "S"]) == (
+            4,
+            5,
+            None,
+            None,
+        )
 
-    def test_no_labels_2d_is_none(self):
-        assert get_z_dim_index([512, 512]) is None
+    def test_samples_needs_room_for_y_and_x(self):
+        # Rank 2 leaves nothing behind a samples axis, so it is not one.
+        assert _resolve_axes([8, 3], ["y", "s"]) == (0, 1, None, None)
+
+    def test_trailing_size_three_is_not_colour_without_the_label(self):
+        # The whole point of label-gating: a 3-channel stack must not be
+        # rendered as false colour.
+        assert _resolve_axes([3, 8, 8], ["c", "y", "x"])[3] is None
+        assert _resolve_axes([8, 8, 3], None)[3] is None
 
 
 class TestBuildPyramidLevels:
@@ -336,9 +390,9 @@ class TestAdvertisedPyramidLevelsHelper:
 
 
 class TestBuildPyramidCanonicalOrder:
-    """build_pyramid_levels emits levels in napari display order
-    [..., Z, Y, X], transposing mis-ordered sources and inserting a singleton
-    Z when the tensor has none."""
+    """The levels arrive in napari display order [..., Z, Y, X] already -- the
+    data plane's guarantee -- so the only axis work left here is inserting a
+    singleton Z when the tensor has none."""
 
     def test_inserts_singleton_z_for_2d(self):
         desc = _make_tensor_desc([64, 64], ["y", "x"])
@@ -348,46 +402,8 @@ class TestBuildPyramidCanonicalOrder:
         levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
         assert levels[0].shape == (1, 64, 64)
 
-    def test_reorders_trailing_channel(self):
-        # [Y, X, C] -> [C, Z(=1), Y, X].
-        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
-        client = MagicMock()
-        client.get_tensor.return_value = da.zeros((64, 32, 3))
-
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-        assert levels[0].shape == (3, 1, 64, 32)
-
-    def test_reorders_buried_z(self):
-        # [Z, C, Y, X] -> [C, Z, Y, X]; real z, so no singleton inserted.
-        desc = _make_tensor_desc([10, 3, 64, 64], ["z", "c", "y", "x"])
-        client = MagicMock()
-        client.get_tensor.return_value = da.zeros((10, 3, 64, 64))
-
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-        assert levels[0].shape == (3, 10, 64, 64)
-
-    def test_keeps_samples_axis_trailing(self):
-        # The biopb/biopb#596 case: [T, C, Z, Y, X, S] must stay [.., Y, X, S],
-        # NOT transpose S into a leading slider axis.
-        desc = _make_tensor_desc([1, 1, 1, 512, 512, 3], ["T", "C", "Z", "Y", "X", "S"])
-        client = MagicMock()
-        client.get_tensor.return_value = da.zeros((1, 1, 1, 512, 512, 3))
-
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-        assert levels[0].shape == (1, 1, 1, 512, 512, 3)
-
-    def test_moves_buried_samples_axis_to_the_end(self):
-        # [S, Y, X] -> [Z(=1), Y, X, S]: singleton Z is inserted ahead of Y/X
-        # and S stays strictly last.
-        desc = _make_tensor_desc([3, 64, 32], ["s", "y", "x"])
-        client = MagicMock()
-        client.get_tensor.return_value = da.zeros((3, 64, 32))
-
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-        assert levels[0].shape == (1, 64, 32, 3)
-
-    def test_size_three_channel_axis_is_not_treated_as_colour(self):
-        # [C, Y, X] with C=3 is a channel stack, not RGB -> C stays leading.
+    def test_inserts_singleton_z_behind_a_leading_channel(self):
+        # [C, Y, X] -> [C, Z(=1), Y, X]: Z lands third-from-last, not first.
         desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((3, 64, 32))
@@ -395,23 +411,76 @@ class TestBuildPyramidCanonicalOrder:
         levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
         assert levels[0].shape == (3, 1, 64, 32)
 
+    def test_a_real_z_is_left_alone(self):
+        # [C, Z, Y, X] passes through untouched -- no singleton, no transpose.
+        desc = _make_tensor_desc([3, 10, 64, 64], ["c", "z", "y", "x"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((3, 10, 64, 64))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (3, 10, 64, 64)
+
+    def test_keeps_samples_axis_trailing(self):
+        # The biopb/biopb#596 case: [T, C, Z, Y, X, S] renders as colour, not as
+        # a 3-plane stack behind a slider.
+        desc = _make_tensor_desc([1, 1, 1, 512, 512, 3], ["T", "C", "Z", "Y", "X", "S"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((1, 1, 1, 512, 512, 3))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (1, 1, 1, 512, 512, 3)
+
+    def test_singleton_z_goes_ahead_of_a_samples_axis(self):
+        # [Y, X, S] -> [Z(=1), Y, X, S]: Z is spliced ahead of Y/X so S stays
+        # strictly last.
+        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "s"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((64, 32, 3))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (1, 64, 32, 3)
+
+    def test_size_three_channel_axis_is_not_treated_as_colour(self):
+        # [C, Y, X] with C=3 is a channel stack, not RGB -> no trailing samples
+        # axis, so the singleton Z goes between C and Y.
+        desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (3, 1, 64, 32)
+
+    def test_a_non_canonical_source_is_served_as_ordered(self):
+        # [Y, X, C] is an order the data plane no longer serves -- it normalizes
+        # it to [C, Y, X]. Should one arrive anyway (a server predating the
+        # guarantee), the client trusts the wire rather than re-deriving an
+        # order behind it: C reads as X, and the singleton Z lands ahead of the
+        # last two axes. Deliberate -- the fix belongs upstream.
+        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((64, 32, 3))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (64, 1, 32, 3)
+
     def test_uses_source_desc_labels_when_tensor_unlabeled(self):
-        # Per-tensor labels missing -> fall back to the source descriptor's
-        # labels for both the reorder and the (implicit) scale alignment.
+        # Per-tensor labels missing -> fall back to the source descriptor's.
+        # Without them the trailing 3 is unlabeled and reads as X; with them it
+        # is a samples axis and the singleton Z goes ahead of Y/X.
         desc = _make_tensor_desc([64, 32, 3], None)
-        source_desc = MagicMock(dim_labels=["y", "x", "c"])
+        source_desc = MagicMock(dim_labels=["y", "x", "s"])
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((64, 32, 3))
 
         levels = build_pyramid_levels(
             client, "src", "t1", desc, source_desc=source_desc, config=_CFG
         )
-        assert levels[0].shape == (3, 1, 64, 32)
+        assert levels[0].shape == (1, 64, 32, 3)
 
 
 class TestCanonicalDimLabels:
-    """The source's labels put through the same canonicalization as the pixels,
-    so they name the *layer's* axes (biopb/biopb#651)."""
+    """The source's labels with the inserted Z spliced in, so they name the
+    *layer's* axes (biopb/biopb#651)."""
 
     def test_tczyx_passes_through_unswapped(self):
         # The bug case: the leading pair is (T, C), not the (C, T) the writer's
@@ -419,9 +488,9 @@ class TestCanonicalDimLabels:
         desc = _make_tensor_desc([2, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
         assert canonical_dim_labels(desc) == ["t", "c", "z", "y", "x"]
 
-    def test_follows_the_transpose(self):
-        # [Y, X, C] -> [C, Z(=1), Y, X]: reordered, with the inserted Z named.
-        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+    def test_splices_the_z_behind_the_leading_axes(self):
+        # [C, Y, X] -> [C, Z(=1), Y, X]: the inserted Z is named in place.
+        desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
         assert canonical_dim_labels(desc) == ["c", "z", "y", "x"]
 
     def test_names_the_inserted_singleton_z(self):
@@ -429,8 +498,8 @@ class TestCanonicalDimLabels:
         assert canonical_dim_labels(desc) == ["z", "y", "x"]
 
     def test_samples_axis_stays_last_after_the_inserted_z(self):
-        # [S, Y, X] -> [Z(=1), Y, X, S]: Z is spliced ahead of Y/X, not of S.
-        desc = _make_tensor_desc([3, 64, 32], ["s", "y", "x"])
+        # [Y, X, S] -> [Z(=1), Y, X, S]: Z is spliced ahead of Y/X, not of S.
+        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "s"])
         assert canonical_dim_labels(desc) == ["z", "y", "x", "s"]
 
     def test_matches_the_level_rank_and_order(self):
@@ -452,47 +521,14 @@ class TestCanonicalDimLabels:
         assert canonical_dim_labels(_make_tensor_desc([3, 64, 32], ["y", "x"])) is None
 
     def test_falls_back_to_the_source_descriptor(self):
-        desc = _make_tensor_desc([64, 32, 3], None)
-        source_desc = MagicMock(dim_labels=["y", "x", "c"])
+        desc = _make_tensor_desc([3, 64, 32], None)
+        source_desc = MagicMock(dim_labels=["c", "y", "x"])
         assert canonical_dim_labels(desc, source_desc=source_desc) == [
             "c",
             "z",
             "y",
             "x",
         ]
-
-
-class TestSamplesDimIndex:
-    """Interleaved RGB(A) samples axis detection -- label-gated on size 3/4, and
-    deliberately without a positional fallback (biopb/biopb#596)."""
-
-    def test_detects_rgb(self):
-        assert (
-            get_samples_dim_index([1, 1, 1, 8, 8, 3], ["T", "C", "Z", "Y", "X", "S"])
-            == 5
-        )
-
-    def test_detects_rgba(self):
-        assert (
-            get_samples_dim_index([1, 1, 1, 8, 8, 4], ["T", "C", "Z", "Y", "X", "S"])
-            == 5
-        )
-
-    def test_detects_samples_synonym_and_is_case_insensitive(self):
-        assert get_samples_dim_index([8, 8, 3], ["y", "x", "samples"]) == 2
-
-    def test_ignores_wrong_size(self):
-        # An "S" axis of 5 is not colour.
-        assert (
-            get_samples_dim_index([1, 1, 1, 8, 8, 5], ["T", "C", "Z", "Y", "X", "S"])
-            is None
-        )
-
-    def test_ignores_unlabeled_trailing_three(self):
-        # The whole point of label-gating: a 3-channel [C, Y, X] stack must not
-        # be rendered as false colour.
-        assert get_samples_dim_index([3, 8, 8], ["c", "y", "x"]) is None
-        assert get_samples_dim_index([8, 8, 3], None) is None
 
 
 def _make_physical_client(scale_vec=None, unit_vec=None, raises=False):
@@ -542,14 +578,15 @@ def test_build_layer_scale_2d_canonical_has_singleton_z():
     assert scale == [1.0, 0.25, 0.5]
 
 
-def test_build_layer_scale_maps_misordered_source_axes_by_label():
-    # Source order [y, x, c]: x/y must be resolved by label, not position.
-    client = _make_physical_client([0.25, 0.5, 0.0], ["µm", "µm", ""])
-    desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+def test_build_layer_scale_skips_the_leading_axes():
+    # Source order [c, y, x]: the summary is in the same canonical order, so
+    # x/y come off the tail and the leading channel axis gets 1.0.
+    client = _make_physical_client([0.0, 0.25, 0.5], ["", "µm", "µm"])
+    desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
     scale, info = build_layer_scale(
         client, "src", ndim=4, tensor_id="t1", tensor_desc=desc
     )
-    # Canonical [C, Z(=1), Y, X].
+    # Layer is [C, Z(=1), Y, X].
     assert scale == [1.0, 1.0, 0.25, 0.5]
     assert info["physical_size_y"] == 0.25
     assert info["physical_size_x"] == 0.5
@@ -641,11 +678,11 @@ class TestAddTensorLayer:
     def test_attaches_canonical_dim_labels(self):
         # The layer is the only place the OME-Zarr writer can learn its axis
         # names from (biopb/biopb#651) -- they must describe the *layer*, so
-        # [Y, X, C] arrives as [C, Z, Y, X], not as the source's order.
+        # [C, Y, X] arrives as [C, Z, Y, X], naming the inserted singleton.
         viewer = MagicMock()
-        client = _make_physical_client([0.25, 0.5, 0.0], ["µm", "µm", ""])
-        client.get_tensor.return_value = da.zeros((64, 32, 3))
-        desc = _make_tensor_desc([64, 32, 3], ["Y", "X", "C"])
+        client = _make_physical_client([0.0, 0.25, 0.5], ["", "µm", "µm"])
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+        desc = _make_tensor_desc([3, 64, 32], ["C", "Y", "X"])
 
         add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
@@ -685,21 +722,20 @@ class TestAddTensorLayer:
         # The qualified array_id client.get_tensor takes, not the routing prefix.
         assert kwargs["metadata"]["array_id"] == "multi/Image:0"
 
-    def test_misordered_axes_canonicalized_with_aligned_scale(self):
+    def test_inserted_z_keeps_the_scale_aligned(self):
         viewer = MagicMock()
-        client = _make_physical_client([0.25, 0.5, 0.0], ["µm", "µm", ""])
-        # [Y, X, C] layout: without canonicalization napari would display the
-        # wrong plane. A real dask array so the transpose actually reorders.
-        client.get_tensor.return_value = da.zeros((64, 32, 3))
-        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+        client = _make_physical_client([0.0, 0.25, 0.5], ["", "µm", "µm"])
+        # [C, Y, X]: the scale vector has to grow with the array, or the
+        # singleton Z would shift every physical size one axis off.
+        client.get_tensor.return_value = da.zeros((3, 64, 32))
+        desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
 
         add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
         arr = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args
-        # Reordered to [C, Z(=1), Y, X].
+        # [C, Z(=1), Y, X].
         assert arr.shape == (3, 1, 64, 32)
-        # Scale aligns to the canonical output: [c, z, y, x].
         assert kwargs["scale"] == [1.0, 1.0, 0.25, 0.5]
 
     def test_interleaved_rgb_gets_rgb_kwarg_and_shorter_scale(self):
