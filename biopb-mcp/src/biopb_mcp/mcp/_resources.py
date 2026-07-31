@@ -31,7 +31,9 @@ runs in a background thread to keep the main Qt thread responsive.
   mouse events.
 - The `client` represents a `TensorFlightClient` instance. Data from the client are
   lazy, thread-safe, picklable dask arrays. See `guide://client` for the full set of client
-  operations, including browsing sources, reading tensors, and uploading results.
+  operations, including browsing sources, reading tensors, and uploading results; and see
+  `guide://data` for the traps when moving pixels between the server, a layer, and your own
+  variables.
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
   The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
   server. The callable can take either a numpy array (eager) or a tensor-server source_id string
@@ -474,7 +476,7 @@ client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT data_r
 ```
 
 ## Load into Viewer
-Both calls take the same `array_id`: `"source_id/t1"` for a tensor within a
+Arrays are referenced by their `array_id`: `"source_id/t1"` for a tensor within a
 multi-tensor source, a bare `"source_id"` for a single-tensor one.
 ```python
 # As a layer -- auto-handles the multiscale pyramid for large images.
@@ -489,7 +491,7 @@ arr = client.get_tensor("source_id/t1")
 Use `"cache:my_result"` as destination for ephemeral results that don't
 need to be persisted long-term.
 ```python
-source_id = client.upload_array(arr, "cache:my_result")
+array_id = client.upload_array(arr, "cache:my_result")
 ```
 """
 
