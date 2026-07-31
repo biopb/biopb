@@ -59,7 +59,7 @@ function makeClient(returnVal?: TypedNdArray): TensorHttpClient {
 describe("buildAxisMap", () => {
   it("maps explicit tzcyx labels", () => {
     const m = buildAxisMap(["t", "z", "c", "y", "x"]);
-    expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4 });
+    expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4, s: null });
   });
 
   it("maps explicit yx only (2-D)", () => {
@@ -73,17 +73,17 @@ describe("buildAxisMap", () => {
 
   it("maps aliases: depth → z, width → x, height → y, time → t, channel → c", () => {
     const m = buildAxisMap(["time", "depth", "channel", "height", "width"]);
-    expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4 });
+    expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4, s: null });
   });
 
   it("does not duplicate z when labels are channel-first c,y,x", () => {
     const m = buildAxisMap(["c", "y", "x"]);
-    expect(m).toEqual<AxisMap>({ t: null, z: null, c: 0, y: 1, x: 2 });
+    expect(m).toEqual<AxisMap>({ t: null, z: null, c: 0, y: 1, x: 2, s: null });
   });
 
   it("does not duplicate c when labels are z,y,x", () => {
     const m = buildAxisMap(["z", "y", "x"]);
-    expect(m).toEqual<AxisMap>({ t: null, z: 0, c: null, y: 1, x: 2 });
+    expect(m).toEqual<AxisMap>({ t: null, z: 0, c: null, y: 1, x: 2, s: null });
   });
 
   it("applies positional heuristic for unknown labels (last=x, second-last=y)", () => {
@@ -106,7 +106,7 @@ describe("buildAxisMap", () => {
 
   it("is case-insensitive", () => {
     const m = buildAxisMap(["T", "Z", "C", "Y", "X"]);
-    expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4 });
+    expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4, s: null });
   });
 
   it("trims whitespace", () => {
@@ -117,7 +117,71 @@ describe("buildAxisMap", () => {
 
   it("handles empty dim_labels", () => {
     const m = buildAxisMap([]);
-    expect(m).toEqual<AxisMap>({ t: null, z: null, c: null, y: null, x: null });
+    expect(m).toEqual<AxisMap>({ t: null, z: null, c: null, y: null, x: null, s: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildAxisMap — the canonical wire order (biopb/biopb#596)
+// ---------------------------------------------------------------------------
+
+describe("buildAxisMap: interleaved samples", () => {
+  it("keeps the plane ahead of a trailing samples axis", () => {
+    const m = buildAxisMap(["t", "c", "z", "y", "x", "s"]);
+    expect(m).toEqual<AxisMap>({ t: 0, c: 1, z: 2, y: 3, x: 4, s: 5 });
+  });
+
+  it("does not let z swallow the samples axis of a bare RGB source", () => {
+    // Regression: the old whole-array fallback assigned the unknown trailing
+    // "s" to z, so the UI showed a Z slider over the colour components and a
+    // z-crop sliced into them.
+    const m = buildAxisMap(["y", "x", "s"]);
+    expect(m.s).toBe(2);
+    expect(m.z).toBeNull();
+    expect(m).toEqual<AxisMap>({ t: null, c: null, z: null, y: 0, x: 1, s: 2 });
+  });
+
+  it("treats a samples label as known, so RGB is not flagged ambiguous", () => {
+    // Every interleaved-RGB source used to trip the ambiguity warning.
+    expect(isAxisMapAmbiguous(["T", "C", "Z", "Y", "X", "S"])).toBe(false);
+    expect(isAxisMapAmbiguous(["y", "x", "samples"])).toBe(false);
+  });
+
+  it("needs room for y and x before honouring samples", () => {
+    const m = buildAxisMap(["y", "s"]);
+    expect(m.s).toBeNull();
+    expect([m.y, m.x]).toEqual([0, 1]);
+  });
+
+  it("ignores a samples label the canonical order would not put last", () => {
+    // Not an order the server serves; it reduces to a leading axis like any
+    // other rather than being hunted down.
+    const m = buildAxisMap(["s", "y", "x"]);
+    expect(m.s).toBeNull();
+    expect([m.y, m.x]).toEqual([1, 2]);
+  });
+});
+
+describe("buildAxisMap: the plane is a position", () => {
+  it("reads y/x off the tail even when the labels are unknown", () => {
+    const m = buildAxisMap(["q", "w", "e"]);
+    expect([m.y, m.x]).toEqual([1, 2]);
+  });
+
+  it("does not let a label on the plane become a slider axis", () => {
+    // A source labelling its last two axes z/y does not thereby get a z slider
+    // sitting on the axis being displayed.
+    const m = buildAxisMap(["c", "z", "y"]);
+    expect([m.y, m.x]).toEqual([1, 2]);
+    expect(m.z).toBeNull();
+    expect(m.c).toBe(0);
+  });
+
+  it("agrees with the server's plane_axes on the 6-D RGB layout", () => {
+    // The coupling that matters: this side picks the crop and scale_hint, the
+    // sidecar renders the block they describe. Both must call axis 3 Y.
+    const m = buildAxisMap(["T", "C", "Z", "Y", "X", "S"]);
+    expect([m.y, m.x, m.s]).toEqual([3, 4, 5]);
   });
 });
 
@@ -144,7 +208,7 @@ describe("isAxisMapAmbiguous", () => {
 // ---------------------------------------------------------------------------
 
 describe("computeScaleHint", () => {
-  const axisMap: AxisMap = { t: null, z: null, c: null, y: 0, x: 1 };
+  const axisMap: AxisMap = { t: null, z: null, c: null, y: 0, x: 1, s: null };
 
   it("returns [1,1] with default zoom (viewportZoom=1)", () => {
     // effectiveTargetScale = max(1/1, 1) = 1
@@ -177,13 +241,13 @@ describe("computeScaleHint", () => {
   });
 
   it("returns all-1 when y or x axis is null", () => {
-    const noYX: AxisMap = { t: null, z: null, c: null, y: null, x: null };
+    const noYX: AxisMap = { t: null, z: null, c: null, y: null, x: null, s: null };
     const { factors } = computeScaleHint([4096, 4096], noYX, 512, 512);
     expect(factors).toEqual([1, 1]);
   });
 
   it("preserves non-spatial axes at 1 for 4-D tensor", () => {
-    const zyx: AxisMap = { t: null, z: 0, c: null, y: 1, x: 2 };
+    const zyx: AxisMap = { t: null, z: 0, c: null, y: 1, x: 2, s: null };
     const { factors } = computeScaleHint([10, 4096, 4096], zyx, 1024, 1024);
     expect(factors[0]).toBe(1); // z axis untouched
     expect(factors[1]).toBe(factors[2]); // y and x should match

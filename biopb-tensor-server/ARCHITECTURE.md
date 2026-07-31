@@ -148,7 +148,7 @@ family whose behavior actually changes.
 
 | | |
 |---|---|
-| **Not in scope** | Unlabeled stores (`zarr`, `hdf5`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting `build_axis_map`'s positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Give such a source semantics with `dim_labels` in its config. |
+| **Not in scope** | Unlabeled stores (`zarr`, `hdf5`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting the consumers' positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Give such a source semantics with `dim_labels` in its config. |
 | **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture `serving/renderer.py` already takes toward adapter-supplied labels. |
 | **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
 | **Cache** | The transpose happens *before* the cache store, so a segment holds what the client is served and the localhost mmap fast path stays valid. `CACHE_FILE_FORMAT_VERSION` was bumped to `2` for that (same layout, reordered content); an older client declines the fast path and reads the same normalized chunk over `do_get`. |

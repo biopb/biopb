@@ -921,8 +921,9 @@ class TestDataGuide:
         assert "multiscale" in guide  # ...which may be a list of levels
 
     def test_pairs_each_scale_with_the_array_it_belongs_to(self):
-        # Crossing these transposes the spacing onto the wrong axes, which
-        # changes every measurement without changing any shape.
+        # The two scale vectors sit on the same axes now, so crossing them no
+        # longer transposes anything -- but for interleaved colour layer.scale
+        # is one shorter, so the guide must still name both.
         guide = _server._resources.DATA
         assert "get_physical_scale" in guide
         assert "layer.scale" in guide

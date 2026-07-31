@@ -136,7 +136,7 @@ class TestCanonicalPermutation:
     )
     def test_unlabeled_axes_are_identity(self, labels):
         """Plain zarr / HDF5 emit ``dimN``. There is nothing to reorder, and
-        relabeling them z/y/x would turn build_axis_map's positional *guess*
+        relabeling them z/y/x would turn the consumers' positional *guess*
         into a wire *assertion* -- wrong for e.g. an unlabeled [y, x, c]."""
         assert canonical_permutation(labels, [2] * len(labels)) is None
 
