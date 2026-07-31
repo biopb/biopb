@@ -199,8 +199,9 @@ class NormalizingAdapter(TensorAdapter):
     source-level methods normalize each tensor descriptor by its own labels,
     while the tensor-level methods share one permutation derived from this
     object's own descriptor. ``get_tensor_adapter`` / ``get_level_adapter``
-    re-run the decision on whatever they return, so a per-tensor view of a
-    multi-tensor source gets the permutation *its* labels imply -- or none.
+    hand back a view wrapping whatever they return, so a per-tensor view of a
+    multi-tensor source gets the permutation *its* labels imply -- or, when they
+    are already canonical, a pass-through (see :meth:`_view`).
     """
 
     def __init__(self, inner: SourceAdapter) -> None:
@@ -348,7 +349,33 @@ class NormalizingAdapter(TensorAdapter):
         return self._inner.is_resident()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
-        return normalize_adapter(self._inner.get_tensor_adapter(tensor_id))
+        return self._view(self._inner.get_tensor_adapter(tensor_id))
+
+    def _view(self, inner: SourceAdapter) -> SourceAdapter:
+        """Wrap a tensor-level view of this source, deciding nothing.
+
+        These two lookups (:meth:`get_tensor_adapter`, :meth:`get_level_adapter`)
+        sit on the ``do_get`` path -- the server resolves a chunk's adapter
+        through them on *every* read -- so running the source-level classifier
+        here cost a full ``list_tensor_descriptors`` per chunk.
+
+        Nothing needs to be decided. Whether a view actually permutes is
+        :attr:`perm`'s business, re-derived per access from that view's own
+        descriptor, and a wrapper whose ``perm`` is ``None`` is a pass-through:
+        every method early-returns to the delegate. So wrap unconditionally and
+        let a canonical sibling tensor of a mixed source carry a transparent
+        wrapper, rather than paying to find out it did not need one.
+
+        This is also why no cache is needed and none is kept: caching the
+        decision would reintroduce exactly the staleness :attr:`perm` was
+        de-memoized to avoid -- a cached "does not need wrapping" cannot notice
+        its source's labels changed -- to save an object allocation.
+        """
+        return (
+            inner
+            if isinstance(inner, NormalizingAdapter)
+            else NormalizingAdapter(inner)
+        )
 
     def put_chunk(
         self,
@@ -429,7 +456,7 @@ class NormalizingAdapter(TensorAdapter):
 
     def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
         level = self._inner.get_level_adapter(path)
-        return None if level is None else normalize_adapter(level)
+        return None if level is None else self._view(level)
 
     # --- planning (delegate, then permute) -----------------------------------
 

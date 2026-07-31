@@ -236,6 +236,38 @@ class TestNormalizeAdapter:
             said = lines[0].getMessage()
             assert "['z', 'y', 'x']" in said and "['x', 'y', 'z']" in said
 
+    def test_the_chunk_lookup_path_does_not_reclassify(self, monkeypatch):
+        """``get_tensor_adapter`` / ``get_level_adapter`` sit on the do_get path
+        -- the server resolves a chunk's adapter through them on *every* read --
+        so running the source-level classifier there cost a full
+        ``list_tensor_descriptors`` per chunk. A view needs no decision: whether
+        it permutes is ``perm``'s business, made per access.
+        """
+        from biopb_tensor_server import ZarrAdapter
+
+        calls = {"n": 0}
+        real = ZarrAdapter.list_tensor_descriptors
+        monkeypatch.setattr(
+            ZarrAdapter,
+            "list_tensor_descriptors",
+            lambda self: (calls.__setitem__("n", calls["n"] + 1), real(self))[1],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
+            registry = SourceRegistry()
+            adapter = registry.register("src", _zarr_adapter(tmp, src, ["x", "y", "z"]))
+            assert isinstance(adapter, NormalizingAdapter)
+            plan = adapter.get_tensor_adapter(None).plan_flight_info(
+                TensorReadOption(tensor_id="src"), PyramidConfig()
+            )
+            assert len(plan.chunk_endpoints) > 1
+
+            calls["n"] = 0
+            for ce in plan.chunk_endpoints:  # the do_get inner loop
+                adapter.get_tensor_adapter(None).resolve_chunk_data(ce.chunk_id)
+            assert calls["n"] == 0
+
     def test_registry_leaves_a_compliant_source_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = SourceRegistry()
