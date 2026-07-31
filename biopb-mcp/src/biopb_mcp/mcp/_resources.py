@@ -159,7 +159,7 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 | Source | You get it with | What you get |
 |---|---|---|
 | **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **canonical order** `[..., Z, Y, X]` (`S` last for interleaved colour), full resolution |
-| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, in that same order plus a singleton Z if the source had none |
+| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, at the same order and rank |
 | **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
 
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
@@ -188,56 +188,28 @@ ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, and a
 bare `np.asarray(arr)` materializes the **whole** array in the main process
 instead of on the cluster. Slice first, or `.compute()` explicitly.
 
-**3. Same axis order, different rank.** The server guarantees everything it
-serves is `[..., Z, Y, X]`, with an interleaved colour axis `S` strictly last
-when there is one, so nothing is transposed on the way into a layer — the source
-and the layer describe their axes in the same order. What differs is the *count*:
-a source with no Z gains one (trap 4), so `layer.metadata['dim_labels']` is one
-longer than `client.get_descriptor(array_id).dim_labels`.
+**3. `layer.scale` is not positional.** A layer carries the source's axes
+unchanged, so each size sits on the axis it describes — which means a 3-D
+`[C, Y, X]` layer has **no Z**, and `layer.scale[-3]` is its channel axis, not
+depth. Read `layer.metadata['dim_labels']` (it matches
+`client.get_descriptor(array_id).dim_labels`) rather than counting from the end.
+For interleaved colour napari does not count `S`, so `layer.scale` is one shorter
+than the array and than `client.get_physical_scale()`: `layer.scale[-1]` is X,
+the array's last axis is the colour count.
 
-That shift is why the source's physical scale (`client.get_physical_scale()`) and
-the layer's (`layer.scale`, what `regionprops(..., spacing=)` wants) are not the
-same vector. **X and Y always line up from the right; nothing further in is
-guaranteed to.** Where a Z was inserted, `layer.scale[-3]` is that synthetic
-axis' `1.0` while the source's `[-3]` is its own leading axis:
-
-```
-source [T, C, Y, X]   get_physical_scale() -> [0.0, 0.0, 0.25, 0.5]
-layer  [T, C, Z, Y, X]        layer.scale  -> [1.0, 1.0, 1.0, 0.25, 0.5]
-                                    [-1] X  0.5  == 0.5   ✓
-                                    [-2] Y  0.25 == 0.25  ✓
-                                    [-3]    1.0  != 0.0   ← inserted Z vs C
-```
-
-Take X and Y off the end; take Z from `layer.scale[-3]` only when the source
-really has one. `'z' in layer.metadata['dim_labels']` does not settle that — the
-inserted axis is named `z` too. Compare ranks instead: the layer array one
-larger than `len(descriptor.shape)` means a Z was inserted. Leading axes carry no
-physical size on either side.
-
-One extra wrinkle for interleaved colour: napari does not count `S` as a
-dimension, so `layer.scale` is one shorter than the array and `layer.scale[-1]`
-is X's spacing while the array's last axis is the colour count.
-
-**4. A source without a Z gains a rank in the viewer.** Not just 2-D ones —
-loading *inserts* a singleton Z whenever the source has none, so `[Y, X]` becomes
-`[1, Y, X]`, `[C, Y, X]` becomes `[C, 1, Y, X]`, and `[T, C, Y, X]` becomes
-`[T, C, 1, Y, X]`. Only a source that already carries a Z keeps its rank. Read
-`ndim` off the array you are about to use, not off the source.
-
-**5. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
+**4. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
 while the pixels are not there yet; a scikit-image call, `np.asarray`, or a
 `for` loop over the array materializes all of it at once, unchunked and without
 progress — which is how a session allocates a volume it cannot hold. Crop first,
 keep the chain lazy, `.compute()` once; past `promote_after` that compute is a
 job you can watch and cancel (`guide://kernel`).
 
-**6. A layer you built carries no geometry.** `add_labels(arr)` /
+**5. A layer you built carries no geometry.** `add_labels(arr)` /
 `add_image(arr)` store exactly that array: no pyramid, `scale` all ones. A
 segmentation added beside a calibrated image measures in pixels until you copy
 the image's `scale` onto it.
 
-**7. Upload does not carry labels or physical size.** `client.upload_array`
+**6. Upload does not carry labels or physical size.** `client.upload_array`
 takes a **dask** array (wrap numpy with `da.from_array`) and stores shape, dtype
 and chunks; axis labels and pixel size travel only via `dim_labels=` /
 `ome_metadata=`. Otherwise the round trip drops them and `add_tensor` gives back
@@ -278,7 +250,7 @@ layer_name = viewer.add_tensor(source_id)
 
 Uploading is also what makes a result *shareable* — an array in the kernel is
 visible to nothing else and dies with it. `guide://client` has the upload
-arguments, including the ones that carry axis labels and pixel size (trap 7).
+arguments, including the ones that carry axis labels and pixel size (trap 6).
 """
 
 VIEWER = """\
@@ -424,8 +396,8 @@ CLIENT = """\
 
 Arrays from here are lazy dask arrays in the canonical `[..., Z, Y, X]` axis
 order the server guarantees, and a tensor loaded into the viewer stops being
-lazy and may gain a singleton Z — see `guide://data` before moving pixels
-between the server, a layer, and your own variables.
+lazy — see `guide://data` before moving pixels between the server, a layer,
+and your own variables.
 
 ## Check Connection
 ```python

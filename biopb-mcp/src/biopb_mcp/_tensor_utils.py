@@ -115,31 +115,13 @@ def _resolve_axes(
     return y_idx, x_idx, z_idx, s_idx
 
 
-def _z_insert_tail(z_idx: int | None, s_idx: int | None) -> int | None:
-    """How many axes an inserted singleton Z sits ahead of, or ``None`` when Z is real.
-
-    The server reorders axes but never changes a tensor's rank, so evening the
-    rank out is the one axis job left to the client: every layer carries an
-    explicit Z, which is what lets :func:`build_layer_scale` map physical sizes
-    onto fixed trailing slots. Z goes ahead of Y/X to stay third-from-last, and
-    ahead of a samples axis so that stays strictly last.
-
-    :func:`build_pyramid_levels` applies it to the level arrays and
-    :func:`canonical_dim_labels` to the labels, so the arrays and the names
-    describing them cannot drift apart.
-    """
-    if z_idx is not None:
-        return None
-    return 3 if s_idx is not None else 2
-
-
 def canonical_dim_labels(tensor_desc, source_desc=None) -> List[str] | None:
     """Per-axis labels for the array :func:`build_pyramid_levels` returns.
 
-    The source's own labels with a ``"z"`` spliced in where the singleton Z is
-    inserted, so the result names the *layer's* axes rather than the source's.
-    Lowercased, both because the spliced ``"z"`` would otherwise clash with an
-    upper-case source convention and because that is the NGFF axis-name
+    The source's own labels, lowercased -- which is the whole job now that the
+    layer array *is* the source array: the server guarantees the order and the
+    client no longer changes the rank, so the source's names describe the
+    layer's axes one for one. Lowercased because that is the NGFF axis-name
     convention this feeds (``_writers._axis_dict``).
 
     The length matches the array's rank, not napari's ``layer.ndim``: an
@@ -147,18 +129,13 @@ def canonical_dim_labels(tensor_desc, source_desc=None) -> List[str] | None:
     and the OME-Zarr writer sees the raw array.
 
     Returns ``None`` when the source declares no usable labels -- there is then
-    nothing to name the leading axes with, and the caller keeps its own fallback.
+    nothing to name the axes with, and the caller keeps its own fallback.
     """
     dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
     shape = list(tensor_desc.shape)
     if not dim_labels or len(dim_labels) != len(shape):
         return None
-    _, _, z_idx, s_idx = _resolve_axes(shape, dim_labels)
-    labels = [str(label).lower() for label in dim_labels]
-    tail = _z_insert_tail(z_idx, s_idx)
-    if tail is not None:
-        labels.insert(len(labels) - tail, "z")
-    return labels
+    return [str(label).lower() for label in dim_labels]
 
 
 def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
@@ -247,16 +224,16 @@ def build_pyramid_levels(
     a buried Z, swapped X/Y) would render the wrong plane silently. The order is
     the data plane's guarantee, not this function's job: it advertises
     ``[..., Z, Y, X, S]`` (biopb/biopb#596), so the levels arrive in display
-    order and nothing is transposed here.
+    order and **no axis work happens here at all** -- nothing is transposed, and
+    the rank is the source's.
 
-    What the server does not do is change a tensor's *rank*, so the one axis
-    step left is inserting a singleton Z when the tensor has none -- ahead of
-    Y/X, and ahead of an interleaved samples axis so that stays strictly last.
-
-    The result is therefore **always** canonical ``[..., Z, Y, X]`` (rank >= 3),
-    or ``[..., Z, Y, X, S]`` (rank >= 4) for interleaved colour -- which lets
-    ``build_layer_scale`` map physical sizes onto fixed trailing positions
-    without re-deriving the labels.
+    In particular a tensor with no Z does *not* get a singleton one inserted.
+    That used to happen so ``build_layer_scale`` could write physical sizes to
+    fixed trailing slots, but it made every layer disagree in rank with its
+    source -- so ``layer.ndim`` had to be reasoned about separately from the
+    descriptor, a 2-D image round-tripped through the OME-Zarr writer gained a
+    phantom Z, and the agent guide needed a trap for the offset. The scale is
+    placed by axis index instead, and the layer is now exactly the source array.
 
     Returns:
         List of dask arrays at canonical ``[..., Z, Y, X]`` resolution levels,
@@ -274,7 +251,7 @@ def build_pyramid_levels(
 
     # Per-tensor labels win; fall back to the source descriptor's labels.
     dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
-    y_idx, x_idx, z_idx, s_idx = _resolve_axes(shape, dim_labels)
+    y_idx, x_idx, z_idx, _ = _resolve_axes(shape, dim_labels)
 
     # Stop shrinking an axis once it reaches this floor; see the docstring for
     # why the cube-root-capped-at-threshold value guarantees termination.
@@ -329,14 +306,6 @@ def build_pyramid_levels(
                 break  # nothing left to shrink; avoid an infinite loop
             sx, sy, sz = nsx, nsy, nsz
 
-    # The levels are already in canonical order (the server's guarantee); only
-    # the rank needs evening out, so a tensor with no z gets a singleton one
-    # inserted. Lazy on dask arrays.
-    tail = _z_insert_tail(z_idx, s_idx)
-    if tail is not None:
-        expand = (Ellipsis, None) + (slice(None),) * tail
-        levels = [level[expand] for level in levels]
-
     return levels
 
 
@@ -361,11 +330,10 @@ def build_layer_scale(
     positionally, using the source's ``dim_labels`` (per-tensor, falling back to
     *source_desc*) only to tell whether a z axis is there at all.
 
-    *ndim* is the rank of the layer **array**, which ``build_pyramid_levels``
-    guarantees is in canonical ``[..., Z, Y, X]`` order (rank >= 3, with an
-    explicit -- possibly singleton -- Z). So the resolved x/y/z sizes land on
-    fixed trailing positions: X last, Y second-to-last, Z third-to-last; leading
-    axes (channel, time) get 1.0.
+    *ndim* is the rank of the layer **array**, which is the source's own rank:
+    ``build_pyramid_levels`` neither transposes nor pads. So each resolved size
+    is written to the axis it describes, and an axis the source does not have
+    (no Z) is simply not written; every other axis (channel, time) gets 1.0.
 
     Pass *rgb* when the array is ``[..., Z, Y, X, S]`` interleaved colour. napari
     does not count the samples axis as a layer dimension (``layer.ndim ==
@@ -421,13 +389,18 @@ def build_layer_scale(
         if not any((psx, psy, psz)):
             return None, None
 
-        # Canonical [..., Z, Y, X(, S)]: physical sizes land on the trailing
-        # spatial axes. For rgb the samples axis is not a napari layer dimension,
-        # so it is excluded here and X is last in the scale vector either way.
+        # The layer array is the source array, so a size goes to the axis it
+        # describes -- no fixed trailing slot, and nothing written for an axis
+        # the source does not have. (A blind ``scale[-3] = psz`` was safe only
+        # while every layer was rank-evened with a singleton Z; it would now put
+        # depth on the channel axis of a [C, Y, X], and IndexError on a 2-D one.)
+        # For rgb the samples axis is not a napari layer dimension, so the vector
+        # is one shorter -- S is last, so the x/y/z indices stay in range.
         scale = [1.0] * (ndim - 1 if rgb else ndim)
-        scale[-1] = psx or 1.0
-        scale[-2] = psy or 1.0
-        scale[-3] = psz or 1.0
+        scale[x_idx] = psx or 1.0
+        scale[y_idx] = psy or 1.0
+        if z_idx is not None:
+            scale[z_idx] = psz or 1.0
 
         info = {
             "physical_size_x": psx,
@@ -520,8 +493,8 @@ def add_tensor_layer(
     _, _, _, s_idx = _resolve_axes(tensor_desc.shape, dim_labels)
     rgb = s_idx is not None
 
-    # Levels are in canonical [..., Z, Y, X(, S)] order, so the scale maps onto
-    # the output rank directly -- no reordering to keep in sync.
+    # Levels are the source arrays, in canonical order, at the source's rank,
+    # so the scale maps onto them by axis index -- nothing to keep in sync.
     out_ndim = levels[0].ndim
     levels = wrap_levels(levels, compute_scheduler)
 
