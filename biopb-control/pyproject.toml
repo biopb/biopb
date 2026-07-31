@@ -73,6 +73,16 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# Same as biopb-mcp: the suite sits under src/ (biopb_control/_tests/) and would
+# otherwise be packaged as a subpackage. Tests are collected from the checkout,
+# never from an installed wheel.
+exclude = ["biopb_control._tests", "biopb_control._tests.*"]
+
+# Required alongside the exclude above: a non-package directory inside a package
+# becomes package *data*, which include-package-data would then ship. See the
+# longer note in biopb-mcp/pyproject.toml.
+[tool.setuptools.exclude-package-data]
+"biopb_control" = ["_tests/*", "_tests/**/*"]
 
 # Product component: versioned off the single product tag `release-v*`, shared
 # with the tensor server, mcp, and the web bundle. root = ".." because the package
