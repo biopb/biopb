@@ -1,7 +1,9 @@
-import warnings
-from typing import Optional, Sequence, Tuple, Union
+from __future__ import annotations
 
-import dask.array as da
+import sys
+import warnings
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
+
 import numpy as np
 
 # Imported from the defining modules, not from `.`: `biopb/image/__init__.py`
@@ -11,10 +13,32 @@ from biopb.image.bindata_pb2 import BinData
 from biopb.image.image_data_pb2 import ImageData, Pixels, Tensor
 from biopb.image.roi_pb2 import ROI, Mask, Point, Rectangle
 
+if TYPE_CHECKING:
+    import dask.array as da
+
 # NOTE: TensorFlightClient is imported lazily inside the lazy_data branch below.
 # It pulls in pyarrow, whose compiled SSE4.2 baseline SIGILLs on pre-SSE4.2 CPUs
 # (e.g. old AMD Opterons). Keeping it out of the module top lets eager/pixels
 # data paths work on such hardware.
+#
+# `dask` is deferred for a related but distinct reason: it is declared only under
+# the `biopb[tensor]` extra, yet `biopb/image/__init__.py` imports this module
+# eagerly -- so a top-level `import dask.array` made `import biopb.image` fail on
+# a bare `pip install biopb`. Only the dask-array paths below need it, and each
+# reaches it through `_is_dask_array` / a local import. The `from __future__ import
+# annotations` above is what lets `da.Array` appear in signatures without the
+# import existing at runtime; nothing introspects this module's annotations.
+
+
+def _is_dask_array(arr) -> bool:
+    """True if *arr* is a dask array, without importing dask to find out.
+
+    A `dask.array.Array` cannot exist in a process that never imported
+    `dask.array`, so an absent entry in `sys.modules` is a definitive "no" --
+    and the common numpy-only path never pays for the import.
+    """
+    da_mod = sys.modules.get("dask.array")
+    return da_mod is not None and isinstance(arr, da_mod.Array)
 
 
 def _canonicalize_dtype(dtype_str: str) -> str:
@@ -684,7 +708,9 @@ def normalize_array_dims(
     for target_label in target_dim_labels:
         if target_label.upper() in expand_dims:
             insert_pos = target_dim_labels.index(target_label)
-            if isinstance(arr, da.Array):
+            if _is_dask_array(arr):
+                import dask.array as da  # already imported; see _is_dask_array
+
                 arr = da.expand_dims(arr, axis=insert_pos)
             else:
                 arr = np.expand_dims(arr, axis=insert_pos)
