@@ -7,7 +7,9 @@ Covers the rule (``core.axes.canonical_permutation``), the seam that applies it
    provably the identity for them, and must not invent semantic labels;
 2. the guarantee is unconditional on the read path, including for the geometry a
    read plan hands a client and for what lands in the chunk cache;
-3. writable sources are validated at ``create_source`` rather than permuted.
+3. an axis order this server does not own is refused rather than permuted -- an
+   uploader's declared order at ``create_source``, and a remote upstream's
+   advertised order at the proxy's read boundary.
 """
 
 import tempfile
@@ -196,6 +198,25 @@ class TestNormalizeAdapter:
             returned = registry.register("src", adapter)
             assert isinstance(returned, NormalizingAdapter)
             assert registry.get("src") is returned
+
+    def test_wrapping_is_announced_once(self, caplog):
+        """Reordering a source is a visible behavior change; without a log line
+        the only evidence of it is the transposed data. Once, not once per chunk
+        read -- normalize_adapter is re-entered per get_tensor_adapter."""
+        import logging as _logging
+
+        from biopb_tensor_server.core import normalize as _normalize
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _normalize._reported.clear()
+            adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["x", "y", "z"])
+            with caplog.at_level(_logging.INFO, logger=_normalize.__name__):
+                for _ in range(3):
+                    normalize_adapter(adapter)
+            lines = [r for r in caplog.records if "axis normalization" in r.message]
+            assert len(lines) == 1
+            said = lines[0].getMessage()
+            assert "['z', 'y', 'x']" in said and "['x', 'y', 'z']" in said
 
     def test_registry_leaves_a_compliant_source_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -541,3 +562,215 @@ class TestServedOverFlight:
         finally:
             server.shutdown()
             CacheManager.reset()
+
+
+# ==============================================================================
+# An order this server does not own: the remote proxy refuses, never permutes
+# ==============================================================================
+
+
+def _proxy_adapter(upstream_port, source_id="m", upstream_source_id="u"):
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    return RemoteTensorAdapter(
+        source_id=source_id,
+        upstream_location=f"grpc://localhost:{upstream_port}",
+        upstream_source_id=upstream_source_id,
+    )
+
+
+def _legacy_upstream(tmp, arr, labels, name="u"):
+    """A server advertising ``labels`` verbatim -- i.e. a pre-#596 upstream.
+
+    Registered straight into the registry dict rather than through
+    ``register_source``, which would normalize it and defeat the point: what is
+    under test is a *downstream* facing a server that never learned the
+    guarantee.
+    """
+    server = TensorFlightServer("grpc://localhost:0")
+    server.sources._sources[name] = _zarr_adapter(tmp, arr, labels, name)
+    server.mark_ready()
+    threading.Thread(target=server.serve, daemon=True).start()
+    time.sleep(0.8)
+    return server
+
+
+@requires_zarr
+class TestRemoteProxyRefusesRatherThanPermutes:
+    """The upstream owns a mirrored source's axis order -- it mints the chunk_ids,
+    plans the reads (#295) and sizes the grid -- so the server validates that
+    order instead of permuting behind it, exactly as ``create_source`` does for an
+    uploader's declared order."""
+
+    def test_a_proxy_is_never_wrapped(self):
+        """Not because it is compliant -- it is asserted non-canonical here -- but
+        because it enforces the contract itself."""
+        proxy = _proxy_adapter(1)
+        proxy.seed_catalog(
+            [{"array_id": "u", "dim_labels": ["x", "y", "z"], "shape": [2, 3, 4]}],
+            {},
+            True,
+            None,
+        )
+        assert canonical_permutation(["x", "y", "z"], [2, 3, 4]) is not None
+        assert normalize_adapter(proxy) is proxy
+        assert SourceRegistry().register("m", proxy) is proxy
+
+    def test_a_legacy_upstream_is_refused_at_open(self):
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
+        up = _legacy_upstream(tmp, src, ["x", "y", "z"])
+        down = TensorFlightServer("grpc://localhost:0")
+        down.register_source("m", _proxy_adapter(up.port))
+        down.mark_ready()
+        threading.Thread(target=down.serve, daemon=True).start()
+        time.sleep(0.8)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{down.port}")
+            with pytest.raises(Exception) as exc:
+                client.get_tensor("m")
+            msg = str(exc.value)
+            # Names the offending order, the order to use, and where to fix it.
+            assert "['x', 'y', 'z']" in msg
+            assert "['z', 'y', 'x']" in msg
+            assert "upstream" in msg
+            client.close()
+        finally:
+            down.shutdown()
+            up.shutdown()
+            CacheManager.reset()
+
+    def test_the_catalog_keeps_a_refused_source_but_describe_refuses(self):
+        """Where the refusal is drawn.
+
+        ``list_sources`` still enumerates it -- refusing the read must not hide
+        the broken thing from an operator. But a *describe* is refused along with
+        a read: the descriptor it would hand back is itself the violation, and a
+        consumer trusting it mis-maps its axes just as surely as one that read
+        the pixels.
+        """
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
+        up = _legacy_upstream(tmp, src, ["x", "y", "z"])
+        down = TensorFlightServer("grpc://localhost:0")
+        down.register_source("m", _proxy_adapter(up.port))
+        down.mark_ready()
+        threading.Thread(target=down.serve, daemon=True).start()
+        time.sleep(0.8)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{down.port}")
+            assert "m" in client.list_sources()
+            with pytest.raises(Exception, match="canonical"):
+                client.get_descriptor("m")
+            client.close()
+        finally:
+            down.shutdown()
+            up.shutdown()
+            CacheManager.reset()
+
+    def test_a_canonical_upstream_is_mirrored_unchanged(self):
+        from biopb.tensor.client import TensorFlightClient
+
+        tmp = tempfile.mkdtemp()
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        src = (np.arange(4 * 3 * 8, dtype=np.uint16) % 251).reshape(4, 3, 8)
+        up = _legacy_upstream(tmp, src, ["z", "y", "x"])
+        down = TensorFlightServer("grpc://localhost:0")
+        down.register_source("m", _proxy_adapter(up.port))
+        down.mark_ready()
+        threading.Thread(target=down.serve, daemon=True).start()
+        time.sleep(0.8)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{down.port}")
+            desc = client.get_descriptor("m")
+            assert list(desc.dim_labels) == ["z", "y", "x"]
+            np.testing.assert_array_equal(
+                client.get_tensor("m").compute(scheduler="threads"), src
+            )
+            client.close()
+        finally:
+            down.shutdown()
+            up.shutdown()
+            CacheManager.reset()
+
+    def test_an_upstream_upgrade_is_picked_up_without_re_registration(self):
+        """The regression this design exists to prevent.
+
+        ``seed_catalog`` replaces a mirror's descriptors in place on every
+        reconcile pass, so any decision cached at registration goes stale. A
+        wrapper would have frozen the permutation derived from the legacy labels
+        and kept applying it to the now-canonical upstream -- serving reversed
+        axes under a reversed descriptor. Because the check holds nothing, the
+        same adapter object flips from refusing to serving.
+        """
+
+        def row(labels, shape):
+            return [
+                {
+                    "array_id": "u",
+                    "dim_labels": labels,
+                    "shape": shape,
+                    "chunk_shape": shape,
+                    "dtype": "<u2",
+                }
+            ]
+
+        proxy = _proxy_adapter(1)
+
+        proxy.seed_catalog(row(["x", "y", "z"], [2, 3, 4]), {}, True, None)
+        with pytest.raises(flight.FlightServerError, match="canonical"):
+            proxy.get_read_plan(proxy.get_tensor_descriptor())
+
+        # Same adapter object, no re-registration: the upstream upgraded and the
+        # mirror follows on the very next read.
+        proxy.seed_catalog(row(["z", "y", "x"], [4, 3, 2]), {}, True, None)
+        plan = proxy.get_read_plan(proxy.get_tensor_descriptor())
+        assert list(plan.descriptor.dim_labels) == ["z", "y", "x"]
+        assert list(plan.descriptor.shape) == [4, 3, 2]
+        # No permutation was ever applied, so there is none to un-apply: the
+        # mirror is exactly what the upstream now advertises.
+        assert (
+            canonical_permutation(plan.descriptor.dim_labels, plan.descriptor.shape)
+            is None
+        )
+
+    def test_the_refusal_wording_is_shared_with_create_source(self):
+        """One rule stated once: both seams that validate an order they do not own
+        report it through ``noncanonical_order``."""
+        from biopb_tensor_server.core.axes import noncanonical_order
+        from biopb_tensor_server.serving.upload_manager import UploadManager
+
+        why = noncanonical_order(["x", "y"], [4, 5])
+        assert why is not None and "['y', 'x']" in why
+
+        with pytest.raises(flight.FlightServerError) as upload_exc:
+            UploadManager(SourceRegistry(), None, None).create_source(
+                TensorDescriptor(
+                    array_id="cache:bad",
+                    dim_labels=["x", "y"],
+                    shape=[4, 5],
+                    chunk_shape=[4, 5],
+                    dtype="<u2",
+                )
+            )
+        proxy = _proxy_adapter(1)
+        proxy.seed_catalog(
+            [{"array_id": "u", "dim_labels": ["x", "y"], "shape": [4, 5]}],
+            {},
+            True,
+            None,
+        )
+        with pytest.raises(flight.FlightServerError) as proxy_exc:
+            proxy.get_read_plan(proxy.get_tensor_descriptor())
+
+        assert why in str(upload_exc.value)
+        assert why in str(proxy_exc.value)

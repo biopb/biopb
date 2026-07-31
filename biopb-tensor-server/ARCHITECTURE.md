@@ -145,11 +145,18 @@ family whose behavior actually changes.
 |---|---|
 | **Not in scope** | Unlabeled stores (`zarr`, `hdf5`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting `build_axis_map`'s positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Give such a source semantics with `dim_labels` in its config. |
 | **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture `serving/renderer.py` already takes toward adapter-supplied labels. |
-| **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level / proxy-envelope ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
+| **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
 | **Cache** | The transpose happens *before* the cache store, so a segment holds what the client is served and the localhost mmap fast path stays valid. `CACHE_FILE_FORMAT_VERSION` was bumped to `2` for that (same layout, reordered content); an older client declines the fast path and reads the same normalized chunk over `do_get`. |
-| **Plans** | `plan_flight_info` / `get_read_plan` are delegated and their answer permuted, not re-derived — which is what keeps the remote proxy's upstream forwarding (#295) and the native-pyramid `precompute` routing working underneath. |
-| **Remote proxy** | Needs no version negotiation. The permutation is a function of the labels the upstream advertised and is idempotent, so a normalized upstream yields identity (the proxy is not wrapped at all) while a legacy one is fixed locally. |
-| **Writes** | Refused, not permuted. `create_source` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote. |
+| **Plans** | `plan_flight_info` / `get_read_plan` are delegated and their answer permuted, not re-derived — which is what keeps the native-pyramid `precompute` routing working underneath. |
+
+An order this server does not own is **refused, not permuted** — permuting works
+only where the server owns the whole read path, and two seams don't. Both report
+through the shared `core/axes.py::noncanonical_order`:
+
+| | |
+|---|---|
+| **Writes** | `create_source` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
+| **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy opts out of wrapping (`_normalizable_axes = False`) and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
 
 ### Adapter file-handle policy (biopb/biopb#71)
 

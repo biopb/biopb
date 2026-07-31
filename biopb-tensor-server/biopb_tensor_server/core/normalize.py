@@ -21,8 +21,8 @@ What the wrapper permutes, and what it deliberately does not
 
 **chunk_ids stay native and opaque.** They are minted by the wrapped adapter,
 never rewritten here. That is what keeps this wrapper blind to the chunk codec:
-a versioned id, a scaled id, a precompute level id, and a remote-proxy envelope
-all pass through untouched. What gets permuted is the *client-visible* geometry
+a versioned id, a scaled id and a precompute level id all pass through
+untouched. What gets permuted is the *client-visible* geometry
 -- the descriptor (``dim_labels`` / ``shape`` / ``chunk_shape`` / ``slice_hint``
 / ``scale_hint`` / ``physical_scale`` / pyramid level shapes) and each
 endpoint's logical ``bounds`` -- plus the pixels themselves on the way out. A
@@ -38,24 +38,36 @@ localhost mmap fast path stays valid.
 
 **Plans are delegated, not re-derived.** ``plan_flight_info`` / ``get_read_plan``
 call the wrapped adapter and permute its answer, rather than inheriting the base
-planner. That is what keeps two overrides working that a primitives-only wrapper
-would silently bypass: the remote proxy's forwarding of its upstream's
-authoritative plan (biopb/biopb#295) and the native-pyramid ``precompute``
-routing, both of which run entirely in native order inside the delegate.
+planner. That is what keeps the native-pyramid ``precompute`` routing working --
+an override a primitives-only wrapper would silently bypass -- by letting it run
+entirely in native order inside the delegate.
 
-Composability is why the remote proxy needs no version negotiation (#596
-Decision 2): the permutation is a function of the labels the upstream actually
-advertised and is idempotent, so a normalized upstream yields the identity and
-the proxy is not wrapped at all -- byte-for-byte its previous behavior -- while a
-legacy upstream is fixed locally. There is no capability flag and no
-server-version skew axis.
+An order this server does not own is refused, not permuted
+-----------------------------------------------------------
 
-**Writes are refused, not permuted** (#596 Decision 3). A writable source carries
-the uploader's own declared order, with ``physical_scale`` and ``chunk_shape``
-aligned to it; silently permuting reads would desynchronize them from what
-``put_chunk`` wrote. ``serving.upload_manager`` validates the declared order at
-``create_source`` instead, so a non-canonical writable source never exists and
-this branch is unreachable in practice.
+Permuting reads works only where the server owns the whole read path. Two seams
+do not, and both **validate** instead, reporting through the shared
+:func:`biopb_tensor_server.core.axes.noncanonical_order`:
+
+**Writes** (#596 Decision 3). A writable source carries the uploader's own
+declared order, with ``physical_scale`` and ``chunk_shape`` aligned to it;
+silently permuting reads would desynchronize them from what ``put_chunk`` wrote.
+``serving.upload_manager`` refuses the order at ``create_source``, so a
+non-canonical writable source never exists and this wrapper's ``put_chunk``
+branch is unreachable in practice.
+
+**The remote proxy.** Its upstream owns the order in exactly the same sense: that
+server mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
+So ``adapters.remote_tensor`` opts out of wrapping (``_normalizable_axes =
+False``) and refuses a non-canonical upstream at its read boundary instead.
+
+Refusing rather than repairing is what keeps the guarantee *unconditional* while
+leaving nothing stateful to go stale: the test is re-run against the descriptor
+in hand on every open, so an upstream that upgrades is picked up immediately and
+one that has not cannot be silently mis-served. It costs an upstream-first
+upgrade ordering across a federation -- a legacy upstream's sources stay
+catalogued and listed, but reads of them fail with a legible error naming the
+order to fix -- which is the trade the write path already makes.
 """
 
 from __future__ import annotations
@@ -81,9 +93,7 @@ from biopb_tensor_server.core.axes import canonical_permutation
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     cache_key_for_chunk_id,
-    is_proxy_envelope,
     is_scaled_chunk,
-    peel_proxy_envelope,
 )
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 
@@ -174,25 +184,6 @@ def _normalize_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
     """
     perm = canonical_permutation(desc.dim_labels, desc.shape)
     return desc if perm is None else _permute_descriptor(desc, perm)
-
-
-def _chunk_is_scaled(chunk_id: bytes) -> bool:
-    """Whether ``chunk_id`` carries scale info, seeing through a proxy envelope.
-
-    Mirrors the cache gate on both sides of the seam: the base
-    ``resolve_chunk_data`` tests the id directly, while the remote proxy peels
-    its envelope first. Doing the same here keeps a wrapped source's caching
-    behavior identical to the unwrapped one's.
-    """
-    try:
-        probe = (
-            peel_proxy_envelope(chunk_id)[2]
-            if is_proxy_envelope(chunk_id)
-            else chunk_id
-        )
-        return is_scaled_chunk(probe)
-    except Exception:  # pragma: no cover - a malformed id is not a cache decision
-        return False
 
 
 # --- the wrapper -------------------------------------------------------------
@@ -501,11 +492,13 @@ class NormalizingAdapter(TensorAdapter):
 
         The delegate is called with no cache manager and this wrapper owns the
         cache interaction instead, under the same key and the same gate the
-        delegate would have used. That ordering is the point: a cached segment
-        must hold what the client is served, because the localhost fast path
-        hands the client that segment's bytes directly, with the server no longer
-        in the loop to transpose them. Existing segments predate the transpose,
-        which is what ``CACHE_FILE_FORMAT_VERSION`` is bumped for.
+        delegate would have used -- literally the base's gate, since the only
+        adapter that mints a different kind of id (the remote proxy's envelope)
+        is never wrapped. That ordering is the point: a cached segment must hold
+        what the client is served, because the localhost fast path hands the
+        client that segment's bytes directly, with the server no longer in the
+        loop to transpose them. Existing segments predate the transpose, which is
+        what ``CACHE_FILE_FORMAT_VERSION`` is bumped for.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
@@ -514,7 +507,7 @@ class NormalizingAdapter(TensorAdapter):
             return self._inner.resolve_chunk_data(chunk_id, cache_manager)
 
         should_cache = cache_manager is not None and (
-            _chunk_is_scaled(chunk_id)
+            is_scaled_chunk(chunk_id)
             or isinstance(cache_manager.backend, ArrowFileBackend)
         )
 
@@ -533,6 +526,31 @@ class NormalizingAdapter(TensorAdapter):
         return data
 
 
+def _noncanonical_tensors(adapter: SourceAdapter) -> List[Tuple[str, list, list]]:
+    """``(array_id, native labels, canonical labels)`` per out-of-order tensor.
+
+    The classification behind both :func:`needs_normalization` and the log line
+    in :func:`normalize_adapter`, so deciding and reporting share one pass over
+    ``list_tensor_descriptors`` rather than listing the source twice.
+    """
+    out = []
+    for d in adapter.list_tensor_descriptors():
+        perm = canonical_permutation(d.dim_labels, d.shape)
+        if perm is not None:
+            labels = list(d.dim_labels)
+            out.append((d.array_id, labels, [labels[p] for p in perm]))
+    return out
+
+
+# Sources already reported as reordered, as (source_id, array_id, native order).
+# normalize_adapter is re-entered per ``get_tensor_adapter`` -- i.e. per chunk
+# read for a wrapped source -- so the INFO below would otherwise repeat on the
+# hot path. Keyed by the native order too, so a source whose labels genuinely
+# change is reported again rather than silently suppressed. Bounded by the number
+# of distinct non-canonical tensors, which is small by construction.
+_reported: set = set()
+
+
 def needs_normalization(adapter: SourceAdapter) -> bool:
     """Whether ``adapter`` must be wrapped to satisfy the canonical-order contract.
 
@@ -543,17 +561,14 @@ def needs_normalization(adapter: SourceAdapter) -> bool:
     source, and its concrete type is something callers legitimately test and
     switch on.
 
-    The gap that leaves is narrow and covered at closer seams:
-    ``UnresolvedSourceAdapter`` normalizes the adapter it builds at resolution
-    time, when the labels finally exist. What remains is a proxy of a legacy
-    upstream that was unreachable at registration; it stays in the upstream's
-    order until the source is registered again, which is a degraded guarantee
-    rather than incoherent data (descriptor and pixels still agree).
+    The gap that leaves is closed at a closer seam: ``UnresolvedSourceAdapter``
+    normalizes the adapter it builds at resolution time, when the labels finally
+    exist. Nothing else advertises tensors late -- the remote proxy, which does,
+    is not a candidate for wrapping at all (``_normalizable_axes``), so an
+    upstream that is down at registration cannot leave a source stranded in a
+    stale order here.
     """
-    return any(
-        canonical_permutation(d.dim_labels, d.shape) is not None
-        for d in adapter.list_tensor_descriptors()
-    )
+    return bool(_noncanonical_tensors(adapter))
 
 
 def normalize_adapter(adapter: Optional[SourceAdapter]) -> Optional[SourceAdapter]:
@@ -565,14 +580,20 @@ def normalize_adapter(adapter: Optional[SourceAdapter]) -> Optional[SourceAdapte
     test double, an adapter that raises while listing -- also returns the adapter
     unchanged, because failing to normalize is a degraded contract while
     misfiring is a correctness bug.
+
+    An adapter whose order is owned upstream (``_normalizable_axes = False``) is
+    returned unchanged too, and *not* because it is compliant: it enforces the
+    contract itself, by refusing a non-canonical order at its read boundary. See
+    the module docstring.
     """
     if adapter is None or isinstance(adapter, NormalizingAdapter):
         return adapter
     if not isinstance(adapter, SourceAdapter):
         return adapter  # duck-typed double: nothing to guarantee, nothing to wrap
+    if not adapter._normalizable_axes:
+        return adapter  # order owned upstream: validated there, never permuted
     try:
-        if not needs_normalization(adapter):
-            return adapter
+        offenders = _noncanonical_tensors(adapter)
     except Exception:
         logger.debug(
             "axis normalization: could not classify source %r; leaving it as-is",
@@ -580,4 +601,22 @@ def normalize_adapter(adapter: Optional[SourceAdapter]) -> Optional[SourceAdapte
             exc_info=True,
         )
         return adapter
+    if not offenders:
+        return adapter
+    # Reordering a source's axes is a visible behavior change -- it is what a
+    # client sees, and it costs the zero-copy read for that source -- so say so
+    # once, at INFO, naming both orders. Without this the only evidence that a
+    # source is being transposed is the transposed data itself.
+    source_id = getattr(adapter, "source_id", "?")
+    for array_id, native, canonical in offenders:
+        key = (source_id, array_id, tuple(native))
+        if key in _reported:
+            continue
+        _reported.add(key)
+        logger.info(
+            "axis normalization: serving %s as %s (stored as %s)",
+            array_id,
+            canonical,
+            native,
+        )
     return NormalizingAdapter(adapter)

@@ -260,6 +260,20 @@ class SourceAdapter(ABC):
     # purely cosmetic and needs no re-index.
     _catalog_url: Optional[str] = None
 
+    # Whether the server may bring this source into canonical axis order by
+    # *permuting* it -- wrapping the adapter in a ``NormalizingAdapter``
+    # (biopb/biopb#596). True for every adapter that reads its own bytes: the
+    # server owns the whole read path for those, so it can transpose them.
+    #
+    # False when the axis order is owned by ANOTHER party who has aligned the
+    # rest of their state to it -- today only the remote proxy, whose upstream
+    # mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
+    # Permuting behind such an owner is the same desynchronization the write path
+    # already refuses at ``create_source``, so those sources are validated and
+    # refused at their read boundary instead. See ``core.normalize`` and
+    # ``core.axes.noncanonical_order``.
+    _normalizable_axes: bool = True
+
     @property
     def source_url(self) -> Optional[str]:
         """The source's URL/path, used for filesystem ops (warm/recall).

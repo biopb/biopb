@@ -37,7 +37,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.core.axes import canonical_permutation
+from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
@@ -193,17 +193,18 @@ class UploadManager:
         before upload is the client-side fix, and it is a cheap one.
 
         This keeps the canonical-order guarantee unconditional -- it holds for
-        uploaded sources too -- at zero cost on the write data path.
+        uploaded sources too -- at zero cost on the write data path. The remote
+        proxy refuses for the same reason, in the same words
+        (``core.axes.noncanonical_order``): there too the order belongs to
+        someone who has aligned the rest of their state to it.
         """
-        perm = canonical_permutation(req_desc.dim_labels, req_desc.shape)
-        if perm is None:
+        why = noncanonical_order(req_desc.dim_labels, req_desc.shape)
+        if why is None:
             return
-        labels = list(req_desc.dim_labels)
         raise flight.FlightServerError(
-            f"create_source: dim_labels {labels} are not in canonical "
-            f"[..., Z, Y, X, S] order (expected {[labels[p] for p in perm]}). "
-            f"The data plane advertises canonical order on every source "
-            f"(biopb/biopb#596); transpose the array before uploading."
+            f"create_source: {why}. The data plane advertises canonical order on "
+            f"every source (biopb/biopb#596); transpose the array before "
+            f"uploading."
         )
 
     def create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:

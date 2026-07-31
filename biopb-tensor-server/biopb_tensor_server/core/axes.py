@@ -13,6 +13,10 @@ between them:
   the permutation that reorders an adapter's native axes into the canonical
   trailing order the server advertises. See ``core.normalize``.
 
+:func:`noncanonical_order` states the same rule as a refusal rather than a
+transform, for the seams that validate an order they do not own (an upload's
+declared order, a remote upstream's advertised one).
+
 Mirrors the frontend ``buildAxisMap`` in ``@biopb/tensor-flight-client``.
 """
 
@@ -162,6 +166,36 @@ def canonical_permutation(
     # order, and the recognized axes land in Z, Y, X, S order behind it.
     perm = tuple(sorted(range(len(labels)), key=lambda i: ranks[i]))
     return None if perm == tuple(range(len(labels))) else perm
+
+
+def noncanonical_order(
+    dim_labels: Sequence[str], shape: Sequence[int]
+) -> Optional[str]:
+    """One sentence naming a non-canonical order and the order to use, else None.
+
+    The same rule as :func:`canonical_permutation`, phrased as a refusal instead
+    of a transform. Two seams validate an axis order rather than permuting it,
+    because in both the order is *owned by another party* who has aligned the
+    rest of their state to it (biopb/biopb#596):
+
+    - an upload's declared order (``serving.upload_manager.create_source``), whose
+      ``physical_scale`` / ``chunk_shape`` arrive aligned to it and whose
+      ``put_chunk`` writes in it;
+    - a remote upstream's advertised order (``adapters.remote_tensor``), whose
+      server mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the
+      grid.
+
+    Sharing the wording keeps the two refusals reporting the same fact the same
+    way; each caller raises its own error type around it.
+    """
+    perm = canonical_permutation(dim_labels, shape)
+    if perm is None:
+        return None
+    labels = list(dim_labels)
+    return (
+        f"dim_labels {labels} are not in canonical [..., Z, Y, X, S] order "
+        f"(expected {[labels[p] for p in perm]})"
+    )
 
 
 def build_axis_map(dim_labels: list[str]) -> dict[str, Optional[int]]:

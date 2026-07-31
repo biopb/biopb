@@ -52,6 +52,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorReadPlan,
     unpack_chunk_array,
 )
+from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     cache_key_for_chunk_id,
@@ -289,6 +290,15 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
 
 class RemoteTensorAdapter(TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
+
+    # The upstream owns this source's axis order, so the server validates it
+    # rather than permuting it (biopb/biopb#596) -- see
+    # ``_require_canonical_upstream`` and ``core.normalize``. Wrapping a proxy in
+    # a NormalizingAdapter would freeze a permutation derived from the labels the
+    # upstream advertised *at registration*, while ``seed_catalog`` keeps
+    # replacing those labels in place on every reconcile; an upstream that later
+    # upgraded to canonical order would then be re-permuted into the wrong one.
+    _normalizable_axes = False
 
     def __init__(
         self,
@@ -569,6 +579,21 @@ class RemoteTensorAdapter(TensorAdapter):
         self._reachable = True
         self._upstream_resident = new_resident
         self._source_url = new_url
+        if changed:
+            # Say it at seed time, not only when someone opens the tensor: a
+            # reads-refused mirror should be discoverable from the log of the
+            # reconcile that mirrored it (biopb/biopb#596). Gated on `changed` so
+            # a steady re-list does not repeat it every tick.
+            for desc in descs:
+                why = noncanonical_order(desc.dim_labels, desc.shape)
+                if why is not None:
+                    logger.warning(
+                        "mirrored source %s: upstream tensor %s %s -- reads of it "
+                        "will be refused until that upstream is upgraded",
+                        self.source_id,
+                        desc.array_id,
+                        why,
+                    )
         return changed
 
     def get_metadata(self) -> dict:
@@ -702,9 +727,55 @@ class RemoteTensorAdapter(TensorAdapter):
         #266/#274).
         """
         plan = self.forward_flight_info(read_opt)
-        if plan is not None:
-            return plan
-        return super().plan_flight_info(read_opt, pyramid_config)
+        if plan is None:
+            plan = super().plan_flight_info(read_opt, pyramid_config)
+        self._require_canonical_upstream(plan.descriptor)
+        return plan
+
+    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
+        """Plan a read, refusing a non-canonical upstream first (#596).
+
+        The other read boundary besides ``plan_flight_info``: the precache warms
+        through it, and the local-planner fallback routes through it. Checking
+        the request descriptor is free -- it is derived from the mirrored one the
+        caller already holds.
+        """
+        self._require_canonical_upstream(request_desc)
+        return super().get_read_plan(request_desc)
+
+    def _require_canonical_upstream(self, desc: TensorDescriptor) -> None:
+        """Refuse to serve an upstream whose axis order is not canonical (#596).
+
+        The upstream owns this source's order -- it mints the chunk_ids, plans the
+        reads (biopb/biopb#295) and sizes the grid -- so the server validates that
+        order instead of permuting it behind the upstream's back, exactly as the
+        write path refuses a non-canonical ``create_source``.
+
+        Scope of the refusal, deliberately drawn at ``GetFlightInfo``: a describe
+        (``with_read_plan=false``) is refused along with a read, because the
+        descriptor it hands back *is* the artifact that would violate the
+        guarantee -- a consumer that trusted it would mis-map its axes just as
+        surely as one that read the pixels. The **catalog** surface is untouched:
+        ``list_flights`` / ``list_sources`` still enumerate the source, so an
+        operator sees the broken thing and a legible reason rather than a silent
+        disappearance.
+
+        Checked against the descriptor about to be served, so it is free (no
+        extra upstream RPC) and holds nothing stateful: a re-seed or an upstream
+        upgrade is picked up on the very next open. Ambiguity degrades to
+        "allowed", the same fail-safe direction ``canonical_permutation`` takes.
+        """
+        why = noncanonical_order(desc.dim_labels, desc.shape)
+        if why is None:
+            return
+        raise flight.FlightServerError(
+            f"upstream source {self._upstream_source_id!r} at "
+            f"{self._upstream_location} advertises axes this server will not "
+            f"mirror: {why}. The data plane advertises canonical order on every "
+            f"source (biopb/biopb#596); a proxy forwards its upstream's chunk "
+            f"ids and read plans verbatim, so the fix belongs upstream -- "
+            f"upgrade that server, and this mirror follows on the next open."
+        )
 
     # -------------------------------------------------------------- tensor layer
 
