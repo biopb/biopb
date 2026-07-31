@@ -8,13 +8,13 @@ Every advertised op becomes a thin callable placed in the ``ops`` dict in the
 
 Unlike the Image Processing widget, these functions add no chunking or
 dimensional iteration. They expose the ``Run`` RPC almost directly so the agent
-can decide how to use them, and they support tensor-server ``array_id`` (a
-source_id string) on both input and output:
+can decide how to use them, and they support tensor-server ``array_id`` strings
+on both input and output:
 
 * ``op(ndarray)``  -> inline ``eager_data`` request -> ``np.ndarray`` result.
-* ``op("src_id")`` -> ``lazy_data`` request built from ``client.get_tensor_pb``
+* ``op("array_id")`` -> ``lazy_data`` request built from ``client.get_tensor_pb``
   (the server pulls pixels from the tensor server directly, no kernel
-  round-trip) -> result uploaded back to the tensor server -> new source_id str.
+  round-trip) -> result uploaded back to the tensor server -> new ``array_id``.
 """
 
 import logging
@@ -129,7 +129,9 @@ def _build_op(
 
         if is_id:
             # Symmetric id<->id: consolidate the result onto the agent's
-            # tensor server and return a source_id for further lazy chaining.
+            # tensor server and return its array_id for further lazy chaining
+            # (upload_array creates a single-tensor source, so the id it returns
+            # is that tensor's array_id).
             if not isinstance(result, da.Array):
                 result = da.from_array(result, chunks=result.shape)
             return client.upload_array(result, "cache:")
@@ -159,14 +161,14 @@ def _build_op(
     doc += [
         "",
         "Call: op(image, dim_labels=None, **kwargs)",
-        "  image: np.ndarray (sent inline/eager) OR a tensor-server source_id",
+        "  image: np.ndarray (sent inline/eager) OR a tensor-server array_id",
         "    str (sent as a lazy reference; the server pulls pixels from the",
         "    tensor server directly).",
         "  dim_labels: axis labels for ndarray input; inferred from ndim when",
         "    None (2D=YX, 3D=YXC, 4D=ZYXC, 5D=TZYXC).",
-        "  Returns np.ndarray when image is an array; a new source_id str when",
-        "  image is a source_id (result uploaded as an ephemeral 'cache:'",
-        "  source on the connected tensor server).",
+        "  Returns np.ndarray when image is an array; a new array_id str when",
+        "  image is an array_id (result uploaded as an ephemeral 'cache:'",
+        "  single-tensor source on the connected tensor server).",
     ]
     op.__doc__ = "\n".join(doc)
     op.__name__ = _sanitize_name(op_name) or "process_op"

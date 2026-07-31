@@ -36,7 +36,7 @@ runs in a background thread to keep the main Qt thread responsive.
   variables.
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
   The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
-  server. The callable can take either a numpy array (eager) or a tensor-server source_id string
+  server. The callable can take either a numpy array (eager) or a tensor-server array_id string
   (lazy). See `guide://ops` for details.
 
 ## Kernel plugins
@@ -244,10 +244,10 @@ arr = client.get_tensor("raw_data_id")
 mask_arr = arr > 0.5
 
 # 3. Upload -- the eager step. Computes and sends chunk by chunk.
-source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
+array_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 
 # 4. Back onto the viewer for the user to check (pyramid-shaped again: trap 1)
-layer_name = viewer.add_tensor(source_id)
+layer_name = viewer.add_tensor(array_id)
 ```
 
 Uploading is also what makes a result *shareable* — an array in the kernel is
@@ -506,10 +506,10 @@ inspect_object("ops['op_name']")   # docstring, default kwargs, server
 ```
 Call signature: `ops["name"](image, dim_labels=None, **kwargs)`
 * `image` as an `np.ndarray` -> sent inline (eager) -> returns an `np.ndarray`.
-* `image` as a tensor-server **source_id str** -> sent as a lazy reference (the
+* `image` as a tensor-server **array_id str** -> sent as a lazy reference (the
   op server pulls pixels straight from the tensor server, no kernel
   round-trip) -> the result is uploaded back to the tensor server and a new
-  **source_id str** is returned, so ops chain lazily on large data:
+  **array_id str** is returned, so ops chain lazily on large data:
 ```python
 labels = ops["cellpose_cyto2"](arr)          # ndarray -> ndarray
 seg_id = ops["cellpose_cyto2"]("raw_data_id") # id -> id (lazy, large data)
