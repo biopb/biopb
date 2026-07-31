@@ -229,6 +229,20 @@ def test_bundle_gives_a_fresh_offline_install_the_meta_skill(
     assert not body.lstrip().startswith("---")  # frontmatter stripped
 
 
+def test_every_bundled_skill_is_retrievable_by_its_own_name(
+    mock_home, skills_cfg, real_bundle, monkeypatch
+):
+    # The offline agent's first move is a query, not a bare listing, so the
+    # test above (find_skills("")) does not cover the path it actually takes.
+    # Stated over whatever the bundle holds rather than naming write-a-skill:
+    # the bundle is deliberately meta-skills only, and an invariant costs the
+    # same one assertion today while covering a second one for free.
+    _offline(monkeypatch)
+    for s in _skills.load_catalog():
+        query = s["id"].replace("-", " ")
+        assert [r["id"] for r in _skills.find_skills(query)] == [s["id"]]
+
+
 def test_bundle_body_sha_matches_its_catalog(mock_home, skills_cfg, real_bundle):
     # The snapshot is refreshed by copying files in; a body updated without its
     # catalog entry (or vice versa) would ship a sha that verifies nothing.
@@ -479,3 +493,142 @@ def test_corrupt_cached_body_is_not_trusted_and_refetched(
     assert fetches["body"] == 1  # the corrupt cache was rejected, so it refetched
     # ...and the cache was repaired with the correct bytes.
     assert (bodies / f"{sha}.md").read_bytes() == raw_body
+
+
+# --------------------------------------------------------------------------- #
+# Retrieval — matcher semantics
+#
+# A skill nobody retrieves is absent, so what `query` means is a contract in its
+# own right. These use a synthetic catalog: they are about the matcher, and must
+# not move when a published description is reworded.
+#
+# Whether a real description answers the phrasings a user would type is the other
+# half, and it is not testable here -- the published skills live in biopb-site,
+# on its own release cadence, so a copy of them kept in this repo would go stale
+# green. That gate belongs in biopb-site's suite, against the real skills/*.md.
+# --------------------------------------------------------------------------- #
+def _serve(monkeypatch, skills_cfg, skills):
+    """Point discovery at an in-memory catalog."""
+    skills_cfg["skills_catalog_url"] = CATALOG_URL
+    monkeypatch.setattr(
+        _skills, "_http_get", lambda url, timeout: _catalog_bytes(skills)
+    )
+
+
+def test_every_term_must_match_not_just_one(mock_home, skills_cfg, monkeypatch):
+    # AND, not OR: a skill matching only half the query is not a hit, or every
+    # multi-word query would drag in most of the catalog.
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [
+            {"id": "a", "title": "Stitch tiles", "description": "a mosaic"},
+            {"id": "b", "title": "Stitch nothing", "description": "unrelated"},
+        ],
+    )
+    assert [s["id"] for s in _skills.find_skills("stitch mosaic")] == ["a"]
+
+
+def test_terms_match_in_any_order_and_across_fields(mock_home, skills_cfg, monkeypatch):
+    # The user's word order is not the author's. "tiles stitch" is the same
+    # request as "stitch tiles", and the two terms may land in different fields.
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [{"id": "a", "title": "Stitch a grid", "description": "overlapping tiles"}],
+    )
+    assert [s["id"] for s in _skills.find_skills("tiles stitch")] == ["a"]
+
+
+def test_query_matches_the_skill_id(mock_home, skills_cfg, monkeypatch):
+    # Naming the skill is the most specific request there is; hyphens in the id
+    # must not hide it.
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [{"id": "flatfield-and-stitch-tiles", "title": "Correct", "description": "d"}],
+    )
+    assert len(_skills.find_skills("flatfield")) == 1
+    assert len(_skills.find_skills("flatfield tiles")) == 1
+
+
+def test_query_is_case_insensitive(mock_home, skills_cfg, monkeypatch):
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [{"id": "a", "title": "Score", "description": "F1 at matched IoU"}],
+    )
+    assert len(_skills.find_skills("f1 iou")) == 1
+    assert len(_skills.find_skills("F1 IOU")) == 1
+
+
+def test_terms_match_inside_words(mock_home, skills_cfg, monkeypatch):
+    # Deliberate: "measure" should reach "measurements". Stemming is not worth
+    # its weight at catalog scale, and the cost is only over-matching.
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [{"id": "a", "title": "Report measurements", "description": "d"}],
+    )
+    assert len(_skills.find_skills("measure")) == 1
+
+
+def test_matching_a_tag_retrieves(mock_home, skills_cfg, monkeypatch):
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [{"id": "a", "title": "T", "description": "d", "tags": ["segmentation", "qc"]}],
+    )
+    assert len(_skills.find_skills("qc")) == 1
+
+
+def test_a_whole_phrase_that_matched_before_still_matches(
+    mock_home, skills_cfg, monkeypatch
+):
+    # Term matching only ever widens the result set: anything that hit as one
+    # substring necessarily has every term present.
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [{"id": "a", "title": "Correct illumination and stitch", "description": "d"}],
+    )
+    assert len(_skills.find_skills("illumination and stitch")) == 1
+
+
+def test_unmatched_query_returns_empty_not_everything(
+    mock_home, skills_cfg, monkeypatch
+):
+    _serve(monkeypatch, skills_cfg, [{"id": "a", "title": "T", "description": "d"}])
+    assert _skills.find_skills("deconvolution") == []
+
+
+def test_empty_and_whitespace_query_return_the_whole_catalog(
+    mock_home, skills_cfg, monkeypatch
+):
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [
+            {"id": "a", "title": "A", "description": "d"},
+            {"id": "b", "title": "B", "description": "d"},
+        ],
+    )
+    assert len(_skills.find_skills("")) == 2
+    assert len(_skills.find_skills("   ")) == 2
+
+
+def test_results_are_sorted_by_title(mock_home, skills_cfg, monkeypatch):
+    _serve(
+        monkeypatch,
+        skills_cfg,
+        [
+            {"id": "c", "title": "zebra", "description": "shared"},
+            {"id": "a", "title": "Apple", "description": "shared"},
+            {"id": "b", "title": "mango", "description": "shared"},
+        ],
+    )
+    assert [s["title"] for s in _skills.find_skills("shared")] == [
+        "Apple",
+        "mango",
+        "zebra",
+    ]

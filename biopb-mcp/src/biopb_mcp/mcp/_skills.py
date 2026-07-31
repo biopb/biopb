@@ -443,21 +443,46 @@ def _resolve_catalog(url: str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Public: discovery tool + resource read
 # --------------------------------------------------------------------------- #
+def _search_text(s: dict) -> str:
+    """The haystack one skill is matched against.
+
+    The ``id`` is in it, with hyphens opened out to spaces, because a user who
+    names the skill ("flatfield") is making the most specific request there is;
+    matching only prose would miss it. Everything else is what the ``find_skills``
+    docstring advertises: title, description, tags.
+    """
+    return " ".join(
+        (
+            s["id"].replace("-", " "),
+            s["title"],
+            s["description"],
+            " ".join(s["tags"]),
+        )
+    ).lower()
+
+
 def find_skills(query: str = "") -> list[dict]:
-    """Filter the catalog by *query* over title/description/tags (empty = all).
+    """Filter the catalog by *query* over id/title/description/tags (empty = all).
+
+    Every whitespace-separated term must appear somewhere in that text; order and
+    adjacency do not matter. The tool docstring offers the agent multi-word
+    queries ("segment nuclei", "measure labels"), and matching the query as one
+    substring could not serve them — "stitch tiles" missed a skill whose title
+    says "stitch" and whose description says "tiles". Since a whole-query
+    substring hit implies every term hits, this only ever widens the result set.
+
+    Substring terms, not tokens: "measure" is meant to find "measurements". The
+    cost is that a term also matches mid-word, which at catalog scale is a
+    trade worth making. Natural-language sentences are still out of scope --
+    "how do I stitch tiles?" carries terms no description contains.
 
     Returns a list of metadata dicts, each with a ``uri`` (``skill://<id>``) the
     caller reads for the full workflow. Sorted by title.
     """
     skills = load_catalog()
-    q = (query or "").strip().lower()
-    if q:
-        skills = [
-            s
-            for s in skills
-            if q
-            in (s["title"] + " " + s["description"] + " " + " ".join(s["tags"])).lower()
-        ]
+    terms = (query or "").lower().split()
+    if terms:
+        skills = [s for s in skills if all(t in _search_text(s) for t in terms)]
     out = []
     for s in sorted(skills, key=lambda s: s["title"].lower()):
         out.append(

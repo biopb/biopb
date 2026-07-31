@@ -561,7 +561,10 @@ def find_skills(query: str = "") -> list:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
     Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
-    labels"). `query` filters by title/description/tags; empty returns all.
+    labels"). `query` filters by id/title/description/tags — every word must
+    appear, in any order — and an empty query returns all. Prefer a few content
+    words over a whole sentence: "stitch tiles" retrieves, "how do I stitch
+    these tiles together?" does not.
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
 
