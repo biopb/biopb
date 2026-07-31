@@ -38,6 +38,10 @@ runs in a background thread to keep the main Qt thread responsive.
   The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
   server. The callable can take either a numpy array (eager) or a tensor-server array_id string
   (lazy). See `guide://ops` for details.
+- **Only `np` and `da` are pre-imported.** Everything else needs an explicit
+  import, and these are guaranteed installed: `pandas`, `skimage`, `scipy`,
+  `sklearn`, `matplotlib`, `cv2` (opencv-headless), `ome_zarr`, `napari`. The
+  kernel is stateful, so one import per session is enough.
 
 ## Kernel plugins
 
