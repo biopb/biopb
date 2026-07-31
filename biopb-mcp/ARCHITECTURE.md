@@ -137,12 +137,15 @@ is trusted from disk (its cert is already on this machine).
 
 The agent's capability surface **is** the kernel namespace (e.g., `viewer`, `client`,
 `ops`, `np`/`da`), so a user adds capability by simply *putting objects in scope*.
-Two paths feed it: `*.py` files in a user kernel dir, exec'd with IPython `startup/`
-semantics, and `biopb_mcp.namespace` entry points for published plugin packages. Both
-are **fail-open per unit** (one bad plugin is skipped without aborting the bootstrap)
-and gated with **reserved-name guard**, so a plugin cannot overwrite the default names.
-The agent discovers plugins with `dir()`/`inspect_object`, not from a "generated
-enumeration", so code and doc cannot drift.
+Two paths feed it: `*.py` files in a user kernel dir, and `biopb_mcp.namespace` entry
+points for published plugin packages. Either way a plugin is loaded as a **module and
+bound under one name** — its file stem or entry-point name (#664) — so its helpers and
+imports stay off the namespace, and the **reserved-name guard** is one check per
+plugin. Both paths are **fail-open per unit** (one bad plugin is skipped without
+aborting the bootstrap). Plugin modules are registered for by-value pickling, so their
+functions still run on a dask worker that cannot import them. The agent discovers
+plugins with `dir()`/`inspect_object`, not from a "generated enumeration", so code and
+doc cannot drift.
 
 ---
 

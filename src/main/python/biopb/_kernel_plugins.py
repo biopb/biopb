@@ -3,14 +3,14 @@
 Two plugin sources feed the biopb-mcp agent kernel's namespace at bootstrap:
 
 - ``*.py`` files in ``~/.config/biopb/kernel/`` (the low-friction path: drop a
-  file; its top-level defs land in the namespace), and
+  file; it is imported and bound in the namespace under its stem), and
 - installed ``biopb_mcp.namespace`` entry-point packages (the distribution path).
 
 This module is a **read-only inspector** for the control dashboard, mirroring
 :mod:`biopb._algorithms`: it lists what is present **without ever importing or
-executing it**. That static "what will load" view is deliberate — the *live* set
-of names a running kernel actually bound depends on each file's top-level code and
-each package's ``register()`` hook, which only executing it reveals, and the lean
+executing it**. That static "what will load" view is deliberate — whether a file
+actually loads depends on its top-level code, and what a package's ``register()``
+hook binds is known only by running it, which only executing reveals, and the lean
 control must not run user Python (invariant I2, and it would be a robustness /
 security hole). A file's one-line summary comes from its module docstring parsed
 with :mod:`ast` (parse, not exec); an entry point reports the distribution that

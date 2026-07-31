@@ -309,13 +309,17 @@ it already calls before heavy work) and, for a `pkg:` token, tries the import.
 is legible from handles the agent already holds; this one is not, and the
 temptation is to answer it by scanning `~/.config/biopb/kernel/` for `<name>.py`.
 That is wrong: the loader is **fail-open per file**, so a plugin that raises on
-`exec` — or loses a name to the reserved-name guard — is on disk and *not* in the
-namespace. Nor does the namespace show it: a plugin *file* contributes its
-top-level function names, not its own name, so `dir()` never says
-`segmentation_qc`. Only the loader knows which happened, so it **reports what
+import — or loses its name to the reserved-name guard — is on disk and *not* in
+the namespace. Only the loader knows which happened, so it **reports what
 survived** (`_requires.record_loaded_plugins`, called from
 `_load_namespace_plugins`) and `server_status` prints that record — held in module
 state, not `user_ns`, where a plugin could clobber the record of itself.
+
+Since #664 the namespace at least *agrees* with the token: a plugin binds one name
+and it is the file stem, so a loaded `segmentation_qc.py` does appear in `dir()` as
+`segmentation_qc`. That makes `dir()` a useful cross-check, not a substitute — it
+still cannot distinguish "never loaded" from "loaded and then shadowed", and it
+says nothing about why.
 
 Guidance lives in the `find_skills` docstring and `guide://kernel`, at the two
 moments it is needed, rather than in the handshake instructions (a per-session

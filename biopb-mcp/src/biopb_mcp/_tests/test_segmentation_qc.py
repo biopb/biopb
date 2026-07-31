@@ -240,9 +240,9 @@ class TestSeeding:
         assert (dest / "segmentation_qc.py").exists()
 
     def test_seeded_file_loads_with_a_clean_namespace_surface(self, tmp_path):
-        # The production path: the startup loader exec's the seeded file into the
-        # namespace. It must contribute only its public API — pandas/scipy handles
-        # stay private and the reserved np handle is left intact.
+        # The production path: the loader imports the seeded file and binds it
+        # under its stem, so it contributes one name — its public API is reached
+        # through the module, and the reserved np handle is left intact.
         from biopb_mcp.mcp import _bootstrap
         from biopb_mcp.plugins._seed import seed_kernel_plugins
 
@@ -255,17 +255,14 @@ class TestSeeding:
                 self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
 
         ip = IP()
-        _bootstrap._load_startup_files(ip, dest)
+        _bootstrap._load_plugin_files(ip, dest)
         builtins_ = {"viewer", "client", "np", "da", "ops"}
         contributed = {
             n for n in ip.user_ns if not n.startswith("_") and n not in builtins_
         }
-        assert contributed == {
-            "match_labels",
-            "f1_at_thresholds",
-            "SegQCResult",
-            "DEFAULT_THRESHOLDS",
-        }
+        assert contributed == {"segmentation_qc"}
+        plug = ip.user_ns["segmentation_qc"]
+        assert {"match_labels", "f1_at_thresholds", "SegQCResult"} <= set(dir(plug))
         assert ip.user_ns["np"] is np  # reserved handle untouched
 
     def test_seeded_plugin_is_callable_from_the_namespace(self, tmp_path):
@@ -280,6 +277,7 @@ class TestSeeding:
                 self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
 
         ip = IP()
-        _bootstrap._load_startup_files(ip, dest)
+        _bootstrap._load_plugin_files(ip, dest)
         gt = _boxes((20, 20), [((2, 10), (2, 10))])
-        assert ip.user_ns["match_labels"](gt, gt.copy()).f1 == pytest.approx(1.0)
+        qc = ip.user_ns["segmentation_qc"]
+        assert qc.match_labels(gt, gt.copy()).f1 == pytest.approx(1.0)

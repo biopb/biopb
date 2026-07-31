@@ -138,11 +138,11 @@ class TestSeeding:
         assert all(a == "exists" for a in actions.values())
         assert (dest / "rolling_ball.py").read_text(encoding="utf-8") == "# my edit\n"
 
-    def test_seeded_file_loads_as_startup_plugin_clean_surface(self, tmp_path):
-        # The production path: the kernel startup-file loader exec's the seeded
-        # file into the namespace. It must contribute the two public callables and
-        # nothing else — scipy/skimage handles stay private, __init__.py (leading
-        # underscore) is skipped, and the reserved np handle is left intact.
+    def test_seeded_file_loads_as_a_plugin_module(self, tmp_path):
+        # The production path: the kernel loader imports the seeded file and binds
+        # it under its stem. It contributes that one name — the public callables
+        # are reached through it, __init__.py (leading underscore) is skipped, and
+        # the reserved np handle is left intact.
         from biopb_mcp.mcp import _bootstrap
         from biopb_mcp.plugins._seed import seed_kernel_plugins
 
@@ -159,24 +159,23 @@ class TestSeeding:
                 self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
 
         ip = IP()
-        _bootstrap._load_startup_files(ip, dest)
-        assert callable(ip.user_ns.get("subtract_background"))
-        assert callable(ip.user_ns.get("rolling_ball_background"))
+        _bootstrap._load_plugin_files(ip, dest)
         builtins_ = {"viewer", "client", "np", "da", "ops"}
         contributed = {
             n for n in ip.user_ns if not n.startswith("_") and n not in builtins_
         }
-        assert contributed == {
-            "subtract_background",
-            "rolling_ball_background",
-            "DEFAULT_RADIUS",
-        }
+        assert contributed == {"rolling_ball"}
+        plug = ip.user_ns["rolling_ball"]
+        assert callable(plug.subtract_background)
+        assert callable(plug.rolling_ball_background)
+        assert plug.DEFAULT_RADIUS == 50.0
+        assert ip.user_ns["np"] is np
 
     def test_a_skill_can_name_the_seeded_plugin_by_file_stem(self, tmp_path):
         # The token↔file contract a skill author relies on: `plugin:rolling_ball`
         # in frontmatter is answered by `rolling_ball.py` appearing in the
-        # server_status report, not by the names the file happens to export
-        # (subtract_background, …) — those are all the namespace ever shows.
+        # server_status report. Since #664 the namespace agrees with that token —
+        # the stem is also the name bound in `dir()`.
         from biopb_mcp.mcp import _bootstrap, _requires
         from biopb_mcp.plugins._seed import seed_kernel_plugins
 
@@ -187,8 +186,9 @@ class TestSeeding:
             user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
 
         ip = IP()
-        _requires.record_loaded_plugins(_bootstrap._load_startup_files(ip, dest))
+        _requires.record_loaded_plugins(_bootstrap._load_plugin_files(ip, dest))
         assert "rolling_ball" in "\n".join(_requires.plugin_status_lines())
+        assert "rolling_ball" in ip.user_ns
 
     def test_static_inspector_lists_seeded_file(self, tmp_path):
         # The dashboard reads the kernel dir statically (parse, no exec).

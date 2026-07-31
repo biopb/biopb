@@ -30,15 +30,11 @@ is scipy's edge-replicate, a minor rim approximation vs ImageJ's roll-past-edge 
 immaterial to the interior background estimate.
 """
 
-# No ``from __future__ import annotations``: as a startup file this exec's into
-# the agent namespace, and that import would leak the name ``annotations`` there.
-# The 3.10+ signatures below don't need it (no ``X | Y`` unions).
-
-# Imported under private aliases so that when this file is loaded as a kernel
-# startup plugin (exec'd directly into the agent namespace, IPython startup/
-# semantics) it contributes only its public API — subtract_background,
-# rolling_ball_background, DEFAULT_RADIUS — and not scipy/skimage handles. np is
-# left public but the loader's reserved-name guard restores the kernel's own.
+# Private aliases keep the module's own surface to its public API, so
+# `inspect_object("rolling_ball")` shows the agent two callables rather than every
+# scipy/skimage handle this file imported. Style, not protection: as a kernel
+# plugin this module is bound under one name, so nothing here can reach the
+# agent's namespace (#664).
 import math as _math
 
 import numpy as np

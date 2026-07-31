@@ -165,22 +165,89 @@ def _seeded_ns():
     }
 
 
-class TestLoadStartupFiles:
-    """`~/.config/biopb/kernel/*.py`, exec'd in the namespace (#92)."""
+class TestLoadPluginFiles:
+    """`~/.config/biopb/kernel/*.py`, imported and bound by module name (#664)."""
 
-    def test_top_level_defs_land_and_see_live_handles(self, tmp_path):
-        # A plugin function referencing `viewer`/`client` as globals resolves them
-        # against the kernel namespace at call time -- including a `client`
-        # refreshed after load (the per-job refresh), exactly like execute_code.
+    def test_a_plugin_contributes_exactly_one_name(self, tmp_path):
+        # The whole point of the module binding: a file's helpers, its imports and
+        # its dunders stay on the module. Under the old exec loader every one of
+        # these landed in the agent's namespace.
         (tmp_path / "a.py").write_text(
-            '"""Lab tools."""\ndef my_tool():\n    return (viewer, client)\n',
+            '"""Lab tools."""\n'
+            "import math\n"
+            "__all__ = ['my_tool']\n"
+            "HELPER_CONST = 3\n"
+            "def _helper():\n    return 1\n"
+            "def my_tool():\n    return math.floor(2.5) + _helper()\n",
             encoding="utf-8",
         )
         ns = _seeded_ns()
-        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
-        assert "my_tool" in ns
-        ns["client"] = "CONNECTED"  # simulate the per-job client refresh
-        assert ns["my_tool"]() == ("REAL_VIEWER", "CONNECTED")
+        before = set(ns)
+        _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+        assert set(ns) - before == {"a"}
+        assert ns["a"].my_tool() == 3
+        assert ns["a"].HELPER_CONST == 3  # reachable, just not in the namespace
+
+    def test_a_plugin_cannot_shadow_a_reserved_handle(self, tmp_path):
+        # Now a single check on one name, and the file that loses it is not bound
+        # at all -- there is no partial contribution to clean up.
+        (tmp_path / "viewer.py").write_text("def hijack():\n    return 1\n", "utf-8")
+        ns = _seeded_ns()
+        loaded = _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+        assert ns["viewer"] == "REAL_VIEWER"
+        assert loaded == []
+
+    def test_a_plugin_named_after_a_real_package_does_not_shadow_it(self, tmp_path):
+        # Registered under the `biopb_kernel_plugins.` prefix, never the bare stem:
+        # a `json.py` in the kernel dir must not become `sys.modules["json"]` for
+        # everything imported afterwards.
+        import json
+        import sys
+
+        (tmp_path / "json.py").write_text(
+            "def dumps(x):\n    return 'HIJACKED'\n", "utf-8"
+        )
+        ns = _seeded_ns()
+        _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+        assert ns["json"].dumps({}) == "HIJACKED"  # the plugin, under its own name
+        assert sys.modules["json"] is json  # the real module, untouched
+        assert json.dumps({"a": 1}) == '{"a": 1}'
+        sys.modules.pop("biopb_kernel_plugins.json", None)
+
+    def test_plugin_functions_still_run_on_a_dask_worker(self, tmp_path):
+        # A module's functions pickle *by reference* by default -- a few bytes
+        # naming a module no worker can import, since the kernel plugin dir is on
+        # no other process's sys.path. The loader registers each plugin for
+        # by-value pickling to keep `da.map_blocks(plug.fn)` working; without it
+        # this fails at compute time, inside the worker, far from the load.
+        import subprocess
+        import sys
+
+        import cloudpickle
+
+        (tmp_path / "shipped.py").write_text(
+            "def double(x):\n    return x * 2\n", "utf-8"
+        )
+        ns = _seeded_ns()
+        _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+        blob = cloudpickle.dumps(ns["shipped"].double)
+        sys.modules.pop("biopb_kernel_plugins.shipped", None)
+
+        # A fresh interpreter, as a dask worker process would be: no plugin dir on
+        # sys.path, no loader run, nothing shared but the bytes.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import pickle,sys; fn=pickle.loads(sys.stdin.buffer.read());"
+                " print(fn(21))",
+            ],
+            input=blob,
+            capture_output=True,
+            cwd=tmp_path.parent,
+        )
+        assert proc.returncode == 0, proc.stderr.decode()
+        assert proc.stdout.strip() == b"42"
 
     def test_failing_file_is_fail_open_and_next_still_loads(self, tmp_path):
         (tmp_path / "a_boom.py").write_text(
@@ -188,24 +255,28 @@ class TestLoadStartupFiles:
         )
         (tmp_path / "b_ok.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
         ns = _seeded_ns()
-        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
-        assert "ok" in ns  # the boom did not abort the sweep
+        _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+        assert "b_ok" in ns  # the boom did not abort the sweep
+        assert "a_boom" not in ns
 
-    def test_reserved_name_overwrite_is_restored(self, tmp_path):
-        (tmp_path / "c.py").write_text(
-            'viewer = "HIJACKED"\nclient = "HIJACKED"\n', encoding="utf-8"
+    def test_a_half_executed_file_leaves_no_module_registered(self, tmp_path):
+        # The file raised partway through import; nothing may be left in
+        # sys.modules for a later import to find in that state.
+        import sys
+
+        (tmp_path / "halfway.py").write_text(
+            "def ok():\n    return 1\nraise RuntimeError('boom')\n", encoding="utf-8"
         )
-        ns = _seeded_ns()
-        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
-        assert ns["viewer"] == "REAL_VIEWER" and ns["client"] is None
+        _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path)
+        assert "biopb_kernel_plugins.halfway" not in sys.modules
 
     def test_underscore_files_skipped_and_missing_dir_is_noop(self, tmp_path):
         (tmp_path / "_priv.py").write_text("secret = 1\n", encoding="utf-8")
         ns = _seeded_ns()
-        _bootstrap._load_startup_files(_FakeIP(ns), tmp_path)
-        assert "secret" not in ns
+        _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+        assert "_priv" not in ns and "secret" not in ns
         # A non-existent dir must not raise.
-        _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path / "nope")
+        _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path / "nope")
 
     def test_only_the_files_that_survived_are_reported_as_loaded(self, tmp_path):
         # The record `server_status` reports a skill's `plugin:<name>` from. It
@@ -217,7 +288,7 @@ class TestLoadStartupFiles:
             'raise RuntimeError("boom")\n', encoding="utf-8"
         )
         (tmp_path / "_priv.py").write_text("x = 1\n", encoding="utf-8")
-        loaded = _bootstrap._load_startup_files(_FakeIP(_seeded_ns()), tmp_path)
+        loaded = _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path)
         assert loaded == ["good"]
 
 
@@ -378,19 +449,36 @@ class TestLoadEntryPointPlugins:
         ns = self._run(monkeypatch, [self._ep("reg", register)])
         assert ns["reg_tool"] == "R" and ns["viewer"] == "REAL_VIEWER"
 
-    def test_module_and_mapping_filter_public_names(self, monkeypatch):
+    def test_module_and_mapping_each_bind_one_name(self, monkeypatch):
+        # Same contract as a plugin file (#664): the entry-point name is the whole
+        # contribution, and a mapping is wrapped so it is reached the same way.
         import types
 
         mod = types.ModuleType("m")
-        mod.__all__ = ["mod_tool"]
         mod.mod_tool = "M"
         mod.hidden = "H"
-        ns = self._run(
-            monkeypatch,
-            [self._ep("mod", mod), self._ep("map", {"map_tool": "MP", "_skip": "no"})],
+        ns = _seeded_ns()
+        before = set(ns)
+        import importlib.metadata as md
+
+        monkeypatch.setattr(
+            md,
+            "entry_points",
+            lambda group=None: [
+                self._ep("mod", mod),
+                self._ep("map", {"map_tool": "MP", "_skip": "no"}),
+            ],
         )
-        assert ns["mod_tool"] == "M" and "hidden" not in ns
-        assert ns["map_tool"] == "MP" and "_skip" not in ns
+        _bootstrap._load_entry_point_plugins(_FakeIP(ns))
+        assert set(ns) - before == {"mod", "map"}
+        assert ns["mod"].mod_tool == "M" and ns["mod"].hidden == "H"
+        assert ns["map"].map_tool == "MP" and not hasattr(ns["map"], "_skip")
+
+    def test_a_module_entry_point_cannot_shadow_a_reserved_handle(self, monkeypatch):
+        import types
+
+        ns = self._run(monkeypatch, [self._ep("viewer", types.ModuleType("m"))])
+        assert ns["viewer"] == "REAL_VIEWER"
 
     def test_junk_and_import_failure_are_fail_open(self, monkeypatch):
         class _Boom:
@@ -409,7 +497,7 @@ class TestLoadNamespacePluginsGate:
     def test_disabled_by_config_skips_everything(self, tmp_path, monkeypatch):
         called = []
         monkeypatch.setattr(
-            _bootstrap, "_load_startup_files", lambda *a: called.append("f")
+            _bootstrap, "_load_plugin_files", lambda *a: called.append("f")
         )
         monkeypatch.setattr(
             _bootstrap, "_load_entry_point_plugins", lambda *a: called.append("e")
