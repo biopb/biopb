@@ -193,7 +193,8 @@ control.
   capability is added by *putting objects in scope* — not by extending a protocol.
   That is also the extension story: a lab drops a `*.py` file in
   `~/.config/biopb/kernel/` (or ships a `biopb_mcp.namespace` entry-point package)
-  and its callables load straight into the kernel namespace (biopb/biopb-mcp#92).
+  and it is loaded into the kernel namespace as a module named after the file, so
+  the agent calls its functions through it (biopb/biopb-mcp#92, #664).
 - **It is a *shared* session, not a headless one.** The viewer the agent mutates
   is the same window the scientist is watching: the agent adds a result layer, the
   scientist sees it appear, tweaks it by hand, and the agent reads it back. The
