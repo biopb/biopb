@@ -415,6 +415,46 @@ That fixture is deterministic, needs no key and no model, so it lives under the
 `outcome` marker with the rest of §5's machinery. The agent half is what needs
 the harness below.
 
+### 6c. A real session, not a stand-in tool surface
+
+The run happens at **Tier 2** of §8: a real shim-spawned session child, a real
+IPython kernel, a real napari viewer, real dask, and the nine real tools reached
+over real MCP with their own schemas and the server's own `instructions`. The
+body arrives through the real `_skills.py`.
+
+A hand-written tool surface would have been much cheaper. It was rejected
+because it puts `execute_code`'s return shape, `server_status`'s report and the
+`guide://` bodies back into a **transcription** — the same property that keeps
+§5 out of the merge gate, moved from the subject to the environment. And these
+skills are largely *about* the environment: `layer.scale` one element short on
+interleaved colour, labels and image from different pyramid levels, a lazy array
+that materialises on `regionprops_table`. A stub reproduces none of it.
+
+The cost, stated plainly: **a red run's cause space now includes the kernel, Qt,
+dask and the tool schemas**, at the tier least able to isolate. Three things
+bound that — the trace is written before any assertion runs; a smoke test with
+no model in it fails separately when the stack is at fault; and §5 is where a
+*numeric* finding gets pinned down.
+
+Three environment facts are **forced rather than inherited**, because each
+silently changes what a run tests:
+
+- **A real viewer, and a GL context behind it.** `display_mode: auto` degrades
+  to a viewer-less kernel with no display, and `QT_QPA_PLATFORM=offscreen` is
+  not enough either — napari builds and then `add_image` dies in vispy's
+  extension probe. Either way step 2's *"show the user the first and last
+  frames"* could not happen. So a GL-capable display is required (a desktop
+  session, or `xvfb-run`), and bring-up refuses rather than degrades.
+- **No tensor plane.** A developer box often has one up, and then the agent can
+  wander into whatever catalog that machine holds. `client` is forced to `None`;
+  the fixture reaches the agent as a napari layer, which every skill's
+  Parameters table accepts as a source.
+- **A config tree of its own**, so the catalog under test is the shipped set and
+  not the developer's personal `~/.config/biopb/skills/*.md`.
+
+Built: `interaction/_session.py` and `test_session_smoke.py`. The agent adapter,
+the respondent and the conversation loop are not.
+
 ## 7. Layer 5 — ablation (authoring, not gating)
 
 Give a small model the task **without** the skill, closed-book, and diff against

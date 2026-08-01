@@ -26,6 +26,7 @@ workstation as a diagnostic (`outcomes/README.md`).
 | `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
 | `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? *(diagnostic, not a gate)* |
 | `outcomes/test_drift_channel_choice.py` | Interaction, prep | Does a fact only a person holds actually cost the measurement when nobody asks? *(no model in the loop)* |
+| `interaction/` | Interaction | A model in front of the shipped body, against a real session *(§6; the session floor is built, the agent is not)* |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
@@ -119,3 +120,26 @@ belonging to the tier above (`docs/skill-testing.md` §6b). It has no model in
 it: it asserts that a fact only the microscopist holds — which channel is
 structural — cannot be recovered from the pixels, by scoring runs that guessed.
 That has to hold before it is worth paying a model to demonstrate it.
+
+## The `interaction` marker
+
+A **real** biopb-mcp session — shim-spawned child, real kernel, real napari,
+real dask, the nine real tools over real MCP — with the skill body arriving
+through the real `_skills.py`. `docs/skill-testing.md` §6 and
+`interaction/README.md`.
+
+```sh
+xvfb-run -a -s '-screen 0 1024x768x24' \
+  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction
+```
+
+**It needs a GL-capable display**, and not merely offscreen Qt: napari builds
+under `QT_QPA_PLATFORM=offscreen` and then `add_image` dies in vispy's GL probe.
+Without one the tests skip with instructions.
+
+Nothing here is stood in for, deliberately — a hand-written tool surface would
+put `execute_code`'s return shape and the `guide://` bodies back into a
+transcription, which is the property that keeps §5 out of the gate. The cost is
+that a red run's cause space includes the kernel, Qt and dask, so
+`test_session_smoke.py` exists to fail separately when the stack rather than the
+skill is at fault — and it runs without a model or a key.
