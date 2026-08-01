@@ -8,11 +8,11 @@ The deterministic layers of [`docs/skill-testing.md`](../../../../../docs/skill-
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 ```
 
-Two layers are held back from that default run, each by a marker and for the
-same reason — they need something the shared env does not have. `satisfiability`
-needs a real resolver run (below); `outcome` needs each skill's own package, so
-it runs in the per-package envs `skill-contracts.yaml` builds
-(`outcomes/README.md`).
+Two layers are held back from that default run, each by a marker. `satisfiability`
+needs a real resolver run (below). `outcome` needs each skill's own package —
+and, unlike everything else here, is **not a gate at all**: it scores a hand
+transcription of a skill rather than the shipped file, so it runs on a
+workstation as a diagnostic (`outcomes/README.md`).
 
 ## What is covered
 
@@ -24,7 +24,7 @@ it runs in the per-package envs `skill-contracts.yaml` builds
 | `test_retrieval.py` | Retrieval | Do the real descriptions answer the phrasings a user would type? |
 | `test_satisfiability.py` | Contract | Can a skill's declared packages be installed here at all? |
 | `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
-| `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? |
+| `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? *(diagnostic, not a gate)* |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
@@ -82,17 +82,33 @@ if the shipped catalog ever stops declaring a third-party package again.
 ## The `outcome` marker
 
 Fixtures with a known answer, and a verifier that scores a run against them —
-`docs/skill-testing.md` §5. Deselected by default, and unlike `satisfiability`
-it is not a matter of cost: the subjects import the skill's package, and that
-package is deliberately not in this environment. One shared resolution would
-force every skill's dependency to co-exist with every other's.
+`docs/skill-testing.md` §5. Deselected by default for two reasons, and the
+second is the important one:
+
+- the subjects import the skill's package, and that package is deliberately not
+  in this environment (one shared resolution would force every skill's
+  dependency to co-exist with every other's);
+- **it tests nothing this repo ships.** The subjects are a hand transcription of
+  what a skill body says and never read the file, so a green run certifies the
+  transcription. Edit a step, or delete the skill, and these stay green. That is
+  why it is a workstation diagnostic and not a merge gate, unlike
+  `test_contracts.py` next door, whose assertions come out of the shipped
+  frontmatter.
 
 ```sh
-pytest biopb-mcp/src/biopb_mcp/_tests/skills -m outcome   # needs the package
+uv run --no-project --python .venv/bin/python --with pystackreg \
+  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills -m outcome
 ```
 
-See `outcomes/README.md`. Two things there are worth knowing from here: real
-data can be substituted for a synthetic fixture without touching a verifier
-(`BIOPB_SKILL_FIXTURES`), and every case is deliberately also run through the
-mistake its skill body warns about, because a verifier nothing has ever failed
-is not known to work.
+Its use is downstream of the interaction tier (§6): an agent run against a real
+skill file is the test with teeth and is non-deterministic, and this is the
+harness a finding from one gets pinned down in. See `outcomes/README.md`,
+including what the fixtures deliberately do not span. Two mechanisms there are
+worth knowing from here: real data can be substituted for a synthetic fixture
+without touching a verifier (`BIOPB_SKILL_FIXTURES`), and every case is also run
+through the mistake its skill body warns about, because a verifier nothing has
+ever failed is not known to work.
+
+The protocol tests (`outcomes/test_outcome_protocol.py`) are *not* marked and do
+run with the ordinary suite — they are hermetic and instant, and a break in the
+machinery should surface before someone is mid-diagnosis with it.

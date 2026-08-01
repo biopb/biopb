@@ -37,19 +37,17 @@ from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
-# What runs in each per-package env. The signature contracts (§3), and the
-# reference-implementation half of the outcome layer (§5) -- which belongs here
-# rather than in mcp-ci for the same reason the contracts do: it needs the
-# skill's package, and one shared env cannot hold every skill's.
+# What runs in each per-package env: the signature contracts (§3), and nothing
+# else. These assertions are *derived from the shipped catalog* -- the packages
+# below come out of the skills' own frontmatter, and each assertion pins an API
+# a body quotes. Delete a skill and the work here changes.
 #
-# Only the deterministic half is armed. These runs are a reference
-# implementation of what a body prescribes, scored against a fixture with a
-# known answer -- no agent, no display, no network. The agent tier stays local
-# and advisory, as §10 says.
-TARGETS = [
-    Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py"),
-    Path("biopb-mcp/src/biopb_mcp/_tests/skills/outcomes"),
-]
+# The outcome layer (§5) is deliberately NOT here, though it also needs a
+# skill's package. Its subjects are a hand transcription of what a body says,
+# not a reading of the file: nothing in it would notice if the skill were
+# deleted, so a green result certifies the transcription, not the catalog. It is
+# a diagnostic harness, run on a workstation -- see docs/skill-testing.md §5.
+CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
 
 # Prose docs that live beside the skills. Keep in step with `_validate.NOT_SKILLS`.
 NOT_SKILLS = {"README", "ROADMAP"}
@@ -128,12 +126,7 @@ def check_one(spec: str, python: str) -> bool:
                     "--color=yes",
                     "-p",
                     "no:cacheprovider",
-                    # Overrides the repo's default deselection, which hides the
-                    # outcome marker. Satisfiability stays out: it is mcp-ci's
-                    # step and it would resolve against this throwaway env.
-                    "-m",
-                    "not satisfiability",
-                    *(str(t) for t in TARGETS),
+                    str(CONTRACTS),
                 ]
             )
             == 0

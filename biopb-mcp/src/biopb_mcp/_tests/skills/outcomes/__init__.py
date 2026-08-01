@@ -35,11 +35,19 @@ expected-to-fail row in :mod:`.test_drift_correction` is a claim the skill file
 makes in prose.
 
 **No agent yet.** The subject under test is a reference implementation of the
-procedure the body prescribes, not a model following it. That is a smaller
-question than §5's, and worth answering first: it proves the fixture and the
-verifier discriminate, and it catches a body whose recipe stopped working. An
-agent run plugs into the same :class:`._outcome.Attempt` and the same verifier.
+procedure the body prescribes, not a model following it. An agent run plugs into
+the same :class:`._outcome.Attempt` and the same verifier.
 
-Marked ``outcome`` and deselected by default — the assertions are slow, and §10
-places this layer outside the merge gate on purpose.
+**This is a diagnostic harness, not a gate.** Nothing here reads a skill file —
+:mod:`._drift` is a hand transcription of what ``drift-correction.md`` says, so
+a green run certifies the transcription, not the shipped catalog. That is why it
+stays out of CI while the contract layer next door (whose assertions *are*
+derived from the frontmatter) gates every PR. Its use is downstream of §6: an
+agent run against the real skill file is the test with teeth and is
+non-deterministic, and this is where one of its findings gets pinned to a
+fixture, a tolerance, and a repeatable pass/fail. See ``README.md`` here for
+what the fixtures deliberately do not span.
+
+Marked ``outcome`` and deselected by default; §10 places this layer outside the
+merge gate on purpose.
 """

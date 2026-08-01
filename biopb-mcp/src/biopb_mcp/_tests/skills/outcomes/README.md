@@ -15,6 +15,27 @@ protocol tests in `test_outcome_protocol.py` are *not* marked and run with the
 ordinary suite — they are hermetic and instant, and a break in the fixture
 protocol should surface as a normal test failure.
 
+## This is a diagnostic harness, not a gate
+
+**Nothing here tests shipped code.** `_drift.py` is a hand transcription of what
+`drift-correction.md` says; it never reads that file. Edit step 3 to prescribe a
+different `reference=` and this suite stays green while the body and the tested
+procedure quietly part ways. Delete the skill entirely and nothing here notices.
+A green result certifies the transcription — that the recipe, as written down
+here, still stabilises a movie against the installed libraries.
+
+That is why it is **not in CI**, unlike the contract layer next door, whose
+assertions are derived from the shipped catalog (`skill_contracts.py` reads the
+`pkg:` tokens out of the frontmatter, so deleting a skill changes the work it
+does). The gate has to test the artifact users get.
+
+What it is *for* is the tier above it: an agent run against the real skill file
+(§6) is the test with teeth, and it is **non-deterministic**. When one surfaces
+something — a step that reads as unambiguous and isn't, a number that comes out
+wrong on one field and not another — this is where that gets pinned down: a
+fixture, a subject, a tolerance, and a repeatable pass/fail. Reach for it after
+§6 gives you something to isolate, not before.
+
 ## What is here
 
 | File | Holds |
@@ -66,13 +87,41 @@ deliberately does not live in the shared test env — one resolution cannot hold
 every skill's dependency (see `../README.md`). So:
 
 - rows needing `pystackreg` `importorskip` and are silent without it;
-- rows on the degraded path (`skimage.registration`) always run;
-- CI runs the whole layer inside `skill-contracts.yaml`'s per-package env, where
-  the package is present by construction.
+- rows on the degraded path (`skimage.registration`) always run.
 
-That last point is a change from §10's original plan of workstation-only. It
-applies to the **reference-implementation** half only — deterministic, agent
-free, display-free, four seconds. The agent tier stays local and advisory.
+The `uv run --with` line at the top of this file is the whole setup: it overlays
+the package on the existing `.venv` for one command without disturbing it.
+
+## What this does not test
+
+The scope of this layer is not the skill. It is **whatever the fixture and the
+tolerances in `_drift.py` happen to span** — a judgement made by whoever wrote
+them, and one the pass/fail signal does not carry. Read a green run as "correct
+on these three movies, to this precision, against these four mistakes", never as
+"the skill works". The ones that most narrow it:
+
+- **The fixtures are noiseless.** Every frame is a deterministic resample of one
+  base image. Registration precision is fundamentally noise-limited, so these
+  numbers measure systematic correctness, not the precision a microscope gets.
+- **Fixture and correction share an interpolation kernel** — both `order=3`,
+  `mode="nearest"`. `residual_ratio` was designed not to share a *registration*
+  error with the subject; it does share a *resampling* one. Partly self-limiting
+  (cubic resampling is not exactly invertible, which is where the non-zero
+  residual floor comes from), but the bias is common-mode.
+- **Translation only.** Rotational or scale drift is not untested, it is
+  unrepresentable: `StackReg.TRANSLATION` and `ndimage.shift` cannot express it.
+- **`TOLERANCE` is a band, not a promise.** It was chosen to sit in the measured
+  gap between the procedures that work and the mistakes that don't. The skill
+  body states no precision, so these numbers are invented, not quoted.
+- **Borders are excluded** by `_margin()` — which is exactly what step 6 of the
+  body is about, so that claim is structurally outside the verifier's reach.
+- **Absolute registration is out of gauge.** Both series are normalised to frame
+  0, so a run that gets every relative offset right and displaces the whole
+  series passes.
+
+None of this is fixable in general — the set of things a fixture leaves out is
+unbounded, and only a human can name the parts worth naming. It is written down
+so a diagnostic result is read for what it is.
 
 ## Artifacts
 
@@ -111,7 +160,20 @@ The protocol in `_outcome.py` knows nothing about drift and should stay that
 way: what a metric means, what truth it needs, and what the tolerance is are all
 the skill's business.
 
-Not every skill can have this layer. It needs an outcome that is a number with a
-knowable right answer — `calibrated-measurements` and `segmentation-qc-metrics`
-qualify (an analytic volume, a closed-form F1); `write-a-skill` does not. That
-is a real limit, not a backlog.
+**Nothing is queued.** `drift-correction` is the worked example, and the reason
+to write a second module is a specific finding that needs isolating, not
+coverage for its own sake. Two things bound what would be worth it:
+
+- The outcome has to be a number with a knowable right answer.
+  `calibrated-measurements` and `segmentation-qc-metrics` qualify (an analytic
+  volume, a closed-form F1); `write-a-skill` emits markdown and never will.
+- A **correct-by-construction reference implementation has to be able to fail**.
+  Where the failure mode is an agent's *choice* — passing `spacing=` and then
+  multiplying by `prod(spacing)` again, picking the wrong structural channel —
+  the subject here makes the right choice by construction, and the fixture
+  scores data nothing can fail. Those belong to §6.
+
+Cost, for calibration: `drift-correction` took ~640 lines against a 157-line
+skill, most of it the fixture design and the tolerance measurement rather than
+the plumbing. A scalar, analytically-known truth would be a fraction of that;
+drift's is a trajectory with a gauge freedom, which is the expensive shape.
