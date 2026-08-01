@@ -100,11 +100,23 @@ def _plan(requirement: str) -> tuple[dict, dict]:
 # or say in the body that the package wants its own environment).
 _KNOWN_DOWNGRADES = {
     "basicpy": (
-        "basicpy 2.0.0 forces numpy<2 (2.3.5 -> 1.26.4), and pandas/scipy with "
-        "it. The tensor stack moved to numpy 2.x in the bioio migration, so "
-        "this install quietly reverts it."
+        "basicpy 2.0.0 pins scipy<1.13, which drags numpy back with it "
+        "(2.3.5 -> 1.26.4, plus pandas and scipy). It does not pin numpy "
+        "directly. The tensor stack moved to numpy 2.x in the bioio migration, "
+        "so this install quietly reverts it -- under a live kernel that already "
+        "imported numpy 2. There is no older basicpy to fall back to: 1.1.0 is "
+        "jax-backed and takes no scipy pin, but its source uses pydantic v1 "
+        "@root_validator/class Config while declaring pydantic>=1.9.1, so a "
+        "resolver leaves pydantic 2.x in place and `import basicpy` fails at "
+        "class definition. Take the skill's degraded path instead "
+        "(FLATFIELD_METHOD = 'smoothed-median')."
     ),
-    "m2stitch": "m2stitch pins pandas 1.5.3-era metadata; pandas 3.0.3 -> 2.3.3.",
+    "m2stitch": (
+        "m2stitch takes pandas 3.0.3 -> 2.3.3. Milder than basicpy -- pandas is "
+        "a direct biopb-mcp dependency rather than the array layer everything "
+        "else is compiled against -- but still an unrequested change to the "
+        "running environment. Degraded path: PLACEMENT = 'nominal-grid'."
+    ),
 }
 
 
