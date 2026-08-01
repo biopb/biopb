@@ -95,6 +95,16 @@ def test_shipped_skill_is_not_retrieved_for(shipped_only, query, unwanted):
     assert unwanted not in got, f"{query!r} wrongly surfaced {unwanted}; got {got}"
 
 
+def test_every_shipped_skill_is_retrievable_by_its_own_name(shipped_only):
+    """No skill is stranded. The one retrieval check that needs no table and
+    can never go stale: each id, read as words, retrieves that skill and only
+    that skill. A new skill inherits it for free."""
+    for s in _skills.find_skills(""):
+        query = s["id"].replace("-", " ")
+        got = [r["id"] for r in _skills.find_skills(query)]
+        assert got == [s["id"]], f"{query!r} -> {got}"
+
+
 def test_every_shipped_skill_appears_in_the_phrasing_table(shipped_only):
     """A skill added without a phrasing entry is a skill nobody checked anyone
     can find. Cheap to satisfy, and the alternative is a table that quietly

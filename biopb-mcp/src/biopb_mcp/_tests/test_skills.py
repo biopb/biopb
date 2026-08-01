@@ -231,6 +231,10 @@ def test_unreadable_shipped_file_is_skipped_not_fatal(
 
 # --------------------------------------------------------------------------- #
 # The shipped set
+#
+# That it *loads* -- not that it retrieves. Whether the real descriptions answer
+# real phrasings is _tests/skills/test_retrieval.py, beside the rest of the
+# authoring gate; this file stops at the loader and the matcher.
 # --------------------------------------------------------------------------- #
 def test_the_shipped_skills_load(mock_home, real_skills):
     # The package always answers find_skills with something -- there is no
@@ -238,15 +242,6 @@ def test_the_shipped_skills_load(mock_home, real_skills):
     ids = [s["id"] for s in _skills.find_skills("")]
     assert "write-a-skill" in ids, ids
     assert all(s["origin"] == "catalog" for s in _skills.find_skills(""))
-
-
-def test_every_shipped_skill_is_retrievable_by_its_own_name(mock_home, real_skills):
-    # No skill is stranded: each id, read as words, retrieves that skill and
-    # only that skill. Stated over whatever ships rather than naming ids, so a
-    # new skill inherits the check for free.
-    for s in _skills.find_skills(""):
-        query = s["id"].replace("-", " ")
-        assert [r["id"] for r in _skills.find_skills(query)] == [s["id"]]
 
 
 def test_every_shipped_skill_has_a_readable_body(mock_home, real_skills):
