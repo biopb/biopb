@@ -14,6 +14,19 @@ from ._validate import NOT_SKILLS
 SKILLS_DIR = Path(__file__).resolve().parents[2] / "mcp" / "_skills_data"
 
 
+def read_skill(path: Path) -> str:
+    """Read a skill file the way the runtime does -- as UTF-8, always.
+
+    Never `Path.read_text()` bare here. Skill bodies carry µm, superscripts and
+    em dashes, and a bare read uses the *locale* codec: on a Windows runner
+    (cp1252) `10⁹` raises UnicodeDecodeError, and a body whose non-ASCII happens
+    to be in cp1252's range decodes to mojibake with no error at all. The runtime
+    reader (`mcp/_skills.py`) passes utf-8 at all three of its read sites; this
+    keeps the gate reading the same bytes it does.
+    """
+    return path.read_text(encoding="utf-8")
+
+
 def make_body(
     *,
     h1: str = "Do the thing",

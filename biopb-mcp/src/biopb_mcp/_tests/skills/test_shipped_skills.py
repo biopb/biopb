@@ -17,7 +17,7 @@ import re
 import pytest
 
 from ._validate import Report, split_frontmatter, validate
-from .conftest import SKILLS_DIR
+from .conftest import SKILLS_DIR, read_skill
 
 # The live `requires:` vocabulary. The agent resolves these against
 # `server_status`, so a token outside the grammar is not a lint nit -- it is a
@@ -208,11 +208,8 @@ def test_every_skill_carries_at_least_one_tag(shipped):
 def test_bodies_stay_under_the_length_proxy(shipped_skill_files):
     """~200 lines is `write-a-skill`'s proxy for "an algorithm is living in the
     skill". Enforced with headroom, since it is a proxy and not the rule."""
-    oversized = [
-        f"{p.stem}: {len(p.read_text().splitlines())} lines"
-        for p in shipped_skill_files
-        if len(p.read_text().splitlines()) > 250
-    ]
+    counts = {p.stem: len(read_skill(p).splitlines()) for p in shipped_skill_files}
+    oversized = [f"{stem}: {n} lines" for stem, n in counts.items() if n > 250]
     assert not oversized, "\n".join(oversized)
 
 
