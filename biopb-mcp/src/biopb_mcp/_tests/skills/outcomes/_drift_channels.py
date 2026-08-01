@@ -58,7 +58,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
 
-from ._drift import SKILL, _apply, _blobby_field, _stackreg, _trajectory
+from ._drift import SKILL, blobby_field, run_stackreg, trajectory, undo_offsets
 from ._outcome import Attempt, Fixture, Kind, Tier, register
 
 #: Shared by every object, in px/frame. This is the part that makes the mistake
@@ -108,12 +108,12 @@ class AmbiguousChannels:
 
     def build(self) -> Fixture:
         rng = np.random.default_rng(self.seed + 100)
-        offsets = _trajectory(self.n_frames, self.per_frame_px, self.seed + 1)
+        offsets = trajectory(self.n_frames, self.per_frame_px, self.seed + 1)
 
         # Channel 1 -- the structural one. A pure shift of one image, so its
         # un-drifted state is ground truth to machine precision, exactly as in
         # the single-channel cases.
-        stable = _blobby_field(self.seed, self.shape)
+        stable = blobby_field(self.seed, self.shape)
         stable = (stable - BACKGROUND) * STRUCTURAL_DIM + BACKGROUND
         structural = np.array(
             [ndimage.shift(stable, o, order=3, mode="nearest") for o in offsets]
@@ -181,12 +181,12 @@ CROWDED = register(
 def _corrected_stack(movie: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     """Undo `offsets` on every channel — step 5's "apply to all of them"."""
     return np.stack(
-        [_apply(movie[:, c], offsets) for c in range(movie.shape[1])], axis=1
+        [undo_offsets(movie[:, c], offsets) for c in range(movie.shape[1])], axis=1
     )
 
 
 def _on_channel(fixture: Fixture, plane: np.ndarray, subject: str, notes: str):
-    attempt = _stackreg(plane, "previous")
+    attempt = run_stackreg(plane, "previous")
     offsets = np.asarray(attempt.arrays["offsets"])
     return Attempt(
         subject=subject,
