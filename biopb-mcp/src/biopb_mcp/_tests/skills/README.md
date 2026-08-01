@@ -25,6 +25,7 @@ workstation as a diagnostic (`outcomes/README.md`).
 | `test_satisfiability.py` | Contract | Can a skill's declared packages be installed here at all? |
 | `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
 | `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? *(diagnostic, not a gate)* |
+| `outcomes/test_drift_channel_choice.py` | Interaction, prep | Does a fact only a person holds actually cost the measurement when nobody asks? *(no model in the loop)* |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
@@ -112,3 +113,9 @@ ever failed is not known to work.
 The protocol tests (`outcomes/test_outcome_protocol.py`) are *not* marked and do
 run with the ordinary suite — they are hermetic and instant, and a break in the
 machinery should surface before someone is mid-diagnosis with it.
+
+`outcomes/test_drift_channel_choice.py` also sits under this marker while
+belonging to the tier above (`docs/skill-testing.md` §6b). It has no model in
+it: it asserts that a fact only the microscopist holds — which channel is
+structural — cannot be recovered from the pixels, by scoring runs that guessed.
+That has to hold before it is worth paying a model to demonstrate it.

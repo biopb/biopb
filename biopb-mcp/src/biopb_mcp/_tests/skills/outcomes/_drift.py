@@ -12,6 +12,11 @@ makes the right one by construction. Only an agent can get it wrong, so it
 belongs to the interaction tier (§6), where which channel is structural is a
 private fact the respondent holds. A second channel here would be scored data
 that no subject could fail.
+
+That tier's fixture lives in :mod:`._drift_channels` and is scored by the
+verifier here, unchanged. All this module lends it is :func:`_structural`: a
+multi-channel movie is collapsed to the channel the truth is about, and every
+measurement below is then the same single-channel comparison.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from ._outcome import (
     Kind,
     Metric,
     Outcome,
+    Tier,
     register,
     register_curated,
     save_png,
@@ -112,6 +118,7 @@ class SyntheticDrift:
     seed: int = 0
     skill_id: str = SKILL
     kind: Kind = "synthetic"
+    tier: Tier = "outcome"
 
     def available(self) -> tuple[bool, str]:
         return True, ""
@@ -266,6 +273,31 @@ def with_default_normalization(fixture: Fixture) -> Attempt:
 # --- the verifier ----------------------------------------------------------
 
 
+def _structural(fixture: Fixture, movie) -> np.ndarray | None:
+    """The one channel this fixture's truth describes, out of a `(T, C, Y, X)`
+    stack. Anything with fewer dimensions is already that channel.
+
+    The verifier may read this and the run may not: *which* channel is
+    structural is the fact §6 strips from the data, and reading it off the
+    truth is exactly the asymmetry. A run that picked the wrong channel is
+    still scored on this one, which is what makes the mistake visible — its
+    corrected structural channel carries whatever the other channel's motion
+    told it to do.
+    """
+    if movie is None:
+        return None
+    arr = np.asarray(movie)
+    if arr.ndim < 4:
+        return arr
+    channel = fixture.truth.get("structural_channel")
+    if channel is None:
+        raise ValueError(
+            f"{fixture.label} is multi-channel but its truth does not say which "
+            "channel is structural, so nothing here can be scored"
+        )
+    return arr[:, int(channel)]
+
+
 def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
     """Score *attempt* against *fixture*'s truth.
 
@@ -334,8 +366,8 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
         detail["worst_frame"] = int(per_frame.argmax())
 
     stable = fixture.truth.get("stable")
-    corrected = attempt.arrays.get("corrected")
-    movie = fixture.data.get("movie")
+    corrected = _structural(fixture, attempt.arrays.get("corrected"))
+    movie = _structural(fixture, fixture.data.get("movie"))
     if stable is None or corrected is None or movie is None:
         why = (
             "no un-drifted reference exists for this fixture"
@@ -388,8 +420,8 @@ def save_artifacts(outcome: Outcome, where: Path) -> None:
     through. Never raises — an artifact explains a failure, it does not cause
     one."""
     fixture, attempt = outcome.fixture, outcome.attempt
-    movie = fixture.data.get("movie")
-    corrected = attempt.arrays.get("corrected")
+    movie = _structural(fixture, fixture.data.get("movie"))
+    corrected = _structural(fixture, attempt.arrays.get("corrected"))
 
     # The two images that carry the answer: last minus first, before and after.
     # A stabilised movie is near-flat; a failed one keeps the whole structure.

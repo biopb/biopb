@@ -43,7 +43,14 @@ fixture, a subject, a tolerance, and a repeatable pass/fail. Reach for it after
 | `_outcome.py` | The skill-agnostic protocol: `Fixture`, `Attempt`, `Metric`, `Outcome`, the provider registry, `CuratedNpz`, artifact writing |
 | `_drift.py` | `drift-correction`: three synthetic cases, four subjects, one verifier |
 | `test_drift_correction.py` | The expectation table — which subject must pass which case, and which claim in the skill body each row is |
+| `_drift_channels.py` | The **interaction-tier** fixture (§6b): a two-channel movie whose structural channel only a person can name |
+| `test_drift_channel_choice.py` | Whether not asking actually costs the measurement |
 | `test_outcome_protocol.py` | The protocol itself, including the curated path almost no machine has data for |
+
+Fixtures carry a `tier`, and test modules filter on it explicitly
+(`providers_for(SKILL, tier="outcome")`). The registry is process-global and
+filled at import, so a module that took everything would silently gain cases the
+moment a sibling was collected beside it.
 
 ## The three ideas
 
@@ -79,6 +86,29 @@ without anyone noticing. So every case is also run through the specific mistake
 the skill body warns against, and the suite asserts the two are told apart.
 Every expected-to-fail row in `EXPECTED` is a sentence of prose from the skill
 file, turned into a measurement.
+
+## The interaction tier's fixture lives here too
+
+`_drift_channels.py` belongs to §6, not §5, but it is deterministic — no model,
+no key, no network — so it runs with this machinery and under this marker.
+
+It exists to settle the claim §6 rests on **before** a model is paid to
+demonstrate it: that the fact stripped from the fixture is genuinely
+unobtainable from the pixels. The movie has two channels and no channel names.
+Channel 0 is bright puncta that carry the stage drift *and* crawl on their own;
+channel 1 is a dim field that moves only with the stage. Which is which is a
+question about what the channels *are*, and the body says so — "These look
+identical in a single frame and the correction for one destroys the other."
+
+Three scripted subjects, none a straw man: one told which channel is structural,
+one registering on whichever channel has the most contrast, one averaging them
+to dodge the choice. The second and third are what a competent run does when it
+must answer from the pixels alone. The verifier separates them by a factor of
+2.6 at the narrowest, using the same `TOLERANCE` — a fixture that needed looser
+limits to separate would not be separating.
+
+If that ever stops holding, the agent half of §6 is measuring something else,
+whatever the respondent is told to say.
 
 ## What has to be installed
 
@@ -118,6 +148,12 @@ on these three movies, to this precision, against these four mistakes", never as
 - **Absolute registration is out of gauge.** Both series are normalised to frame
   0, so a run that gets every relative offset right and displaces the whole
   series passes.
+- **`_drift_channels` does not test asking.** It tests that *not* asking costs
+  the measurement, which is the precondition, not the thing. Whether an agent
+  asks is §6's question and needs the harness.
+- **Those objects move as a rigid crowd.** A common velocity plus per-object
+  scatter, which is what makes the error systematic rather than a lucky seed —
+  but real crawling cells also change shape, and that is not represented.
 
 None of this is fixable in general — the set of things a fixture leaves out is
 unbounded, and only a human can name the parts worth naming. It is written down

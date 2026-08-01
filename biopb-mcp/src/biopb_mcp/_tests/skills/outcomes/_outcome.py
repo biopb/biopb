@@ -31,6 +31,13 @@ import numpy as np
 
 Kind = Literal["synthetic", "curated"]
 
+#: Which layer a fixture is built for. An ``interaction`` fixture has a fact
+#: stripped from its data that only a respondent holds (§6), so its cases pair
+#: with a different set of subjects than the ``outcome`` ones do -- and the
+#: registry is global, so the two must be separable without depending on which
+#: test module imported first.
+Tier = Literal["outcome", "interaction"]
+
 
 @dataclass(frozen=True)
 class Fixture:
@@ -146,6 +153,7 @@ class Provider(Protocol):
     skill_id: str
     case_id: str
     kind: Kind
+    tier: Tier
 
     def available(self) -> tuple[bool, str]:
         """``(usable, why not)``. A synthetic provider is always usable; a
@@ -169,8 +177,16 @@ def register(provider: Provider) -> Provider:
     return provider
 
 
-def providers_for(skill_id: str) -> list[Provider]:
-    return list(_PROVIDERS.get(skill_id, ()))
+def providers_for(skill_id: str, tier: Tier | None = None) -> list[Provider]:
+    """Every registered case for *skill_id*, optionally just one tier's.
+
+    Pass *tier* explicitly from a test module. Filtering is not a convenience
+    here: the registry is process-global and populated at import, so a module
+    that took everything would silently gain cases the moment a sibling module
+    was collected alongside it.
+    """
+    cases = list(_PROVIDERS.get(skill_id, ()))
+    return cases if tier is None else [p for p in cases if p.tier == tier]
 
 
 def registered_skills() -> list[str]:
@@ -216,6 +232,7 @@ class CuratedNpz:
     skill_id: str
     case_id: str
     kind: Kind = "curated"
+    tier: Tier = "outcome"
 
     @property
     def _dir(self) -> Path | None:
