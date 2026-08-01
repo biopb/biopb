@@ -36,7 +36,11 @@ def shipped_only(monkeypatch, tmp_path):
     )
 
 
-# How a user actually asks, in the few content words the tool asks for.
+# The **agent's** vocabulary, not the user's. `find_skills` is called by the
+# agent at the start of a task, so the query is a domain term it chose after
+# reading the request -- "drift correction", not "my stage moved". Chasing user
+# idiom instead pushes synonyms into the description until it stops reading as a
+# request, which is its own rule (test_descriptions_are_one_sentence_...).
 RETRIEVES = [
     ("measure", "calibrated-measurements"),
     ("measure microns", "calibrated-measurements"),
@@ -51,6 +55,12 @@ RETRIEVES = [
     ("qc", "segmentation-qc-metrics"),
     ("write skill", "write-a-skill"),
     ("authoring", "write-a-skill"),
+    ("drift", "drift-correction"),
+    ("drift correction", "drift-correction"),
+    ("registration", "drift-correction"),
+    ("stage drift", "drift-correction"),
+    ("register time series", "drift-correction"),
+    ("time lapse registration", "drift-correction"),
 ]
 
 # Queries that must not drag a skill in. Over-retrieval is not harmless: the
