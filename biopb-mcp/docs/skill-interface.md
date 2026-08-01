@@ -1,180 +1,162 @@
-# Skill Interface — Curated Agent Workflows Sourced from biopb.org
+# Skill Interface — Curated Agent Workflows Shipped with biopb-mcp
 
-**Status:** Partly implemented. P0 contract delivered in `biopb-site` (schema,
-builder/validator, generated `catalog.json` — see Appendices A/B), which now also
-enforces the required body sections and carries the catalog's scope and authoring
-rules in `skills/ROADMAP.md`; **P2 (MCP retrieval) shipped** — the `find_skills`
-tool, the `skill://{skill_id}` resource, the `services.skills_*` config, and the
-local skills directory (§3f) are live in `biopb-mcp` (`mcp/_skills.py`,
-`mcp/_server.py`), and `requires:` is resolvable at runtime (§3g). P1 and P3–P4
-not started.
-**Component:** `biopb-mcp` (discovery + retrieval), `biopb-site` (authoring + publishing)
-**Related:** the MCP `guide://*` resources and `find_skills`-style discovery, the
-`mcp.services` config block, the fail-open remote fetch in
-`biopb_mcp/mcp/_update.py`, the dynamic op discovery in
-`biopb_mcp/mcp/_process_ops.py`, the server's `_BASE_INSTRUCTIONS`
-("ask the user whether a new skill should be generated…").
+**Status:** Implemented. The `find_skills` tool, the `skill://{skill_id}`
+resource, the `services.skills_*` config, the local skills directory (§3f) and
+runtime `requires:` resolution (§3g) are live. The skills themselves and their
+authoring gate moved into this repo (§2); the published-catalog design this
+document originally described is retired (§1a).
+**Component:** `biopb-mcp` — `mcp/_skills.py` (runtime), `mcp/_skills_data/`
+(the skills), `_tests/skills/` (the authoring gate).
+**Related:** the MCP `guide://*` resources, the `services` config block, the
+dynamic op discovery in `mcp/_process_ops.py`, the server's `_BASE_INSTRUCTIONS`
+("ask the user whether a new skill should be generated…"),
+[`docs/skill-testing.md`](../../docs/skill-testing.md) in the repo root.
 
 ---
 
 ## Goal
 
 Give the agent a library of **curated, reusable workflows ("skills")** — e.g.
-"segment cells with Cellpose", "build a multiscale pyramid and load it", "measure
-labels and export a table". Each skill is a markdown file with YAML frontmatter,
-authored and reviewed through a **git workflow** in `biopb-site`, published on
-`https://biopb.org/`, and consumed at runtime by the `biopb-mcp` server through:
+"correct illumination and stitch a tile grid", "measure labeled objects in
+physical units", "score a segmentation against ground truth". Each skill is a
+markdown file with YAML frontmatter, authored and reviewed through a git
+workflow, **shipped inside the package**, and consumed at runtime through:
 
-1. a **discovery tool** (`find_skills`) that queries a catalog, and
-2. a **dynamic resource list** (`skill://<id>`) that returns the full workflow body.
+1. a **discovery tool** (`find_skills`) that filters the catalog, and
+2. a **resource** (`skill://<id>`) that returns the full workflow body.
 
 This realizes the loop the server already gestures at in its instructions —
 *"after a task, ask whether a new skill should be generated and added to the
-agent's toolbox"* — where the toolbox is the curated catalog and "adding" is a PR.
-
-Two repos, **one contract**: the published `catalog.json`. The site owns
-*authoring + publishing*; the MCP server owns *discovery + retrieval* and degrades
-gracefully when offline.
+agent's toolbox"* — where the toolbox is the shipped set plus the user's own
+directory, and "adding" is either a file in `~/.config/biopb/skills` or a PR.
 
 ```
-   biopb-site repo (curation = git)          biopb-mcp server (runtime)
-   ┌───────────────────────────┐             ┌────────────────────────────┐
-   │ skills/<id>.md (frontmtr)  │   CI build  │  find_skills(query) TOOL   │
-   │ scripts/build_catalog.py   │──generates─▶│    → queries catalog       │
-   │ skills/catalog.json (gen)  │   + rsync   │                            │
-   │ docs/skills.md (browser)   │             │  skill://<id> RESOURCES    │
-   └───────────────────────────┘             │    → lazy-fetch .md body    │
-            │ served at                       │  (dynamic list from catalog)│
-            ▼                                  └──────────┬─────────────────┘
-   https://biopb.org/skills/catalog.json  ◀── httpx GET ──┘  fail-open:
-   https://biopb.org/skills/<id>.md       ◀── httpx GET ──┘  cache → bundled
+   this repo                                  a session
+   ┌────────────────────────────┐             ┌────────────────────────────┐
+   │ mcp/_skills_data/<id>.md   │             │  find_skills(query) TOOL   │
+   │   the shipped skills       │──packaged──▶│    → filters the catalog   │
+   │ _tests/skills/             │   in the    │                            │
+   │   the authoring gate       │   wheel     │  skill://<id> RESOURCE     │
+   └────────────────────────────┘             │    → reads the .md body    │
+                                              └──────────┬─────────────────┘
+   ~/.config/biopb/skills/*.md ──────merged in──────────┘
+     the user's own (§3f)
 ```
 
 ---
 
-## Design principle — variation is a publisher problem, not a consumer problem
+## 1a. Why they ship rather than publish
 
-Skill files are authored by humans and agents over time; their format *will* drift
-(missing fields, `tags` as a string vs. a list, freeform bodies, evolving
-conventions). The load-bearing decision of this design is that **all variation is
-normalized at one choke point — the site's build script — and never reaches the
-MCP server.** Postel's law applied to skills: the build is *liberal in what it
-accepts* (tolerant reader, coercion, inference, migrations) and *conservative in
-what it publishes* (a strict, canonical, versioned `catalog.json` + normalized
-bodies). See [§5](#5-handling-format-variation) for the full strategy.
+The original design served one `catalog.json` from biopb.org and fetched bodies
+over HTTP. That is retired. The reasoning, in full, is
+[`docs/skill-testing.md`](../../docs/skill-testing.md) §9; in short:
 
----
+**A skill is documentation about a specific runtime version.** It quotes an API,
+assumes a namespace handle, and depends on packages resolving a particular way.
+One served catalog meant every deployed version of biopb read the same text at
+once — a body had to be simultaneously correct for every release in the field,
+with no migration story, and a bug report could not answer which skill text a
+session actually saw.
 
-## 1. The contract: `catalog.json`
+Shipping them removes that, and removes the machinery with it: the fetch, the
+TTL cache, the on-disk cache, atomic writes, corrupt-cache repair, `sha256`
+verification, `catalog_version` negotiation, and `catalog.json` itself. The
+frontmatter *is* the metadata, and §3f's reader already parsed it, so a generated
+index was only a second thing to disagree with the bodies — which is exactly what
+the `sha256` check existed to catch.
 
-Published at **`https://biopb.org/skills/catalog.json`**. Metadata only — bodies
-are fetched lazily and separately, keeping the catalog small and discovery cheap.
+**The cost: a skill fix needs a release.** §3f is the escape hatch, which makes
+it load-bearing rather than a convenience.
 
-```jsonc
-{
-  "catalog_version": 1,               // schema of THIS file; server guards, fails open on unknown
-  "generated": "2026-06-30T12:00:00Z",
-  "skills": [
-    {
-      "id": "cell-segmentation-cellpose",  // == filename stem; kebab; unique; stable
-      "title": "Segment cells with Cellpose",
-      "description": "Run Cellpose over the active image layer and load the labels.", // 1 line; drives discovery
-      "tags": ["segmentation", "cellpose", "ops"],
-      "version": "1.2.0",                  // author-owned semver of the skill's content
-      "spec_version": 1,                   // body/frontmatter dialect; enables migrations
-      "requires": ["viewer", "ops:segmentation"],  // capability tokens the agent resolves (§3g)
-      "updated": "2026-06-20",             // derived from git log, NOT the author
-      "url": "https://biopb.org/skills/cell-segmentation-cellpose.md",
-      "sha256": "e3b0c4…"                  // body integrity + client cache key
-    }
-  ]
-}
-```
+`https://biopb.org/skills/` stays served but frozen. Older clients still fetch
+it, and they fail open to their own bundled copy when it goes away.
 
-Two independent version knobs (see [§5.3](#53-versioning-the-contract)):
-`catalog_version` (the file schema) and per-skill `spec_version` (the authoring
-dialect). Bodies are **not inlined** — the server reads `skill://<id>` on demand
-and fetches `url`, verifying `sha256`.
+## 1. What ships
 
-### The skill file
-
-`skills/<id>.md` is a Claude-style skill: frontmatter + a markdown body written to
-drop into the agent's context.
+`mcp/_skills_data/<id>.md` — frontmatter plus a markdown body written to drop
+into the agent's context. There is no index file; the directory is the catalog.
 
 ```markdown
 ---
-id: cell-segmentation-cellpose
-title: Segment cells with Cellpose
-description: Run Cellpose over the active image layer and load the labels.
-tags: [segmentation, cellpose, ops]
-version: 1.2.0
-requires: [viewer, "ops:segmentation"]
+id: calibrated-measurements
+title: Measure labeled objects in physical units, not pixels
+description: Report object areas, volumes, and diameters in microns instead of pixels, using the image's real voxel spacing.
+tags: [measurement, quantification]
+version: 1.0.0
+requires: [viewer, tensor, "pkg:biopb-mcp>=0.13.0"]
 ---
 
-# Segment cells with Cellpose
+# Measure labeled objects in physical units, not pixels
 
-**When to use.** The user has a 2D/3D fluorescence image loaded and wants
-instance labels for cells/nuclei.
+## When to use
+…
 
 ## Steps
-1. Confirm the active image layer and channel with the user.
-2. Call the `segmentation` op via `ops` (see `guide://ops`)…
-3. Load the returned labels with `viewer.add_labels(...)` for validation.
-
-## Guardrails
-- Prefer lazy dask; `.compute()` only the final result.
-- Put intermediate results on `viewer` at each step.
+1. Resolve `requires:` against `server_status` (§3g).
+2. Confirm the active labels layer and its spacing with the user.
+…
 ```
 
-The `url`, `sha256`, `updated`, and `spec_version` fields in the catalog are
-**generated** — authors do not write them (see field policy in
-[§5.1](#51-frontmatter-tolerant-read-canonical-emit)).
+`id` must equal the filename stem; `spec_version` defaults to 1 and selects the
+migration path (§5.3). Everything else is in the field policy at §5.1.
 
 ---
 
-## 2. biopb-site changes (authoring + publishing)
+## 2. Authoring and the gate
 
-New layout (skills live at repo root so the existing landing-page rsync serves
-them from `/var/www/biopb.org/skills/` — no new hosting):
+Skills live beside the runtime they describe, so a skill edit and the code change
+it depends on land in the same PR. The gate is `_tests/skills/`, an ordinary part
+of the pytest suite:
 
 ```
-biopb-site/
-  skills/
-    cell-segmentation-cellpose.md    # curated source (frontmatter + body)
-    …
-    catalog.json                     # GENERATED (gitignored)
-  scripts/
-    build_skills_catalog.py          # normalizer + validator + generator (Appendix A/B)
-  docs/skills.md                     # browser page
+biopb-mcp/src/biopb_mcp/
+  mcp/_skills_data/<id>.md     the skills
+  mcp/_skills.py               the tolerant runtime reader (§3)
+  _tests/skills/
+    _schema.py, _validate.py   the strict authoring reader
+    test_schema.py             the frontmatter contract
+    test_validate.py           which malformations are fatal vs tolerable
+    test_shipped_skills.py     rules the real files must satisfy
+    test_retrieval.py          do the descriptions answer real phrasings
+    test_satisfiability.py     may this skill declare that package at all
+    test_packaging.py          do the skills reach the wheel
 ```
 
-Serving falls out of the current deploy:
-`skills/*.md` → `https://biopb.org/skills/<id>.md`,
-`skills/catalog.json` → `https://biopb.org/skills/catalog.json`.
-
-**CI wiring** (`.github/workflows/`):
-
-- `docs-check.yml` (PR): run `python scripts/build_skills_catalog.py --check`.
-  Malformed frontmatter, duplicate ids, a missing required section → **fail the
-  PR**. This *is* the curation gate — the author gets the error, never the
-  runtime agent. Tags are *not* gated: see §5.1.
-- `deploy.yml` (push to main): run `python scripts/build_skills_catalog.py`
-  **before** the landing rsync, so the generated `catalog.json` is in-tree at
-  rsync time. The landing rsync already uploads repo root; add `PyYAML` to
-  `requirements-docs.txt` (the only added dependency — validation is stdlib-only).
-
-**Browser page** — `docs/skills.md`: a small vanilla-JS widget (Material already
-enables `attr_list` / `md_in_html`) that fetches `/skills/catalog.json` and renders
-a tag-filterable, searchable grid linking each `.md` and its GitHub source. Add one
-`nav:` entry in `mkdocs.yml`; served at `https://biopb.org/docs/skills/`. Reuses
-Material's search/nav rather than reinventing it.
+See `_tests/skills/README.md` for what each layer asks. The layer split and what gates a merge is
+[`docs/skill-testing.md`](../../docs/skill-testing.md) §1 and §10.
 
 ---
 
-## 3. biopb-mcp changes (discovery + retrieval)
+## Design principle — two readers, tolerant and strict
 
-New module **`biopb_mcp/mcp/_skills.py`**, wired into `_server.py`. Modeled on the
-fail-open philosophy of `_update.py` and the discovery pattern of `_process_ops.py`.
+Skill files are authored by humans and agents over time; their format *will*
+drift (missing fields, `tags` as a string vs. a list, freeform bodies). The
+load-bearing decision is that the drift is answered in **two places with
+different jobs**, not one:
+
+- **`mcp/_skills.py` is tolerant.** It is on the agent's path, where a malformed
+  file must degrade to a skipped entry rather than an error. It infers `id` from
+  the filename and `description` from the first H1 or prose line, so a bare
+  markdown file with no frontmatter still loads, and it carries no YAML
+  dependency.
+- **`_tests/skills/_validate.py` is strict.** It is on the author's path, where
+  the same file should stop the PR. It uses a real YAML parser precisely so it
+  can reject what the other one forgives.
+
+This used to be a *publisher/consumer* split across two repos, with the strict
+half at the publish boundary. Collapsing the repos did not collapse the split —
+the two jobs are still different — but it did make them checkable against each
+other: `test_what_validates_is_what_the_runtime_loads` pins them to the same
+answer about which files are skills, so a file only the gate can read cannot pass
+review and then be invisible to the agent.
+
+See [§5](#5-handling-format-variation) for the full strategy.
+
+---
+
+## 3. Discovery and retrieval
+
+`mcp/_skills.py`, wired into `_server.py`.
 
 ### 3a. Discovery — a tool
 
@@ -186,92 +168,84 @@ mirroring how `query_sources` is preferred over `list_sources`:
 def find_skills(query: str = "") -> list[dict]:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
-    `query` filters by title/description/tags (empty = all). Returns catalog
-    metadata including the skill://<id> resource URI to read for the full
-    workflow. Prefer an existing skill over improvising."""
+    `query` filters by id/title/description/tags — every word must appear, in any
+    order — and an empty query returns all. Returns metadata including the
+    skill://<id> resource URI to read for the full workflow."""
 ```
 
-### 3b. Full skill files — a dynamic resource list
+**Matching is term-wise, not whole-query.** Every whitespace-separated term must
+appear somewhere in the skill's id/title/description/tags; order and adjacency do
+not matter. Terms are substrings, so "measure" finds "measurements". The `id` is
+in the haystack with hyphens opened out to spaces, because naming a skill
+("flatfield") is the most specific request there is. What this rules out is
+natural-language sentences — "how do I stitch tiles?" carries terms no
+description contains — which is why the tool docstring steers the agent to a few
+content words. `_tests/test_skills.py` pins the semantics; `_tests/skills/test_retrieval.py`
+pins that the real descriptions answer real phrasings.
 
-At kernel/server start (and on TTL refresh), fetch the catalog and **register one
-concrete resource per skill**, `skill://<id>`, then emit
-`notifications/resources/list_changed`. Clients that enumerate resources then see
-the curated set — the "dynamic resource list." The read handler **lazily fetches**
-the body from `url`, verifies `sha256`, and caches it.
+### 3b. Full skill files — a resource template
 
-> **v1 fallback.** If dynamic registration + `list_changed` is more than we want up
-> front, ship a single **resource template** `skill://{id}` instead. It won't appear
-> in `resources/list` (templates list separately), but `find_skills` already hands
-> the agent the exact URIs, so retrieval still works. Recommended path: template
-> first (P2), upgrade to dynamic concrete resources once the catalog stabilizes (P3).
+`skill://{skill_id}` is a **template**. It does not appear in `resources/list`
+(templates list separately), but `find_skills` hands the agent the exact URIs, so
+retrieval works. The read handler strips frontmatter and returns the body.
 
-### 3c. Fetch / cache / fallback (fail-open, like `_update.py`)
+Upgrading to dynamically-registered concrete resources with
+`notifications/resources/list_changed` remains possible and is now cheaper — the
+set is known at import time rather than after a fetch — but nothing depends on
+it.
 
-- `httpx` GET the catalog with a short timeout. On **any** error
-  (offline/DNS/TLS/HTTP/parse) degrade to: on-disk cache → **bundled snapshot**
-  shipped in the package. Never raise into bootstrap. (The snapshot carries the
-  meta-skill, so an install that has never reached the network still knows how to
-  author one; refreshing it is a data drop, not a code change.)
-- Cache catalog + bodies under the biopb cache dir with a TTL; `sha256` is the
-  body cache key.
-- Guard on `catalog_version`; an unknown future version keeps the last-good /
-  bundled catalog rather than crashing.
-- Treat entries defensively: unknown fields ignored, missing optionals defaulted,
-  and **a single malformed entry is skipped, not fatal** — one bad skill must never
-  sink `find_skills` or the resource list.
+### 3c. Loading
+
+`load_catalog()` reads two sources on **every call** and merges them (§3f). There
+is no cache: the reads are a handful of small local files, and re-reading is what
+makes a local edit live immediately. Loading is **fail-open per file** — an
+unreadable or malformed file is skipped and debug-logged, never fatal, and one
+bad skill must never sink `find_skills`. A leading `_` marks a file private, as in
+the kernel-plugin loader.
 
 ### 3d. Config (flat keys on the `services` block in `_config.py`)
-
-As shipped, the keys are flat on `ServicesConfig` — no nested `skills` sub-block
-and no `mcp.` wrapper (the config was flattened onto the tensor-server's dataclass
-machinery):
 
 ```python
 "services": {
     "skills_enabled": True,  # on by default
-    "skills_catalog_url": "https://biopb.org/skills/catalog.json",
-    "skills_cache_ttl": 3600,
     "skills_local_dir": "",  # empty -> ~/.config/biopb/skills
 }
 ```
 
 `skills_enabled` is **on by default** — a default install discovers skills — and
-it is the switch for the *whole* subsystem: false means no fetch, no local scan,
-an empty `find_skills`, and no skills directive in the handshake.
+it is the switch for the *whole* subsystem: false means no scan, an empty
+`find_skills`, and no skills directive in the handshake.
 
 `skills_local_dir` is the **personal tier** (§3f). It is deliberately governed by
 the same switch: a user who turns skills off is turning the feature off, not just
-the network half.
+one source of it.
+
+> `skills_catalog_url` and `skills_cache_ttl` were removed with the fetch (§1a).
+> A config carrying them still loads — unknown keys are ignored — but a
+> self-hosted catalog URL has no effect.
 
 ### 3f. Local (user-authored) skills
 
 `~/.config/biopb/skills/*.md` (`biopb._locations.mcp_skill_dir()`) are merged
-into the catalog beside the curated entries. The distinction that matters: the
-§3c chain is three copies of *one* catalog, so first-one-wins is right there;
-local files are a **second source** and therefore union, with local winning a
-shared id (a user editing their own copy of a published skill expects theirs).
+into the catalog beside the shipped entries, with local winning a shared id (a
+user editing their own copy of a shipped skill expects theirs).
 
-- **Read on every call, not TTL-cached** — a personal skill is usually one the
-  user is still editing, and an authoring loop that needs a restart to see a
-  draft is unusable. Deleting the file retracts the skill just as immediately.
-- **Body comes from disk**, with no `sha256` and no body cache: the file *is* the
-  source of truth, so there is nothing to verify it against.
-- **Consumer stays lenient** (the §"variation is a publisher problem" principle):
-  a ~25-line frontmatter reader, no PyYAML in this stdlib-only module, `id`
-  inferred from the filename and `description` from the first H1/prose line, so a
-  bare markdown file with no frontmatter still loads. Strictness — required
-  sections — stays at the publish boundary in `biopb-site`,
-  which is the only place with the tooling. A second copy of those rules in the
-  install would be a constant to drift, not a safeguard.
-- **Fail-open per file**: one unreadable or malformed file is skipped, never
-  fatal; a leading `_` marks a file private, as in the kernel-plugin loader.
+- **Read on every call** — a personal skill is usually one the user is still
+  editing, and an authoring loop that needs a restart to see a draft is unusable.
+  Deleting the file retracts the skill just as immediately.
+- **Body comes from disk**, read fresh at retrieval time.
+- **Same reader as the shipped set.** Both are markdown files with frontmatter,
+  and reading them two ways would be two things to keep agreeing.
+- **Fail-open per file** (§3c).
 - **Provenance travels**: every entry carries `origin` (`local`/`catalog`), and
-  `find_skills` returns it so the agent can tell a personal draft from a
-  reviewed one rather than presenting both as curated.
+  `find_skills` returns it so the agent can tell a personal draft from a reviewed
+  one rather than presenting both as curated.
 
-The three sharing tiers are then: **personal** = this directory, **lab** =
-`skills_catalog_url` pointed at a self-hosted catalog, **public** = biopb.org.
-Nothing else needs a sync mechanism.
+The sharing tiers are now: **personal** = this directory, **public** = a release.
+The middle tier a self-hosted catalog used to serve is gone with the fetch; a lab
+wanting a shared set distributes the files, or vendors them into an internal
+build. This is the load-bearing cost of §1a, and it is also the only path by
+which a skill reaches a machine between releases.
 
 ### 3e. Instructions
 
@@ -330,39 +304,63 @@ no return value invites `if not ok: bail`. Every fix — installing a package,
 seeding a plugin, restarting the kernel — needs the user's consent, so the agent's
 job is to name the gap and ask, not to decide.
 
-The consequence for authoring: `pkg:biopb-mcp>=X` makes a skill safe to publish
-*ahead of* the release that carries the plugin it needs — an older install is told
-so up front instead of failing halfway through. That makes it the one `pkg:` token
-common enough to report rather than import, and `## Versions` reports it from the
-**kernel's** interpreter, which is the one that will run the skill and need not be
-the server process's env.
+**A `pkg:` token is not only a runtime question, and not every package may be
+declared.** `test_satisfiability.py` resolves every `pkg:` a shipped skill
+declares against the installed environment and **rejects** the skill when the
+package installs only by moving something biopb already depends on. That is not
+hypothetical: `basicpy` reverts numpy 2.3.5 → 1.26.4 (and pandas and scipy with
+it), and `m2stitch` takes pandas 3.0.3 → 2.3.3. Neither errors, so the agent and
+the user get an older stack silently — under a live kernel that already imported
+the versions being replaced.
+
+A warning in the body does not fix it: the three options above are general
+guidance, and option 2 is the harmful one. Nor does a separate environment —
+the kernel's interpreter is the agent's only execution surface, so a package
+installed elsewhere cannot be imported. **A package that needs its own
+environment is an `ops:<kind>` server**, called rather than imported, which is
+what the algorithm plane is for. `flatfield-and-stitch-tiles` declared
+`pkg:basicpy` and `pkg:m2stitch` and was dropped rather than shipped with a
+workaround.
+
+**`pkg:biopb-mcp>=X` is now an open question.** It made a skill safe to publish
+*ahead of* the release carrying the plugin it needs — an older install was told
+so up front instead of failing halfway. That was a cross-repo version bound.
+Within one release the skill and the runtime ship together, so it is either
+redundant or a statement about backwards compatibility, and which is not yet
+settled (`docs/skill-testing.md` §11). It is still validated and still reported
+from the **kernel's** interpreter, which is the one that will run the skill and
+need not be the server process's env.
 
 ---
 
 ## 4. Curation = git workflow
 
-1. Author (often the agent, per the existing close-out prompt) drafts
-   `skills/<id>.md` with frontmatter.
-2. PR to `biopb-site` → `docs-check.yml` runs
-   `build_skills_catalog.py --check` (schema / uniqueness / required sections) +
-   `mkdocs build --strict`.
-3. Human review → merge to `main` → `deploy.yml` regenerates `catalog.json` and
-   publishes. Live within one deploy.
-4. Versioning: author-owned `version` in frontmatter; `updated` derived from
-   `git log`. The repo *is* the source of truth — no DB, no admin UI.
+1. Author (often the agent, per the existing close-out prompt) drafts a skill,
+   usually landing it in `~/.config/biopb/skills` first so it is usable *this
+   session* (§7.5).
+2. Promotion is a PR that moves the identical file into `mcp/_skills_data/`.
+   The suite gates it: schema, uniqueness, required sections, `requires:`
+   grammar, cross-skill links, phrasing coverage.
+3. Human review → merge. Live in the next release.
+4. Versioning: author-owned `version` in frontmatter. The repo *is* the source of
+   truth — no DB, no admin UI.
+
+Step 3 is the change §1a bought and paid for: skills are no longer live within
+one deploy. What used to be a same-day publish is now a release, and the local
+directory is what covers the gap.
 
 ---
 
 ## 5. Handling format variation
 
-The governing rule ([design principle](#design-principle--variation-is-a-publisher-problem-not-a-consumer-problem)):
-absorb or reject every variation in `build_skills_catalog.py`; the runtime sees one
-shape.
+The governing rule ([design principle](#design-principle--two-readers-tolerant-and-strict)):
+the strict reader rejects at authoring time, the tolerant one degrades at
+runtime, and they agree on what counts as a skill.
 
-### 5.1 Frontmatter: tolerant read, canonical emit
+### 5.1 Frontmatter: tolerant read, strict result
 
-A canonical model (Appendix A) coerces and infers on read, and the emitter is
-strict and uniform. Field policy:
+The canonical model (Appendix A) coerces and infers on read; what it yields is
+uniform. Field policy:
 
 | Field | Policy on variation |
 |---|---|
@@ -371,40 +369,46 @@ strict and uniform. Field policy:
 | `title` | Fallback chain: frontmatter → first `#` H1 → humanized `id` (warn). |
 | `tags` | Coerce `str → [str]` and lowercase. **Not** validated against a fixed vocabulary: a closed set needs an edit for every new topic and fails the PR introducing it, to enforce a judgment the reviewer curating the catalog is making anyway. |
 | `version` | Require semver, else default `0.0.0`. |
-| `updated` | **Ignore any author value**; always derive from `git log -1` — authors forget to bump it. |
-| `requires` | Optional; coerce to list. |
+| `requires` | Optional; coerce to list. Grammar checked at §3g's vocabulary. |
 | `spec_version` | Default `1`; selects the migration path ([§5.3](#53-versioning-the-contract)). |
-| unknown keys | Collected into a `metadata` passthrough bag + warn (forward-compat), not rejected. |
+| `updated` | Optional and rarely used. It was derived from `git log` to stamp the generated index; with no index, a shipped skill's currency is its release. The runtime still reads an explicit `updated:` if present, and a *local* skill takes it from the file mtime. |
 
-Validation failures fail CI in `--check` mode, so the **author** gets the error in
-the PR — never the agent at runtime.
+Validation failures fail the suite, so the **author** gets the error in the PR —
+never the agent at runtime.
 
 ### 5.2 Body: opaque, lint lightly
 
 The body is freeform markdown *by design* — it is LLM context, which tolerates
-prose. Do not over-constrain it. But the build:
+prose. Do not over-constrain it. But the gate:
 
-- Normalizes mechanically: CRLF→LF, strips frontmatter, ensures a leading H1.
-- **Lints as warnings, not errors**: recommend *When to use / Steps / Guardrails*;
-  warn when the body references an op/tag that does not exist.
-- Records `spec_version` so body *conventions* can evolve and the browser/tools can
-  branch on the dialect.
+- Requires the H2 sections at Appendix A: they are what a small model needs and
+  cannot infer, especially "when not to use" and the symptom→cause→fix table.
+- Checks the authoring guardrails that are mechanically checkable: no
+  dataset-specific paths or ids, one-sentence descriptions, `[[wiki-links]]`
+  landing on a skill that exists, a declared `plugin:<stem>` actually called
+  through its module name, bodies under the ~200-line proxy.
+- Records `spec_version` so body *conventions* can evolve.
+
+Bodies are excluded from ruff and from the trailing-whitespace hook: they are
+authored prose, two trailing spaces are a markdown hard break, and the contract
+layer asserts a fence quotes a third-party call *exactly* as the body claims.
 
 ### 5.3 Versioning the contract
 
-Two independent knobs:
+One knob now, not two. `catalog_version` described the schema of a file that a
+server fetched from a publisher that might be newer than it — there is no such
+file and no such skew, so it is gone.
 
-- **`catalog_version`** — schema of `catalog.json`. The server guards on it and
-  fails open (keeps last-good/bundled) on an unknown value.
-- **per-skill `spec_version`** — lets multiple authoring dialects coexist. The build
-  runs **migration functions** to up-convert older dialects to the current one, so
-  the *emitted* catalog is uniform even when source files lag. Rule: additive-only
-  within a major; any new required field ships with a back-fill default.
+**Per-skill `spec_version`** remains: it lets multiple authoring dialects coexist,
+with `migrate()` up-converting older ones. Rule: additive-only within a major;
+any new required field ships with a back-fill default.
 
-### 5.4 Defensive runtime (belt and suspenders)
+### 5.4 Defensive runtime
 
-Even after build-time normalization, the server tolerates a bad entry: skip-and-log,
-default optionals, ignore unknown fields ([§3c](#3c-fetch--cache--fallback-fail-open-like-_updatepy)).
+Even with an authoring gate, the runtime tolerates a bad file: skip-and-log,
+default optionals, ignore unknown fields (§3c). The gate runs on files in this
+repo; the user's directory (§3f) has no gate at all, and that is the case the
+tolerance is really for.
 
 ### 5.5 Different *source* formats (only if needed — YAGNI)
 
@@ -412,161 +416,101 @@ If skills authored elsewhere are later imported (e.g. Claude-style `SKILL.md`
 folders that bundle scripts/assets vs. biopb's single-file `.md`), add a small
 **loader registry** keyed by detected shape:
 
-- `skills/<id>.md` — single file (default)
-- `skills/<id>/SKILL.md` — folder with assets; the catalog entry gains an `assets` list
+- `<id>.md` — single file (default)
+- `<id>/SKILL.md` — folder with assets; the entry gains an `assets` list
 
-Each loader maps its dialect to the one canonical model. The choke-point design means
-adding this touches only the build script — don't build it until a second real format
-appears.
+Each loader maps its dialect to the one canonical model. Don't build it until a
+second real format appears.
 
 ---
 
 ## 6. Phasing
 
-- **P0 — contract. ✅ Delivered.** Schema + stdlib frontmatter contract
-  (Appendix A) and the `build_skills_catalog.py` builder/validator (Appendix B) are
-  in `biopb-site`; three example skills (`load-tensor-source`, `segment-nuclei`,
-  `measure-labels`) generate a real 3-entry `skills/catalog.json`. Both repos can now
-  build against it. Remaining: add `PyYAML` to `requirements-docs.txt`.
-- **P1 — site.** `build_skills_catalog.py` + `--check` (Appendix B), CI wiring,
-  `docs/skills.md` browser.
-- **P2 — MCP retrieval.** `_skills.py`: `find_skills` tool + `skill://{id}`
-  template + fetch/cache/bundle fallback + config + instruction line.
-- **P3 — MCP dynamic resources.** Upgrade the template to dynamically-registered
-  `skill://<id>` resources with `list_changed`.
-- **P4 — contribution loop.** Wire the "generate a skill?" close-out prompt to emit
-  a ready-to-PR `skills/<id>.md`. **The draft lands in the local `skills_dir` first**
-  (see [§7.5](#7-open-decisions)) so it is usable *this session*; promotion to the
-  curated catalog is the PR, whose payload is that same file byte-for-byte. Without
-  the local tier this loop does not close — a generated skill is invisible to
-  `find_skills` until merged upstream, so "added to your toolbox" would be false.
+- **P0 — contract. ✅** Schema + frontmatter contract (Appendix A) and the
+  validator (Appendix B).
+- **P1 — publishing.** ✅ then retired (§1a). The site build, the generated
+  `catalog.json`, and the CI wiring existed and worked; shipping the files
+  removed the need for all of it.
+- **P2 — MCP retrieval. ✅** `_skills.py`: `find_skills` + `skill://{id}` +
+  config + instruction line.
+- **P3 — MCP dynamic resources.** Not started; cheaper now (§3b) and still
+  optional.
+- **P4 — contribution loop.** Partly there: the local tier (§3f) exists, so a
+  generated skill is usable this session. Remaining is wiring the close-out
+  prompt to emit a ready-to-PR file into it.
 
 ---
 
 ## 7. Open decisions
 
-1. **Discovery surface** — recommend a `find_skills` **tool** (queryable) as
-   primary, with skills also exposed as resources. Alternative: resource-only
-   discovery (loses query tailoring).
-2. **Dynamic resources vs. template** — recommend template first (P2), dynamic
-   concrete resources later (P3). If "everything in `resources/list` from day one"
-   is a hard requirement, do dynamic registration in P2.
-3. **Skill home** — sources live in **biopb-site** (matches "pulled from
-   biopb.org"). Alternative: keep them in the biopb monorepo and have the site build
-   fetch them — more moving parts; not recommended.
+1. **Discovery surface** — resolved: a `find_skills` **tool** (queryable) as
+   primary, skills also readable as resources.
+2. **Dynamic resources vs. template** — template shipped (§3b); dynamic
+   registration remains optional.
+3. **Skill home** — **resolved, opposite to the original recommendation.**
+   Sources were in `biopb-site` to match "pulled from biopb.org". They are now in
+   this repo. The deciding argument was not tidiness but testability: a skill's
+   claims are about *this* runtime — the API it quotes, the packages it needs
+   resolving against this workspace — and no other repo can check them. Resolving
+   `biopb-mcp[mcp]` from PyPI answers for the last release, not the branch. See
+   `docs/skill-testing.md` §3a and §9.
 4. **Tag vocabulary** — resolved: free tags, curated by review. A controlled list
    was tried and removed; enforcement bought nothing the reviewer wasn't already
    doing, and cost an edit per new topic.
+5. **`pkg:biopb-mcp>=X`** — open. See §3g.
+6. **Release cadence vs. skill churn** — open. §1a trades hot-fix for coherence,
+   and §3f only covers it per-machine. If skill edits outpace releases by much,
+   revisit.
 
 ### 7.5 Local skills — resolved: a local *source*, not a parallel mechanism
 
 Should the runtime merge locally-stored (uncurated) skills alongside the curated
-catalog? The question is two questions with different answers, and conflating them
-is what makes it look like scope creep:
+set? Yes, and the reason has strengthened. The original argument was the **draft
+on-ramp**: the server promises "generate a skill and add it to your toolbox," and
+under curated-only a freshly generated skill is useless until merged upstream —
+it can't appear in `find_skills` or be read as `skill://<id>`. The local dir is
+where that draft lands so it is usable this session; promotion is the PR, whose
+payload is the identical file.
 
-- **A — lab customization** ("skills we'll never upstream"). *Already covered* by
-  `catalog_url` ([§3d](#3d-config-extend-the-mcpservices-block-in-_configpy)): a lab
-  points it at their own `catalog.json` and gets the full pipeline — validation,
-  versioning, `find_skills`, `skill://` — for their private set, with the same review
-  discipline. The only real gap is that `catalog_url` is singular. The honest fix is
-  to make catalog resolution take an **ordered list of sources** (e.g.
-  `[biopb.org, lab-site, local-dir]`), merged with a defined collision policy — *not*
-  a separate uncurated-file feature. This is a config shape change, not a new
-  subsystem.
+The second argument, **lab customization**, used to be answered by pointing
+`catalog_url` at a self-hosted catalog. That answer is gone with the fetch, so
+the local dir now carries both cases, and it is the only mechanism by which any
+skill reaches a machine outside a release.
 
-- **B — the individual draft on-ramp** (the real motivation). This is a **P4
-  concern**, not a standalone feature. The server already promises "generate a skill
-  and add it to your toolbox," but under curated-only a freshly generated skill is
-  useless until merged upstream — it can't appear in `find_skills` or be read as
-  `skill://<id>`. A local `skills_dir` is simply *where P4's draft lands so it is
-  usable this session*; promotion is the PR, whose payload is the identical file. The
-  lifecycle the design gestures at — **local draft → validated in use → promoted via
-  PR** — only exists if biopb-mcp owns this local tier.
-
-Why the host's own local-skill mechanism (Claude Code / opencode / Claude Desktop)
-does **not** cover B: it splits discovery (host skills never reach `find_skills`); it
-can't read biopb's `requires:` capability gating; and it is host-specific, whereas a
-biopb-owned local tier is one authoring format (identical to curated `.md`) that is
-portable across all three hosts and is exactly the PR payload.
-
-**Decision.** Yes, add it — scoped as *one more source in the resolution list*, not a
-parallel discovery path:
-
-1. Catalog resolution takes an **ordered source list**; one entry is a local
-   `skills_dir`. (Answers A independently of P4.)
-2. Local files are parsed by the **already-vendored** `skill_schema.py`
-   ([§5.4](#54-defensive-runtime-belt-and-suspenders)) — same tolerant reader, no new
-   parser. Entries flow into the existing in-memory merge ([§3c](#3c-fetch--cache--fallback-fail-open-like-_updatepy))
-   and are marked `source: local`.
-3. Collision policy is a knob; default **local-wins**, so a site can shadow a curated
-   skill.
-4. Ship it **with P4**, framed as "close the contribution loop," not as a P2 feature.
-
-It is scope creep only if built as a second discovery mechanism for its own sake —
-which the ordered-source-list framing explicitly avoids.
+Why the host's own local-skill mechanism (Claude Code / opencode / Claude
+Desktop) does **not** cover this: it splits discovery (host skills never reach
+`find_skills`); it can't read biopb's `requires:` capability gating; and it is
+host-specific, whereas a biopb-owned local tier is one authoring format
+(identical to a shipped `.md`) that is portable across all three hosts and is
+exactly the PR payload.
 
 ---
 
 ## 8. Development & testing
 
-The two repos are decoupled by the `catalog.json` contract, and **the inner dev
-loop needs no live site.** Each side tests hermetically; a production URL is an
-*integration* concern, not a development dependency.
+Hermetic, and now trivially so — there is no site to be up and no URL to point
+at. `_tests/test_skills.py` covers the runtime reader against synthetic trees;
+`_tests/skills/` is the authoring gate. Both run in the ordinary suite:
 
-### 8.1 Fixtures-first (the inner loop)
+```sh
+uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests
+```
 
-- **biopb-site side** (P1) is a static generator: test it by running
-  `build_skills_catalog.py` locally and `mkdocs build --strict`. The CI gate is
-  `--check` on the PR. No URL is involved at any point.
-- **biopb-mcp side** (P2/P3) is built not to depend on a live site (fail-open →
-  cache → bundled snapshot, [§3c](#3c-fetch--cache--fallback-fail-open-like-_updatepy)).
-  Point `catalog_url` at a local source — a `file://` fixture, a
-  `python -m http.server` on localhost, or the bundled snapshot — plus the local
-  `skills_dir` ([§7.5](#75-local-skills--resolved-a-local-source-not-a-parallel-mechanism)).
-  CI should assert the fallback and `catalog_version`-guard branches here, because
-  those need *deliberately-broken* catalogs, which belong in local fixtures, not on
-  a host.
+Two layers are marked and deselected by default — `contract` (needs
+basicpy/m2stitch, several GB) and `satisfiability` (a real resolver run per
+package, run as its own CI step). `_tests/skills/README.md` has both.
 
-### 8.2 Prod-unlinked (the integration smoke)
-
-Once P1's `--check` gate is green, let `deploy.yml` publish
-`skills/catalog.json` + `skills/*.md` to biopb.org. This is harmless — static files
-under `/skills/`, with no shipped consumer pointing at them until `skills.enabled`
-flips — and it covers what localhost can't: real TLS, `Content-Type`, CORS (if the
-browser page fetches it), httpx-against-real-cert, and the actual rsync deploy path.
-Two guardrails:
-
-1. **Publish the data, don't advertise the page.** Hold the `docs/skills.md` nav
-   entry (`mkdocs.yml`) until the catalog is real, so humans don't find a
-   placeholder. The JSON/MD sit at their URLs unlinked.
-2. **Sequence the default flip after the publish.** Keep the shipped MCP build from
-   hitting prod by default (`skills.enabled=False`, or a non-live `catalog_url`)
-   until the prod catalog exists — otherwise every session start races a 404. It
-   fails open silently, but boot-time 404 noise is avoidable. Order: publish the
-   static catalog → then ship the consumer defaulting to it.
-
-### 8.3 No separate testing site
-
-A dedicated test host is real ongoing ops (DNS, TLS, another deploy target + rsync
-key) for a static-file payload. Its only edge over prod-unlinked is isolating
-broken/in-flight catalogs from prod — already covered twice over by the `--check`
-gate (a broken catalog never reaches prod) and the server's fail-open + version
-guard (a bad prod catalog degrades gracefully). The one case it would serve —
-publishing malformed catalogs to exercise the consumer's fallback — is faster and
-safer as local fixtures ([§8.1](#81-fixtures-first-the-inner-loop)). Not worth the
-standing cost.
+The layer split, what gates a merge, and the agent-facing tiers that are *not*
+gates live in [`docs/skill-testing.md`](../../docs/skill-testing.md).
 
 ---
 
-## Appendix A — canonical frontmatter contract (shipped)
+## Appendix A — canonical frontmatter contract
 
-Implemented as **stdlib-only** in `biopb-site/scripts/skill_schema.py` — no pydantic,
-so the docs toolchain needs only PyYAML. Holds the version constants, the required
-body sections, the `CatalogEntry` dataclass (what the build emits), and the
-`coerce_list` helper. Excerpt:
+**stdlib + PyYAML**, in `_tests/skills/_schema.py`. Holds the version constant,
+the required body sections, the `SkillEntry` dataclass, and `coerce_list`:
 
 ```python
-CATALOG_VERSION = 1            # schema of catalog.json; server guards, fails open
 CURRENT_SPEC_VERSION = 1       # current authoring dialect (migrate() up-converts older)
 
 # Body structure every skill must carry, as normalized H2 headings. Order is free,
@@ -580,7 +524,7 @@ KEBAB = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 @dataclass
-class CatalogEntry:            # strict, canonical — what the build EMITS per skill
+class SkillEntry:              # strict, canonical — what validation yields
     id: str
     title: str
     description: str
@@ -588,9 +532,6 @@ class CatalogEntry:            # strict, canonical — what the build EMITS per 
     version: str
     spec_version: int
     requires: list
-    updated: str              # ISO date, from git — never author-supplied
-    url: str
-    sha256: str
     def to_dict(self) -> dict: return asdict(self)
 
 
@@ -601,32 +542,31 @@ def coerce_list(v) -> list:   # list | "a, b" | scalar | None  ->  list
     return [v]
 ```
 
-For defensive runtime parsing on the MCP side ([§5.4](#54-defensive-runtime-belt-and-suspenders)),
-`skill_schema.py` is small enough to vendor into `biopb-mcp` as-is.
+`url` and `sha256` are gone: they said where to fetch a body and how to verify
+it. `CATALOG_VERSION` went with the file it described. A test asserts the entry
+carries no fetch fields, so re-adding one would mean the fetch came back.
 
-## Appendix B — build + validator (shipped)
+The runtime does **not** import this. `mcp/_skills.py` has its own ~25-line
+frontmatter reader — deliberately weaker, stdlib-only, and forgiving where this
+one rejects (see the design principle above).
 
-`biopb-site/scripts/build_skills_catalog.py` (~170 lines, stdlib + PyYAML) is the
-authoritative source; run it bare to generate `skills/catalog.json`, or with
-`--check` in CI to validate only. Warnings never fail the build; **errors** do
-(non-zero exit, catalog not written). Its `process(path)` pipeline is the choke
-point — one pass per file:
+## Appendix B — the validator
+
+`_tests/skills/_validate.py` (~170 lines, stdlib + PyYAML). Its `process(path)`
+pipeline is the choke point — one pass per file:
 
 1. **split** frontmatter (normalize CRLF→LF; malformed fence → error).
 2. **migrate** the dialect to `CURRENT_SPEC_VERSION`.
-3. **infer / coerce** (tolerant read): `id` defaults to the stem and must match it;
-   `title` falls back to the first H1 then a humanized id (warn); `tags` coerced +
-   lowercased (not gated); `version` checked semver; `updated`
-   taken from `git log -1` (author value ignored); `description` required.
-4. **emit** a canonical `CatalogEntry` with `sha256` of the raw file, or `None` on
-   any error.
+3. **infer / coerce** (tolerant read): `id` defaults to the stem and must match
+   it; `title` falls back to the first H1 then a humanized id (warn); `tags`
+   coerced + lowercased (not gated); `version` checked semver; `description`
+   required.
+4. **emit** a canonical `SkillEntry`, or `None` on any error.
 
-`main()` then dedupes by `id`, prints warnings/errors, and — only if error-free —
-writes the versioned catalog. The delivered P0 run produced a 3-skill
-`catalog.json` with real hashes; `--check` was verified to reject a malformed file
-(missing `description`, id/stem mismatch, unknown tag, bad semver) with a non-zero
-exit.
+`validate(dir)` dedupes by `id` and returns `(entries, Report)`. Warnings never
+fail; **errors** do. It writes nothing — it used to end by generating
+`catalog.json`, and pytest is now the gate that used to be a CLI.
 
-> **Note on `generated` / timestamps.** CI stamps `generated` at build time; this is
-> fine for the published artifact. (This is a plain CI script — don't carry the
-> determinism concern into any workflow-scripting context that forbids wall-clock calls.)
+`Report` is per-run rather than module state, because the suite calls the
+validator many times in one process and a global accumulator would carry one
+run's errors into the next.

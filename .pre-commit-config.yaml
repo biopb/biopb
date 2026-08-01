@@ -10,7 +10,10 @@ repos:
       - id: check-docstring-first
       - id: end-of-file-fixer
       - id: trailing-whitespace
-        exclude: ^biopb-mcp/\.napari-hub/.*
+        # Skill bodies are authored prose shipped to an agent, not source. Two
+        # trailing spaces are a markdown hard line break, so stripping them is a
+        # silent content edit -- same reason [tool.ruff] excludes the directory.
+        exclude: ^(biopb-mcp/\.napari-hub/.*|biopb-mcp/src/biopb_mcp/mcp/_skills_data/.*)
       - id: check-yaml
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.15

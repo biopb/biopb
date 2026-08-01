@@ -127,6 +127,11 @@ testing = [
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
     "pytest-env",  # https://github.com/qwertyquerty/pytest-env
+    # The skills authoring gate (_tests/skills/) parses frontmatter with a real
+    # YAML parser. The runtime reader in mcp/_skills.py deliberately does not --
+    # it is stdlib-only and tolerant -- but the gate must reject what that one
+    # forgives, which takes a strict parser.
+    "pyyaml",
 ]
 
 [project.scripts]
@@ -163,9 +168,12 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
-# Bundled skills snapshot (mcp/_skills_bundle/): last-resort offline fallback for
-# the curated catalog + bodies (see mcp/_skills.py).
-"biopb_mcp.mcp" = ["_skills_bundle/*.json", "_skills_bundle/*.md"]
+# The curated skills (mcp/_skills_data/). These ship with the package and are the
+# only source the runtime reads — a skill is documentation about a specific
+# runtime version, so it rides that version's upgrade cycle rather than being
+# fetched. There is no catalog index: the frontmatter is the metadata and
+# mcp/_skills.py parses it. See docs/skill-testing.md §9.
+"biopb_mcp.mcp" = ["_skills_data/*.md"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
 # is no longer a package, setuptools reclassifies its files as *data* of the
@@ -195,7 +203,17 @@ describe_command = "git describe --tags --match 'release-v*'"
 
 [tool.pytest.ini_options]
 qt_api = "pyqt6"
-addopts = "--ignore-glob='*_vendor*'"
+# -m: the satisfiability layer runs a real resolver per skill package (tens of
+# seconds each over a torch-sized graph), so it is deselected by default and run
+# as its own CI step. A command-line -m overrides this one, which is how
+# `-m satisfiability` and `-m contract` still work.
+addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability'"
+markers = [
+    # Resolves each skill's pkg: tokens against the installed environment to
+    # reject a package that installs only by moving biopb's own deps. Metadata
+    # only -- nothing is downloaded or installed. See _tests/skills/README.md.
+    "satisfiability: resolves a skill's declared packages against this environment",
+]
 
 [tool.pytest_env]
 QT_QPA_PLATFORM = "offscreen"
