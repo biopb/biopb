@@ -43,7 +43,7 @@ fixture, a subject, a tolerance, and a repeatable pass/fail. Reach for it after
 | `_outcome.py` | The skill-agnostic protocol: `Fixture`, `Attempt`, `Metric`, `Outcome`, the provider registry, `CuratedNpz`, artifact writing |
 | `_drift.py` | `drift-correction`: three synthetic cases, four subjects, one verifier |
 | `test_drift_correction.py` | The expectation table — which subject must pass which case, and which claim in the skill body each row is |
-| `test_outcome_protocol.py` | The protocol itself, including the curated path no CI machine has data for |
+| `test_outcome_protocol.py` | The protocol itself, including the curated path almost no machine has data for |
 
 ## The three ideas
 
@@ -126,7 +126,8 @@ so a diagnostic result is read for what it is.
 ## Artifacts
 
 Every case writes to `.skill-outcomes/<run>/<case>/<subject>/` (override with
-`BIOPB_SKILL_OUTCOME_DIR`; gitignored). The number gates, the artifact explains:
+`BIOPB_SKILL_OUTCOME_DIR`; gitignored). The number decides, the artifact
+explains — and for a diagnostic run the artifact is usually the point:
 
 - `summary.json` — provenance, every metric with its limit, and what could not
   be measured at all
