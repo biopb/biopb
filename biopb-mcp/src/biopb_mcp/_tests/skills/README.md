@@ -56,6 +56,13 @@ pytest biopb-mcp/src/biopb_mcp/_tests/skills -m satisfiability   # just this lay
 Deselected by default only because each token is a real resolver run; CI runs it
 as its own step. Metadata only — nothing is downloaded or installed.
 
+**CI runs it on every matrix cell** (ubuntu 3.10/3.11/3.12, macos 3.12, windows
+3.12), because the answer is environment-dependent: a package can co-install on
+one interpreter and not another. That is not hypothetical for this class of
+dependency — m2stitch pins pandas 1.5.3 and has no 3.12 wheel. **One red cell
+rejects the skill.** A shipped catalog goes to every platform, so a skill that
+only resolves on Linux is one most users would get a silent downgrade from.
+
 The gate is unconditional: no allowlist, no xfail. Those would be somewhere to
 record that a known-bad skill ships anyway, which is what it exists to prevent.
 A package that genuinely needs its own environment belongs behind the algorithm

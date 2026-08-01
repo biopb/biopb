@@ -112,6 +112,11 @@ jobs:
       # the environment just built, so a skill whose package installs only by
       # downgrading biopb's own deps fails here rather than on a user's machine.
       # Metadata only -- nothing is downloaded or installed.
+      #
+      # Runs on every matrix cell on purpose: the answer depends on the
+      # interpreter and platform (m2stitch, for one, has no 3.12 wheel). One red
+      # cell rejects the skill -- the catalog ships to every platform, so
+      # "resolves on Linux" is not good enough.
       - name: Skill package satisfiability
         run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/skills
 
