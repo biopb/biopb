@@ -325,11 +325,18 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
 
     truth_offsets = fixture.truth.get("offsets")
     got_offsets = attempt.arrays.get("offsets")
+    # Same reasoning as the corrected-movie check below: a run binding
+    # `offsets` to something of the wrong shape is a result that cannot be
+    # scored, which is not the same as an error in the verifier.
+    if got_offsets is not None and truth_offsets is not None:
+        got_shape = np.asarray(got_offsets).shape
+        if got_shape != np.asarray(truth_offsets).shape:
+            got_offsets = None
     if truth_offsets is None or got_offsets is None:
         why = (
             "the fixture carries no annotated trajectory"
             if truth_offsets is None
-            else "the run reported no per-frame offsets"
+            else "the run reported no per-frame offsets of the expected shape"
         )
         metrics += [
             Metric(
@@ -374,6 +381,31 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
     stable = fixture.truth.get("stable")
     corrected = _structural(fixture, attempt.arrays.get("corrected"))
     movie = _structural(fixture, fixture.data.get("movie"))
+    # A run may bind `corrected` to anything at all -- the wrong array, a
+    # transposed one, a summary. Scoring that is meaningless, but *crashing* on
+    # it is worse: an unscorable result is an ordinary outcome of an agent run
+    # and has to arrive as "not measured", the same as a truth the fixture
+    # cannot supply. Found by an agent doing exactly this; no reference
+    # implementation could have, being correct by construction.
+    mismatched = (
+        corrected is not None
+        and movie is not None
+        and (corrected.ndim != movie.ndim or corrected.shape[-2:] != movie.shape[-2:])
+    )
+    if mismatched:
+        metrics.append(
+            Metric(
+                "residual_ratio",
+                None,
+                limits["residual_ratio"],
+                unavailable=(
+                    f"the run's corrected movie is {corrected.shape}, which "
+                    f"cannot be compared with the input {movie.shape}"
+                ),
+            )
+        )
+        detail["corrected_shape"] = list(corrected.shape)
+        return Outcome(fixture=fixture, attempt=attempt, metrics=metrics, detail=detail)
     if stable is None or corrected is None or movie is None:
         why = (
             "no un-drifted reference exists for this fixture"

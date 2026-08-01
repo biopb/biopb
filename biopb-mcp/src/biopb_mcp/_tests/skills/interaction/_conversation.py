@@ -68,13 +68,29 @@ class Trace:
 
     @property
     def questions(self) -> list[str]:
-        """Everything the agent said *to the user* — its blocking questions.
-
-        This is what the "at most three blocking checkpoints" assertion counts,
-        and it is only meaningful because a plain-text turn has nowhere else to
-        go in this loop.
-        """
+        """Everything the agent said *to the user*, asking or not."""
         return [e.text for e in self.events if e.role == "agent" and e.text]
+
+    @property
+    def blocking_questions(self) -> list[str]:
+        """The subset that actually asks for something — what §6's "at most
+        three blocking checkpoints" is counted against.
+
+        Not the same as :attr:`questions`, and the difference is not pedantry.
+        Models narrate: "I found a drift-correction skill, let me read it" is a
+        plain-text turn with no tool call, so the loop routes it to the
+        respondent like anything else — but it is a status update, not a
+        checkpoint, and counting it put a well-behaved run at six over a budget
+        of four on the first real measurement.
+
+        **The test is a question mark**, which is a heuristic and is stated as
+        one. It cannot see a checkpoint phrased as "let me know which channel
+        is structural", and it would miscount a rhetorical question. It is
+        transparent and cheap, where the alternative is asking a third model to
+        classify each turn — paying for a judgement in a layer built to avoid
+        judged verifiers.
+        """
+        return [text for text in self.questions if "?" in text]
 
     @property
     def tool_names(self) -> list[str]:

@@ -44,6 +44,7 @@ from typing import Protocol
 #: `BIOPB_SKILL_ENV_FILE`, then the repo root, then the biopb config dir.
 ENV_FILE_ENV = "BIOPB_SKILL_ENV_FILE"
 CONFIG_ENV_FILE = Path.home() / ".config" / "biopb" / "skill-harness.env"
+HOME_ENV_FILE = Path.home() / ".env"
 
 #: Which side is being configured. Separate variables so agent and respondent
 #: can sit on different providers, or the same one at different addresses.
@@ -55,6 +56,14 @@ RESPONDENT_BASE_URL_ENV = "BIOPB_SKILL_RESPONDENT_BASE_URL"
 DEFAULT_AGENT = "openai:gpt-5"
 DEFAULT_RESPONDENT = "anthropic:claude-sonnet-5"
 
+#: Model-name substrings that mean "this came from the family that wrote these
+#: skills", checked in addition to the provider. Needed because `provider:`
+#: names a wire protocol as often as a vendor: behind an OpenAI-compatible
+#: gateway a Claude model is spelled `openai:claude-...`, and §6a's whole point
+#: is to notice that. Not a security boundary -- a gateway can name a model
+#: anything -- but it catches the mistake somebody actually makes.
+AUTHORING_FAMILY_MARKERS = ("claude", "sonnet", "opus", "haiku")
+
 
 def _repo_root() -> Path | None:
     for parent in Path(__file__).resolve().parents:
@@ -64,15 +73,18 @@ def _repo_root() -> Path | None:
 
 
 def env_file() -> Path | None:
-    """The dotenv this run would read, if any."""
+    """The dotenv this run would read, if any. Most specific first."""
     explicit = os.environ.get(ENV_FILE_ENV, "").strip()
     if explicit:
         path = Path(explicit).expanduser()
         return path if path.is_file() else None
     root = _repo_root()
-    if root and (root / ".env").is_file():
-        return root / ".env"
-    return CONFIG_ENV_FILE if CONFIG_ENV_FILE.is_file() else None
+    candidates = [
+        *([root / ".env"] if root else ()),
+        CONFIG_ENV_FILE,
+        HOME_ENV_FILE,
+    ]
+    return next((p for p in candidates if p.is_file()), None)
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -179,6 +191,36 @@ class ModelChoice:
             return setting(self.provider.key_env, "ollama")
         return setting(self.provider.key_env)
 
+    @property
+    def from_authoring_family(self) -> bool:
+        """Whether this model comes from the family that wrote these skills.
+
+        Two ways to be one, because `provider:` names a **wire protocol** as
+        often as a vendor. Behind a gateway — an OpenAI-compatible endpoint
+        serving many vendors' models — `openai:` says nothing about who trained
+        what is on the other end, so a gateway-served Claude spells
+        ``openai:claude-sonnet-5`` and would sail through a check that only
+        read the provider. That is precisely the case §6a exists to catch, so
+        the model name is read too.
+
+        A name check is a heuristic and cannot be otherwise: a gateway may call
+        a model anything at all. It catches the honest mistake, not a
+        determined one, and `interaction_notes` says which of the two it is.
+        """
+        if self.provider.wrote_these_skills:
+            return True
+        low = self.model.casefold()
+        return any(marker in low for marker in AUTHORING_FAMILY_MARKERS)
+
+    @property
+    def family_is_certain(self) -> bool:
+        """False when a gateway makes the family unknowable from config alone.
+
+        A run behind one is not invalid — it is unverified, which is a
+        different thing and belongs in the trace rather than in an exception.
+        """
+        return not self.base_url or self.provider.base_url == self.base_url
+
     def why_unavailable(self) -> str:
         if self.key:
             return ""
@@ -211,13 +253,26 @@ def parse_choice(spec: str, base_url: str = "") -> ModelChoice:
     return ModelChoice(provider, model, base_url or provider.base_url)
 
 
+#: The conventional name, which the OpenAI SDK reads by itself. Honoured as a
+#: fallback for both sides: anyone pointing a gateway at this harness reaches
+#: for it first, and quietly ignoring it sends a gateway key to
+#: api.openai.com, which fails with an authentication error that explains
+#: nothing. The per-side variables still win, which is what keeps "one model on
+#: each of two endpoints" sayable.
+SHARED_BASE_URL_ENV = "OPENAI_BASE_URL"
+
+
 def agent_choice() -> ModelChoice:
-    return parse_choice(setting(AGENT_ENV, DEFAULT_AGENT), setting(AGENT_BASE_URL_ENV))
+    return parse_choice(
+        setting(AGENT_ENV, DEFAULT_AGENT),
+        setting(AGENT_BASE_URL_ENV) or setting(SHARED_BASE_URL_ENV),
+    )
 
 
 def respondent_choice() -> ModelChoice:
     return parse_choice(
-        setting(RESPONDENT_ENV, DEFAULT_RESPONDENT), setting(RESPONDENT_BASE_URL_ENV)
+        setting(RESPONDENT_ENV, DEFAULT_RESPONDENT),
+        setting(RESPONDENT_BASE_URL_ENV) or setting(SHARED_BASE_URL_ENV),
     )
 
 

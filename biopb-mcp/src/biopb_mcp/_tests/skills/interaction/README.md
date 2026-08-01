@@ -66,27 +66,48 @@ written to a trace, an artifact or a log.
 | `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
 | `_personas.py` | The respondent fixtures — who the agent talks to, and what only they know |
 | `_conversation.py` | The two-model loop, the caps, the `Trace` |
+| `test_drift_benchmark.py` | The 2x2 benchmark: skill offered/withheld x respondent answers/silent |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
 | `test_conversation.py` | That the loop works, with no model *and* no session |
 | `test_personas.py` | That a persona gives nothing away |
 | `test_models.py` | That provider selection resolves, and that §6a holds of the defaults |
 
-## What has been run, and what has not
+## A benchmark, not a gate
 
-Worth stating plainly, because "armed but never run" is how the contract layer
-rotted for a release:
+**No run's outcome fails a test here.** Each arm reports an `outcome` and a
+`reason` — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`,
+`gave-up`, `no-result`, `unscorable-result`, `harness-error` — plus flags that
+change how to read it: `cut-off-but-scored`, `over-ask-budget(n)`,
+`never-asked`, `never-registered`, `catalog-mismatch`.
 
-- **Run and green**: everything driven by `ScriptedAgent` / `ScriptedRespondent`
-  (the loop, the trace, replay, the caps, scraping, the personas) and the nine
-  session smoke tests. No key, no cost.
-- **Written but never executed**: `ToolCallingAgent` and `ModelRespondent` —
-  the two live adapters. Their *selection* is tested; their network calls
-  are not. They are a few dozen lines of plumbing each and
-  the first real run will shake them out. Until that run has happened, do not
-  read this README as saying they work.
+Every arm runs inside its own `try`, so a corner that dies becomes a row rather
+than an exception that destroys the other three. The report is the deliverable;
+a poor fixture is still informative, a missing report is not.
 
-The scoring pass that puts a real agent in front of `drift-correction` is not
-here yet either.
+Two things *are* asserted, and neither judges the skill: that `summary.md`
+reached disk with a transcript per arm, and that the **ablation took effect**.
+The second is not a finding — if `skills_enabled: false` stopped withholding
+the catalog, the delta would read as zero for a reason unrelated to the skill,
+which is a green table asserting the opposite of the truth.
+
+## What the first full run showed
+
+Agent `glm-5.1`, respondent `qwen3.5-plus`, one sample per corner:
+
+| arm | rms px | within tol | stopped |
+|---|---|---|---|
+| skill + asked | 0.00033 | yes | finished |
+| skill + silent | 5.28 | no | turn-cap |
+| noskill + asked | 4.72 | no | finished |
+| noskill + silent | 0.024 | **yes** | turn-cap |
+
+The floor passed, and beat the arm that had a microscopist answering by 200x.
+No monotonic pattern, so the spread is run-to-run variance rather than the
+manipulations: **no delta can be claimed from this, in either direction.**
+
+That is the layer's real output so far, and it is worth more than a green
+light. `n=1` per corner is not a measurement — see `docs/skill-testing.md` §6d
+for what follows.
 
 ## Why this tier is the one with teeth
 

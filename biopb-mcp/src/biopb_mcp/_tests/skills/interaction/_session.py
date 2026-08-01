@@ -151,6 +151,8 @@ class LiveSession:
     instructions: str
     tools: list[ToolSpec]
     scratch: Path
+    #: Whether the curated catalog was offered at all (the ablation arm).
+    skills_enabled: bool
     _loop: _LoopThread
     _session: Any
     _turn: int = 0
@@ -243,9 +245,16 @@ class LiveSession:
         return f"{SENTINEL} client True" in out.text
 
 
-def _write_config(root: Path) -> None:
+def _write_config(root: Path, *, skills_enabled: bool = True) -> None:
     """A config tree of our own, so neither the developer's settings nor their
-    personal skills reach the child."""
+    personal skills reach the child.
+
+    ``skills_enabled=False`` is the **ablation arm**: the catalog goes away and
+    with it the ``find_skills`` tool, while the kernel, napari, dask and every
+    library stay exactly as they were. That is §7's rule — disclose the
+    environment, withhold only the skill — and it is a real shipped
+    configuration rather than a hole cut for the test.
+    """
     (root / "biopb").mkdir(parents=True, exist_ok=True)
     (root / "biopb" / "mcp-config.json").write_text(
         json.dumps(
@@ -256,6 +265,7 @@ def _write_config(root: Path) -> None:
                 # Nothing watches a web UI during an unattended run.
                 "observe": {"enabled": False},
                 "transport": {"kind": "http", "display_mode": "auto"},
+                "services": {"skills_enabled": skills_enabled},
             }
         ),
         encoding="utf-8",
@@ -266,8 +276,12 @@ def _write_config(root: Path) -> None:
 
 
 @contextmanager
-def live_session() -> Iterator[LiveSession]:
-    """Bring a session up, hand back a driver, and reap it on the way out."""
+def live_session(*, skills_enabled: bool = True) -> Iterator[LiveSession]:
+    """Bring a session up, hand back a driver, and reap it on the way out.
+
+    ``skills_enabled=False`` withholds the curated catalog and nothing else
+    -- the ablation arm of the benchmark.
+    """
     if reason := why_unavailable():
         raise SessionUnavailable(reason)
 
@@ -275,7 +289,7 @@ def live_session() -> Iterator[LiveSession]:
     from biopb_mcp.mcp import _shim
 
     scratch = Path(tempfile.mkdtemp(prefix="biopb-skill-session-"))
-    _write_config(scratch / "config")
+    _write_config(scratch / "config", skills_enabled=skills_enabled)
 
     saved = {
         k: os.environ.get(k)
@@ -299,6 +313,7 @@ def live_session() -> Iterator[LiveSession]:
             instructions=(init.instructions or "").strip(),
             tools=tools,
             scratch=scratch,
+            skills_enabled=skills_enabled,
             _loop=loop,
             _session=session,
         )

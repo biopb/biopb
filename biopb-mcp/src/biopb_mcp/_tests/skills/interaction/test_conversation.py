@@ -188,7 +188,6 @@ def test_the_trace_answers_the_gate_spy_question():
 
 
 def test_questions_counts_only_what_was_said_to_the_user():
-    """What "at most three blocking checkpoints" is counted against."""
     agent = ScriptedAgent(
         [_says("One?"), _calls("server_status"), _says("Two?"), _says("Done.")]
     )
@@ -199,6 +198,30 @@ def test_questions_counts_only_what_was_said_to_the_user():
         task="t",
     )
     assert trace.questions == ["One?", "Two?", "Done."]
+
+
+def test_narration_is_not_a_blocking_question():
+    """Models narrate their plan in a turn of their own and act in the next.
+    The loop routes that to the respondent like any plain text -- but it is a
+    status update, not a checkpoint, and counting it put a well-behaved run six
+    over a budget of four on the first real measurement of this layer."""
+    agent = ScriptedAgent(
+        [
+            _says("I found a drift-correction skill. Let me read it."),
+            _calls("server_status"),
+            _says("Which channel is structural?"),
+            _says("The correction is complete."),
+        ]
+    )
+    trace = converse(
+        FakeSession(),
+        agent,
+        ScriptedRespondent([("channel", "Channel 1."), ("complete", DONE)]),
+        task="t",
+    )
+
+    assert len(trace.questions) == 3
+    assert trace.blocking_questions == ["Which channel is structural?"]
 
 
 def test_the_trace_is_written_in_both_forms(tmp_path):

@@ -4,8 +4,11 @@
 > and exercised on one skill, but it is a **diagnostic harness rather than a
 > gate** — it tests a transcription of a skill, not the shipped file (§5c), so
 > it stays out of CI and nothing further is queued for it. §6 is the tier that
-> actually tests the shipped bodies: its deterministic half is built for
-> `drift-correction` (§6b) and the agent half is not. §7 remains a design sketch.
+> actually tests the shipped bodies, and it is **built end to end** — but as a
+> benchmark rather than a gate (§6d): it reports each run's outcome and
+> reason, and its first full 2x2 showed the corners dominated by run-to-run
+> variance. §7 remains a design sketch, though §6d's ablation arm implements
+> its central idea.
 >
 > This revision follows a structural decision that the earlier draft predates:
 > **skills ship inside the biopb packages and are never fetched over the
@@ -36,7 +39,7 @@ Five questions, very different costs. Only two of them need an agent.
 | **Contract** | Does the API it asserts still exist — and can it be installed at all? | resolve the declared packages; import them and assert signatures | yes |
 | **Retrieval** | Does `find_skills` surface it for the right request? | matcher fixtures + a phrasing table, no agent | yes |
 | **Outcome** | Does following it produce the right numbers? | ground-truth fixtures + programmatic verifier | yes, but it tests a transcription, not the file (§5c) |
-| **Interaction** | Does it ask at the right moments, and only then? | simulated user + trace assertions | no |
+| **Interaction** | Does the skill change what an agent does? | 2x2 benchmark: a real session, a real agent, the skill withheld or offered | no — a report, not a verdict |
 
 A sixth, **ablation** (§7), is not a test — it is an authoring tool. It answers
 "is this content necessary", which is a question about the file, not about a run.
@@ -467,8 +470,63 @@ silently changes what a run tests:
 - **A config tree of its own**, so the catalog under test is the shipped set and
   not the developer's personal `~/.config/biopb/skills/*.md`.
 
-Built: `interaction/_session.py` and `test_session_smoke.py`. The agent adapter,
-the respondent and the conversation loop are not.
+Built: `interaction/`, end to end.
+
+### 6d. A benchmark, not a gate — and what the first run showed
+
+This tier **does not produce a verdict**. A skill's claim is a behavioural
+delta, so measuring it needs a baseline, and the layer runs a 2x2 and reports
+the corners:
+
+| | respondent answers | respondent silent |
+|---|---|---|
+| **skill offered** | does the whole thing work | does *asking* matter |
+| **skill withheld** | does the *skill* matter | the floor |
+
+Withholding is `services.skills_enabled: false` — a real shipped configuration,
+so the kernel, napari, dask and every library stay as they are and only the
+curated procedure goes (§7's rule). The ablation is asserted on what the
+catalog *returns*, not on whether `find_skills` was called: the tool stays
+registered either way and `load_catalog()` is what gates.
+
+**No run's outcome fails the test.** Out of turns, wrong answer, gave up, even
+a harness error — each is a row with a reason (`out-of-turns`, `wrong-answer`,
+`unscorable-result`, …) plus flags that change how to read it
+(`cut-off-but-scored`, `over-ask-budget`, `never-asked`). Stopping at the first
+bad corner would discard the three rows that explain it, and a poor fixture is
+still informative.
+
+**The first full run, and it is the reason this is not a gate.** Agent
+`glm-5.1`, respondent `qwen3.5-plus`, one sample per corner:
+
+| arm | rms px | within tol | stopped |
+|---|---|---|---|
+| skill + asked | 0.00033 | yes | finished |
+| skill + silent | 5.28 | no | turn-cap |
+| noskill + asked | 4.72 | no | finished |
+| noskill + silent | 0.024 | **yes** | turn-cap |
+
+The floor passed. With neither the procedure nor an answer, the run corrected
+the drift 200x better than the arm that had a microscopist answering. There is
+no monotonic pattern, so **the spread is run-to-run variance rather than the
+manipulations, and no delta can be claimed in either direction**.
+
+Three things follow, and they are the layer's actual output so far:
+
+- **n=1 per corner is not a measurement.** Four arms cost 18 minutes and four
+  conversations and settled nothing. A delta needs several samples per corner,
+  which is where §11's "per-edit or per-release" question stops being
+  theoretical.
+- **The floor earned its place immediately.** Without it, three arms read as a
+  large skill effect — and that is what the fourth refutes. Dropping it to save
+  a run would have produced a confident wrong answer on the first outing.
+- **§6b's guarantee is weaker than it looked.** Proving a fixture defeats the
+  heuristics its author thought of is not proving the fact is unobtainable: a
+  capable agent recovered the structural channel by trying both and seeing
+  which gave a self-consistent trajectory. A §6 fixture's withheld fact has to
+  be *categorically absent* from the data — a unit, a scale, a provenance — not
+  merely implicit in it. `calibrated-measurements`' spacing is that; this one
+  is not.
 
 ## 7. Layer 5 — ablation (authoring, not gating)
 
@@ -553,7 +611,7 @@ parameterisation over where the skills came from.
 | Contract — satisfiability (§3a) | this repo's CI (metadata resolution only) | yes |
 | Contract — signatures (§3) | this repo's CI, on skill-touching PRs only | yes |
 | Outcome (§5) | local — a diagnostic harness, run when §6 gives it something to isolate | no |
-| Interaction | local | no |
+| Interaction (§6) | local — a benchmark; reports outcomes, never fails on one | no |
 | Ablation | manual, per skill edit | no |
 
 Everything that gates is in this repo, and a skill edit and the runtime change it
