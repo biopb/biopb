@@ -232,11 +232,13 @@ class TestDefaultConfig:
     def test_skills_are_flat_scalars(self):
         """The former services.skills object is flattened to scalar leaves."""
         services = DEFAULT_CONFIG["services"]
-        # Skills ship on: the catalog resolves offline via the bundled snapshot,
-        # so the default install has something to answer with.
+        # Skills ship on: they are package data, so the default install always
+        # has something to answer with and there is nothing to fetch.
         assert services["skills_enabled"] is True
-        assert services["skills_catalog_url"].startswith("https://")
-        assert services["skills_cache_ttl"] == 3600
+        assert services["skills_local_dir"] == ""
+        # The fetch knobs went with the network path (docs/skill-testing.md §9).
+        assert "skills_catalog_url" not in services
+        assert "skills_cache_ttl" not in services
         # No nested object survives.
         assert "skills" not in services
 

@@ -380,28 +380,20 @@ class ServicesConfig:
     skills_enabled: bool = _h(
         True,
         "Master switch for skills discovery/retrieval. On by default: the agent is "
-        "told to consult find_skills, which resolves the curated-workflow catalog "
-        "(network -> disk cache -> bundled snapshot, so it still answers offline). "
-        "Set false to keep the subsystem dormant -- find_skills returns nothing, no "
-        "catalog fetch is attempted, and the agent is not told about skills.",
-    )
-    skills_catalog_url: str = _h(
-        "https://biopb.org/skills/catalog.json",
-        "Published skills metadata catalog. Point at a self-hosted catalog to serve "
-        "a lab's own curated set.",
-    )
-    skills_cache_ttl: int = _h(
-        3600,
-        "Seconds a fetched skills catalog is reused before re-fetching. A stale "
-        "on-disk cache is still used past this if the network is down.",
+        "told to consult find_skills, which resolves the curated workflows shipped "
+        "with this package plus the user's own (skills_local_dir). Set false to keep "
+        "the subsystem dormant -- find_skills returns nothing and the agent is not "
+        "told about skills.",
     )
     skills_local_dir: str = _h(
         "",
         "Directory of user-authored skill files (*.md) merged into the catalog "
-        "beside the curated one; empty -> ~/.config/biopb/skills. Personal and "
+        "beside the shipped ones; empty -> ~/.config/biopb/skills. Personal and "
         "unreviewed (find_skills reports them as origin=local), re-read on every "
-        "discovery so an edit is live without a restart. Off with skills_enabled "
-        "like the rest of the subsystem.",
+        "discovery so an edit is live without a restart. Since the curated set now "
+        "arrives only with a release, this is also the only way a skill reaches a "
+        "machine out of band. Off with skills_enabled like the rest of the "
+        "subsystem.",
     )
     namespace_enabled: bool = _h(
         True,
@@ -532,9 +524,6 @@ _CONSTRAINTS = {
     "TensorRuntimeConfig": {
         "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
         "health_poll_max_interval": Range(min=0),
-    },
-    "ServicesConfig": {
-        "skills_cache_ttl": Range(min=0),
     },
 }
 

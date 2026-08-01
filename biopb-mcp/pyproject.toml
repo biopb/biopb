@@ -163,9 +163,12 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
-# Bundled skills snapshot (mcp/_skills_bundle/): last-resort offline fallback for
-# the curated catalog + bodies (see mcp/_skills.py).
-"biopb_mcp.mcp" = ["_skills_bundle/*.json", "_skills_bundle/*.md"]
+# The curated skills (mcp/_skills_data/). These ship with the package and are the
+# only source the runtime reads — a skill is documentation about a specific
+# runtime version, so it rides that version's upgrade cycle rather than being
+# fetched. There is no catalog index: the frontmatter is the metadata and
+# mcp/_skills.py parses it. See docs/skill-testing.md §9.
+"biopb_mcp.mcp" = ["_skills_data/*.md"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
 # is no longer a package, setuptools reclassifies its files as *data* of the

@@ -47,7 +47,7 @@ The frontmatter fields, and how to determine each:
 | `description` | One sentence. This is what `find_skills` ranks on — write it as the user's request, not as an implementation summary |
 | `tags` | A list of categories describing the skill. Reuse tags you have seen on published skills where they fit — consistent tags are what make discovery work |
 | `version` | `1.0.0` for a new skill. Bump on every content edit; the site derives `updated` from git, so never set a date by hand |
-| `requires` | Capability hints: `viewer`, `tensor`, `dask`, `ops:<kind>`, `plugin:<name>`, `pkg:<name>`. List what the steps actually touch |
+| `requires` | What the steps actually touch: `viewer`, `tensor`, `dask`, `ops:<kind>`, `plugin:<name>` (the plugin's **file stem**, e.g. `plugin:rolling_ball` ↔ `rolling_ball.py` — also the name it is bound under in the kernel namespace, so the body calls `rolling_ball.subtract_background(...)`), `pkg:<name>` with an optional version bound. Not decoration — the agent resolves this list against the live session before starting (see step 2). A skill that drives the kernel carries `pkg:biopb-mcp>=0.13.0`, the first release exposing the interface it is written against; raise that bound only if the skill needs something newer. An empty list is a real answer, not an omission: a skill whose steps touch nothing in the session has nothing to resolve |
 
 ## Steps
 
@@ -61,11 +61,43 @@ The frontmatter fields, and how to determine each:
    | Amount | Ships as | The body carries |
    |---|---|---|
    | ≲ 30 lines | Inline code fences | The code itself |
-   | 30–150 lines | A kernel plugin (`biopb_mcp/plugins/`, seeded to `~/.config/biopb/kernel/`) | The call signature and what the parameters mean |
-   | A published algorithm | A `pip install` pointer | The install command, an import check, and the degraded path when it is absent |
+   | 30–150 lines | A kernel plugin (`biopb_mcp/plugins/`, seeded to `~/.config/biopb/kernel/`) | The call signature — qualified by the plugin's module name — and what the parameters mean |
+   | A published algorithm | A `pip install` pointer | The install command and the degraded path when it is absent |
 
-   Never tell the agent to install anything itself — name the command and let the
-   user run it.
+   **Do not restate the install mechanics.** Which command to quote, why never a
+   bare `pip install`, and what a managed environment does to an added package
+   are all in `guide://kernel`, which ships with the server that prints them — a
+   copy in your body is one more thing to go stale. Write the half that is yours:
+   *which* packages, and *what the degraded path is*. That path is the load-
+   bearing half of a package-tier skill anyway, since it is the one that survives
+   an upgrade.
+
+   **Do not write data-access code either.** Getting an array out of a layer or
+   off the tensor server is `guide://data`'s job — pyramids, laziness, a `scale`
+   that is per-axis rather than positional, what an upload drops. A snippet in
+   your body is a
+   second copy of mechanics that change with the loader, and a wrong one is the
+   most expensive kind of wrong here: it runs, and the numbers are silently off.
+   Name what your steps need from the data — *both label arrays at the same
+   level*, *the spacing that belongs to this array* — and point at the guide for
+   how. Code fences in a skill are for the skill's **own** algorithm and calls.
+
+   Whatever the tier, **step 1 of the workflow is the requirement check**, before
+   the confirm-input step — there is no point asking the user which layer is truth
+   if the scorer was never going to be there.
+
+   Keep *the check itself* to one sentence: resolve `requires:` against
+   `server_status`, and point at `guide://kernel` for what to do about a gap. The
+   diagnosis — which section answers which token, what a missing plugin means, the
+   options for a missing package — lives in the guide, and a copy in your body is
+   one more thing to go stale. Add a clause only where your own token needs
+   pointing at ("the scorer is a kernel plugin, so `## Kernel plugins` answers for
+   it").
+
+   Then, in the same step, write the half the guide cannot know: the **degraded
+   path** for each optional piece and what taking it costs the result — or that
+   there is none, which is just as useful to say. It belongs beside the check,
+   where the agent decides whether to go on.
 
 3. **Draft the six required sections**: *When to use*, *When NOT to use*,
    *Parameters*, *Steps*, *Failure modes*, *Next steps*. Two carry most of the
@@ -114,18 +146,27 @@ The frontmatter fields, and how to determine each:
    ask the user first, explain what is lost, and offer to note the layers worth
    reloading. Never restart to test your own draft without consent.
 
-6. **Check the draft yourself.** There is no validator on the user's machine —
-   the catalog builder lives in the publishing repository, not in the biopb
-   install — so read the draft back against this list:
+6. **Check the draft yourself.** 
 
    - `id` is kebab-case and matches the intended filename stem.
    - `description` reads like the user's request; that string is what
      `find_skills` ranks on.
-   - `tags` reuse tags you have seen on existing skills (`find_skills` returns
-     them). A genuinely new tag is fine but needs a maintainer's review.
+   - `tags` reuse tags you have seen on existing skills.
    - All six sections are present as `##` headings.
    - Every parameter has a derivation rule, not a magic constant.
-   - The body is under roughly 200 lines.
+   - The body is under roughly 200 lines — a proxy for the rule below.
+
+   **Then ablate it.** A skill earns its length by fixing what a model gets wrong
+   unaided, so measure that rather than guessing: give an subagent with fresh context
+   the same task **without** the skill, and diff what it produces against what you
+   wrote. Cut what it got right on its own; keep what it got wrong. Do not ask it
+   which parts are obvious — models introspect their own competence badly.
+
+   Run it a few times, and vary the scenario to put weight on particular advice —
+   a deliberately oversized input is what shows whether a cost check is
+   load-bearing. What it gets right only *sometimes* is where a one-line reminder
+   beats a paragraph. A different model family is the better probe, since it does
+   not share the blind spots of whoever drafted the skill.
 
 7. **Deliver the draft** *(blocking)*. Show the complete file in the
    conversation. Then ask what the user wants done with it:
@@ -156,6 +197,7 @@ The frontmatter fields, and how to determine each:
 | A saved skill never appears in `find_skills` | Saved outside `~/.config/biopb/skills`, or the filename starts with `_` (private), or skills are switched off | Check the path and `services.skills_enabled` |
 | Section written as bold text or a deeper heading | Required sections are `##` headings | Use `## ` with the exact section names |
 | The body has grown past ~200 lines | An algorithm is living in the skill | Move it to a plugin or a package pointer (step 2) |
+| The body is long but every line reads as necessary | Never ablated — obviousness is invisible from the inside | Diff it against a cold small-model run (step 6) |
 
 ## Next steps
 
