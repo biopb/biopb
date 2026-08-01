@@ -12,15 +12,30 @@ from ._models import (
     AGENT_ENV,
     DEFAULT_AGENT,
     DEFAULT_RESPONDENT,
+    ENV_FILE_ENV,
     PROVIDERS,
     RESPONDENT_ENV,
     AnthropicText,
     OpenAICompatText,
     agent_choice,
     parse_choice,
+    read_env_file,
+    reload_env_file,
     respondent_choice,
     text_backend,
 )
+
+
+@pytest.fixture
+def no_dotenv(tmp_path, monkeypatch):
+    """Point the loader at nothing, so a developer's real `.env` cannot decide
+    the result of a test. Restores the cache on the way out — it is process-wide
+    and a stale one would leak into whatever ran next."""
+    monkeypatch.setenv(ENV_FILE_ENV, str(tmp_path / "absent.env"))
+    reload_env_file()
+    yield monkeypatch
+    monkeypatch.undo()
+    reload_env_file()
 
 
 def test_a_bare_model_name_is_refused():
@@ -70,15 +85,76 @@ def test_a_base_url_override_beats_the_provider_default(monkeypatch):
     assert respondent_choice().base_url == "http://proxy.internal/v1"
 
 
-def test_a_missing_key_is_reported_by_name_not_by_traceback(monkeypatch):
+def test_a_missing_key_is_reported_by_name_not_by_traceback(no_dotenv):
     """A run that cannot start should say which variable to set, and must not
     be the thing that discovers it three tool calls in."""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    choice = parse_choice("openai:gpt-5")
-    assert "OPENAI_API_KEY" in choice.why_unavailable()
+    no_dotenv.delenv("OPENAI_API_KEY", raising=False)
+    why = parse_choice("openai:gpt-5").why_unavailable()
+    assert "OPENAI_API_KEY" in why
+    # And it names the trap, because this one cost an afternoon: an export at
+    # the bottom of ~/.bashrc never reaches a non-interactive shell.
+    assert ".bashrc" in why and ".env" in why
 
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-not-a-real-key")
+    no_dotenv.setenv("OPENAI_API_KEY", "sk-not-a-real-key")
     assert parse_choice("openai:gpt-5").why_unavailable() == ""
+
+
+# --- the dotenv ------------------------------------------------------------
+
+
+def test_a_key_can_come_from_a_file(tmp_path, no_dotenv):
+    """The whole point: a file is read by any shell, interactive or not."""
+    env = tmp_path / ".env"
+    env.write_text("OPENAI_API_KEY=sk-from-a-file\n")
+    no_dotenv.delenv("OPENAI_API_KEY", raising=False)
+    no_dotenv.setenv(ENV_FILE_ENV, str(env))
+    reload_env_file()
+
+    assert parse_choice("openai:gpt-5").why_unavailable() == ""
+
+
+def test_the_environment_beats_the_file(tmp_path, no_dotenv):
+    """An explicit export must override a file somebody forgot about. The
+    other direction makes a surprising result harder to explain, not easier."""
+    env = tmp_path / ".env"
+    env.write_text("BIOPB_SKILL_AGENT=deepseek:deepseek-chat\n")
+    no_dotenv.setenv(ENV_FILE_ENV, str(env))
+    reload_env_file()
+    assert agent_choice().provider.name == "deepseek"
+
+    no_dotenv.setenv(AGENT_ENV, "gemini:gemini-2.5-pro")
+    assert agent_choice().provider.name == "gemini"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("KEY=plain", "plain"),
+        ("export KEY=with-export-prefix", "with-export-prefix"),
+        ('KEY="double quoted"', "double quoted"),
+        ("KEY='single quoted'", "single quoted"),
+        ("KEY = spaced ", "spaced"),
+        ("KEY=has=equals=inside", "has=equals=inside"),
+    ],
+)
+def test_the_parser_handles_what_people_actually_write(tmp_path, line, expected):
+    """Including `export ` prefixes, because the natural move is to copy the
+    line straight out of a shell profile."""
+    path = tmp_path / ".env"
+    path.write_text(f"# a comment\n\n{line}\n")
+    assert read_env_file(path) == {"KEY": expected}
+
+
+def test_a_line_without_an_equals_is_skipped(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text("NOT_A_SETTING\nKEY=value\n")
+    assert read_env_file(path) == {"KEY": "value"}
+
+
+def test_no_file_anywhere_is_not_an_error(tmp_path, no_dotenv):
+    no_dotenv.setenv(ENV_FILE_ENV, str(tmp_path / "nope.env"))
+    reload_env_file()
+    assert parse_choice("openai:gpt-5").why_unavailable() != ""
 
 
 def test_a_local_model_needs_no_key():

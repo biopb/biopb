@@ -29,9 +29,21 @@ implementation reaches nearly all of them.
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
+
+#: Where a key may live besides the environment. A non-interactive shell does
+#: not read `~/.bashrc` past its `case $- in *i*` guard, so an export added at
+#: the bottom of it is invisible to anything run from a tool or a CI step --
+#: which is a confusing way to spend an afternoon. A file is simply read.
+#:
+#: `.env` at the repo root is already gitignored. Order: an explicit
+#: `BIOPB_SKILL_ENV_FILE`, then the repo root, then the biopb config dir.
+ENV_FILE_ENV = "BIOPB_SKILL_ENV_FILE"
+CONFIG_ENV_FILE = Path.home() / ".config" / "biopb" / "skill-harness.env"
 
 #: Which side is being configured. Separate variables so agent and respondent
 #: can sit on different providers, or the same one at different addresses.
@@ -42,6 +54,76 @@ RESPONDENT_BASE_URL_ENV = "BIOPB_SKILL_RESPONDENT_BASE_URL"
 
 DEFAULT_AGENT = "openai:gpt-5"
 DEFAULT_RESPONDENT = "anthropic:claude-sonnet-5"
+
+
+def _repo_root() -> Path | None:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def env_file() -> Path | None:
+    """The dotenv this run would read, if any."""
+    explicit = os.environ.get(ENV_FILE_ENV, "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        return path if path.is_file() else None
+    root = _repo_root()
+    if root and (root / ".env").is_file():
+        return root / ".env"
+    return CONFIG_ENV_FILE if CONFIG_ENV_FILE.is_file() else None
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """``KEY=VALUE`` lines, minus comments, blanks and surrounding quotes.
+
+    Deliberately not a dotenv library: this needs to parse five lines, and a
+    dependency whose only job is that would be carried by every developer
+    running the ordinary suite.
+    """
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.removeprefix("export ").strip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+@functools.cache
+def _dotenv() -> dict[str, str]:
+    path = env_file()
+    if path is None:
+        return {}
+    try:
+        return read_env_file(path)
+    except OSError:
+        # Unreadable is the same as absent here; a missing key is reported by
+        # name further down, which is a better message than a stat error.
+        return {}
+
+
+def reload_env_file() -> None:
+    """Forget the cached dotenv. For tests, and for a file edited mid-session."""
+    _dotenv.cache_clear()
+
+
+def setting(name: str, default: str = "") -> str:
+    """*name* from the environment, else the dotenv, else *default*.
+
+    **The environment wins**, so an explicit export always overrides a file
+    somebody forgot about — the direction that makes a surprising result easier
+    to explain, not harder.
+    """
+    return os.environ.get(name) or _dotenv().get(name) or default
 
 
 @dataclass(frozen=True)
@@ -94,14 +176,17 @@ class ModelChoice:
     def key(self) -> str:
         """The API key, read at call time. Never stored, logged or traced."""
         if self.provider.name == "ollama":
-            return os.environ.get(self.provider.key_env, "ollama")
-        return os.environ.get(self.provider.key_env, "")
+            return setting(self.provider.key_env, "ollama")
+        return setting(self.provider.key_env)
 
     def why_unavailable(self) -> str:
+        if self.key:
+            return ""
         return (
-            ""
-            if self.key
-            else f"{self.name} needs {self.provider.key_env} in the environment"
+            f"{self.name} needs {self.provider.key_env}: export it, or put it "
+            f"in a .env at the repo root (gitignored). Note that an export at "
+            f"the bottom of ~/.bashrc will NOT reach a non-interactive shell — "
+            f"it returns early at the `case $- in *i*` guard."
         )
 
 
@@ -127,16 +212,12 @@ def parse_choice(spec: str, base_url: str = "") -> ModelChoice:
 
 
 def agent_choice() -> ModelChoice:
-    return parse_choice(
-        os.environ.get(AGENT_ENV) or DEFAULT_AGENT,
-        os.environ.get(AGENT_BASE_URL_ENV, ""),
-    )
+    return parse_choice(setting(AGENT_ENV, DEFAULT_AGENT), setting(AGENT_BASE_URL_ENV))
 
 
 def respondent_choice() -> ModelChoice:
     return parse_choice(
-        os.environ.get(RESPONDENT_ENV) or DEFAULT_RESPONDENT,
-        os.environ.get(RESPONDENT_BASE_URL_ENV, ""),
+        setting(RESPONDENT_ENV, DEFAULT_RESPONDENT), setting(RESPONDENT_BASE_URL_ENV)
     )
 
 
