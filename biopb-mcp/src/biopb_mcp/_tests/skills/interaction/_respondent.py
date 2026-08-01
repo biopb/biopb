@@ -8,9 +8,11 @@ silently invalidates the suite — the whole tier rests on the agent having to
 Two rules hold it to that, and both are structural rather than hoped for:
 
 **Skill-blind.** The respondent never sees the body. It cannot paraphrase step
-2 back at the agent, because it does not know step 2 exists. Claude is fine
-here even though it co-authored the skills (§6a) — holding a persona and
-answering from a fact table is not a job where family contamination helps.
+2 back at the agent, because it does not know step 2 exists. That is also why
+§6a does not constrain *which* model plays this part: holding a persona and
+answering from a fact table is not a job where knowing the skills helps, so any
+provider will do and `_models.py` picks it. Anthropic is one option, not the
+assumption.
 
 **Facts are data, not prose.** :class:`Persona` carries its private facts as a
 mapping *and* renders them into the prompt, so a test can assert that none of
@@ -25,18 +27,15 @@ fixture's asymmetry is decorative and the layer is measuring something else.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from ._models import TextBackend, respondent_choice, text_backend
+
 #: What a respondent says instead of answering, when the agent's message is a
 #: hand-off rather than a question. The loop ends on it.
 DONE = "__BIOPB_DONE__"
-
-RESPONDENT_KEY_ENV = "ANTHROPIC_API_KEY"
-RESPONDENT_MODEL_ENV = "BIOPB_SKILL_RESPONDENT_MODEL"
-DEFAULT_RESPONDENT_MODEL = "claude-sonnet-5"
 
 _RULES = f"""
 You are a microscopist talking to an analysis assistant about your own data.
@@ -130,49 +129,46 @@ class ScriptedRespondent:
         return self.fallback
 
 
-def respondent_key() -> str:
-    """``ANTHROPIC_API_KEY`` if set, else ``""``. Presence only, never logged."""
-    return RESPONDENT_KEY_ENV if os.environ.get(RESPONDENT_KEY_ENV) else ""
-
-
 @dataclass
-class ClaudeRespondent:
-    """The real respondent. Persona in, one short answer out.
+class ModelRespondent:
+    """A real model playing the persona. Provider is a parameter, not a fact.
+
+    Anthropic is one choice among several and nothing here assumes it —
+    `_models.py` owns that selection, and agent and respondent are configured
+    independently so they can sit on different vendors, or on the same
+    compatible API at two different addresses.
 
     Stateful across a run: it keeps its own view of the conversation so that
     "you already told me that" behaves like a person rather than a lookup
-    table. It never sees the tool calls, only what the agent said to it —
-    which is exactly a user's view.
+    table. It never sees tool calls or their output, only what the agent said
+    *to it* — which is exactly a user's view, and the reason a run cannot be
+    rescued by a respondent noticing a bad array.
     """
 
     persona: Persona
-    model: str = ""
-    name: str = ""
+    backend: TextBackend
     max_tokens: int = 300
     history: list[dict] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        self.model = (
-            self.model
-            or os.environ.get(RESPONDENT_MODEL_ENV)
-            or DEFAULT_RESPONDENT_MODEL
-        )
-        self.name = self.name or f"claude:{self.model}"
+    @property
+    def name(self) -> str:
+        return f"{self.backend.name}/{self.persona.name}"
 
     def reply(self, message: str) -> str:
-        import anthropic
-
-        if not respondent_key():
-            raise RuntimeError(f"no respondent key: set {RESPONDENT_KEY_ENV}")
         self.history.append({"role": "user", "content": message})
-        response = anthropic.Anthropic().messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
+        text = self.backend.complete(
             system=self.persona.system_prompt(),
             messages=self.history,
+            max_tokens=self.max_tokens,
         )
-        text = "".join(
-            block.text for block in response.content if block.type == "text"
-        ).strip()
+        # An empty reply would leave the loop with nothing to append and no
+        # reason to stop; read it as the hand-off it almost certainly was.
         self.history.append({"role": "assistant", "content": text or DONE})
-        return text
+        return text or DONE
+
+
+def model_respondent(persona: Persona, **kwargs) -> ModelRespondent:
+    """A respondent for *persona*, on whatever `BIOPB_SKILL_RESPONDENT` names."""
+    return ModelRespondent(
+        persona=persona, backend=text_backend(respondent_choice()), **kwargs
+    )

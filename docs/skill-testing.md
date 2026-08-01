@@ -375,14 +375,29 @@ These bodies were co-authored with Claude. A Claude agent can pass by
 recognising its own prose rather than by reading it, and §7 already records that
 blind spots correlate within a family — so the agent under test is a hosted
 **non-Anthropic** model, reached through an OpenAI-compatible tool-calling
-adapter. Claude's role here is the **respondent**, which is a different job:
-hold a persona and a few private facts, answer, volunteer nothing. Family
-contamination is harmless there, and the respondent is deliberately kept
-**skill-blind** — it never sees the body, so it cannot rescue a bad run by
-paraphrasing step 2 back at the agent.
+adapter.
+
+**The rule constrains the agent and only the agent.** The respondent holds a
+persona and answers from a fact table; it is deliberately **skill-blind**, so it
+cannot rescue a bad run by paraphrasing step 2 back at the agent, and having
+written the skills does not help it do that job. Claude is therefore a perfectly
+good respondent — it is the current default — but it is *a* choice, not the
+design. Both sides are named the same way and configured independently:
+
+```
+BIOPB_SKILL_AGENT=openai:gpt-5
+BIOPB_SKILL_RESPONDENT=anthropic:claude-sonnet-5
+```
+
+with separate base URLs, so the two can sit on different vendors or on the same
+compatible API at two different addresses (a hosted agent against a local
+respondent, say). Which vendor serves a model is never inferred from the model
+name, because that is exactly the fact this rule turns on.
 
 The reference agent is therefore a fixture too, and its *family* is part of what
-makes the fixture valid — not just its version.
+makes the fixture valid — not just its version. That fact lives in a provider
+table rather than in prose, so `test_models` can assert it: exactly one provider
+is marked as having written these skills, and the default agent is not it.
 
 ### 6b. Prove the asymmetry before paying a model to demonstrate it
 

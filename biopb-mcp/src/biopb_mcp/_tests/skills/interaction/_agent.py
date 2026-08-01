@@ -16,10 +16,12 @@ at all:
     deterministically. The same move as the scripted subjects in §6b: prove the
     machinery works before paying anything to exercise it.
 
-:class:`OpenAICompatAgent`
+:class:`ToolCallingAgent`
     The real one. Chat-completions with tool calling, which reaches OpenAI,
     Gemini, DeepSeek and Mistral, plus a local Ollama or vLLM, through one
-    implementation and a base URL.
+    implementation. Which model, and at which address, comes from
+    `_models.py` — the same table the respondent uses, and configured by a
+    separate variable so the two sides can differ.
 
 :class:`ReplayAgent`
     Re-feeds a recorded trace, so the structural assertions can be re-checked
@@ -28,11 +30,11 @@ at all:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ._bridge import parse_arguments
+from ._models import ModelChoice, agent_choice
 
 
 @dataclass(frozen=True)
@@ -132,61 +134,54 @@ class ReplayAgent:
         return turn
 
 
-#: Where a hosted non-Anthropic model is configured from. Nothing is stored:
-#: the key is read from the environment at call time and never written to a
-#: trace, an artifact or a log.
-API_KEY_ENV = ("OPENAI_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY")
-BASE_URL_ENV = "OPENAI_BASE_URL"
-MODEL_ENV = "BIOPB_SKILL_AGENT_MODEL"
-DEFAULT_MODEL = "gpt-5"
-
-
-def agent_key() -> str:
-    """The first configured agent key, or ``""``. Presence only — never logged."""
-    for name in API_KEY_ENV:
-        if os.environ.get(name):
-            return name
-    return ""
-
-
 @dataclass
-class OpenAICompatAgent:
+class ToolCallingAgent:
     """A hosted chat model with tool calling, over the OpenAI-compatible API.
 
-    One implementation reaches every provider §6a allows, because they all
-    speak this shape: point ``OPENAI_BASE_URL`` at Gemini's or DeepSeek's
-    compatibility endpoint, or at a local Ollama, and set the model id.
+    One implementation reaches OpenAI, Gemini, DeepSeek, Mistral and a local
+    Ollama or vLLM, because they all speak this shape — `_models.py` supplies
+    the address and the key, exactly as it does for the respondent.
 
-    **Temperature is pinned to 0.** It does not make the run deterministic —
+    There is no Anthropic tool-calling agent here, and that is a *consequence*
+    of §6a rather than an omission: the one family whose SDK would need its own
+    implementation is the family that wrote these skills, so such an agent
+    would be unusable the moment it existed. If a skill is ever authored by
+    another family, this is where the second implementation goes.
+
+    **Temperature is pinned to 0.** It does not make a run deterministic —
     nothing does, with tool calling and a second model in the loop — but it
     removes the one source of variance that is free to remove.
     """
 
-    model: str = ""
-    base_url: str = ""
-    name: str = ""
+    choice: ModelChoice | None = None
     temperature: float = 0.0
     max_tokens: int = 4096
 
     def __post_init__(self) -> None:
-        self.model = self.model or os.environ.get(MODEL_ENV) or DEFAULT_MODEL
-        self.base_url = self.base_url or os.environ.get(BASE_URL_ENV, "")
-        self.name = self.name or f"openai-compat:{self.model}"
+        self.choice = self.choice or agent_choice()
+
+    @property
+    def name(self) -> str:
+        return self.choice.name
 
     def _client(self):
         from openai import OpenAI
 
-        key_env = agent_key()
-        if not key_env:
-            raise RuntimeError(f"no agent key: set one of {', '.join(API_KEY_ENV)}")
-        kwargs = {"api_key": os.environ[key_env]}
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
+        if why := self.choice.why_unavailable():
+            raise RuntimeError(why)
+        if self.choice.provider.sdk != "openai":
+            raise RuntimeError(
+                f"{self.choice.name} does not speak the OpenAI tool-calling API; "
+                "see the class docstring on why there is no second backend"
+            )
+        kwargs = {"api_key": self.choice.key}
+        if self.choice.base_url:
+            kwargs["base_url"] = self.choice.base_url
         return OpenAI(**kwargs)
 
     def respond(self, messages: list[dict], tools: list[dict]) -> AgentTurn:
         completion = self._client().chat.completions.create(
-            model=self.model,
+            model=self.choice.model,
             messages=messages,
             tools=tools,
             temperature=self.temperature,

@@ -32,10 +32,13 @@ Two rules that are fixtures in their own right:
 
 - **The agent under test is not from the family that wrote the skill** (§6a).
   These bodies were co-authored with Claude, which could pass by recognising
-  its own prose rather than reading it.
+  its own prose rather than reading it. That fact lives in
+  :mod:`._models`' provider table, so it can be asserted rather than assumed.
 - **The respondent is skill-blind.** It holds a persona and a few private
   facts and volunteers nothing. A respondent that has read the body can
   paraphrase step 2 back at the agent and silently invalidate the suite.
+  Because of that, §6a does *not* constrain which model plays it: both sides
+  are configured independently, and the authoring family is a fine respondent.
 
 Marked ``interaction``, deselected by default, and never in CI (§10).
 """

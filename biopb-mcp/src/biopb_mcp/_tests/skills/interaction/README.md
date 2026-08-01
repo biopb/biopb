@@ -20,18 +20,35 @@ someone mid-diagnosis with a paid run.
 
 ## Running one with real models
 
-Two keys, two families, and neither is optional (§6a):
+Both sides are `provider:model`, named separately, so they can be different
+vendors — or the same compatible API at two addresses:
 
 ```sh
-export OPENAI_API_KEY=...        # or GEMINI_API_KEY / DEEPSEEK_API_KEY
-export ANTHROPIC_API_KEY=...     # the respondent, and only ever the respondent
-export BIOPB_SKILL_AGENT_MODEL=gpt-5          # optional, has a default
-export OPENAI_BASE_URL=...                    # for a non-OpenAI compatible endpoint
+export BIOPB_SKILL_AGENT=openai:gpt-5                  # default
+export BIOPB_SKILL_RESPONDENT=anthropic:claude-sonnet-5 # default
+export OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
 
 xvfb-run -a -s '-screen 0 1024x768x24' \
   uv run --no-project --python .venv/bin/python --with openai --with anthropic \
   python -m pytest .../interaction -m interaction
 ```
+
+Known providers: `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` — each a
+`(sdk, base_url, key_env)` triple, and most of them the OpenAI-compatible API
+at a different address. Override an address with
+`BIOPB_SKILL_AGENT_BASE_URL` / `BIOPB_SKILL_RESPONDENT_BASE_URL`. A bare model
+name is refused rather than guessed: which vendor serves a model is exactly the
+fact §6a turns on, and inferring it from the name would make the rule depend on
+vendors' naming conventions.
+
+**§6a constrains the agent, not the respondent.** The respondent is skill-blind
+and answers from a fact table, and having written the skills does not help with
+that — so Anthropic is a fine respondent and is the default, while the default
+*agent* is deliberately not from the authoring family. `test_models.py` asserts
+both, off the provider table rather than off a comment.
+
+`ollama` needs no key, which makes it the cheap way to rehearse a run end to end
+before spending anything.
 
 The provider SDKs are imported lazily and are **not** dependencies of this
 package — one `--with` line, the same pattern the outcome layer uses for
@@ -44,13 +61,15 @@ written to a trace, an artifact or a log.
 |---|---|
 | `_session.py` | Bring-up: a real shim-spawned session, a synchronous façade over the async MCP client, and the environment facts that are forced rather than inherited |
 | `_bridge.py` | MCP tool schemas → the function-calling shape a chat model expects |
-| `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `OpenAICompatAgent` |
-| `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ClaudeRespondent` |
+| `_models.py` | The provider table: which model on each side, at which address, with which key |
+| `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `ToolCallingAgent` |
+| `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
 | `_personas.py` | The respondent fixtures — who the agent talks to, and what only they know |
 | `_conversation.py` | The two-model loop, the caps, the `Trace` |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
 | `test_conversation.py` | That the loop works, with no model *and* no session |
 | `test_personas.py` | That a persona gives nothing away |
+| `test_models.py` | That provider selection resolves, and that §6a holds of the defaults |
 
 ## What has been run, and what has not
 
@@ -60,8 +79,9 @@ rotted for a release:
 - **Run and green**: everything driven by `ScriptedAgent` / `ScriptedRespondent`
   (the loop, the trace, replay, the caps, scraping, the personas) and the nine
   session smoke tests. No key, no cost.
-- **Written but never executed**: `OpenAICompatAgent` and `ClaudeRespondent` —
-  the two provider adapters. They are a few dozen lines of plumbing each and
+- **Written but never executed**: `ToolCallingAgent` and `ModelRespondent` —
+  the two live adapters. Their *selection* is tested; their network calls
+  are not. They are a few dozen lines of plumbing each and
   the first real run will shake them out. Until that run has happened, do not
   read this README as saying they work.
 
