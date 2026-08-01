@@ -37,6 +37,16 @@ from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
+# What runs in each per-package env: the signature contracts (§3), and nothing
+# else. These assertions are *derived from the shipped catalog* -- the packages
+# below come out of the skills' own frontmatter, and each assertion pins an API
+# a body quotes. Delete a skill and the work here changes.
+#
+# The outcome layer (§5) is deliberately NOT here, though it also needs a
+# skill's package. Its subjects are a hand transcription of what a body says,
+# not a reading of the file: nothing in it would notice if the skill were
+# deleted, so a green result certifies the transcription, not the catalog. It is
+# a diagnostic harness, run on a workstation -- see docs/skill-testing.md §5.
 CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
 
 # Prose docs that live beside the skills. Keep in step with `_validate.NOT_SKILLS`.

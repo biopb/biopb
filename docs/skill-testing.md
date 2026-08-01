@@ -1,7 +1,10 @@
 # Testing the skills catalog
 
-> **Status: in progress.** The deterministic layers are being built; the
-> agent-facing tiers (§5–§7) remain a design sketch.
+> **Status: in progress.** The gating layers are built. §5's machinery is built
+> and exercised on one skill, but it is a **diagnostic harness rather than a
+> gate** — it tests a transcription of a skill, not the shipped file (§5c), so
+> it stays out of CI and nothing further is queued for it. §6–§7 remain a design
+> sketch, and §6 is the tier that actually tests the shipped bodies.
 >
 > This revision follows a structural decision that the earlier draft predates:
 > **skills ship inside the biopb packages and are never fetched over the
@@ -31,7 +34,7 @@ Five questions, very different costs. Only two of them need an agent.
 | **Structure** | Is the file well-formed? | the frontmatter validator | yes |
 | **Contract** | Does the API it asserts still exist — and can it be installed at all? | resolve the declared packages; import them and assert signatures | yes |
 | **Retrieval** | Does `find_skills` surface it for the right request? | matcher fixtures + a phrasing table, no agent | yes |
-| **Outcome** | Does an agent using it produce the right numbers? | ground-truth fixtures + programmatic verifier | no |
+| **Outcome** | Does following it produce the right numbers? | ground-truth fixtures + programmatic verifier | yes, but it tests a transcription, not the file (§5c) |
 | **Interaction** | Does it ask at the right moments, and only then? | simulated user + trace assertions | no |
 
 A sixth, **ablation** (§7), is not a test — it is an authoring tool. It answers
@@ -63,8 +66,11 @@ Consequences:
   fallbacks where a screenshot is impossible) is itself exercised — `_config.py`
   already treats headless as a first-class production mode, so this is a real
   configuration, not a test artifact.
-- CI runs the deterministic layers only (§10). The image-outcome layers stay
-  local or scheduled on a real machine.
+- CI runs the deterministic layers that test a **shipped artifact** (§10):
+  structure, retrieval, and the contracts derived from the skills' own
+  frontmatter. The outcome fixtures are deterministic too but score a
+  transcription rather than the file, so they stay local as a diagnostic (§5c) —
+  as does anything with an agent in it.
 
 ## 3. Layer 1 — contract tests
 
@@ -195,33 +201,136 @@ ever seen. With the skills in this repo the table simply reads them.
 
 ## 5. Layer 3 — outcome fixtures
 
-Where the real effort goes. The principle from the wider eval literature:
-**programmatic verifiers beat judged prose wherever you can construct one.** These
-skills are unusually well suited to it, because they emit numbers with knowable
-right answers.
+The principle from the wider eval literature: **programmatic verifiers beat
+judged prose wherever you can construct one.** These skills are unusually well
+suited to it, because they emit numbers with knowable right answers.
+
+Built, for `drift-correction`, in `_tests/skills/outcomes/`. Its README is the
+working documentation; this section is the reasoning.
+
+Read §5c before using any of it: this is a **diagnostic harness that does not
+gate**, because unlike §3 it tests no shipped artifact. `drift-correction` is
+the worked example that proves the machinery, and **nothing further is queued** —
+the reason to write a second module is a §6 finding that needs isolating, not
+coverage for its own sake.
 
 Fixtures are **synthetic and procedural** — generated at test time from a seed, so
 nothing binary lands in git and the ground truth is exact by construction rather
-than annotated:
+than annotated. Built, and what else could be:
 
-- **calibrated-measurements** — an ellipsoid of known semi-axes rasterised at
-  0.1/0.1/0.5 µm. True volume is analytic. Catches the failure seen in a cold run:
-  passing `spacing=` to `regionprops` *and* multiplying by `prod(spacing)` again,
-  wrong by µm³ squared and silent.
-- **segmentation-qc-metrics** — constructed gt/pred with overlaps chosen so
-  TP/FP/FN and F1@0.5 are known in closed form. A touching-pair variant gives a
-  known merge count.
-- **flatfield-and-stitch-tiles** — one source image cut into ≥20 tiles at *known*
-  offsets and multiplied by a *known* vignette. Two measurable channels: offset
-  error in px, and residual illumination CV. A snake-ordered variant makes
-  row-major reading show up as mirrored rows.
+- **drift-correction** *(built)* — one image shifted along a chosen trajectory,
+  so both the trajectory and the un-drifted image are truth to machine
+  precision. Three cases: an ordinary blobby field at 1.7 px/frame, the same at
+  4.0, and a smooth low-contrast field that separates the two methods.
+- **calibrated-measurements** *(candidate, cheap)* — an ellipsoid of known
+  semi-axes rasterised at 0.1/0.1/0.5 µm; true volume is analytic, so no
+  tolerance has to be hunted for. But the failure it would target — passing
+  `spacing=` to `regionprops` *and* multiplying by `prod(spacing)` again, wrong
+  by µm³ squared and silent — is an agent's *choice*, and a reference
+  implementation does not make it. That is a §6 question wearing a §5 costume.
+- **segmentation-qc-metrics** *(candidate, duplicative)* — constructed gt/pred
+  with overlaps chosen so TP/FP/FN and F1@0.5 are known in closed form. The
+  metric itself is `plugin:segmentation_qc`, which should carry its own unit
+  tests; scoring it through the skill re-tests the plugin at one remove.
+- **write-a-skill** — never. It emits markdown; there is no number.
 
-Each emits its artifact alongside its number, per §2.
+The bar for writing one is both of: the outcome is a number with a knowable
+right answer, **and** a correct-by-construction reference implementation can
+still fail it. Where only the first holds, the fixture scores data nothing can
+fail. Each that is written emits its artifact alongside its number, per §2.
 
 Where ground truth cannot be constructed, fall back to **binary criterion
 extraction** — not "rate this 1–5" but "did it pass `spacing=`? did it budget
 memory before allocating?" A judge model can extract booleans reliably even where
 it cannot judge quality reliably.
+
+### 5a. Synthetic by default, curated real data by substitution
+
+A synthetic movie is not a microscope. Procedural fixtures give exact truth and
+cost nothing to store, but they only contain the failure modes someone thought
+to simulate — no vendor metadata, no genuine vignetting, no real stage error
+(§11 has carried this as an open question from the start).
+
+So the fixture is a **provider**, and real data is a substitution rather than a
+rewrite: point `BIOPB_SKILL_FIXTURES` at a tree of `case.json` + `arrays.npz`
+and the same verifier scores it. That path is implemented, not reserved — the
+protocol tests build a curated tree in a temp dir and read it back, because a
+door nothing has walked through is not open.
+
+What the substitution costs is **truth**, and the protocol is shaped around
+that. A curated movie can carry a trajectory someone measured off a bead; it
+cannot carry the un-drifted reference image, because no such acquisition exists.
+So a metric the fixture cannot support reports as **unavailable**, never as
+passing — and an outcome that scored *nothing* has not passed, it has not been
+tested. Without that rule a substituted fixture with a mis-declared truth turns
+the layer green while measuring nothing, which is the same stale-green failure
+§4 records about the skills snapshot.
+
+The other cost is review. A seed needs none; an annotation is someone's claim
+about their own data, and it is only as good as the review it got. That belongs
+in the case's `provenance` string, which is why the field is free text and
+required.
+
+### 5b. A verifier is calibrated by a run it must reject
+
+A verifier that only ever sees correct runs is indistinguishable from one that
+returns green unconditionally. That is not hypothetical here: it is exactly how
+§3 sat unmanned for a release.
+
+So every case is run twice over — through the procedure the body prescribes, and
+through the specific mistake the body warns about — and the suite asserts the
+verifier tells them apart. Each expected-to-fail row is a sentence of prose from
+the skill file turned into a measurement, which makes the table a second reader
+of the body: a claim nobody can construct a failing run for is a claim worth
+re-reading.
+
+Three came out of writing the first one:
+
+- `reference="first"` fails **deterministically** on the blob fixtures (23 px
+  RMS at 1.7 px/frame, 53 px at 4.0) — sharper than the 2-of-4 the body quotes.
+- `normalization="phase"` recovers ~0 drift on every case, so the failure
+  table's first row reproduces without needing a special image.
+- On the smooth low-contrast field the degraded path is **5.4 px** off while
+  pystackreg is exact. The body calls the fallback "translation-only and less
+  precise ... a real fallback, not a lesser one", and defers the check to step 4
+  — but this error is *smooth*, so step 4's largest-single-frame-step test does
+  not see it. The fixture records the discrepancy; whether the body should say
+  more is an authoring decision, not a test fix.
+
+That third one is the layer paying for itself: a claim that reads fine in review
+and is wrong in a corner nobody would have chosen to look at.
+
+### 5c. A diagnostic harness, not a gate
+
+**This layer does not test shipped code, and that is what keeps it out of CI.**
+Its subject is a **reference implementation** of the procedure — a hand
+transcription of what the body says, which never reads the body. Edit step 3 to
+prescribe a different argument and the suite stays green while the file and the
+tested procedure part ways; delete the skill and nothing notices. A green run
+certifies the transcription. Contrast §3, whose assertions are derived from the
+shipped frontmatter: that is the property a gate needs, and this does not have it.
+
+**The scope is a judgement, not a fact about the skill.** What gets tested is
+whatever the fixtures and tolerances happen to span — three movies, a precision
+nobody's prose states, four mistakes someone thought of — and the pass/fail
+signal carries none of that. `drift-correction`'s fixtures, for instance, are
+noiseless, and registration precision is fundamentally noise-limited. So the
+outcomes README names its own blind spots explicitly; read a green run as the
+narrow claim it is.
+
+**What it is for is §6.** An agent run against the real skill file is the test
+with teeth, and it is non-deterministic — a finding arrives as one bad run among
+several, hard to reproduce and easy to dismiss. This is where such a finding gets
+pinned to a fixture, a tolerance and a repeatable pass/fail, and where a fix can
+be shown to hold. The order is §6 first, then this — not the reverse.
+
+It also structurally cannot catch any instruction that needs a *choice* to be
+wrong. `drift-correction` says to estimate on one structural channel and apply
+the transforms to all of them; a reference implementation makes that choice
+correctly by construction, so a second channel would be scored data no subject
+could fail. Those belong to §6 too, where the information asymmetry does the work.
+
+An agent run plugs into the same `Attempt` and the same verifier.
 
 ## 6. Layer 4 — interaction tests
 
@@ -341,7 +450,7 @@ parameterisation over where the skills came from.
 | Structure, Retrieval | this repo's CI | yes |
 | Contract — satisfiability (§3a) | this repo's CI (metadata resolution only) | yes |
 | Contract — signatures (§3) | this repo's CI, on skill-touching PRs only | yes |
-| Outcome | local; scheduled on a real machine | no — advisory, reviewed |
+| Outcome (§5) | local — a diagnostic harness, run when §6 gives it something to isolate | no |
 | Interaction | local | no |
 | Ablation | manual, per skill edit | no |
 
@@ -360,6 +469,19 @@ rotted. `skill-contracts.yaml` runs them, and two properties earn the change:
   skill, so the harness must not make it one.
 - **A `paths` filter, not every PR.** A skill's third-party dependency should
   cost nothing to a PR that does not touch skills.
+
+**The outcome layer does not gate, and the reason is not flakiness.** The
+reference-run half has every property that would qualify it — deterministic, no
+agent, no display, no network, four seconds — and it was briefly armed on those
+grounds. The disqualifying property is different: **it does not test anything
+this repo ships.** Its subjects are a hand transcription of what a skill body
+says, not a reading of the file, so a green run certifies the transcription.
+Delete the skill and the suite stays green. That is the opposite of what §3's
+assertions do — those are derived from the shipped frontmatter, which is what
+makes them a gate worth having.
+
+So it sits beside the merge gate rather than in it, as the harness §6's findings
+get isolated in (§5c).
 
 **And no cron**, because a skill declares a *bounded* range (§3b), so the API
 cannot move under a shipped skill: what a user resolves is inside the range the

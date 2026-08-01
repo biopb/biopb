@@ -8,7 +8,11 @@ The deterministic layers of [`docs/skill-testing.md`](../../../../../docs/skill-
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 ```
 
-Everything runs except the `contract` layer, which skips (see below).
+Two layers are held back from that default run, each by a marker. `satisfiability`
+needs a real resolver run (below). `outcome` needs each skill's own package —
+and, unlike everything else here, is **not a gate at all**: it scores a hand
+transcription of a skill rather than the shipped file, so it runs on a
+workstation as a diagnostic (`outcomes/README.md`).
 
 ## What is covered
 
@@ -19,6 +23,8 @@ Everything runs except the `contract` layer, which skips (see below).
 | `test_shipped_skills.py` | Structure+ | Do the *real* skill files obey the rules the validator does not express generically? |
 | `test_retrieval.py` | Retrieval | Do the real descriptions answer the phrasings a user would type? |
 | `test_satisfiability.py` | Contract | Can a skill's declared packages be installed here at all? |
+| `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
+| `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? *(diagnostic, not a gate)* |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
@@ -70,12 +76,39 @@ plane as an `ops:<kind>` server, called rather than imported — the kernel's
 interpreter is the agent's only execution surface, so "install it in a separate
 venv" is not a resolution.
 
-No shipped skill declares a third-party package today, so the parametrized half
-is empty and `test_the_extractor_finds_pkg_tokens` is what keeps the layer from
-going vacuously green.
+`test_the_extractor_finds_pkg_tokens` keeps the layer from going vacuously green
+if the shipped catalog ever stops declaring a third-party package again.
 
-> A **contract** layer used to live here too (`test_contracts.py`), asserting
-> that the third-party APIs a body quotes still look that way — `importorskip`ed,
-> armed on a workstation. It was written entirely for `flatfield-and-stitch-tiles`
-> and went with it. Bring it back when a skill declares a package that passes the
-> gate above; the shape is in git and in `docs/skill-testing.md` §3.
+## The `outcome` marker
+
+Fixtures with a known answer, and a verifier that scores a run against them —
+`docs/skill-testing.md` §5. Deselected by default for two reasons, and the
+second is the important one:
+
+- the subjects import the skill's package, and that package is deliberately not
+  in this environment (one shared resolution would force every skill's
+  dependency to co-exist with every other's);
+- **it tests nothing this repo ships.** The subjects are a hand transcription of
+  what a skill body says and never read the file, so a green run certifies the
+  transcription. Edit a step, or delete the skill, and these stay green. That is
+  why it is a workstation diagnostic and not a merge gate, unlike
+  `test_contracts.py` next door, whose assertions come out of the shipped
+  frontmatter.
+
+```sh
+uv run --no-project --python .venv/bin/python --with pystackreg \
+  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills -m outcome
+```
+
+Its use is downstream of the interaction tier (§6): an agent run against a real
+skill file is the test with teeth and is non-deterministic, and this is the
+harness a finding from one gets pinned down in. See `outcomes/README.md`,
+including what the fixtures deliberately do not span. Two mechanisms there are
+worth knowing from here: real data can be substituted for a synthetic fixture
+without touching a verifier (`BIOPB_SKILL_FIXTURES`), and every case is also run
+through the mistake its skill body warns about, because a verifier nothing has
+ever failed is not known to work.
+
+The protocol tests (`outcomes/test_outcome_protocol.py`) are *not* marked and do
+run with the ordinary suite — they are hermetic and instant, and a break in the
+machinery should surface before someone is mid-diagnosis with it.
