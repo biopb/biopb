@@ -151,40 +151,75 @@ def _entry(text: str, *, stem: str, origin: str, updated: str = "") -> dict | No
 # Source 1: the shipped skills
 # --------------------------------------------------------------------------- #
 def _data_dir():
-    """The packaged ``_skills_data`` directory as a Traversable, or ``None``."""
-    try:
-        return resources.files(_DATA_PKG).joinpath(_DATA_DIR)
-    except (ModuleNotFoundError, OSError):  # pragma: no cover - package is present
-        logger.debug("skills: package data dir unresolvable", exc_info=True)
-        return None
+    """The packaged ``_skills_data`` directory, as a Traversable.
+
+    Not guarded: this asks about the package this module lives in, so a failure
+    here means ``import biopb_mcp.mcp._skills`` already failed. ``joinpath`` does
+    not touch the filesystem either — a directory that is not there surfaces at
+    :func:`_scan_shipped`, which is where it can be reported usefully. Kept as a
+    function because the tests redirect it.
+    """
+    return resources.files(_DATA_PKG).joinpath(_DATA_DIR)
 
 
 def _shipped_text(name: str) -> str | None:
     """Read one packaged skill file, or ``None`` if absent/unreadable."""
-    directory = _data_dir()
-    if directory is None:
-        return None
     try:
-        return directory.joinpath(name).read_text(encoding="utf-8")
+        return _data_dir().joinpath(name).read_text(encoding="utf-8")
     except (FileNotFoundError, OSError, UnicodeError):
         # UnicodeError: a corrupt / non-UTF8 file (a ValueError subclass, not an
         # OSError) must also fail open, not crash the read.
         return None
 
 
+# One warning per process, not per call: load_catalog() runs on every
+# find_skills, and a broken install would otherwise fill the session log.
+_warned_empty = False
+
+
+def _warn_empty_once(detail: str) -> None:
+    """An empty shipped set is always a bug — say so, once, and carry on.
+
+    This used to be an ordinary state: the catalog came over the network, so
+    "nothing resolved" meant offline, and quietly returning [] was right. Skills
+    ship with the package now, so nothing legitimate produces zero of them. The
+    realistic cause is a packaging regression -- the wheel's contents come from a
+    `[tool.setuptools.package-data]` glob that is independent of this code, so
+    the .md files can stop shipping while the .py files still do. Everything
+    imports, every test that reads the checkout passes, and the agent is simply
+    never told skills exist.
+
+    Still not raised: this is on the agent's path, and a missing skill must not
+    take down a tool call. `_tests/skills/test_packaging.py` is what actually
+    prevents it; this is the breadcrumb for when something slips past.
+    """
+    global _warned_empty
+    if _warned_empty:
+        return
+    _warned_empty = True
+    logger.warning(
+        "skills: no skills found in the package (%s). This is an install or "
+        "packaging problem, not a configuration one -- find_skills will only "
+        "return skills from %s.",
+        detail,
+        _local_dir() or "the local skills dir",
+    )
+
+
 def _scan_shipped() -> list[dict]:
     """Every readable packaged ``*.md``. Fail-open per file."""
     directory = _data_dir()
-    if directory is None:
-        return []
     try:
         names = sorted(
             p.name
             for p in directory.iterdir()
             if p.name.endswith(".md") and not p.name.startswith("_")
         )
-    except (FileNotFoundError, OSError):
-        logger.debug("skills: package data dir unreadable (fail-open)", exc_info=True)
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        _warn_empty_once(f"{directory} is missing or unreadable")
+        return []
+    if not names:
+        _warn_empty_once(f"{directory} contains no *.md")
         return []
 
     out = []
@@ -200,6 +235,9 @@ def _scan_shipped() -> list[dict]:
         if entry is not None:
             entry["_file"] = name
             out.append(entry)
+    if not out:
+        # Files present but none usable: a different cause, same severity.
+        _warn_empty_once(f"{len(names)} file(s) in {directory}, none usable")
     return out
 
 

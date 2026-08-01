@@ -183,6 +183,42 @@ def test_shipped_skill_entry_is_built_from_its_frontmatter(
     assert found["uri"] == "skill://x"
 
 
+def test_an_empty_shipped_set_warns_because_it_is_always_a_bug(
+    mock_home, skills_cfg, monkeypatch, caplog
+):
+    # Nothing legitimate produces zero shipped skills -- the catalog is package
+    # data, so the realistic cause is a packaging regression that keeps the .py
+    # files and drops the .md ones. Still not raised (this is the agent's path),
+    # but not silent either: before skills shipped, an empty result meant
+    # "offline", and quietly returning [] was the right answer.
+    monkeypatch.setattr(_skills, "_warned_empty", False)
+    with caplog.at_level("WARNING"):
+        assert _skills.find_skills("") == []
+    assert "packaging problem" in caplog.text
+
+
+def test_the_empty_warning_does_not_repeat(mock_home, skills_cfg, monkeypatch, caplog):
+    # load_catalog() runs on every find_skills; a broken install must not fill
+    # the session log.
+    monkeypatch.setattr(_skills, "_warned_empty", False)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            _skills.find_skills("")
+    assert caplog.text.count("packaging problem") == 1
+
+
+def test_files_present_but_none_usable_warns_too(
+    mock_home, skills_cfg, monkeypatch, tmp_path, caplog
+):
+    # A different cause with the same consequence, so the same severity.
+    d = tmp_path / "shipped"
+    (d / "broken.md").write_bytes(b"\xff\xfe\x00 not utf-8")
+    monkeypatch.setattr(_skills, "_warned_empty", False)
+    with caplog.at_level("WARNING"):
+        assert _skills.find_skills("") == []
+    assert "none usable" in caplog.text
+
+
 def test_unreadable_shipped_file_is_skipped_not_fatal(
     mock_home, skills_cfg, monkeypatch, tmp_path
 ):
