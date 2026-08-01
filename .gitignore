@@ -156,3 +156,7 @@ web/packages/*/coverage/
 
 # Generated SDK API-reference site (docs-api/, see api-docs.yaml)
 docs-api/site/
+
+# Outcome-layer artifacts (docs/skill-testing.md §5): one directory per run of
+# the skills outcome fixtures, meant to be paged through locally.
+.skill-outcomes/

@@ -105,3 +105,15 @@ jobs:
             --with pyyaml --with packaging \
             python .github/scripts/skill_contracts.py \
             --python "${{ matrix.python-version }}"
+
+      # The outcome layer emits a number and an artifact: the number failed the
+      # job, the artifact is how a human sees *why*. Imaging failures are
+      # recognisable at a glance and awkward to read out of an assertion.
+      - name: Upload the outcome artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-outcomes-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: .skill-outcomes/
+          if-no-files-found: ignore
+          retention-days: 7

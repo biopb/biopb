@@ -37,7 +37,19 @@ from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
-CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
+# What runs in each per-package env. The signature contracts (§3), and the
+# reference-implementation half of the outcome layer (§5) -- which belongs here
+# rather than in mcp-ci for the same reason the contracts do: it needs the
+# skill's package, and one shared env cannot hold every skill's.
+#
+# Only the deterministic half is armed. These runs are a reference
+# implementation of what a body prescribes, scored against a fixture with a
+# known answer -- no agent, no display, no network. The agent tier stays local
+# and advisory, as §10 says.
+TARGETS = [
+    Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py"),
+    Path("biopb-mcp/src/biopb_mcp/_tests/skills/outcomes"),
+]
 
 # Prose docs that live beside the skills. Keep in step with `_validate.NOT_SKILLS`.
 NOT_SKILLS = {"README", "ROADMAP"}
@@ -116,7 +128,12 @@ def check_one(spec: str, python: str) -> bool:
                     "--color=yes",
                     "-p",
                     "no:cacheprovider",
-                    str(CONTRACTS),
+                    # Overrides the repo's default deselection, which hides the
+                    # outcome marker. Satisfiability stays out: it is mcp-ci's
+                    # step and it would resolve against this throwaway env.
+                    "-m",
+                    "not satisfiability",
+                    *(str(t) for t in TARGETS),
                 ]
             )
             == 0

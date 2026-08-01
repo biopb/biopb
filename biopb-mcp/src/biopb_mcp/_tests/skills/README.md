@@ -8,7 +8,11 @@ The deterministic layers of [`docs/skill-testing.md`](../../../../../docs/skill-
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 ```
 
-Everything runs except the `contract` layer, which skips (see below).
+Two layers are held back from that default run, each by a marker and for the
+same reason — they need something the shared env does not have. `satisfiability`
+needs a real resolver run (below); `outcome` needs each skill's own package, so
+it runs in the per-package envs `skill-contracts.yaml` builds
+(`outcomes/README.md`).
 
 ## What is covered
 
@@ -19,6 +23,8 @@ Everything runs except the `contract` layer, which skips (see below).
 | `test_shipped_skills.py` | Structure+ | Do the *real* skill files obey the rules the validator does not express generically? |
 | `test_retrieval.py` | Retrieval | Do the real descriptions answer the phrasings a user would type? |
 | `test_satisfiability.py` | Contract | Can a skill's declared packages be installed here at all? |
+| `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
+| `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
@@ -70,12 +76,23 @@ plane as an `ops:<kind>` server, called rather than imported — the kernel's
 interpreter is the agent's only execution surface, so "install it in a separate
 venv" is not a resolution.
 
-No shipped skill declares a third-party package today, so the parametrized half
-is empty and `test_the_extractor_finds_pkg_tokens` is what keeps the layer from
-going vacuously green.
+`test_the_extractor_finds_pkg_tokens` keeps the layer from going vacuously green
+if the shipped catalog ever stops declaring a third-party package again.
 
-> A **contract** layer used to live here too (`test_contracts.py`), asserting
-> that the third-party APIs a body quotes still look that way — `importorskip`ed,
-> armed on a workstation. It was written entirely for `flatfield-and-stitch-tiles`
-> and went with it. Bring it back when a skill declares a package that passes the
-> gate above; the shape is in git and in `docs/skill-testing.md` §3.
+## The `outcome` marker
+
+Fixtures with a known answer, and a verifier that scores a run against them —
+`docs/skill-testing.md` §5. Deselected by default, and unlike `satisfiability`
+it is not a matter of cost: the subjects import the skill's package, and that
+package is deliberately not in this environment. One shared resolution would
+force every skill's dependency to co-exist with every other's.
+
+```sh
+pytest biopb-mcp/src/biopb_mcp/_tests/skills -m outcome   # needs the package
+```
+
+See `outcomes/README.md`. Two things there are worth knowing from here: real
+data can be substituted for a synthetic fixture without touching a verifier
+(`BIOPB_SKILL_FIXTURES`), and every case is deliberately also run through the
+mistake its skill body warns about, because a verifier nothing has ever failed
+is not known to work.
