@@ -13,15 +13,60 @@ xvfb-run -a -s '-screen 0 1024x768x24' \
 Deselected by default (`-m interaction`), like `outcome` and `satisfiability`,
 and never in CI (§10).
 
+The hermetic half — the loop, the trace, the personas — is **not** marked and
+runs with the ordinary suite, like `outcomes/test_outcome_protocol.py`. A break
+in the machinery should surface as a normal red test rather than be found by
+someone mid-diagnosis with a paid run.
+
+## Running one with real models
+
+Two keys, two families, and neither is optional (§6a):
+
+```sh
+export OPENAI_API_KEY=...        # or GEMINI_API_KEY / DEEPSEEK_API_KEY
+export ANTHROPIC_API_KEY=...     # the respondent, and only ever the respondent
+export BIOPB_SKILL_AGENT_MODEL=gpt-5          # optional, has a default
+export OPENAI_BASE_URL=...                    # for a non-OpenAI compatible endpoint
+
+xvfb-run -a -s '-screen 0 1024x768x24' \
+  uv run --no-project --python .venv/bin/python --with openai --with anthropic \
+  python -m pytest .../interaction -m interaction
+```
+
+The provider SDKs are imported lazily and are **not** dependencies of this
+package — one `--with` line, the same pattern the outcome layer uses for
+`pystackreg`. Keys are read from the environment at call time and are never
+written to a trace, an artifact or a log.
+
 ## What is here
 
 | File | Holds |
 |---|---|
 | `_session.py` | Bring-up: a real shim-spawned session, a synchronous façade over the async MCP client, and the environment facts that are forced rather than inherited |
+| `_bridge.py` | MCP tool schemas → the function-calling shape a chat model expects |
+| `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `OpenAICompatAgent` |
+| `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ClaudeRespondent` |
+| `_personas.py` | The respondent fixtures — who the agent talks to, and what only they know |
+| `_conversation.py` | The two-model loop, the caps, the `Trace` |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
+| `test_conversation.py` | That the loop works, with no model *and* no session |
+| `test_personas.py` | That a persona gives nothing away |
 
-The agent adapter, the respondent and the conversation loop are not built yet.
-This is the floor they stand on.
+## What has been run, and what has not
+
+Worth stating plainly, because "armed but never run" is how the contract layer
+rotted for a release:
+
+- **Run and green**: everything driven by `ScriptedAgent` / `ScriptedRespondent`
+  (the loop, the trace, replay, the caps, scraping, the personas) and the nine
+  session smoke tests. No key, no cost.
+- **Written but never executed**: `OpenAICompatAgent` and `ClaudeRespondent` —
+  the two provider adapters. They are a few dozen lines of plumbing each and
+  the first real run will shake them out. Until that run has happened, do not
+  read this README as saying they work.
+
+The scoring pass that puts a real agent in front of `drift-correction` is not
+here yet either.
 
 ## Why this tier is the one with teeth
 
