@@ -24,7 +24,13 @@ from .conftest import SKILLS_DIR, read_skill
 # requirement that silently never resolves.
 BARE_TOKENS = {"viewer", "tensor", "dask"}
 NAMESPACED = re.compile(r"^(ops|plugin|pkg):(.+)$")
-PKG_SPEC = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(>=\d+(\.\d+)*)?$")
+# `>=` is a floor; `~=` is PEP 440's compatible release, i.e. a floor plus an
+# upper bound at the next minor. Deliberately no comma-separated pair: the
+# runtime reader (mcp/_skills.py) splits a `[a, b]` frontmatter list on every
+# comma before it strips quotes, so `"pkg:x>=1,<2"` reaches the agent as two
+# broken tokens while the strict parser here reads it correctly -- a mis-parse
+# that would pass review and only appear in the field.
+PKG_SPEC = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*((>=|~=)\d+(\.\d+)*)?$")
 PLUGIN_STEM = re.compile(r"^[a-z_][a-z0-9_]*$")  # a module name, not kebab-case
 
 # `[[link]]`s, ignoring any inside an inline code span -- `write-a-skill` quotes

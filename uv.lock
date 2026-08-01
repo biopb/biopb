@@ -735,6 +735,7 @@ testing = [
     { name = "pytest-cov" },
     { name = "pytest-env" },
     { name = "pytest-qt" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -779,6 +780,7 @@ testing = [
     { name = "pytest-cov" },
     { name = "pytest-env" },
     { name = "pytest-qt" },
+    { name = "pyyaml" },
 ]
 
 [[package]]

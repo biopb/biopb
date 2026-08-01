@@ -1,0 +1,105 @@
+# Layer 1 signature contracts for the skills catalog (docs/skill-testing.md §3).
+#
+# A skill body is an un-versioned assertion about someone else's API. This job
+# proves those assertions against the real library -- that the parameter exists,
+# that the default is what the prose assumes, that the return shape is what the
+# snippet unpacks.
+#
+# WHY IT IS ITS OWN WORKFLOW, and not a step in mcp-ci:
+#
+#   1. Each declared package is installed into its OWN ephemeral env. The shared
+#      test env would force every skill's package to co-exist with every other's,
+#      and the first pair that cannot would break the whole suite -- with the
+#      reflex fix being to drop a skill. Per-package envs make that unrepresentable:
+#      N packages, N independent resolutions.
+#
+#   2. The paths filter means an unrelated PR never builds any of it. A skill's
+#      third-party dependency should cost nothing to a PR that does not touch
+#      skills.
+#
+# WHY ON PUSH/PR AND NOT ON A SCHEDULE. A skill declares a bounded range (`~=`:
+# a floor plus an upper bound at the next minor), so the API cannot move under a
+# shipped skill -- what a user resolves is inside the range these assertions were
+# proved against. Upstream releasing a new minor is therefore not an event this
+# layer needs to hear about. What is left is our own editing, which is exactly
+# what these triggers catch. A range that stops installing is caught elsewhere,
+# by mcp-ci's satisfiability step.
+name: Skill contracts
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'biopb-mcp/src/biopb_mcp/mcp/_skills_data/**'
+      - 'biopb-mcp/src/biopb_mcp/_tests/skills/**'
+      - '.github/workflows/skill-contracts.yaml'
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'biopb-mcp/src/biopb_mcp/mcp/_skills_data/**'
+      - 'biopb-mcp/src/biopb_mcp/_tests/skills/**'
+      - '.github/workflows/skill-contracts.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # One env per declared package, per platform. The matrix is the same sparse
+  # shape as mcp-ci: all versions on Linux, plus one version on macOS/Windows.
+  # Wheel availability differs per cell, so a package that installs only on
+  # Linux fails visibly here rather than on a user's laptop.
+  contracts:
+    name: ${{ matrix.os }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.10'
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          - os: macos-latest
+            python-version: '3.12'
+          - os: windows-latest
+            python-version: '3.12'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      # Each env installs `biopb` from this checkout, and that build generates
+      # the protobuf stubs -- so buf has to be here even though nothing in these
+      # assertions touches gRPC. Same step as mcp-ci.
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # The assertions import the package under test, plus numpy/scipy for the
+      # fixtures and the skills gate's own validator. No napari, no Qt: nothing
+      # here drives a viewer.
+      - name: Run the contracts, one env per declared package
+        run: |
+          set -euo pipefail
+          uv run --python "${{ matrix.python-version }}" --no-project \
+            --with pyyaml --with packaging \
+            python .github/scripts/skill_contracts.py \
+            --python "${{ matrix.python-version }}"
