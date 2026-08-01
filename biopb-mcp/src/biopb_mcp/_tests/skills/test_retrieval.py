@@ -38,12 +38,6 @@ def shipped_only(monkeypatch, tmp_path):
 
 # How a user actually asks, in the few content words the tool asks for.
 RETRIEVES = [
-    ("stitch", "flatfield-and-stitch-tiles"),
-    ("stitch tiles", "flatfield-and-stitch-tiles"),
-    ("mosaic", "flatfield-and-stitch-tiles"),
-    ("flatfield", "flatfield-and-stitch-tiles"),
-    ("uneven illumination", "flatfield-and-stitch-tiles"),
-    ("overlapping tiles", "flatfield-and-stitch-tiles"),
     ("measure", "calibrated-measurements"),
     ("measure microns", "calibrated-measurements"),
     ("physical units", "calibrated-measurements"),
@@ -63,12 +57,10 @@ RETRIEVES = [
 # agent is told to prefer a curated skill over improvising, so a false hit sends
 # it down a workflow written for someone else's problem.
 REJECTS = [
-    ("deconvolution", "flatfield-and-stitch-tiles"),
     ("stitch", "calibrated-measurements"),
     ("measure", "segmentation-qc-metrics"),
     ("segmentation", "calibrated-measurements"),
     ("tiles", "segmentation-qc-metrics"),
-    ("ground truth", "flatfield-and-stitch-tiles"),
 ]
 
 

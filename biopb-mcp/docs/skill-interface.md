@@ -118,12 +118,11 @@ biopb-mcp/src/biopb_mcp/
     test_validate.py           which malformations are fatal vs tolerable
     test_shipped_skills.py     rules the real files must satisfy
     test_retrieval.py          do the descriptions answer real phrasings
-    test_contracts.py          third-party APIs the bodies quote (marker)
-    test_satisfiability.py     can those packages be installed here at all
+    test_satisfiability.py     may this skill declare that package at all
+    test_packaging.py          do the skills reach the wheel
 ```
 
-See `_tests/skills/README.md` for what each layer asks and how to arm the two
-marked ones. The layer split and what gates a merge is
+See `_tests/skills/README.md` for what each layer asks. The layer split and what gates a merge is
 [`docs/skill-testing.md`](../../docs/skill-testing.md) §1 and §10.
 
 ---
@@ -305,13 +304,23 @@ no return value invites `if not ok: bail`. Every fix — installing a package,
 seeding a plugin, restarting the kernel — needs the user's consent, so the agent's
 job is to name the gap and ask, not to decide.
 
-**A `pkg:` token is not only a runtime question.** `test_satisfiability.py`
-resolves every `pkg:` a shipped skill declares against the installed environment
-and fails when the package installs only by moving something biopb already
-depends on. That is not hypothetical: `basicpy` resolves by reverting numpy
-2.3.5 → 1.26.4 (and pandas and scipy with it), and `m2stitch` takes pandas
-3.0.3 → 2.3.3. Neither errors — the install succeeds and the user gets an older
-stack silently — which is why it is checked rather than trusted.
+**A `pkg:` token is not only a runtime question, and not every package may be
+declared.** `test_satisfiability.py` resolves every `pkg:` a shipped skill
+declares against the installed environment and **rejects** the skill when the
+package installs only by moving something biopb already depends on. That is not
+hypothetical: `basicpy` reverts numpy 2.3.5 → 1.26.4 (and pandas and scipy with
+it), and `m2stitch` takes pandas 3.0.3 → 2.3.3. Neither errors, so the agent and
+the user get an older stack silently — under a live kernel that already imported
+the versions being replaced.
+
+A warning in the body does not fix it: the three options above are general
+guidance, and option 2 is the harmful one. Nor does a separate environment —
+the kernel's interpreter is the agent's only execution surface, so a package
+installed elsewhere cannot be imported. **A package that needs its own
+environment is an `ops:<kind>` server**, called rather than imported, which is
+what the algorithm plane is for. `flatfield-and-stitch-tiles` declared
+`pkg:basicpy` and `pkg:m2stitch` and was dropped rather than shipped with a
+workaround.
 
 **`pkg:biopb-mcp>=X` is now an open question.** It made a skill safe to publish
 *ahead of* the release carrying the plugin it needs — an older install was told

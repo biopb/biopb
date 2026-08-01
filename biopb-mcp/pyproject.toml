@@ -209,15 +209,9 @@ qt_api = "pyqt6"
 # `-m satisfiability` and `-m contract` still work.
 addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability'"
 markers = [
-    # The skills contract layer (_tests/skills/test_contracts.py) asserts the
-    # surface of packages a *skill* depends on (basicpy, m2stitch), not this
-    # package's. They are importorskip-ed, so an ordinary checkout runs the rest
-    # unaffected; arming them costs several GB (basicpy is torch-backed), which
-    # is why CI does not. See _tests/skills/README.md.
-    "contract: asserts a third-party API a skill body quotes; skipped when the package is absent",
     # Resolves each skill's pkg: tokens against the installed environment to
-    # catch a package that installs only by downgrading biopb's own deps.
-    # Metadata only -- nothing is downloaded or installed.
+    # reject a package that installs only by moving biopb's own deps. Metadata
+    # only -- nothing is downloaded or installed. See _tests/skills/README.md.
     "satisfiability: resolves a skill's declared packages against this environment",
 ]
 

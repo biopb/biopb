@@ -18,7 +18,8 @@ Everything runs except the `contract` layer, which skips (see below).
 | `test_validate.py` | Structure | Which malformations are fatal versus tolerable, and is a valid tree read correctly? |
 | `test_shipped_skills.py` | Structure+ | Do the *real* skill files obey the rules the validator does not express generically? |
 | `test_retrieval.py` | Retrieval | Do the real descriptions answer the phrasings a user would type? |
-| `test_contracts.py` | Contract | Do the third-party APIs the bodies quote still look like that? |
+| `test_satisfiability.py` | Contract | Can a skill's declared packages be installed here at all? |
+| `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
 grammar the agent resolves at runtime, `[[wiki-links]]` landing on a skill that
@@ -40,33 +41,34 @@ token outside the vocabulary, a link to a skill that does not exist, a
 description that runs to two sentences — and, from `test_retrieval.py`, that you
 owe the new skill a phrasing entry.
 
-## The `contract` marker
+## The `satisfiability` marker
 
-`test_contracts.py` asserts the surface of packages a *skill* depends on
-(`basicpy`, `m2stitch`) — not packages this one depends on. They are
-`importorskip`ed:
-
-```sh
-pytest biopb-mcp/src/biopb_mcp/_tests/skills              # they skip
-pytest biopb-mcp/src/biopb_mcp/_tests/skills -m contract  # just this layer, once armed
-```
-
-To arm it, python **3.11** — not 3.12 — because m2stitch pins pandas 1.5.3 and
-there is no 3.12 wheel for it:
+A skill may not declare a `pkg:` token that installs only by moving something
+already in the environment. `uv pip install --dry-run basicpy` *succeeds* — and
+takes numpy 2.3.5 down to 1.26.4, plus pandas and scipy, under a live kernel
+that has already imported numpy 2.
 
 ```sh
-uv venv .venv-contract --python 3.11
-uv pip install --python .venv-contract/bin/python pytest pyyaml basicpy m2stitch
+pytest biopb-mcp/src/biopb_mcp/_tests/skills                     # deselected
+pytest biopb-mcp/src/biopb_mcp/_tests/skills -m satisfiability   # just this layer
 ```
 
-Budget ~5 GB: `basicpy` is torch-backed and pulls CUDA. That cost is why CI does
-not arm this layer — pulling a solver in to read a function signature is a bad
-trade, and the layer's job is to fail on a workstation before an edit ships.
+Deselected by default only because each token is a real resolver run; CI runs it
+as its own step. Metadata only — nothing is downloaded or installed.
 
-It asserts against **code fences only**, never the prose. The failure-modes
-tables quote the same call signatures in English, so a whole-body match would
-pass even after the call itself lost the argument.
+The gate is unconditional: no allowlist, no xfail. Those would be somewhere to
+record that a known-bad skill ships anyway, which is what it exists to prevent.
+A package that genuinely needs its own environment belongs behind the algorithm
+plane as an `ops:<kind>` server, called rather than imported — the kernel's
+interpreter is the agent's only execution surface, so "install it in a separate
+venv" is not a resolution.
 
-Note what this layer does *not* answer: whether those packages can be installed
-alongside biopb at the version the body was written against. That is
-`test_satisfiability.py`, which needs no install and does run in CI.
+No shipped skill declares a third-party package today, so the parametrized half
+is empty and `test_the_extractor_finds_pkg_tokens` is what keeps the layer from
+going vacuously green.
+
+> A **contract** layer used to live here too (`test_contracts.py`), asserting
+> that the third-party APIs a body quotes still look that way — `importorskip`ed,
+> armed on a workstation. It was written entirely for `flatfield-and-stitch-tiles`
+> and went with it. Bring it back when a skill declares a package that passes the
+> gate above; the shape is in git and in `docs/skill-testing.md` §3.

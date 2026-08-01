@@ -85,6 +85,11 @@ in the frontmatter, so the test and the declaration cannot drift apart.
 
 Cheap, fast, and it fails in the author's PR rather than in a stranger's session.
 
+**Currently unmanned.** The signature half was written entirely for
+`flatfield-and-stitch-tiles`, which §3a rejected, and went with it. No shipped
+skill declares a third-party package now, so there is nothing to assert against.
+The shape is in git; it returns with the first skill whose package passes §3a.
+
 ### 3a. Satisfiability comes before signatures
 
 The draft assumed the packages a skill declares can simply be installed. They
@@ -98,9 +103,15 @@ nothing downloaded):
 | `biopb[tensor]` + `basicpy` | 2.0.0 | 2.5.1 |
 | `biopb-mcp[mcp]` + `basicpy` | **1.1.0** | 2.5.1 |
 
-Three environments, three answers. A user who follows a skill into the full MCP
-stack silently gets a basicpy two majors behind the one the body quotes. Nothing
-errors; the skill just does not work, and it looks like the agent's fault.
+Three environments, three answers, and no good one. Resolved against the real
+workspace venv, `basicpy` lands at 2.0.0 and takes numpy 2.3.5 → 1.26.4 with it
+(the mechanism is its `scipy<1.13` pin, not a numpy pin). Nor is the older
+version a fallback: 1.1.0 declares `pydantic>=1.9.1` but its source is pydantic
+**v1** (`@root_validator`, `class Config`), so a resolver leaves the stack's
+pydantic 2.x in place and `import basicpy` fails at class definition.
+
+Nothing errors in either case. The install succeeds and the failure surfaces
+later, somewhere else, looking like the agent's fault.
 
 This is the layer's *first* question, and it is cheaper than the second:
 resolution reads metadata, so it runs in CI, while importing `basicpy` pulls a
@@ -110,6 +121,21 @@ cannot be run from anywhere else — resolving against PyPI answers for the last
 `napari==0.8.0`, though the source pins `napari[all]==0.7.0` exactly.) Only the
 repo holding the workspace can ask the question correctly, which is one of the
 reasons the skills now live in it.
+
+**And it is a rejection, not a caveat.** A skill that declares such a package is
+a bug: the install succeeds, so the agent and the user both get the downgrade
+silently, under a live kernel that has already imported the old versions. It
+cannot be fixed in the body either — `guide://kernel` offers the agent an
+install-it-for-you path that no single skill's prose overrides, and a package in
+a separate environment is not importable from the kernel at all, which is the
+agent's only execution surface. A package that genuinely needs its own
+environment belongs behind the **algorithm plane**, as an `ops:<kind>` server
+that is called rather than imported.
+
+So the gate is unconditional — no allowlist, no xfail. `flatfield-and-stitch-tiles`
+was written against `basicpy` and `m2stitch` and was dropped rather than shipped
+with a workaround; it is the case the layer was built to catch, and it should
+have been caught in review.
 
 ## 4. Layer 2 — retrieval tests
 
@@ -283,7 +309,7 @@ parameterisation over where the skills came from.
 |---|---|---|
 | Structure, Retrieval | this repo's CI | yes |
 | Contract — satisfiability (§3a) | this repo's CI (metadata resolution only) | yes |
-| Contract — signatures (§3) | workstation; `-m contract`, skipped when absent | no |
+| Contract — signatures (§3) | workstation, when a skill has packages to check | no |
 | Outcome | local; scheduled on a real machine | no — advisory, reviewed |
 | Interaction | local | no |
 | Ablation | manual, per skill edit | no |
