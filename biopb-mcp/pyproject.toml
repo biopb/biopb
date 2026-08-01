@@ -127,6 +127,11 @@ testing = [
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
     "pytest-env",  # https://github.com/qwertyquerty/pytest-env
+    # The skills authoring gate (_tests/skills/) parses frontmatter with a real
+    # YAML parser. The runtime reader in mcp/_skills.py deliberately does not --
+    # it is stdlib-only and tolerant -- but the gate must reject what that one
+    # forgives, which takes a strict parser.
+    "pyyaml",
 ]
 
 [project.scripts]
@@ -198,7 +203,23 @@ describe_command = "git describe --tags --match 'release-v*'"
 
 [tool.pytest.ini_options]
 qt_api = "pyqt6"
-addopts = "--ignore-glob='*_vendor*'"
+# -m: the satisfiability layer runs a real resolver per skill package (tens of
+# seconds each over a torch-sized graph), so it is deselected by default and run
+# as its own CI step. A command-line -m overrides this one, which is how
+# `-m satisfiability` and `-m contract` still work.
+addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability'"
+markers = [
+    # The skills contract layer (_tests/skills/test_contracts.py) asserts the
+    # surface of packages a *skill* depends on (basicpy, m2stitch), not this
+    # package's. They are importorskip-ed, so an ordinary checkout runs the rest
+    # unaffected; arming them costs several GB (basicpy is torch-backed), which
+    # is why CI does not. See _tests/skills/README.md.
+    "contract: asserts a third-party API a skill body quotes; skipped when the package is absent",
+    # Resolves each skill's pkg: tokens against the installed environment to
+    # catch a package that installs only by downgrading biopb's own deps.
+    # Metadata only -- nothing is downloaded or installed.
+    "satisfiability: resolves a skill's declared packages against this environment",
+]
 
 [tool.pytest_env]
 QT_QPA_PLATFORM = "offscreen"
