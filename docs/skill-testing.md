@@ -85,10 +85,17 @@ in the frontmatter, so the test and the declaration cannot drift apart.
 
 Cheap, fast, and it fails in the author's PR rather than in a stranger's session.
 
-**Currently unmanned.** The signature half was written entirely for
-`flatfield-and-stitch-tiles`, which §3a rejected, and went with it. No shipped
-skill declares a third-party package now, so there is nothing to assert against.
-The shape is in git; it returns with the first skill whose package passes §3a.
+**Manned again**, by `drift-correction` — the first skill whose package passes
+§3a. The previous module was written entirely for `flatfield-and-stitch-tiles`,
+which §3a rejected, and was deleted with it in #667 without anything noticing.
+
+So the module now carries a coverage check of its own: a shipped skill that
+declares a third-party package this layer says nothing about fails
+`test_every_declared_package_is_covered_here`, the same shape as the
+phrasing-table check in §4. The layer can go unmanned again only on purpose.
+
+It runs in `skill-contracts.yaml` — one throwaway env per declared package, on
+PRs that touch a skill. §10 has the reasoning for all three of those choices.
 
 ### 3a. Satisfiability comes before signatures
 
@@ -136,6 +143,30 @@ So the gate is unconditional — no allowlist, no xfail. `flatfield-and-stitch-t
 was written against `basicpy` and `m2stitch` and was dropped rather than shipped
 with a workaround; it is the case the layer was built to catch, and it should
 have been caught in review.
+
+### 3b. A declared package is bounded, not floored
+
+`pkg:<name>~=X.Y.Z` — PEP 440's compatible release, i.e. a floor plus an upper
+bound at the next minor. Not `>=` alone, and not `==`.
+
+**Why an upper bound.** Without one, §3's assertions prove the body against
+whatever CI happened to resolve, which says nothing about the version in the
+user's kernel. The bound is what makes the proof transferable: the assertions
+hold across the declared range, and the declared range is what the agent
+resolves. It is also what removes the need to re-run this layer on a schedule —
+there is no drift to catch when the API cannot move under a shipped skill.
+
+**Why not an exact pin.** The agent installs into a *live* kernel. `==0.2.8`
+against a user who has 0.3.0 is satisfiable only by downgrading an
+already-imported compiled extension — the precise pathology §3a rejects. A
+bounded range is satisfied by anything already in range, so it never creates
+downgrade pressure.
+
+**Why not a comma pair.** `>=0.2.8,<0.3` is unrepresentable: the runtime reader
+(`mcp/_skills.py`) splits a `[a, b]` frontmatter list on every comma *before* it
+strips quotes, so the token reaches the agent as two broken fragments while the
+strict parser here reads it correctly — a mis-parse that passes review and
+appears only in the field. `~=` says the same thing in one comma-free token.
 
 ## 4. Layer 2 — retrieval tests
 
@@ -309,13 +340,33 @@ parameterisation over where the skills came from.
 |---|---|---|
 | Structure, Retrieval | this repo's CI | yes |
 | Contract — satisfiability (§3a) | this repo's CI (metadata resolution only) | yes |
-| Contract — signatures (§3) | workstation, when a skill has packages to check | no |
+| Contract — signatures (§3) | this repo's CI, on skill-touching PRs only | yes |
 | Outcome | local; scheduled on a real machine | no — advisory, reviewed |
 | Interaction | local | no |
 | Ablation | manual, per skill edit | no |
 
-Everything that gates is in one CI job in one repo, and a skill edit and the
-runtime change it depends on can land in the same PR.
+Everything that gates is in this repo, and a skill edit and the runtime change it
+depends on can land in the same PR.
+
+**Signatures gate, but on their own trigger and in their own envs.** They were
+planned as workstation-only, on the grounds that they need the package actually
+installed — and a layer that is armed rather than running is how the last one
+rotted. `skill-contracts.yaml` runs them, and two properties earn the change:
+
+- **One ephemeral env per declared package.** The shared test env would force
+  every skill's package to co-exist with every other's, so the first pair that
+  cannot would break the whole suite — and the reflex fix would be to drop a
+  skill. A package that will not share an env is not a reason not to ship a
+  skill, so the harness must not make it one.
+- **A `paths` filter, not every PR.** A skill's third-party dependency should
+  cost nothing to a PR that does not touch skills.
+
+**And no cron**, because a skill declares a *bounded* range (§3b), so the API
+cannot move under a shipped skill: what a user resolves is inside the range the
+assertions were proved against. Upstream releasing a new minor is not an event
+this layer needs to hear about. What is left — a body edited to call something it
+never ran — is change-triggered, so it belongs on the PR that does it. A range
+that stops installing is §3a's job, and §3a runs everywhere.
 
 Stochastic gates get muted within two weeks of the first flake, and then you have
 neither the gate nor the trust. Gate on the deterministic layers; treat the agent

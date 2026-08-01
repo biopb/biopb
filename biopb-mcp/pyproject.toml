@@ -132,6 +132,12 @@ testing = [
     # it is stdlib-only and tolerant -- but the gate must reject what that one
     # forgives, which takes a strict parser.
     "pyyaml",
+    # NOT the place for the packages skills declare. Layer 1's signature
+    # contracts (_tests/skills/test_contracts.py) need them importable, but one
+    # shared resolution means every skill's package must co-exist with every
+    # other's -- so the first pair that cannot would break this whole env and
+    # the reflex fix would be to drop a skill. skill-contracts.yaml installs
+    # each one into its own ephemeral env instead. The module skips here.
 ]
 
 [project.scripts]

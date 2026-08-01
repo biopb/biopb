@@ -45,6 +45,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from ._validate import validate
 from .conftest import SKILLS_DIR, write_skill
@@ -69,8 +70,10 @@ def _pkg_requirements(directory: Path = SKILLS_DIR) -> list[str]:
             if not token.startswith("pkg:"):
                 continue
             spec = token.split(":", 1)[1]
-            name = spec.split(">=")[0].split("==")[0].strip()
-            if name.lower() in _WORKSPACE:
+            # A PEP 508 requirement already: `name`, `name>=X`, `name~=X`. Parse
+            # it rather than splitting on operators, so a new bound spelling
+            # cannot silently make a workspace token look third-party.
+            if Requirement(spec).name.lower() in _WORKSPACE:
                 continue
             out.append(spec)
     return sorted(set(out))

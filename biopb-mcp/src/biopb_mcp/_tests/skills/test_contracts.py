@@ -19,20 +19,37 @@ note "returns with the first skill whose package passes §3a". That is
 a third-party package this module says nothing about -- the same shape as the
 phrasing-table check in test_retrieval.py.
 
-Whether these gate is a separate decision, taken in #673: putting `pystackreg`
-in the `testing` group is what makes them run in CI, and reverses §10's plan of
-workstation-only. Until then the module skips wherever the package is absent,
-which includes CI -- the assertions are here and correct, but they are not yet
-watching anything.
+**When these run, and why not more often.** `.github/workflows/skill-contracts.yaml`,
+on pull requests that touch a skill file or this module -- not on every PR and
+not on a schedule.
+
+The trigger follows the risk. A skill declares a *bounded* package range
+(`~=`, so a floor plus an upper bound at the next minor), which means the API
+these assertions pin cannot move underneath a shipped skill: what a user
+resolves is inside the range the assertions were proved against. Upstream
+releasing a new minor is therefore not an event this layer needs to hear about,
+which rules out a cron. What remains is our own editing -- a body rewritten to
+pass `tmats` positionally, a new skill written against an API nobody ran -- and
+that is change-triggered, so it belongs on the PR that does it.
+
+A package going stale inside its own range is caught elsewhere, by the
+satisfiability gate: it resolves every declared token on every matrix cell, so a
+range that stops installing fails there rather than here.
+
+Each package is installed into its **own ephemeral env** by that workflow, never
+into the shared test env. Two skills' packages are then never resolved together,
+so a future pair that cannot co-exist costs neither skill its contract test --
+and no unrelated PR pays for a dependency it does not use.
 """
 
 from __future__ import annotations
 
-from importlib.metadata import version as dist_version
+from importlib.metadata import PackageNotFoundError, version as dist_version
 
 import numpy as np
 import pytest
-from packaging.version import Version
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from scipy import ndimage
 
 from ._validate import validate
@@ -50,16 +67,19 @@ COVERED: dict[str, set[str]] = {
 }
 
 
-def _third_party_requirements(entry) -> dict[str, str | None]:
-    """`{name: floor or None}` for the `pkg:` tokens that name a third party."""
-    out: dict[str, str | None] = {}
+def _third_party_requirements(entry) -> dict[str, SpecifierSet]:
+    """`{name: specifier}` for the `pkg:` tokens that name a third party.
+
+    The token is already a PEP 508 requirement (`name`, `name>=X`, `name~=X`),
+    so it is parsed rather than split on operators.
+    """
+    out: dict[str, SpecifierSet] = {}
     for token in entry.requires:
         if not token.startswith("pkg:"):
             continue
-        spec = token.split(":", 1)[1]
-        name, _, floor = spec.partition(">=")
-        if name not in _WORKSPACE:
-            out[name] = floor or None
+        req = Requirement(token.split(":", 1)[1])
+        if req.name.lower() not in _WORKSPACE:
+            out[req.name] = req.specifier
     return out
 
 
@@ -97,23 +117,43 @@ def test_covered_is_not_stale(entries):
     assert not stale, "COVERED names what no skill declares:\n" + "\n".join(stale)
 
 
-def test_the_installed_version_satisfies_every_declared_floor(entries):
-    """Ties the assertions below to the frontmatter. Without this the module
-    asserts against whatever happened to resolve, while the declaration promises
-    something else."""
+def test_the_installed_version_is_inside_every_declared_range(entries):
+    """Ties the assertions below to the frontmatter, in both directions.
+
+    A floor alone would let this module prove the body against a version no user
+    will ever get. The upper bound is what makes the proof transferable: the
+    assertions hold for the whole declared range, and the range is what the agent
+    resolves. So the version under test has to be *inside* it, not merely above
+    the floor.
+    """
     for e in entries:
-        for name, floor in _third_party_requirements(e).items():
-            if floor is None:
+        for name, spec in _third_party_requirements(e).items():
+            if not spec:
                 continue
-            installed = dist_version(name)
-            assert Version(installed) >= Version(floor), (
-                f"{e.id} declares {name}>={floor}, installed is {installed}"
+            try:
+                installed = dist_version(name)
+            except PackageNotFoundError:
+                # Each env carries one declared package (skill_contracts.py), so
+                # the others are legitimately absent here rather than missing.
+                continue
+            assert spec.contains(installed), (
+                f"{e.id} declares {name}{spec}, installed is {installed} -- "
+                "these assertions would prove nothing about what a user resolves"
             )
 
 
 # --- pystackreg, for drift-correction -------------------------------------
+#
+# Guarded per-package, not at module scope: skill_contracts.py runs this module
+# once per declared package, so in another package's env pystackreg is
+# legitimately absent and only its own assertions should skip. A module-level
+# importorskip would take the whole file down with it, including the checks
+# above that need no package at all.
 
-pystackreg = pytest.importorskip("pystackreg")
+
+@pytest.fixture(scope="module")
+def StackReg():
+    return pytest.importorskip("pystackreg").StackReg
 
 
 @pytest.fixture(scope="module")
@@ -132,16 +172,14 @@ def drifting_movie():
     return movie, truth
 
 
-def test_the_modes_the_body_names_exist():
+def test_the_modes_the_body_names_exist(StackReg):
     """`sr = StackReg(getattr(StackReg, MODE))` with MODE in {TRANSLATION,
     RIGID_BODY} -- step 3, and the `MODE` row of the parameter table."""
-    from pystackreg import StackReg
-
     assert hasattr(StackReg, "TRANSLATION")
     assert hasattr(StackReg, "RIGID_BODY")
 
 
-def test_register_stack_still_defaults_to_previous():
+def test_register_stack_still_defaults_to_previous(StackReg):
     """Step 3 tells the agent to pass `reference="previous"` and explains why.
     It is also the library default, which means an agent that omits the argument
     is still safe *today*. If upstream ever flips it to "first", that stops being
@@ -150,21 +188,17 @@ def test_register_stack_still_defaults_to_previous():
     """
     import inspect
 
-    from pystackreg import StackReg
-
     sig = inspect.signature(StackReg.register_stack)
     assert sig.parameters["reference"].default == "previous"
 
 
-def test_the_translation_lives_where_step_4_reads_it(drifting_movie):
+def test_the_translation_lives_where_step_4_reads_it(StackReg, drifting_movie):
     """The load-bearing indexing claim: `dy = m[1, 2]`, `dx = m[0, 2]`.
 
     Step 4 stops the workflow on these numbers, so a transposed read would not
     raise -- it would report a plausible trajectory for the wrong axis and pass
     its own sanity check.
     """
-    from pystackreg import StackReg
-
     movie, truth = drifting_movie
     tmats = StackReg(StackReg.TRANSLATION).register_stack(movie, reference="previous")
 
@@ -175,12 +209,10 @@ def test_the_translation_lives_where_step_4_reads_it(drifting_movie):
     assert np.abs(dx - truth[:, 1]).max() < 0.05
 
 
-def test_transform_stack_takes_tmats_and_actually_stabilises(drifting_movie):
+def test_transform_stack_takes_tmats_and_actually_stabilises(StackReg, drifting_movie):
     """Step 5's `sr.transform_stack(MOVIE, tmats=tmats)` -- the keyword name, and
     that reusing a foreign `tmats` array is a supported call rather than an
     accident of the signature."""
-    from pystackreg import StackReg
-
     movie, _ = drifting_movie
     sr = StackReg(StackReg.TRANSLATION)
     tmats = sr.register_stack(movie, reference="previous")
@@ -193,12 +225,10 @@ def test_transform_stack_takes_tmats_and_actually_stabilises(drifting_movie):
     assert after < before / 10
 
 
-def test_transform_stack_returns_float64(drifting_movie):
+def test_transform_stack_returns_float64(StackReg, drifting_movie):
     """Step 5 warns that interpolation resamples intensities. It also promotes
     the dtype, which doubles the footprint of a float32 movie -- a surprise worth
     catching here if it ever changes."""
-    from pystackreg import StackReg
-
     movie, _ = drifting_movie
     sr = StackReg(StackReg.TRANSLATION)
     tmats = sr.register_stack(movie, reference="previous")
