@@ -78,7 +78,7 @@ def _third_party_requirements(entry) -> dict[str, SpecifierSet]:
         if not token.startswith("pkg:"):
             continue
         req = Requirement(token.split(":", 1)[1])
-        if req.name not in _WORKSPACE:
+        if req.name.lower() not in _WORKSPACE:
             out[req.name] = req.specifier
     return out
 

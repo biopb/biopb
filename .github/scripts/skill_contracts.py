@@ -97,6 +97,7 @@ def check_one(spec: str, python: str) -> bool:
                 str(ROOT / "biopb-mcp"),
                 "pytest",
                 "pyyaml",
+                "packaging",
                 spec,
             ]
         )
