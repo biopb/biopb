@@ -3,8 +3,9 @@
 > **Status: in progress.** The gating layers are built. §5's machinery is built
 > and exercised on one skill, but it is a **diagnostic harness rather than a
 > gate** — it tests a transcription of a skill, not the shipped file (§5c), so
-> it stays out of CI and nothing further is queued for it. §6–§7 remain a design
-> sketch, and §6 is the tier that actually tests the shipped bodies.
+> it stays out of CI and nothing further is queued for it. §6 is the tier that
+> actually tests the shipped bodies: its deterministic half is built for
+> `drift-correction` (§6b) and the agent half is not. §7 remains a design sketch.
 >
 > This revision follows a structural decision that the earlier draft predates:
 > **skills ship inside the biopb packages and are never fetched over the
@@ -367,6 +368,52 @@ invalidates the suite.
 Keep this layer small. Multi-turn tests are the slowest and flakiest thing here;
 point them at the checkpoint contract and get bulk coverage from §5, where the
 environment already holds everything and no conversation happens.
+
+### 6a. The agent under test is not from the family that wrote the skill
+
+These bodies were co-authored with Claude. A Claude agent can pass by
+recognising its own prose rather than by reading it, and §7 already records that
+blind spots correlate within a family — so the agent under test is a hosted
+**non-Anthropic** model, reached through an OpenAI-compatible tool-calling
+adapter. Claude's role here is the **respondent**, which is a different job:
+hold a persona and a few private facts, answer, volunteer nothing. Family
+contamination is harmless there, and the respondent is deliberately kept
+**skill-blind** — it never sees the body, so it cannot rescue a bad run by
+paraphrasing step 2 back at the agent.
+
+The reference agent is therefore a fixture too, and its *family* is part of what
+makes the fixture valid — not just its version.
+
+### 6b. Prove the asymmetry before paying a model to demonstrate it
+
+The whole tier rests on one claim about each fixture: that the stripped fact is
+genuinely unobtainable from the pixels, so the numeric outcome cannot come out
+right without asking. That claim is easy to get wrong and expensive to test with
+a model — and a fixture whose ambiguity every heuristic happens to survive
+leaves a suite that certifies nothing while looking like it tests conversation.
+
+So it gets settled first, deterministically, with **scripted subjects**: one
+told the private fact, and one for each choice a run that never asked would
+plausibly make. If the §5 verifier cannot separate them, there is nothing here
+to test. This is §5b's calibration argument one tier up — there, a verifier no
+run has ever failed is not known to work; here, a fixture nothing has ever
+failed *for want of asking* is not known to test asking.
+
+**Built for `drift-correction`** (`outcomes/_drift_channels.py`,
+`test_drift_channel_choice.py`). Step 2 asks the user whether the field or the
+objects moved, and which channel is `REF_CHANNEL`. The fixture is a two-channel
+movie with the names stripped: channel 0 is bright puncta that carry the stage
+drift *and* crawl on their own, channel 1 a dim field that moves only with the
+stage. Every available heuristic points at channel 0 — five times the contrast,
+an order of magnitude the peak — and registering there adds the objects' common
+motion to the stage's without anything failing. Told the answer: 0.0006 px RMS
+worst case. Registering on brightness: 1.95–5.28 px. Averaging the channels,
+which the Parameters table forbids by name: 1.92–5.16 px. Scored by §5's
+verifier unchanged.
+
+That fixture is deterministic, needs no key and no model, so it lives under the
+`outcome` marker with the rest of §5's machinery. The agent half is what needs
+the harness below.
 
 ## 7. Layer 5 — ablation (authoring, not gating)
 

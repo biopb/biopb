@@ -85,13 +85,18 @@ EXPECTED = {
     ),
 }
 
-SYNTHETIC = [p for p in providers_for(SKILL) if p.kind == "synthetic"]
-BY_CASE = {p.case_id: p for p in providers_for(SKILL)}
+# `tier="outcome"` is not decoration: `_drift_channels` registers its own case
+# under this same skill, and without the filter this module would collect it --
+# with four subjects that assume a single-channel movie -- as soon as pytest
+# happened to import the two modules together.
+OUTCOME_TIER = providers_for(SKILL, tier="outcome")
+SYNTHETIC = [p for p in OUTCOME_TIER if p.kind == "synthetic"]
+BY_CASE = {p.case_id: p for p in OUTCOME_TIER}
 
 #: On a machine with no curated tree this is one skip carrying instructions,
 #: rather than nothing at all. The tier is worth advertising -- it is where real
 #: data goes, and an invisible seam is one nobody uses.
-CURATED = [p for p in providers_for(SKILL) if p.kind == "curated"] or [
+CURATED = [p for p in OUTCOME_TIER if p.kind == "curated"] or [
     pytest.param(
         None,
         marks=pytest.mark.skip(
