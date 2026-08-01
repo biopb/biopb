@@ -132,6 +132,15 @@ testing = [
     # it is stdlib-only and tolerant -- but the gate must reject what that one
     # forgives, which takes a strict parser.
     "pyyaml",
+    # Layer 1 signature contracts (_tests/skills/test_contracts.py) assert the
+    # API `drift-correction` quotes, which means importing it. Here rather than
+    # left to a workstation because a contract layer that never runs is how the
+    # last one rotted -- it was deleted with its only skill in #667 and nothing
+    # noticed. Safe to co-install: the satisfiability gate certifies pystackreg
+    # adds one package and moves nothing (real wheels on every matrix cell,
+    # checked with --no-build). If that ever stops being true, this dependency
+    # is where CI says so.
+    "pystackreg",
 ]
 
 [project.scripts]

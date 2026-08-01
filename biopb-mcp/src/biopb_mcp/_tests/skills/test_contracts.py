@@ -19,11 +19,13 @@ note "returns with the first skill whose package passes §3a". That is
 a third-party package this module says nothing about -- the same shape as the
 phrasing-table check in test_retrieval.py.
 
-Whether these gate is a separate decision, taken in #673: putting `pystackreg`
-in the `testing` group is what makes them run in CI, and reverses §10's plan of
-workstation-only. Until then the module skips wherever the package is absent,
-which includes CI -- the assertions are here and correct, but they are not yet
-watching anything.
+**These run in CI**, unlike the plan in §10, because `pystackreg` is in the
+`testing` group. The reason §10 marked signature contracts non-gating was that
+they need the package installed; §3a now certifies exactly that, so the reason
+lapses for any package that passes it. The cost is real and worth naming: a
+third-party package is now in the CI dependency set, so if it ever stops
+resolving on a matrix cell, the whole job fails rather than one test. That is
+also the availability signal #670 wants, so it is being accepted deliberately.
 """
 
 from __future__ import annotations

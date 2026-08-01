@@ -85,10 +85,14 @@ in the frontmatter, so the test and the declaration cannot drift apart.
 
 Cheap, fast, and it fails in the author's PR rather than in a stranger's session.
 
-**Currently unmanned.** The signature half was written entirely for
-`flatfield-and-stitch-tiles`, which §3a rejected, and went with it. No shipped
-skill declares a third-party package now, so there is nothing to assert against.
-The shape is in git; it returns with the first skill whose package passes §3a.
+**Manned again**, by `drift-correction` — the first skill whose package passes
+§3a. The previous module was written entirely for `flatfield-and-stitch-tiles`,
+which §3a rejected, and was deleted with it in #667 without anything noticing.
+
+So the module now carries a coverage check of its own: a shipped skill that
+declares a third-party package this layer says nothing about fails
+`test_every_declared_package_is_covered_here`, the same shape as the
+phrasing-table check in §4. The layer can go unmanned again only on purpose.
 
 ### 3a. Satisfiability comes before signatures
 
@@ -309,13 +313,22 @@ parameterisation over where the skills came from.
 |---|---|---|
 | Structure, Retrieval | this repo's CI | yes |
 | Contract — satisfiability (§3a) | this repo's CI (metadata resolution only) | yes |
-| Contract — signatures (§3) | workstation, when a skill has packages to check | no |
+| Contract — signatures (§3) | this repo's CI | yes |
 | Outcome | local; scheduled on a real machine | no — advisory, reviewed |
 | Interaction | local | no |
 | Ablation | manual, per skill edit | no |
 
 Everything that gates is in one CI job in one repo, and a skill edit and the
 runtime change it depends on can land in the same PR.
+
+Signatures were planned as workstation-only, on the grounds that they need the
+package actually installed. §3a is what changed that: it certifies a declared
+package installs without moving anything, so co-installing it in CI is safe by
+construction, and a layer that runs is worth more than one that is armed. The
+cost is that a third-party package sits in the CI dependency set — if it stops
+resolving on a matrix cell the job fails wholesale rather than one test. That is
+the availability signal #670 argues for, taken deliberately rather than by
+accident.
 
 Stochastic gates get muted within two weeks of the first flake, and then you have
 neither the gate nor the trust. Gate on the deterministic layers; treat the agent
