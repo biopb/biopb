@@ -1,12 +1,11 @@
 """A real biopb-mcp session, brought up and driven from synchronous test code.
 
-`docs/skill-testing.md` §6 runs at **Tier 2** of §8: a real shim-spawned session
-child, a real IPython kernel, a real napari viewer, real dask — and the nine
-real tools reached over real MCP. Nothing here stands in for the runtime. That
-is the whole point: a hand-written tool surface would put `execute_code`'s
-return shape, `server_status`'s report and the `guide://` bodies back into a
-transcription, which is precisely the property that disqualified §5 from
-gating (§5c).
+`biopb-mcp/docs/skill-testing.md` §5b: a real shim-spawned session child, a
+real IPython kernel, a real napari viewer, real dask — and the nine real tools
+reached over real MCP. Nothing here stands in for the runtime. That is the
+whole point: a hand-written tool surface would put `execute_code`'s return
+shape, `server_status`'s report and the `guide://` bodies into a transcription
+that no longer tracks what the runtime does.
 
 What this module owns is bring-up, a synchronous façade over the async MCP
 client, and three environment facts that have to be *forced* rather than
@@ -14,7 +13,7 @@ inherited, because each of them silently changes what a run is testing:
 
 **A display, and a GL context behind it.** `transport.display_mode` defaults to
 `auto`, which degrades to a viewer-less kernel when `$DISPLAY` is unset — a
-legitimate production mode, so nothing fails. But a §6 run that took it would
+legitimate production mode, so nothing fails. But a §5 run that took it would
 be scoring a session in which step 2's "show the user the first and last
 frames" *cannot happen*. Worse, `QT_QPA_PLATFORM=offscreen` is not enough on
 its own: napari builds, and then `add_image` dies inside vispy's extension
@@ -49,7 +48,7 @@ import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,7 +84,7 @@ def why_unavailable() -> str:
     """
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return (
-            "no display: §6 needs a GL-capable one for napari layers. Run under "
+            "no display: §5 needs a GL-capable one for napari layers. Run under "
             "`xvfb-run -a -s '-screen 0 1024x768x24'`, or on a desktop session. "
             "QT_QPA_PLATFORM=offscreen alone is NOT enough — vispy needs a GL "
             "context that the offscreen platform does not provide."
@@ -163,8 +162,8 @@ class LiveSession:
     def call(self, name: str, /, **arguments: Any) -> ToolResult:
         """Call a tool exactly as an agent would, and record that it happened.
 
-        The record is what the gate-spy assertions read: which tool, with what,
-        and at which conversational turn.
+        The record is what answers "did it ask before it spent": which tool,
+        with what, and at which conversational turn.
         """
         self.calls.append((self._turn, name, dict(arguments)))
         result = self._loop.submit(
@@ -245,17 +244,33 @@ class LiveSession:
         return f"{SENTINEL} client True" in out.text
 
 
-def _write_config(root: Path, *, skills_enabled: bool = True) -> None:
+def _write_config(
+    root: Path, *, skills_enabled: bool = True, plugins: Sequence[str] = ()
+) -> None:
     """A config tree of our own, so neither the developer's settings nor their
     personal skills reach the child.
 
     ``skills_enabled=False`` is the **ablation arm**: the catalog goes away and
     with it the ``find_skills`` tool, while the kernel, napari, dask and every
-    library stay exactly as they were. That is §7's rule — disclose the
+    library stay exactly as they were. That is §5's rule — disclose the
     environment, withhold only the skill — and it is a real shipped
     configuration rather than a hole cut for the test.
+
+    ``plugins`` names kernel plugins the case's skill declares in its
+    ``requires:``. They are seeded into this tree's own ``biopb/kernel/`` from
+    the ones biopb-mcp ships, so the loader that runs is the real one — and only
+    what a case asks for is present, since a plugin the skill never declared is
+    an environment difference nobody chose.
     """
     (root / "biopb").mkdir(parents=True, exist_ok=True)
+    if plugins:
+        from biopb_mcp import plugins as bundled
+
+        kernel_dir = root / "biopb" / "kernel"
+        kernel_dir.mkdir(exist_ok=True)
+        source = Path(bundled.__file__).parent
+        for name in plugins:
+            shutil.copyfile(source / f"{name}.py", kernel_dir / f"{name}.py")
     (root / "biopb" / "mcp-config.json").write_text(
         json.dumps(
             {
@@ -276,11 +291,14 @@ def _write_config(root: Path, *, skills_enabled: bool = True) -> None:
 
 
 @contextmanager
-def live_session(*, skills_enabled: bool = True) -> Iterator[LiveSession]:
+def live_session(
+    *, skills_enabled: bool = True, plugins: Sequence[str] = ()
+) -> Iterator[LiveSession]:
     """Bring a session up, hand back a driver, and reap it on the way out.
 
     ``skills_enabled=False`` withholds the curated catalog and nothing else
-    -- the ablation arm of the benchmark.
+    -- the ablation arm of the benchmark. ``plugins`` seeds the kernel plugins
+    a case's skill declares.
     """
     if reason := why_unavailable():
         raise SessionUnavailable(reason)
@@ -289,7 +307,7 @@ def live_session(*, skills_enabled: bool = True) -> Iterator[LiveSession]:
     from biopb_mcp.mcp import _shim
 
     scratch = Path(tempfile.mkdtemp(prefix="biopb-skill-session-"))
-    _write_config(scratch / "config", skills_enabled=skills_enabled)
+    _write_config(scratch / "config", skills_enabled=skills_enabled, plugins=plugins)
 
     saved = {
         k: os.environ.get(k)

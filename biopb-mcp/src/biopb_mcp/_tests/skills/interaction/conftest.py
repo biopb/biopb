@@ -1,6 +1,6 @@
 """Smoke first, and the benchmark only after it passes.
 
-§6 is the least isolable tier in the suite: a red run's cause space is the skill
+§5 is the least isolable tier in the suite: a red run's cause space is the skill
 body, the model, the tool schemas, the kernel, Qt, dask and the fixture.
 `test_session_smoke.py` is the mitigation — when the *stack* is what broke, it
 fails deterministically and for free.

@@ -178,7 +178,7 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 # only source the runtime reads — a skill is documentation about a specific
 # runtime version, so it rides that version's upgrade cycle rather than being
 # fetched. There is no catalog index: the frontmatter is the metadata and
-# mcp/_skills.py parses it. See docs/skill-testing.md §9.
+# mcp/_skills.py parses it. See biopb-mcp/docs/skill-interface.md §1.
 "biopb_mcp.mcp" = ["_skills_data/*.md"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
@@ -213,21 +213,16 @@ qt_api = "pyqt6"
 # seconds each over a torch-sized graph), so it is deselected by default and run
 # as its own CI step. A command-line -m overrides this one, which is how
 # `-m satisfiability` and `-m contract` still work.
-addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not outcome and not interaction'"
+addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not interaction'"
 markers = [
     # Resolves each skill's pkg: tokens against the installed environment to
     # reject a package that installs only by moving biopb's own deps. Metadata
     # only -- nothing is downloaded or installed. See _tests/skills/README.md.
     "satisfiability: resolves a skill's declared packages against this environment",
-    # Runs a skill's procedure against a fixture with a known answer. Slower
-    # than a unit test, writes artifacts, and needs each skill's package -- so
-    # it is deselected by default and run as its own step. docs/skill-testing.md
-    # §5 and _tests/skills/outcomes/README.md.
-    "outcome: scores a skill's procedure against a ground-truth fixture",
     # Puts a model in front of the shipped skill body against a REAL session --
     # kernel, napari, dask, the nine real tools. Slow, needs a GL-capable
     # display, and the agent rows need an API key; never in CI.
-    # docs/skill-testing.md §6 and _tests/skills/interaction/README.md.
+    # biopb-mcp/docs/skill-testing.md §5 and _tests/skills/interaction/README.md.
     "interaction: drives a real biopb-mcp session, and sometimes a model",
 ]
 

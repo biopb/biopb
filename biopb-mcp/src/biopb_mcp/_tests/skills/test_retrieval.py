@@ -1,6 +1,6 @@
 """Does a real description answer the phrasings a user would type?
 
-The other half of `docs/skill-testing.md` §4. The matcher's *semantics* are
+The other half of `biopb-mcp/docs/skill-testing.md` §3. The matcher's *semantics* are
 pinned in `_tests/test_skills.py` against synthetic catalogs; this reads the
 shipped descriptions and asks whether they retrieve.
 

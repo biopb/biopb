@@ -1,6 +1,6 @@
 """Which model sits on each side of the conversation, and how to reach it.
 
-Both sides of §6 are chat models, so provider selection is one concern and
+Both sides of §5 are chat models, so provider selection is one concern and
 lives here rather than being hardcoded into either. The two sides are named and
 configured **independently**:
 
@@ -16,7 +16,7 @@ An earlier version hardcoded the respondent to Anthropic and read the agent's
 endpoint from the shared `OPENAI_BASE_URL`, which made "one on each of two
 compatible endpoints" impossible to say.
 
-**What §6a constrains is the agent, and only the agent**: it must not come from
+**What §5a constrains is the agent, and only the agent**: it must not come from
 the family that wrote the skill, because it could then pass by recognising its
 own prose. The respondent holds a persona and answers from a fact table, which
 is not a job where family contamination helps, so nothing here restricts it.
@@ -59,7 +59,7 @@ DEFAULT_RESPONDENT = "anthropic:claude-sonnet-5"
 #: Model-name substrings that mean "this came from the family that wrote these
 #: skills", checked in addition to the provider. Needed because `provider:`
 #: names a wire protocol as often as a vendor: behind an OpenAI-compatible
-#: gateway a Claude model is spelled `openai:claude-...`, and §6a's whole point
+#: gateway a Claude model is spelled `openai:claude-...`, and §5a's whole point
 #: is to notice that. Not a security boundary -- a gateway can name a model
 #: anything -- but it catches the mistake somebody actually makes.
 AUTHORING_FAMILY_MARKERS = ("claude", "sonnet", "opus", "haiku")
@@ -146,7 +146,7 @@ class Provider:
     sdk: str  # "openai" | "anthropic"
     key_env: str
     base_url: str = ""
-    #: True when this vendor authored the skills in this repo. §6a reads it.
+    #: True when this vendor authored the skills in this repo. §5a reads it.
     wrote_these_skills: bool = False
 
 
@@ -200,7 +200,7 @@ class ModelChoice:
         serving many vendors' models — `openai:` says nothing about who trained
         what is on the other end, so a gateway-served Claude spells
         ``openai:claude-sonnet-5`` and would sail through a check that only
-        read the provider. That is precisely the case §6a exists to catch, so
+        read the provider. That is precisely the case §5a exists to catch, so
         the model name is read too.
 
         A name check is a heuristic and cannot be otherwise: a gateway may call
@@ -236,7 +236,7 @@ def parse_choice(spec: str, base_url: str = "") -> ModelChoice:
     """``"openai:gpt-5"`` -> a :class:`ModelChoice`.
 
     A bare model name is an error rather than a guess: which vendor is serving
-    a model is exactly the thing §6a cares about, and inferring it from the
+    a model is exactly the thing §5a cares about, and inferring it from the
     model string would make the rule depend on naming conventions.
     """
     provider_name, _, model = spec.partition(":")

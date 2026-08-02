@@ -1,6 +1,6 @@
 """Can a real session be brought up, driven, and reaped — with no model at all?
 
-This is the floor the interaction layer stands on. §6 is the least isolable
+This is the floor the interaction layer stands on. §5 is the least isolable
 tier in the suite: a red run's cause space includes the skill body, the model,
 the tool schemas, the kernel, Qt, dask and the fixture. These tests exist so
 that when the stack is the problem, *they* fail — separately, deterministically,
@@ -72,9 +72,10 @@ def test_the_server_instructions_reach_the_client(session):
 
 
 def test_the_skill_body_comes_from_the_shipped_catalog(session):
-    """The property §5 turned out not to have. This reads `drift-correction`
-    through the same `_skills.py` the runtime uses, so deleting or editing the
-    file changes what an interaction run is scored against."""
+    """The property that makes this layer worth its cost. This reads
+    `drift-correction` through the same `_skills.py` the runtime uses, so
+    deleting or editing the file changes what a run is scored against — which is
+    exactly what a hand-transcribed procedure could never do."""
     found = session.call("find_skills", query="stage drift in a time lapse")
     assert "drift-correction" in found.text, found.text[:400]
 
@@ -124,7 +125,7 @@ def test_a_missing_result_reads_as_absent_not_as_an_error(session):
 
 
 def test_the_fixture_can_be_a_napari_layer(session):
-    """How a §6 fixture actually reaches the agent, with no tensor plane: as a
+    """How a §5 fixture actually reaches the agent, with no tensor plane: as a
     layer on the viewer, which every skill's Parameters table accepts as a
     source. This is the call that fails without a GL context."""
     movie = np.random.default_rng(1).random((4, 2, 16, 16)).astype(np.float32)
@@ -141,7 +142,7 @@ def test_the_fixture_can_be_a_napari_layer(session):
 
 
 def test_tool_calls_are_recorded_for_the_gate_spy(session):
-    """Structural assertions (§6) ask whether a blocking question preceded the
+    """Structural assertions (§5) ask whether a blocking question preceded the
     expensive call. That needs a record of what was called and when, and setup
     the harness itself did must not appear in it as agent behaviour."""
     before = len(session.calls)

@@ -1,8 +1,8 @@
 """The agent under test, behind one small protocol.
 
-§6a: **not from the family that wrote the skill.** These bodies were
+§5a: **not from the family that wrote the skill.** These bodies were
 co-authored with Claude, so a Claude agent can pass by recognising its own
-prose rather than by reading it — and §7 already records that blind spots
+prose rather than by reading it — and §6 already records that blind spots
 correlate within a family. The reference agent is therefore a hosted
 non-Anthropic model, and the *family* is part of what makes it a valid fixture,
 not just the version.
@@ -13,8 +13,8 @@ at all:
 :class:`ScriptedAgent`
     A canned sequence of turns. No model, no key, no network — and it drives
     the whole conversation loop, respondent hand-off, trace and scraping
-    deterministically. The same move as the scripted subjects in §6b: prove the
-    machinery works before paying anything to exercise it.
+    deterministically. Prove the machinery works before paying anything to
+    exercise it.
 
 :class:`ToolCallingAgent`
     The real one. Chat-completions with tool calling, which reaches OpenAI,
@@ -100,7 +100,7 @@ class ScriptedAgent:
 class ReplayAgent:
     """Replays the agent side of a recorded trace.
 
-    What this is for: the structural assertions (§6) are about the *shape* of a
+    What this is for: the structural assertions (§5) are about the *shape* of a
     conversation — how many blocking questions, whether one preceded the
     expensive call — and that shape is fixed once the run happened. Re-checking
     it should not cost another run, and a finding should be reproducible by
@@ -143,7 +143,7 @@ class ToolCallingAgent:
     the address and the key, exactly as it does for the respondent.
 
     There is no Anthropic tool-calling agent here, and that is a *consequence*
-    of §6a rather than an omission: the one family whose SDK would need its own
+    of §5a rather than an omission: the one family whose SDK would need its own
     implementation is the family that wrote these skills, so such an agent
     would be unusable the moment it existed. If a skill is ever authored by
     another family, this is where the second implementation goes.

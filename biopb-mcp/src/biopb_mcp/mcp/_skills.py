@@ -12,7 +12,7 @@ A skill is documentation about a specific runtime version — it quotes an API,
 assumes a namespace handle, depends on packages resolving a particular way — so
 it rides that version's upgrade cycle rather than being served to every release
 in the field at once. The cost is that a skill fix needs a release; the local
-dir below is the escape hatch. See ``docs/skill-testing.md`` §9.
+dir below is the escape hatch. See ``docs/skill-interface.md`` §1.
 
 There is no catalog index. The frontmatter *is* the metadata, and this module
 parses it, so there is no generated file to disagree with the bodies.

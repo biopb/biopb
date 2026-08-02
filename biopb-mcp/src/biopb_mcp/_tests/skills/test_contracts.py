@@ -1,6 +1,6 @@
 """A skill body is an un-versioned assertion about someone else's API.
 
-`docs/skill-testing.md` §3. The satisfiability gate next door answers "may this
+`biopb-mcp/docs/skill-testing.md` §4. The satisfiability gate next door answers "may this
 package be installed at all"; this answers the question after it — "does the
 surface the body quotes still look like that". Both have to be true before a
 `pkg:` token is honest.
@@ -12,8 +12,8 @@ table described. Nothing about that is findable by testing the agent; it is a
 default in a library nobody in this repo owns.
 
 It went unmanned once already: the original module was written entirely for
-`flatfield-and-stitch-tiles` and was deleted with it in #667, leaving §3 with the
-note "returns with the first skill whose package passes §3a". That is
+`flatfield-and-stitch-tiles` and was deleted with it in #667, leaving §4 with the
+note "returns with the first skill whose package passes §4a". That is
 `drift-correction`. To stop the same thing happening silently a second time,
 `test_every_declared_package_is_covered_here` fails when a shipped skill declares
 a third-party package this module says nothing about -- the same shape as the

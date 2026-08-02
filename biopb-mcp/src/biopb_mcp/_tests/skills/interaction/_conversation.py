@@ -6,7 +6,7 @@ becomes the next user turn. That is the whole idea: the agent has no other way
 to reach the person who knows which channel is structural, so asking is not
 something the harness rewards — it is the only route to the answer.
 
-**The trace is written before any assertion runs.** §6 is the least isolable
+**The trace is written before any assertion runs.** §5 is the least isolable
 tier in the suite: a red run's cause space is the skill body, the model, the
 tool schemas, the kernel, Qt, dask and the fixture. An assertion message cannot
 tell those apart and a transcript usually can, so the transcript exists
@@ -73,7 +73,7 @@ class Trace:
 
     @property
     def blocking_questions(self) -> list[str]:
-        """The subset that actually asks for something — what §6's "at most
+        """The subset that actually asks for something — what §5's "at most
         three blocking checkpoints" is counted against.
 
         Not the same as :attr:`questions`, and the difference is not pedantry.
@@ -99,8 +99,8 @@ class Trace:
     def first_call_of(self, name: str) -> int | None:
         """Index into :attr:`events` of the first call to *name*, or ``None``.
 
-        The gate spy: compare it against the index of a question to answer
-        "did it ask before it spent".
+        The gate question: compare it against the index of a question to
+        answer "did it ask before it spent".
         """
         for i, e in enumerate(self.events):
             if e.role == "tool" and e.name == name:

@@ -1,4 +1,4 @@
-# Layer 1 signature contracts for the skills catalog (docs/skill-testing.md §3).
+# Layer 1 signature contracts for the skills catalog (biopb-mcp/docs/skill-testing.md §4).
 #
 # A skill body is an un-versioned assertion about someone else's API. This job
 # proves those assertions against the real library -- that the parameter exists,

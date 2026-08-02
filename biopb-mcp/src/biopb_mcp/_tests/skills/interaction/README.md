@@ -1,6 +1,6 @@
 # The interaction layer
 
-[`docs/skill-testing.md`](../../../../../../docs/skill-testing.md) §6. Put a
+[`biopb-mcp/docs/skill-testing.md`](../../../../docs/skill-testing.md) §5. Put a
 model in front of the **shipped** skill body, against a **real** session, and
 score what comes out.
 
@@ -10,13 +10,14 @@ xvfb-run -a -s '-screen 0 1024x768x24' \
   uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction
 ```
 
-Deselected by default (`-m interaction`), like `outcome` and `satisfiability`,
-and never in CI (§10).
+Deselected by default (`-m interaction`), like `satisfiability`, and never in
+CI (§1).
 
-The hermetic half — the loop, the trace, the personas — is **not** marked and
-runs with the ordinary suite, like `outcomes/test_outcome_protocol.py`. A break
-in the machinery should surface as a normal red test rather than be found by
-someone mid-diagnosis with a paid run.
+The hermetic half — the loop, the trace, the personas, the fixtures, the
+verifiers — is **not** marked and runs with the ordinary suite. A break in the
+machinery, or a case whose persona gives its own answer away, should surface as
+a normal red test rather than be found by someone mid-diagnosis with a paid
+run.
 
 ## Running one with real models
 
@@ -38,10 +39,10 @@ Known providers: `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` — each 
 at a different address. Override an address with
 `BIOPB_SKILL_AGENT_BASE_URL` / `BIOPB_SKILL_RESPONDENT_BASE_URL`. A bare model
 name is refused rather than guessed: which vendor serves a model is exactly the
-fact §6a turns on, and inferring it from the name would make the rule depend on
+fact §5a turns on, and inferring it from the name would make the rule depend on
 vendors' naming conventions.
 
-**§6a constrains the agent, not the respondent.** The respondent is skill-blind
+**§5a constrains the agent, not the respondent.** The respondent is skill-blind
 and answers from a fact table, and having written the skills does not help with
 that — so Anthropic is a fine respondent and is the default, while the default
 *agent* is deliberately not from the authoring family. `test_models.py` asserts
@@ -51,9 +52,8 @@ both, off the provider table rather than off a comment.
 before spending anything.
 
 The provider SDKs are imported lazily and are **not** dependencies of this
-package — one `--with` line, the same pattern the outcome layer uses for
-`pystackreg`. Keys are read from the environment at call time and are never
-written to a trace, an artifact or a log.
+package — one `--with` line each. Keys are read from the environment at call
+time and are never written to a trace, an artifact or a log.
 
 ## What is here
 
@@ -64,45 +64,49 @@ written to a trace, an artifact or a log.
 | `_models.py` | The provider table: which model on each side, at which address, with which key |
 | `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `ToolCallingAgent` |
 | `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
+| `_fixture.py` | What a run is given and what it recovers: `Fixture`, `Attempt`, `Metric`, `Outcome`, the curated-data path, artifact writing. Knows no skill |
 | `_benchmark.py` | The engine: `Case`, the 2x2 arms, outcome classification, the report. Knows no skill |
-| `cases/` | One module per skill, each a single `Case`. Data, not code |
+| `cases/` | One module per skill, each a single `CASE`. Data, not code |
 | `_conversation.py` | The two-model loop, the caps, the `Trace` |
 | `test_benchmark.py` | The pytest surface: run every case, assert only that it reported |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
 | `test_conversation.py` | That the loop works, with no model *and* no session |
 | `test_report.py` | That the engine classifies and reports, on hand-built outcomes |
-| `test_personas.py` | That no case's persona gives anything away |
-| `test_models.py` | That provider selection resolves, and that §6a holds of the defaults |
+| `test_cases.py` | That every case's persona, fixture and verifier hold up — and that the catalogue is covered |
+| `test_fixture_protocol.py` | The scoring protocol itself, including the curated path almost no machine has data for |
+| `test_models.py` | That provider selection resolves, and that §5a holds of the defaults |
 
 ## Adding a skill
 
-The engine is skill-agnostic, so a new skill is **data**:
-
-1. register an `interaction`-tier fixture in `outcomes/` — the one that strips a
-   fact from the data so it can only be obtained by asking, proved there
-   deterministically and without a model (§6b);
-2. write `cases/<skill>.py` holding one `Case`;
-3. add it to `cases.CASES`.
+The engine is skill-agnostic, so a new skill is **data**: one module under
+`cases/`, exporting a module-level `CASE`. There is no registration step — the
+module is discovered by being there.
 
 ```python
 CASE = Case(
-    skill="drift-correction",
-    task=TASK,                                   # the prompt, incl. where results land
-    persona=MICROSCOPIST,                        # who holds the withheld fact
-    layers={"timelapse": "movie"},               # layer name -> fixture data key
-    collect={"offsets": "offsets", "corrected": "corrected"},
-    score=_drift.verify,                         # the outcome layer's verifier, reused
-    save_artifacts=_drift.save_artifacts,
-    spy=GATE_SPY,                                # optional: did it ask before it spent
-    spy_markers=("register_stack", ...),
+    skill="calibrated-measurements",
+    task=TASK,                        # the prompt, incl. where results land
+    persona=MICROSCOPIST,             # who holds the fact the fixture withholds
+    build=Ellipsoids(),               # () -> Fixture: data, truth, tolerances
+    layers=(Layer("nuclei", "image"),
+            Layer("nuclei_labels", "labels", kind="labels")),
+    collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},
+    score=verify,                     # (fixture, attempt) -> Outcome
+    save_artifacts=save_artifacts,
+    plugins=("segmentation_qc",),     # kernel plugins the skill's `requires:` names
     persona_must_know=(...), persona_must_not_know=(...),
 )
 ```
 
-No test code: `test_benchmark.py` parametrizes over `CASES`, so the new case
-brings its own arms, report and transcripts, and `test_personas.py` /
-`test_report.py` start checking it by its arriving. Report and transcripts land
-under `.skill-outcomes/interaction/<skill>/`.
+A skill that cannot be benchmarked goes in `cases.NOT_BENCHMARKED` with the
+reason instead; `test_cases.py` asserts the shipped catalogue is covered by one
+or the other, so "what does this cover" never has to be answered by reading the
+directory.
+
+No test code either way: `test_benchmark.py` parametrizes over `CASES`, so the
+new case brings its own arms, report and transcripts, and `test_cases.py` starts
+checking its persona, its fixture and its verifier by its arriving. Report and
+transcripts land under `.skill-outcomes/interaction/<skill>/`.
 
 ## A benchmark, not a gate
 
@@ -110,7 +114,7 @@ under `.skill-outcomes/interaction/<skill>/`.
 `reason` — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`,
 `gave-up`, `no-result`, `unscorable-result`, `harness-error` — plus flags that
 change how to read it: `cut-off-but-scored`, `over-ask-budget(n)`,
-`never-asked`, `never-registered`, `catalog-mismatch`.
+`never-asked`, `catalog-mismatch`.
 
 Every arm runs inside its own `try`, so a corner that dies becomes a row rather
 than an exception that destroys the other three. The report is the deliverable;
@@ -138,15 +142,17 @@ No monotonic pattern, so the spread is run-to-run variance rather than the
 manipulations: **no delta can be claimed from this, in either direction.**
 
 That is the layer's real output so far, and it is worth more than a green
-light. `n=1` per corner is not a measurement — see `docs/skill-testing.md` §6d
+light. `n=1` per corner is not a measurement — see `biopb-mcp/docs/skill-testing.md` §5c
 for what follows.
 
 ## Why this tier is the one with teeth
 
-Every other layer reads a skill file, or runs a procedure transcribed from one.
-§5 was pulled out of the merge gate for exactly that reason: its subjects are a
-hand transcription, so deleting `drift-correction.md` would leave it green
-(§5c).
+This suite used to carry a layer below this one that ran each skill's procedure
+as a **hand transcription** of what its body said, scored against the same kind
+of fixture. It was dropped, and the reason is the argument for this one: a
+transcription never reads the file, so editing a step — or deleting the skill —
+left it green. It also could not reach the instructions that need a *choice* in
+order to be wrong, which is most of what these bodies are for.
 
 Here the body arrives through the real `biopb_mcp.mcp._skills` — `find_skills`
 and `skill://<id>`, the same calls the runtime makes — and the run happens
@@ -156,7 +162,7 @@ tools with their real schemas and the server's own `instructions`.
 **Nothing is stood in for, and that was a deliberate choice.** A hand-written
 tool surface would have been cheaper and would have put `execute_code`'s return
 shape, `server_status`'s report and the `guide://` bodies back into a
-transcription — the same disease one level up.
+transcription — the same disease, moved from the subject into the environment.
 
 ## What this needs
 
@@ -168,7 +174,28 @@ rather than run somewhere subtly different.
 
 Nothing else: no API key for the smoke tests, and no network beyond loopback.
 
-## Three things the harness forces
+## What a fixture has to withhold
+
+The whole tier rests on one claim per case: that the fact the respondent holds
+is **not obtainable from the pixels**, so the numeric outcome cannot come out
+right without asking.
+
+The first fixture written here got that half right and it is worth knowing why.
+`drift-correction`'s movie is built so every available heuristic — contrast,
+peak intensity, feature density — points at the wrong channel, and a scripted
+run that guessed was 5 px out where one that was told was 0.0006 px out. Then a
+capable agent recovered the answer anyway, by registering on both channels and
+keeping the self-consistent one. Defeating the heuristics *its author thought
+of* is not the same as being unobtainable.
+
+So prefer a withheld fact that is **categorically absent** from the data — a
+unit, a scale, a provenance, an identity. `calibrated-measurements` withholds
+µm per voxel: no amount of looking at an array of numbers yields microns.
+`segmentation-qc-metrics` withholds which of two label layers a person drew,
+and pays for it in precision and recall while F1 — symmetric under the swap —
+stays exactly right.
+
+## Four things the harness forces
 
 Each of these silently changes what a run tests, so none of them is inherited
 from whatever machine is running.
@@ -192,6 +219,13 @@ resolve.
 reads neither the developer's `mcp-config.json` nor their personal
 `~/.config/biopb/skills/*.md`. The catalog under test is the shipped one.
 
+**Only the kernel plugins a case asks for.** That same temp tree means an empty
+`~/.config/biopb/kernel/`, so a skill declaring `plugin:segmentation_qc` would
+be scored in a session where its own `requires:` cannot be met. `Case.plugins`
+seeds the ones it names, from the copies biopb-mcp ships, through the real
+loader — and nothing else, because a plugin the skill never declared is an
+environment difference nobody chose.
+
 ## Arrays cross by file, not by literal
 
 `put_array` / `get_array` write `.npy` into a shared temp dir and have the
@@ -208,13 +242,13 @@ already refuses to treat as a pass.
 
 `session.call(...)` is the agent acting and is recorded with its turn number.
 `session.setup(...)` is the harness talking to the kernel around the agent and
-is recorded at turn `-1`. The structural assertions (§6) ask whether a blocking
-question preceded the expensive call, so injecting the fixture must never read
-as something the agent did.
+is recorded at turn `-1`. The report says whether a blocking question preceded
+the expensive call, so injecting the fixture must never read as something the
+agent did.
 
 ## Why the smoke tests exist
 
-§6 is the least isolable tier in the suite: a red run's cause space is the skill
+§5 is the least isolable tier in the suite: a red run's cause space is the skill
 body, the model, the tool schemas, the kernel, Qt, dask and the fixture. That is
 the real cost of testing against the full environment rather than a stand-in,
 and it was taken on with open eyes.
