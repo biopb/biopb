@@ -72,7 +72,7 @@ def test_entry_to_dict_is_complete_and_ordered():
         tags=["t"],
         version="1.0.0",
         spec_version=CURRENT_SPEC_VERSION,
-        requires=["viewer"],
+        checklist=["viewer"],
     )
     d = entry.to_dict()
     assert list(d) == [
@@ -82,9 +82,9 @@ def test_entry_to_dict_is_complete_and_ordered():
         "tags",
         "version",
         "spec_version",
-        "requires",
+        "checklist",
     ]
-    assert d["requires"] == ["viewer"]
+    assert d["checklist"] == ["viewer"]
 
 
 def test_the_entry_carries_no_fetch_fields():

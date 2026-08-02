@@ -1,7 +1,7 @@
 """Rules the shipped skill files must satisfy, beyond well-formedness.
 
 :mod:`._validate` answers "is this parseable and complete". These answer "is what
-it claims still coherent" -- the `requires:` grammar the agent resolves at
+it claims still coherent" -- the `checklist:` grammar the agent resolves at
 runtime, cross-skill links that must land somewhere, and the authoring
 guardrails from `write-a-skill` that are mechanically checkable.
 
@@ -19,7 +19,7 @@ import pytest
 from ._validate import Report, split_frontmatter, validate
 from .conftest import SKILLS_DIR, read_skill
 
-# The live `requires:` vocabulary. The agent resolves these against
+# The live `checklist:` vocabulary. The agent resolves these against
 # `server_status`, so a token outside the grammar is not a lint nit -- it is a
 # requirement that silently never resolves.
 BARE_TOKENS = {"viewer", "tensor", "dask"}
@@ -88,14 +88,14 @@ def test_what_validates_is_what_the_runtime_loads(shipped):
     assert loaded == {e.id for e in entries}
 
 
-# --- requires: grammar ----------------------------------------------------
+# --- checklist: grammar -------------------------------------------------------
 
 
-def test_every_requires_token_is_in_the_live_vocabulary(shipped):
+def test_every_check_token_is_in_the_live_vocabulary(shipped):
     entries, _ = shipped
     bad = []
     for e in entries:
-        for token in e.requires:
+        for token in e.checklist:
             if token in BARE_TOKENS:
                 continue
             m = NAMESPACED.match(token)
@@ -112,13 +112,13 @@ def test_every_requires_token_is_in_the_live_vocabulary(shipped):
                 )
             elif kind == "ops" and not value:
                 bad.append(f"{e.id}: {token!r} (ops needs a kind)")
-    assert not bad, "requires: tokens outside the vocabulary:\n" + "\n".join(bad)
+    assert not bad, "checklist: tokens outside the vocabulary:\n" + "\n".join(bad)
 
 
-def test_requires_has_no_duplicates(shipped):
+def test_check_has_no_duplicates(shipped):
     entries, _ = shipped
     for e in entries:
-        assert len(e.requires) == len(set(e.requires)), f"{e.id}: {e.requires}"
+        assert len(e.checklist) == len(set(e.checklist)), f"{e.id}: {e.checklist}"
 
 
 def test_a_skill_that_drives_the_kernel_pins_a_biopb_mcp_floor(shipped):
@@ -127,10 +127,10 @@ def test_a_skill_that_drives_the_kernel_pins_a_biopb_mcp_floor(shipped):
     metaskill is the exception -- it authors a file and touches nothing."""
     entries, _ = shipped
     for e in entries:
-        drives_kernel = any(t in BARE_TOKENS for t in e.requires)
-        pinned = any(t.startswith("pkg:biopb-mcp>=") for t in e.requires)
+        drives_kernel = any(t in BARE_TOKENS for t in e.checklist)
+        pinned = any(t.startswith("pkg:biopb-mcp>=") for t in e.checklist)
         if drives_kernel:
-            assert pinned, f"{e.id} requires the session but no pkg:biopb-mcp>=X floor"
+            assert pinned, f"{e.id} drives the session but no pkg:biopb-mcp>=X floor"
         else:
             assert not pinned, f"{e.id} pins biopb-mcp but declares nothing it drives"
 
@@ -141,7 +141,7 @@ def test_a_declared_plugin_is_called_through_its_module_name(shipped, bodies):
     written against a namespace it does not get."""
     entries, _ = shipped
     for e in entries:
-        for token in e.requires:
+        for token in e.checklist:
             if token.startswith("plugin:"):
                 stem = token.split(":", 1)[1]
                 assert f"{stem}." in bodies[e.id], (
@@ -219,17 +219,21 @@ def test_bodies_stay_under_the_length_proxy(shipped_skill_files):
     assert not oversized, "\n".join(oversized)
 
 
+def _first_step(body: str, skill_id: str) -> str:
+    steps = body.split("## Steps", 1)
+    assert len(steps) == 2, f"{skill_id}: no '## Steps' section"
+    return steps[1].lstrip().split("\n2.", 1)[0]
+
+
 def test_the_first_step_is_the_requirement_check(bodies, shipped):
-    """Whatever the tier, step 1 is resolving `requires:` -- there is no point
+    """Whatever the tier, step 1 is resolving `checklist:` -- there is no point
     asking the user which layer is truth if the scorer was never going to be
     there. A skill requiring nothing has nothing to check."""
     entries, _ = shipped
     for e in entries:
-        if not e.requires:
+        if not e.checklist:
             continue
-        steps = bodies[e.id].split("## Steps", 1)
-        assert len(steps) == 2, f"{e.id}: no '## Steps' section"
-        first_step = steps[1].lstrip().split("\n2.", 1)[0]
-        assert "requires:" in first_step and "server_status" in first_step, (
-            f"{e.id}: step 1 does not resolve requires: against server_status"
+        first_step = _first_step(bodies[e.id], e.id)
+        assert "checklist:" in first_step and "server_status" in first_step, (
+            f"{e.id}: step 1 does not resolve checklist: against server_status"
         )

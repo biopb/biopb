@@ -132,8 +132,11 @@ def _entry(text: str, *, stem: str, origin: str, updated: str = "") -> dict | No
 
     tags = fm.get("tags")
     tags = [str(t) for t in tags] if isinstance(tags, list) else []
-    requires = fm.get("requires")
-    requires = [str(r) for r in requires] if isinstance(requires, list) else []
+    # `requires:` was this key's name until the rename; a local skill in the
+    # user's own directory may still say it, and dropping their list silently is
+    # worse than reading it.
+    checklist = fm.get("checklist", fm.get("requires"))
+    checklist = [str(c) for c in checklist] if isinstance(checklist, list) else []
 
     return {
         "id": skill_id,
@@ -141,7 +144,7 @@ def _entry(text: str, *, stem: str, origin: str, updated: str = "") -> dict | No
         "description": description,
         "tags": tags,
         "version": str(fm.get("version") or ""),
-        "requires": requires,
+        "checklist": checklist,
         "updated": str(fm.get("updated") or updated or ""),
         "origin": origin,
     }
@@ -410,7 +413,7 @@ def find_skills(query: str = "") -> list[dict]:
                 "tags": s["tags"],
                 "version": s["version"],
                 "updated": s["updated"],
-                "requires": s["requires"],
+                "checklist": s["checklist"],
                 # "local" = the user's own file, unreviewed. The agent should be
                 # able to say so rather than let a draft pass as curated.
                 "origin": s.get("origin", _ORIGIN_CATALOG),

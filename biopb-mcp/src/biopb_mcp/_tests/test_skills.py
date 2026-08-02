@@ -171,16 +171,33 @@ def test_shipped_skill_entry_is_built_from_its_frontmatter(
         "description: d\n"
         "tags: [a, b]\n"
         "version: 2.1.0\n"
-        "requires: [viewer, pkg:biopb-mcp>=0.13.0]\n"
+        "checklist: [viewer, pkg:biopb-mcp>=0.13.0]\n"
         "---\n\n# T\n\nbody\n",
         encoding="utf-8",
     )
     (found,) = _skills.find_skills("")
     assert found["tags"] == ["a", "b"]
     assert found["version"] == "2.1.0"
-    assert found["requires"] == ["viewer", "pkg:biopb-mcp>=0.13.0"]
+    assert found["checklist"] == ["viewer", "pkg:biopb-mcp>=0.13.0"]
     assert found["origin"] == "catalog"
     assert found["uri"] == "skill://x"
+
+
+def test_the_old_key_name_still_reads_for_a_users_own_skill(
+    mock_home, skills_cfg, monkeypatch, tmp_path
+):
+    # `requires:` was this key's name, and the tolerant reader is on the agent's
+    # path: a local skill written before the rename keeps its list rather than
+    # silently resolving nothing. The strict validator rejects it, so nothing
+    # shipped can drift back to the old spelling.
+    d = _ship(monkeypatch, tmp_path, [{"id": "y", "title": "T", "description": "d"}])
+    (d / "y.md").write_text(
+        "---\nid: y\ntitle: T\ndescription: d\nrequires: [viewer]\n"
+        "---\n\n# T\n\nbody\n",
+        encoding="utf-8",
+    )
+    (found,) = _skills.find_skills("")
+    assert found["checklist"] == ["viewer"]
 
 
 def test_an_empty_shipped_set_warns_because_it_is_always_a_bug(
@@ -276,7 +293,7 @@ def test_local_skill_is_discovered_with_frontmatter(local_skills, mock_home):
         "title: My workflow\n"
         "description: does the thing\n"
         "tags: [segmentation, workflow]\n"
-        "requires: [viewer]\n"
+        "checklist: [viewer]\n"
         "version: 1.2.0\n"
         "---\n"
         "\n# My workflow\n\nSteps here.\n",
@@ -287,7 +304,7 @@ def test_local_skill_is_discovered_with_frontmatter(local_skills, mock_home):
     assert found["title"] == "My workflow"
     assert found["description"] == "does the thing"
     assert found["tags"] == ["segmentation", "workflow"]
-    assert found["requires"] == ["viewer"]
+    assert found["checklist"] == ["viewer"]
     assert found["version"] == "1.2.0"
     assert found["origin"] == "local"
     assert found["updated"]  # from the file mtime
@@ -371,7 +388,7 @@ def test_local_body_gone_at_read_time_reports_instead_of_raising(
         "description": "d",
         "tags": [],
         "version": "",
-        "requires": [],
+        "checklist": [],
         "updated": "",
         "origin": "local",
         "_path": str(tmp_path / "gone.md"),

@@ -213,12 +213,17 @@ qt_api = "pyqt6"
 # seconds each over a torch-sized graph), so it is deselected by default and run
 # as its own CI step. A command-line -m overrides this one, which is how
 # `-m satisfiability` and `-m contract` still work.
-addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not interaction'"
+addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not availability and not interaction'"
 markers = [
     # Resolves each skill's pkg: tokens against the installed environment to
     # reject a package that installs only by moving biopb's own deps. Metadata
     # only -- nothing is downloaded or installed. See _tests/skills/README.md.
     "satisfiability: resolves a skill's declared packages against this environment",
+    # Resolves each skill's pkg: tokens for all nine supported interpreter x
+    # platform cells, from one job, so a per-cell verdict is knowable in one
+    # place: unavailable rejects a required token and is recorded for an
+    # optional one. See _tests/skills/README.md.
+    "availability: resolves a skill's declared packages for every supported platform",
     # Puts a model in front of the shipped skill body against a REAL session --
     # kernel, napari, dask, the nine real tools. Slow, needs a GL-capable
     # display, and the agent rows need an API key; never in CI.

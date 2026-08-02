@@ -66,7 +66,7 @@ def write_skill(
             f"description: One sentence describing what the user gets.\n"
             f"tags: [testing]\n"
             f"version: 1.0.0\n"
-            f"requires: []\n"
+            f"checklist: []\n"
         )
     )
     path.write_text(

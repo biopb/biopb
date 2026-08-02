@@ -95,7 +95,7 @@ _SKILLS_INSTRUCTIONS = (
     "Skills name three checkpoint types in their steps; honor them:\n"
     "- confirm-input: ask before computing, but only for facts the data cannot "
     "give you (voxel spacing, which channel is which, expected object size).\n"
-    "- visual check: put the intermediate on the viewer and report two or three "
+    "- visual checklist: put the intermediate on the viewer and report two or three "
     "numbers with it -- never a screenshot alone, and report the numbers alone "
     "when the data is too large to show usefully.\n"
     "- validate-and-gate: stop and get the user's agreement before anything "
@@ -477,7 +477,7 @@ def get_kernel_guide() -> str:
 
     The skill-requirements section is appended only when the catalog is enabled
     (``services.skills_enabled``): with it off there is no ``find_skills`` to
-    return a ``requires:`` list, so the section would document an unreachable
+    return a ``checklist:``, so the section would document an unreachable
     tool -- the same gate the handshake instructions use.
     """
     if _skills_enabled:
@@ -538,9 +538,10 @@ def find_skills(query: str = "") -> list:
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
 
-    A result's `requires` lists what the skill needs (`viewer`, `tensor`, `dask`,
+    A result's `checklist` lists what the skill touches (`viewer`, `tensor`, `dask`,
     `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
-    skill: `server_status` answers every token except a third-party `pkg:` — it
+    skill — it informs rather than blocks, so a gap is something to name and
+    work around, not a reason to abandon the skill: `server_status` answers every token except a third-party `pkg:` — it
     does carry biopb-mcp's own version — and for those, `execute_code` an
     `import <name>` and read the version with
     `importlib.metadata.version("<name>")`, not the module's `__version__`
@@ -794,7 +795,7 @@ def server_status() -> str:
     queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
     tensor server connectivity, viewer layer count, the available `ops`, and which
     kernel plugins loaded. Use before heavy computation, and to resolve a skill's
-    `requires:` list.
+    `checklist:` list.
     """
     import psutil
 

@@ -244,3 +244,17 @@ def test_h2_sections_ignores_deeper_and_shallower_headings():
 
 def test_first_h1_returns_none_when_absent():
     assert first_h1("## Steps\n\ntext\n") is None
+
+
+def test_the_old_key_name_is_rejected_on_the_authors_path(skills_dir):
+    """`requires:` was renamed to `checklist:`. The runtime reader still accepts the
+    old name so a user's own older skill keeps its list, but a shipped one has
+    an author and a PR, and two spellings in the catalog is how a grammar rots.
+    """
+    write_skill(
+        skills_dir,
+        "old-key",
+        frontmatter="description: A sentence.\ntitle: T\nversion: 1.0.0\nrequires: [viewer]\n",
+    )
+    _, rep = validate(skills_dir)
+    assert any("renamed to `checklist:`" in m for m in rep.errors), rep.errors

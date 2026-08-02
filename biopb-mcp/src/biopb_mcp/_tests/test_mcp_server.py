@@ -103,7 +103,7 @@ class TestResources:
         assert "execute_code" in content
 
     def test_guide_routes_every_requires_token_to_a_status_section(self):
-        # The guide is where a skill's `requires:` is resolved, so every token
+        # The guide is where a skill's `checklist:` is resolved, so every token
         # kind must name the section that answers it -- a token with no route is
         # one the agent will guess at.
         guide = _server.get_kernel_guide()
@@ -153,7 +153,7 @@ class TestResources:
 
     def test_guide_skill_section_gated_on_the_catalog_switch(self):
         # With the catalog off there is no find_skills to hand back a
-        # `requires:` list, so the section documents a tool the agent cannot
+        # `checklist:`, so the section documents a tool the agent cannot
         # call -- the gate the handshake instructions already use.
         _server.set_skills_enabled(False)
         off = _server.get_kernel_guide()

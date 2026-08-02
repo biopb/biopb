@@ -144,7 +144,7 @@ class Case:
     score: Callable[[Fixture, Attempt], Outcome]
     #: Optional ``(outcome, dir) -> None`` — the before/after images.
     save_artifacts: Callable[[Outcome, Path], None] | None = None
-    #: Kernel plugins the skill's `requires:` names, seeded into the session's
+    #: Kernel plugins the skill's `checklist:` names, seeded into the session's
     #: own config tree. Without this a `plugin:` token is unresolvable and the
     #: run is scoring an environment the skill declares it cannot work in.
     plugins: Sequence[str] = ()

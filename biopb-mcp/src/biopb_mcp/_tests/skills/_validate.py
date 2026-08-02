@@ -135,7 +135,11 @@ def process(path: Path, rep: Report) -> SkillEntry | None:
     if not SEMVER.match(version):
         rep.err(fname, f"version must be MAJOR.MINOR.PATCH, got {version!r}")
 
-    requires = [str(r) for r in coerce_list(fm.get("requires"))]
+    if "requires" in fm and "checklist" not in fm:
+        # Strict side, so this is an authoring error rather than the tolerant
+        # alias the runtime reader keeps for the user's own older skills.
+        rep.err(fname, "`requires:` was renamed to `checklist:`")
+    checklist = [str(c) for c in coerce_list(fm.get("checklist", fm.get("requires")))]
 
     if not body.strip():
         rep.err(fname, "empty body")
@@ -156,7 +160,7 @@ def process(path: Path, rep: Report) -> SkillEntry | None:
         tags=tags,
         version=version,
         spec_version=int(fm["spec_version"]),
-        requires=requires,
+        checklist=checklist,
     )
 
 

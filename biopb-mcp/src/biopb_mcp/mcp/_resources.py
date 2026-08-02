@@ -97,15 +97,22 @@ and the round trip for data too large to hold: `guide://data`.
 
 # Appended to GUIDE only when the skills catalog is enabled
 # (``services.skills_enabled``, on by default; see _server.get_kernel_guide).
-# An install with skills off has no `requires:` lists to resolve and no
+# An install with skills off has no `checklist:` to resolve and no
 # `find_skills` to get them from, so this section would describe a tool the
 # agent cannot call -- the same reasoning as _SKILLS_INSTRUCTIONS.
 SKILL_REQUIREMENTS = """\
 
 ## Skill requirements
-A curated skill from `find_skills` carries a `requires:` list. **Resolve it before you start
-the skill** — one that assumes a plugin or package it doesn't have fails partway through,
-after the user has already waited.
+A curated skill from `find_skills` carries a `checklist:`. **Resolve it before you start the
+skill** — one that assumes a plugin or package it doesn't have fails partway through, after
+the user has already waited.
+
+`checklist:` informs you; it does not gate the skill. A gap is a fact to tell the user and work
+around, not a stop sign: take the body's fallback where it names one, and where it doesn't,
+say what you are substituting and why before you spend their time on it. Most tokens have a
+workaround — a missing `tensor` plane means data comes from the viewer instead, a missing
+package usually has a slower or cruder equivalent in scipy/skimage. What you must not do is
+proceed silently: the user cannot judge a result whose method they were never told changed.
 
 One `server_status` call answers every token but a third-party `pkg:`, which is the agent's
 responsibility to resolve. Each token names its section: `viewer` → `## Viewer`, `tensor` →
@@ -129,7 +136,7 @@ theirs to authorize — but a named gap usually beats abandoning the skill, and 
 these have a fix worth offering.
 
 **`plugin:<name>` — three different causes, in this order:**
-1. **Is `pkg:biopb-mcp>=X` in the same `requires:` also unmet?** Then this install simply
+1. **Is `pkg:biopb-mcp>=X` in the same `checklist:` also unmet?** Then this install simply
    predates the plugin. Seeding cannot conjure it — say so, and point at upgrading biopb
    (rerun the installer). Stop there.
 2. **Else check the file:** `ls ~/.config/biopb/kernel/<name>.py`. Present, but absent from

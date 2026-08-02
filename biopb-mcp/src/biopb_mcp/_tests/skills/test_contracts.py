@@ -78,7 +78,7 @@ def _third_party_requirements(entry) -> dict[str, SpecifierSet]:
     so it is parsed rather than split on operators.
     """
     out: dict[str, SpecifierSet] = {}
-    for token in entry.requires:
+    for token in entry.checklist:
         if not token.startswith("pkg:"):
             continue
         req = Requirement(token.split(":", 1)[1])

@@ -4,7 +4,7 @@ title: Measure labeled objects in physical units, not pixels
 description: Report object areas, volumes, and diameters in microns instead of pixels, using the image's real voxel spacing.
 tags: [measurement, quantification]
 version: 1.0.0
-requires: [viewer, tensor, pkg:biopb-mcp>=0.13.0]
+checklist: [viewer, tensor, pkg:biopb-mcp>=0.13.0]
 ---
 
 # Measure labeled objects in physical units, not pixels
@@ -48,7 +48,7 @@ generated from a previous step. Read `guide://data` before pulling pixels and me
 
 ## Steps
 
-1. **Check the requirements** *(blocking)*. Resolve `requires:` against
+1. **Check the requirements** *(blocking)*. Resolve `checklist:` against
    `server_status` — `guide://kernel` covers what to do about a gap.
 
    `IMAGE` comes from either `viewer` or `client`. We need at least one of the two.

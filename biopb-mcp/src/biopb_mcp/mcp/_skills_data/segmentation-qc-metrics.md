@@ -4,7 +4,7 @@ title: Score an instance segmentation against ground truth
 description: Compare a segmentation to ground truth and report F1 at matched IoU, plus how many objects were split or merged.
 tags: [segmentation, qc, evaluation]
 version: 1.0.0
-requires: [viewer, tensor, plugin:segmentation_qc, pkg:biopb-mcp>=0.13.0]
+checklist: [viewer, tensor, plugin:segmentation_qc, pkg:biopb-mcp>=0.13.0]
 ---
 
 # Score an instance segmentation against ground truth
@@ -55,7 +55,7 @@ measurement made from it.
 
 ## Steps
 
-1. **Check the requirements** *(blocking)*. Resolve `requires:` against
+1. **Check the requirements** *(blocking)*. Resolve `checklist:` against
    `server_status` — `guide://kernel` covers what to do about a gap.
 
    `GT` and `PRED` come from either `viewer` or `client`. We need at least one of
