@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Env var carrying the inherited *write* end of the window-close pipe. The
-# in-kernel bootstrap (non-headless) writes a byte to this fd when the user
+# in-kernel bootstrap writes a byte to this fd when the user
 # closes the napari window; the launcher's reader thread reaps the kernel back
 # to idle on the signal. The literal is mirrored in _bootstrap._install_window_
 # close_hook (kept in sync by this comment, like _deathwatch.ENV_FD).
@@ -182,8 +182,7 @@ class KernelHost:
         # Window-close pipe (reverse of the death pipe): the *kernel* holds the
         # write end and writes a byte when the user closes the napari window; the
         # launcher holds this read end and a reader thread reaps the kernel back
-        # to idle on the signal. Only meaningful with a viewer (the launcher sets
-        # window_close_pipe=False for a headless kernel).
+        # to idle on the signal.
         self._window_close_pipe = window_close_pipe and os.name == "posix"
         self._window_r = None
         self._window_thread = None

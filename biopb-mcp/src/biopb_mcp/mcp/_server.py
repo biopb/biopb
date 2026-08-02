@@ -27,11 +27,6 @@ _kernel_host: KernelHost | None = None
 # instead of an inline result (set from config by the launcher).
 _promote_after: float = 10.0
 
-# Compute-only mode: no display, so the kernel has no napari viewer. Set by the
-# launcher (set_headless) before serving. Viewer-dependent tools return a clear
-# message and the agent is told via the initialize `instructions` field.
-_headless: bool = False
-
 # Whether the curated-skills catalog is advertised to the agent (mirrors
 # `services.skills_enabled`, on by default). Set by the launcher
 # (set_skills_enabled); gates the _SKILLS_INSTRUCTIONS fragment in the handshake.
@@ -102,25 +97,11 @@ _SKILLS_INSTRUCTIONS = (
     "give you (voxel spacing, which channel is which, expected object size).\n"
     "- visual check: put the intermediate on the viewer and report two or three "
     "numbers with it -- never a screenshot alone, and report the numbers alone "
-    "when the session is headless or the data too large to show usefully.\n"
+    "when the data is too large to show usefully.\n"
     "- validate-and-gate: stop and get the user's agreement before anything "
     "expensive or hard to walk back.\n"
     "Destructive steps always ask first, whatever a skill says: restarting the "
     "kernel, interrupting a running job, overwriting a layer, or writing files."
-)
-
-# Appended to _BASE_INSTRUCTIONS when the session is headless. Phrased to fire
-# only when the user actually reaches for the viewer (compliance is up to the
-# client/agent).
-_HEADLESS_INSTRUCTIONS = (
-    "This biopb-mcp session is running HEADLESS: it was started without a "
-    "display, so there is NO napari viewer window and screenshots are not "
-    "available. If the user asks to access, open, view, or look at the biopb "
-    "viewer/napari (or asks for a screenshot), alert them plainly that no "
-    "viewer is available in this session because it started without a display. "
-    "You can still load data, run image-processing ops, and compute results "
-    "via execute_code (using client and ops); offer results as values/arrays. "
-    "Do not call take_screenshot or use viewer.* methods."
 )
 
 # DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
@@ -157,8 +138,8 @@ def build_transport_security(
 mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
 
 # FastMCP built the low-level server with instructions=None at import; seed the
-# always-on base guidance now so it is present even if set_headless is never
-# called (e.g. tests, or a standalone import). set_headless recomposes from this
+# always-on base guidance now so it is present even if set_skills_enabled is
+# never called (e.g. tests, or a standalone import), which recomposes from this
 # base.
 mcp._mcp_server.instructions = _BASE_INSTRUCTIONS
 
@@ -311,9 +292,11 @@ else:
 
 print("")
 print("## Viewer")
-if not viewer:
-    print("  headless: no viewer (no display)")
-elif not _viewer_window_alive():
+import os as _os
+if _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+    # Launcher-owned Xvfb (#90): screenshots work, but no human sees the window.
+    print("  display: virtual (Xvfb) — the viewer window is not visible to the user")
+if not _viewer_window_alive():
     print("  window: CLOSED — the napari window was closed; layer mutations")
     print("    won't display. Data/compute still work; restart_kernel to restore.")
     print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
@@ -384,8 +367,7 @@ def set_session_log_path(path: str | None):
 
 def _recompose_instructions():
     """Rebuild the handshake ``instructions`` from ``_BASE_INSTRUCTIONS`` plus
-    whichever optional fragments the current mode enables (skills, then
-    headless).
+    whichever optional fragments the current mode enables (skills).
 
     Recomposing from the base in both directions is idempotent, so flipping any
     dimension back off can't leave a stale fragment in the handshake while
@@ -395,18 +377,7 @@ def _recompose_instructions():
     parts = [_BASE_INSTRUCTIONS]
     if _skills_enabled:
         parts.append(_SKILLS_INSTRUCTIONS)
-    if _headless:
-        parts.append(_HEADLESS_INSTRUCTIONS)
     mcp._mcp_server.instructions = "\n\n".join(parts)
-
-
-def set_headless(headless: bool):
-    """Mark the session compute-only (no viewer) and advertise it to the agent
-    via the initialize ``instructions`` field (append the headless directive
-    when headless, drop it otherwise)."""
-    global _headless
-    _headless = bool(headless)
-    _recompose_instructions()
 
 
 def set_skills_enabled(enabled: bool):
@@ -477,10 +448,9 @@ def _run_job_call(host, call: str):
 def _window_note(window_alive) -> str:
     """Closed-window warning to append when a result returns with no viewer.
 
-    Gated on non-headless (headless has no window and carries its own
-    messaging). ``window_alive`` is None when liveness is unknown -> no note.
+    ``window_alive`` is None when liveness is unknown -> no note.
     """
-    if not _headless and window_alive is False:
+    if window_alive is False:
         return _WINDOW_CLOSED_NOTE
     return ""
 
@@ -592,19 +562,6 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     Returns a PNG screenshot as an image content block.
     """
-    if _headless:
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    "No screenshot available: this session is running headless "
-                    "(started without a display), so there is no viewer window "
-                    "to capture. Data loading and compute via execute_code/ops "
-                    "still work — tell the user the viewer is unavailable here."
-                ),
-            )
-        ]
-
     host = _kernel_host
     if host is None:
         return [TextContent(type="text", text="Kernel host not initialized")]
@@ -782,12 +739,10 @@ def start_kernel() -> str:
     """Start the napari kernel on demand (it does not auto-start).
 
     The MCP server stays cheap and idle until you call this; it then brings up
-    the child IPython kernel, dask, the tensor client, and -- unless the session
-    is headless -- the napari viewer window. This BLOCKS until the kernel is
-    ready (or the bring-up fails), so on return you can use execute_code /
-    inspect_object directly, plus take_screenshot when a viewer is present (no
-    polling needed). A ready kernel is a no-op. The return message reports
-    whether the session is headless.
+    the child IPython kernel, dask, the tensor client, and the napari viewer
+    window. This BLOCKS until the kernel is ready (or the bring-up fails), so
+    on return you can use execute_code / take_screenshot / inspect_object
+    directly (no polling needed). A ready kernel is a no-op.
 
     Call this once at the start of a session. It is also the recovery path:
     after a failed start, a dead kernel, or the user closing the viewer window
@@ -799,14 +754,6 @@ def start_kernel() -> str:
         return "Error: kernel host not initialized"
     result = host.ensure_started()
     if result.get("state") == "ready":
-        if _headless:
-            # No napari window in a headless session, so take_screenshot is
-            # unavailable -- say so rather than claiming a viewer that isn't there.
-            return (
-                "Kernel ready (headless -- no napari viewer; screenshots "
-                "unavailable). dask and the tensor client are up; use "
-                "execute_code / inspect_object now."
-            )
         return (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
             "use execute_code / take_screenshot now."
@@ -823,10 +770,9 @@ def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the tensor client and -- unless the
-    session is headless -- the napari viewer. All variables defined in previous
-    execute_code calls are lost; when a viewer is present, a new desktop window
-    replaces the old one.
+    respawns a fresh kernel, rebuilding the tensor client and the napari
+    viewer. All variables defined in previous execute_code calls are lost; a
+    new viewer window replaces the old one.
     """
     host = _kernel_host
     if host is None:
@@ -835,12 +781,6 @@ def restart_kernel() -> str:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
-    if _headless:
-        # No napari window in a headless session -- don't claim a rebuilt viewer.
-        return (
-            "Kernel restarted (headless -- no napari viewer). dask and the "
-            "tensor client are up; previous variables are gone."
-        )
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
@@ -893,7 +833,6 @@ def server_status() -> str:
         lines.append("  state: not initialized")
         return "\n".join(lines)
 
-    lines.append(f"  display: {'headless (no viewer)' if _headless else 'visible'}")
     health = host.health()
     lines.append(f"  alive: {health['alive']}")
     lines.append(f"  ready: {health['ready']}")

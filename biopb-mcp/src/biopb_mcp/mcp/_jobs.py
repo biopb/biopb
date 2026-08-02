@@ -202,7 +202,7 @@ def run_on_main(fn, *args, **kwargs):
 
     app = QCoreApplication.instance()
     if app is None:
-        # No Qt loop running; best-effort inline (e.g. headless unit tests).
+        # No Qt loop running; best-effort inline (e.g. unit tests with no Qt app).
         return fn(*args, **kwargs)
 
     future = Future()

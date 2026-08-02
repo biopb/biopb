@@ -69,8 +69,7 @@ method **breaks CI, not production**; the pinned `napari[all]==0.7.0`
   code holding a lock the main thread needs.
 - **Only the agent handle is proxied.** `_bootstrap` wires the *real* viewer into
   internal subsystems (they already run on the main thread); `add_tensor`
-  (monkeypatched on real) is reached through the proxy like any method. Headless
-  installs no proxy (`if not headless:` guard, `_HeadlessViewer`).
+  (monkeypatched on real) is reached through the proxy like any method.
 - **Residual (accepted):** a worker that `import napari` / `current_viewer()` /
   pokes raw `PyQt6` gets an unwrapped handle and can still crash — only a
   separate-process viewer would close it.

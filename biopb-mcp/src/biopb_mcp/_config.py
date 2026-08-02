@@ -19,7 +19,7 @@ Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` 
 ``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
 the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
 widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
-headless kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
+MCP kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
 shared by the widgets and ``ops``.
 
 There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
@@ -208,12 +208,6 @@ class TransportConfig:
         "Fixed loopback port for the http server. Applies only to a directly-"
         "launched `--transport http` server (the stdio shim and `biopb mcp view` "
         "use dynamic ports).",
-    )
-    display_mode: str = _h(
-        "auto",
-        'Whether the kernel opens a visible napari viewer: "auto" (visible if a '
-        'display is present, else headless), "visible" (require a display; fail '
-        'fast if none), "headless" (never open a viewer -- compute-only).',
     )
     kernel_log: str = _h(
         "",
@@ -503,7 +497,6 @@ _CONSTRAINTS = {
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),
-        "display_mode": Enum({"auto", "visible", "headless"}),
         "session_log_keep": Range(min=1),  # keep at least the current
         "server_start_timeout": Range(exclusive_min=0),
     },

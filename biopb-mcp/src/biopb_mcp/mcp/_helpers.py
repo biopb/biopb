@@ -47,10 +47,10 @@ def viewer_window_alive(viewer) -> bool:
     half-dead viewer as healthy: after the user closes the window the Python
     ``viewer`` survives (the kernel namespace holds it), but its Qt window and
     vispy canvas are destroyed, so mutations silently no-op and ``screenshot``
-    raises.  Covers all three teardown shapes: a user X-close (``_qt_window``
-    wraps a deleted C++ object, so ``isVisible()`` raises ``RuntimeError``), a
-    programmatic ``Window.close()`` (``del self._qt_window`` -> attribute gone),
-    and the headless sentinel (``__getattr__`` raises).  An alive-but-minimized
+    raises.  Covers both teardown shapes: a user X-close (``_qt_window``
+    wraps a deleted C++ object, so ``isVisible()`` raises ``RuntimeError``) and a
+    programmatic ``Window.close()`` (``del self._qt_window`` -> attribute
+    gone).  An alive-but-minimized
     or hidden window is still "alive" (``isVisible()`` returns a bool rather than
     raising)."""
     try:

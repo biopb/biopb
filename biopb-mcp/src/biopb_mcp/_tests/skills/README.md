@@ -92,8 +92,7 @@ user who holds a fact the fixture withheld. `biopb-mcp/docs/skill-testing.md` §
 `interaction/README.md`.
 
 ```sh
-xvfb-run -a -s '-screen 0 1024x768x24' \
-  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
 ```
 
 The trailing `-s` is what makes the per-arm progress lines visible; pytest

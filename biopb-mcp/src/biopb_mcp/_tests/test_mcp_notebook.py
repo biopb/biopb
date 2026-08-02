@@ -70,8 +70,6 @@ def test_ordering_and_count_in_intro():
     assert "2 job(s)" in "".join(nb["cells"][0]["source"])
 
 
-def test_headless_note_and_filename():
-    nb = _notebook.build_notebook([], headless=True)
-    assert "headless" in "".join(nb["cells"][0]["source"]).lower()
+def test_suggested_filename():
     assert _notebook.suggested_filename().endswith(".ipynb")
     assert _notebook.suggested_filename().startswith("biopb-mcp-session-")

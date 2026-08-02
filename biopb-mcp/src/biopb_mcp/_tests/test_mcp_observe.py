@@ -108,7 +108,6 @@ def test_api_jobs_lists_summary(client, host):
     body = r.json()
     assert body["jobs"][0]["job_id"] == "job-1"
     assert body["jobs"][0]["code_preview"] == "print('hi')"
-    assert body["headless"] is False
 
 
 def test_api_job_detail(client, host):
@@ -223,7 +222,6 @@ def test_api_status(client):
     assert r.status_code == 200
     body = r.json()
     assert body["alive"] is True and body["ready"] is True
-    assert body["headless"] is False
     # The observe SPA (served by the control, so unable to be server-templated)
     # reads the launcher-tuned poll cadence off the status payload.
     assert body["poll_interval_ms"] == 3000

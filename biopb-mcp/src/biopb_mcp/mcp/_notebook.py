@@ -175,17 +175,15 @@ _INTRO = (
 )
 
 
-def build_notebook(jobs, *, headless=False):
+def build_notebook(jobs):
     """Build an nbformat-v4 notebook dict from a list of job snapshots.
 
     *jobs* is the oldest-first list returned by ``_jobs.export()`` (each a
-    ``_Job.snapshot()`` dict). *headless* tweaks the intro wording. The result is
-    a plain dict ready to ``json.dumps`` into a ``.ipynb`` file.
+    ``_Job.snapshot()`` dict). The result is a plain dict ready to
+    ``json.dumps`` into a ``.ipynb`` file.
     """
     jobs = jobs or []
     intro = _INTRO.format(ts=_fmt_ts(_now_epoch()), n=len(jobs))
-    if headless:
-        intro += "\n\n_Exported from a headless (no-display) session._"
 
     cells = [_markdown_cell(_TITLE + "\n" + intro), _code_cell(BOOTSTRAP_SRC)]
     if jobs:

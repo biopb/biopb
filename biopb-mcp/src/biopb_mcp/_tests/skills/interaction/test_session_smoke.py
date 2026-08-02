@@ -8,9 +8,9 @@ and before a single token is spent.
 
 They also pin the three environment facts the harness forces rather than
 inherits, each of which silently changes what a run tests: a real napari viewer
-rather than the headless fallback, no tensor plane so the fixture reaches the
-agent as a layer and nothing else, and a config tree of our own so the catalog
-under test is the shipped one.
+(on the user's display or the launcher's own Xvfb), no tensor plane so the
+fixture reaches the agent as a layer and nothing else, and a config tree of our
+own so the catalog under test is the shipped one.
 
 Marked `interaction` and deselected by default. Slow (a kernel, napari and dask
 per test) but free — no key, no network beyond loopback.
@@ -85,11 +85,11 @@ def test_the_skill_body_comes_from_the_shipped_catalog(session):
     assert len(body) > 4000, f"body is only {len(body)} chars"
 
 
-def test_the_viewer_is_real_and_not_the_headless_sentinel(session):
-    """`display_mode: auto` degrades silently when no display is found, and
-    `QT_QPA_PLATFORM=offscreen` is not enough either -- napari builds, then
-    `add_image` dies in vispy's GL probe. Either way step 2 could not happen,
-    so the harness refuses to run there and this is where that is stated."""
+def test_the_viewer_is_real(session):
+    """A working viewer is what §5 scores against; on a display-less box the
+    launcher's own Xvfb provides it. `QT_QPA_PLATFORM=offscreen` is not a
+    substitute -- napari builds, then `add_image` dies in vispy's GL probe --
+    which is why the harness forces a real GL platform."""
     real, detail = session.has_real_viewer()
     assert real, detail
 
