@@ -29,7 +29,7 @@ numeric verifier tests the interaction for free.
 |---|---|---|---|
 | **Structure** (§2) | Is the file well-formed, and does it obey the authoring rules? | `test_schema.py`, `test_validate.py`, `test_shipped_skills.py`, `test_packaging.py` | yes, in `mcp-ci` |
 | **Retrieval** (§3) | Does `find_skills` surface it for the right request? | `test_retrieval.py` | yes, in `mcp-ci` |
-| **Contract** (§4) | Can its packages be installed, do they import, and does the API it quotes still exist? | `test_satisfiability.py`, `test_contracts.py` | yes — satisfiability in `mcp-ci`, the rest in `skill-contracts.yaml` |
+| **Contract** (§4) | Can its packages be installed here, are they available everywhere, do they import, and does the API it quotes still exist? | `test_satisfiability.py`, `test_availability.py`, `test_contracts.py` | yes — damage per matrix cell and availability in one job, both in `mcp-ci`; the rest in `skill-contracts.yaml` |
 | **Interaction** (§5) | Does a model following it produce the right numbers? | `interaction/` | **no** — a benchmark; and the case *data* under it does gate |
 
 Everything that gates is in this repo, so a skill edit and the runtime change it
@@ -40,6 +40,8 @@ Two pytest markers hold work back from the default run
 
 - `satisfiability` — each token is a real resolver run; `mcp-ci` runs it as its
   own step on every matrix cell.
+- `availability` — nine real resolver runs per token; `mcp-ci` runs it once, in a
+  job of its own.
 - `interaction` — needs a display, API keys and about twenty minutes.
 
 Everything else in `_tests/skills/` — including every hermetic check on an
@@ -104,9 +106,9 @@ where that gets checked. Recent breakages it exists for: a stitching call whose
 singleton-Z axis model still described in two bodies; `np.prod(canvas) *
 itemsize` as a memory estimate, ~4× under the real footprint.
 
-The layer asks three questions in order, and the first is cheapest.
+The layer asks four questions in order, and the first is cheapest.
 
-### 4a. Satisfiability — may this package be installed here at all?
+### 4a. Damage — would installing it move something already here?
 
 `test_satisfiability.py`, marker `satisfiability`, metadata only (`uv pip
 install --dry-run`); nothing is downloaded.
@@ -125,9 +127,10 @@ gate is unconditional: no allowlist, no xfail, since either would be a place to
 record that a known-bad skill ships anyway.
 
 **It runs on every `mcp-ci` matrix cell** (ubuntu 3.10/3.11/3.12, macos 3.12,
-windows 3.12), because the answer depends on the interpreter and the platform —
-wheel availability differs per cell. One red cell rejects the skill: the catalog
-ships to every platform, so "resolves on Linux" is not good enough.
+windows 3.12), because a resolution depends on the interpreter and the platform.
+One red cell rejects the skill, and `requires:` and `suggests:` are judged the
+same way here: optionality is about whether the *skill* still works without the
+package, and says nothing about what installing it does to the environment.
 
 Only this repo can ask the question correctly. Resolving against PyPI answers for
 the last *release*, not the branch — `biopb-mcp[mcp]` from PyPI yields
@@ -137,7 +140,48 @@ The workspace's own distributions (`biopb`, `biopb-mcp`, `biopb-tensor-server`,
 `biopb-control`) are skipped: a floor on one is a statement about this repo's
 release history, not about a third party.
 
-### 4b. Import — does the installed package work at all?
+### 4b. Availability — can it be installed on every platform we ship to?
+
+`test_availability.py`, marker `availability`, its own `mcp-ci` job. A different
+question from §4a with a different verdict, split out in #680.
+
+`uv pip install --dry-run psfmodels` **succeeds** on 3.12, moving nothing — and
+`psfmodels` has no cp312 wheel, so that success is a resolution to an sdist that
+`--dry-run` never tries to build. The user gets a C++ compile, and on Windows
+that means MSVC Build Tools. `--only-binary`, scoped to the declared package, is
+what turns that into an answer. It refuses pure-Python sdists too, deliberately:
+a pure-Python project essentially always ships a `py3-none-any` wheel, so
+requiring one is a good proxy for "no compiler needed".
+
+**The verdict depends on which key declared it.**
+
+| | required | suggested |
+|---|---|---|
+| available everywhere | pass | pass |
+| a hole on some cells | **reject** | pass, and print the cells |
+| installs nowhere | **reject** | **reject** |
+
+A required package missing on a cell ships a workflow those users cannot run, and
+`find_skills` still retrieves it for them. A suggested one missing on a cell is
+an ordinary gap the body's degraded path already answers (§4's `suggests:`
+contract requires step 1 to name it) — which is the whole point of the key.
+Missing *everywhere* fails either way: nobody would ever run the preferred path,
+so the declaration advertises something that does not exist.
+
+**Nine cells from one Linux job.** `uv pip compile` resolves for an interpreter
+and platform that are not present, at about a second a cell, co-resolving the
+token with this checkout's `biopb-mcp[mcp]` rather than the last release. That
+buys two things the per-cell shape could not have: all nine combinations instead
+of the matrix's five (3.10 and 3.11 were Linux-only, so a macOS-3.10 hole went
+unscreened), and **a single place that can render a verdict** — five independent
+pytest runs cannot know "failed on 1 of 5", which is why all-or-nothing was not
+merely the old policy but the only rule that shape could express.
+
+What it does not screen: a *transitive* dependency that ships only an sdist.
+`--only-binary` is scoped to the declared package because the workspace is a
+local source tree and must still be built to co-resolve.
+
+### 4c. Import — does the installed package work at all?
 
 `test_contracts.py::test_every_installed_declared_package_actually_imports`, one
 check over whatever the catalog declares. §4a asks whether a package can be
@@ -146,13 +190,13 @@ installed without damage, and a package can pass that and still be useless:
 `csbdeep` declares TensorFlow only under a `[tf1]` extra, and then `import
 stardist` raises. The skill dead-ends at step 1 for every user.
 
-Unlike §4c this needs no per-package authoring — it is not a claim about anyone's
+Unlike §4d this needs no per-package authoring — it is not a claim about anyone's
 API — so it runs over every declared package the env has installed. Which env
 that is does not matter: `skill_contracts.py` gives each package its own, so an
 absent distribution is legitimate, and a present one that will not import is
 fatal on every platform.
 
-### 4c. Signatures — is the API still what the body quotes?
+### 4d. Signatures — is the API still what the body quotes?
 
 `test_contracts.py`: parameter exists, default is what the prose assumes, return
 shape is what the snippet unpacks. Currently manned by `drift-correction` —
@@ -447,10 +491,13 @@ to ask "is this redundant or over-constraining".
 # everything that gates, and every hermetic check (~1.5 s)
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 
-# the resolver layer (§4a); CI runs this as its own step
+# the damage gate (§4a); CI runs this as its own step, on every matrix cell
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills -m satisfiability
 
-# the import + signature layers (§4b, §4c), which need the skill's package
+# the availability grid (§4b): 9 cells per declared package, ~1 s each
+uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills -m availability
+
+# the import + signature layers (§4c, §4d), which need the skill's package
 uv run --no-project --python .venv/bin/python --with pystackreg \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py
 
@@ -473,5 +520,5 @@ watch -n5 'find .skill-outcomes/interaction -newermt "-1 hour" | sort'
 **Adding a skill.** Drop the `.md` in `mcp/_skills_data/` — the suite discovers
 the directory and applies every rule. It will ask for: a `requires:` token inside
 the vocabulary, a `[[link]]` that resolves, a one-sentence description, a
-phrasing-table entry (§3), a contract test for any third-party package (§4c), and
+phrasing-table entry (§3), a contract test for any third-party package (§4d), and
 either a benchmark case or a `NOT_BENCHMARKED` reason (§5e).

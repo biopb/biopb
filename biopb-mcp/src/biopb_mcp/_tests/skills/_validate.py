@@ -136,6 +136,12 @@ def process(path: Path, rep: Report) -> SkillEntry | None:
         rep.err(fname, f"version must be MAJOR.MINOR.PATCH, got {version!r}")
 
     requires = [str(r) for r in coerce_list(fm.get("requires"))]
+    suggests = [str(s) for s in coerce_list(fm.get("suggests"))]
+    if both := sorted(set(requires) & set(suggests)):
+        # The two keys are answers to the same question, and a token in both
+        # says the skill needs it and does not. Whichever the reader trusts,
+        # half the machinery downstream disagrees.
+        rep.err(fname, "token in both requires: and suggests: " + ", ".join(both))
 
     if not body.strip():
         rep.err(fname, "empty body")
@@ -157,6 +163,7 @@ def process(path: Path, rep: Report) -> SkillEntry | None:
         version=version,
         spec_version=int(fm["spec_version"]),
         requires=requires,
+        suggests=suggests,
     )
 
 

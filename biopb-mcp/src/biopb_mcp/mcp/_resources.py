@@ -103,9 +103,16 @@ and the round trip for data too large to hold: `guide://data`.
 SKILL_REQUIREMENTS = """\
 
 ## Skill requirements
-A curated skill from `find_skills` carries a `requires:` list. **Resolve it before you start
-the skill** — one that assumes a plugin or package it doesn't have fails partway through,
-after the user has already waited.
+A curated skill from `find_skills` carries a `requires:` list, and may carry a `suggests:`
+list. **Resolve both before you start the skill** — one that assumes a plugin or package it
+doesn't have fails partway through, after the user has already waited.
+
+The two lists resolve identically and mean different things when unmet. A missing
+**`requires:`** token blocks the skill: name the gap and let the user choose (below). A
+missing **`suggests:`** token blocks only the *preferred* path — the body names another one,
+so take it, say which you used, and carry on. That gap is expected, not a fault; do not stall
+the task over it. Offering the install is still reasonable when the user is present and the
+difference matters, but "the skill needs something you don't have" is the wrong report.
 
 One `server_status` call answers every token but a third-party `pkg:`, which is the agent's
 responsibility to resolve. Each token names its section: `viewer` → `## Viewer`, `tensor` →
@@ -139,7 +146,9 @@ these have a fix worth offering.
    kernel must restart to load them. **Ask before restarting** — it takes the namespace and
    every layer with it.
 
-**`pkg:<name>` — offer three options and let the user pick:**
+**`pkg:<name>` — offer three options and let the user pick** (for a `requires:` token; for a
+`suggests:` one, option 3 is the default and the others are worth raising only if the user is
+there and the quality difference matters)**:**
 1. **They install it** — quote the exact command `## Versions` prints (it names *this*
    interpreter). Never a bare `pip install`: it targets whatever env their shell has active,
    which can succeed while the import here still fails.

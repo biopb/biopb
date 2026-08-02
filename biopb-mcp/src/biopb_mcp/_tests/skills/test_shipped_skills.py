@@ -91,11 +91,14 @@ def test_what_validates_is_what_the_runtime_loads(shipped):
 # --- requires: grammar ----------------------------------------------------
 
 
-def test_every_requires_token_is_in_the_live_vocabulary(shipped):
+@pytest.mark.parametrize("key", ["requires", "suggests"])
+def test_every_token_is_in_the_live_vocabulary(shipped, key):
+    """One grammar, two keys. `suggests:` is the same vocabulary resolved the
+    same way -- what differs is the verdict when it is unmet, not the syntax."""
     entries, _ = shipped
     bad = []
     for e in entries:
-        for token in e.requires:
+        for token in getattr(e, key):
             if token in BARE_TOKENS:
                 continue
             m = NAMESPACED.match(token)
@@ -112,13 +115,26 @@ def test_every_requires_token_is_in_the_live_vocabulary(shipped):
                 )
             elif kind == "ops" and not value:
                 bad.append(f"{e.id}: {token!r} (ops needs a kind)")
-    assert not bad, "requires: tokens outside the vocabulary:\n" + "\n".join(bad)
+    assert not bad, f"{key}: tokens outside the vocabulary:\n" + "\n".join(bad)
 
 
-def test_requires_has_no_duplicates(shipped):
+def test_neither_list_has_duplicates(shipped):
     entries, _ = shipped
     for e in entries:
         assert len(e.requires) == len(set(e.requires)), f"{e.id}: {e.requires}"
+        assert len(e.suggests) == len(set(e.suggests)), f"{e.id}: {e.suggests}"
+
+
+def test_the_workspace_floor_is_never_optional(shipped):
+    """`pkg:biopb-mcp>=X` says which release the body is written against, so a
+    session below it cannot run the skill at all -- there is no degraded path
+    from an interface that does not exist yet. Suggesting it would also put the
+    workspace into the availability grid, which resolves against PyPI and would
+    report the checkout being "downgraded" to the last release."""
+    entries, _ = shipped
+    for e in entries:
+        bad = [t for t in e.suggests if t.startswith("pkg:biopb-mcp")]
+        assert not bad, f"{e.id} suggests the workspace floor: {bad}"
 
 
 def test_a_skill_that_drives_the_kernel_pins_a_biopb_mcp_floor(shipped):
@@ -219,17 +235,49 @@ def test_bodies_stay_under_the_length_proxy(shipped_skill_files):
     assert not oversized, "\n".join(oversized)
 
 
+def _first_step(body: str, skill_id: str) -> str:
+    steps = body.split("## Steps", 1)
+    assert len(steps) == 2, f"{skill_id}: no '## Steps' section"
+    return steps[1].lstrip().split("\n2.", 1)[0]
+
+
 def test_the_first_step_is_the_requirement_check(bodies, shipped):
     """Whatever the tier, step 1 is resolving `requires:` -- there is no point
     asking the user which layer is truth if the scorer was never going to be
     there. A skill requiring nothing has nothing to check."""
     entries, _ = shipped
     for e in entries:
-        if not e.requires:
+        if not (e.requires or e.suggests):
             continue
-        steps = bodies[e.id].split("## Steps", 1)
-        assert len(steps) == 2, f"{e.id}: no '## Steps' section"
-        first_step = steps[1].lstrip().split("\n2.", 1)[0]
+        first_step = _first_step(bodies[e.id], e.id)
         assert "requires:" in first_step and "server_status" in first_step, (
             f"{e.id}: step 1 does not resolve requires: against server_status"
         )
+
+
+def test_a_suggested_package_has_its_absence_answered_in_step_1(bodies, shipped):
+    """What makes `suggests:` sound rather than a way to duck the gate.
+
+    An optional package is allowed to be unavailable on some platforms
+    (skill-testing.md §4b), and `find_skills` still retrieves the skill there --
+    so an agent on an unlucky platform reads this body and has to find the
+    fallback in it. If step 1 does not say what to do without the package, that
+    agent improvises from a half-followed recipe, which is the failure a curated
+    catalog exists to prevent.
+
+    Named in step 1 specifically, because that is where the gap is discovered.
+    """
+    entries, _ = shipped
+    for e in entries:
+        for token in e.suggests:
+            if not token.startswith("pkg:"):
+                continue
+            name = re.split(r"[><~=]", token.split(":", 1)[1])[0]
+            first_step = _first_step(bodies[e.id], e.id).lower()
+            assert name.lower() in first_step, (
+                f"{e.id}: step 1 never mentions the suggested {name}"
+            )
+            assert any(w in first_step for w in ("without", "degraded", "fallback")), (
+                f"{e.id}: step 1 mentions {name} but never says what happens "
+                "without it -- an optional package needs a named degraded path"
+            )

@@ -74,11 +74,15 @@ COVERED: dict[str, set[str]] = {
 def _third_party_requirements(entry) -> dict[str, SpecifierSet]:
     """`{name: specifier}` for the `pkg:` tokens that name a third party.
 
+    Both keys: a `suggests:` package is optional to the *skill*, not to this
+    layer. Whoever does have it installed runs the preferred path, and the body
+    quotes that path's API just as literally.
+
     The token is already a PEP 508 requirement (`name`, `name>=X`, `name~=X`),
     so it is parsed rather than split on operators.
     """
     out: dict[str, SpecifierSet] = {}
-    for token in entry.requires:
+    for token in [*entry.requires, *entry.suggests]:
         if not token.startswith("pkg:"):
             continue
         req = Requirement(token.split(":", 1)[1])

@@ -134,6 +134,12 @@ def _entry(text: str, *, stem: str, origin: str, updated: str = "") -> dict | No
     tags = [str(t) for t in tags] if isinstance(tags, list) else []
     requires = fm.get("requires")
     requires = [str(r) for r in requires] if isinstance(requires, list) else []
+    # Needed by the preferred path only: the skill still runs without it, on a
+    # degraded path its body names. Kept a separate key rather than a decorated
+    # `requires:` token so a reader that has never heard of it drops the
+    # optional thing rather than mis-parsing it as mandatory.
+    suggests = fm.get("suggests")
+    suggests = [str(s) for s in suggests] if isinstance(suggests, list) else []
 
     return {
         "id": skill_id,
@@ -142,6 +148,7 @@ def _entry(text: str, *, stem: str, origin: str, updated: str = "") -> dict | No
         "tags": tags,
         "version": str(fm.get("version") or ""),
         "requires": requires,
+        "suggests": suggests,
         "updated": str(fm.get("updated") or updated or ""),
         "origin": origin,
     }
@@ -411,6 +418,7 @@ def find_skills(query: str = "") -> list[dict]:
                 "version": s["version"],
                 "updated": s["updated"],
                 "requires": s["requires"],
+                "suggests": s.get("suggests", []),
                 # "local" = the user's own file, unreviewed. The agent should be
                 # able to say so rather than let a draft pass as curated.
                 "origin": s.get("origin", _ORIGIN_CATALOG),

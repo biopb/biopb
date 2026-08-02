@@ -113,10 +113,14 @@ jobs:
       # downgrading biopb's own deps fails here rather than on a user's machine.
       # Metadata only -- nothing is downloaded or installed.
       #
-      # Runs on every matrix cell on purpose: the answer depends on the
-      # interpreter and platform (m2stitch, for one, has no 3.12 wheel). One red
-      # cell rejects the skill -- the catalog ships to every platform, so
-      # "resolves on Linux" is not good enough.
+      # This step owns ONE question: does installing it move something already
+      # here. That is fatal wherever it happens -- a live kernel has the old
+      # versions imported -- so one red cell rejects the skill, and required and
+      # optional packages are judged the same way.
+      #
+      # Whether the package can be installed on a platform at all is a different
+      # question with a different verdict, and it is the skill-availability job
+      # below rather than another per-cell step (#680).
       - name: Skill package satisfiability
         run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/skills
 
@@ -125,3 +129,34 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: ${{ matrix.os }}-py${{ matrix.python-version }}
+
+  # Wheel availability for every interpreter x platform biopb supports, from one
+  # Linux job: `uv pip compile` resolves for a platform that is not present, so
+  # this covers all nine cells where the matrix above covers five -- and, more to
+  # the point, it is a single place that can render a per-cell verdict. Split out
+  # from the matrix in #680, where the old shape's "one red cell rejects" was
+  # shown to be not a policy choice but the only rule five independent pytest
+  # runs could express.
+  #
+  # A required package must resolve on all nine. An optional one (`suggests:`)
+  # may have a hole -- the skill's degraded path is what covers those users --
+  # but must resolve somewhere.
+  skill-availability:
+    name: skill package availability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # No workspace sync: the grid resolves metadata for absent interpreters, so
+      # nothing here needs to be installed. The checkout is the point -- the
+      # co-resolve uses this branch's biopb-mcp, not the last release.
+      - name: Skill package availability
+        run: >-
+          uv run --with pytest --with pyyaml --with packaging --no-project
+          pytest -v --color=yes -m availability
+          biopb-mcp/src/biopb_mcp/_tests/skills/test_availability.py

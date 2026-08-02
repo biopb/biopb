@@ -34,8 +34,16 @@ So this gate is unconditional. There is no allowlist and no xfail: those would
 be a place to record that a known-bad skill ships anyway, which is the outcome
 the gate exists to prevent.
 
+**One question, not two.** Whether the package can be installed on this platform
+*at all* is a different failure with a different verdict, and it lives in
+`test_availability.py` (#680): a missing wheel is loud, arrives before anything
+runs, and a `suggests:` package may legitimately lack one on some cell. Nothing
+here bends that way -- a downgrade is silent, arrives after the fact, and no
+degraded path in a body saves the user from it, so `requires:` and `suggests:`
+are judged identically below.
+
 Marked `satisfiability` and deselected by default — each token costs a real
-resolver run. CI runs the marker as its own step.
+resolver run. CI runs the marker as its own step, on every matrix cell.
 """
 
 from __future__ import annotations
@@ -66,7 +74,11 @@ def _pkg_requirements(directory: Path = SKILLS_DIR) -> list[str]:
     entries, _ = validate(directory)
     out = []
     for e in entries:
-        for token in e.requires:
+        # Both keys. Optionality is about whether the *skill* still works
+        # without the package; it says nothing about what installing it does to
+        # the environment, and the agent installs a suggested package on
+        # exactly the same path.
+        for token in [*e.requires, *e.suggests]:
             if not token.startswith("pkg:"):
                 continue
             spec = token.split(":", 1)[1]
@@ -119,16 +131,25 @@ def test_the_extractor_finds_pkg_tokens(skills_dir):
     """No shipped skill declares a third-party package today, which would leave
     the gate below parametrized over nothing. That is the correct state, not a
     reason to stop checking the machinery -- so prove the extractor works on a
-    tree that does declare one, and the gate cannot go vacuously green."""
+    tree that does declare one, and the gate cannot go vacuously green.
+
+    The `suggests:` token is here for the same reason it is in the gate: an
+    optional package is installed by the same agent into the same live kernel,
+    so skipping it would leave the damage question unasked for exactly the
+    packages users are most likely to add mid-session."""
     write_skill(
         skills_dir,
         "needs-things",
         frontmatter=(
             "description: A sentence.\ntitle: T\nversion: 1.0.0\n"
             "requires: [viewer, pkg:biopb-mcp>=0.13.0, pkg:some-package>=2.0]\n"
+            "suggests: [pkg:optional-package~=1.2]\n"
         ),
     )
-    assert _pkg_requirements(skills_dir) == ["some-package>=2.0"]
+    assert _pkg_requirements(skills_dir) == [
+        "optional-package~=1.2",
+        "some-package>=2.0",
+    ]
 
 
 @pytest.mark.parametrize("requirement", REQUIREMENTS)

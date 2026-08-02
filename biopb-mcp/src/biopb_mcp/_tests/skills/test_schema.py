@@ -73,6 +73,7 @@ def test_entry_to_dict_is_complete_and_ordered():
         version="1.0.0",
         spec_version=CURRENT_SPEC_VERSION,
         requires=["viewer"],
+        suggests=["pkg:something~=1.0"],
     )
     d = entry.to_dict()
     assert list(d) == [
@@ -83,8 +84,24 @@ def test_entry_to_dict_is_complete_and_ordered():
         "version",
         "spec_version",
         "requires",
+        "suggests",
     ]
     assert d["requires"] == ["viewer"]
+    assert d["suggests"] == ["pkg:something~=1.0"]
+
+
+def test_suggests_defaults_to_empty():
+    # Most skills need no optional package, and every caller iterates the list.
+    entry = SkillEntry(
+        id="x",
+        title="T",
+        description="D",
+        tags=[],
+        version="1.0.0",
+        spec_version=CURRENT_SPEC_VERSION,
+        requires=[],
+    )
+    assert entry.suggests == []
 
 
 def test_the_entry_carries_no_fetch_fields():

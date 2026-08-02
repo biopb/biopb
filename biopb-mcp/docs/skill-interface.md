@@ -160,7 +160,7 @@ that would come back empty.
 
 ---
 
-## 4. `requires:` — resolved by the agent, against `server_status`
+## 4. `requires:` / `suggests:` — resolved by the agent, against `server_status`
 
 `requires:` used to be metadata nothing could act on: emitted by `find_skills`,
 answerable nowhere. A skill naming a kernel plugin the install did not have read
@@ -200,6 +200,30 @@ was stated against, so the two are comparable by construction. The token names a
 *distribution*, and that is the argument metadata wants; the import half still
 goes by module name, which is why `pkg:scikit-image` is imported as `skimage` and
 read as `scikit-image`.
+
+### `suggests:` — the same resolution, a different answer to a gap
+
+A `requires:` gap means the skill cannot run. A `suggests:` gap means the
+*preferred* path cannot run, and the body names another one — so the agent takes
+the degraded path and says which was used, rather than opening the
+install-or-abandon conversation `guide://kernel` prescribes for a missing
+requirement. Offering the install is still fine when the user is there and the
+difference matters; treating the skill as blocked is not.
+
+The key exists because there was no way to say it. `drift-correction` declared
+`pkg:pystackreg` under `requires:` while its own step 1 called the skimage
+fallback "a real fallback, not a lesser one" — the frontmatter said mandatory and
+the body said optional, and an agent reading the frontmatter first would stop for
+a gap the skill had already answered.
+
+It is also what lets the availability gate be per-platform at all
+([`skill-testing.md`](skill-testing.md) §4b): a package with no wheel on some
+interpreter is a rejection when required and a recorded hole when suggested, and
+without a marker for "expected gap" there is nothing for that verdict to key on.
+Two rules keep it honest — the workspace floor (`pkg:biopb-mcp>=X`) may never be
+suggested, since there is no degraded path from an interface that does not exist
+yet, and step 1 of the body must name the suggested package *and* say what
+happens without it.
 
 **It informs, it never gates.** Nothing filters a skill out of `find_skills`, and
 no return value invites `if not ok: bail`. Every fix — installing a package,
@@ -247,6 +271,7 @@ coerce, emit an entry or `None`. `validate(dir)` dedupes by `id` and returns
 | `tags` | Coerce `str → [str]`, lowercase. **Not** gated against a vocabulary: a closed set needs an edit for every new topic and fails the PR introducing it, to enforce a judgment the reviewer is already making |
 | `version` | Semver required, else default `0.0.0` |
 | `requires` | Optional; coerced to a list, grammar checked against §4's vocabulary |
+| `suggests` | Optional; same coercion and same vocabulary. What the *preferred* path needs. A token may not appear in both lists — the two are answers to one question, and a token in both says the skill needs it and does not |
 | `spec_version` | Defaults to `1`; selects the migration path (§5c) |
 | `updated` | Optional. A shipped skill's currency is its release; a local one takes it from the file mtime |
 

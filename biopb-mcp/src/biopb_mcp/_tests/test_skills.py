@@ -172,6 +172,7 @@ def test_shipped_skill_entry_is_built_from_its_frontmatter(
         "tags: [a, b]\n"
         "version: 2.1.0\n"
         "requires: [viewer, pkg:biopb-mcp>=0.13.0]\n"
+        "suggests: [pkg:pystackreg~=0.2.8]\n"
         "---\n\n# T\n\nbody\n",
         encoding="utf-8",
     )
@@ -179,8 +180,26 @@ def test_shipped_skill_entry_is_built_from_its_frontmatter(
     assert found["tags"] == ["a", "b"]
     assert found["version"] == "2.1.0"
     assert found["requires"] == ["viewer", "pkg:biopb-mcp>=0.13.0"]
+    # Reaches the agent as its own field. Folding it into `requires` would make
+    # an expected gap read as a blocked skill, which is what the key exists to
+    # tell apart.
+    assert found["suggests"] == ["pkg:pystackreg~=0.2.8"]
     assert found["origin"] == "catalog"
     assert found["uri"] == "skill://x"
+
+
+def test_a_skill_without_suggests_still_carries_the_field(
+    mock_home, skills_cfg, monkeypatch, tmp_path
+):
+    # Every caller iterates it, and most skills declare none -- so absent must
+    # read as empty rather than missing.
+    d = _ship(monkeypatch, tmp_path, [{"id": "y", "title": "T", "description": "d"}])
+    (d / "y.md").write_text(
+        "---\nid: y\ntitle: T\ndescription: d\n---\n\n# T\n\nbody\n",
+        encoding="utf-8",
+    )
+    (found,) = _skills.find_skills("")
+    assert found["suggests"] == []
 
 
 def test_an_empty_shipped_set_warns_because_it_is_always_a_bug(

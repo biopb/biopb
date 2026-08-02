@@ -3,7 +3,7 @@ id: write-a-skill
 title: Write a new biopb skill file
 description: Turn a workflow the user has just validated into a reviewed skill file for the biopb catalog.
 tags: [workflow, authoring]
-version: 1.0.0
+version: 1.1.0
 requires: []
 ---
 
@@ -47,6 +47,7 @@ The frontmatter fields, and how to determine each:
 | `description` | One sentence. This is what `find_skills` ranks on — write it as the user's request, not as an implementation summary |
 | `tags` | A list of categories describing the skill. Reuse tags you have seen on published skills where they fit — consistent tags are what make discovery work |
 | `version` | `1.0.0` for a new skill. Bump on every content edit; the site derives `updated` from git, so never set a date by hand |
+| `suggests` | Same vocabulary as `requires`, for what only the **preferred** path needs — a package the skill is better with and honest without. Use it when your body names a real fallback, and then step 1 must name the package *and* say what happens without it. This is what lets the skill ship to a platform the package has no wheel for: a required package missing there rejects the skill outright, a suggested one is a hole the degraded path covers. The workspace floor (`pkg:biopb-mcp>=X`) may never be suggested — there is no fallback from an interface that does not exist yet — and no token may appear in both lists |
 | `requires` | What the steps actually touch: `viewer`, `tensor`, `dask`, `ops:<kind>`, `plugin:<name>` (the plugin's **file stem**, e.g. `plugin:rolling_ball` ↔ `rolling_ball.py` — also the name it is bound under in the kernel namespace, so the body calls `rolling_ball.subtract_background(...)`), `pkg:<name>` with a version bound — `~=X.Y.Z` for a third party (a floor *and* an upper bound at the next minor, so the API the body quotes cannot move under it; never a bare floor, never `==`, and never a comma pair, which the runtime reader splits), `>=X.Y.Z` only for `biopb-mcp` itself. Not decoration — the agent resolves this list against the live session before starting (see step 2). A skill that drives the kernel carries `pkg:biopb-mcp>=0.13.0`, the first release exposing the interface it is written against; raise that bound only if the skill needs something newer. An empty list is a real answer, not an omission: a skill whose steps touch nothing in the session has nothing to resolve |
 
 ## Steps
@@ -86,8 +87,11 @@ The frontmatter fields, and how to determine each:
    the confirm-input step — there is no point asking the user which layer is truth
    if the scorer was never going to be there.
 
-   Keep *the check itself* to one sentence: resolve `requires:` against
-   `server_status`, and point at `guide://kernel` for what to do about a gap. The
+   Keep *the check itself* to one sentence: resolve `requires:` (and `suggests:`,
+   if you declared one) against `server_status`, and point at `guide://kernel` for
+   what to do about a gap. A suggested package is the exception to the one-sentence
+   rule: say in the same step what the run does without it, because that is the
+   version of the skill some platforms only ever get. The
    diagnosis — which section answers which token, what a missing plugin means, the
    options for a missing package — lives in the guide, and a copy in your body is
    one more thing to go stale. Add a clause only where your own token needs

@@ -59,7 +59,11 @@ FRONTMATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
 def declared_packages() -> list[str]:
-    """Every third-party `pkg:` spec in the shipped catalog, deduplicated."""
+    """Every third-party `pkg:` spec in the shipped catalog, deduplicated.
+
+    `suggests:` counts: an optional package is what the users who have it
+    actually run, and the body quotes its API literally either way.
+    """
     specs: set[str] = set()
     for path in sorted(SKILLS_DIR.glob("*.md")):
         if path.stem in NOT_SKILLS:
@@ -68,7 +72,11 @@ def declared_packages() -> list[str]:
         if not match:
             continue
         frontmatter = yaml.safe_load(match.group(1)) or {}
-        for token in frontmatter.get("requires") or []:
+        declared = [
+            *(frontmatter.get("requires") or []),
+            *(frontmatter.get("suggests") or []),
+        ]
+        for token in declared:
             token = str(token)
             if not token.startswith("pkg:"):
                 continue

@@ -8,7 +8,7 @@ See ``biopb-mcp/docs/skill-interface.md`` §1 and §5.
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 # Current authoring dialect. Older skill files declare a lower spec_version and
 # are up-converted by migrate() in _validate, so what the gate checks is uniform.
@@ -54,6 +54,11 @@ class SkillEntry:
     version: str
     spec_version: int
     requires: list
+    # Needed by the preferred path only. A skill that resolves a `suggests:`
+    # gap takes the degraded path its own body names; nothing about it is
+    # broken. Kept apart from `requires:` because the availability gate renders
+    # a different verdict for each -- see skill-testing.md §4b.
+    suggests: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
