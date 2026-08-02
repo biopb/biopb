@@ -56,9 +56,15 @@ TOLERANCE = {
 
 
 # --- the synthetic fixtures ------------------------------------------------
+#
+# Names without a leading underscore here are this skill's shared fixture
+# vocabulary: `_drift_channels` builds its movies out of them. The underscored
+# ones are private to this module because nothing else uses them, which is the
+# convention meaning what it says rather than being tolerated — `_smooth_field`
+# sitting beside a public `blobby_field` is that distinction, not an oversight.
 
 
-def _blobby_field(seed: int, shape: tuple[int, int]) -> np.ndarray:
+def blobby_field(seed: int, shape: tuple[int, int]) -> np.ndarray:
     """Sparse bright objects on a flat background — a fluorescence field.
 
     Structurally what registration is easy on: isolated high-frequency features
@@ -80,7 +86,7 @@ def _smooth_field(seed: int, shape: tuple[int, int]) -> np.ndarray:
     return (1000.0 + 20.0 * base).astype(np.float32)
 
 
-def _trajectory(n_frames: int, per_frame_px: float, seed: int) -> np.ndarray:
+def trajectory(n_frames: int, per_frame_px: float, seed: int) -> np.ndarray:
     """A smooth, slowly turning drift of `per_frame_px` per frame, plus jitter.
 
     Deliberately not a straight line. A pure ramp is separable in y and x and
@@ -124,9 +130,9 @@ class SyntheticDrift:
         return True, ""
 
     def build(self) -> Fixture:
-        make = _blobby_field if self.texture == "blobby" else _smooth_field
+        make = blobby_field if self.texture == "blobby" else _smooth_field
         base = make(self.seed, self.shape)
-        offsets = _trajectory(self.n_frames, self.per_frame_px, self.seed + 1)
+        offsets = trajectory(self.n_frames, self.per_frame_px, self.seed + 1)
         movie = np.array(
             [ndimage.shift(base, o, order=3, mode="nearest") for o in offsets],
             dtype=np.float32,
@@ -196,7 +202,7 @@ CURATED = register_curated(SKILL)
 # which is the same pair an agent run would be scraped for.
 
 
-def _apply(movie: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+def undo_offsets(movie: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     """Undo `offsets` frame by frame — the transform-stack step, by hand."""
     return np.array(
         [
@@ -206,7 +212,7 @@ def _apply(movie: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     )
 
 
-def _stackreg(movie: np.ndarray, reference: str) -> Attempt:
+def run_stackreg(movie: np.ndarray, reference: str) -> Attempt:
     from pystackreg import StackReg
 
     sr = StackReg(StackReg.TRANSLATION)
@@ -240,14 +246,14 @@ def _cross_correlation(movie: np.ndarray, normalization: str | None) -> Attempt:
     offsets = np.asarray(offsets)
     return Attempt(
         subject=f"cross-correlation-{normalization or 'none'}",
-        arrays={"offsets": offsets, "corrected": _apply(movie, offsets)},
+        arrays={"offsets": offsets, "corrected": undo_offsets(movie, offsets)},
         notes=f"skimage phase_cross_correlation, normalization={normalization!r}",
     )
 
 
 def as_the_skill_says(fixture: Fixture) -> Attempt:
     """Step 3 and step 5, verbatim: TRANSLATION, ``reference="previous"``."""
-    return _stackreg(fixture.data["movie"], "previous")
+    return run_stackreg(fixture.data["movie"], "previous")
 
 
 def the_degraded_path(fixture: Fixture) -> Attempt:
@@ -260,7 +266,7 @@ def against_the_first_frame(fixture: Fixture) -> Attempt:
     """The mistake step 3 exists to prevent: registering every frame to frame 0,
     so the displacement grows past the optimiser's capture range and the fit
     returns a confident, wrong transform rather than failing."""
-    return _stackreg(fixture.data["movie"], "first")
+    return run_stackreg(fixture.data["movie"], "first")
 
 
 def with_default_normalization(fixture: Fixture) -> Attempt:
@@ -319,11 +325,18 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
 
     truth_offsets = fixture.truth.get("offsets")
     got_offsets = attempt.arrays.get("offsets")
+    # Same reasoning as the corrected-movie check below: a run binding
+    # `offsets` to something of the wrong shape is a result that cannot be
+    # scored, which is not the same as an error in the verifier.
+    if got_offsets is not None and truth_offsets is not None:
+        got_shape = np.asarray(got_offsets).shape
+        if got_shape != np.asarray(truth_offsets).shape:
+            got_offsets = None
     if truth_offsets is None or got_offsets is None:
         why = (
             "the fixture carries no annotated trajectory"
             if truth_offsets is None
-            else "the run reported no per-frame offsets"
+            else "the run reported no per-frame offsets of the expected shape"
         )
         metrics += [
             Metric(
@@ -368,6 +381,31 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
     stable = fixture.truth.get("stable")
     corrected = _structural(fixture, attempt.arrays.get("corrected"))
     movie = _structural(fixture, fixture.data.get("movie"))
+    # A run may bind `corrected` to anything at all -- the wrong array, a
+    # transposed one, a summary. Scoring that is meaningless, but *crashing* on
+    # it is worse: an unscorable result is an ordinary outcome of an agent run
+    # and has to arrive as "not measured", the same as a truth the fixture
+    # cannot supply. Found by an agent doing exactly this; no reference
+    # implementation could have, being correct by construction.
+    mismatched = (
+        corrected is not None
+        and movie is not None
+        and (corrected.ndim != movie.ndim or corrected.shape[-2:] != movie.shape[-2:])
+    )
+    if mismatched:
+        metrics.append(
+            Metric(
+                "residual_ratio",
+                None,
+                limits["residual_ratio"],
+                unavailable=(
+                    f"the run's corrected movie is {corrected.shape}, which "
+                    f"cannot be compared with the input {movie.shape}"
+                ),
+            )
+        )
+        detail["corrected_shape"] = list(corrected.shape)
+        return Outcome(fixture=fixture, attempt=attempt, metrics=metrics, detail=detail)
     if stable is None or corrected is None or movie is None:
         why = (
             "no un-drifted reference exists for this fixture"
