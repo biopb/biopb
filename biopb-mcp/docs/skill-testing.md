@@ -29,7 +29,7 @@ numeric verifier tests the interaction for free.
 |---|---|---|---|
 | **Structure** (§2) | Is the file well-formed, and does it obey the authoring rules? | `test_schema.py`, `test_validate.py`, `test_shipped_skills.py`, `test_packaging.py` | yes, in `mcp-ci` |
 | **Retrieval** (§3) | Does `find_skills` surface it for the right request? | `test_retrieval.py` | yes, in `mcp-ci` |
-| **Contract** (§4) | Can its packages be installed, and does the API it quotes still exist? | `test_satisfiability.py`, `test_contracts.py` | yes — satisfiability in `mcp-ci`, signatures in `skill-contracts.yaml` |
+| **Contract** (§4) | Can its packages be installed, do they import, and does the API it quotes still exist? | `test_satisfiability.py`, `test_contracts.py` | yes — satisfiability in `mcp-ci`, the rest in `skill-contracts.yaml` |
 | **Interaction** (§5) | Does a model following it produce the right numbers? | `interaction/` | **no** — a benchmark; and the case *data* under it does gate |
 
 Everything that gates is in this repo, so a skill edit and the runtime change it
@@ -104,7 +104,7 @@ where that gets checked. Recent breakages it exists for: a stitching call whose
 singleton-Z axis model still described in two bodies; `np.prod(canvas) *
 itemsize` as a memory estimate, ~4× under the real footprint.
 
-The layer asks two questions in order, and the first is cheaper.
+The layer asks three questions in order, and the first is cheapest.
 
 ### 4a. Satisfiability — may this package be installed here at all?
 
@@ -137,7 +137,22 @@ The workspace's own distributions (`biopb`, `biopb-mcp`, `biopb-tensor-server`,
 `biopb-control`) are skipped: a floor on one is a statement about this repo's
 release history, not about a third party.
 
-### 4b. Signatures — is the API still what the body quotes?
+### 4b. Import — does the installed package work at all?
+
+`test_contracts.py::test_every_installed_declared_package_actually_imports`, one
+check over whatever the catalog declares. §4a asks whether a package can be
+installed without damage, and a package can pass that and still be useless:
+`uv pip install --dry-run stardist` resolves clean and moves nothing, because
+`csbdeep` declares TensorFlow only under a `[tf1]` extra, and then `import
+stardist` raises. The skill dead-ends at step 1 for every user.
+
+Unlike §4c this needs no per-package authoring — it is not a claim about anyone's
+API — so it runs over every declared package the env has installed. Which env
+that is does not matter: `skill_contracts.py` gives each package its own, so an
+absent distribution is legitimate, and a present one that will not import is
+fatal on every platform.
+
+### 4c. Signatures — is the API still what the body quotes?
 
 `test_contracts.py`: parameter exists, default is what the prose assumes, return
 shape is what the snippet unpacks. Currently manned by `drift-correction` —
@@ -435,7 +450,7 @@ uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 # the resolver layer (§4a); CI runs this as its own step
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills -m satisfiability
 
-# the signature layer (§4b), which needs the skill's package
+# the import + signature layers (§4b, §4c), which need the skill's package
 uv run --no-project --python .venv/bin/python --with pystackreg \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py
 
@@ -458,5 +473,5 @@ watch -n5 'find .skill-outcomes/interaction -newermt "-1 hour" | sort'
 **Adding a skill.** Drop the `.md` in `mcp/_skills_data/` — the suite discovers
 the directory and applies every rule. It will ask for: a `requires:` token inside
 the vocabulary, a `[[link]]` that resolves, a one-sentence description, a
-phrasing-table entry (§3), a contract test for any third-party package (§4b), and
+phrasing-table entry (§3), a contract test for any third-party package (§4c), and
 either a benchmark case or a `NOT_BENCHMARKED` reason (§5e).

@@ -115,6 +115,14 @@ names, not its own name, so `dir()` cannot answer it, and a file that failed to 
 on disk, so a directory listing cannot either), `pkg:biopb-mcp` → `## Versions` (the version
 in **this kernel's** interpreter, the one that will run the skill).
 
+A third-party `pkg:<name>` you resolve here, in two steps: `import <name>` answers whether it
+is present, and `importlib.metadata.version("<name>")` answers *which version* — never the
+module's `__version__` attribute, which is hand-maintained and drifts (`laptrack` ships
+`__version__ = "0.17.0"` in its 0.17.1 release, so the attribute fails a `>=0.17.1` token on a
+correctly installed package). The token carries a bound at both ends when it names a version,
+so an install *newer* than the range is unmet too, and the fix is not another install:
+say so and offer the degraded path.
+
 ### When something is missing
 **Diagnose, tell the user, let them choose.** Installing, seeding and restarting are all
 theirs to authorize — but a named gap usually beats abandoning the skill, and several of

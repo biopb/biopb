@@ -571,8 +571,10 @@ def find_skills(query: str = "") -> list:
     A result's `requires` lists what the skill needs (`viewer`, `tensor`, `dask`,
     `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
     skill: `server_status` answers every token except a third-party `pkg:` — it
-    does carry biopb-mcp's own version — and for those, import the package in
-    `execute_code` and read its `__version__`. A gap is the user's call —
+    does carry biopb-mcp's own version — and for those, `execute_code` an
+    `import <name>` and read the version with
+    `importlib.metadata.version("<name>")`, not the module's `__version__`
+    (packages forget to bump it). A gap is the user's call —
     installing, seeding a plugin, restarting the kernel all need their consent —
     but naming it up front beats failing halfway through.
 
