@@ -40,5 +40,11 @@ Two rules that are fixtures in their own right:
   Because of that, §6a does *not* constrain which model plays it: both sides
   are configured independently, and the authoring family is a fine respondent.
 
+**A skill's contribution is data.** :mod:`._benchmark` owns the arms, the
+outcome classification and the report and knows no skill; :mod:`.cases` holds one
+:class:`~._benchmark.Case` per skill — a task prompt, a persona, a fixture
+already registered with the outcome layer, and the names its verifier wants.
+Adding a skill writes a `Case` and no test code.
+
 Marked ``interaction``, deselected by default, and never in CI (§10).
 """

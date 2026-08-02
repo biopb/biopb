@@ -64,13 +64,45 @@ written to a trace, an artifact or a log.
 | `_models.py` | The provider table: which model on each side, at which address, with which key |
 | `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `ToolCallingAgent` |
 | `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
-| `_personas.py` | The respondent fixtures — who the agent talks to, and what only they know |
+| `_benchmark.py` | The engine: `Case`, the 2x2 arms, outcome classification, the report. Knows no skill |
+| `cases/` | One module per skill, each a single `Case`. Data, not code |
 | `_conversation.py` | The two-model loop, the caps, the `Trace` |
-| `test_drift_benchmark.py` | The 2x2 benchmark: skill offered/withheld x respondent answers/silent |
+| `test_benchmark.py` | The pytest surface: run every case, assert only that it reported |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
 | `test_conversation.py` | That the loop works, with no model *and* no session |
-| `test_personas.py` | That a persona gives nothing away |
+| `test_report.py` | That the engine classifies and reports, on hand-built outcomes |
+| `test_personas.py` | That no case's persona gives anything away |
 | `test_models.py` | That provider selection resolves, and that §6a holds of the defaults |
+
+## Adding a skill
+
+The engine is skill-agnostic, so a new skill is **data**:
+
+1. register an `interaction`-tier fixture in `outcomes/` — the one that strips a
+   fact from the data so it can only be obtained by asking, proved there
+   deterministically and without a model (§6b);
+2. write `cases/<skill>.py` holding one `Case`;
+3. add it to `cases.CASES`.
+
+```python
+CASE = Case(
+    skill="drift-correction",
+    task=TASK,                                   # the prompt, incl. where results land
+    persona=MICROSCOPIST,                        # who holds the withheld fact
+    layers={"timelapse": "movie"},               # layer name -> fixture data key
+    collect={"offsets": "offsets", "corrected": "corrected"},
+    score=_drift.verify,                         # the outcome layer's verifier, reused
+    save_artifacts=_drift.save_artifacts,
+    spy=GATE_SPY,                                # optional: did it ask before it spent
+    spy_markers=("register_stack", ...),
+    persona_must_know=(...), persona_must_not_know=(...),
+)
+```
+
+No test code: `test_benchmark.py` parametrizes over `CASES`, so the new case
+brings its own arms, report and transcripts, and `test_personas.py` /
+`test_report.py` start checking it by its arriving. Report and transcripts land
+under `.skill-outcomes/interaction/<skill>/`.
 
 ## A benchmark, not a gate
 
