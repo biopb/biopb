@@ -61,6 +61,13 @@ RETRIEVES = [
     ("stage drift", "drift-correction"),
     ("register time series", "drift-correction"),
     ("time lapse registration", "drift-correction"),
+    ("flatfield", "flatfield"),
+    ("flat field", "flatfield"),
+    ("illumination", "flatfield"),
+    ("uneven illumination", "flatfield"),
+    ("vignetting", "flatfield"),
+    ("shading", "flatfield"),
+    ("shading correction tiles", "flatfield"),
 ]
 
 # Queries that must not drag a skill in. Over-retrieval is not harmless: the
@@ -71,6 +78,14 @@ REJECTS = [
     ("measure", "segmentation-qc-metrics"),
     ("segmentation", "calibrated-measurements"),
     ("tiles", "segmentation-qc-metrics"),
+    # `flatfield` and `drift-correction` are both "fix the images before
+    # measuring", and both bodies talk about correcting a collection of frames.
+    # The pair that must stay apart is the one an agent would land on from a
+    # single word: a moved field of view is not an uneven one.
+    ("drift", "flatfield"),
+    ("registration", "flatfield"),
+    ("illumination", "drift-correction"),
+    ("vignetting", "calibrated-measurements"),
 ]
 
 
