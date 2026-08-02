@@ -1,21 +1,22 @@
-"""The fixture protocol every outcome case is written against.
+"""What a run is given, what it has to recover, and how that is scored.
 
-Skill-agnostic on purpose: nothing here knows what drift is. A skill's module
-supplies a provider that builds a :class:`Fixture`, a runner that produces an
-:class:`Attempt`, and a verifier that turns the pair into an :class:`Outcome`.
+Skill-agnostic on purpose: nothing here knows what drift is. A case module
+supplies a builder that returns a :class:`Fixture` and a verifier that turns
+``(fixture, attempt)`` into an :class:`Outcome`; this file is the vocabulary
+they are both written in.
 
-The shape is chosen so a **curated fixture of real data can replace a synthetic
-one without touching the verifier**. Two things follow from that, and they are
-the only non-obvious parts of this file:
+Two properties shape it, and they are the only non-obvious parts.
 
 *Truth is data, not a formula.* A synthetic fixture knows the answer because it
 constructed it; a curated one knows whatever a human annotated. Both hand the
-verifier a mapping, and the verifier reads the keys it needs.
+verifier a mapping, and the verifier reads the keys it needs — which is what
+lets real data replace a synthetic case without touching the verifier (§5a).
 
 *A metric it cannot compute is unavailable, not passing.* A real movie has no
-un-drifted reference image, so any metric needing one is simply absent from the
-report. :attr:`Outcome.passed` is false when *nothing* was scored, which is what
-stops a fixture with an empty truth from reading as a clean run.
+un-drifted reference image, so any metric needing one is absent from the report.
+:attr:`Outcome.passed` is false when *nothing* was scored, which is what stops a
+fixture with an empty truth from reading as a clean run — and, just as often
+here, what stops an agent that left nothing behind from reading as one.
 """
 
 from __future__ import annotations
@@ -25,18 +26,11 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal
 
 import numpy as np
 
 Kind = Literal["synthetic", "curated"]
-
-#: Which layer a fixture is built for. An ``interaction`` fixture has a fact
-#: stripped from its data that only a respondent holds (§6), so its cases pair
-#: with a different set of subjects than the ``outcome`` ones do -- and the
-#: registry is global, so the two must be separable without depending on which
-#: test module imported first.
-Tier = Literal["outcome", "interaction"]
 
 
 @dataclass(frozen=True)
@@ -68,10 +62,10 @@ class Fixture:
 class Attempt:
     """What a run left behind, in the terms a verifier can score.
 
-    Fields are optional because a run may legitimately produce only some of
-    them — the degraded path of a skill can yield a trajectory without ever
-    materialising a corrected array, and an agent may leave one and not the
-    other in its namespace. A verifier reports what it could not score.
+    ``arrays`` is whatever the harness could scrape out of the kernel, so it is
+    routinely partial: an agent may bind one of the two names the task asked
+    for, or bind a name to something of the wrong shape. A verifier reports what
+    it could not score rather than raising.
     """
 
     subject: str
@@ -83,9 +77,9 @@ class Attempt:
 class Metric:
     """One number, its limit, and whether it could be computed at all.
 
-    ``value is None`` is the load-bearing state: it says *this fixture's truth
-    does not support this measurement*, which is the normal condition for a
-    curated real fixture and must never be confused with a pass.
+    ``value is None`` is the load-bearing state: it says *this run, against this
+    fixture's truth, does not support this measurement*, which must never be
+    confused with a pass.
     """
 
     name: str
@@ -131,8 +125,8 @@ class Outcome:
     @property
     def passed(self) -> bool:
         """Every metric that could be computed is within its limit — and at
-        least one could be. A fixture whose truth supports nothing has not
-        passed; it has not been tested."""
+        least one could be. A run that scored nothing has not passed; it has not
+        been tested."""
         return bool(self.scored) and not self.failures
 
     def summary(self) -> str:
@@ -143,60 +137,52 @@ class Outcome:
         return "\n  ".join([head, *(str(m) for m in self.metrics)])
 
 
-# --- providers -------------------------------------------------------------
+# --- reading a run's leavings ----------------------------------------------
+#
+# Every verifier starts the same way, and it is not the part worth writing
+# three times: an agent binds a name to the wrong thing about as often as it
+# binds it to the right one, and *crashing* on that is worse than scoring it.
+# An unscorable result is an ordinary outcome of an agent run and has to arrive
+# as "not measured", the same as a truth the fixture cannot supply.
 
 
-@runtime_checkable
-class Provider(Protocol):
-    """A source of one fixture. The seam a curated fixture substitutes at."""
-
-    skill_id: str
-    case_id: str
-    kind: Kind
-    tier: Tier
-
-    def available(self) -> tuple[bool, str]:
-        """``(usable, why not)``. A synthetic provider is always usable; a
-        curated one answers for whether its data is on this machine."""
-
-    def build(self) -> Fixture: ...
+def read_array(
+    attempt: Attempt, key: str, shape: tuple[int, ...]
+) -> tuple[np.ndarray | None, str]:
+    """``(array, why not)`` for *key*, required to be exactly *shape*."""
+    got = attempt.arrays.get(key)
+    if got is None:
+        return None, f"the run left no `{key}`"
+    got = np.asarray(got, float)
+    if got.shape != shape:
+        return None, f"the run's `{key}` is {got.shape}, not {shape}"
+    return got, ""
 
 
-_PROVIDERS: dict[str, list[Provider]] = {}
+def read_scalar(attempt: Attempt, key: str) -> tuple[float | None, str]:
+    """``(number, why not)`` for a *key* the run should have bound to one."""
+    got = attempt.arrays.get(key)
+    if got is None:
+        return None, f"the run left no `{key}`"
+    got = np.asarray(got, float)
+    if got.size != 1 or not np.isfinite(got).all():
+        return None, f"the run's `{key}` is not a finite single number ({got.shape})"
+    return float(got.reshape(())), ""
 
 
-def register(provider: Provider) -> Provider:
-    """Add *provider* to the registry, newest last. Returns it, so it can be
-    used as a decorator on a provider class instance."""
-    cases = _PROVIDERS.setdefault(provider.skill_id, [])
-    if any(p.case_id == provider.case_id for p in cases):
-        raise ValueError(
-            f"duplicate fixture case {provider.skill_id}/{provider.case_id}"
-        )
-    cases.append(provider)
-    return provider
-
-
-def providers_for(skill_id: str, tier: Tier | None = None) -> list[Provider]:
-    """Every registered case for *skill_id*, optionally just one tier's.
-
-    Pass *tier* explicitly from a test module. Filtering is not a convenience
-    here: the registry is process-global and populated at import, so a module
-    that took everything would silently gain cases the moment a sibling module
-    was collected alongside it.
-    """
-    cases = list(_PROVIDERS.get(skill_id, ()))
-    return cases if tier is None else [p for p in cases if p.tier == tier]
-
-
-def registered_skills() -> list[str]:
-    return sorted(_PROVIDERS)
+def relative_error(got, want) -> float:
+    """Worst elementwise ``|got - want| / |want|``. The comparison for a
+    quantity whose scale is the point — a volume in µm³ against one in voxels
+    is wrong by a factor, not by an amount."""
+    got = np.asarray(got, float)
+    want = np.asarray(want, float)
+    return float(np.max(np.abs(got - want) / np.maximum(np.abs(want), 1e-12)))
 
 
 # --- the curated path ------------------------------------------------------
 
 #: Where a curated fixture tree lives. Unset on most machines, and that is the
-#: normal state -- curated cases skip rather than fail.
+#: normal state -- a case falls back to its own procedural builder.
 FIXTURE_DIR_ENV = "BIOPB_SKILL_FIXTURES"
 
 
@@ -209,8 +195,9 @@ def curated_root() -> Path | None:
 class CuratedNpz:
     """A fixture read off disk: real data someone acquired and annotated.
 
-    This exists so that substituting real data for a synthetic case is *putting
-    a directory somewhere*, not writing code. Under
+    A synthetic fixture is not a microscope — no vendor metadata, no genuine
+    vignetting, no real stage error. This exists so substituting real data is
+    *putting a directory somewhere*, not writing code. Under
     ``$BIOPB_SKILL_FIXTURES/<skill_id>/<case_id>/``:
 
     ``case.json``
@@ -223,16 +210,20 @@ class CuratedNpz:
     ``arrays.npz``
         every array named by those lists.
 
+    What the substitution costs is **truth**: a curated movie can carry a
+    trajectory someone measured off a bead, but not the un-drifted reference
+    image, because no such acquisition exists. A metric the fixture cannot
+    support reports as unavailable, never as passing.
+
     Nothing here validates the *science* of the annotation. It cannot: whether
-    someone's fiducial trajectory is right is a review question, and this is the
-    same review a synthetic seed does not need. That asymmetry is the real cost
-    of real data, and it belongs in the case's ``provenance``.
+    someone's fiducial trajectory is right is a review question, and it is the
+    review a synthetic seed does not need. That asymmetry is the real cost of
+    real data, and it belongs in the case's ``provenance``.
     """
 
     skill_id: str
     case_id: str
     kind: Kind = "curated"
-    tier: Tier = "outcome"
 
     @property
     def _dir(self) -> Path | None:
@@ -276,29 +267,28 @@ class CuratedNpz:
         )
 
 
-def register_curated(skill_id: str) -> list[CuratedNpz]:
-    """Register every curated case present for *skill_id*, if any.
+def curated_for(skill_id: str) -> Fixture | None:
+    """The curated fixture for *skill_id*, if this machine has one.
 
-    Called at import time by a skill's fixture module. A tree that is not there
-    registers nothing: no phantom case appears for data that was never going to
-    be on this machine. The *tier* still advertises itself, as a single skip
-    carrying the name of this env var — see `test_drift_correction.CURATED`.
+    Checked before a case builds its own, so pointing `$BIOPB_SKILL_FIXTURES`
+    at a tree of real acquisitions substitutes them for the procedural fixtures
+    without editing anything. The first case directory wins: a curated tree is a
+    deliberate act, and one skill's benchmark runs one fixture.
     """
     root = curated_root()
     if root is None or not (root / skill_id).is_dir():
-        return []
-    added = []
+        return None
     for case in sorted((root / skill_id).iterdir()):
         if case.is_dir() and (case / "case.json").is_file():
-            added.append(register(CuratedNpz(skill_id=skill_id, case_id=case.name)))
-    return added
+            return CuratedNpz(skill_id=skill_id, case_id=case.name).build()
+    return None
 
 
 # --- artifacts -------------------------------------------------------------
 
-#: Per §2, every outcome case emits a number *and* an artifact: the number
-#: gates, the artifact explains. Imaging failures are recognisable in a second
-#: by eye and awkward to characterise in an assertion.
+#: Every case emits a number *and* an artifact: the number says what happened,
+#: the artifact explains it. Imaging failures are recognisable in a second by
+#: eye and awkward to characterise in an assertion.
 ARTIFACT_DIR_ENV = "BIOPB_SKILL_OUTCOME_DIR"
 
 
@@ -306,9 +296,9 @@ def artifact_root() -> Path:
     raw = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
     if raw:
         return Path(raw).expanduser()
-    # .../biopb-mcp/src/biopb_mcp/_tests/skills/outcomes/_outcome.py -> checkout
-    # root. Landing beside the source is deliberate: these are meant to be
-    # opened and paged through, not hunted for in a temp dir.
+    # .../biopb-mcp/src/biopb_mcp/_tests/skills/interaction/_fixture.py -> the
+    # checkout root. Landing beside the source is deliberate: these are meant to
+    # be opened and paged through, not hunted for in a temp dir.
     return Path(__file__).resolve().parents[6] / ".skill-outcomes"
 
 

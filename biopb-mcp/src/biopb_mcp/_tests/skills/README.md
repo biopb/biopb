@@ -1,6 +1,6 @@
 # The skills authoring gate
 
-The deterministic layers of [`docs/skill-testing.md`](../../../../../docs/skill-testing.md)
+The deterministic layers of [`biopb-mcp/docs/skill-testing.md`](../../../../docs/skill-testing.md)
 — no agent, no session, no display — run against the skills this package ships
 (`biopb_mcp/mcp/_skills_data/*.md`).
 
@@ -8,11 +8,11 @@ The deterministic layers of [`docs/skill-testing.md`](../../../../../docs/skill-
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 ```
 
-Two layers are held back from that default run, each by a marker. `satisfiability`
-needs a real resolver run (below). `outcome` needs each skill's own package —
-and, unlike everything else here, is **not a gate at all**: it scores a hand
-transcription of a skill rather than the shipped file, so it runs on a
-workstation as a diagnostic (`outcomes/README.md`).
+Two layers are held back from that default run, each by a marker.
+`satisfiability` needs a real resolver run (below). `interaction` needs a
+display, two API keys and about twenty minutes, and — unlike everything else
+here — is **not a gate at all**: it is a benchmark that reports what four
+conversations did (`interaction/README.md`).
 
 ## What is covered
 
@@ -24,9 +24,7 @@ workstation as a diagnostic (`outcomes/README.md`).
 | `test_retrieval.py` | Retrieval | Do the real descriptions answer the phrasings a user would type? |
 | `test_satisfiability.py` | Contract | Can a skill's declared packages be installed here at all? |
 | `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
-| `outcomes/` | Outcome | Does following a skill's procedure produce the right numbers? *(diagnostic, not a gate)* |
-| `outcomes/test_drift_channel_choice.py` | Interaction, prep | Does a fact only a person holds actually cost the measurement when nobody asks? *(no model in the loop)* |
-| `interaction/` | Interaction | A model in front of the shipped body, against a real session *(§6; the session floor is built, the agent is not)* |
+| `interaction/` | Interaction | A model in front of the shipped body, against a real session, scored on numbers *(§5; a benchmark, not a gate)* |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the `requires:`
@@ -48,6 +46,10 @@ the directory and applies every rule. Expect to be told about a `requires:`
 token outside the vocabulary, a link to a skill that does not exist, a
 description that runs to two sentences — and, from `test_retrieval.py`, that you
 owe the new skill a phrasing entry.
+
+You also owe it either a benchmark case (`interaction/cases/<skill>.py`) or a
+line in `interaction/cases.NOT_BENCHMARKED` saying why it cannot have one;
+`interaction/test_cases.py` fails until one of the two exists.
 
 ## The `satisfiability` marker
 
@@ -81,65 +83,64 @@ venv" is not a resolution.
 `test_the_extractor_finds_pkg_tokens` keeps the layer from going vacuously green
 if the shipped catalog ever stops declaring a third-party package again.
 
-## The `outcome` marker
-
-Fixtures with a known answer, and a verifier that scores a run against them —
-`docs/skill-testing.md` §5. Deselected by default for two reasons, and the
-second is the important one:
-
-- the subjects import the skill's package, and that package is deliberately not
-  in this environment (one shared resolution would force every skill's
-  dependency to co-exist with every other's);
-- **it tests nothing this repo ships.** The subjects are a hand transcription of
-  what a skill body says and never read the file, so a green run certifies the
-  transcription. Edit a step, or delete the skill, and these stay green. That is
-  why it is a workstation diagnostic and not a merge gate, unlike
-  `test_contracts.py` next door, whose assertions come out of the shipped
-  frontmatter.
-
-```sh
-uv run --no-project --python .venv/bin/python --with pystackreg \
-  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills -m outcome
-```
-
-Its use is downstream of the interaction tier (§6): an agent run against a real
-skill file is the test with teeth and is non-deterministic, and this is the
-harness a finding from one gets pinned down in. See `outcomes/README.md`,
-including what the fixtures deliberately do not span. Two mechanisms there are
-worth knowing from here: real data can be substituted for a synthetic fixture
-without touching a verifier (`BIOPB_SKILL_FIXTURES`), and every case is also run
-through the mistake its skill body warns about, because a verifier nothing has
-ever failed is not known to work.
-
-The protocol tests (`outcomes/test_outcome_protocol.py`) are *not* marked and do
-run with the ordinary suite — they are hermetic and instant, and a break in the
-machinery should surface before someone is mid-diagnosis with it.
-
-`outcomes/test_drift_channel_choice.py` also sits under this marker while
-belonging to the tier above (`docs/skill-testing.md` §6b). It has no model in
-it: it asserts that a fact only the microscopist holds — which channel is
-structural — cannot be recovered from the pixels, by scoring runs that guessed.
-That has to hold before it is worth paying a model to demonstrate it.
-
 ## The `interaction` marker
 
 A **real** biopb-mcp session — shim-spawned child, real kernel, real napari,
 real dask, the nine real tools over real MCP — with the skill body arriving
-through the real `_skills.py`. `docs/skill-testing.md` §6 and
+through the real `_skills.py`, and a model in front of it talking to a simulated
+user who holds a fact the fixture withheld. `biopb-mcp/docs/skill-testing.md` §5 and
 `interaction/README.md`.
 
 ```sh
 xvfb-run -a -s '-screen 0 1024x768x24' \
-  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction
+  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
 ```
+
+The trailing `-s` is what makes the per-arm progress lines visible; pytest
+discards a passing test's output. `interaction/README.md` has the other way to
+watch a run.
 
 **It needs a GL-capable display**, and not merely offscreen Qt: napari builds
 under `QT_QPA_PLATFORM=offscreen` and then `add_image` dies in vispy's GL probe.
-Without one the tests skip with instructions.
+Without one the tests skip with instructions. It also needs two API keys, and
+costs four conversations per skill.
+
+**It is a benchmark, not a gate, and no run's outcome fails a test.** Each of
+the four arms — skill offered or withheld, respondent answering or silent —
+reports an outcome and a reason. The report is the deliverable.
 
 Nothing here is stood in for, deliberately — a hand-written tool surface would
 put `execute_code`'s return shape and the `guide://` bodies back into a
-transcription, which is the property that keeps §5 out of the gate. The cost is
-that a red run's cause space includes the kernel, Qt and dask, so
+transcription, which is the disease that got the layer below this one deleted.
+The cost is that a red run's cause space includes the kernel, Qt and dask, so
 `test_session_smoke.py` exists to fail separately when the stack rather than the
 skill is at fault — and it runs without a model or a key.
+
+Most of that directory is *not* marked and runs with the ordinary suite: the
+conversation loop, the report writer, the fixture protocol, and — per skill —
+its persona, its fixture and its verifier (`interaction/test_cases.py`). A case
+whose persona volunteers the answer, or whose verifier passes a run that left
+nothing behind, is a normal red test and never a surprise mid-run.
+
+## There used to be an `outcome` marker
+
+A layer that ran each skill's procedure against a ground-truth fixture and
+checked the number, with the procedure written **by hand** from what the body
+said. It was deleted, and the reasoning is worth keeping:
+
+- **It tested nothing this repo ships.** The subject was a transcription that
+  never read the file, so editing a step — or deleting the skill — left it
+  green. That is the opposite of `test_contracts.py` next door, whose
+  assertions come out of the shipped frontmatter.
+- **It could not reach the instructions that matter.** Anything that needs a
+  *choice* in order to be wrong — which channel is structural, whether to pass
+  `spacing=` — is made correctly by construction in a reference implementation,
+  so the fixture scored data no subject could fail.
+- **It did not scale.** `drift-correction` cost ~640 lines against a 157-line
+  skill, most of it reference implementations and tolerance measurement, and
+  every skill would have owed the same.
+
+What was worth keeping moved into `interaction/`: the fixture protocol, the
+substitutable curated-data path (`BIOPB_SKILL_FIXTURES`), the tolerances, and
+the verifiers themselves — which now score what a model actually left in the
+kernel instead of what a transcription computed.

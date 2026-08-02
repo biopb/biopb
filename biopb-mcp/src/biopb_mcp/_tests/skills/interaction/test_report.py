@@ -11,6 +11,10 @@ The metric columns are the part most worth pinning. They used to be three
 hardcoded names; now they are read off whatever the verifier reported, because a
 curated fixture and a synthetic one for the same skill support different
 measurements and the table has to follow.
+
+What a *case* has to be true of — its persona, its fixture, its verifier — is
+`test_cases.py`. This file knows about one only as something to write a report
+for.
 """
 
 from __future__ import annotations
@@ -19,14 +23,12 @@ import json
 
 import pytest
 
-from ..outcomes._outcome import Attempt, Fixture, Metric, Outcome
 from . import _benchmark, conftest
 from ._benchmark import (
     ARMS,
     FLAG_CATALOG_MISMATCH,
     FLAG_CUT_OFF,
     FLAG_NEVER_ASKED,
-    FLAG_NEVER_REGISTERED,
     FLAG_OVER_BUDGET,
     GAVE_UP,
     HARNESS_ERROR,
@@ -38,8 +40,10 @@ from ._benchmark import (
     WRONG_ANSWER,
     Result,
     Run,
+    catalog_size,
 )
 from ._conversation import FINISHED, SILENT, TURN_CAP
+from ._fixture import Attempt, Fixture, Metric, Outcome
 from .cases import CASES
 
 FIXTURE = Fixture(
@@ -144,14 +148,6 @@ def test_asking_too_much_and_never_asking_are_both_flagged():
     assert FLAG_NEVER_ASKED in silent.flags()
 
 
-def test_never_registered_is_only_claimed_when_a_spy_was_installed():
-    """Without one the list is empty by construction, and a flag that fires on
-    every arm of every case says nothing about any of them."""
-    watched = result(outcome=scored(0.1), watched=True)
-    assert FLAG_NEVER_REGISTERED in watched.flags()
-    assert FLAG_NEVER_REGISTERED not in result(outcome=scored(0.1)).flags()
-
-
 def test_a_scored_but_severed_run_says_so():
     cut = result(trace=FakeTrace(stopped=TURN_CAP), outcome=scored(0.1))
     assert FLAG_CUT_OFF in cut.flags()
@@ -167,6 +163,22 @@ def test_the_catalog_flag_fires_in_both_directions():
     assert FLAG_CATALOG_MISMATCH in offered_but_absent.flags()
 
 
+def test_the_catalog_is_counted_from_what_the_tool_returned():
+    """Whether the ablation took effect rests on this number, so it is parsed
+    rather than pattern-counted — and an empty catalog and an unreadable one are
+    not the same claim."""
+    assert catalog_size(json.dumps([{"id": "a"}, {"id": "b"}])) == 2
+    assert catalog_size("[]") == 0
+    assert catalog_size("") == 0
+    # A list return can reach a client wrapped in structured content.
+    assert catalog_size(json.dumps({"result": [{"id": "a"}]})) == 1
+    assert catalog_size(json.dumps({"result": []})) == 0
+    # Not JSON at all: whatever this is, it is not evidence that the catalog was
+    # withheld — and reading it as such would turn a broken ablation into a
+    # clean-looking table.
+    assert catalog_size("1 skill: drift-correction") == 1
+
+
 # --- the report ------------------------------------------------------------
 
 
@@ -179,7 +191,7 @@ def report(tmp_path, monkeypatch):
         case=case,
         fixture=FIXTURE,
         results=[
-            result(ARMS[0], outcome=scored(0.05), registered=["register_stack"]),
+            result(ARMS[0], outcome=scored(0.05)),
             result(ARMS[1], trace=FakeTrace(stopped=TURN_CAP), outcome=scored(9.0)),
             result(ARMS[2], outcome=outcome(Metric("err_px", None, 1.0))),
             Result(arm=ARMS[3], error="RuntimeError: boom"),
@@ -211,6 +223,14 @@ def test_a_metric_no_arm_could_produce_reads_as_absent_not_as_zero(report):
     assert data["arms"][2]["metrics"]["err_px"] is None
 
 
+def test_a_row_says_how_long_its_arm_took(report):
+    """The only cost signal a reader gets afterwards. An arm is minutes, and
+    "was this twenty minutes or ninety" is not recoverable from the transcript."""
+    text, data, _ = report
+    assert all("seconds" in row for row in data["arms"])
+    assert "| min |" in text
+
+
 def test_the_report_names_both_models_and_the_fixture(report):
     """A row is uninterpretable a week later without them."""
     text, data, _ = report
@@ -227,7 +247,7 @@ def test_the_report_lands_under_its_own_skill(report):
     assert (where / "summary.md").is_file()
 
 
-# --- the case protocol -----------------------------------------------------
+# --- a run that never started ----------------------------------------------
 
 
 def test_a_run_that_never_got_a_session_is_distinguishable(tmp_path):
@@ -244,28 +264,6 @@ def test_a_run_that_never_got_a_session_is_distinguishable(tmp_path):
         fixture=FIXTURE,
         results=[result(a, outcome=scored(0.1)) for a in ARMS],
     ).failed_to_start
-
-
-@pytest.mark.parametrize("case", CASES, ids=lambda c: c.skill)
-def test_every_case_is_complete_enough_to_run(case):
-    """The fields a run cannot proceed without, checked without running one."""
-    assert case.task.strip(), f"{case.skill}: no task prompt"
-    assert case.layers, f"{case.skill}: no fixture layer to load"
-    assert case.collect, f"{case.skill}: nothing would be collected"
-    assert callable(case.score)
-    assert case.query
-
-
-@pytest.mark.parametrize("case", CASES, ids=lambda c: c.skill)
-def test_the_task_asks_for_exactly_what_is_collected(case):
-    """The scrape names are a **harness convention**, not a claim the skill
-    makes — so the prompt has to state them, or the run is scored on names the
-    agent was never told to bind."""
-    for expression in case.collect.values():
-        assert expression in case.task, (
-            f"{case.skill}: the task never mentions {expression!r}, "
-            "which is where its result is read from"
-        )
 
 
 # --- smoke runs first, and gates ------------------------------------------
@@ -311,12 +309,3 @@ def test_a_failed_smoke_test_is_recorded_and_a_skipped_one_is_not(monkeypatch):
     conftest.pytest_runtest_logreport(Report(f"{conftest.SMOKE}::skipped", False))
     conftest.pytest_runtest_logreport(Report("test_benchmark.py::other", True))
     assert conftest.smoke_failures() == [f"{conftest.SMOKE}::boom"]
-
-
-@pytest.mark.parametrize("case", CASES, ids=lambda c: c.skill)
-def test_a_spy_and_its_markers_travel_together(case):
-    """Either both or neither: markers without a spy match nothing, and a spy
-    without markers means `never-registered` fires on every arm forever."""
-    assert bool(case.spy) == bool(case.spy_markers), (
-        f"{case.skill}: spy and spy_markers must be set together"
-    )

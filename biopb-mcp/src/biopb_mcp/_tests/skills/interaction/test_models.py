@@ -1,4 +1,4 @@
-"""Provider selection: hermetic, and it makes §6a checkable instead of assumed.
+"""Provider selection: hermetic, and it makes §5a checkable instead of assumed.
 
 No network and no key — every one of these is about resolution, which is the
 part that decides *what* a run measured. Runs with the ordinary suite.
@@ -59,7 +59,7 @@ def no_dotenv(tmp_path, monkeypatch):
 
 
 def test_a_bare_model_name_is_refused():
-    """Which vendor serves a model is exactly what §6a cares about, so it is
+    """Which vendor serves a model is exactly what §5a cares about, so it is
     never inferred from the model string — that would make the rule depend on
     naming conventions that vendors change at will."""
     with pytest.raises(ValueError, match="provider:model"):
@@ -182,11 +182,11 @@ def test_a_local_model_needs_no_key():
     assert parse_choice("ollama:qwen3").why_unavailable() == ""
 
 
-# --- §6a, as a check rather than a comment ---------------------------------
+# --- §5a, as a check rather than a comment ---------------------------------
 
 
 def test_exactly_one_provider_is_marked_as_having_written_these_skills():
-    """§6a is a rule about a fact, and the fact lives in the table. If these
+    """§5a is a rule about a fact, and the fact lives in the table. If these
     skills are ever co-authored with another vendor, this is the line that has
     to change before the rule means anything again."""
     authors = [p.name for p in PROVIDERS.values() if p.wrote_these_skills]
@@ -195,17 +195,17 @@ def test_exactly_one_provider_is_marked_as_having_written_these_skills():
 
 def test_the_default_agent_is_not_from_the_authoring_family():
     """The rule, applied to what a run does when nobody configured anything.
-    A default that violated §6a would be the easiest way to get a green suite
+    A default that violated §5a would be the easiest way to get a green suite
     that measured recognition rather than reading."""
     choice = parse_choice(DEFAULT_AGENT)
     assert not choice.provider.wrote_these_skills, (
         f"the default agent {choice.name} comes from the family that wrote "
-        "these skills, so it could pass by recognising its own prose (§6a)"
+        "these skills, so it could pass by recognising its own prose (§5a)"
     )
 
 
 def test_the_respondent_default_is_deliberately_unconstrained():
-    """The other half of §6a, and it is a real asymmetry rather than an
+    """The other half of §5a, and it is a real asymmetry rather than an
     oversight: holding a persona and answering from a fact table is not a job
     where having written the skills helps, so the authoring family is a fine
     respondent -- and is in fact the default."""
@@ -213,7 +213,7 @@ def test_the_respondent_default_is_deliberately_unconstrained():
 
 
 def test_an_agent_configured_against_the_rule_is_still_resolvable(monkeypatch):
-    """Resolution does not enforce §6a -- the scoring pass does, where it can
+    """Resolution does not enforce §5a -- the scoring pass does, where it can
     be skipped or overridden deliberately. Refusing here would make it
     impossible to reproduce someone else's contaminated run in order to show
     that it was contaminated."""

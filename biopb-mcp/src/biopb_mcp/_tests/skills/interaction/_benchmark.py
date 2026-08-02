@@ -1,14 +1,15 @@
 """The benchmark engine: arms, outcomes, the report. Skill-agnostic.
 
-`docs/skill-testing.md` §6. Nothing here knows what drift is. A skill's
-contribution is one :class:`Case` — a task prompt, a persona, a fixture already
-registered with the outcome layer, and the names its verifier wants — and this
-module runs the arms, classifies what happened, and writes the report.
+`biopb-mcp/docs/skill-testing.md` §5. Nothing here knows what drift is. A skill's whole
+contribution is one :class:`Case` — a task prompt, a persona, a fixture builder,
+a verifier, and the names it wants back out of the kernel — and this module runs
+the arms, classifies what happened, and writes the report.
 
-That split is the point. The first version of this layer was a single
-`test_drift_benchmark.py` in which about three quarters of the code was the
-engine and one quarter was drift, so a second skill meant copying the engine.
-The engine belongs in one place and a skill should be **data**.
+That split is the point, and it is what makes the layer affordable at catalogue
+scale: adding a skill writes one module under `cases/` and no test code. The
+first version of this layer was a single `test_drift_benchmark.py` in which
+about three quarters of the code was the engine and one quarter was drift, so a
+second skill meant copying the engine.
 
 The arms are a 2x2, because a skill's claim is a *behavioural delta* and a delta
 needs a baseline:
@@ -22,7 +23,7 @@ needs a baseline:
 
 **Withholding is `services.skills_enabled: false`**, a real shipped
 configuration: the kernel, napari, dask and every library stay exactly as they
-are and only the curated procedure goes. §7's rule — disclose the environment,
+are and only the curated procedure goes. §6's rule — disclose the environment,
 withhold only the skill — and the reason a hand-cut hole would have been worse.
 
 **No run's outcome fails anything.** Out of turns, wrong answer, gave up, even a
@@ -40,23 +41,24 @@ it is made in `test_benchmark.py`; here a run that cannot happen is a
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
-from ..outcomes._outcome import (
+from ._agent import ToolCallingAgent
+from ._conversation import SILENT, TOOL_CAP, TURN_CAP, converse, scrape
+from ._fixture import (
     Attempt,
     Fixture,
     Outcome,
     artifact_root,
-    providers_for,
+    curated_for,
     write_report,
 )
-from ._agent import ToolCallingAgent
-from ._conversation import SILENT, TOOL_CAP, TURN_CAP, converse, scrape
 from ._models import agent_choice, respondent_choice
 from ._respondent import Persona, SilentRespondent, model_respondent
 from ._session import SessionUnavailable, live_session
@@ -69,7 +71,7 @@ from ._session import SessionUnavailable, live_session
 MAX_TURNS = 90
 MAX_TOOL_CALLS = 200
 
-#: `write-a-skill` step 6 budgets at most three blocking checkpoints. Reported,
+#: `write-a-skill` step 4 budgets at most three blocking checkpoints. Reported,
 #: not asserted: one sample per corner cannot support a verdict.
 BLOCKING_BUDGET = 3
 
@@ -85,11 +87,10 @@ UNSCORABLE = "unscorable-result"
 HARNESS_ERROR = "harness-error"
 
 #: Observations that do not decide the outcome but change how to read it. A run
-#: can be `ok` *and* have asked six questions, or `ok` having never registered
-#: anything — both are worth seeing next to the number.
+#: can be `ok` *and* have asked six questions, or `ok` having been cut off at a
+#: cap — both are worth seeing next to the number.
 FLAG_OVER_BUDGET = "over-ask-budget"
 FLAG_NEVER_ASKED = "never-asked"
-FLAG_NEVER_REGISTERED = "never-registered"
 FLAG_CUT_OFF = "cut-off-but-scored"
 FLAG_CATALOG_MISMATCH = "catalog-mismatch"
 
@@ -99,17 +100,31 @@ NO_SESSION = "session unavailable: "
 
 
 @dataclass(frozen=True)
+class Layer:
+    """One fixture array, as the agent finds it on the viewer.
+
+    ``kind`` picks `add_image` or `add_labels`, which is not cosmetic: a Labels
+    layer is what makes a segmentation addressable as objects, and several
+    skills' Parameters tables ask for one by name.
+    """
+
+    name: str
+    key: str
+    kind: str = "image"
+
+
+@dataclass(frozen=True)
 class Case:
     """One skill's whole contribution to this layer.
 
-    Everything a benchmark needs that is *about the skill* and nothing that is
-    about benchmarking. Adding a skill is writing one of these; see
-    `cases/drift_correction.py` for the worked example.
+    Everything that is *about the skill* and nothing that is about
+    benchmarking. Adding a skill is writing one of these — see
+    `cases/drift_correction.py` for the worked example, and `cases/__init__.py`
+    for the three-line procedure.
 
-    The fixture is not passed in — it is looked up in the outcome layer's
-    registry by ``skill`` and the ``interaction`` tier, so the fact that a fixture
-    withholds something a respondent holds stays provable without a model (§6b)
-    and there is one definition of the case rather than two.
+    The fixture is a callable rather than a value so a case module costs
+    nothing at import: 30 of these are collected by every ordinary test run,
+    and only the one being benchmarked should build megabytes of arrays.
     """
 
     #: Skill id, as `find_skills` and `skill://<id>` know it.
@@ -118,22 +133,21 @@ class Case:
     task: str
     #: Who it is talking to, and the fact the fixture strips out.
     persona: Persona
-    #: napari layer name -> the key in ``fixture.data`` to load there.
-    layers: Mapping[str, str]
+    #: ``() -> Fixture``: the data, the truth withheld from it, the tolerances.
+    build: Callable[[], Fixture]
+    #: Where the fixture's arrays land on the viewer, in order.
+    layers: Sequence[Layer]
     #: What the verifier wants -> the kernel expression that yields it.
     collect: Mapping[str, str]
-    #: ``(fixture, attempt) -> Outcome``. The outcome layer's verifier, reused
-    #: unchanged: §6 scores what §5 scores, on a run a model produced.
+    #: ``(fixture, attempt) -> Outcome``. Numeric, never judged prose: these
+    #: skills emit numbers with knowable right answers.
     score: Callable[[Fixture, Attempt], Outcome]
     #: Optional ``(outcome, dir) -> None`` — the before/after images.
     save_artifacts: Callable[[Outcome, Path], None] | None = None
-    #: Which registered interaction fixture, when the skill has more than one.
-    case_id: str = ""
-    #: Optional setup snippet appending to a kernel-level ``_expensive_calls``
-    #: list, so "did it ask before it spent" is answerable.
-    spy: str = ""
-    #: Substrings of that list which count as having spent.
-    spy_markers: Sequence[str] = ()
+    #: Kernel plugins the skill's `requires:` names, seeded into the session's
+    #: own config tree. Without this a `plugin:` token is unresolvable and the
+    #: run is scoring an environment the skill declares it cannot work in.
+    plugins: Sequence[str] = ()
     #: What to ask `find_skills`, to check the ablation actually took effect.
     #: Defaults to the skill id.
     catalog_query: str = ""
@@ -143,7 +157,7 @@ class Case:
     #: Case-folded substrings that must **not**. A persona that has absorbed the
     #: procedure can answer a question the agent never properly asked, and the
     #: numeric result stops meaning what it appears to. Name the skill's own
-    #: vocabulary here — `test_personas` asserts it, hermetically and free.
+    #: vocabulary here — `test_cases` asserts it, hermetically and free.
     persona_must_not_know: Sequence[str] = ()
     blocking_budget: int = BLOCKING_BUDGET
     max_turns: int = MAX_TURNS
@@ -154,17 +168,9 @@ class Case:
         return self.catalog_query or self.skill
 
     def build_fixture(self) -> Fixture:
-        """The registered interaction fixture for this skill."""
-        cases = providers_for(self.skill, tier="interaction")
-        if self.case_id:
-            cases = [p for p in cases if p.case_id == self.case_id]
-        if len(cases) != 1:
-            raise LookupError(
-                f"{self.skill}: expected exactly one interaction fixture"
-                f"{f' named {self.case_id!r}' if self.case_id else ''}, "
-                f"found {[p.case_id for p in cases]}"
-            )
-        return cases[0].build()
+        """This case's fixture — real data if this machine has any, else the
+        procedural one the case ships (`_fixture.curated_for`)."""
+        return curated_for(self.skill) or self.build()
 
 
 @dataclass(frozen=True)
@@ -213,12 +219,11 @@ class Result:
     arm: Arm
     trace: object = None
     outcome: Outcome | None = None
-    registered: list[str] = field(default_factory=list)
-    #: What the catalog actually offered this run, checked at bring-up.
+    #: How many skills the catalog actually offered this run, read at bring-up.
     catalog_hits: int = 0
-    #: Whether the case installed a spy at all; without one, "never registered"
-    #: is a fact about the case rather than about the run.
-    watched: bool = False
+    #: Wall-clock for this arm, including bring-up and teardown. Reported so the
+    #: cost of a case is legible from its own report rather than remembered.
+    seconds: float = 0.0
     #: Set when the arm could not be run to completion at all.
     error: str = ""
 
@@ -275,8 +280,6 @@ class Result:
             out.append(f"{FLAG_OVER_BUDGET}({asked})")
         if asked == 0:
             out.append(FLAG_NEVER_ASKED)
-        if self.watched and not self.registered:
-            out.append(FLAG_NEVER_REGISTERED)
         severed = self.trace.stopped in (TURN_CAP, TOOL_CAP)
         if self.outcome is not None and self.outcome.scored and severed:
             out.append(FLAG_CUT_OFF)
@@ -299,7 +302,7 @@ class Result:
             "messages_to_user": len(getattr(self.trace, "questions", [])),
             "tool_calls": len(getattr(self.trace, "tool_names", [])),
             "catalog_entries": self.catalog_hits,
-            "registered": ",".join(self.registered) or "none",
+            "seconds": round(self.seconds, 1),
         }
 
 
@@ -308,40 +311,53 @@ def where_for(case: Case) -> Path:
     return artifact_root() / "interaction" / case.skill
 
 
+def catalog_size(text: str) -> int:
+    """How many skills `find_skills` returned, from the text an agent sees.
+
+    Parsed rather than pattern-counted: whether the ablation took effect is the
+    one thing that would silently make the whole table meaningless, so it must
+    not rest on a substring surviving a formatting change. Text this cannot
+    parse counts as *something*, never as nothing — an unreadable answer is not
+    evidence that the catalog was withheld, and reading it as one would turn a
+    broken ablation into a clean-looking table.
+    """
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return 1 if text.strip() else 0
+    if isinstance(parsed, dict):
+        # A list return can reach a client wrapped in structured content; the
+        # entries are still the only list in it.
+        parsed = next((v for v in parsed.values() if isinstance(v, list)), parsed)
+    if isinstance(parsed, list):
+        return len(parsed)
+    return 1 if parsed else 0
+
+
 def _load_fixture(session, case: Case, fixture: Fixture) -> None:
-    """Put the fixture on the viewer, then install the spy — both as *setup*.
+    """Put the fixture on the viewer as *setup*, not as something the agent did.
 
     Injecting before handover keeps the fixture out of the agent's context and
-    stops it burning turns on a setup the harness can do instantly. Both go
-    through `session.setup`, recorded at turn -1, so nothing here reads as
-    something the agent did.
+    stops it burning turns on a setup the harness can do instantly. It goes
+    through `session.setup`, recorded at turn -1, so the trace still answers
+    "what did the agent do" honestly.
     """
-    for layer, key in case.layers.items():
-        session.put_array("_fixture_array", np.asarray(fixture.data[key]))
+    for layer in case.layers:
+        session.put_array("_fixture_array", np.asarray(fixture.data[layer.key]))
+        adder = "add_labels" if layer.kind == "labels" else "add_image"
         session.setup(
-            f"viewer.add_image(_fixture_array, name={layer!r})\ndel _fixture_array"
+            f"viewer.{adder}(_fixture_array, name={layer.name!r})\ndel _fixture_array"
         )
     session.setup("print('layers:', [lyr.name for lyr in viewer.layers])")
-    if case.spy:
-        session.setup(case.spy)
-
-
-def _registered(session, case: Case) -> list[str]:
-    if not case.spy:
-        return []
-    out = session.setup("print('SPY', _expensive_calls)")
-    return [marker for marker in case.spy_markers if marker in out.text]
 
 
 def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
     """One corner: its own session, so the ablation is a real configuration."""
-    with live_session(skills_enabled=arm.skills) as session:
-        # Checked here rather than inferred from behaviour: whether the catalog
-        # was actually withheld is the one thing that would silently make the
-        # delta meaningless, and the agent may well call `find_skills` in the
-        # ablation arm and simply get nothing back.
-        catalog = session.call("find_skills", query=case.query)
-        catalog_hits = catalog.text.count('"id"')
+    with live_session(skills_enabled=arm.skills, plugins=case.plugins) as session:
+        # Read here rather than inferred from behaviour: the agent may well call
+        # `find_skills` in the ablation arm and simply get nothing back, and
+        # `load_catalog()` is what gates, not whether the tool was registered.
+        catalog_hits = catalog_size(session.call("find_skills", query=case.query).text)
         _load_fixture(session, case, fixture)
         trace = converse(
             session,
@@ -352,26 +368,18 @@ def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
             max_tool_calls=case.max_tool_calls,
         )
         trace.write(where_for(case) / arm.name)
-        registered = _registered(session, case)
         scraped = scrape(session, trace, dict(case.collect))
 
     attempt = Attempt(
         subject=arm.name,
         arrays=scraped,
-        notes=f"{arm.about} | stopped={trace.stopped} registered={registered}",
+        notes=f"{arm.about} | stopped={trace.stopped}",
     )
     outcome = case.score(fixture, attempt)
     write_report(outcome, where_for(case))
     if case.save_artifacts is not None:
         case.save_artifacts(outcome, where_for(case) / arm.name)
-    return Result(
-        arm=arm,
-        trace=trace,
-        outcome=outcome,
-        registered=registered,
-        catalog_hits=catalog_hits,
-        watched=bool(case.spy),
-    )
+    return Result(arm=arm, trace=trace, outcome=outcome, catalog_hits=catalog_hits)
 
 
 @dataclass
@@ -394,17 +402,42 @@ class Run:
         return write_summary(self.case, self.results, self.fixture)
 
 
+def progress(message: str) -> None:
+    """One line of progress, straight to stdout.
+
+    A case is four conversations and the better part of half an hour, and
+    without this the only sign of life is the artifact directory filling up.
+    This module never imports pytest, so it emits and the *test* decides
+    visibility — pytest discards a passing test's captured output, which is why
+    the documented command passes ``-s``.
+    """
+    print(message, flush=True)
+
+
 def run_case(case: Case) -> Run:
     """Every corner, once. A failing arm becomes a row, never an exception."""
     fixture = case.build_fixture()
+    progress(
+        f"\n[{case.skill}] {len(ARMS)} arms against `{fixture.case_id}` "
+        f"-> {where_for(case)}"
+    )
     results = []
-    for arm in ARMS:
+    for n, arm in enumerate(ARMS, start=1):
+        progress(f"[{case.skill}] {n}/{len(ARMS)} {arm.name}: running")
+        started = time.monotonic()
         try:
-            results.append(run_arm(case, arm, fixture))
+            result = run_arm(case, arm, fixture)
         except SessionUnavailable as exc:
-            results.append(Result(arm=arm, error=f"{NO_SESSION}{exc}"))
+            result = Result(arm=arm, error=f"{NO_SESSION}{exc}")
         except Exception as exc:  # noqa: BLE001 - the row is the point
-            results.append(Result(arm=arm, error=f"{type(exc).__name__}: {exc}"))
+            result = Result(arm=arm, error=f"{type(exc).__name__}: {exc}")
+        result.seconds = time.monotonic() - started
+        outcome, reason = result.classify()
+        progress(
+            f"[{case.skill}] {n}/{len(ARMS)} {arm.name}: {outcome} "
+            f"in {result.seconds / 60:.1f} min — {reason}"
+        )
+        results.append(result)
     return Run(case=case, fixture=fixture, results=results)
 
 
@@ -439,16 +472,15 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         f"Agent under test: **{agent.name}**  ",
         f"Respondent: **{respondent.name}**  ",
         f"Fixture: `{fixture.case_id}` — {fixture.about or 'no description'}  ",
-        "Tolerances (from §5, unchanged): "
-        + ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns),
+        "Tolerances: " + ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns),
         "",
         "One sample per corner. These runs are non-deterministic; read the",
         "table as an observation, not a measurement.",
         "",
         "| arm | skill | outcome | "
         + " | ".join(name for name, _ in columns)
-        + " | turns | asked | tools | reason |",
-        "|---|---|---|" + "---|" * (len(columns) + 4),
+        + " | turns | asked | tools | min | reason |",
+        "|---|---|---|" + "---|" * (len(columns) + 5),
     ]
     for row in rows:
         cells = " | ".join(fmt(row["metrics"].get(name)) for name, _ in columns)
@@ -456,7 +488,7 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
             f"| `{row['arm']}` | {'yes' if row['skill_offered'] else 'no'} "
             f"| **{row['outcome']}** | {cells} | {row['turns']} "
             f"| {row['blocking_questions']} | {row['tool_calls']} "
-            f"| {row['reason']} |"
+            f"| {row['seconds'] / 60:.1f} | {row['reason']} |"
         )
 
     if flagged := [r for r in rows if r["flags"]]:
@@ -478,7 +510,7 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         "  the interaction premise does not hold for this case.",
         "- **noskill+silent** is the floor. A corner at or near the tolerances",
         "  means the task is easy enough that nothing here discriminates.",
-        f"- `asked` counts blocking questions; `write-a-skill` step 6 budgets"
+        f"- `asked` counts blocking questions; `write-a-skill` step 4 budgets"
         f" {case.blocking_budget}.",
         "",
         "Transcripts are in `<arm>/transcript.md`, with the raw event stream in",
@@ -511,7 +543,7 @@ def unavailable(case: Case) -> str:
     """Why this case cannot be benchmarked here, or ``""``.
 
     The environment checks that are cheap and answerable before anything is
-    spawned or spent. §6a is one of them: an agent from the family that wrote
+    spawned or spent. §5a is one of them: an agent from the family that wrote
     these skills could pass by recognising its own prose.
     """
     from . import _session
@@ -527,8 +559,6 @@ def unavailable(case: Case) -> str:
     if agent_choice().from_authoring_family:
         return (
             f"the agent is {agent_choice().name}, from the family that wrote these "
-            "skills — it could pass by recognising its own prose (§6a)."
+            "skills — it could pass by recognising its own prose (§5a)."
         )
-    if not providers_for(case.skill, tier="interaction"):
-        return f"{case.skill} has no registered interaction fixture"
     return ""

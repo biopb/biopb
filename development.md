@@ -242,3 +242,7 @@ durable planes and the web origin in
   `packages/tensor-flight-client/` (the TS data-plane SDK). See `web/README.md`
   and `web/ARCHITECTURE.md`.
 - **Release / build:** `docs/release-model.md`.
+- **Testing the skills catalog:** `biopb-mcp/docs/skill-testing.md` — how a shipped skill
+  is checked: structure, retrieval and contract tests in CI; simulated-user
+  interaction runs against a real session locally, as a benchmark rather than a
+  gate.

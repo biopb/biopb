@@ -100,7 +100,7 @@ def test_tool_calls_go_to_the_session_and_never_to_the_respondent():
 
 def test_a_turn_that_both_speaks_and_calls_is_not_a_question():
     """Models narrate while acting. Counting that as a blocking question would
-    inflate every structural assertion in §6."""
+    inflate every structural assertion in §5."""
     agent = ScriptedAgent(
         [
             AgentTurn(
@@ -164,7 +164,7 @@ def test_the_tool_cap_bounds_a_model_stuck_in_a_loop():
 
 
 def test_the_trace_answers_the_gate_spy_question():
-    """Structural assertion (§6): did a blocking question precede the expensive
+    """Structural assertion (§5): did a blocking question precede the expensive
     call, or follow it? That is an ordering question about the record."""
     asked_first = converse(
         FakeSession(),

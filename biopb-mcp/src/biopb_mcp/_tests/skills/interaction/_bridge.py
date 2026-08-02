@@ -1,6 +1,6 @@
 """MCP tool schemas ⇄ the function-calling shape a chat model expects.
 
-The agent under test is **not** an MCP client. §6a puts it outside the family
+The agent under test is **not** an MCP client. §5a puts it outside the family
 that wrote these skills, which in practice means a hosted non-Anthropic model
 reached over the OpenAI-compatible chat-completions API — and that API speaks
 `tools=[{"type": "function", ...}]`, not MCP.

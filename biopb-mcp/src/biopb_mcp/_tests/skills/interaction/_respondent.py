@@ -9,7 +9,7 @@ Two rules hold it to that, and both are structural rather than hoped for:
 
 **Skill-blind.** The respondent never sees the body. It cannot paraphrase step
 2 back at the agent, because it does not know step 2 exists. That is also why
-§6a does not constrain *which* model plays this part: holding a persona and
+§5a does not constrain *which* model plays this part: holding a persona and
 answering from a fact table is not a job where knowing the skills helps, so any
 provider will do and `_models.py` picks it. Anthropic is one option, not the
 assumption.
