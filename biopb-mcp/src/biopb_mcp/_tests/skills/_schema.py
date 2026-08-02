@@ -53,7 +53,10 @@ class SkillEntry:
     tags: list
     version: str
     spec_version: int
-    requires: list
+    # What step 1 verifies against `server_status`, named `requires:` until the
+    # rename. It informs the agent; it has never gated anything, and the old
+    # name promised otherwise -- see skill-interface.md §4.
+    checklist: list
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -292,7 +292,7 @@ CASE = Case(
     collect={"precision": "precision", "recall": "recall", "f1": "f1"},
     score=verify,
     save_artifacts=save_artifacts,
-    # `requires: plugin:segmentation_qc`, and the body says there is no degraded
+    # `checklist: plugin:segmentation_qc`, and the body says there is no degraded
     # path. Without this the session has no such plugin and the run would be
     # scoring an environment the skill declares it cannot work in.
     plugins=("segmentation_qc",),

@@ -262,7 +262,7 @@ def _write_config(
     configuration rather than a hole cut for the test.
 
     ``plugins`` names kernel plugins the case's skill declares in its
-    ``requires:``. They are seeded into this tree's own ``biopb/kernel/`` from
+    ``checklist:``. They are seeded into this tree's own ``biopb/kernel/`` from
     the ones biopb-mcp ships, so the loader that runs is the real one — and only
     what a case asks for is present, since a plugin the skill never declared is
     an environment difference nobody chose.

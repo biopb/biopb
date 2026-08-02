@@ -68,7 +68,7 @@ def declared_packages() -> list[str]:
         if not match:
             continue
         frontmatter = yaml.safe_load(match.group(1)) or {}
-        for token in frontmatter.get("requires") or []:
+        for token in frontmatter.get("checklist") or []:
             token = str(token)
             if not token.startswith("pkg:"):
                 continue

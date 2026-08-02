@@ -3,8 +3,8 @@ id: drift-correction
 title: Correct stage drift in a time series before measuring
 description: Register a time-lapse whose field of view has drifted, so the same object stays at the same coordinates across frames.
 tags: [registration, time-series, preprocessing]
-version: 1.0.0
-requires: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0, pkg:pystackreg~=0.2.8]
+version: 1.1.0
+checklist: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0, pkg:pystackreg~=0.2.8]
 ---
 
 # Correct stage drift in a time series before measuring
@@ -45,7 +45,7 @@ chromatic error that was not there.
 
 ## Steps
 
-1. **Check the requirements** *(blocking)*. Resolve `requires:` against
+1. **Check the requirements** *(blocking)*. Resolve `checklist:` against
    `server_status`, and `import pystackreg` for the `pkg:` token —
    `guide://kernel` covers what to do about a gap.
 

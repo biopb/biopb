@@ -1,4 +1,4 @@
-"""The two `requires:` facts the session can't show the agent by itself.
+"""The two `checklist:` facts the session can't show the agent by itself.
 
 A skill declares what it touches (``viewer``, ``tensor``, ``dask``, ``ops:<kind>``,
 ``plugin:<name>``, ``pkg:<name>``). The agent resolves that list itself, against

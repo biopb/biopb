@@ -2,7 +2,7 @@
 
 **Status:** Implemented — the `find_skills` tool, the `skill://{skill_id}`
 resource, the `services.skills_*` config, the local skills directory (§3d) and
-runtime `requires:` resolution (§4).
+runtime `checklist:` resolution (§4).
 **Component:** `biopb-mcp` — `mcp/_skills.py` (runtime), `mcp/_skills_data/`
 (the skills), `_tests/skills/` (the authoring gate).
 **Related:** [`skill-testing.md`](skill-testing.md) — how a skill is tested, and
@@ -34,7 +34,7 @@ title: Measure labeled objects in physical units, not pixels
 description: Report object areas, volumes, and diameters in microns instead of pixels, using the image's real voxel spacing.
 tags: [measurement, quantification]
 version: 1.0.0
-requires: [viewer, tensor, "pkg:biopb-mcp>=0.13.0"]
+checklist: [viewer, tensor, "pkg:biopb-mcp>=0.13.0"]
 ---
 
 # Measure labeled objects in physical units, not pixels
@@ -42,7 +42,7 @@ requires: [viewer, tensor, "pkg:biopb-mcp>=0.13.0"]
 ## When to use
 …
 ## Steps
-1. Resolve `requires:` against `server_status` (§4).
+1. Resolve `checklist:` against `server_status` (§4).
 …
 ```
 
@@ -147,7 +147,7 @@ set distributes the files or vendors them into an internal build.
 
 A host's own skill mechanism (Claude Code, opencode, Claude Desktop) does not
 cover this: it splits discovery (host skills never reach `find_skills`), it
-cannot read biopb's `requires:` gating, and it is host-specific — whereas one
+cannot read biopb's `checklist:`, and it is host-specific — whereas one
 biopb-owned local tier is a single authoring format, identical to a shipped
 `.md`, portable across all three hosts, and exactly the PR payload.
 
@@ -160,10 +160,10 @@ that would come back empty.
 
 ---
 
-## 4. `requires:` — resolved by the agent, against `server_status`
+## 4. `checklist:` — resolved by the agent, against `server_status`
 
-`requires:` used to be metadata nothing could act on: emitted by `find_skills`,
-answerable nowhere. A skill naming a kernel plugin the install did not have read
+The list used to be called `requires:`, and used to be metadata nothing could act
+on: emitted by `find_skills`, answerable nowhere. A skill naming a kernel plugin the install did not have read
 as available and dead-ended partway through its own steps, and bodies
 compensated with hand-rolled prose checks. The resolution is the agent's, not a
 function's: it reads `server_status` — which it already calls before heavy work —
@@ -200,6 +200,36 @@ was stated against, so the two are comparable by construction. The token names a
 *distribution*, and that is the argument metadata wants; the import half still
 goes by module name, which is why `pkg:scikit-image` is imported as `skimage` and
 read as `scikit-image`.
+
+### Why it is not called `requires:`
+
+The name was a promise the mechanism never made. Nothing filters a skill out of
+`find_skills` on a missing token, no return value invites `if not ok: bail`, and
+the paragraph below has said "it informs, it never gates" since the list became
+resolvable at all — but an agent reading `requires:` in frontmatter reasonably
+concludes the skill is blocked, and stops for a gap it could have worked around.
+
+Most of these tokens were never hard requirements in the first place. `viewer`
+and `tensor` are usually two routes to the same pixels, and an agent handed one
+proceeds with it. `dask` names a scheduler, not a capability. Even a `pkg:` token
+usually has a cruder equivalent in scipy or skimage that a competent agent
+reaches for unprompted — that is what an agent is *for*, and #672's own
+`drift-correction` says so in prose: pystackreg is the preferred registration and
+`skimage.registration.phase_cross_correlation` is "a real fallback, not a lesser
+one".
+
+So the key says what actually happens to it: the agent checks these against the
+session before starting, reports what is missing, and adapts. A body that has a
+particular fallback in mind should name it — the agent will improvise one
+otherwise, and the author's is usually better than the invented one. That is
+authoring advice, not a schema obligation, and it is where `write-a-skill` puts
+it.
+
+This is also why the availability gate reports rather than rejects
+([`skill-testing.md`](skill-testing.md) §4b): a package with no wheel on some
+interpreter is a gap like any other. The one thing that still fails is a package
+installable on *no* supported platform — nobody can ever satisfy that token, so
+it is a dead declaration rather than a gap.
 
 **It informs, it never gates.** Nothing filters a skill out of `find_skills`, and
 no return value invites `if not ok: bail`. Every fix — installing a package,
@@ -246,7 +276,7 @@ coerce, emit an entry or `None`. `validate(dir)` dedupes by `id` and returns
 | `title` | Fallback chain: frontmatter → first `#` H1 → humanized `id` (warn) |
 | `tags` | Coerce `str → [str]`, lowercase. **Not** gated against a vocabulary: a closed set needs an edit for every new topic and fails the PR introducing it, to enforce a judgment the reviewer is already making |
 | `version` | Semver required, else default `0.0.0` |
-| `requires` | Optional; coerced to a list, grammar checked against §4's vocabulary |
+| `checklist` | Optional; coerced to a list, grammar checked against §4's vocabulary. `requires:` is read as an alias by the runtime reader (a user's own older skill keeps its list) and rejected by the strict validator, so nothing shipped drifts back to it |
 | `spec_version` | Defaults to `1`; selects the migration path (§5c) |
 | `updated` | Optional. A shipped skill's currency is its release; a local one takes it from the file mtime |
 
@@ -286,7 +316,7 @@ has none, and that is the case the tolerance is really for.
    usually landing it in `~/.config/biopb/skills` first so it is usable *this
    session*.
 2. Promotion is a PR moving the identical file into `mcp/_skills_data/`. The
-   suite gates it: schema, uniqueness, required sections, `requires:` grammar,
+   suite gates it: schema, uniqueness, required sections, `checklist:` grammar,
    cross-skill links, phrasing coverage, package satisfiability.
 3. Human review → merge → live in the next release.
 4. Versioning is author-owned `version` in frontmatter. The repo *is* the source

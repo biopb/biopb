@@ -91,7 +91,7 @@ CASE = Case(
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},
     score=verify,                     # (fixture, attempt) -> Outcome
     save_artifacts=save_artifacts,
-    plugins=("segmentation_qc",),     # kernel plugins the skill's `requires:` names
+    plugins=("segmentation_qc",),     # kernel plugins the skill's `checklist:` names
     persona_must_know=(...), persona_must_not_know=(...),
 )
 ```
@@ -252,7 +252,7 @@ reads neither the developer's `mcp-config.json` nor their personal
 
 **Only the kernel plugins a case asks for.** That same temp tree means an empty
 `~/.config/biopb/kernel/`, so a skill declaring `plugin:segmentation_qc` would
-be scored in a session where its own `requires:` cannot be met. `Case.plugins`
+be scored in a session where its own `checklist:` cannot be met. `Case.plugins`
 seeds the ones it names, from the copies biopb-mcp ships, through the real
 loader — and nothing else, because a plugin the skill never declared is an
 environment difference nobody chose.
