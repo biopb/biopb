@@ -149,6 +149,28 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
+def _float_accumulator(dtype: np.dtype) -> np.dtype:
+    """Width to mean-pool at on the float path: the input's own, but >= float32.
+
+    Widening every input to float64 made float32 the *slowest* dtype here --
+    slower than float64 at twice the bytes -- because the promotion doubles the
+    full-resolution working set to produce the same picture. float16 still
+    widens: a 10-bit mantissa loses too much across a block mean.
+
+    Non-float inputs that reach this path (bool, and the integers
+    :func:`_plan_integer_area` refused) keep float64, so their fallback is
+    unchanged.
+
+    Note this is *not* bit-identical to the old always-float64 behavior for
+    float32 input -- the staged means now round at float32. That is the
+    intended trade; integer inputs, which the equivalence suite pins bit for
+    bit, do not take this path at all.
+    """
+    if np.issubdtype(dtype, np.floating):
+        return np.result_type(dtype, np.float32)
+    return np.dtype(np.float64)
+
+
 def _integer_accumulator(dtype: np.dtype, block_size: int) -> Optional[np.dtype]:
     """Smallest integer accumulator that holds a whole block sum exactly.
 
@@ -226,7 +248,9 @@ def downsample_block(
         result = np.clip(np.round(reduced / block_size), info.min, info.max)
         return result.astype(original_dtype)
 
-    result = _area_reduce(np.asarray(padded, dtype=np.float64), scale_hint)
+    result = _area_reduce(
+        np.asarray(padded, dtype=_float_accumulator(original_dtype)), scale_hint
+    )
 
     # Cast back to original dtype with safe rounding for integers
     if original_dtype != result.dtype:
