@@ -250,8 +250,9 @@ def _write_config(
     """A config tree of our own, so neither the developer's settings nor their
     personal skills reach the child.
 
-    ``skills_enabled=False`` is the **ablation arm**: the catalog goes away and
-    with it the ``find_skills`` tool, while the kernel, napari, dask and every
+    ``skills_enabled=False`` is the **ablation arm**: the ``find_skills`` tool
+    stays registered but ``load_catalog()`` returns an empty list, so the agent
+    can call it and get nothing back, while the kernel, napari, dask and every
     library stay exactly as they were. That is §5's rule — disclose the
     environment, withhold only the skill — and it is a real shipped
     configuration rather than a hole cut for the test.
