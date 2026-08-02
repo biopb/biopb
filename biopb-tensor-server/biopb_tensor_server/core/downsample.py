@@ -149,6 +149,36 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
+def _float_accumulator(dtype: np.dtype) -> np.dtype:
+    """Width to mean-pool at on the float path: the input's own, but >= float32.
+
+    Widening every input to float64 made float32 the *slowest* dtype here --
+    slower than float64 at twice the bytes -- because the promotion doubles the
+    full-resolution working set to produce the same picture.
+
+    float16 is the deliberate exception to that rule, and widening it costs
+    nothing: x86 has no native float16 arithmetic without AVX512-FP16, so numpy
+    emulates it per element and loses vectorization. Reducing a 5032x5032 plane
+    by 4x4 measured 159.3 ms at float16 against 97.6 ms at float32, at a max
+    error against a float64 reference of 5.6e-2 against 5.4e-6 -- faster *and*
+    ~1e4 more accurate, so there is nothing to trade off. numpy does not rescue
+    a native reduction either: mean() on a float16 array returns float16, so it
+    rounds to a 10-bit mantissa at every stage.
+
+    Non-float inputs that reach this path (bool, and the integers
+    :func:`_plan_integer_area` refused) keep float64, so their fallback is
+    unchanged.
+
+    Note this is *not* bit-identical to the old always-float64 behavior for
+    float32 input -- the staged means now round at float32. That is the
+    intended trade; integer inputs, which the equivalence suite pins bit for
+    bit, do not take this path at all.
+    """
+    if np.issubdtype(dtype, np.floating):
+        return np.result_type(dtype, np.float32)
+    return np.dtype(np.float64)
+
+
 def _integer_accumulator(dtype: np.dtype, block_size: int) -> Optional[np.dtype]:
     """Smallest integer accumulator that holds a whole block sum exactly.
 
@@ -226,7 +256,9 @@ def downsample_block(
         result = np.clip(np.round(reduced / block_size), info.min, info.max)
         return result.astype(original_dtype)
 
-    result = _area_reduce(np.asarray(padded, dtype=np.float64), scale_hint)
+    result = _area_reduce(
+        np.asarray(padded, dtype=_float_accumulator(original_dtype)), scale_hint
+    )
 
     # Cast back to original dtype with safe rounding for integers
     if original_dtype != result.dtype:

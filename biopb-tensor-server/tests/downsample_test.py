@@ -102,10 +102,17 @@ _DTYPES = [
 ]
 
 
+# float32 is deliberately out of the bit-identity sweep: it now reduces *at*
+# float32 rather than being widened to float64, so the staged means round
+# differently from the legacy oracle. That break is the point of the change --
+# TestFloatAccumulatorWidth covers it by closeness instead of equality.
+_BIT_IDENTICAL_DTYPES = [dtype for dtype in _DTYPES if dtype != "float32"]
+
+
 def _cases():
     for shape in _SHAPES:
         for scale in _SCALES[len(shape)]:
-            for dtype in _DTYPES:
+            for dtype in _BIT_IDENTICAL_DTYPES:
                 yield shape, scale, dtype
 
 
@@ -195,6 +202,75 @@ class TestIntegerAccumulatorSizing:
     def test_non_integer_input_falls_back(self, dtype):
         accumulator, _ = _ds._plan_integer_area(np.dtype(dtype), (1, 4, 4))
         assert accumulator is None
+
+
+class TestFloatAccumulatorWidth:
+    """The float path reduces at the input's own width, never widening float32.
+
+    Widening doubled the full-resolution working set to produce an identical
+    picture, which made float32 the slowest input dtype here -- 230.9 ms
+    against 119.3 ms for float64 on a 5032x5032 plane at scale 4, despite
+    float64 being twice the bytes.
+    """
+
+    @pytest.mark.parametrize(
+        "dtype,expected",
+        [
+            ("float32", "float32"),
+            ("float64", "float64"),
+            # A 10-bit mantissa loses too much across a block mean.
+            ("float16", "float32"),
+            # Non-float inputs reaching the fallback keep float64.
+            ("bool", "float64"),
+            ("uint64", "float64"),
+        ],
+    )
+    def test_accumulator_choice(self, dtype, expected):
+        assert _ds._float_accumulator(np.dtype(dtype)) == np.dtype(expected)
+
+    @pytest.mark.parametrize(
+        "dtype,expected", [("float32", "float32"), ("float64", "float64")]
+    )
+    def test_reduction_actually_runs_at_that_width(self, monkeypatch, dtype, expected):
+        """Pin the array handed to the reduction, not just the returned dtype.
+
+        The output dtype was already the input's -- the widening happened in
+        the middle and was invisible from either end, which is how it survived
+        #639.
+        """
+        seen = []
+        real = _ds._area_reduce
+
+        def spy(arr, scale_hint):
+            seen.append(arr.dtype)
+            return real(arr, scale_hint)
+
+        monkeypatch.setattr(_ds, "_area_reduce", spy)
+        _ds.downsample_block(
+            _sample(dtype, (1, 1, 1, 8, 8), seed=3), (1, 1, 1, 4, 4), "area"
+        )
+        assert seen == [np.dtype(expected)]
+
+    def test_float32_still_agrees_with_legacy_to_float32_precision(self):
+        """Not bit-identical by design, but the difference must be rounding.
+
+        A wrong axis or a lost block would show up far above float32 epsilon,
+        so this separates "rounds differently" from "computes differently".
+        """
+        data = _sample("float32", (1, 1, 1, 63, 65), seed=13)
+        expected = legacy_downsample_block(data, (1, 1, 1, 4, 4), "area")
+        actual = _ds.downsample_block(data, (1, 1, 1, 4, 4), "area")
+
+        assert actual.dtype == expected.dtype == np.dtype("float32")
+        assert actual.shape == expected.shape
+
+        # Bound the error by the *inputs'* magnitude, not the output's: a block
+        # whose values nearly cancel keeps an absolute error at input scale
+        # while its mean is small, so rtol on the output is the wrong bound. A
+        # wrong axis or a dropped block lands at `peak` -- orders above this.
+        peak = float(np.abs(data).max())
+        tol = np.finfo(np.float32).eps * 4 * 4 * peak
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=tol)
 
 
 class TestNoAccumulatorOverflow:
