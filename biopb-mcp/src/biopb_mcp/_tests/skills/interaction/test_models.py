@@ -9,12 +9,15 @@ from __future__ import annotations
 import pytest
 
 from ._models import (
+    AGENT_BASE_URL_ENV,
     AGENT_ENV,
     DEFAULT_AGENT,
     DEFAULT_RESPONDENT,
     ENV_FILE_ENV,
     PROVIDERS,
+    RESPONDENT_BASE_URL_ENV,
     RESPONDENT_ENV,
+    SHARED_BASE_URL_ENV,
     AnthropicText,
     OpenAICompatText,
     agent_choice,
@@ -30,7 +33,24 @@ from ._models import (
 def no_dotenv(tmp_path, monkeypatch):
     """Point the loader at nothing, so a developer's real `.env` cannot decide
     the result of a test. Restores the cache on the way out — it is process-wide
-    and a stale one would leak into whatever ran next."""
+    and a stale one would leak into whatever ran next.
+
+    **The real environment has to go too**, not just the file. `setting()` ranks
+    the environment above the dotenv on purpose, so a developer with
+    `BIOPB_SKILL_AGENT` exported from their shell profile — the ordinary way to
+    run this layer — silently overrode the file each of these tests writes, and
+    the assertions read a machine's configuration instead of the fixture's. CI
+    exports none of them, so this passed everywhere except where it mattered.
+    """
+    for name in (
+        AGENT_ENV,
+        RESPONDENT_ENV,
+        AGENT_BASE_URL_ENV,
+        RESPONDENT_BASE_URL_ENV,
+        SHARED_BASE_URL_ENV,
+        *(provider.key_env for provider in PROVIDERS.values()),
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(ENV_FILE_ENV, str(tmp_path / "absent.env"))
     reload_env_file()
     yield monkeypatch

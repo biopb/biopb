@@ -20,7 +20,7 @@ import json
 import pytest
 
 from ..outcomes._outcome import Attempt, Fixture, Metric, Outcome
-from . import _benchmark
+from . import _benchmark, conftest
 from ._benchmark import (
     ARMS,
     FLAG_CATALOG_MISMATCH,
@@ -266,6 +266,51 @@ def test_the_task_asks_for_exactly_what_is_collected(case):
             f"{case.skill}: the task never mentions {expression!r}, "
             "which is where its result is read from"
         )
+
+
+# --- smoke runs first, and gates ------------------------------------------
+
+
+class FakeItem:
+    """Just enough of a pytest item for the collection hook."""
+
+    def __init__(self, filename: str, where=None):
+        self.path = (where or conftest.HERE) / filename
+        self.nodeid = f"{filename}::a_test"
+
+
+def test_the_smoke_tests_are_moved_to_the_front():
+    """Alphabetically `test_benchmark` sorts first, so four paid conversations
+    went out before anything checked the stack could hold a napari layer."""
+    items = [FakeItem("test_benchmark.py"), FakeItem(conftest.SMOKE)]
+    conftest.pytest_collection_modifyitems(items)
+    assert [i.path.name for i in items] == [conftest.SMOKE, "test_benchmark.py"]
+
+
+def test_only_this_directory_is_reordered(tmp_path):
+    """The hook is handed every item in the run, so a directory-level conftest
+    that re-sorted all of them would silently rearrange the rest of the suite."""
+    outsider = FakeItem("test_zzz_elsewhere.py", where=tmp_path)
+    items = [outsider, FakeItem("test_benchmark.py"), FakeItem(conftest.SMOKE)]
+    conftest.pytest_collection_modifyitems(items)
+    assert items[0] is outsider
+    assert [i.path.name for i in items[1:]] == [conftest.SMOKE, "test_benchmark.py"]
+
+
+def test_a_failed_smoke_test_is_recorded_and_a_skipped_one_is_not(monkeypatch):
+    """Ordering alone gates nothing without `-x`; the benchmark reads this list
+    and refuses to spend. A skip is not a failure — no display is reported by
+    `unavailable()`, with better instructions."""
+    monkeypatch.setattr(conftest, "_SMOKE_FAILURES", [])
+
+    class Report:
+        def __init__(self, nodeid, failed):
+            self.nodeid, self.failed = nodeid, failed
+
+    conftest.pytest_runtest_logreport(Report(f"{conftest.SMOKE}::boom", True))
+    conftest.pytest_runtest_logreport(Report(f"{conftest.SMOKE}::skipped", False))
+    conftest.pytest_runtest_logreport(Report("test_benchmark.py::other", True))
+    assert conftest.smoke_failures() == [f"{conftest.SMOKE}::boom"]
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.skill)

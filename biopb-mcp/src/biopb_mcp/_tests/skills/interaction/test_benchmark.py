@@ -25,6 +25,7 @@ import pytest
 
 from ._benchmark import Run, run_case, unavailable, where_for
 from .cases import CASES
+from .conftest import smoke_failures
 
 pytestmark = pytest.mark.interaction
 
@@ -38,6 +39,14 @@ def run(request) -> Run:
     case = request.param
     if reason := unavailable(case):
         pytest.skip(reason)
+    # `conftest.py` puts the smoke tests first so this is answerable. A broken
+    # stack does not produce a weak benchmark, it produces a meaningless one
+    # that reads like a weak one -- so refuse rather than spend.
+    if broken := smoke_failures():
+        pytest.skip(
+            f"the session smoke tests failed ({len(broken)}), so the stack is "
+            f"what broke and not the skill: {broken[0]}"
+        )
     if case.skill not in _RUNS:
         _RUNS[case.skill] = run_case(case)
         print("\n\n" + _RUNS[case.skill].summary() + "\n")
