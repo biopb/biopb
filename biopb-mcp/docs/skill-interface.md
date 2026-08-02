@@ -176,7 +176,7 @@ and, for a `pkg:` token, tries the import.
 | `dask` | `## Dask`. `da` is always bound, so this never fails; the scheduler behind it (distributed vs. in-process threads) is a *performance* property, and reporting it beats a met/unmet verdict |
 | `ops:<kind>` | `## Ops` — and what the servers *do* offer falls out of the same line |
 | `plugin:<name>` | `## Kernel plugins` — the file stem (`plugin:rolling_ball` ↔ `rolling_ball.py`) or an entry-point name, reported apart |
-| `pkg:<name>[>=v\|~=v]` | `## Versions` for `pkg:biopb-mcp`, otherwise `import <name>` in `execute_code`: a real ImportError or a real `__version__`, with none of the dev-build / `skimage`-vs-`scikit-image` guesswork a version comparator has to hard-code. A third-party token is bounded above as well as below, so an installed version *newer* than the range is unmet too |
+| `pkg:<name>[>=v\|~=v]` | `## Versions` for `pkg:biopb-mcp`, otherwise `execute_code`, in two halves: **present?** is a real `import <name>` and its real ImportError, with none of the dev-build guesswork a version comparator has to hard-code; **which version?** is `importlib.metadata.version("<name>")`, never the module's `__version__` attribute. A third-party token is bounded above as well as below, so an installed version *newer* than the range is unmet too |
 
 **Why the kernel plugin line is reported, not derived.** Every other token is
 legible from handles the agent already holds; this one is not, and the temptation
@@ -189,6 +189,17 @@ namespace. Only the loader knows which happened, so it reports what survived
 where a plugin could clobber the record of itself. Since #664 a plugin binds one
 name and it is the file stem, so `dir()` is a useful cross-check — but it still
 cannot distinguish "never loaded" from "loaded and then shadowed".
+
+**Why the version comes from metadata and not from `__version__`.** The attribute
+is set by hand and drifts: `laptrack` ships `__version__ = "0.17.0"` inside its
+0.17.1 distribution, so an agent resolving `pkg:laptrack>=0.17.1` off the
+attribute reports the requirement unmet on a correctly installed package — and
+then offers to install what is already there. `importlib.metadata.version()`
+reads what the resolver actually wrote, which is also what the bound in the token
+was stated against, so the two are comparable by construction. The token names a
+*distribution*, and that is the argument metadata wants; the import half still
+goes by module name, which is why `pkg:scikit-image` is imported as `skimage` and
+read as `scikit-image`.
 
 **It informs, it never gates.** Nothing filters a skill out of `find_skills`, and
 no return value invites `if not ok: bail`. Every fix — installing a package,

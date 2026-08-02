@@ -1,9 +1,11 @@
 """A skill body is an un-versioned assertion about someone else's API.
 
 `biopb-mcp/docs/skill-testing.md` §4. The satisfiability gate next door answers "may this
-package be installed at all"; this answers the question after it — "does the
-surface the body quotes still look like that". Both have to be true before a
-`pkg:` token is honest.
+package be installed at all"; this answers the two questions after it — "does it
+import once installed" (#670: `stardist` resolves clean and imports nothing,
+because its TensorFlow dependency hides under an extra) and "does the surface the
+body quotes still look like that". All three have to be true before a `pkg:`
+token is honest.
 
 The layer exists because of what has actually broken. `m2stitch.stitch_images`
 defaults `row_col_transpose=True` and swaps rows and cols for you, so a body that
@@ -44,12 +46,14 @@ and no unrelated PR pays for a dependency it does not use.
 
 from __future__ import annotations
 
+import importlib
 from importlib.metadata import PackageNotFoundError, version as dist_version
 
 import numpy as np
 import pytest
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 from scipy import ndimage
 
 from ._validate import validate
@@ -115,6 +119,52 @@ def test_covered_is_not_stale(entries):
         if pkgs - live.get(skill_id, set())
     ]
     assert not stale, "COVERED names what no skill declares:\n" + "\n".join(stale)
+
+
+def test_every_installed_declared_package_actually_imports(entries):
+    """Installing is not working, and the satisfiability gate cannot tell them apart.
+
+    `uv pip install --dry-run stardist` resolves clean and moves nothing, so §3a
+    passes it -- and `import stardist` still fails, because `csbdeep` declares
+    TensorFlow only under a `[tf1]` extra. The gate asks "can this be installed
+    without damage"; nothing asked "will this import". This does.
+
+    Unlike the rest of the file this is not a claim about anyone's API, so it
+    needs no hand-written assertion per package: it runs over whatever the
+    catalog declares. Conditioned on the distribution being *installed* rather
+    than on which env this is -- skill_contracts.py gives each package its own,
+    so elsewhere the others are legitimately absent, and unimportable-when-
+    present is fatal on every platform either way.
+    """
+    from importlib.metadata import packages_distributions
+
+    modules = packages_distributions()
+    for e in entries:
+        for name in _third_party_requirements(e):
+            try:
+                dist_version(name)
+            except PackageNotFoundError:
+                continue  # not this package's env
+            canonical = canonicalize_name(name)
+            top_level = sorted(
+                mod
+                for mod, dists in modules.items()
+                if any(canonicalize_name(d) == canonical for d in dists)
+            )
+            # A namespace package can leave the mapping empty; the import name
+            # then differs from the distribution name only by the separator.
+            for module in top_level or [name.replace("-", "_")]:
+                try:
+                    importlib.import_module(module)
+                # Not just ImportError: a package can raise anything at import.
+                except Exception as exc:
+                    pytest.fail(
+                        f"{e.id} declares {name}, which is installed "
+                        f"({dist_version(name)}) and does not import:\n"
+                        f"  import {module} -> {type(exc).__name__}: {exc}\n"
+                        "A declared package the agent cannot import is a skill that "
+                        "dead-ends at step 1 on every platform."
+                    )
 
 
 def test_the_installed_version_is_inside_every_declared_range(entries):
