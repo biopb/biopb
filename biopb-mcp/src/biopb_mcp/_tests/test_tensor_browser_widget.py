@@ -1,7 +1,7 @@
 """Tests for the TensorBrowserWidget connect flow.
 
 The widget delegates connecting to ``TensorConnection.auto_connect`` — the
-single, GUI-independent connect policy shared with the headless kernel — run on
+single, GUI-independent connect policy shared with the MCP kernel — run on
 a worker thread, then renders the outcome on the Qt main thread via the
 ``_connect_done`` signal (no modal prompt; the old blocking autostart dialog is
 gone). These tests drive that flow deterministically: the worker thread is

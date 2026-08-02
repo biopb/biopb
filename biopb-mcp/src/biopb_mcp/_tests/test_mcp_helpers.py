@@ -362,12 +362,14 @@ class TestViewerWindowAlive:
         viewer.window = None
         assert viewer_window_alive(viewer) is False
 
-    def test_dead_for_headless_sentinel(self):
-        class _Sentinel:
+    def test_dead_when_every_attribute_raises(self):
+        # Defensive: a viewer stand-in whose attribute access raises must read
+        # as "no window", never propagate.
+        class _Raising:
             def __getattr__(self, name):
-                raise RuntimeError("napari viewer unavailable: headless")
+                raise RuntimeError("napari viewer unavailable")
 
-        assert viewer_window_alive(_Sentinel()) is False
+        assert viewer_window_alive(_Raising()) is False
 
 
 class _FakeLayer:

@@ -249,11 +249,12 @@ one.
 Four environment facts are **forced rather than inherited**, because each
 silently changes what a run tests:
 
-- **A GL-capable display.** `display_mode: auto` degrades to a viewer-less
-  kernel, and `QT_QPA_PLATFORM=offscreen` is not enough either — napari builds
-  and then `add_image` dies in vispy's extension probe. Either way a step that
-  says *"show the user the first and last frames"* could not happen. Bring-up
-  probes and refuses; use a desktop session or `xvfb-run`.
+- **A GL-capable display.** On a display-less box the launcher spawns its own
+  `Xvfb` and renders the viewer there (`mcp/_xvfb.py`), so installing the
+  `xvfb` package is all such a box needs; absent both a display and the
+  binary, bring-up probes and refuses. `QT_QPA_PLATFORM=offscreen` is never a
+  substitute — napari builds and then `add_image` dies in vispy's extension
+  probe, so the harness forces a real GL platform.
 - **No tensor plane.** `BIOPB_TENSOR_URL` points at an unreachable address, so
   `client` lands as `None` and the agent cannot wander into whatever catalog the
   developer's machine happens to hold. The fixture reaches it as a napari layer,
@@ -439,9 +440,9 @@ uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills -m satisfiability
 uv run --no-project --python .venv/bin/python --with pystackreg \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py
 
-# the benchmark (§5): a GL display, two API keys, ~20 min per skill
-xvfb-run -a -s '-screen 0 1024x768x24' \
-  uv run --no-project --python .venv/bin/python --with openai --with anthropic \
+# the benchmark (§5): a GL display (or the xvfb package — the session
+# brings its own virtual display), two API keys, ~20 min per skill
+uv run --no-project --python .venv/bin/python --with openai --with anthropic \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
 ```
 

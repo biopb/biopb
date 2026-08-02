@@ -488,7 +488,7 @@ class TensorConnection:
         watcher.
 
         Deliberately thread-based (not a ``QTimer``): it must run in the kernel
-        with no assumption of a Qt event loop (the kernel can be headless), and
+        with no assumption of a live Qt event loop, and
         its blocking ``health_check`` belongs off any GUI thread.
         """
         if min_interval is None:

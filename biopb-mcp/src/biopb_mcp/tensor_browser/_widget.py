@@ -1051,8 +1051,8 @@ class TensorBrowserWidget(QWidget):
     def _start_connect(self):
         """Run the shared auto-connect policy on a worker thread.
 
-        Delegates to :meth:`TensorConnection.auto_connect` — the same
-        non-blocking policy the headless kernel uses (try the URL, wait through a
+        Delegates to :meth:`TensorConnection.auto_connect` — the shared
+        non-blocking policy (try the URL, wait through a
         ``STARTING`` data-folder scan, and auto-start a local biopb server as a
         last resort when the URL is local and the CLI is installed) — run off the
         Qt main thread. Two reasons it must not run inline: the viewer stays

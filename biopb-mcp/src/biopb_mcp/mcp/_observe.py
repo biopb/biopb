@@ -169,7 +169,7 @@ def _kernel_error(res):
     """
     status = res.get("status")
     if status == "busy":
-        return JSONResponse({"busy": True, "jobs": [], "headless": _server._headless})
+        return JSONResponse({"busy": True, "jobs": []})
     return JSONResponse(
         {
             "error": status or "kernel error",
@@ -203,7 +203,7 @@ async def _api_jobs(request):
     result, res, _w = _server._run_job_call(host, "jobs_summary()")
     if result is None:
         return _kernel_error(res)
-    return JSONResponse({"jobs": result, "headless": _server._headless})
+    return JSONResponse({"jobs": result})
 
 
 async def _api_job_detail(request):
@@ -234,7 +234,7 @@ async def _api_notebook(request):
     jobs, res, _w = _server._run_job_call(host, "export()")
     if jobs is None:
         return _kernel_error(res)
-    nb = _notebook.build_notebook(jobs, headless=_server._headless)
+    nb = _notebook.build_notebook(jobs)
     filename = _notebook.suggested_filename()
     return Response(
         json.dumps(nb, indent=1),
@@ -283,7 +283,6 @@ async def _api_status(request):
     return JSONResponse(
         {
             **host.health(),
-            "headless": _server._headless,
             "poll_interval_ms": _poll_interval_ms,
         }
     )

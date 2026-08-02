@@ -24,7 +24,7 @@ export interface McpNavItem {
 
 /**
  * Flat, ordered nav, grouped by concern in reading order: the data-plane knobs
- * the headless kernel uses, the compute-plane knobs, then the MCP server runtime.
+ * the MCP kernel uses, the compute-plane knobs, then the MCP server runtime.
  * The `id` equals the config section key. The demo-widget sections
  * (`widget` / `detection` / `grid`, the experimental image_processing/ widgets)
  * are deliberately omitted from the nav — they stay in the config and remain

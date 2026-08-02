@@ -114,7 +114,6 @@ export default function ObservePage() {
       const s = await (await fetch(base + "/api/status")).json();
       if (typeof s.poll_interval_ms === "number") setPollMs(s.poll_interval_ms);
       const bits = [s.alive ? "alive" : "dead"];
-      if (s.headless) bits.push("headless");
       if (s.busy) bits.push("busy");
       if (!s.ready) bits.push("starting");
       setStatus("kernel: " + bits.join(" · "));

@@ -5,9 +5,8 @@ model in front of the **shipped** skill body, against a **real** session, and
 score what comes out.
 
 ```sh
-# needs a GL-capable display -- see "what this needs" below
-xvfb-run -a -s '-screen 0 1024x768x24' \
-  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+# needs a GL-capable display, or the xvfb package -- see "what this needs" below
+uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
 ```
 
 Deselected by default (`-m interaction`), like `satisfiability`, and never in
@@ -29,8 +28,7 @@ export BIOPB_SKILL_AGENT=openai:gpt-5                  # default
 export BIOPB_SKILL_RESPONDENT=anthropic:claude-sonnet-5 # default
 export OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
 
-xvfb-run -a -s '-screen 0 1024x768x24' \
-  uv run --no-project --python .venv/bin/python --with openai --with anthropic \
+uv run --no-project --python .venv/bin/python --with openai --with anthropic \
   python -m pytest .../interaction -m interaction -s
 ```
 
@@ -168,9 +166,11 @@ transcription — the same disease, moved from the subject into the environment.
 
 **A GL-capable display.** Not just Qt: `QT_QPA_PLATFORM=offscreen` gets you a
 napari `Viewer`, and then `add_image` dies inside vispy's extension probe,
-because the offscreen platform provides no GL context. Use a desktop session's
-own display, or `xvfb-run`. Without one these tests **skip with instructions**
-rather than run somewhere subtly different.
+because the offscreen platform provides no GL context. A desktop session's own
+display works, and on a display-less box the session child spawns its own
+`Xvfb` (`mcp/_xvfb.py`) — so installing the `xvfb` package is enough. Absent
+both, these tests **skip with instructions** rather than run somewhere subtly
+different.
 
 Nothing else: no API key for the smoke tests, and no network beyond loopback.
 
@@ -231,11 +231,11 @@ stays exactly right.
 Each of these silently changes what a run tests, so none of them is inherited
 from whatever machine is running.
 
-**A real viewer.** `transport.display_mode` defaults to `auto`, which degrades
-to a viewer-less kernel when no display is found. That is a legitimate
-production mode and so nothing fails loudly — but a run that took it would be
-scoring a session in which step 2's *"show the user the first and last frames"*
-cannot happen at all. Bring-up probes for it and refuses.
+**A real viewer.** A session always has one now — on the user's display or the
+launcher's own Xvfb — but a box with neither a display nor the `xvfb` binary
+cannot bring one up, and paying the slow bring-up to learn that helps nobody.
+Bring-up probes for it and refuses, so a run never scores a session in which
+step 2's *"show the user the first and last frames"* could not happen.
 
 **No tensor plane.** A developer box often has a data plane up, and then
 `client` is live and the agent can wander into whatever catalog that machine

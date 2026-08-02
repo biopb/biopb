@@ -11,15 +11,15 @@ What this module owns is bring-up, a synchronous façade over the async MCP
 client, and three environment facts that have to be *forced* rather than
 inherited, because each of them silently changes what a run is testing:
 
-**A display, and a GL context behind it.** `transport.display_mode` defaults to
-`auto`, which degrades to a viewer-less kernel when `$DISPLAY` is unset — a
-legitimate production mode, so nothing fails. But a §5 run that took it would
-be scoring a session in which step 2's "show the user the first and last
-frames" *cannot happen*. Worse, `QT_QPA_PLATFORM=offscreen` is not enough on
-its own: napari builds, and then `add_image` dies inside vispy's extension
-probe, because offscreen Qt has no GL context. So a GL-capable display is a
-hard requirement here — a workstation's own, or `xvfb-run -a`. Absent one,
-these tests **skip with instructions** rather than run somewhere else.
+**A display, and a GL context behind it.** With no `$DISPLAY` the launcher
+spawns its own Xvfb and renders the viewer there (`mcp/_xvfb.py`), so a
+display-less box with the `xvfb` package installed runs these tests unaided.
+What still cannot be conjured is the binary itself (plus Mesa's software GL
+behind it): absent both a display and Xvfb, the session child fails fast at
+spawn — so these tests **skip with instructions** rather than pay the slow
+bring-up for a guaranteed failure. (`QT_QPA_PLATFORM=offscreen` is never a
+substitute: napari builds, then `add_image` dies inside vispy's extension
+probe, because offscreen Qt has no GL context.)
 
 **No tensor plane.** A developer box often has a data plane up, and then
 `client` is live and the agent can wander into whatever that machine's catalog
@@ -83,12 +83,16 @@ def why_unavailable() -> str:
     `add_image` dies deep inside vispy with an ``AttributeError`` on ``None``.
     """
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return (
-            "no display: §5 needs a GL-capable one for napari layers. Run under "
-            "`xvfb-run -a -s '-screen 0 1024x768x24'`, or on a desktop session. "
-            "QT_QPA_PLATFORM=offscreen alone is NOT enough — vispy needs a GL "
-            "context that the offscreen platform does not provide."
-        )
+        from biopb_mcp.mcp import _xvfb
+
+        if not _xvfb.available():
+            return (
+                "no display and no Xvfb: §5 needs a GL-capable display for "
+                "napari layers. Install xvfb (the launcher then provides its "
+                "own virtual display) or run on a desktop session. "
+                "QT_QPA_PLATFORM=offscreen alone is NOT enough — vispy needs a "
+                "GL context that the offscreen platform does not provide."
+            )
     try:
         import mcp  # noqa: F401
     except ImportError:  # pragma: no cover - the mcp extra is a test dep
@@ -229,7 +233,7 @@ class LiveSession:
         return np.load(path)
 
     def has_real_viewer(self) -> tuple[bool, str]:
-        """Whether `viewer` is a napari viewer and not the headless sentinel."""
+        """Whether `viewer` is a live napari viewer with a working canvas."""
         out = self.setup(
             "try:\n"
             "    _n = len(viewer.layers)\n"
@@ -280,7 +284,7 @@ def _write_config(
                 "dask": {"scheduler": "threads"},
                 # Nothing watches a web UI during an unattended run.
                 "observe": {"enabled": False},
-                "transport": {"kind": "http", "display_mode": "auto"},
+                "transport": {"kind": "http"},
                 "services": {"skills_enabled": skills_enabled},
             }
         ),

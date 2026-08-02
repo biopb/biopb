@@ -17,32 +17,6 @@ import traceback
 logger = logging.getLogger(__name__)
 
 
-class _HeadlessViewer:
-    """Stand-in bound to ``viewer`` when the kernel runs without a display.
-
-    Any attribute access raises a clear, quotable error so agent code that
-    reaches for the viewer (``viewer.add_image(...)``, ``viewer.layers`` …)
-    surfaces a self-describing message — relayed to the user by the model —
-    instead of a cryptic ``AttributeError`` on ``None``.  Falsy so kernel
-    snippets can guard with ``if viewer:``.
-    """
-
-    _MSG = (
-        "napari viewer unavailable: this biopb-mcp kernel started headless "
-        "(no display). Data access (client), compute (ops), and execute_code "
-        "still work — there is just no viewer window or screenshot."
-    )
-
-    def __getattr__(self, name):
-        raise RuntimeError(self._MSG)
-
-    def __repr__(self):
-        return "<headless: no napari viewer (no display)>"
-
-    def __bool__(self):
-        return False
-
-
 def _configure_dask(config: dict):
     """Set up dask in the kernel process.
 
@@ -240,7 +214,7 @@ def _start_update_check(viewer, config):
     ``.show()``s rather than ``.exec()``s). Fully best-effort and fail-open: the
     check itself swallows every error, and this wrapper swallows the rest, so it
     never disturbs a working session. The caller invokes this only when a real
-    napari window exists (never headless — "only when a napari window exists").
+    napari window exists.
 
     This is a *notify-only* reminder: it tells the user to run the install/
     upgrade script. biopb does not self-update (a graceful cross-platform apply
@@ -567,12 +541,6 @@ def _bootstrap_impl():
     ip = get_ipython()
     config = load_config()
 
-    # Headless (compute-only) mode: the launcher sets BIOPB_HEADLESS when no
-    # display is available (or display_mode forces it), so we skip Qt/napari
-    # entirely rather than crash on a missing display.  client/ops/execute_code
-    # still work; `viewer` is a self-describing sentinel.
-    headless = bool(os.environ.get("BIOPB_HEADLESS"))
-
     # 1. Qt integration must be enabled before the viewer is created so napari
     #    shares the kernel's integrated Qt event loop (programmatic %gui qt).
     #    Do it FIRST — before the heavy core imports below (dask.array, and on
@@ -581,14 +549,11 @@ def _bootstrap_impl():
     #    those deps, so popping the splash here covers the *whole* slow stretch;
     #    showing it after the imports (as before) left several seconds of blank
     #    screen the splash was meant to hide (issue #386). Best-effort: show_splash
-    #    fails open to _NullSplash when Qt is unavailable, and the headless branch
-    #    (no Qt loop) keeps the _NullSplash default below.
-    from ._splash import _NullSplash, show_splash
+    #    fails open to _NullSplash when Qt is unavailable.
+    from ._splash import show_splash
 
-    splash = _NullSplash()  # replaced below when a real one can be shown
-    if not headless:
-        ip.enable_gui("qt")
-        splash = show_splash()
+    ip.enable_gui("qt")
+    splash = show_splash()
 
     # Heavy core imports, now covered by the splash. dask.array is the slow one
     # here; napari is pulled in transitively on some platforms, so this is the
@@ -666,76 +631,59 @@ def _bootstrap_impl():
 
     threading.Thread(target=_attach_dask, name="biopb-dask-attach", daemon=True).start()
 
-    # 4. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
+    # 4. napari viewer + Tensor Browser (auto-connects on its own tick).
     #    compute_scheduler pins the viewer's serial slice reads to a
     #    single-process scheduler so they share the main-process chunk cache
     #    instead of scattering across the distributed cluster (issue #8).
-    #    Headless: no viewer — `viewer` is a self-describing sentinel instead.
     compute_scheduler = get_setting(config, "viewer.compute_scheduler")
-    if headless:
-        viewer = _HeadlessViewer()
-        logger.info("Headless mode: no napari viewer (no display).")
-        # No widget exists to drive the initial connect (the GUI branch's
-        # TensorBrowserWidget runs the same conn.auto_connect policy off a
-        # worker thread), so drive it here. On a daemon thread: connect() blocks
-        # on network I/O and we must not stall kernel bring-up (this runs in
-        # exec_lines, ahead of start_kernel returning). execute_code refreshes
-        # `client` from `_conn.client` per job, so a connect that lands after the
-        # kernel is ready is still seen. (threading imported at step 3.)
-        threading.Thread(
-            target=conn.auto_connect,
-            name="biopb-headless-connect",
-            daemon=True,
-        ).start()
-    else:
-        # Enable napari async slicing via its NAPARI_ASYNC env override, set
-        # BEFORE importing napari. The settings singleton reads the env at load,
-        # and the viewer's _LayerSlicer captures the flag once at construction
-        # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
-        # var is the only reliable hook; assigning the settings object after
-        # import is too late (the settings load resets it). Async slicing
-        # fetches slices off the Qt main thread so a zoom into a not-yet-cached
-        # level doesn't freeze the viewer (vispy keeps the current coarse
-        # texture until the finer slice resolves); take_screenshot force-syncs a
-        # slice before capturing so the agent still sees the requested frame
-        # (resync_view_for_capture).
-        os.environ["NAPARI_ASYNC"] = (
-            "1" if get_setting(config, "viewer.async_slicing") else "0"
+    # Enable napari async slicing via its NAPARI_ASYNC env override, set
+    # BEFORE importing napari. The settings singleton reads the env at load,
+    # and the viewer's _LayerSlicer captures the flag once at construction
+    # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
+    # var is the only reliable hook; assigning the settings object after
+    # import is too late (the settings load resets it). Async slicing
+    # fetches slices off the Qt main thread so a zoom into a not-yet-cached
+    # level doesn't freeze the viewer (vispy keeps the current coarse
+    # texture until the finer slice resolves); take_screenshot force-syncs a
+    # slice before capturing so the agent still sees the requested frame
+    # (resync_view_for_capture).
+    os.environ["NAPARI_ASYNC"] = (
+        "1" if get_setting(config, "viewer.async_slicing") else "0"
+    )
+
+    try:
+        # napari was already pulled in by the core imports above (splash is
+        # showing "Loading napari…" for that phase), so this import just
+        # binds the name — the real cost is napari.Viewer() below.
+        import napari
+
+        from ..tensor_browser import TensorBrowserWidget
+
+        splash.message("Opening viewer…")  # the slow step
+        viewer = napari.Viewer()
+        tbw = TensorBrowserWidget(
+            viewer, connection=conn, compute_scheduler=compute_scheduler
         )
+        viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+        # Hand the splash off to the viewer window (closes once it's shown).
+        splash.finish(viewer)
+        # Tear the kernel down to idle when the user closes the window: signal
+        # the launcher's reader thread over the inherited window-close pipe.
+        _install_window_close_hook(viewer)
 
-        try:
-            # napari was already pulled in by the core imports above (splash is
-            # showing "Loading napari…" for that phase), so this import just
-            # binds the name — the real cost is napari.Viewer() below.
-            import napari
+        # Kernel-start update reminder (issue #87): once a window exists, check
+        # in the background whether a newer release-v* deployment is available
+        # and, if so, remind the user to run the upgrade script. Never blocks
+        # window paint.
+        _start_update_check(viewer, config)
 
-            from ..tensor_browser import TensorBrowserWidget
-
-            splash.message("Opening viewer…")  # the slow step
-            viewer = napari.Viewer()
-            tbw = TensorBrowserWidget(
-                viewer, connection=conn, compute_scheduler=compute_scheduler
-            )
-            viewer.window.add_dock_widget(tbw, name="Tensor Browser")
-            # Hand the splash off to the viewer window (closes once it's shown).
-            splash.finish(viewer)
-            # Tear the kernel down to idle when the user closes the window: signal
-            # the launcher's reader thread over the inherited window-close pipe.
-            _install_window_close_hook(viewer)
-
-            # Kernel-start update reminder (issue #87): once a window exists, check
-            # in the background whether a newer release-v* deployment is available
-            # and, if so, remind the user to run the upgrade script. GUI branch only;
-            # never blocks window paint.
-            _start_update_check(viewer, config)
-
-        except Exception:
-            # Happy path: finish() hands the splash off to the viewer window (it
-            # closes once the window shows). If a step above fails first, close it
-            # so it can't linger before the kernel is torn down, then re-raise for
-            # bootstrap()'s BOOTSTRAP_ERROR handler.
-            splash.close()
-            raise
+    except Exception:
+        # Happy path: finish() hands the splash off to the viewer window (it
+        # closes once the window shows). If a step above fails first, close it
+        # so it can't linger before the kernel is torn down, then re-raise for
+        # bootstrap()'s BOOTSTRAP_ERROR handler.
+        splash.close()
+        raise
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
@@ -766,14 +714,12 @@ def _bootstrap_impl():
     # job-thread code (viewer/layers/dims/camera mutations) can't segfault Qt --
     # the real viewer is touched only on the Qt main thread. Internal subsystems
     # (helpers, tools, the Tensor Browser widget) keep the real viewer. See
-    # docs/viewer-thread-safety.md. Headless has no Qt loop, so no proxy.
-    viewer_handle = viewer
-    if not headless:
-        from ._helpers import patch_viewer_add_tensor
-        from ._viewer_proxy import make_viewer_proxy
+    # docs/viewer-thread-safety.md.
+    from ._helpers import patch_viewer_add_tensor
+    from ._viewer_proxy import make_viewer_proxy
 
-        patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
-        viewer_handle = make_viewer_proxy(viewer)
+    patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
+    viewer_handle = make_viewer_proxy(viewer)
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
@@ -811,8 +757,8 @@ def _bootstrap_impl():
     #    changes, so a catalog cached while the server was still indexing
     #    self-heals — for the agent (reads `_conn.sources` live) and, in a GUI
     #    session, the widget (which wires its own tree rebuild and also starts
-    #    the watch; the call is idempotent). Thread-based, not a QTimer, so it
-    #    runs even headless where there is no Qt loop.
+    #    the watch; the call is idempotent). Thread-based, not a QTimer, so a
+    #    busy Qt loop never starves the poll.
     try:
         conn.start_source_watch(
             min_interval=get_setting(config, "tensor.health_poll_min_interval"),

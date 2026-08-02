@@ -57,13 +57,11 @@ def _snapshot(
 def reset_server_state():
     old_host = _server._kernel_host
     old_promote = _server._promote_after
-    old_headless = _server._headless
     old_skills = _server._skills_enabled
     old_instructions = _server.mcp._mcp_server.instructions
     yield
     _server._kernel_host = old_host
     _server._promote_after = old_promote
-    _server._headless = old_headless
     _server._skills_enabled = old_skills
     _server.mcp._mcp_server.instructions = old_instructions
 
@@ -206,14 +204,6 @@ class TestTakeScreenshot:
         assert result[0].type == "text"
         assert "not initialized" in result[0].text
 
-    def test_headless_returns_message_without_touching_kernel(self, server_with_host):
-        _server.set_headless(True)
-        result = _server.take_screenshot()
-        assert result[0].type == "text"
-        assert "headless" in result[0].text.lower()
-        # Must short-circuit before dispatching into the kernel.
-        server_with_host.execute.assert_not_called()
-
     def test_returns_png_image_from_delimited_stdout(self, server_with_host):
         data = base64.b64encode(b"fake-png-bytes").decode()
         server_with_host.execute.return_value = _result(stdout=f"<<PNG_B64>>{data}\n")
@@ -251,11 +241,11 @@ class TestTakeScreenshot:
 
 
 # -----------------------------------------------------------------------
-# headless mode
+# handshake instructions
 # -----------------------------------------------------------------------
 
 
-class TestSetHeadless:
+class TestInstructions:
     def test_base_instructions_carry_guardrails(self):
         # The operation guardrails must be delivered up front via the handshake
         # instructions (not left to a pull-on-demand resource).
@@ -271,8 +261,7 @@ class TestSetHeadless:
         # Skills stay a separate fragment: the base guidance must not point the
         # agent at find_skills, which returns nothing once the catalog is off.
         assert "find_skills" not in base
-        # And they are advertised when visible (no headless / skills directive).
-        _server.set_headless(False)
+        # And the base alone is the handshake when skills are off.
         _server.set_skills_enabled(False)
         assert _server.mcp._mcp_server.instructions == base
 
@@ -285,7 +274,6 @@ class TestSetHeadless:
 
     def test_skills_directive_gated_on_enable(self):
         # Off: no find_skills mention in the handshake.
-        _server.set_headless(False)
         _server.set_skills_enabled(False)
         assert "find_skills" not in _server.mcp._mcp_server.instructions
         # On: the skills fragment is appended to the base guidance.
@@ -297,43 +285,6 @@ class TestSetHeadless:
         # Back off: no stale fragment left behind.
         _server.set_skills_enabled(False)
         assert _server.mcp._mcp_server.instructions == _server._BASE_INSTRUCTIONS
-
-    def test_skills_and_headless_compose(self):
-        _server.set_headless(True)
-        _server.set_skills_enabled(True)
-        instr = _server.mcp._mcp_server.instructions
-        # Base first, then the skills fragment, then the headless directive.
-        assert instr.startswith(_server._BASE_INSTRUCTIONS)
-        assert "find_skills" in instr
-        assert instr.index("find_skills") < instr.index("HEADLESS")
-
-    def test_headless_appends_directive_to_base_instructions(self):
-        _server.set_headless(True)
-        instr = _server.mcp._mcp_server.instructions
-        assert instr is not None
-        # Always-on base guidance plus the headless directive.
-        assert instr.startswith(_server._BASE_INSTRUCTIONS)
-        assert "HEADLESS" in instr
-        # The directive is conditioned on the user reaching for the viewer.
-        assert "viewer" in instr.lower()
-
-    def test_visible_keeps_base_drops_headless_directive(self):
-        # A flip headless -> visible must not leave the HEADLESS directive in
-        # the handshake, but must retain the always-on base guidance
-        # (set_headless owns the field in both directions). Skills off, so the
-        # comparison isolates the headless dimension.
-        _server.set_skills_enabled(False)
-        _server.set_headless(True)
-        assert "HEADLESS" in _server.mcp._mcp_server.instructions
-        _server.set_headless(False)
-        assert _server._headless is False
-        assert _server.mcp._mcp_server.instructions == _server._BASE_INSTRUCTIONS
-        assert "HEADLESS" not in _server.mcp._mcp_server.instructions
-
-    def test_server_status_reports_display_mode(self, server_with_host):
-        _server.set_headless(True)
-        out = _server.server_status()
-        assert "headless (no viewer)" in out
 
 
 # -----------------------------------------------------------------------
@@ -449,15 +400,6 @@ class TestExecuteCode:
         assert "job-7" in result
         assert "viewer window is closed" in result
 
-    def test_window_note_suppressed_when_headless(self, server_with_host):
-        _server.set_headless(True)
-        server_with_host.execute.side_effect = [
-            _job_reply(job_id="job-1", status="running", window_alive=False),
-            _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
-        ]
-        result = _server.execute_code("compute()")
-        assert "viewer window is closed" not in result
-
 
 class TestJobTools:
     def test_poll_job_formats_status(self, server_with_host):
@@ -557,16 +499,6 @@ class TestInterruptRestart:
         server_with_host.restart.assert_called_once()
         assert "restarted" in result.lower()
 
-    def test_restart_headless_reports_no_viewer(self, server_with_host):
-        # A headless restart rebuilds no napari window, so the message must not
-        # promise a rebuilt viewer that isn't there.
-        _server.set_headless(True)
-        result = _server.restart_kernel()
-        server_with_host.restart.assert_called_once()
-        assert "restarted" in result.lower()
-        assert "headless" in result.lower()
-        assert "rebuilt" not in result.lower()  # no viewer to rebuild
-
     def test_restart_reports_failure(self, server_with_host):
         server_with_host.restart.side_effect = RuntimeError("nope")
         result = _server.restart_kernel()
@@ -585,17 +517,6 @@ class TestStartKernel:
         server_with_host.ensure_started.assert_called_once()
         assert "ready" in result.lower()
         assert "execute_code" in result
-
-    def test_ready_headless_reports_no_viewer(self, server_with_host):
-        # In a headless session there is no napari window and take_screenshot is
-        # unavailable, so the ready message must say so and not promise a viewer.
-        _server.set_headless(True)
-        server_with_host.ensure_started.return_value = {"state": "ready"}
-        result = _server.start_kernel()
-        assert "ready" in result.lower()
-        assert "headless" in result.lower()
-        assert "execute_code" in result
-        assert "take_screenshot" not in result  # not offered when headless
 
     def test_error_state_message(self, server_with_host):
         server_with_host.ensure_started.return_value = {
@@ -731,7 +652,8 @@ class TestServerStatus:
             "_dask_client": None,
             "_dask_attach_done": True,
             "_conn": MagicMock(client=None, last_status="", last_message=""),
-            "viewer": None,  # headless: no window to report
+            "viewer": MagicMock(layers=[]),
+            "_viewer_window_alive": lambda: True,
             "ops": {"segmentation": object(), "restoration": object()},
             "_jobs": MagicMock(jobs_summary=list),
         }
@@ -764,7 +686,8 @@ class TestServerStatus:
             "_dask_client": None,
             "_dask_attach_done": True,
             "_conn": MagicMock(client=None, last_status="", last_message=""),
-            "viewer": None,
+            "viewer": MagicMock(layers=[]),
+            "_viewer_window_alive": lambda: True,
             "ops": {},
             "_jobs": MagicMock(jobs_summary=list),
         }

@@ -468,7 +468,7 @@ class TestConnect:
         out = conn.resolve_source("cloud_x")
 
         # progress/cancel hooks are forwarded verbatim (None when the caller,
-        # e.g. the headless agent, supplies neither).
+        # e.g. the agent's kernel, supplies neither).
         client.resolve.assert_called_once_with(
             "cloud_x", on_progress=None, should_cancel=None
         )

@@ -4,7 +4,6 @@ These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing
 and the stdio-vs-http dispatch) without starting a real kernel or viewer.
 """
 
-import logging
 import sys
 
 import pytest
@@ -14,8 +13,6 @@ from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
     _parse_args,
-    _resolve_headless,
-    _resolve_headless_logged,
     _setup_observe,
     main,
 )
@@ -162,41 +159,6 @@ class TestHasDisplay:
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         assert _has_display() is True
-
-
-class TestResolveHeadless:
-    def test_explicit_headless_always_true(self):
-        assert _resolve_headless("headless", True) is True
-        assert _resolve_headless("headless", False) is True
-
-    def test_explicit_visible_always_false(self):
-        # The launcher fails fast separately when visible + no display.
-        assert _resolve_headless("visible", False) is False
-        assert _resolve_headless("visible", True) is False
-
-    def test_auto_follows_display(self):
-        assert _resolve_headless("auto", True) is False
-        assert _resolve_headless("auto", False) is True
-
-
-class TestResolveHeadlessLogged:
-    def test_auto_no_display_warns(self, caplog):
-        # The silent auto->headless degrade (#98/#408) must emit a WARNING.
-        with caplog.at_level(logging.WARNING):
-            assert _resolve_headless_logged("auto", False) is True
-        assert any(r.levelno == logging.WARNING for r in caplog.records)
-        assert "headless" in caplog.text.lower()
-
-    def test_auto_with_display_is_silent(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            assert _resolve_headless_logged("auto", True) is False
-        assert caplog.records == []
-
-    def test_explicit_headless_is_silent(self, caplog):
-        # An intentional headless choice is not a surprise -- no warning.
-        with caplog.at_level(logging.WARNING):
-            assert _resolve_headless_logged("headless", False) is True
-        assert caplog.records == []
 
 
 class TestSetupObserve:

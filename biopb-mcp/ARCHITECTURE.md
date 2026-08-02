@@ -123,7 +123,7 @@ launch re-spins it.
 ### Data connection
 
 `TensorConnection` is a **GUI-independent** data-access service — it imports
-neither Qt nor napari — so the `TensorBrowserWidget` and the headless MCP kernel
+neither Qt nor napari — so the `TensorBrowserWidget` and the MCP kernel
 share one implementation. It owns the tensor Flight client and the source catalog.
 It resolves no endpoint from config and persists nothing.
 
