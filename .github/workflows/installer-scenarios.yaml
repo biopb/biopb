@@ -53,7 +53,7 @@ jobs:
       matrix:
         scenario: ${{ fromJSON(inputs.scenario == 'all' && '["clean","uv-preinstalled","old-python","rerun","bioformats"]' || format('["{0}"]', inputs.scenario)) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Docker is preinstalled on ubuntu-latest, so there is nothing to set up:
       # run.sh builds the image and runs assert.sh in it, exiting nonzero on the
