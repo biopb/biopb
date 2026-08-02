@@ -442,7 +442,17 @@ uv run --no-project --python .venv/bin/python --with pystackreg \
 # the benchmark (§5): a GL display, two API keys, ~20 min per skill
 xvfb-run -a -s '-screen 0 1024x768x24' \
   uv run --no-project --python .venv/bin/python --with openai --with anthropic \
-  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction
+  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+```
+
+`-s` is not optional in practice: pytest discards a *passing* test's captured
+output, so without it the engine's per-arm progress lines never appear and the
+terminal sits blank for the whole run. From a second terminal, the artifact
+directory is the other progress view — every arm writes its transcript before
+it is scored:
+
+```sh
+watch -n5 'find .skill-outcomes/interaction -newermt "-1 hour" | sort'
 ```
 
 **Adding a skill.** Drop the `.md` in `mcp/_skills_data/` — the suite discovers

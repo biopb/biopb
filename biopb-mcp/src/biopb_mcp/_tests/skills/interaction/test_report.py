@@ -223,6 +223,14 @@ def test_a_metric_no_arm_could_produce_reads_as_absent_not_as_zero(report):
     assert data["arms"][2]["metrics"]["err_px"] is None
 
 
+def test_a_row_says_how_long_its_arm_took(report):
+    """The only cost signal a reader gets afterwards. An arm is minutes, and
+    "was this twenty minutes or ninety" is not recoverable from the transcript."""
+    text, data, _ = report
+    assert all("seconds" in row for row in data["arms"])
+    assert "| min |" in text
+
+
 def test_the_report_names_both_models_and_the_fixture(report):
     """A row is uninterpretable a week later without them."""
     text, data, _ = report

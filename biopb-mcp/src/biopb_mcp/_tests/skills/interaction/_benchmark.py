@@ -41,6 +41,7 @@ it is made in `test_benchmark.py`; here a run that cannot happen is a
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -220,6 +221,9 @@ class Result:
     outcome: Outcome | None = None
     #: How many skills the catalog actually offered this run, read at bring-up.
     catalog_hits: int = 0
+    #: Wall-clock for this arm, including bring-up and teardown. Reported so the
+    #: cost of a case is legible from its own report rather than remembered.
+    seconds: float = 0.0
     #: Set when the arm could not be run to completion at all.
     error: str = ""
 
@@ -298,6 +302,7 @@ class Result:
             "messages_to_user": len(getattr(self.trace, "questions", [])),
             "tool_calls": len(getattr(self.trace, "tool_names", [])),
             "catalog_entries": self.catalog_hits,
+            "seconds": round(self.seconds, 1),
         }
 
 
@@ -397,17 +402,42 @@ class Run:
         return write_summary(self.case, self.results, self.fixture)
 
 
+def progress(message: str) -> None:
+    """One line of progress, straight to stdout.
+
+    A case is four conversations and the better part of half an hour, and
+    without this the only sign of life is the artifact directory filling up.
+    This module never imports pytest, so it emits and the *test* decides
+    visibility — pytest discards a passing test's captured output, which is why
+    the documented command passes ``-s``.
+    """
+    print(message, flush=True)
+
+
 def run_case(case: Case) -> Run:
     """Every corner, once. A failing arm becomes a row, never an exception."""
     fixture = case.build_fixture()
+    progress(
+        f"\n[{case.skill}] {len(ARMS)} arms against `{fixture.case_id}` "
+        f"-> {where_for(case)}"
+    )
     results = []
-    for arm in ARMS:
+    for n, arm in enumerate(ARMS, start=1):
+        progress(f"[{case.skill}] {n}/{len(ARMS)} {arm.name}: running")
+        started = time.monotonic()
         try:
-            results.append(run_arm(case, arm, fixture))
+            result = run_arm(case, arm, fixture)
         except SessionUnavailable as exc:
-            results.append(Result(arm=arm, error=f"{NO_SESSION}{exc}"))
+            result = Result(arm=arm, error=f"{NO_SESSION}{exc}")
         except Exception as exc:  # noqa: BLE001 - the row is the point
-            results.append(Result(arm=arm, error=f"{type(exc).__name__}: {exc}"))
+            result = Result(arm=arm, error=f"{type(exc).__name__}: {exc}")
+        result.seconds = time.monotonic() - started
+        outcome, reason = result.classify()
+        progress(
+            f"[{case.skill}] {n}/{len(ARMS)} {arm.name}: {outcome} "
+            f"in {result.seconds / 60:.1f} min — {reason}"
+        )
+        results.append(result)
     return Run(case=case, fixture=fixture, results=results)
 
 
@@ -449,8 +479,8 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         "",
         "| arm | skill | outcome | "
         + " | ".join(name for name, _ in columns)
-        + " | turns | asked | tools | reason |",
-        "|---|---|---|" + "---|" * (len(columns) + 4),
+        + " | turns | asked | tools | min | reason |",
+        "|---|---|---|" + "---|" * (len(columns) + 5),
     ]
     for row in rows:
         cells = " | ".join(fmt(row["metrics"].get(name)) for name, _ in columns)
@@ -458,7 +488,7 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
             f"| `{row['arm']}` | {'yes' if row['skill_offered'] else 'no'} "
             f"| **{row['outcome']}** | {cells} | {row['turns']} "
             f"| {row['blocking_questions']} | {row['tool_calls']} "
-            f"| {row['reason']} |"
+            f"| {row['seconds'] / 60:.1f} | {row['reason']} |"
         )
 
     if flagged := [r for r in rows if r["flags"]]:

@@ -7,7 +7,7 @@ score what comes out.
 ```sh
 # needs a GL-capable display -- see "what this needs" below
 xvfb-run -a -s '-screen 0 1024x768x24' \
-  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction
+  uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
 ```
 
 Deselected by default (`-m interaction`), like `satisfiability`, and never in
@@ -31,7 +31,7 @@ export OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
 
 xvfb-run -a -s '-screen 0 1024x768x24' \
   uv run --no-project --python .venv/bin/python --with openai --with anthropic \
-  python -m pytest .../interaction -m interaction
+  python -m pytest .../interaction -m interaction -s
 ```
 
 Known providers: `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` — each a
@@ -173,6 +173,37 @@ own display, or `xvfb-run`. Without one these tests **skip with instructions**
 rather than run somewhere subtly different.
 
 Nothing else: no API key for the smoke tests, and no network beyond loopback.
+
+## Watching a run
+
+A case is four conversations and the better part of half an hour, so the engine
+prints one line per arm — when it starts, and how it ended:
+
+```
+[calibrated-measurements] 4 arms against `twelve-nuclei-anisotropic` -> .skill-outcomes/interaction/calibrated-measurements
+[calibrated-measurements] 1/4 skill+asked: running
+[calibrated-measurements] 1/4 skill+asked: ok in 6.2 min — within every tolerance
+[calibrated-measurements] 2/4 skill+silent: running
+```
+
+**That needs `-s`.** pytest discards a passing test's captured output, so
+without it these lines — and the final report the fixture prints — never reach
+the terminal. Nothing is lost either way (`summary.md` is on disk regardless),
+but the run looks hung.
+
+The other view is the artifact directory, from a second terminal. Every arm
+writes `transcript.md` and `trace.jsonl` *before* it is scored, so the tree
+fills as the run proceeds:
+
+```sh
+watch -n5 'find .skill-outcomes/interaction -newermt "-1 hour" | sort'
+
+# or follow one arm's conversation as it happens
+tail -f .skill-outcomes/interaction/<skill>/skill+asked/transcript.md
+```
+
+Each arm's wall-clock lands in the report as a `min` column, so the cost of a
+case is legible afterwards rather than remembered.
 
 ## What a fixture has to withhold
 
