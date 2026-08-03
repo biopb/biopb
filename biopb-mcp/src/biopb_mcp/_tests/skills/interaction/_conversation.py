@@ -237,6 +237,10 @@ def converse(
         if step.tool_calls:
             messages.append(
                 {
+                    # Whatever the provider requires echoed — a reasoning
+                    # model's turn is not just text and tool calls, and
+                    # dropping the rest fails the *next* request, not this one.
+                    **step.provider_fields,
                     "role": "assistant",
                     "content": step.text or None,
                     "tool_calls": [
@@ -314,7 +318,9 @@ def converse(
             trace.stopped = FINISHED
             return trace
 
-        messages.append({"role": "assistant", "content": step.text})
+        messages.append(
+            {**step.provider_fields, "role": "assistant", "content": step.text}
+        )
         messages.append({"role": "user", "content": answer})
         trace.events.append(Event(turn=turn, role="user", text=answer))
 

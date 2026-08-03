@@ -36,6 +36,11 @@ from typing import Any, Protocol
 from ._bridge import parse_arguments
 from ._models import ModelChoice, agent_choice
 
+#: Keys a provider may return on an assistant message and require back. Tried
+#: in order; the first one present is carried under its own name, because a
+#: provider that spells it `reasoning` will not accept `reasoning_content`.
+ECHOED_FIELDS = ("reasoning_content", "reasoning")
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -61,6 +66,17 @@ class AgentTurn:
     #: cut off mid-reasoning are the same empty turn, and they mean opposite
     #: things about the skill. Empty for agents that do not have one.
     finish_reason: str = ""
+    #: Fields the provider requires echoed back on the assistant message.
+    #:
+    #: **A reasoning model's conversation is not just text and tool calls.**
+    #: Several providers return the reasoning alongside them and then *reject
+    #: the next request* if it is not sent back — DeepSeek's is
+    #: `reasoning_content`, and a request that drops it fails with "the
+    #: `reasoning_content` in the thinking mode must be passed back to the
+    #: API". Rebuilding the assistant turn from the parts this harness happens
+    #: to care about silently discards them, so they are carried here and
+    #: merged back verbatim, under whatever key they arrived on.
+    provider_fields: dict[str, Any] = field(default_factory=dict)
     #: Whatever else the provider returned, for the trace. Never asserted on.
     raw: Any = None
 
@@ -222,8 +238,14 @@ class ToolCallingAgent:
             )
             for c in (choice.tool_calls or ())
         )
+        echoed = {}
+        for key in ECHOED_FIELDS:
+            if value := getattr(choice, key, None):
+                echoed[key] = value
+                break
         return AgentTurn(
             text=choice.content or "",
             tool_calls=calls,
             finish_reason=completion.choices[0].finish_reason or "",
+            provider_fields=echoed,
         )

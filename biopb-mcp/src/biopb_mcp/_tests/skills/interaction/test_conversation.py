@@ -415,3 +415,68 @@ def test_malformed_tool_arguments_are_a_finding_not_a_crash():
     from ._bridge import parse_arguments
 
     assert parse_arguments("{not json") == {"__malformed__": "{not json"}
+
+
+# --- what the provider needs back ------------------------------------------
+
+
+def test_provider_fields_are_echoed_on_the_assistant_turn():
+    """A reasoning model's turn is not just text and tool calls.
+
+    Several providers return the reasoning alongside them and reject the
+    *next* request if it does not come back — the failure lands a turn later
+    than its cause, which is what made it read as intermittent. Rebuilding the
+    assistant message from the parts this harness cares about drops them.
+    """
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                tool_calls=(ToolCall("c1", "server_status", {}),),
+                provider_fields={"reasoning_content": "thinking about it"},
+            ),
+            AgentTurn(
+                text="Which channel?",
+                provider_fields={"reasoning_content": "still thinking"},
+            ),
+        ]
+    )
+    respondent = ScriptedRespondent([("channel", "Channel 1."), ("x", DONE)])
+    session = FakeSession()
+
+    class Recorder(ScriptedAgent):
+        sent: list = []
+
+        def respond(self, messages, tools):
+            Recorder.sent = list(messages)
+            return super().respond(messages, tools)
+
+    recorder = Recorder(turns=agent.turns)
+    converse(session, recorder, respondent, task="t")
+
+    assistants = [m for m in Recorder.sent if m.get("role") == "assistant"]
+    assert assistants, "no assistant turn was ever replayed back"
+    assert all("reasoning_content" in m for m in assistants), (
+        "a provider field was dropped when the assistant turn was rebuilt; "
+        "the next request fails, not this one"
+    )
+
+
+def test_an_agent_without_provider_fields_sends_no_extra_keys():
+    """The echo has to stay opt-in: a provider that never asked for one must
+    not start receiving an empty key it does not know."""
+    agent = ScriptedAgent([_calls("server_status"), _says("Done.")])
+    respondent = ScriptedRespondent([("done", DONE)])
+
+    class Recorder(ScriptedAgent):
+        sent: list = []
+
+        def respond(self, messages, tools):
+            Recorder.sent = list(messages)
+            return super().respond(messages, tools)
+
+    recorder = Recorder(turns=agent.turns)
+    converse(FakeSession(), recorder, respondent, task="t")
+
+    assistants = [m for m in Recorder.sent if m.get("role") == "assistant"]
+    assert assistants
+    assert all(set(m) <= {"role", "content", "tool_calls"} for m in assistants)
