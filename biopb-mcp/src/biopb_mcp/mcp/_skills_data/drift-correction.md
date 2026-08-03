@@ -3,7 +3,7 @@ id: drift-correction
 title: Correct stage drift in a time series before measuring
 description: Register a time-lapse whose field of view has drifted, so the same object stays at the same coordinates across frames.
 tags: [registration, time-series, preprocessing]
-version: 1.1.0
+version: 1.0.0
 checklist: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0, pkg:pystackreg~=0.2.8]
 ---
 

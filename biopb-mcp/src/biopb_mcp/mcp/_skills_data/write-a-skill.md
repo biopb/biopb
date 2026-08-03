@@ -3,7 +3,7 @@ id: write-a-skill
 title: Write a new biopb skill file
 description: Turn a workflow the user has just validated into a reviewed skill file for the biopb catalog.
 tags: [workflow, authoring]
-version: 1.2.0
+version: 1.0.0
 checklist: []
 ---
 
