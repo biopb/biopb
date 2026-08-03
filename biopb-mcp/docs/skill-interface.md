@@ -287,9 +287,23 @@ where to fetch a body and how to verify it, and nothing fetches.
 
 Freeform markdown *by design* — it is LLM context, which tolerates prose. The
 gate requires the H2 sections `when to use`, `when not to use`, `parameters`,
-`steps`, `failure modes`, `next steps` (normalized; order free, extras allowed):
-they are what a small model needs and cannot infer, especially "when not to use"
-and the symptom→cause→fix table. It also checks the guardrails that are
+`steps` (normalized; order free, extras allowed): they are what a small model
+needs and cannot infer, especially "when not to use", and every one of them is
+answerable from the workflow the author has just run.
+
+`failure modes` and `next steps` are allowed but **not required**, and the
+asymmetry is deliberate. Both are only worth writing from evidence, and a
+required section gets filled either way — asked for a symptom→cause→fix table
+about a workflow that has not failed yet, an author writes what sounds plausible,
+and once it is a table row nothing distinguishes that from a failure someone hit.
+So they are treated like a regression suite: a row is added when a real failure
+is observed — a contract test (`skill-testing.md` §4d), a reference-implementation
+measurement (§7), a benchmark transcript (§5), or a user report — and it names
+the fix that was actually applied. An empty table is a real answer. The same rule
+keeps `next steps` to handoffs the steps really produce, rather than the adjacent
+workflows an author can always imagine.
+
+The gate also checks the guardrails that are
 mechanically checkable — no dataset-specific paths or ids, one-sentence
 descriptions, `[[wiki-links]]` that resolve, a declared `plugin:<stem>` actually
 called through its module name, bodies under a ~200-line proxy.

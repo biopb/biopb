@@ -60,7 +60,10 @@ Ordinary hermetic unit tests over `mcp/_skills_data/*.md`.
 - `test_validate.py` — which malformations are fatal (id disagreeing with the
   filename, missing description, non-semver version, a missing required `##`
   section, unparseable YAML, an empty body) and which only warn (a missing
-  title, inferred from the H1; a future spec version, clamped).
+  title, inferred from the H1; a future spec version, clamped). `failure modes`
+  and `next steps` are optional and silent when absent: they are written from
+  evidence (§7), and a section the gate demands is one an author fills by
+  guessing on every skill that has nothing to report.
 - `test_shipped_skills.py` — the authoring rules the validator does not express
   generically: the live `checklist:` vocabulary (`viewer`, `tensor`, `dask`,
   `ops:<kind>`, `plugin:<stem>`, `pkg:<spec>`), no duplicate tokens, a
@@ -553,6 +556,19 @@ Four rules:
 - **Cite it in the PR.** Paste the script and its output into the issue or the
   PR body, where it lives as long as the repo does. A gist has its own lifetime
   and owner, and the link rots independently of the thing it justifies.
+- **A failure row records a failure, it does not predict one.** The measurement
+  produces some; the layers above produce the rest — `m2stitch`'s
+  `row_col_transpose=True` was a contract-test finding, and the swapped
+  precision/recall in `segmentation-qc-metrics` is what its benchmark case is
+  built to catch. Everything else an author can imagine going wrong is the same
+  guesswork the prose is not allowed to contain, and it costs more here, because
+  a table row reads as something that happened. Write the section only where
+  there is something to put in it; `failure modes` is optional for that reason.
+- **The evidence goes in the PR; the row keeps only what outlives it.** The body
+  is read by an agent with no repository and no PR — an attribution ("measured in
+  the bake-off", "seen in cold runs") is one it can neither verify nor act on, and
+  it is the maintainer half of the same sentence. What transfers is the number the
+  symptom is compared against and the regime or version it holds for.
 
 **It stays out of the suite deliberately.** Executing prose needs an opt-in
 fence, a per-skill checker and a threshold to maintain, and it would gate on a

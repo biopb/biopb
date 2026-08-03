@@ -143,22 +143,12 @@ measurement made from it.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| F1 near 0 but the overlay looks fine | The two are offset, or one was transposed in the kernel — the server's canonical order covers what it hands out, not what you built from it | Check `.shape` on both and the overlay before believing any score |
-| F1 mediocre on a segmentation that looks right | The two arrays came from different pyramid levels | Take both at level 0 (step 3) |
-| F1 = 1.0 exactly | Scored a layer against itself, or `pred` is a copy of `gt` | Confirm the two layer names differ and were produced independently |
-| F1 much lower than the paper's number for the same model | Border objects excluded on one side only, or a different IoU threshold | State both; a threshold difference alone moves F1 by tenths |
-| Precision and recall swapped versus expectation | `GT` and `PRED` passed in the wrong order | Step 2 exists to prevent this; re-run with them swapped and see if it resolves |
-| High F1 but measurements downstream still wrong | Detection is fine, boundaries are loose — F1@0.8 will be low | Quote the sweep, not just F1@0.5, before measuring from the labels |
-| Score changes between runs on identical input | Greedy matching, or a non-deterministic upstream model | Optimal assignment is deterministic; if it still moves, the segmentation did |
-| Metrics undefined / `nan` | One layer has no objects after border exclusion | Report "no objects to match" — not a score of 0, which reads as a bad model rather than an empty field |
-| A verdict like "excellent, production-ready", or one model winning by "a decisive margin" | Quality bands invented to bridge the gap between a number and a decision | Quote F1@0.5, F1@0.8 and the split/merge counts; *good enough* is the user's call, not the scorer's (step 7) |
+| A verdict like "excellent, production-ready", or one model winning by "a decisive margin" | Quality bands invented to bridge the gap between a number and a decision | Quote F1@0.5, F1@0.8 and the split/merge counts; *good enough* is the user's call, not the scorer's (step 7). Expect the pull: 3 of 3 models asked this cold invented a band |
+| Precision and recall swapped versus expectation, while F1 looks right | `GT` and `PRED` passed in the wrong order. F1 is symmetric under the swap, so the headline number does not move and the split/merge diagnosis inverts silently | Step 2 exists to prevent this; re-run with them swapped and see if it resolves. Measured: precision and recall trade 0.80 ↔ 0.94 while F1 stays exact |
+| Metrics undefined / `nan` | One layer has no objects after border exclusion | Report "no objects to match" — not a score of 0, which reads as a bad model rather than an empty field. This is what the plugin returns by design, so the `nan` is the answer rather than a bug |
 
 ## Next steps
 
 - To report object sizes in physical units alongside the score, use
   [[calibrated-measurements]] — the QC numbers say whether the labels are
   trustworthy, the calibrated table is what gets quoted.
-- Once one field's score is agreed, the same two calls apply per field over more
-  data; keep the parameter dict from step 7 as the batch's fixed settings.
-- If splits or merges dominate, the fix is in the segmentation step, not here —
-  re-tune there and re-score.

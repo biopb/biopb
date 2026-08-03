@@ -22,13 +22,22 @@ CURRENT_SPEC_VERSION = 1
 # Body structure every skill must carry, as normalized H2 headings (lowercased,
 # surrounding punctuation stripped). Order is not enforced, extra sections are
 # allowed. These are the sections a small model needs and cannot infer --
-# especially "when not to use" and the symptom->cause->fix table, which is the
-# only debugging aid it can act on.
+# especially "when not to use" -- and every one of them is answerable from the
+# workflow the author has just run.
 REQUIRED_SECTIONS = (
     "when to use",
     "when not to use",
     "parameters",
     "steps",
+)
+
+# Allowed, never required. Both are only worth writing from evidence, and a
+# required section gets filled whether or not the author has any: asked for a
+# failure table about a workflow that has not failed yet, an author writes what
+# sounds plausible, and speculation is indistinguishable from observation once it
+# is a table row. So they grow like a regression suite instead -- a row per
+# failure someone actually hit. See docs/skill-interface.md 5b.
+EVIDENCE_SECTIONS = (
     "failure modes",
     "next steps",
 )

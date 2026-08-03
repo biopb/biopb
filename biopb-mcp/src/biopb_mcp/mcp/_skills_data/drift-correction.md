@@ -139,19 +139,10 @@ chromatic error that was not there.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Recovered drift is ~0 for every frame while the movie visibly moves | `phase_cross_correlation` with its default `normalization="phase"` on a smooth, low-contrast image — it whitens frequency bins holding only numerical noise and buries the true peak | Pass `normalization=None`. Verified: a true (1.19, −0.68) px shift returns (0.0, −0.05) by default and (1.10, −0.55) with it |
-| One frame's offset jumps by tens of px, then everything after is shifted | StackReg lost lock, and `reference="previous"` propagated it | Step 4 catches it; re-register that pair with `RIGID_BODY`, or exclude the frame |
-| Steady, believable drift is reported but the movie is not stabilised | Registered on a channel whose content changes, so the fit tracked biology | Re-register on a structural channel |
-| Objects are still moving after correction | They were moving in the sample; the field never drifted | Track instead; see next steps |
-| Corrected movie is stable but intensities changed | Interpolation resampled the pixels | Expected — measure photometry on the raw movie |
-| Registration is stable but measurements drift at the borders | The invalid margin was included | Crop to the common valid region (step 6) |
-| `RIGID_BODY` rotation looks large and implausible | A near-symmetric field has no rotational information | Use `TRANSLATION`; report that rotation was not estimable |
+| Recovered drift is ~0 for every frame while the movie visibly moves | `phase_cross_correlation` with its default `normalization="phase"` on a smooth, low-contrast image — it whitens frequency bins holding only numerical noise and buries the true peak | Pass `normalization=None`. Measured: a true (1.19, −0.68) px shift returns (0.0, −0.05) by default and (1.10, −0.55) with it |
+| One frame's offset jumps by tens of px, and everything after it is shifted | `reference="first"`, which asks StackReg to match frames that no longer overlap once drift accumulates | `reference="previous"` (step 3). Measured: `"first"` fails deterministically at 23 px RMS for 1.7 px/frame of drift and 53 px at 4.0, where `"previous"` stays at 0.01–0.05 px |
 
 ## Next steps
 
-- Measure intensity traces on the corrected movie — the same pixel is now the
-  same place across frames, which is what a trace assumes.
-- Report sizes and positions from it with [[calibrated-measurements]], after
-  carrying the pixel spacing across (step 7).
-- If objects move *within* the stabilised field, that is tracking, and it starts
-  from this movie rather than the raw one.
+- Report sizes and positions from the corrected movie with
+  [[calibrated-measurements]], after carrying the pixel spacing across (step 7).

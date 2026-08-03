@@ -228,23 +228,19 @@ known positions, nominal placement left an rms of **10 px** (individual tiles
 
 ## Failure modes
 
+Every one of these came off the sweep behind steps 4 to 6, on a synthetic grid
+with a known layout. Note what is *not* here: uncorrected shading, which the same
+sweep found does not move the placement (step 3).
+
 | Symptom | Cause | Fix |
 |---|---|---|
-| Step 5 reports many components on tiles that plainly overlap | Snake acquisition read as row-major, so the "neighbours" being correlated are not adjacent | Reverse the odd rows when building the stack, then re-run from step 4 |
-| Mosaic is a diagonal staircase, or tiles pile into one corner | `rows`/`cols` transposed | Step 2 — `n_tiles == rows * cols` does not catch a square grid |
-| Nearly every pair rejected, on tiles that plainly overlap | `normalization` left at skimage's `"phase"` default | Pass `normalization=None` (step 4) |
-| Pairs rejected along one axis only | `PAD` smaller than the stage's error on that axis | Raise `PAD`; it costs time, not accuracy |
-| `n_parts > 1`, and raising `PAD` does not help | Genuinely too little shared texture, or blank tiles with nothing to correlate | Not recoverable by tuning — report nominal placement as unregistered. Thin overlap is the usual cause (~10% on ordinary content), but featureless tiles fail at any width |
-| Offsets are believable but the mosaic is blurred at every seam | Registered on uncorrected tiles, so shading dragged the correlation | Step 3 — correct first, then re-register |
-| Seams show as brightness steps, with the pixels aligned | Illumination was never corrected; placement is fine | [[flatfield]] on the tiles, then re-blend — no need to re-register |
-| One tile is far off and everything after it follows | Offsets accumulated along the acquisition path instead of composed | Step 6 |
+| Step 5 reports many components on tiles that plainly overlap | Snake acquisition read as row-major, so the "neighbours" being correlated are not adjacent | Reverse the odd rows when building the stack, then re-run from step 4. Measured: 1.0 px placement when the order is obtained by asking, ~450 px when assumed |
+| Nearly every pair rejected, on tiles that plainly overlap | `normalization` left at skimage's `"phase"` default | Pass `normalization=None` (step 4). Measured: correctly registered pairs fall from 92% to 68% on strips, and from 90% to 18% on whole tiles |
+| `n_parts > 1`, and raising `PAD` does not help | Genuinely too little shared texture where the tiles meet | Not recoverable by tuning — report nominal placement as unregistered. Measured: acceptance falls with overlap (55% at 10%, 45% at 8%, 22% at 5%), and every run that fragmented landed at 3.7–17.9 px |
+| One tile is far off and everything after it follows | Offsets accumulated along the acquisition path instead of composed | Step 6. Measured: 11.9 px rms, against the spanning tree's 0.3 and *worse* than not registering at all (10.3) |
 
 ## Next steps
 
-- Segment the mosaic as one image — the usual point of stitching, and what
-  removes the duplicate-objects-at-seams problem entirely. Score that with
-  [[segmentation-qc-metrics]], and report sizes from it with
+- Segment the mosaic as one image, then score that with
+  [[segmentation-qc-metrics]] and report sizes from it with
   [[calibrated-measurements]], carrying the spacing across (step 7).
-- The settings printed at step 7 are the fixed configuration for the rest of a
-  plate or slide set. The illumination fit that preceded them is not — that is
-  per channel and per session.

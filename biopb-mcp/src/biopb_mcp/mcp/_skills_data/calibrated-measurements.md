@@ -130,17 +130,11 @@ generated from a previous step. Read `guide://data` before pulling pixels and me
 
 ## Failure modes
 
+`regionprops` behaviour as of `scikit-image` 0.26.
+
 | Symptom | Cause | Fix |
 |---|---|---|
-| Volumes off by ~10³ or ~10⁹ | Spacing in nm while the report says µm | Read the unit list beside the scale; convert once, at the source |
 | 3D volumes too small by exactly the Z:XY ratio | `spacing` omitted, or given as XY only | Pass the full per-axis vector; in 3D `area` is the volume |
-| Sizes off by a power of the downsample factor | Labels and image taken from different pyramid levels | Read both at level 0, or downsample both (step 2) |
-| `ValueError` on the length of `spacing`, or Z-sized numbers on a channel axis | `layer.scale` read positionally — a non-spatial axis counted as one, or an interleaved-colour layer whose scale is one element short | Match entries to `LABELS`' axis labels, not to positions (step 2) |
 | `NotImplementedError: perimeter supports isotropic spacings only` | `perimeter` / `perimeter_crofton` reject anisotropic spacing | Measure perimeter on an isotropic plane, or resample to isotropic first |
 | `eccentricity` / `axis_major_length` shift when spacing is added | Correct, not a bug — anisotropic voxels genuinely change the fitted ellipse | Report the calibrated value; note the spacing alongside it |
-| Sizes plausible but every object counted twice | Objects duplicated at tile seams upstream | A tiling problem, not a spacing one — reconcile labels across blocks first |
-
-## Next steps
-
-- Feed the calibrated table into whatever comparison follows; the spacing dict
-  from step 6 is the handoff, so downstream passes never re-derive it.
+| `ValueError` on the length of `spacing`, or Z-sized numbers on a channel axis | `layer.scale` read positionally — a non-spatial axis counted as one, or an interleaved-colour layer whose scale is one element short (napari does not count the samples axis) | Match entries to `LABELS`' axis labels, not to positions (step 2) |

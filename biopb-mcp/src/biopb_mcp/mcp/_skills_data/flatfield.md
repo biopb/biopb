@@ -210,16 +210,15 @@ that was not there.
 
 ## Failure modes
 
+Short on purpose, and not a checklist for "is the correction right". These are
+the two mistakes that produce a *visible* symptom; the more expensive ones — a
+wrong offset above all — leave a field that looks entirely ordinary, which is
+what steps 2 and 5 are for.
+
 | Symptom | Cause | Fix |
 |---|---|---|
-| Corners come out *brighter* than the centre | The data was already flat-field corrected, so a second vignette was fitted and divided out | Step 2. Discard and use the original |
-| `flat` spans far more than the raw stack does, and the corners blow up | `DARKFIELD` was over-subtracted — often a low quantile used as an estimate rather than a ceiling | Lower it; it must be below the darkest pixel by the specimen's background |
-| Correction is visible but weak, and `flat` barely spans more than the raw stack | `DARKFIELD` assumed 0 when the camera has an offset | Step 2 — this is worth more than any other change |
-| `flat` shows recognisable specimen structure | Too few frames, or a specimen that barely moves between them | Fit on more frames, or on frames from the same optics with different fields of view |
-| `flat` is nearly featureless and the images are unchanged | `KEEP` starved (4 or less), or there is genuinely no vignette | Raise `KEEP` to 16; if it stays flat, report that no correction was needed |
-| Tiles that individually look right, but the mosaic still shows a checkerboard | A field was fitted per tile, cancelling the real differences between them | One `flat` per channel per optical configuration |
-| One channel looks corrected and another looks worse | A single field applied to every channel | Estimate per channel |
-| The fit runs out of memory on a large tile set | The float64 log stack is ~4x the uint16 input | Step 3 — fit on 8 tiles, or on a decimated stack |
+| `flat` spans far more than the raw stack does, and the corners blow up | `DARKFIELD` was over-subtracted — often a low quantile used as an estimate rather than a ceiling | Lower it; it must be below the darkest pixel by the specimen's background. Measured: a quantile estimate fits a field spanning 6.3 where the true one spans 2.0, and 10.0% field error against 0.5% |
+| `flat` is nearly featureless and the images are unchanged | `KEEP` starved, or there is genuinely no vignette | Raise `KEEP` to 16; if it stays flat, report that no correction was needed. Measured: `KEEP=4` gives 2.4% field error, and anything from 8 to 64 gives 0.5–0.8% |
 
 ## Next steps
 
@@ -230,6 +229,3 @@ that was not there.
   problem, not an illumination one.
 - Report intensities and sizes from the corrected stack with
   [[calibrated-measurements]], carrying the pixel spacing across (step 6).
-- For a time series where the field of view moved rather than the illumination
-  being uneven, [[drift-correction]] is the other workflow, and it is independent
-  of this one.

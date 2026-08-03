@@ -95,8 +95,8 @@ class TwoRuns:
             into[((yy - cy) ** 2 + (xx - cx) ** 2) <= radius**2] = label
 
         # The matched pairs, offset by a pixel: identical masks would score a
-        # mean IoU of exactly 1, which the body's failure table reads as "you
-        # scored a layer against itself".
+        # mean IoU of exactly 1, which is a degenerate field that says nothing
+        # about whether a run matched the objects or copied one layer.
         matched = self.n_gt - self.n_missed
         pred_label = 0
         for label, centre in enumerate(annotated, start=1):
