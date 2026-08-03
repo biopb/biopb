@@ -54,7 +54,15 @@ from typing import Callable
 import numpy as np
 
 from ._agent import ToolCallingAgent
-from ._conversation import SILENT, TOOL_CAP, TURN_CAP, converse, scrape
+from ._conversation import (
+    AGENT_TRUNCATED,
+    RESPONDENT_FAILED,
+    SILENT,
+    TOOL_CAP,
+    TURN_CAP,
+    converse,
+    scrape,
+)
 from ._fixture import (
     Attempt,
     Fixture,
@@ -97,6 +105,10 @@ FLAG_OVER_BUDGET = "over-ask-budget"
 FLAG_NEVER_ASKED = "never-asked"
 FLAG_CUT_OFF = "cut-off-but-scored"
 FLAG_CATALOG_MISMATCH = "catalog-mismatch"
+#: Asked, and was never once answered. On an `asked` arm that is not a result,
+#: it is the respondent being broken — the arm measured the `silent` condition
+#: under the `asked` label, and its row is not comparable to anything.
+FLAG_UNANSWERED = "asked-but-unanswered"
 
 #: A missing session is worth telling apart from any other harness failure: it
 #: means the machine, not the run.
@@ -290,6 +302,15 @@ class Result:
             return HARNESS_ERROR, "the arm produced neither a trace nor a score"
 
         stopped = self.trace.stopped
+        # Before anything about the agent: these two are the *provider* ending
+        # the run, and they are indistinguishable from an agent finishing or
+        # giving up unless they are read first. Scoring them against the skill
+        # is how a broken respondent gets reported as four bad rows.
+        if stopped == RESPONDENT_FAILED:
+            return HARNESS_ERROR, "the respondent never answered; see the trace"
+        if stopped == AGENT_TRUNCATED:
+            return HARNESS_ERROR, "the agent was cut off at its token budget"
+
         if not self.outcome.scored:
             if stopped == TURN_CAP:
                 return OUT_OF_TURNS, "hit the turn cap with nothing scorable bound"
@@ -324,6 +345,8 @@ class Result:
             out.append(f"{FLAG_OVER_BUDGET}({asked})")
         if asked == 0:
             out.append(FLAG_NEVER_ASKED)
+        if asked and not self.trace.answers:
+            out.append(FLAG_UNANSWERED)
         severed = self.trace.stopped in (TURN_CAP, TOOL_CAP)
         if self.outcome is not None and self.outcome.scored and severed:
             out.append(FLAG_CUT_OFF)

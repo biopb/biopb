@@ -276,9 +276,40 @@ def respondent_choice() -> ModelChoice:
     )
 
 
+class EmptyCompletion(RuntimeError):
+    """A provider returned no usable text, and said so.
+
+    **This exists so that a budget failure cannot be mistaken for a reply.** A
+    reasoning model bills its reasoning against the same `max_tokens` as its
+    answer, so a budget that would comfortably hold the answer can be consumed
+    entirely before the answer starts: the provider returns
+    `finish_reason="length"` with empty content, which is a *truncation*, not a
+    short response. An earlier version returned `""` here and let the caller
+    read it as a hand-off, which ended runs at the first question and scored
+    them against the agent.
+
+    ``reason`` is the provider's own word for it (`length`, `max_tokens`, or
+    `no-text` when it gave none), so a trace says which happened.
+    """
+
+    def __init__(self, model: str, reason: str, max_tokens: int) -> None:
+        super().__init__(
+            f"{model} returned no text (reason={reason!r}, max_tokens={max_tokens}). "
+            "A reasoning model spends its reasoning from this same budget; raise "
+            "max_tokens rather than reading the empty result as an answer."
+        )
+        self.model = model
+        self.reason = reason
+        self.max_tokens = max_tokens
+
+
 class TextBackend(Protocol):
     """A chat model with a system prompt and **no tools** — what a respondent
-    is. The agent needs tool calling and keeps its own client (`_agent.py`)."""
+    is. The agent needs tool calling and keeps its own client (`_agent.py`).
+
+    Raises :class:`EmptyCompletion` rather than returning an empty string: the
+    caller cannot tell the two apart, and one of them is a bug.
+    """
 
     name: str
 
@@ -310,7 +341,13 @@ class OpenAICompatText:
             temperature=self.temperature,
             max_tokens=max_tokens,
         )
-        return (completion.choices[0].message.content or "").strip()
+        choice = completion.choices[0]
+        text = (choice.message.content or "").strip()
+        if not text:
+            raise EmptyCompletion(
+                self.name, choice.finish_reason or "no-text", max_tokens
+            )
+        return text
 
 
 @dataclass
@@ -337,9 +374,17 @@ class AnthropicText:
             system=system,
             messages=messages,
         )
-        return "".join(
+        # Thinking blocks are dropped here but *are* billed against max_tokens,
+        # and on the current models thinking is on unless it is turned off — so
+        # a budget spent thinking arrives as content with no text block in it.
+        text = "".join(
             block.text for block in response.content if block.type == "text"
         ).strip()
+        if not text:
+            raise EmptyCompletion(
+                self.name, response.stop_reason or "no-text", max_tokens
+            )
+        return text
 
 
 def text_backend(choice: ModelChoice) -> TextBackend:

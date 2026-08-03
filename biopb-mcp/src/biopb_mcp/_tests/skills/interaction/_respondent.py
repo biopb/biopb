@@ -31,7 +31,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from ._models import TextBackend, respondent_choice, text_backend
+from ._models import EmptyCompletion, TextBackend, respondent_choice, text_backend
+
+__all__ = [
+    "DONE",
+    "EmptyCompletion",
+    "ModelRespondent",
+    "Persona",
+    "Respondent",
+    "ScriptedRespondent",
+    "SilentRespondent",
+    "model_respondent",
+]
 
 #: What a respondent says instead of answering, when the agent's message is a
 #: hand-off rather than a question. The loop ends on it.
@@ -147,7 +158,12 @@ class ModelRespondent:
 
     persona: Persona
     backend: TextBackend
-    max_tokens: int = 300
+    #: Sized for the *reasoning*, not the answer. A persona reply is one or two
+    #: sentences, and 300 tokens was set against that — but a reasoning model
+    #: bills its reasoning from this same budget, and on the measured case
+    #: spent 1772 of them before writing a word. Below roughly 4k the reply
+    #: never starts, and the run ends at the agent's first question.
+    max_tokens: int = 8192
     history: list[dict] = field(default_factory=list)
 
     @property
@@ -155,16 +171,22 @@ class ModelRespondent:
         return f"{self.backend.name}/{self.persona.name}"
 
     def reply(self, message: str) -> str:
+        """The persona's answer, or :class:`EmptyCompletion` if there is none.
+
+        **The failure is not caught here**, and that is deliberate. `DONE` ends
+        the run and is scored as the agent finishing, so returning it for a
+        provider that gave no text spends a whole arm and reports the loss
+        against the skill. The loop stops on the exception with a reason of its
+        own instead.
+        """
         self.history.append({"role": "user", "content": message})
         text = self.backend.complete(
             system=self.persona.system_prompt(),
             messages=self.history,
             max_tokens=self.max_tokens,
         )
-        # An empty reply would leave the loop with nothing to append and no
-        # reason to stop; read it as the hand-off it almost certainly was.
-        self.history.append({"role": "assistant", "content": text or DONE})
-        return text or DONE
+        self.history.append({"role": "assistant", "content": text})
+        return text
 
 
 def model_respondent(persona: Persona, **kwargs) -> ModelRespondent:

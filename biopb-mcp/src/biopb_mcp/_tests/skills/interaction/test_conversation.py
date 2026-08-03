@@ -21,7 +21,9 @@ import pytest
 
 from ._agent import AgentTurn, ReplayAgent, ScriptedAgent, ToolCall
 from ._conversation import (
+    AGENT_TRUNCATED,
     FINISHED,
+    RESPONDENT_FAILED,
     SILENT,
     TOOL_CAP,
     TURN_CAP,
@@ -29,6 +31,7 @@ from ._conversation import (
     converse,
     scrape,
 )
+from ._models import EmptyCompletion
 from ._respondent import DONE, ScriptedRespondent, SilentRespondent
 from ._session import ToolResult, ToolSpec
 
@@ -127,11 +130,87 @@ def test_the_respondent_ends_the_run_with_the_sentinel():
     assert trace.stopped == FINISHED
 
 
+@dataclass
+class BrokenRespondent:
+    """A respondent whose provider returns nothing. The measured failure."""
+
+    name: str = "broken"
+
+    def reply(self, message: str) -> str:
+        raise EmptyCompletion("some:model", "length", 300)
+
+
+def test_a_respondent_that_never_answers_is_not_the_agent_signing_off():
+    """`DONE` ends the run and scores as the agent having handed off, which is
+    both the nearest reading of this failure and the most expensive to
+    believe: it ends the arm at the first question and reports the loss
+    against the skill."""
+    agent = ScriptedAgent([_says("Which channel is structural?")])
+
+    trace = converse(FakeSession(), agent, BrokenRespondent(), task="t")
+
+    assert trace.stopped == RESPONDENT_FAILED
+    assert trace.stopped != FINISHED
+    failure = [e for e in trace.events if e.role == "harness" and e.is_error]
+    assert failure, "the provider's own reason has to reach the trace"
+    assert "max_tokens" in failure[0].text
+
+
+def test_a_question_with_no_answer_behind_it_is_visible_in_the_trace():
+    """The shape a broken respondent leaves: questions asked, none answered.
+    The report flags on exactly this."""
+    agent = ScriptedAgent([_says("Which channel is structural?")])
+
+    trace = converse(FakeSession(), agent, BrokenRespondent(), task="t")
+
+    assert trace.blocking_questions
+    assert trace.answers == []
+
+
 def test_a_silent_agent_stops_the_run():
     """Nothing said and nothing called: there is no next move to make, and
     spinning to the turn cap would only hide it."""
     trace = converse(FakeSession(), ScriptedAgent([]), ScriptedRespondent([]), task="t")
     assert trace.stopped == SILENT
+
+
+def test_an_agent_cut_off_at_its_budget_is_not_an_agent_that_gave_up():
+    """The identical empty turn, and opposite meanings. A reasoning model
+    bills its reasoning against `max_tokens`, so it can spend the whole budget
+    before writing anything — which arrives as a turn with no text and no tool
+    calls, exactly like a model with nothing left to say."""
+    agent = ScriptedAgent([AgentTurn(text="", finish_reason="length")])
+
+    trace = converse(FakeSession(), agent, ScriptedRespondent([]), task="t")
+
+    assert trace.stopped == AGENT_TRUNCATED
+    assert any(e.role == "harness" and e.is_error for e in trace.events), (
+        "the reason has to reach the trace, not just the stop code"
+    )
+
+
+def test_a_truncated_turn_that_still_said_something_is_an_ordinary_turn():
+    """Only the *empty* truncated turn is unreadable. One that got a question
+    out before the budget ran down is still a question."""
+    agent = ScriptedAgent([AgentTurn(text="Which channel?", finish_reason="length")])
+    respondent = ScriptedRespondent([("channel", DONE)])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+    assert respondent.heard == ["Which channel?"]
+
+
+def test_the_finish_reason_survives_into_the_trace():
+    """Recorded rather than inferred: after the fact, nothing else in the
+    record distinguishes a cut-off turn from a finished one."""
+    agent = ScriptedAgent([AgentTurn(text="Hello?", finish_reason="length")])
+
+    trace = converse(FakeSession(), agent, ScriptedRespondent([]), task="t")
+
+    spoken = next(e for e in trace.events if e.role == "agent")
+    assert spoken.finish_reason == "length"
+    assert "cut off at the token budget" in trace._markdown()
 
 
 def test_the_turn_cap_is_recorded_as_the_outcome_it_is():

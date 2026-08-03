@@ -55,12 +55,32 @@ class AgentTurn:
 
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
-    #: Whatever the provider returned, for the trace. Never asserted on.
+    #: The provider's own word for why generation stopped, carried into the
+    #: trace. **A turn with no text and no tool calls is ambiguous without
+    #: it**: the model deciding it has nothing left to say and the model being
+    #: cut off mid-reasoning are the same empty turn, and they mean opposite
+    #: things about the skill. Empty for agents that do not have one.
+    finish_reason: str = ""
+    #: Whatever else the provider returned, for the trace. Never asserted on.
     raw: Any = None
 
     @property
     def is_question(self) -> bool:
         return not self.tool_calls and bool(self.text.strip())
+
+    @property
+    def is_empty(self) -> bool:
+        """Nothing said and nothing called — no next move to make."""
+        return not self.tool_calls and not self.text.strip()
+
+    @property
+    def was_truncated(self) -> bool:
+        """Cut off at the token budget rather than finished.
+
+        `length` is the OpenAI-compatible spelling and `max_tokens` the
+        Anthropic one; both mean the budget ran out mid-generation.
+        """
+        return self.finish_reason in ("length", "max_tokens")
 
 
 class ChatAgent(Protocol):
@@ -120,6 +140,7 @@ class ReplayAgent:
                     ToolCall(c["id"], c["name"], c.get("arguments") or {})
                     for c in r.get("tool_calls") or ()
                 ),
+                finish_reason=r.get("finish_reason", ""),
             )
             for r in records
             if r.get("role") == "agent"
@@ -155,7 +176,12 @@ class ToolCallingAgent:
 
     choice: ModelChoice | None = None
     temperature: float = 0.0
-    max_tokens: int = 4096
+    #: Headroom for reasoning *and* the tool call that follows it. A reasoning
+    #: model bills both from here, and the measured agent spent 3570 of 4096 on
+    #: reasoning alone in a first turn against an almost empty context — a
+    #: margin thin enough that a harder turn truncates, and a truncated turn is
+    #: an empty one. The cost of the larger budget is nothing until it is used.
+    max_tokens: int = 16384
 
     def __post_init__(self) -> None:
         self.choice = self.choice or agent_choice()
@@ -199,5 +225,5 @@ class ToolCallingAgent:
         return AgentTurn(
             text=choice.content or "",
             tool_calls=calls,
-            raw={"finish_reason": completion.choices[0].finish_reason},
+            finish_reason=completion.choices[0].finish_reason or "",
         )

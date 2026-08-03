@@ -6,6 +6,9 @@ part that decides *what* a run measured. Runs with the ordinary suite.
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from ._models import (
@@ -19,6 +22,7 @@ from ._models import (
     RESPONDENT_ENV,
     SHARED_BASE_URL_ENV,
     AnthropicText,
+    EmptyCompletion,
     OpenAICompatText,
     agent_choice,
     parse_choice,
@@ -219,3 +223,113 @@ def test_an_agent_configured_against_the_rule_is_still_resolvable(monkeypatch):
     that it was contaminated."""
     monkeypatch.setenv(AGENT_ENV, "anthropic:claude-sonnet-5")
     assert agent_choice().provider.wrote_these_skills
+
+
+# --- empty completions -----------------------------------------------------
+#
+# The provider is faked, not the boundary: what is under test is that
+# `complete()` refuses to hand back an empty string, and that only runs if a
+# provider is there to return one. The SDKs are imported inside the method, so
+# a module in `sys.modules` is enough and no key or network is involved.
+
+
+class _Message:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Choice:
+    def __init__(self, content, finish_reason):
+        self.message = _Message(content)
+        self.finish_reason = finish_reason
+
+
+def _fake_openai(monkeypatch, content, finish_reason):
+    module = types.ModuleType("openai")
+
+    class _Completions:
+        def create(self, **kwargs):
+            return types.SimpleNamespace(choices=[_Choice(content, finish_reason)])
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=_Completions())
+
+    module.OpenAI = _OpenAI
+    monkeypatch.setitem(sys.modules, "openai", module)
+
+
+def _fake_anthropic(monkeypatch, blocks, stop_reason):
+    module = types.ModuleType("anthropic")
+
+    class _Messages:
+        def create(self, **kwargs):
+            return types.SimpleNamespace(content=blocks, stop_reason=stop_reason)
+
+    class _Anthropic:
+        def __init__(self, **kwargs):
+            self.messages = _Messages()
+
+    module.Anthropic = _Anthropic
+    monkeypatch.setitem(sys.modules, "anthropic", module)
+
+
+def _block(kind, text=""):
+    return types.SimpleNamespace(type=kind, text=text)
+
+
+def test_a_truncated_openai_reply_raises_instead_of_looking_like_an_answer(
+    monkeypatch,
+):
+    """`finish_reason="length"` with empty content is a *truncation*, not a
+    short reply. Returning `""` here is what let a budget failure be read as
+    the agent signing off."""
+    _fake_openai(monkeypatch, content="", finish_reason="length")
+    backend = OpenAICompatText(parse_choice("openai:some-model"))
+
+    with pytest.raises(EmptyCompletion) as caught:
+        backend.complete(system="s", messages=[], max_tokens=300)
+
+    assert caught.value.reason == "length"
+    assert caught.value.max_tokens == 300
+    assert "max_tokens" in str(caught.value), "the message has to name the lever"
+
+
+def test_a_thinking_only_anthropic_reply_raises(monkeypatch):
+    """Thinking blocks are dropped here but billed against `max_tokens`, and
+    on the current models thinking is on unless turned off — so the budget can
+    be spent on content that has no text block in it at all."""
+    _fake_anthropic(
+        monkeypatch, blocks=[_block("thinking", "")], stop_reason="max_tokens"
+    )
+    backend = AnthropicText(parse_choice("anthropic:some-model"))
+
+    with pytest.raises(EmptyCompletion) as caught:
+        backend.complete(system="s", messages=[], max_tokens=300)
+
+    assert caught.value.reason == "max_tokens"
+
+
+@pytest.mark.parametrize("reason", ["stop", "end_turn"])
+def test_a_real_answer_still_comes_back_as_text(monkeypatch, reason):
+    """The guard has to stay narrow: a backend that raised on ordinary replies
+    would be a worse failure than the one it replaces."""
+    _fake_openai(monkeypatch, content="  Channel 1.  ", finish_reason=reason)
+    assert (
+        OpenAICompatText(parse_choice("openai:m")).complete(
+            system="s", messages=[], max_tokens=300
+        )
+        == "Channel 1."
+    )
+
+    _fake_anthropic(
+        monkeypatch,
+        blocks=[_block("thinking", ""), _block("text", "Channel 1.")],
+        stop_reason=reason,
+    )
+    assert (
+        AnthropicText(parse_choice("anthropic:m")).complete(
+            system="s", messages=[], max_tokens=300
+        )
+        == "Channel 1."
+    )

@@ -27,6 +27,7 @@ from typing import Any
 
 from ._agent import AgentTurn, ChatAgent
 from ._bridge import to_function_tools
+from ._models import EmptyCompletion
 from ._respondent import DONE, Respondent
 
 #: Bounds on one run. Generous enough for the seven-step drift workflow with
@@ -42,6 +43,15 @@ TURN_CAP = "turn-cap"
 TOOL_CAP = "tool-cap"
 SILENT = "agent-said-nothing"
 
+#: The two ways a *provider* ends a run, as opposed to a model deciding to.
+#: They are named separately from `SILENT` and `FINISHED` because they look
+#: exactly like them from the outside and are not the agent's doing: a
+#: reasoning model bills its reasoning against `max_tokens`, so a budget that
+#: holds the answer can still be spent before the answer starts. Both are
+#: scored as harness errors, which is what they are.
+AGENT_TRUNCATED = "agent-truncated"
+RESPONDENT_FAILED = "respondent-failed"
+
 
 @dataclass
 class Event:
@@ -53,6 +63,11 @@ class Event:
     tool_calls: list[dict] = field(default_factory=list)
     name: str = ""
     is_error: bool = False
+    #: Agent turns only: the provider's own word for why generation stopped.
+    #: Recorded because an empty turn cannot otherwise be told apart from a
+    #: truncated one after the fact, and that is the distinction a red run
+    #: turns on.
+    finish_reason: str = ""
 
 
 @dataclass
@@ -70,6 +85,12 @@ class Trace:
     def questions(self) -> list[str]:
         """Everything the agent said *to the user*, asking or not."""
         return [e.text for e in self.events if e.role == "agent" and e.text]
+
+    @property
+    def answers(self) -> list[str]:
+        """Everything the respondent said back. Zero of these against a
+        non-empty :attr:`questions` is the shape of a broken respondent."""
+        return [e.text for e in self.events if e.role == "user"]
 
     @property
     def blocking_questions(self) -> list[str]:
@@ -152,6 +173,13 @@ class Trace:
                     lines.append(f"**agent** (turn {e.turn}) calls {calls}")
                 if e.text:
                     lines.append(f"**agent → user** (turn {e.turn}): {e.text}")
+                # Only when it is the surprising one: `stop`/`tool_calls` is
+                # every ordinary turn and would be noise on all of them.
+                if e.finish_reason in ("length", "max_tokens"):
+                    lines.append(
+                        f"_(turn {e.turn} cut off at the token budget: "
+                        f"finish_reason={e.finish_reason})_"
+                    )
             elif e.role == "tool":
                 flag = " *(error)*" if e.is_error else ""
                 body = e.text if len(e.text) < 1200 else e.text[:1200] + " …"
@@ -202,6 +230,7 @@ def converse(
                     {"id": c.id, "name": c.name, "arguments": c.arguments}
                     for c in step.tool_calls
                 ],
+                finish_reason=step.finish_reason,
             )
         )
 
@@ -247,12 +276,40 @@ def converse(
                 return trace
             continue
 
-        if not step.text.strip():
+        if step.is_empty:
             # Nothing said and nothing called: there is no next move to make.
-            trace.stopped = SILENT
+            # Whose doing that was is the provider's to say — a model with
+            # nothing left to say and a model cut off mid-reasoning produce
+            # the identical turn, and only one of them is about the skill.
+            if step.was_truncated:
+                trace.stopped = AGENT_TRUNCATED
+                trace.events.append(
+                    Event(
+                        turn=turn,
+                        role="harness",
+                        text=(
+                            "agent turn was cut off at the token budget, not "
+                            "finished: raise ToolCallingAgent.max_tokens"
+                        ),
+                        is_error=True,
+                    )
+                )
+            else:
+                trace.stopped = SILENT
             return trace
 
-        answer = respondent.reply(step.text)
+        try:
+            answer = respondent.reply(step.text)
+        except EmptyCompletion as failure:
+            # The respondent never answered. Ending here as FINISHED would
+            # report the agent as having handed off, which is the one reading
+            # this failure most resembles and the most expensive to believe.
+            trace.stopped = RESPONDENT_FAILED
+            trace.events.append(
+                Event(turn=turn, role="harness", text=str(failure), is_error=True)
+            )
+            return trace
+
         if answer.strip() == DONE:
             trace.stopped = FINISHED
             return trace

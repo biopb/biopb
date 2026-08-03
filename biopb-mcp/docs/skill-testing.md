@@ -377,10 +377,21 @@ indistinguishable from a square whose other corners died.
 reason — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`, `gave-up`,
 `no-result`, `unscorable-result`, `harness-error` — plus flags that change how to
 read it: `cut-off-but-scored`, `over-ask-budget(n)`, `never-asked`,
-`catalog-mismatch`. Ordering matters: a cap beats a bad number, so a run severed
-mid-workflow is not reported as a wrong answer. Every arm runs inside its own
-`try`, so a corner that dies becomes a row instead of an exception that destroys
-the other three.
+`asked-but-unanswered`, `catalog-mismatch`. Ordering matters: a cap beats a bad
+number, so a run severed mid-workflow is not reported as a wrong answer, and a
+*provider* failure beats everything, because it is not about the skill at all.
+Every arm runs inside its own `try`, so a corner that dies becomes a row instead
+of an exception that destroys the other three.
+
+**A budget failure is not a behaviour.** Both models bill their reasoning
+against `max_tokens`, so a budget that comfortably holds the answer can be spent
+before the answer starts — and what comes back is empty. On the respondent that
+looks like a hand-off, on the agent like a model with nothing left to say, and
+read either way it is scored against the skill. So the empty completion is never
+laundered into a reply: the backend raises, the loop stops as `respondent-failed`
+or `agent-truncated`, and both classify as `harness-error`. Every agent turn
+records the provider's own `finish_reason`, so the distinction survives into the
+transcript instead of having to be re-derived against a live endpoint.
 
 Two things *are* asserted, and neither judges a skill: that the report reached
 disk with a transcript per arm, and that the ablation took effect. The second is
