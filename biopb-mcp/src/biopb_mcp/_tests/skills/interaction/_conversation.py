@@ -266,6 +266,7 @@ def converse(
     )
     calls_made = 0
     idle_turns = 0
+    echo_key = ""
 
     for turn in range(max_turns):
         trace.turns_used = turn + 1
@@ -285,13 +286,29 @@ def converse(
             )
         )
 
+        # What this turn has to carry. **Every assistant message or none** —
+        # a history where some have the key and some do not is rejected, and
+        # the model does not think on every turn, so "echo what arrived" is
+        # not enough on its own. Measured against the gateway over five trials
+        # each: key omitted, 3/5 accepted; key present as "", 5/5; key present
+        # with a real value, 5/5. The empty string is as good as the real one,
+        # and the rejection is flaky rather than deterministic — which is why
+        # this looked like an intermittent bug for four rounds of guessing.
+        echo = dict(step.provider_fields)
+        if echo and not echo_key:
+            # First sight of the key: earlier turns predate it and would make
+            # the history mixed, so bring them up to it.
+            echo_key = next(iter(echo))
+            for earlier in messages:
+                if earlier.get("role") == "assistant" and echo_key not in earlier:
+                    earlier[echo_key] = ""
+        elif not echo and echo_key:
+            echo = {echo_key: ""}
+
         if step.tool_calls:
             messages.append(
                 {
-                    # Whatever the provider requires echoed — a reasoning
-                    # model's turn is not just text and tool calls, and
-                    # dropping the rest fails the *next* request, not this one.
-                    **step.provider_fields,
+                    **echo,
                     "role": "assistant",
                     "content": step.text or None,
                     "tool_calls": [
@@ -404,9 +421,7 @@ def converse(
             trace.stopped = FINISHED
             return trace
 
-        messages.append(
-            {**step.provider_fields, "role": "assistant", "content": step.text}
-        )
+        messages.append({**echo, "role": "assistant", "content": step.text})
         messages.append({"role": "user", "content": answer})
         trace.events.append(Event(turn=turn, role="user", text=answer))
 

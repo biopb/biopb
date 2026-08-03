@@ -689,3 +689,80 @@ def test_every_run_is_told_the_protocol():
 
     assert "Correct the drift." in assembled
     assert TASK_COMPLETE in assembled
+
+
+# --- keeping the history consistent for a reasoning provider ---------------
+
+
+def _sent_assistants(recorder):
+    return [m for m in recorder.sent if m.get("role") == "assistant"]
+
+
+class _Recorder(ScriptedAgent):
+    """A scripted agent that keeps the last message list it was handed."""
+
+    sent: list = []
+
+    def respond(self, messages, tools):
+        type(self).sent = [dict(m) for m in messages]
+        return super().respond(messages, tools)
+
+
+def test_a_turn_the_model_did_not_think_on_still_carries_the_key():
+    """The model does not reason on every turn, so "echo what arrived" leaves
+    holes — and a history where some assistant messages have the key and some
+    do not is rejected. Measured over five trials each: omitted 3/5 accepted,
+    empty string 5/5."""
+    agent = _Recorder(
+        turns=[
+            AgentTurn(
+                tool_calls=(ToolCall("a", "server_status", {}),),
+                provider_fields={"reasoning_content": "thinking"},
+            ),
+            AgentTurn(tool_calls=(ToolCall("b", "server_status", {}),)),
+            _calls("server_status"),
+        ]
+    )
+
+    converse(FakeSession(), agent, ScriptedRespondent([]), task="t", max_turns=3)
+
+    assistants = _sent_assistants(agent)
+    assert len(assistants) >= 2
+    assert all("reasoning_content" in m for m in assistants), (
+        "a turn without reasoning left a hole in the history"
+    )
+    assert assistants[-1]["reasoning_content"] == ""
+
+
+def test_turns_before_the_key_appeared_are_brought_up_to_it():
+    """The first turn may carry nothing and a later one may reason. That
+    leaves the history mixed in the other direction, which is rejected too."""
+    agent = _Recorder(
+        turns=[
+            AgentTurn(tool_calls=(ToolCall("a", "server_status", {}),)),
+            AgentTurn(
+                tool_calls=(ToolCall("b", "server_status", {}),),
+                provider_fields={"reasoning_content": "thinking"},
+            ),
+            _calls("server_status"),
+        ]
+    )
+
+    converse(FakeSession(), agent, ScriptedRespondent([]), task="t", max_turns=3)
+
+    assistants = _sent_assistants(agent)
+    assert all("reasoning_content" in m for m in assistants), (
+        "the turn that predated the key was left behind"
+    )
+
+
+def test_a_provider_that_never_reasons_is_left_alone():
+    """The backfill is keyed on the provider having shown the field. A plain
+    chat model must not start receiving one it never sent."""
+    agent = _Recorder(turns=[_calls("server_status"), _calls("server_status")])
+
+    converse(FakeSession(), agent, ScriptedRespondent([]), task="t", max_turns=2)
+
+    assistants = _sent_assistants(agent)
+    assert assistants
+    assert all(set(m) <= {"role", "content", "tool_calls"} for m in assistants)
