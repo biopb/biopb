@@ -43,6 +43,24 @@ TURN_CAP = "turn-cap"
 TOOL_CAP = "tool-cap"
 SILENT = "agent-said-nothing"
 
+#: What the agent says, alone on the last line, to declare the task finished.
+#:
+#: **Termination used to rest on somebody's judgement.** `SilentRespondent`
+#: could not end a run at all — it answers "I don't know" to a sign-off like
+#: everything else — and `ModelRespondent` ended one *wrongly*, reading "I've
+#: asked the key questions, I'll wait for their answers" as a hand-off. A
+#: declared sentinel takes the judgement out: the agent says when it is done,
+#: and every respondent behaves the same.
+TASK_COMPLETE = "__BIOPB_TASK_COMPLETE__"
+
+#: The protocol appended to every task, so a case cannot forget it.
+COMPLETION_PROTOCOL = f"""
+
+When the work is finished and the names above are bound, end your final
+message with {TASK_COMPLETE} alone on its own line. Write it only when you are
+done — not while describing what you are about to do.
+"""
+
 #: The two ways a *provider* ends a run, as opposed to a model deciding to.
 #: They are named separately from `SILENT` and `FINISHED` because they look
 #: exactly like them from the outside and are not the agent's doing: a
@@ -207,6 +225,23 @@ class Trace:
         return "\n".join(lines)
 
 
+def declares_done(text: str) -> bool:
+    """Whether *text* ends by declaring the task complete.
+
+    **Last line, exact match** — not "contains". An agent that mentions the
+    sentinel while describing the protocol ("I'll write ... when finished")
+    leaves other words on that line, so quoting it costs nothing. Requiring it
+    alone at the end makes an accidental ending take real effort.
+    """
+    lines = text.strip().splitlines()
+    return bool(lines) and lines[-1].strip() == TASK_COMPLETE
+
+
+def with_protocol(task: str) -> str:
+    """*task* plus the completion protocol every run is held to."""
+    return task.rstrip() + "\n" + COMPLETION_PROTOCOL
+
+
 def converse(
     session,
     agent: ChatAgent,
@@ -344,6 +379,13 @@ def converse(
                 )
             else:
                 trace.stopped = SILENT
+            return trace
+
+        # Before the respondent sees it: the agent declaring itself done is not
+        # a question, and routing it would only invite a judgement about
+        # whether it was one.
+        if declares_done(step.text):
+            trace.stopped = FINISHED
             return trace
 
         try:

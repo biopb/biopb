@@ -27,11 +27,13 @@ from ._conversation import (
     RESPONDENT_FAILED,
     SILENT,
     STALLED,
+    TASK_COMPLETE,
     TOOL_CAP,
     TURN_CAP,
     Trace,
     converse,
     scrape,
+    with_protocol,
 )
 from ._models import EmptyCompletion
 from ._respondent import DONE, ScriptedRespondent, SilentRespondent
@@ -619,3 +621,71 @@ def test_an_unknown_block_still_says_something():
     from ._session import describe_block
 
     assert describe_block(SimpleNamespace(type="resource")).strip()
+
+
+# --- declaring completion ---------------------------------------------------
+
+
+def test_the_agent_can_declare_itself_done():
+    """Termination used to rest on somebody's judgement: `SilentRespondent`
+    could not end a run at all, and `ModelRespondent` ended one wrongly."""
+    agent = ScriptedAgent([_says(f"Both names are bound.\n{TASK_COMPLETE}")])
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t")
+
+    assert trace.stopped == FINISHED
+
+
+def test_the_sentinel_is_not_routed_to_the_respondent():
+    """A declaration is not a question, and handing it over would only invite
+    a judgement about whether it was one."""
+    agent = ScriptedAgent([_says(f"Done.\n{TASK_COMPLETE}")])
+    respondent = ScriptedRespondent([])
+
+    converse(FakeSession(), agent, respondent, task="t")
+
+    assert respondent.heard == []
+
+
+def test_quoting_the_protocol_does_not_end_the_run():
+    """Last line, exact match — not "contains". An agent describing what it
+    will do later must not finish the run by mentioning the word."""
+    agent = ScriptedAgent(
+        [
+            _says(f"I'll write {TASK_COMPLETE} when the arrays are bound."),
+            _says(f"Now they are.\n{TASK_COMPLETE}"),
+        ]
+    )
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t")
+
+    assert trace.stopped == FINISHED
+    assert trace.turns_used == 2, "it ended on the declaration, not the mention"
+
+
+def test_a_working_turn_cannot_declare_completion():
+    """The sentinel is honoured on a turn that stopped to say so. A turn that
+    also called a tool is still working, whatever it wrote."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text=f"Binding them now.\n{TASK_COMPLETE}",
+                tool_calls=(ToolCall("i", "execute_code", {"code": "x=1"}),),
+            ),
+            _calls("server_status"),
+        ]
+    )
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=3)
+
+    assert trace.stopped != FINISHED
+    assert trace.tool_names == ["execute_code", "server_status"]
+
+
+def test_every_run_is_told_the_protocol():
+    """Appended by the harness rather than written into each case, so a new
+    case cannot forget it and then livelock."""
+    assembled = with_protocol("Correct the drift. Leave `offsets` bound.")
+
+    assert "Correct the drift." in assembled
+    assert TASK_COMPLETE in assembled

@@ -412,6 +412,18 @@ is now routed whether or not it acted; the ask budget still counts what it
 counted before. The mirror of the bug is guarded too: `DONE` in reply to a turn
 that also called tools means "not a question to me", never "we are finished".
 
+**The agent declares when it is done.** Termination used to rest on somebody's
+judgement, and both respondents got it wrong in opposite directions:
+`SilentRespondent` cannot end a run at all, and `ModelRespondent` ended one
+early by reading "I've asked the key questions, I'll wait for their answers" as
+a hand-off. The harness appends a completion protocol to every task — end the
+final message with `__BIOPB_TASK_COMPLETE__` alone on its own line — and the
+loop ends on that, before the respondent sees the turn. Honoured only on a
+tool-free turn and only as an exact final line, so quoting the protocol while
+describing it costs nothing. The respondent's `DONE` stays as a fallback and
+the stall guard as the backstop, because an agent that forgets the sentinel
+must still terminate.
+
 Two things *are* asserted, and neither judges a skill: that the report reached
 disk with a transcript per arm, and that the ablation took effect. The second is
 not a finding — if `skills_enabled: false` stopped withholding the catalog, the

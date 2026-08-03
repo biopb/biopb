@@ -63,6 +63,7 @@ from ._conversation import (
     TURN_CAP,
     converse,
     scrape,
+    with_protocol,
 )
 from ._fixture import (
     Attempt,
@@ -437,7 +438,7 @@ def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
             session,
             ToolCallingAgent(),
             _respondent_for(arm, case),
-            case.task,
+            with_protocol(case.task),
             max_turns=case.max_turns,
             max_tool_calls=case.max_tool_calls,
         )
