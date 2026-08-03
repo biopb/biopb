@@ -47,11 +47,18 @@ from .._respondent import Persona
 SKILL = "drift-correction"
 
 # Set from measurement, not from taste. Over six seeds of this construction, a
-# run told which channel is structural lands at 0.0001-0.0006 px RMS and a
-# residual ratio of 0.0001, while registering on brightness -- or averaging the
-# channels, which the Parameters table forbids by name -- lands at 1.9-5.3 px
-# and 0.29-0.56. These sit in the gap, and the narrowest margin is max error,
-# where the mildest failure still clears the limit by 2.6x.
+# run told which channel is structural lands at 0.003-0.010 px RMS and a
+# residual ratio of 0.0005-0.0016, while registering on brightness -- or
+# averaging the channels, which the Parameters table forbids by name -- lands at
+# 2.8-4.1 px and 0.35-0.54. These sit in the gap, and the narrowest margin is
+# the residual ratio, where the mildest failure still clears the limit by 3.5x.
+#
+# Measured with the skill's own recipe (StackReg TRANSLATION,
+# reference="previous"), which is also why the passing numbers are not at
+# machine precision: cropping a padded canvas means consecutive frames no longer
+# share identical content, so registration has real work to do. That costs an
+# order of magnitude of precision and buys a fixture with no fabricated pixels
+# in it.
 TOLERANCE = {
     "trajectory_rms_px": 0.5,
     "trajectory_max_err_px": 1.0,
@@ -72,6 +79,13 @@ SPREAD_VELOCITY_PX = 0.5
 STRUCTURAL_DIM = 0.35
 
 BACKGROUND = 100.0
+
+#: Canvas kept outside the field of view, on top of the largest offset, so that
+#: what drifts into frame is real sample rather than something the renderer
+#: invented. Covers the cubic-spline support of the shift and the reach of
+#: `_blobby_field`'s Gaussian at the canvas edge;
+#: `test_the_drifted_movie_invents_no_pixels` measures that it is enough.
+PAD_MARGIN = 16
 
 
 # --- the fixture -----------------------------------------------------------
@@ -111,11 +125,17 @@ def _trajectory(n_frames: int, per_frame_px: float, seed: int) -> np.ndarray:
 def _puncta(positions: np.ndarray, amplitudes: np.ndarray, shape, sigma=2.0):
     """Render point objects as Gaussian spots. Positions may be sub-pixel; they
     are rounded to the nearest sample, which is well below the tolerances here
-    and keeps the render cheap."""
+    and keeps the render cheap.
+
+    An object off the canvas is dropped, not clamped to the edge. Clamping piles
+    every escapee onto one border row, and since they all escape in the
+    direction of the motion, that pile-up is a picture of the trajectory.
+    """
     img = np.zeros(shape, dtype=np.float32)
-    yy = np.clip(np.round(positions[:, 0]).astype(int), 0, shape[0] - 1)
-    xx = np.clip(np.round(positions[:, 1]).astype(int), 0, shape[1] - 1)
-    np.add.at(img, (yy, xx), amplitudes)
+    yy = np.round(positions[:, 0]).astype(int)
+    xx = np.round(positions[:, 1]).astype(int)
+    inside = (yy >= 0) & (yy < shape[0]) & (xx >= 0) & (xx < shape[1])
+    np.add.at(img, (yy[inside], xx[inside]), amplitudes[inside])
     return ndimage.gaussian_filter(img, sigma)
 
 
@@ -126,12 +146,22 @@ class AmbiguousChannels:
     `ndimage.shift(base, (dy, dx))` puts a feature at ``(y, x)`` in `base` at
     ``(y + dy, x + dx)``, so ``offsets[t]`` is the displacement of frame *t*
     relative to frame 0 — the same sense and sign the task asks for.
+
+    Both channels are rendered on a canvas larger than `shape` and cropped to a
+    fixed window in the middle of it, because a moving stage does not create
+    pixels: it reveals sample that was outside the field of view. Shifting a
+    frame-sized image instead leaves a border of pixels the renderer invented,
+    and their width is the shift — the trajectory, legible without registering
+    anything, and a band of flat correlated structure sitting in the data the
+    run *does* register on. See `test_the_drifted_movie_invents_no_pixels`.
     """
 
     case_id: str = "two-channels-one-structural"
     per_frame_px: float = 1.7
     n_frames: int = 24
     n_objects: int = 60
+    #: The field of view, not the canvas — objects are drawn at this density
+    #: over the whole padded canvas so the count in frame stays about `n_objects`.
     shape: tuple[int, int] = (192, 192)
     seed: int = 0
 
@@ -139,25 +169,32 @@ class AmbiguousChannels:
         rng = np.random.default_rng(self.seed + 100)
         offsets = _trajectory(self.n_frames, self.per_frame_px, self.seed + 1)
 
+        pad = int(np.ceil(np.abs(offsets).max())) + PAD_MARGIN
+        canvas = (self.shape[0] + 2 * pad, self.shape[1] + 2 * pad)
+        window = (slice(pad, pad + self.shape[0]), slice(pad, pad + self.shape[1]))
+
         # Channel 1 -- the structural one. A pure shift of one image, so its
         # un-drifted state is ground truth to machine precision.
-        stable = _blobby_field(self.seed, self.shape)
-        stable = (stable - BACKGROUND) * STRUCTURAL_DIM + BACKGROUND
+        field = _blobby_field(self.seed, canvas)
+        field = (field - BACKGROUND) * STRUCTURAL_DIM + BACKGROUND
         structural = np.array(
-            [ndimage.shift(stable, o, order=3, mode="nearest") for o in offsets]
+            [ndimage.shift(field, o, order=3, mode="nearest")[window] for o in offsets]
         )
+        stable = field[window]
 
-        # Channel 0 -- bright objects that both ride the stage and move.
-        start = rng.uniform(10, min(self.shape) - 10, size=(self.n_objects, 2))
-        amplitudes = rng.uniform(4000.0, 9000.0, size=self.n_objects)
+        # Channel 0 -- bright objects that both ride the stage and move. Drawn
+        # across the whole canvas, so objects leaving the frame are replaced by
+        # others arriving from outside it rather than by empty background.
+        n_objects = int(round(self.n_objects * np.prod(canvas) / np.prod(self.shape)))
+        start = rng.uniform(0.0, 1.0, size=(n_objects, 2)) * np.asarray(canvas, float)
+        amplitudes = rng.uniform(4000.0, 9000.0, size=n_objects)
         heading = rng.uniform(0.0, 2.0 * np.pi)
         common = COMMON_VELOCITY_PX * np.array([np.sin(heading), np.cos(heading)])
-        velocity = common + rng.normal(
-            0.0, SPREAD_VELOCITY_PX, size=(self.n_objects, 2)
-        )
+        velocity = common + rng.normal(0.0, SPREAD_VELOCITY_PX, size=(n_objects, 2))
         reporter = np.array(
             [
-                _puncta(start + velocity * t + o, amplitudes, self.shape) + BACKGROUND
+                _puncta(start + velocity * t + o, amplitudes, canvas)[window]
+                + BACKGROUND
                 for t, o in enumerate(offsets)
             ]
         )
