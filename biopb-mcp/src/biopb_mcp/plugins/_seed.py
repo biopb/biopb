@@ -1,8 +1,9 @@
 """Seed biopb-mcp's built-in example kernel plugins into the user's plugin dir (#92).
 
 The installer runs this (``biopb-mcp-seed-plugins``) so the bundled plugins —
-``rolling_ball.py``, ``segmentation_qc.py``, plus the namespace ``__init__.py``
-doc — land in ``~/.config/biopb/kernel/``. Delivering them as **files there**, rather
+``rolling_ball.py``, ``segmentation_qc.py``, ``chunked_label.py``, plus the
+namespace ``__init__.py`` doc — land in ``~/.config/biopb/kernel/``. Delivering
+them as **files there**, rather
 than only as an installed module, makes them visible/editable to the user and loads
 them from a path, which is robust to the kernel interpreter's entry-point metadata
 view (the ``python3`` kernelspec need not be the biopb-mcp tool env).
@@ -22,8 +23,14 @@ from pathlib import Path
 # Files bundled in this package that the installer seeds into the kernel dir.
 # __init__.py documents the dir (the loader skips it — leading underscore);
 # rolling_ball.py is the worked example plugin; segmentation_qc.py backs the
-# segmentation-qc-metrics skill, whose body carries the call signature only.
-SEED_FILES = ("__init__.py", "rolling_ball.py", "segmentation_qc.py")
+# segmentation-qc-metrics skill, whose body carries the call signature only;
+# chunked_label.py is connected components across dask chunk boundaries.
+SEED_FILES = (
+    "__init__.py",
+    "rolling_ball.py",
+    "segmentation_qc.py",
+    "chunked_label.py",
+)
 
 
 def seed_kernel_plugins(dest: Path | str | None = None) -> list[tuple[str, str]]:
