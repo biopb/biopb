@@ -495,7 +495,65 @@ Cross-*family* coverage beats cross-*size*: blind spots correlate within a
 family. Use a weak model to ask "is this necessary" and the strongest available
 to ask "is this redundant or over-constraining".
 
-## 7. Running it
+§7 is its companion and asks the complementary question — not *is this content
+necessary* but *is it true*. Both run at authoring time, both produce evidence
+for the PR rather than a green tick, and a body that has had neither is a claim
+nobody has tested.
+
+## 7. Reference implementation — the other authoring tool, also not a test
+
+**A skill body containing a formula is code**, and no layer above runs it.
+Structure checks the frontmatter, retrieval checks the description,
+satisfiability and availability check the dependencies, and §4 checks *someone
+else's* signatures — every one of them looks past the arithmetic the body is
+asking an agent to reproduce. That gap is not closed by a test; it is closed by
+the authoring process, and this is the rule.
+
+**Before writing a line of the prose, implement the method and measure it
+against a fixture with a known answer.** Not afterwards, as a check on what you
+wrote: the measurement is what decides what the prose *says*. `flatfield` is the
+worked example, and it inverted two of the author's priors — a smoothed median
+turned out to be the weakest of the candidates, and the camera offset turned out
+to dominate every estimator choice by an order of magnitude, which is why the
+body spends a blocking checkpoint on asking for it.
+
+The cost of skipping it is on the record. `flatfield-and-stitch-tiles` shipped a
+`smoothed-median` fallback that nothing had ever executed; it took a bake-off
+written weeks later (biopb#668) to establish it was several times off the
+achievable error, by which point the skill had been dropped for an unrelated
+reason and the fallback had been in strangers' agents for a release.
+
+Four rules:
+
+- **Quote measured numbers, never plausible ones.** A body that says "this is
+  more accurate" is unfalsifiable and ages into folklore. One that says "0.5%
+  against 1.8%" can be checked, argued with, and found wrong.
+- **State the regime.** Every number is conditional on a construction — how many
+  frames, what the specimen was doing, how strong the effect was. `flatfield`'s
+  hold for a dim acquisition and a low-order field, and say so, because the same
+  method on a bright one would make its own headline claim uninteresting.
+- **Assert the limits too, not just the capability.** The most useful thing
+  `flatfield`'s measurement produced was a negative: the residual-spread check
+  every author reaches for does not discriminate a good field from one four
+  times worse. That became a warning in step 5 rather than a metric.
+- **Cite it in the PR.** Paste the script and its output into the issue or the
+  PR body, where it lives as long as the repo does. A gist has its own lifetime
+  and owner, and the link rots independently of the thing it justifies.
+
+**It stays out of the suite deliberately.** Executing prose needs an opt-in
+fence, a per-skill checker and a threshold to maintain, and it would gate on a
+number whose right value is a judgment call — real cost, carried on every CI run,
+against a failure mode that is caught once, at authoring time, by the person who
+already has to do the measurement. Keeping the gating layers cheap and
+deterministic is what keeps them trusted (§1).
+
+**Where the fixture ends up.** If the skill also gets a benchmark case, put the
+generator in `interaction/cases/<skill>.py` and let the same construction back
+both, so a number quoted in the body and a tolerance set in the case mean the
+same thing. `flatfield`'s does. If it gets no case, the measurement script has
+done its job in the PR and does not need a home in the tree.
+
+## 8. Running it
 
 ```sh
 # everything that gates, and every hermetic check (~1.5 s)
@@ -532,3 +590,8 @@ the directory and applies every rule. It will ask for: a `checklist:` token insi
 the vocabulary, a `[[link]]` that resolves, a one-sentence description, a
 phrasing-table entry (§3), a contract test for any third-party package (§4d), and
 either a benchmark case or a `NOT_BENCHMARKED` reason (§5e).
+
+What it *cannot* ask for is the part that has to happen before the file exists:
+if the body states a method, §7 says measure it first and cite the measurement
+in the PR. Nothing goes red when that is skipped, which is exactly why it is
+written down here and why a reviewer should ask for it.
