@@ -318,6 +318,34 @@ class TextBackend(Protocol):
     ) -> str: ...
 
 
+def reachable(backend: TextBackend) -> str:
+    """Why *backend* cannot be used at all, or ``""``.
+
+    **A model name that the endpoint does not serve is an environment fault,
+    and it should cost one skip rather than four dead arms.** `why_unavailable`
+    only knows whether a *key* is present; it cannot know that
+    `BIOPB_SKILL_AGENT` names something this gateway retired, or that a shell
+    export is quietly beating the dotenv — and both of those spend every arm
+    before saying so, each one failing identically for a reason that has
+    nothing to do with the skill.
+
+    One negligible completion answers it. An :class:`EmptyCompletion` counts as
+    *reachable*: the model answered, and having spent its budget on reasoning
+    is a different problem from not existing.
+    """
+    try:
+        backend.complete(
+            system="Reply with the single word: ok",
+            messages=[{"role": "user", "content": "ok"}],
+            max_tokens=16,
+        )
+    except EmptyCompletion:
+        return ""
+    except Exception as exc:  # noqa: BLE001 - any failure here is disqualifying
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
 @dataclass
 class OpenAICompatText:
     """Any OpenAI-compatible endpoint: OpenAI, Gemini, DeepSeek, Ollama, vLLM."""

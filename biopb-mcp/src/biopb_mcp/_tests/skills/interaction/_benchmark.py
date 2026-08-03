@@ -72,7 +72,7 @@ from ._fixture import (
     curated_for,
     write_report,
 )
-from ._models import agent_choice, respondent_choice, setting
+from ._models import agent_choice, reachable, respondent_choice, setting, text_backend
 from ._respondent import Persona, SilentRespondent, model_respondent
 from ._session import SessionUnavailable, live_session
 
@@ -660,4 +660,16 @@ def unavailable(case: Case) -> str:
             f"the agent is {agent_choice().name}, from the family that wrote these "
             "skills — it could pass by recognising its own prose (§5a)."
         )
+    # Last, because it is the only one that costs a request: a model the
+    # endpoint does not serve fails every arm identically, and a shell export
+    # beating the dotenv is the ordinary way to arrive there.
+    for side, choice in (
+        ("agent", agent_choice()),
+        ("respondent", respondent_choice()),
+    ):
+        if why := reachable(text_backend(choice)):
+            return (
+                f"{side} {choice.name} at {choice.base_url or 'the provider default'} "
+                f"is not usable: {why}"
+            )
     return ""

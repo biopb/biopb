@@ -26,6 +26,7 @@ from ._models import (
     OpenAICompatText,
     agent_choice,
     parse_choice,
+    reachable,
     read_env_file,
     reload_env_file,
     respondent_choice,
@@ -333,3 +334,38 @@ def test_a_real_answer_still_comes_back_as_text(monkeypatch, reason):
         )
         == "Channel 1."
     )
+
+
+# --- reachability ----------------------------------------------------------
+
+
+def test_a_model_the_endpoint_does_not_serve_is_reported_not_spent(monkeypatch):
+    """Four arms failing identically on a 401 is an environment fault wearing
+    four skill-shaped rows. One negligible request answers it first."""
+    module = types.ModuleType("openai")
+
+    class _Boom:
+        def create(self, **kwargs):
+            raise RuntimeError("Model GLM-5.1 is not supported")
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=_Boom())
+
+    module.OpenAI = _OpenAI
+    monkeypatch.setitem(sys.modules, "openai", module)
+
+    why = reachable(OpenAICompatText(parse_choice("openai:GLM-5.1")))
+    assert "GLM-5.1" in why and "RuntimeError" in why
+
+
+def test_a_model_that_answers_is_reachable(monkeypatch):
+    _fake_openai(monkeypatch, content="ok", finish_reason="stop")
+    assert reachable(OpenAICompatText(parse_choice("openai:m"))) == ""
+
+
+def test_spending_the_whole_budget_on_reasoning_is_not_unreachable(monkeypatch):
+    """It answered. Having nothing left to say it with is a different fault,
+    and skipping the run for it would hide the one this layer measures."""
+    _fake_openai(monkeypatch, content="", finish_reason="length")
+    assert reachable(OpenAICompatText(parse_choice("openai:m"))) == ""
