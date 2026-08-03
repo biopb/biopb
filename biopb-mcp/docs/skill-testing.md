@@ -393,6 +393,17 @@ or `agent-truncated`, and both classify as `harness-error`. Every agent turn
 records the provider's own `finish_reason`, so the distinction survives into the
 transcript instead of having to be re-derived against a live endpoint.
 
+**A reasoning turn is not just text and tool calls.** Some providers return the
+reasoning alongside them and reject the *next* request if the history is
+inconsistent about it — every assistant message carries the field or none does.
+The model does not reason on every turn, so echoing what arrived leaves holes.
+Both sides that hold history (the loop's `messages`, and `ModelRespondent`'s
+own) carry it, backfilling turns that predate the provider's first use of the
+key; a provider that never sends the field never starts receiving one. The
+check is flaky rather than deterministic, so a short conversation can pass by
+luck: measured at 3/5 accepted with the key omitted against 5/5 with it
+present.
+
 **A conversation that stops progressing is ended.** `SilentRespondent` answers "I
 don't know" to everything — including a sign-off — so it can never end a run:
 an agent that finishes and says so is met with a non-answer and says so again,
