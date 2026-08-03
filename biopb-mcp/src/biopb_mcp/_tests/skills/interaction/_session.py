@@ -56,6 +56,105 @@ from typing import Any
 
 import numpy as np
 
+#: Env the tripwire reads in the child: where to write, and what to watch.
+ENV_GUARD_LOG = "BIOPB_SKILL_GUARD_LOG"
+ENV_GUARD_MARKERS = "BIOPB_SKILL_GUARD_MARKERS"
+
+#: Installed into every child process of a run, as `sitecustomize` on its
+#: `PYTHONPATH`. Records — never blocks — reads of anything the harness owns.
+#:
+#: `execute_code` is arbitrary Python by design, so a run can open the fixture
+#: that defines its own answer (`truth["structural_channel"]`, the trajectory,
+#: the tolerances, the persona's facts) or the skill markdown an ablated arm is
+#: supposed to lack. Both have happened: a measured `skill+asked` arm reached
+#: its procedure by walking the installed package and opening
+#: `mcp/_skills_data/drift-correction.md`.
+#:
+#: Recording rather than refusing, on purpose. The agent is curious, not
+#: adversarial, and it says what it did in the trace; what the layer actually
+#: needs is for a compromised run to be *loud* instead of scoring like a good
+#: one. Refusing would also change the environment under test, which §5
+#: forbids — "disclose the environment, withhold only the skill" — and would
+#: break the session child's own legitimate reads of `_skills_data`. Judgement
+#: about which reads matter belongs in the parent, where it is testable, so the
+#: hook stays a dumb recorder and writes down who was asking.
+_TRIPWIRE = '''\
+"""Benchmark tripwire — records reads of harness-owned paths. Not security."""
+
+import json
+import os
+import sys
+
+_MARKERS = tuple(
+    m for m in os.environ.get({markers!r}, "").split(os.pathsep) if m
+)
+_LOG = os.environ.get({log!r}, "")
+_busy = False
+
+
+def _watch(event, args):
+    global _busy
+    if _busy or event not in ("open", "os.listdir", "os.scandir"):
+        return
+    target = args[0] if args else None
+    if not isinstance(target, (str, bytes, os.PathLike)):
+        return
+    try:
+        path = os.path.abspath(os.fsdecode(target))
+    except Exception:
+        return
+    if not any(m in path for m in _MARKERS):
+        return
+    _busy = True
+    try:
+        # Which process was asking is the whole discrimination: the session
+        # child reads `_skills_data` to serve `skill://`, and that is the
+        # system working. The kernel is where agent code runs.
+        with open(_LOG, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {{
+                        "pid": os.getpid(),
+                        "event": event,
+                        "path": path,
+                        "in_kernel": "ipykernel" in sys.modules,
+                    }}
+                )
+                + "\\n"
+            )
+    except Exception:
+        pass
+    finally:
+        _busy = False
+
+
+if _MARKERS and _LOG:
+    sys.addaudithook(_watch)
+'''
+
+
+def guard_markers() -> list[str]:
+    """What a run must not read: the harness's own tree, and the shipped skill
+    bodies.
+
+    `_tests/` holds every case's `truth`, its tolerances and its persona — read
+    it and any arm passes, with nothing in the result to say so. `_skills_data`
+    is narrower: legitimate for the session child to read, and the ablation's
+    undoing if the *kernel* reads it.
+
+    Path *fragments*, not absolute roots, because the parent and the child need
+    not resolve `biopb_mcp` to the same tree — an editable install re-points it
+    through its own finder, and under a git worktree the two diverge outright.
+    Rooted at the package directory rather than a bare name, so this says
+    "biopb_mcp's tests", not "any directory called `_tests`".
+    """
+    sep = os.sep
+    return [
+        f"{sep}biopb_mcp{sep}_tests{sep}",
+        f"{sep}biopb_mcp{sep}mcp{sep}_skills_data{sep}",
+    ]
+
+
 #: How long bring-up may take. The kernel imports napari and spins dask, which
 #: is seconds on a warm machine and much worse on a cold one.
 SPAWN_TIMEOUT = 120.0
@@ -239,8 +338,14 @@ class LiveSession:
     scratch: Path
     #: Whether the curated catalog was offered at all (the ablation arm).
     skills_enabled: bool
-    _loop: _LoopThread
-    _session: Any
+    #: Where the tripwire writes. Absent until something is recorded.
+    guard_log: Path = Path()
+    #: The session child's own pid. It reads `_skills_data` to serve
+    #: `skill://`, which is the system working, so `peeked` needs to tell that
+    #: process apart from the kernel underneath it.
+    child_pid: int | None = None
+    _loop: _LoopThread = None  # type: ignore[assignment]
+    _session: Any = None
     _turn: int = 0
     calls: list[tuple[int, str, dict]] = field(default_factory=list)
 
@@ -305,6 +410,33 @@ class LiveSession:
             for t in templates.resourceTemplates
         ]
         return "\n".join(lines) or "This server exposes no resources."
+
+    def peeked(self) -> list[dict]:
+        """Harness-owned files this run read that it had no business reading.
+
+        Serving `skill://` means the *session child* opens `_skills_data`, and
+        `load_catalog` scans the whole directory — the system working. The
+        kernel is where agent code runs, so the discriminator is the process,
+        and it is applied here rather than in the hook: the recorder stays dumb
+        and the judgement stays somewhere a test can reach it.
+
+        Not `"ipykernel" in sys.modules`, which reads true in the session child
+        as well and quietly classified every catalog scan as a peek.
+        """
+        if not self.guard_log.exists():
+            return []
+        out = []
+        for line in self.guard_log.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            serving = entry.get(
+                "pid"
+            ) == self.child_pid and "_skills_data" in entry.get("path", "")
+            if not serving:
+                out.append(entry)
+        return out
 
     def read_resource(self, uri: str) -> str:
         from pydantic import AnyUrl
@@ -444,11 +576,34 @@ def live_session(
 
     saved = {
         k: os.environ.get(k)
-        for k in ("XDG_CONFIG_HOME", "BIOPB_TENSOR_URL", "QT_QPA_PLATFORM")
+        for k in (
+            "XDG_CONFIG_HOME",
+            "BIOPB_TENSOR_URL",
+            "QT_QPA_PLATFORM",
+            "PYTHONPATH",
+            ENV_GUARD_LOG,
+            ENV_GUARD_MARKERS,
+        )
     }
     os.environ["XDG_CONFIG_HOME"] = str(scratch / "config")
     os.environ["BIOPB_TENSOR_URL"] = UNREACHABLE_TENSOR_URL
     os.environ.pop("QT_QPA_PLATFORM", None)  # a real GL platform, not offscreen
+
+    # The tripwire, inherited by the session child and its kernel. `sitecustomize`
+    # is imported by `site` from anywhere on the path, which is what lets this
+    # reach both processes without the product knowing it exists. Caveat: it
+    # shadows any other `sitecustomize` on the way — none in this venv, and a
+    # benchmark run is not a general-purpose environment.
+    guard_log = scratch / "guard.jsonl"
+    (scratch / "sitecustomize.py").write_text(
+        _TRIPWIRE.format(markers=ENV_GUARD_MARKERS, log=ENV_GUARD_LOG),
+        encoding="utf-8",
+    )
+    os.environ[ENV_GUARD_LOG] = str(guard_log)
+    os.environ[ENV_GUARD_MARKERS] = os.pathsep.join(guard_markers())
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [str(scratch), *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else [])]
+    )
 
     child = session_id = loop = None
     stop = None
@@ -465,6 +620,8 @@ def live_session(
             tools=tools,
             scratch=scratch,
             skills_enabled=skills_enabled,
+            guard_log=guard_log,
+            child_pid=child.pid,
             _loop=loop,
             _session=session,
         )

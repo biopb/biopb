@@ -151,6 +151,39 @@ def test_the_ablation_survives_the_new_verb():
         pytest.skip(str(exc))
 
 
+def test_reading_the_answer_key_does_not_go_unrecorded(session):
+    """`execute_code` is arbitrary Python, so a run *can* open the fixture that
+    defines its own answer. Nothing stops it and nothing should — but a run that
+    did it must not score like one that did not.
+
+    This is the exact route a measured `skill+asked` arm took to its procedure:
+    `os.path.dirname(biopb_mcp.__file__)`, then open what it found.
+    """
+    before = len(session.peeked())
+    case = (
+        "from biopb_mcp._tests.skills.interaction.cases import drift_correction as d\n"
+        "print(open(d.__file__).read()[:40])"
+    )
+    assert not session.call("execute_code", python_code=case).is_error
+
+    peeked = session.peeked()
+    assert len(peeked) > before, "the fixture was read and nothing recorded it"
+    assert any("drift_correction" in e["path"] for e in peeked), peeked[-3:]
+    assert all(e["pid"] != session.child_pid for e in peeked), (
+        "agent code runs in the kernel, not the session child"
+    )
+
+
+def test_the_session_serving_a_skill_is_not_mistaken_for_peeking(session):
+    """The other half, and the one that decides whether this is usable: reading
+    `_skills_data` is how `skill://` is served. If that counted, every skill arm
+    would flag itself and the signal would be worth nothing."""
+    session.call("read_resource", uri="skill://drift-correction")
+    assert not [e for e in session.peeked() if "_skills_data" in e["path"]], (
+        "serving a skill body registered as the agent peeking at it"
+    )
+
+
 def test_the_viewer_is_real(session):
     """A working viewer is what §5 scores against; on a display-less box the
     launcher's own Xvfb provides it. `QT_QPA_PLATFORM=offscreen` is not a

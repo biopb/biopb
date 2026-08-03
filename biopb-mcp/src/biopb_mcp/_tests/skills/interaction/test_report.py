@@ -31,6 +31,7 @@ from ._benchmark import (
     FLAG_CUT_OFF,
     FLAG_NEVER_ASKED,
     FLAG_OVER_BUDGET,
+    FLAG_PEEKED,
     FLAG_UNANSWERED,
     GAVE_UP,
     HARNESS_ERROR,
@@ -202,6 +203,31 @@ def test_the_catalog_flag_fires_in_both_directions():
 
     offered_but_absent = result(arm=ARMS[0], outcome=scored(0.1), catalog_hits=0)
     assert FLAG_CATALOG_MISMATCH in offered_but_absent.flags()
+
+
+def test_a_run_that_read_the_answer_key_says_so_on_its_own_row():
+    """`execute_code` is arbitrary Python, so this is a thing that *can* happen
+    and the layer's whole defence is that it cannot happen quietly. The number
+    still gets computed — suppressing it would hide what was read — but the row
+    carries the flag and the count."""
+    peeked = result(
+        arm=ARMS[0],
+        outcome=scored(0.0001),
+        peeked=("/x/biopb_mcp/_tests/skills/interaction/cases/drift_correction.py",),
+    )
+    assert any(f.startswith(FLAG_PEEKED) for f in peeked.flags()), peeked.flags()
+    assert "(1)" in next(f for f in peeked.flags() if f.startswith(FLAG_PEEKED))
+
+    clean = result(arm=ARMS[0], outcome=scored(0.0001))
+    assert not any(f.startswith(FLAG_PEEKED) for f in clean.flags())
+
+
+def test_an_arm_that_peeked_and_then_died_still_reports_it():
+    """The flag is raised before the `no trace` guard: a run can read the
+    fixture and then fall over, and that is exactly when the reason for a
+    strange number matters most."""
+    dead = Result(arm=ARMS[0], error="Boom", peeked=("/x/biopb_mcp/_tests/a.py",))
+    assert any(f.startswith(FLAG_PEEKED) for f in dead.flags())
 
 
 def test_the_catalog_is_counted_from_what_the_tool_returned():

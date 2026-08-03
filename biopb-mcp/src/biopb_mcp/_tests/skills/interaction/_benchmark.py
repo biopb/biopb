@@ -115,6 +115,13 @@ FLAG_UNANSWERED = "asked-but-unanswered"
 #: Distinct from `cut-off-but-scored`: a stalled run was not severed mid-workflow,
 #: it was talking in circles — usually because the respondent could not end it.
 FLAG_STALLED = "stalled"
+#: The kernel read something the harness owns — a case's `truth`, or the skill
+#: markdown an ablated arm is meant to lack. Unlike every other flag here, this
+#: one says the *number* is void rather than qualified: a run that read its own
+#: answer key did not measure the skill, and no amount of context makes its row
+#: comparable. `execute_code` is arbitrary Python and always will be, so the
+#: layer's defence is that this cannot happen quietly (`_session` tripwire).
+FLAG_PEEKED = "read-harness-internals"
 
 #: A missing session is worth telling apart from any other harness failure: it
 #: means the machine, not the run.
@@ -292,6 +299,8 @@ class Result:
     seconds: float = 0.0
     #: Set when the arm could not be run to completion at all.
     error: str = ""
+    #: Harness-owned paths the kernel opened, from `LiveSession.peeked()`.
+    peeked: tuple[str, ...] = ()
 
     @property
     def metrics(self) -> dict[str, float | None]:
@@ -348,6 +357,10 @@ class Result:
 
     def flags(self, budget: int = BLOCKING_BUDGET) -> list[str]:
         out = []
+        # Before the `trace is None` guard: an arm that read the answer key and
+        # then died still has to say so.
+        if self.peeked:
+            out.append(f"{FLAG_PEEKED}({len(self.peeked)})")
         if self.trace is None:
             return out
         asked = len(self.trace.blocking_questions)
@@ -448,6 +461,9 @@ def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
         )
         trace.write(where_for(case) / arm.name)
         scraped = scrape(session, trace, dict(case.collect))
+        # After the scrape, so the harness's own reads of the kernel are not
+        # what gets reported, and inside the session — the log dies with it.
+        peeked = tuple(dict.fromkeys(e["path"] for e in session.peeked()))
 
     attempt = Attempt(
         subject=arm.name,
@@ -458,7 +474,13 @@ def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
     write_report(outcome, where_for(case))
     if case.save_artifacts is not None:
         case.save_artifacts(outcome, where_for(case) / arm.name)
-    return Result(arm=arm, trace=trace, outcome=outcome, catalog_hits=catalog_hits)
+    return Result(
+        arm=arm,
+        trace=trace,
+        outcome=outcome,
+        catalog_hits=catalog_hits,
+        peeked=peeked,
+    )
 
 
 @dataclass
