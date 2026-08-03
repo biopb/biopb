@@ -257,7 +257,7 @@ def converse(
     that crashed a tool on every turn, still produces the record. Scoring is
     somebody else's job, and it happens after.
     """
-    tools = to_function_tools(session.tools)
+    tools = to_function_tools(session.agent_tools)
     messages: list[dict] = [{"role": "user", "content": task}]
     trace = Trace(
         agent=getattr(agent, "name", type(agent).__name__),

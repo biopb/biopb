@@ -10,6 +10,16 @@ that go out are **the server's own**, not a restatement of them. If
 `execute_code` renames a parameter, an agent driven through here starts getting
 it wrong, which is the point of running against a real session at all.
 
+"Not an MCP client" is a claim about the **wire**, and reading it as a claim
+about *capability* is what cost the benchmark a measurement. An MCP server also
+exposes **resources** — `skill://<id>`, `guide://<name>` — and a resource has no
+function-calling equivalent, so translating tools alone handed the agent uris it
+had no verb to dereference: the skill *body* was unreachable, and the arms that
+were supposed to have the procedure were running on catalog metadata.
+:data:`._session.CLIENT_TOOLS` supplies the two verbs every shipped client
+already has. They arrive here as ordinary `ToolSpec`s and translate like the
+rest.
+
 The one liberty taken is dropping keys some providers reject in a function
 parameter schema (`$schema`, `title` at the root). That is a transport
 accommodation, not an edit to the contract — :func:`to_function_tools` keeps

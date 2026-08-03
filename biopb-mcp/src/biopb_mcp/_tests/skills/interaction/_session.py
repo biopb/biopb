@@ -148,6 +148,62 @@ class ToolSpec:
     input_schema: dict
 
 
+#: What the **client** contributes, on top of the nine tools the server
+#: advertises. Not `@mcp.tool()`s, and deliberately not: they are the harness
+#: standing in for a capability every shipped MCP client already has.
+#:
+#: A skill body and a `guide://` page are MCP **resources**, and a resource is
+#: not a tool. `find_skills` returns metadata plus a `uri`, the handshake
+#: instructions say to read that uri, and `_bridge` translates *tools* onto a
+#: chat-completions API — so before this existed the agent was handed a pointer
+#: it had no verb to dereference. Measured on the 2026-08-03 sweep, that cost
+#: the benchmark its independent variable: `skill+silent` reached for
+#: `pystackreg` because the catalog *metadata* named it in `checklist:`, having
+#: never read a line of the procedure, and `skill+asked` got the body only by
+#: walking the installed package directory. A broken or empty skill body would
+#: have scored the same.
+#:
+#: The ablation still holds through here, and is not re-implemented: the
+#: `skill://` resource resolves through `load_catalog()`, which returns `[]`
+#: when `services.skills_enabled` is off, so a `noskill` arm that reads the uri
+#: gets "No skill '<id>' in the catalog" — the server's own answer, not one the
+#: harness invented.
+CLIENT_TOOLS: tuple[ToolSpec, ...] = (
+    ToolSpec(
+        name="list_resources",
+        description=(
+            "List the MCP resources this server exposes, including URI "
+            "templates. Resources carry reference material rather than "
+            "actions: the `guide://` pages and the full body of each "
+            "curated skill."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="read_resource",
+        description=(
+            "Read one MCP resource and return its text. `uri` is a full "
+            "resource URI — for example `skill://drift-correction` (the `uri` "
+            "field of a `find_skills` result, whose body holds the actual "
+            "step-by-step workflow) or `guide://kernel`."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "e.g. skill://<id> or guide://<name>",
+                }
+            },
+            "required": ["uri"],
+        },
+    ),
+)
+
+#: Names in :data:`CLIENT_TOOLS`, for dispatch.
+CLIENT_TOOL_NAMES = frozenset(t.name for t in CLIENT_TOOLS)
+
+
 class _LoopThread:
     """An event loop on its own thread, so sync test code can drive an async
     MCP session that must stay open across many calls."""
@@ -190,18 +246,65 @@ class LiveSession:
 
     # --- the agent-visible surface -----------------------------------------
 
+    @property
+    def agent_tools(self) -> list[ToolSpec]:
+        """Everything the agent can actually do: the server's tools plus the
+        client's resource verbs.
+
+        Kept distinct from `tools` — which stays the server's own
+        advertisement — because conflating the two is the bug this exists to
+        fix. What a server offers and what an agent can reach are different
+        lists, and the gap between them was invisible while only one was named.
+        """
+        return [*self.tools, *CLIENT_TOOLS]
+
     def call(self, name: str, /, **arguments: Any) -> ToolResult:
         """Call a tool exactly as an agent would, and record that it happened.
 
         The record is what answers "did it ask before it spent": which tool,
-        with what, and at which conversational turn.
+        with what, and at which conversational turn — so a client-side call is
+        recorded here too, on the same footing as a server one.
         """
         self.calls.append((self._turn, name, dict(arguments)))
+        if name in CLIENT_TOOL_NAMES:
+            return self._call_client_tool(name, arguments)
         result = self._loop.submit(
             self._session.call_tool(name, arguments), CALL_TIMEOUT
         )
         text = "\n".join(describe_block(block) for block in result.content)
         return ToolResult(name=name, text=text, is_error=bool(result.isError))
+
+    def _call_client_tool(self, name: str, arguments: dict) -> ToolResult:
+        """Serve one of :data:`CLIENT_TOOLS`.
+
+        Errors come back as an error *result*, never an exception: a tool that
+        raises out of the conversation loop ends the run, and "that uri does not
+        resolve" is something an agent should be able to read and recover from.
+        """
+        try:
+            if name == "list_resources":
+                return ToolResult(name, self._list_resources())
+            uri = str(arguments.get("uri", "")).strip()
+            if not uri:
+                return ToolResult(name, "read_resource needs a `uri`.", True)
+            return ToolResult(name, self.read_resource(uri))
+        except Exception as exc:  # noqa: BLE001 - handed to the agent as text
+            return ToolResult(name, f"{name} failed: {exc!r}", True)
+
+    def _list_resources(self) -> str:
+        listed = self._loop.submit(self._session.list_resources(), CALL_TIMEOUT)
+        templates = self._loop.submit(
+            self._session.list_resource_templates(), CALL_TIMEOUT
+        )
+        lines = [
+            f"{r.uri} — {r.description or r.name or ''}".rstrip(" —")
+            for r in listed.resources
+        ]
+        lines += [
+            f"{t.uriTemplate} — {t.description or t.name or ''}".rstrip(" —")
+            for t in templates.resourceTemplates
+        ]
+        return "\n".join(lines) or "This server exposes no resources."
 
     def read_resource(self, uri: str) -> str:
         from pydantic import AnyUrl

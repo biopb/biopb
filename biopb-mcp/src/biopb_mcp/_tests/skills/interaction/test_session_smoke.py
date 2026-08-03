@@ -85,6 +85,72 @@ def test_the_skill_body_comes_from_the_shipped_catalog(session):
     assert len(body) > 4000, f"body is only {len(body)} chars"
 
 
+def test_the_agent_can_reach_a_skill_body_and_not_only_the_harness(session):
+    """The gap the test above cannot see, because it uses the harness's own
+    accessor.
+
+    `read_resource` is a method on `LiveSession`; for a long time it was *only*
+    that. The agent is driven over chat-completions and is handed `tools`, so a
+    resource — which is not a tool — had no verb behind it. `find_skills`
+    returned a `uri` and the handshake said to read it, and nothing could.
+
+    Measured consequence: a `skill+silent` arm that used `pystackreg` purely
+    because `checklist:` named it, having never read the procedure. So this
+    asserts the body arrives through `call`, the same door the model uses.
+    """
+    names = {t.name for t in session.agent_tools}
+    assert {"read_resource", "list_resources"} <= names, sorted(names)
+    assert {t.name for t in session.tools} < names, (
+        "agent_tools must extend the server's advertisement, not replace it"
+    )
+
+    found = session.call("find_skills", query="stage drift in a time lapse")
+    uri = next(
+        part.strip('", ')
+        for part in found.text.split()
+        if part.strip('", ').startswith("skill://")
+    )
+    body = session.call("read_resource", uri=uri)
+    assert not body.is_error, body.text
+    assert 'reference="previous"' in body.text, (
+        "the agent reached the resource but not the procedure inside it"
+    )
+
+
+def test_a_uri_that_does_not_resolve_is_an_error_result_not_a_crash(session):
+    """An agent has to be able to read a bad uri and try something else. Raising
+    out of `call` would end the run instead."""
+    out = session.call("read_resource", uri="")
+    assert out.is_error and "uri" in out.text
+
+    unknown = session.call("read_resource", uri="skill://no-such-skill")
+    assert "no-such-skill" in unknown.text or "catalog" in unknown.text.lower()
+
+
+def test_the_ablation_survives_the_new_verb():
+    """The one way this change could quietly void the benchmark.
+
+    `noskill` withholds the catalog, not the filesystem. If `read_resource`
+    reached the body around `load_catalog()`, an ablated arm could read
+    `skill://<id>` straight back and the 2x2 would be measuring nothing. It does
+    not, and it is the server's own gate rather than one the harness re-states —
+    but the cost of that being wrong is every skill number in the layer, so it
+    is worth a session of its own.
+    """
+    if reason := _session.why_unavailable():
+        pytest.skip(reason)
+    try:
+        with live_session(skills_enabled=False) as live:
+            assert "read_resource" in {t.name for t in live.agent_tools}
+            out = live.call("read_resource", uri="skill://drift-correction")
+            assert 'reference="previous"' not in out.text, (
+                "the ablation arm just read the skill it is supposed to lack"
+            )
+            assert "catalog" in out.text.lower(), out.text[:200]
+    except SessionUnavailable as exc:
+        pytest.skip(str(exc))
+
+
 def test_the_viewer_is_real(session):
     """A working viewer is what §5 scores against; on a display-less box the
     launcher's own Xvfb provides it. `QT_QPA_PLATFORM=offscreen` is not a

@@ -309,6 +309,16 @@ arrives through the real `mcp/_skills.py` — `find_skills` and `skill://<id>`,
 the same calls the runtime makes — so editing or deleting a skill changes what a
 run is scored against.
 
+The agent reaches `skill://<id>` through a **client-supplied** verb
+(`_session.CLIENT_TOOLS`), because a resource is not a tool and the
+chat-completions wire carries only tools. Without it `find_skills` returns a uri
+nothing can dereference, and the skill arms run on catalog metadata while
+appearing to have the procedure — which is what happened, and it is why
+`test_session_smoke.py` now asserts the body arrives through `call` and not only
+through the harness's own accessor. The ablation is unaffected: `skill://`
+resolves via `load_catalog()`, so a `noskill` arm reading the uri gets the
+server's "not in the catalog" answer.
+
 The cost is that a red run's cause space includes the kernel, Qt, dask and the
 tool schemas. Two things bound it: the trace is written before any assertion
 runs, and `test_session_smoke.py` — no model, no key — fails separately, first,

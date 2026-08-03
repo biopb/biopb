@@ -165,10 +165,14 @@ class ScriptedAgent:
     turns: list[AgentTurn]
     name: str = "scripted"
     seen: list[tuple[int, int]] = field(default_factory=list)
+    #: The tool list as offered, not just its length — which list the loop
+    #: hands over is itself a thing worth asserting on.
+    seen_tools: list[dict] = field(default_factory=list)
     _index: int = 0
 
     def respond(self, messages: list[dict], tools: list[dict]) -> AgentTurn:
         self.seen.append((len(messages), len(tools)))
+        self.seen_tools = list(tools)
         if self._index >= len(self.turns):
             return AgentTurn(text="")
         turn = self.turns[self._index]
