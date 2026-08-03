@@ -155,6 +155,72 @@ def guard_markers() -> list[str]:
     ]
 
 
+#: Built once per process by :func:`staged_package`.
+_STAGED: Path | None = None
+
+
+def staged_package() -> Path:
+    """biopb-mcp as it *ships*, unpacked, for the child to import instead of
+    the checkout.
+
+    The benchmark runs from a source tree, where `_tests/` sits inside the
+    installed package — so `os.path.dirname(biopb_mcp.__file__)` walks straight
+    into every case's `truth`, its tolerances and its persona. A measured arm
+    made exactly that walk (looking for the skill markdown, which does ship).
+    The wheel excludes `_tests` in both of the two places that matter —
+    `packages.find` *and* `exclude-package-data` — so building one and putting
+    it first on the child's path removes the answer key from the only process
+    that could read it, and leaves the child running what users actually have.
+
+    Prepending is enough because biopb-mcp's editable install is a plain path
+    `.pth`, and `PYTHONPATH` is processed before site-packages contributes
+    those entries — so the staged copy shadows the checkout. It would not
+    shadow a *finder*-style editable (`biopb-tensor-server` has one), which is
+    why this is asserted at bring-up rather than assumed.
+
+    Loud on failure, never silent: an unstaged run is a run whose numbers can be
+    read off a file, and degrading quietly would reintroduce the exact class of
+    bug this exists to close.
+    """
+    global _STAGED
+    if _STAGED is not None:
+        return _STAGED
+
+    import subprocess
+    import zipfile
+
+    root = Path(__file__).resolve().parents[6]
+    out = Path(tempfile.mkdtemp(prefix="biopb-skill-wheel-"))
+    try:
+        subprocess.run(
+            ["uv", "build", "--package", "biopb-mcp", "--wheel", "-o", str(out)],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", b"") or b""
+        raise SessionUnavailable(
+            f"could not build the biopb-mcp wheel to isolate the run from its "
+            f"own test tree: {exc}\n{detail[-500:].decode('utf-8', 'replace')}"
+        ) from exc
+
+    wheels = sorted(out.glob("*.whl"))
+    if not wheels:
+        raise SessionUnavailable(f"uv build produced no wheel in {out}")
+    unpacked = out / "unpacked"
+    with zipfile.ZipFile(wheels[-1]) as zf:
+        zf.extractall(unpacked)
+    if (unpacked / "biopb_mcp" / "_tests").exists():
+        raise SessionUnavailable(
+            "the built wheel still contains biopb_mcp/_tests — the packaging "
+            "excludes have regressed and a run could read its own answer key"
+        )
+    _STAGED = unpacked
+    return _STAGED
+
+
 #: How long bring-up may take. The kernel imports napari and spins dask, which
 #: is seconds on a warm machine and much worse on a cold one.
 SPAWN_TIMEOUT = 120.0
@@ -601,8 +667,15 @@ def live_session(
     )
     os.environ[ENV_GUARD_LOG] = str(guard_log)
     os.environ[ENV_GUARD_MARKERS] = os.pathsep.join(guard_markers())
+    # Order matters: the staged wheel must precede whatever the checkout's
+    # editable `.pth` will later append, and `scratch` only has to be somewhere
+    # importable for `sitecustomize`.
     os.environ["PYTHONPATH"] = os.pathsep.join(
-        [str(scratch), *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else [])]
+        [
+            str(scratch),
+            str(staged_package()),
+            *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else []),
+        ]
     )
 
     child = session_id = loop = None

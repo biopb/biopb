@@ -18,11 +18,14 @@ per test) but free — no key, no network beyond loopback.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from . import _session
 from ._session import SessionUnavailable, live_session
+from .cases import drift_correction
 
 pytestmark = pytest.mark.interaction
 
@@ -151,6 +154,34 @@ def test_the_ablation_survives_the_new_verb():
         pytest.skip(str(exc))
 
 
+def test_the_kernel_runs_the_shipped_package_not_the_checkout(session):
+    """The answer key is not reachable because it is not *there*.
+
+    Running from a checkout puts `_tests/` — every case's `truth`, tolerances
+    and persona — inside the installed package, one `os.path.dirname` from any
+    agent that looks. The wheel excludes it, so the child imports that instead.
+    Also the more faithful run: it is what a user has.
+    """
+    out = session.call(
+        "execute_code",
+        python_code=(
+            "import biopb_mcp, importlib.util, os.path\n"
+            "print('pkg:', biopb_mcp.__file__)\n"
+            "print('tests:', importlib.util.find_spec('biopb_mcp._tests'))\n"
+            # isdir, not load_catalog(): reading the catalog *from the kernel*
+            # is indistinguishable from an ablated arm doing the same, and it
+            # would leave that residue in the tripwire for the next test.
+            "print('skills_dir:', os.path.isdir(os.path.join(\n"
+            "    os.path.dirname(biopb_mcp.__file__), 'mcp', '_skills_data')))\n"
+        ),
+    )
+    assert not out.is_error, out.text
+    assert "tests: None" in out.text, f"the test tree is importable:\n{out.text}"
+    assert "/biopb_mcp/_tests/" not in out.text
+    # Staging must not have cost the child the catalog it is measured on.
+    assert "skills_dir: True" in out.text, out.text
+
+
 def test_reading_the_answer_key_does_not_go_unrecorded(session):
     """`execute_code` is arbitrary Python, so a run *can* open the fixture that
     defines its own answer. Nothing stops it and nothing should — but a run that
@@ -160,11 +191,14 @@ def test_reading_the_answer_key_does_not_go_unrecorded(session):
     `os.path.dirname(biopb_mcp.__file__)`, then open what it found.
     """
     before = len(session.peeked())
-    case = (
-        "from biopb_mcp._tests.skills.interaction.cases import drift_correction as d\n"
-        "print(open(d.__file__).read()[:40])"
+    # By absolute path, because staging already removed the *importable* route:
+    # the checkout is still on this disk and a determined run can still open it,
+    # which is the residual the tripwire exists to cover.
+    answer_key = Path(drift_correction.__file__).resolve()
+    out = session.call(
+        "execute_code", python_code=f"print(open({str(answer_key)!r}).read()[:40])"
     )
-    assert not session.call("execute_code", python_code=case).is_error
+    assert not out.is_error, out.text
 
     peeked = session.peeked()
     assert len(peeked) > before, "the fixture was read and nothing recorded it"

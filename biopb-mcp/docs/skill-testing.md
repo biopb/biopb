@@ -319,6 +319,33 @@ through the harness's own accessor. The ablation is unaffected: `skill://`
 resolves via `load_catalog()`, so a `noskill` arm reading the uri gets the
 server's "not in the catalog" answer.
 
+#### The run must not be able to read its own answer
+
+`execute_code` is arbitrary Python by design, so a run *can* open the fixture
+that defines its answer — `truth`, the tolerances, the persona's facts — or the
+skill markdown an ablated arm is meant to lack. This is a validity problem, not
+a security one: the agent is curious rather than adversarial, and it says what it
+did in the trace. Two measures, because neither is sufficient alone.
+
+**The child imports the shipped wheel, not the checkout.** Running from a source
+tree puts `_tests/` inside the installed package, one `os.path.dirname` from any
+agent that looks — and one measured arm made exactly that walk. `staged_package()`
+builds a wheel (which excludes `_tests`) and puts it first on the child's
+`PYTHONPATH`, so the answer key is not in the process that could read it. It is
+also the more faithful run: it is what a user has. Loud on failure — an unstaged
+run is one whose numbers can be read off a file.
+
+**A tripwire records what is left.** The checkout is still on disk and an
+absolute path still reaches it, so a `sitecustomize` on the child's path adds an
+audit hook for `open`/`os.listdir`/`os.scandir` and records hits on
+harness-owned paths. It records rather than refuses: refusing would change the
+environment under test, which §5 forbids, and would break the session child's own
+reads of `_skills_data`. The discriminator is the *process* — the session child
+serves `skill://`, the kernel is where agent code runs — and it is applied in the
+parent (`LiveSession.peeked`), so the hook stays a dumb recorder. `FLAG_PEEKED`
+carries it onto the arm's row; unlike the other flags it means the number is
+void rather than qualified.
+
 The cost is that a red run's cause space includes the kernel, Qt, dask and the
 tool schemas. Two things bound it: the trace is written before any assertion
 runs, and `test_session_smoke.py` — no model, no key — fails separately, first,
