@@ -25,6 +25,7 @@ from ._conversation import (
     FINISHED,
     RESPONDENT_FAILED,
     SILENT,
+    STALLED,
     TOOL_CAP,
     TURN_CAP,
     Trace,
@@ -480,3 +481,31 @@ def test_an_agent_without_provider_fields_sends_no_extra_keys():
     assistants = [m for m in Recorder.sent if m.get("role") == "assistant"]
     assert assistants
     assert all(set(m) <= {"role", "content", "tool_calls"} for m in assistants)
+
+
+def test_a_conversation_that_stops_progressing_is_ended():
+    """`SilentRespondent` answers "I don't know" to everything, including a
+    sign-off, so an agent that finishes and says so is answered with a
+    non-answer and says so again — to the turn cap. Measured: both silent arms
+    trailed 42 and 55 tool-free turns past their last real action, and scored
+    `turn-cap` with `cut-off-but-scored` on work that was complete."""
+    agent = ScriptedAgent([_calls("server_status")] + [_says("All done.")] * 40)
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=60)
+
+    assert trace.stopped == STALLED
+    assert trace.turns_used < 60, "it should end well before the cap"
+    assert any(e.role == "harness" and e.is_error for e in trace.events)
+
+
+def test_a_tool_call_clears_the_stall_counter():
+    """Only *consecutive* tool-free turns count. An agent that talks, acts,
+    talks again is working, not circling — and the ask budget alone allows
+    several questions in a row."""
+    agent = ScriptedAgent(
+        [_says("Q1?"), _says("Q2?"), _calls("server_status"), _says("Q3?")] * 4
+    )
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=16)
+
+    assert trace.stopped == TURN_CAP, "a working conversation was called stalled"

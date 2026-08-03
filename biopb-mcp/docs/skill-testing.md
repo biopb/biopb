@@ -377,7 +377,7 @@ indistinguishable from a square whose other corners died.
 reason — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`, `gave-up`,
 `no-result`, `unscorable-result`, `harness-error` — plus flags that change how to
 read it: `cut-off-but-scored`, `over-ask-budget(n)`, `never-asked`,
-`asked-but-unanswered`, `catalog-mismatch`. Ordering matters: a cap beats a bad
+`asked-but-unanswered`, `stalled`, `catalog-mismatch`. Ordering matters: a cap beats a bad
 number, so a run severed mid-workflow is not reported as a wrong answer, and a
 *provider* failure beats everything, because it is not about the skill at all.
 Every arm runs inside its own `try`, so a corner that dies becomes a row instead
@@ -392,6 +392,15 @@ laundered into a reply: the backend raises, the loop stops as `respondent-failed
 or `agent-truncated`, and both classify as `harness-error`. Every agent turn
 records the provider's own `finish_reason`, so the distinction survives into the
 transcript instead of having to be re-derived against a live endpoint.
+
+**A conversation that stops progressing is ended.** `SilentRespondent` answers "I
+don't know" to everything — including a sign-off — so it can never end a run:
+an agent that finishes and says so is met with a non-answer and says so again,
+to the turn cap. Measured on both silent arms, which trailed 42 and 55 tool-free
+turns past their last real action and were then reported `turn-cap` with
+`cut-off-but-scored` on work that was complete. Eight consecutive turns with no
+tool call (healthy runs never exceeded two) now stop the run as `stalled`, which
+is flagged as itself rather than as a severance.
 
 Two things *are* asserted, and neither judges a skill: that the report reached
 disk with a transcript per arm, and that the ablation took effect. The second is

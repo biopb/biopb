@@ -112,7 +112,7 @@ transcripts land under `.skill-outcomes/interaction/<skill>/`.
 `reason` — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`,
 `gave-up`, `no-result`, `unscorable-result`, `harness-error` — plus flags that
 change how to read it: `cut-off-but-scored`, `over-ask-budget(n)`,
-`never-asked`, `asked-but-unanswered`, `catalog-mismatch`.
+`never-asked`, `asked-but-unanswered`, `stalled`, `catalog-mismatch`.
 
 Every arm runs inside its own `try`, so a corner that dies becomes a row rather
 than an exception that destroys the other three. The report is the deliverable;

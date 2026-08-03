@@ -52,6 +52,21 @@ SILENT = "agent-said-nothing"
 AGENT_TRUNCATED = "agent-truncated"
 RESPONDENT_FAILED = "respondent-failed"
 
+#: The conversation stopped progressing: the agent keeps talking and never acts
+#: again. `SilentRespondent` cannot end a run — it answers "I don't know" to
+#: everything, including a sign-off — so an agent that finishes its work and
+#: says so is answered with a non-answer and says so again, to the turn cap.
+#: Measured: both silent arms did exactly this, trailing 42 and 55 tool-free
+#: turns after their last real action, and scored `turn-cap` with
+#: `cut-off-but-scored` on work that was complete.
+STALLED = "stalled"
+
+#: Consecutive agent turns with no tool call before the run is called stalled.
+#: Set from measurement: healthy runs never exceeded **2** in either sweep, and
+#: the livelocked ones ran 42 and 55 — so this sits well clear of a legitimate
+#: run of questions (the ask budget is 3) and far below the pathology.
+MAX_IDLE_TURNS = 8
+
 
 @dataclass
 class Event:
@@ -215,6 +230,7 @@ def converse(
         task=task,
     )
     calls_made = 0
+    idle_turns = 0
 
     for turn in range(max_turns):
         trace.turns_used = turn + 1
@@ -278,7 +294,10 @@ def converse(
             if calls_made >= max_tool_calls:
                 trace.stopped = TOOL_CAP
                 return trace
+            idle_turns = 0
             continue
+
+        idle_turns += 1
 
         if step.is_empty:
             # Nothing said and nothing called: there is no next move to make.
@@ -323,6 +342,25 @@ def converse(
         )
         messages.append({"role": "user", "content": answer})
         trace.events.append(Event(turn=turn, role="user", text=answer))
+
+        if idle_turns >= MAX_IDLE_TURNS:
+            # Talking without acting, this many turns running. Nothing new is
+            # entering the conversation, so the remaining budget buys nothing
+            # but tokens and a `turn-cap` on work that may be finished.
+            trace.stopped = STALLED
+            trace.events.append(
+                Event(
+                    turn=turn,
+                    role="harness",
+                    text=(
+                        f"no tool call in {idle_turns} turns — the conversation "
+                        "stopped progressing; the respondent may be unable to "
+                        "end it (SilentRespondent never returns DONE)"
+                    ),
+                    is_error=True,
+                )
+            )
+            return trace
 
     trace.stopped = TURN_CAP
     return trace

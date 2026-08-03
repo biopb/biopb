@@ -58,6 +58,7 @@ from ._conversation import (
     AGENT_TRUNCATED,
     RESPONDENT_FAILED,
     SILENT,
+    STALLED,
     TOOL_CAP,
     TURN_CAP,
     converse,
@@ -109,6 +110,10 @@ FLAG_CATALOG_MISMATCH = "catalog-mismatch"
 #: it is the respondent being broken — the arm measured the `silent` condition
 #: under the `asked` label, and its row is not comparable to anything.
 FLAG_UNANSWERED = "asked-but-unanswered"
+#: The run ended because it stopped progressing, not because the agent finished.
+#: Distinct from `cut-off-but-scored`: a stalled run was not severed mid-workflow,
+#: it was talking in circles — usually because the respondent could not end it.
+FLAG_STALLED = "stalled"
 
 #: A missing session is worth telling apart from any other harness failure: it
 #: means the machine, not the run.
@@ -350,6 +355,8 @@ class Result:
         severed = self.trace.stopped in (TURN_CAP, TOOL_CAP)
         if self.outcome is not None and self.outcome.scored and severed:
             out.append(FLAG_CUT_OFF)
+        if self.trace.stopped == STALLED:
+            out.append(FLAG_STALLED)
         if bool(self.catalog_hits) != self.arm.skills:
             out.append(FLAG_CATALOG_MISMATCH)
         return out
