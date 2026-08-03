@@ -38,11 +38,26 @@ Conventions:
 
   (A small accessor API is planned to replace this.)
 
-Two plugins ship here. ``rolling_ball.py`` is the worked example — a fast ImageJ
-port of rolling-ball background subtraction — and ``segmentation_qc.py`` backs the
-``segmentation-qc-metrics`` skill, whose body carries the call signature while the
-matching itself stays here where it is unit-tested. Both are yours to edit: the
-installer seeds them once and never overwrites a file that already exists.
+What ships here:
+
+===================== ==========================================================
+Plugin                What it is
+===================== ==========================================================
+``rolling_ball``      Rolling-ball background subtraction (Sternberg 1983), the
+                      fast ImageJ port. The worked "bring your own tool"
+                      example — start here if you are writing one.
+``segmentation_qc``   Instance-segmentation QC: IoU matching, F1 at threshold,
+                      splits and merges. Backs the ``segmentation-qc-metrics``
+                      skill, whose body carries the call signature while the
+                      matching stays here where it is unit-tested.
+``chunked_label``     Connected components on a chunked dask array, linked
+                      across chunk boundaries — which per-block
+                      ``scipy.ndimage.label`` silently does not do.
+===================== ==========================================================
+
+All of them are yours to edit: the installer seeds them once and never overwrites
+a file that already exists. The module docstring is the documentation, so
+``inspect_object("<plugin>")`` is the fastest way to see what one offers.
 
 Project and issue tracker: https://github.com/biopb/biopb
 """
