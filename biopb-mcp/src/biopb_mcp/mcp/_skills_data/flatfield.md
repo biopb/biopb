@@ -3,7 +3,7 @@ id: flatfield
 title: Correct uneven illumination across a set of tiles or fields
 description: Remove vignetting and shading from a collection of images taken on the same optics, so intensities are comparable within a frame and between frames.
 tags: [illumination, correction, preprocessing, intensity]
-version: 1.1.0
+version: 1.0.0
 checklist: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0]
 ---
 
