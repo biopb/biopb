@@ -18,11 +18,14 @@ per test) but free — no key, no network beyond loopback.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from . import _session
 from ._session import SessionUnavailable, live_session
+from .cases import drift_correction
 
 pytestmark = pytest.mark.interaction
 
@@ -83,6 +86,136 @@ def test_the_skill_body_comes_from_the_shipped_catalog(session):
     assert 'reference="previous"' in body, "step 3 is missing from the body"
     assert "REF_CHANNEL" in body, "step 2's parameter is missing from the body"
     assert len(body) > 4000, f"body is only {len(body)} chars"
+
+
+def test_the_agent_can_reach_a_skill_body_and_not_only_the_harness(session):
+    """The gap the test above cannot see, because it uses the harness's own
+    accessor.
+
+    `read_resource` is a method on `LiveSession`; for a long time it was *only*
+    that. The agent is driven over chat-completions and is handed `tools`, so a
+    resource — which is not a tool — had no verb behind it. `find_skills`
+    returned a `uri` and the handshake said to read it, and nothing could.
+
+    Measured consequence: a `skill+silent` arm that used `pystackreg` purely
+    because `checklist:` named it, having never read the procedure. So this
+    asserts the body arrives through `call`, the same door the model uses.
+    """
+    names = {t.name for t in session.agent_tools}
+    assert {"read_resource", "list_resources"} <= names, sorted(names)
+    assert {t.name for t in session.tools} < names, (
+        "agent_tools must extend the server's advertisement, not replace it"
+    )
+
+    found = session.call("find_skills", query="stage drift in a time lapse")
+    uri = next(
+        part.strip('", ')
+        for part in found.text.split()
+        if part.strip('", ').startswith("skill://")
+    )
+    body = session.call("read_resource", uri=uri)
+    assert not body.is_error, body.text
+    assert 'reference="previous"' in body.text, (
+        "the agent reached the resource but not the procedure inside it"
+    )
+
+
+def test_a_uri_that_does_not_resolve_is_an_error_result_not_a_crash(session):
+    """An agent has to be able to read a bad uri and try something else. Raising
+    out of `call` would end the run instead."""
+    out = session.call("read_resource", uri="")
+    assert out.is_error and "uri" in out.text
+
+    unknown = session.call("read_resource", uri="skill://no-such-skill")
+    assert "no-such-skill" in unknown.text or "catalog" in unknown.text.lower()
+
+
+def test_the_ablation_survives_the_new_verb():
+    """The one way this change could quietly void the benchmark.
+
+    `noskill` withholds the catalog, not the filesystem. If `read_resource`
+    reached the body around `load_catalog()`, an ablated arm could read
+    `skill://<id>` straight back and the 2x2 would be measuring nothing. It does
+    not, and it is the server's own gate rather than one the harness re-states —
+    but the cost of that being wrong is every skill number in the layer, so it
+    is worth a session of its own.
+    """
+    if reason := _session.why_unavailable():
+        pytest.skip(reason)
+    try:
+        with live_session(skills_enabled=False) as live:
+            assert "read_resource" in {t.name for t in live.agent_tools}
+            out = live.call("read_resource", uri="skill://drift-correction")
+            assert 'reference="previous"' not in out.text, (
+                "the ablation arm just read the skill it is supposed to lack"
+            )
+            assert "catalog" in out.text.lower(), out.text[:200]
+    except SessionUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+def test_the_kernel_runs_the_shipped_package_not_the_checkout(session):
+    """The answer key is not reachable because it is not *there*.
+
+    Running from a checkout puts `_tests/` — every case's `truth`, tolerances
+    and persona — inside the installed package, one `os.path.dirname` from any
+    agent that looks. The wheel excludes it, so the child imports that instead.
+    Also the more faithful run: it is what a user has.
+    """
+    out = session.call(
+        "execute_code",
+        python_code=(
+            "import biopb_mcp, importlib.util, os.path\n"
+            "print('pkg:', biopb_mcp.__file__)\n"
+            "print('tests:', importlib.util.find_spec('biopb_mcp._tests'))\n"
+            # isdir, not load_catalog(): reading the catalog *from the kernel*
+            # is indistinguishable from an ablated arm doing the same, and it
+            # would leave that residue in the tripwire for the next test.
+            "print('skills_dir:', os.path.isdir(os.path.join(\n"
+            "    os.path.dirname(biopb_mcp.__file__), 'mcp', '_skills_data')))\n"
+        ),
+    )
+    assert not out.is_error, out.text
+    assert "tests: None" in out.text, f"the test tree is importable:\n{out.text}"
+    assert "/biopb_mcp/_tests/" not in out.text
+    # Staging must not have cost the child the catalog it is measured on.
+    assert "skills_dir: True" in out.text, out.text
+
+
+def test_reading_the_answer_key_does_not_go_unrecorded(session):
+    """`execute_code` is arbitrary Python, so a run *can* open the fixture that
+    defines its own answer. Nothing stops it and nothing should — but a run that
+    did it must not score like one that did not.
+
+    This is the exact route a measured `skill+asked` arm took to its procedure:
+    `os.path.dirname(biopb_mcp.__file__)`, then open what it found.
+    """
+    before = len(session.peeked())
+    # By absolute path, because staging already removed the *importable* route:
+    # the checkout is still on this disk and a determined run can still open it,
+    # which is the residual the tripwire exists to cover.
+    answer_key = Path(drift_correction.__file__).resolve()
+    out = session.call(
+        "execute_code", python_code=f"print(open({str(answer_key)!r}).read()[:40])"
+    )
+    assert not out.is_error, out.text
+
+    peeked = session.peeked()
+    assert len(peeked) > before, "the fixture was read and nothing recorded it"
+    assert any("drift_correction" in e["path"] for e in peeked), peeked[-3:]
+    assert all(e["pid"] != session.child_pid for e in peeked), (
+        "agent code runs in the kernel, not the session child"
+    )
+
+
+def test_the_session_serving_a_skill_is_not_mistaken_for_peeking(session):
+    """The other half, and the one that decides whether this is usable: reading
+    `_skills_data` is how `skill://` is served. If that counted, every skill arm
+    would flag itself and the signal would be worth nothing."""
+    session.call("read_resource", uri="skill://drift-correction")
+    assert not [e for e in session.peeked() if "_skills_data" in e["path"]], (
+        "serving a skill body registered as the agent peeking at it"
+    )
 
 
 def test_the_viewer_is_real(session):

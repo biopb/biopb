@@ -56,6 +56,171 @@ from typing import Any
 
 import numpy as np
 
+#: Env the tripwire reads in the child: where to write, and what to watch.
+ENV_GUARD_LOG = "BIOPB_SKILL_GUARD_LOG"
+ENV_GUARD_MARKERS = "BIOPB_SKILL_GUARD_MARKERS"
+
+#: Installed into every child process of a run, as `sitecustomize` on its
+#: `PYTHONPATH`. Records — never blocks — reads of anything the harness owns.
+#:
+#: `execute_code` is arbitrary Python by design, so a run can open the fixture
+#: that defines its own answer (`truth["structural_channel"]`, the trajectory,
+#: the tolerances, the persona's facts) or the skill markdown an ablated arm is
+#: supposed to lack. Both have happened: a measured `skill+asked` arm reached
+#: its procedure by walking the installed package and opening
+#: `mcp/_skills_data/drift-correction.md`.
+#:
+#: Recording rather than refusing, on purpose. The agent is curious, not
+#: adversarial, and it says what it did in the trace; what the layer actually
+#: needs is for a compromised run to be *loud* instead of scoring like a good
+#: one. Refusing would also change the environment under test, which §5
+#: forbids — "disclose the environment, withhold only the skill" — and would
+#: break the session child's own legitimate reads of `_skills_data`. Judgement
+#: about which reads matter belongs in the parent, where it is testable, so the
+#: hook stays a dumb recorder and writes down who was asking.
+_TRIPWIRE = '''\
+"""Benchmark tripwire — records reads of harness-owned paths. Not security."""
+
+import json
+import os
+import sys
+
+_MARKERS = tuple(
+    m for m in os.environ.get({markers!r}, "").split(os.pathsep) if m
+)
+_LOG = os.environ.get({log!r}, "")
+_busy = False
+
+
+def _watch(event, args):
+    global _busy
+    if _busy or event not in ("open", "os.listdir", "os.scandir"):
+        return
+    target = args[0] if args else None
+    if not isinstance(target, (str, bytes, os.PathLike)):
+        return
+    try:
+        path = os.path.abspath(os.fsdecode(target))
+    except Exception:
+        return
+    if not any(m in path for m in _MARKERS):
+        return
+    _busy = True
+    try:
+        # Which process was asking is the whole discrimination: the session
+        # child reads `_skills_data` to serve `skill://`, and that is the
+        # system working. The kernel is where agent code runs.
+        with open(_LOG, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {{
+                        "pid": os.getpid(),
+                        "event": event,
+                        "path": path,
+                        "in_kernel": "ipykernel" in sys.modules,
+                    }}
+                )
+                + "\\n"
+            )
+    except Exception:
+        pass
+    finally:
+        _busy = False
+
+
+if _MARKERS and _LOG:
+    sys.addaudithook(_watch)
+'''
+
+
+def guard_markers() -> list[str]:
+    """What a run must not read: the harness's own tree, and the shipped skill
+    bodies.
+
+    `_tests/` holds every case's `truth`, its tolerances and its persona — read
+    it and any arm passes, with nothing in the result to say so. `_skills_data`
+    is narrower: legitimate for the session child to read, and the ablation's
+    undoing if the *kernel* reads it.
+
+    Path *fragments*, not absolute roots, because the parent and the child need
+    not resolve `biopb_mcp` to the same tree — an editable install re-points it
+    through its own finder, and under a git worktree the two diverge outright.
+    Rooted at the package directory rather than a bare name, so this says
+    "biopb_mcp's tests", not "any directory called `_tests`".
+    """
+    sep = os.sep
+    return [
+        f"{sep}biopb_mcp{sep}_tests{sep}",
+        f"{sep}biopb_mcp{sep}mcp{sep}_skills_data{sep}",
+    ]
+
+
+#: Built once per process by :func:`staged_package`.
+_STAGED: Path | None = None
+
+
+def staged_package() -> Path:
+    """biopb-mcp as it *ships*, unpacked, for the child to import instead of
+    the checkout.
+
+    The benchmark runs from a source tree, where `_tests/` sits inside the
+    installed package — so `os.path.dirname(biopb_mcp.__file__)` walks straight
+    into every case's `truth`, its tolerances and its persona. A measured arm
+    made exactly that walk (looking for the skill markdown, which does ship).
+    The wheel excludes `_tests` in both of the two places that matter —
+    `packages.find` *and* `exclude-package-data` — so building one and putting
+    it first on the child's path removes the answer key from the only process
+    that could read it, and leaves the child running what users actually have.
+
+    Prepending is enough because biopb-mcp's editable install is a plain path
+    `.pth`, and `PYTHONPATH` is processed before site-packages contributes
+    those entries — so the staged copy shadows the checkout. It would not
+    shadow a *finder*-style editable (`biopb-tensor-server` has one), which is
+    why this is asserted at bring-up rather than assumed.
+
+    Loud on failure, never silent: an unstaged run is a run whose numbers can be
+    read off a file, and degrading quietly would reintroduce the exact class of
+    bug this exists to close.
+    """
+    global _STAGED
+    if _STAGED is not None:
+        return _STAGED
+
+    import subprocess
+    import zipfile
+
+    root = Path(__file__).resolve().parents[6]
+    out = Path(tempfile.mkdtemp(prefix="biopb-skill-wheel-"))
+    try:
+        subprocess.run(
+            ["uv", "build", "--package", "biopb-mcp", "--wheel", "-o", str(out)],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", b"") or b""
+        raise SessionUnavailable(
+            f"could not build the biopb-mcp wheel to isolate the run from its "
+            f"own test tree: {exc}\n{detail[-500:].decode('utf-8', 'replace')}"
+        ) from exc
+
+    wheels = sorted(out.glob("*.whl"))
+    if not wheels:
+        raise SessionUnavailable(f"uv build produced no wheel in {out}")
+    unpacked = out / "unpacked"
+    with zipfile.ZipFile(wheels[-1]) as zf:
+        zf.extractall(unpacked)
+    if (unpacked / "biopb_mcp" / "_tests").exists():
+        raise SessionUnavailable(
+            "the built wheel still contains biopb_mcp/_tests — the packaging "
+            "excludes have regressed and a run could read its own answer key"
+        )
+    _STAGED = unpacked
+    return _STAGED
+
+
 #: How long bring-up may take. The kernel imports napari and spins dask, which
 #: is seconds on a warm machine and much worse on a cold one.
 SPAWN_TIMEOUT = 120.0
@@ -148,6 +313,62 @@ class ToolSpec:
     input_schema: dict
 
 
+#: What the **client** contributes, on top of the nine tools the server
+#: advertises. Not `@mcp.tool()`s, and deliberately not: they are the harness
+#: standing in for a capability every shipped MCP client already has.
+#:
+#: A skill body and a `guide://` page are MCP **resources**, and a resource is
+#: not a tool. `find_skills` returns metadata plus a `uri`, the handshake
+#: instructions say to read that uri, and `_bridge` translates *tools* onto a
+#: chat-completions API — so before this existed the agent was handed a pointer
+#: it had no verb to dereference. Measured on the 2026-08-03 sweep, that cost
+#: the benchmark its independent variable: `skill+silent` reached for
+#: `pystackreg` because the catalog *metadata* named it in `checklist:`, having
+#: never read a line of the procedure, and `skill+asked` got the body only by
+#: walking the installed package directory. A broken or empty skill body would
+#: have scored the same.
+#:
+#: The ablation still holds through here, and is not re-implemented: the
+#: `skill://` resource resolves through `load_catalog()`, which returns `[]`
+#: when `services.skills_enabled` is off, so a `noskill` arm that reads the uri
+#: gets "No skill '<id>' in the catalog" — the server's own answer, not one the
+#: harness invented.
+CLIENT_TOOLS: tuple[ToolSpec, ...] = (
+    ToolSpec(
+        name="list_resources",
+        description=(
+            "List the MCP resources this server exposes, including URI "
+            "templates. Resources carry reference material rather than "
+            "actions: the `guide://` pages and the full body of each "
+            "curated skill."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="read_resource",
+        description=(
+            "Read one MCP resource and return its text. `uri` is a full "
+            "resource URI — for example `skill://drift-correction` (the `uri` "
+            "field of a `find_skills` result, whose body holds the actual "
+            "step-by-step workflow) or `guide://kernel`."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "e.g. skill://<id> or guide://<name>",
+                }
+            },
+            "required": ["uri"],
+        },
+    ),
+)
+
+#: Names in :data:`CLIENT_TOOLS`, for dispatch.
+CLIENT_TOOL_NAMES = frozenset(t.name for t in CLIENT_TOOLS)
+
+
 class _LoopThread:
     """An event loop on its own thread, so sync test code can drive an async
     MCP session that must stay open across many calls."""
@@ -183,25 +404,105 @@ class LiveSession:
     scratch: Path
     #: Whether the curated catalog was offered at all (the ablation arm).
     skills_enabled: bool
-    _loop: _LoopThread
-    _session: Any
+    #: Where the tripwire writes. Absent until something is recorded.
+    guard_log: Path = Path()
+    #: The session child's own pid. It reads `_skills_data` to serve
+    #: `skill://`, which is the system working, so `peeked` needs to tell that
+    #: process apart from the kernel underneath it.
+    child_pid: int | None = None
+    _loop: _LoopThread = None  # type: ignore[assignment]
+    _session: Any = None
     _turn: int = 0
     calls: list[tuple[int, str, dict]] = field(default_factory=list)
 
     # --- the agent-visible surface -----------------------------------------
 
+    @property
+    def agent_tools(self) -> list[ToolSpec]:
+        """Everything the agent can actually do: the server's tools plus the
+        client's resource verbs.
+
+        Kept distinct from `tools` — which stays the server's own
+        advertisement — because conflating the two is the bug this exists to
+        fix. What a server offers and what an agent can reach are different
+        lists, and the gap between them was invisible while only one was named.
+        """
+        return [*self.tools, *CLIENT_TOOLS]
+
     def call(self, name: str, /, **arguments: Any) -> ToolResult:
         """Call a tool exactly as an agent would, and record that it happened.
 
         The record is what answers "did it ask before it spent": which tool,
-        with what, and at which conversational turn.
+        with what, and at which conversational turn — so a client-side call is
+        recorded here too, on the same footing as a server one.
         """
         self.calls.append((self._turn, name, dict(arguments)))
+        if name in CLIENT_TOOL_NAMES:
+            return self._call_client_tool(name, arguments)
         result = self._loop.submit(
             self._session.call_tool(name, arguments), CALL_TIMEOUT
         )
         text = "\n".join(describe_block(block) for block in result.content)
         return ToolResult(name=name, text=text, is_error=bool(result.isError))
+
+    def _call_client_tool(self, name: str, arguments: dict) -> ToolResult:
+        """Serve one of :data:`CLIENT_TOOLS`.
+
+        Errors come back as an error *result*, never an exception: a tool that
+        raises out of the conversation loop ends the run, and "that uri does not
+        resolve" is something an agent should be able to read and recover from.
+        """
+        try:
+            if name == "list_resources":
+                return ToolResult(name, self._list_resources())
+            uri = str(arguments.get("uri", "")).strip()
+            if not uri:
+                return ToolResult(name, "read_resource needs a `uri`.", True)
+            return ToolResult(name, self.read_resource(uri))
+        except Exception as exc:  # noqa: BLE001 - handed to the agent as text
+            return ToolResult(name, f"{name} failed: {exc!r}", True)
+
+    def _list_resources(self) -> str:
+        listed = self._loop.submit(self._session.list_resources(), CALL_TIMEOUT)
+        templates = self._loop.submit(
+            self._session.list_resource_templates(), CALL_TIMEOUT
+        )
+        lines = [
+            f"{r.uri} — {r.description or r.name or ''}".rstrip(" —")
+            for r in listed.resources
+        ]
+        lines += [
+            f"{t.uriTemplate} — {t.description or t.name or ''}".rstrip(" —")
+            for t in templates.resourceTemplates
+        ]
+        return "\n".join(lines) or "This server exposes no resources."
+
+    def peeked(self) -> list[dict]:
+        """Harness-owned files this run read that it had no business reading.
+
+        Serving `skill://` means the *session child* opens `_skills_data`, and
+        `load_catalog` scans the whole directory — the system working. The
+        kernel is where agent code runs, so the discriminator is the process,
+        and it is applied here rather than in the hook: the recorder stays dumb
+        and the judgement stays somewhere a test can reach it.
+
+        Not `"ipykernel" in sys.modules`, which reads true in the session child
+        as well and quietly classified every catalog scan as a peek.
+        """
+        if not self.guard_log.exists():
+            return []
+        out = []
+        for line in self.guard_log.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            serving = entry.get(
+                "pid"
+            ) == self.child_pid and "_skills_data" in entry.get("path", "")
+            if not serving:
+                out.append(entry)
+        return out
 
     def read_resource(self, uri: str) -> str:
         from pydantic import AnyUrl
@@ -341,15 +642,52 @@ def live_session(
 
     saved = {
         k: os.environ.get(k)
-        for k in ("XDG_CONFIG_HOME", "BIOPB_TENSOR_URL", "QT_QPA_PLATFORM")
+        for k in (
+            "XDG_CONFIG_HOME",
+            "BIOPB_TENSOR_URL",
+            "QT_QPA_PLATFORM",
+            "PYTHONPATH",
+            ENV_GUARD_LOG,
+            ENV_GUARD_MARKERS,
+        )
     }
     os.environ["XDG_CONFIG_HOME"] = str(scratch / "config")
     os.environ["BIOPB_TENSOR_URL"] = UNREACHABLE_TENSOR_URL
     os.environ.pop("QT_QPA_PLATFORM", None)  # a real GL platform, not offscreen
 
+    # The tripwire, inherited by the session child and its kernel. `sitecustomize`
+    # is imported by `site` from anywhere on the path, which is what lets this
+    # reach both processes without the product knowing it exists. Caveat: it
+    # shadows any other `sitecustomize` on the way — none in this venv, and a
+    # benchmark run is not a general-purpose environment.
+    guard_log = scratch / "guard.jsonl"
+    (scratch / "sitecustomize.py").write_text(
+        _TRIPWIRE.format(markers=ENV_GUARD_MARKERS, log=ENV_GUARD_LOG),
+        encoding="utf-8",
+    )
+    os.environ[ENV_GUARD_LOG] = str(guard_log)
+    os.environ[ENV_GUARD_MARKERS] = os.pathsep.join(guard_markers())
+
     child = session_id = loop = None
     stop = None
     try:
+        # Inside the try, because building the wheel can fail and everything
+        # above has already redirected `XDG_CONFIG_HOME` and the tensor URL for
+        # this whole process. Raising past the `finally` would leave that
+        # redirect in place — every later test in the process reading a temp
+        # config tree that no longer exists, which is a far worse failure than
+        # the one being reported, and a silent one.
+        #
+        # Order matters: the staged wheel must precede whatever the checkout's
+        # editable `.pth` will later append, and `scratch` only has to be
+        # somewhere importable for `sitecustomize`.
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(scratch),
+                str(staged_package()),
+                *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else []),
+            ]
+        )
         child, url, session_id = _shim.spawn_session(
             load_config(), timeout=SPAWN_TIMEOUT
         )
@@ -362,6 +700,8 @@ def live_session(
             tools=tools,
             scratch=scratch,
             skills_enabled=skills_enabled,
+            guard_log=guard_log,
+            child_pid=child.pid,
             _loop=loop,
             _session=session,
         )

@@ -37,7 +37,7 @@ from ._conversation import (
 )
 from ._models import EmptyCompletion
 from ._respondent import DONE, ScriptedRespondent, SilentRespondent
-from ._session import ToolResult, ToolSpec
+from ._session import CLIENT_TOOLS, ToolResult, ToolSpec
 
 
 @dataclass
@@ -54,6 +54,10 @@ class FakeSession:
     arrays: dict[str, object] = field(default_factory=dict)
     calls: list[tuple[int, str, dict]] = field(default_factory=list)
     _turn: int = 0
+
+    @property
+    def agent_tools(self) -> list[ToolSpec]:
+        return [*self.tools, *CLIENT_TOOLS]
 
     def call(self, name, /, **arguments):
         self.calls.append((self._turn, name, dict(arguments)))
@@ -103,6 +107,23 @@ def test_tool_calls_go_to_the_session_and_never_to_the_respondent():
 
     assert trace.tool_names == ["server_status"]
     assert respondent.heard == ["All set."]
+
+
+def test_the_model_is_offered_the_resource_verbs():
+    """What the agent is *given* is the whole surface, not just the server's.
+
+    The loop translates one list onto the wire, so if it reads `tools` instead
+    of `agent_tools` the resource verbs never reach the model — which is the
+    original bug, and it is invisible from the session object alone.
+    """
+    agent = ScriptedAgent([_says("done")])
+    session = FakeSession()
+
+    converse(session, agent, ScriptedRespondent([]), task="t")
+
+    offered = {t["function"]["name"] for t in agent.seen_tools}
+    assert {"read_resource", "list_resources"} <= offered, sorted(offered)
+    assert {t.name for t in session.tools} <= offered
 
 
 def test_narration_alongside_a_tool_call_does_not_reach_the_user():
