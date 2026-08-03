@@ -250,6 +250,10 @@ ARMS_ENV = "BIOPB_SKILL_ARMS"
 ARM_SETS: dict[str, tuple[Arm, ...]] = {
     "all": ARMS,
     "asked": tuple(a for a in ARMS if a.asked),
+    # The complement. Termination has nowhere else to come from in these two —
+    # `SilentRespondent` never returns DONE — so they are where the completion
+    # sentinel and the stall guard are actually exercised.
+    "silent": tuple(a for a in ARMS if not a.asked),
 }
 
 
@@ -265,7 +269,7 @@ def selected_arms() -> tuple[Arm, ...]:
         raise ValueError(
             f"{ARMS_ENV}={choice!r} is not one of {sorted(ARM_SETS)} — "
             "`all` is the 2x2, `asked` drops the two silent arms, which measure "
-            "the fixture rather than the skill."
+            "the fixture rather than the skill, and `silent` is their complement."
         )
     return ARM_SETS[choice]
 

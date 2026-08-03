@@ -414,3 +414,17 @@ def test_a_failed_smoke_test_is_recorded_and_a_skipped_one_is_not(monkeypatch):
     conftest.pytest_runtest_logreport(Report(f"{conftest.SMOKE}::skipped", False))
     conftest.pytest_runtest_logreport(Report("test_benchmark.py::other", True))
     assert conftest.smoke_failures() == [f"{conftest.SMOKE}::boom"]
+
+
+def test_the_arm_sets_partition_the_square(monkeypatch):
+    """`asked` and `silent` are complements, and together they are `all` — so
+    two half-price runs cover the same ground as one full one."""
+    monkeypatch.setenv(ARMS_ENV, "asked")
+    _benchmark._dotenv_reset = None
+    asked = set(selected_arms())
+    monkeypatch.setenv(ARMS_ENV, "silent")
+    silent = set(selected_arms())
+
+    assert asked and silent
+    assert not (asked & silent)
+    assert asked | silent == set(ARMS)
