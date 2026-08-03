@@ -3,7 +3,7 @@ id: flatfield
 title: Correct uneven illumination across a set of tiles or fields
 description: Remove vignetting and shading from a collection of images taken on the same optics, so intensities are comparable within a frame and between frames.
 tags: [illumination, correction, preprocessing, intensity]
-version: 1.0.0
+version: 1.1.0
 checklist: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0]
 ---
 
@@ -187,9 +187,10 @@ that was not there.
 
 ## Guardrails
 
-- **Correct before registering, never after.** A seam-finder run on uncorrected
-  tiles fits the vignette instead of the specimen, and correcting afterwards
-  cannot undo an offset that is already baked into the mosaic.
+- **Correct before registering, never after.** Not because registration fails on
+  uncorrected tiles — measured, it barely moves — but because the score a
+  stitcher accepts pairs on loses most of its margin, and because a seam that is
+  a brightness step cannot be fixed by moving a tile. See [[stitch-tiles]].
 - **The corrected data is no longer raw counts.** Division rescales intensities,
   so photon statistics and any calibration expressed in counts belong to the raw
   stack. Keep it.
@@ -212,9 +213,11 @@ that was not there.
 
 ## Next steps
 
-- Register the corrected tiles into a mosaic. Order matters: this correction
-  comes first, and a seam that survives it is a registration problem, not an
-  illumination one.
+- Register the corrected tiles into a mosaic with [[stitch-tiles]]. Order
+  matters, though not for the reason usually given: registration barely notices
+  shading, but the correlation score it accepts pairs on loses most of its margin
+  without this step. A seam that survives the correction is a registration
+  problem, not an illumination one.
 - Report intensities and sizes from the corrected stack with
   [[calibrated-measurements]], carrying the pixel spacing across (step 6).
 - For a time series where the field of view moved rather than the illumination
