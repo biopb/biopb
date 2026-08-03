@@ -766,3 +766,27 @@ def test_a_provider_that_never_reasons_is_left_alone():
     assistants = _sent_assistants(agent)
     assert assistants
     assert all(set(m) <= {"role", "content", "tool_calls"} for m in assistants)
+
+
+def test_a_declined_working_question_is_recorded_as_a_reply():
+    """A rhetorical "?" inside a working turn reaches the respondent, which
+    correctly answers DONE — "not a question to me". That is the respondent
+    replying, so it belongs in the trace: without it a run whose respondent
+    behaved perfectly reports `asked-but-unanswered`, which reads as broken.
+
+    The agent still never sees the sentinel — it was working, not waiting."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Is that the structural one? Let me check.",
+                tool_calls=(ToolCall("i", "server_status", {}),),
+            ),
+            _calls("execute_code", code="x=1"),
+        ]
+    )
+    respondent = ScriptedRespondent([], fallback=DONE)
+
+    trace = converse(FakeSession(), agent, respondent, task="t", max_turns=3)
+
+    assert trace.answers, "the respondent replied; the trace said it did not"
+    assert trace.stopped != FINISHED, "a working turn must not be ended by DONE"

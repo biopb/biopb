@@ -387,7 +387,7 @@ class OpenAICompatText:
     def name(self) -> str:
         return self.choice.name
 
-    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> str:
+    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> Reply:
         from openai import OpenAI
 
         kwargs = {"api_key": self.choice.key}
@@ -419,7 +419,7 @@ class AnthropicText:
     def name(self) -> str:
         return self.choice.name
 
-    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> str:
+    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> Reply:
         import anthropic
 
         kwargs = {"api_key": self.choice.key}

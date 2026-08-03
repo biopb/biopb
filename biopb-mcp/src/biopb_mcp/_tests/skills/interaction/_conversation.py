@@ -369,9 +369,17 @@ def converse(
                 # finished": the agent was working, not handing off. Ending
                 # the run on it would turn every rhetorical question inside a
                 # working turn into a terminated arm — the same bug, mirrored.
+                #
+                # It is still recorded. `DONE` is the respondent *replying*,
+                # and a trace with no reply at all is what
+                # `asked-but-unanswered` reads as a broken respondent — so
+                # leaving it out would report a respondent that answered
+                # correctly as one that never answered. Only the trace gets
+                # it: the agent has no use for the sentinel and was not
+                # waiting on one.
+                trace.events.append(Event(turn=turn, role="user", text=answer))
                 if answer.strip() != DONE:
                     messages.append({"role": "user", "content": answer})
-                    trace.events.append(Event(turn=turn, role="user", text=answer))
             continue
 
         idle_turns += 1
