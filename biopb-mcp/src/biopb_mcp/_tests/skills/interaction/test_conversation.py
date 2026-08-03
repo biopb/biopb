@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -585,3 +586,36 @@ def test_a_rejected_request_reports_what_it_sent():
     assert "tool_calls=2" in text
     assert "reasoning_content" in text, "the key that matters has to be visible"
     assert "go" not in text, "content must not be dumped into the reason column"
+
+
+# --- what a tool result looks like to the agent -----------------------------
+
+
+def test_an_image_result_is_reported_not_dropped():
+    """`take_screenshot` returns an `ImageContent` — no `.text` — and the old
+    filter kept only blocks that had one, so a captured screenshot reached the
+    agent as an empty string. Measured cost: an agent built a montage to look
+    at, got nothing twice, concluded the tool was broken, and worked around a
+    tool that was working."""
+    from ._session import describe_block
+
+    image = SimpleNamespace(type="image", data="A" * 4096, mimeType="image/png")
+    rendered = describe_block(image)
+
+    assert rendered.strip(), "an image must not render as nothing"
+    assert "image/png" in rendered
+    assert "KB" in rendered, "the agent should be able to tell it is non-trivial"
+
+
+def test_a_text_result_is_unchanged():
+    from ._session import describe_block
+
+    assert describe_block(SimpleNamespace(type="text", text="shape (24, 2)")) == (
+        "shape (24, 2)"
+    )
+
+
+def test_an_unknown_block_still_says_something():
+    from ._session import describe_block
+
+    assert describe_block(SimpleNamespace(type="resource")).strip()
