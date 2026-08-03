@@ -667,20 +667,27 @@ def live_session(
     )
     os.environ[ENV_GUARD_LOG] = str(guard_log)
     os.environ[ENV_GUARD_MARKERS] = os.pathsep.join(guard_markers())
-    # Order matters: the staged wheel must precede whatever the checkout's
-    # editable `.pth` will later append, and `scratch` only has to be somewhere
-    # importable for `sitecustomize`.
-    os.environ["PYTHONPATH"] = os.pathsep.join(
-        [
-            str(scratch),
-            str(staged_package()),
-            *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else []),
-        ]
-    )
 
     child = session_id = loop = None
     stop = None
     try:
+        # Inside the try, because building the wheel can fail and everything
+        # above has already redirected `XDG_CONFIG_HOME` and the tensor URL for
+        # this whole process. Raising past the `finally` would leave that
+        # redirect in place — every later test in the process reading a temp
+        # config tree that no longer exists, which is a far worse failure than
+        # the one being reported, and a silent one.
+        #
+        # Order matters: the staged wheel must precede whatever the checkout's
+        # editable `.pth` will later append, and `scratch` only has to be
+        # somewhere importable for `sitecustomize`.
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(scratch),
+                str(staged_package()),
+                *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else []),
+            ]
+        )
         child, url, session_id = _shim.spawn_session(
             load_config(), timeout=SPAWN_TIMEOUT
         )

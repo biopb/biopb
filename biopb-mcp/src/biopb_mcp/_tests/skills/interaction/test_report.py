@@ -20,6 +20,7 @@ for.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -228,6 +229,39 @@ def test_an_arm_that_peeked_and_then_died_still_reports_it():
     strange number matters most."""
     dead = Result(arm=ARMS[0], error="Boom", peeked=("/x/biopb_mcp/_tests/a.py",))
     assert any(f.startswith(FLAG_PEEKED) for f in dead.flags())
+
+
+def test_a_failed_bring_up_leaves_the_process_environment_as_it_found_it(
+    monkeypatch, tmp_path
+):
+    """Hermetic, and it guards a failure that would be invisible where it
+    happened.
+
+    `live_session` redirects `XDG_CONFIG_HOME` and the tensor URL for the whole
+    process and undoes it in a `finally`. Anything that raises *before* that
+    `try` leaves the redirect standing, so every later test in the process reads
+    a temp config tree that has already been deleted — and fails somewhere with
+    no connection to the cause. Staging the wheel is the step most likely to
+    raise (it shells out to `uv build`), which is why it belongs inside.
+    """
+    from . import _session
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "mine"))
+    monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://example:1234")
+    monkeypatch.setattr(_session, "why_unavailable", lambda: "")
+    monkeypatch.setattr(
+        _session,
+        "staged_package",
+        lambda: (_ for _ in ()).throw(_session.SessionUnavailable("no uv")),
+    )
+
+    with pytest.raises(_session.SessionUnavailable, match="no uv"):
+        with _session.live_session():
+            pass
+
+    assert os.environ["XDG_CONFIG_HOME"] == str(tmp_path / "mine")
+    assert os.environ["BIOPB_TENSOR_URL"] == "grpc://example:1234"
+    assert _session.ENV_GUARD_LOG not in os.environ
 
 
 def test_the_catalog_is_counted_from_what_the_tool_returned():
