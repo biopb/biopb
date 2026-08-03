@@ -14,17 +14,18 @@ checklist: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0]
 A grid of **overlapping** tiles that has to become one continuous image — to
 measure across a seam, or to segment without double-counting every boundary.
 
-The stage's own coordinates are not good enough for either: measured against
-tiles cut at known positions, nominal placement leaves an rms of **10 px** and
-individual tiles **16–18 px** out. Registering on the overlap brings that to
-**0.0–1.0 px**, and often to exactly right.
+The stage's own coordinates are not good enough for either: against tiles cut at
+known positions, nominal placement left an rms of **10 px** (individual tiles
+**16–18 px** out) where registering on the overlap gave **0.0–1.0 px**.
 
 ## When NOT to use
 
-- **The tiles do not overlap, or overlap by less than about 10%.** Measured on
-  the same fixture, 12% overlap still registers to under 1 px, 10% fragments the
-  grid into 4–5 unregisterable pieces and 8% into 8. Place at nominal, say the
-  seams are unregistered, and do not report a computed alignment.
+- **The tiles do not overlap, or share too little texture where they do.** Below
+  ~10% expect failure — on the fixture, 12% still registered to under 1 px, 10%
+  fragmented the grid into 4–5 pieces and 8% into 8. But the cliff follows
+  texture, not percentage, so run it and let **step 5** decide rather than
+  declining on the number. If it fails, place at nominal and report the seams as
+  unregistered rather than computed.
 - **The sample deforms between tiles.** Serial sections, folded tissue — anything
   where a tile is not a rigid translation of what it shares. This estimates two
   numbers per pair; elastic registration is a different job.
@@ -44,8 +45,8 @@ individual tiles **16–18 px** out. Registering on the overlap brings that to
 | `GRID` | (rows, cols) | From stage positions in the metadata if they are there; otherwise **ask**. `n_tiles == rows * cols` is a check, not a derivation — 24 tiles is 4×6 or 6×4 |
 | `TILE_ORDER` | — | Row-major, or **snake** (alternate rows reversed). Snake read as row-major mirrors every other row. Step 5 does catch it — measured, the accepted pairs fell into 15 pieces instead of 1 — but as "registration failed", so ask rather than diagnose it backwards |
 | `OVERLAP` | % of tile width | The nominal value from the acquisition, 10–20% typically. It sets where to look, not where the tile lands |
-| `PAD` | px | How far past the nominal overlap to search — the stage's positional error, `32` if nobody knows. Too small misses the true offset; too large costs only time |
-| `NCC_MIN` | 0–1 | `0.5`. Pairs below it are rejected. **Not a knob** — see step 4 |
+| `PAD` | px | How far past the nominal overlap to search — **the stage's positional error**, from the acquisition. `32` if nobody knows, which cleared the 16–18 px error measured on the fixture with margin. Too small misses the true offset; too large costs only time |
+| `NCC_MIN` | 0–1 | The gap between the two clusters of pair scores, read off the sorted list before rejecting anything (step 4). `0.5` is where that gap sat on the fixture these numbers come from — it is a starting point, not a constant |
 
 ## Steps
 
@@ -64,17 +65,15 @@ individual tiles **16–18 px** out. Registering on the overlap brings that to
    throws the registration away too. The blend holds an accumulator *and* a
    weight canvas, both float32, so budget **8 bytes per output pixel** — not the
    2 a `uint16` suggests — over a tile stack that stays resident. Past half of
-   `memory_available` the escape is a **coarser pyramid level**, which is the
-   user's call. Registration is never the problem: 180 pairs of 2048 px tiles
-   take about 3 s.
+   `memory_available` the escape is a **coarser pyramid level**, the user's call.
+   Registration itself is never the constraint; the blend is.
 
 3. **Correct the illumination first, with [[flatfield]]** — but not for the
-   reason usually given. Registration barely notices shading: under a vignette
-   whose corners sit at 15% of the centre it went 0.4 px to 0.7 px, with the same
-   pairs accepted. What shading destroys is **step 4's score**, where a correct
-   pair falls from 0.94 to 0.68 and a wrong one rises from 0.10 to 0.33 — most of
-   the margin step 5's gate runs on. The seams themselves are photometric anyway:
-   a brightness step no placement can remove.
+   reason usually given. Registration barely notices shading (0.4 px to 0.7 px
+   under a vignette whose corners sit at 15% of the centre, same pairs accepted).
+   What shading destroys is **step 4's gap**: a correct pair fell 0.94 → 0.68 and
+   a wrong one rose 0.10 → 0.33, closing it from both sides. The seams are
+   photometric anyway — a brightness step no placement can remove.
 
 4. **Estimate each neighbouring pair.** Correlate the strips where the two tiles
    are *expected* to overlap, not the whole tiles, and score the result on the
@@ -116,10 +115,13 @@ individual tiles **16–18 px** out. Registering on the overlap brings that to
    **Score the pair separately, and never reuse `phase_cross_correlation`'s
    second return value as that score** — it describes the correlation, not the
    alignment, and does not separate a registered pair from an unregistered one.
-   The correlation on the overlap separates them completely: correct pairs score
-   **≥ 0.93** and wrong ones **≤ 0.13**. So `NCC_MIN` is not a knob — anything
-   from 0.2 to 0.8 gives the same answer, and a value that changes the result is
-   telling you about step 3.
+   The overlap correlation does, into two clusters with nothing between: on the
+   fixture, correct pairs scored **≥ 0.93** and wrong ones **≤ 0.13**. **The gap
+   transfers; those two values do not** — both slide with texture and SNR, so read
+   the cut off the data: `print(np.sort(scores))` before rejecting anything, and
+   take the break. No break is a finding rather than a threshold to pick — either
+   shading was never corrected (step 3), which closes the gap from both sides, or
+   the strips share too little texture, which step 5 will say plainly.
 
 5. **Gate on the graph, not on the count** *(blocking)*. Whether this mosaic is
    trustworthy is one number, it is available before anything is composed, and it
@@ -179,15 +181,13 @@ individual tiles **16–18 px** out. Registering on the overlap brings that to
    assumes step 5 passed: a tile the tree cannot reach keeps the position it was
    initialised with, silently.
 
-   **The usual argument against the tree is backwards, so do not be talked out
-   of it.** Least squares over every accepted pair is the other obvious route,
-   preferred on the grounds that a tree accumulates error along its path — which
-   is not what happens. The tree composes offsets that are individually *exact*,
-   so nothing accumulates; least squares averages them into fractional positions
-   that then round the wrong way. At 20% overlap the tree puts **100%** of tiles
-   on the correct pixel and least squares 52–92%. Regularising it toward the
-   nominal grid, the other common addition, only pulls the answer back toward the
-   stage error being corrected for.
+   **The usual argument against the tree is backwards, so do not be talked out of
+   it.** Least squares over every accepted pair is preferred on the grounds that a
+   tree accumulates error along its path — which is not what happens: the tree
+   composes offsets that are individually *exact*, while least squares averages
+   them into fractional positions that round the wrong way (at 20% overlap, 100%
+   of tiles on the correct pixel against 52–92%). Regularising toward the nominal
+   grid only pulls the answer back toward the stage error being corrected for.
 
 7. **Blend, and publish what was applied.** Weight each pixel by its distance to
    its own tile's edge, as a **separable product** — an `np.minimum` of the two
@@ -234,7 +234,7 @@ individual tiles **16–18 px** out. Registering on the overlap brings that to
 | Mosaic is a diagonal staircase, or tiles pile into one corner | `rows`/`cols` transposed | Step 2 — `n_tiles == rows * cols` does not catch a square grid |
 | Nearly every pair rejected, on tiles that plainly overlap | `normalization` left at skimage's `"phase"` default | Pass `normalization=None` (step 4) |
 | Pairs rejected along one axis only | `PAD` smaller than the stage's error on that axis | Raise `PAD`; it costs time, not accuracy |
-| `n_parts > 1`, and raising `PAD` does not help | Genuinely too little overlap, or blank tiles with nothing to correlate | Below ~10% overlap this is not recoverable — report nominal placement as unregistered |
+| `n_parts > 1`, and raising `PAD` does not help | Genuinely too little shared texture, or blank tiles with nothing to correlate | Not recoverable by tuning — report nominal placement as unregistered. Thin overlap is the usual cause (~10% on ordinary content), but featureless tiles fail at any width |
 | Offsets are believable but the mosaic is blurred at every seam | Registered on uncorrected tiles, so shading dragged the correlation | Step 3 — correct first, then re-register |
 | Seams show as brightness steps, with the pixels aligned | Illumination was never corrected; placement is fine | [[flatfield]] on the tiles, then re-blend — no need to re-register |
 | One tile is far off and everything after it follows | Offsets accumulated along the acquisition path instead of composed | Step 6 |
