@@ -19,6 +19,7 @@ That is the property this layer needs to survive a catalogue of thirty.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from .._validate import NOT_SKILLS
@@ -41,11 +42,15 @@ def case(request):
     return request.param
 
 
+def _built(skill: str) -> Fixture:
+    if skill not in _FIXTURES:
+        _FIXTURES[skill] = next(c for c in CASES if c.skill == skill).build()
+    return _FIXTURES[skill]
+
+
 @pytest.fixture
 def built(case) -> Fixture:
-    if case.skill not in _FIXTURES:
-        _FIXTURES[case.skill] = case.build()
-    return _FIXTURES[case.skill]
+    return _built(case.skill)
 
 
 def test_there_is_at_least_one_case():
@@ -130,6 +135,48 @@ def test_the_fixture_keeps_its_truth_out_of_the_data(built):
     answer to."""
     shared = set(built.data) & set(built.truth)
     assert not shared, f"{built.label}: {sorted(shared)} is both given and withheld"
+
+
+#: Widest run of identical rows or columns tolerated at a frame border. A
+#: synthetic field is sparse, so some edge really is flat background: measured
+#: over six seeds, every frame of every channel stays under 6 px. Rendering
+#: frame-sized and shifting in place instead of cropping a padded canvas reached
+#: 25 px, and the width tracked the offset.
+MAX_FLAT_BORDER_PX = 10
+
+
+def _flat_border_px(frame, tol=1e-3) -> int:
+    """Rows at the top edge of `frame` that are copies of their neighbour."""
+    varies = np.abs(np.diff(frame, axis=0)).mean(axis=1) > tol
+    return int(np.argmax(varies)) if varies.any() else frame.shape[0]
+
+
+def test_the_drifted_movie_invents_no_pixels():
+    """The same leak as `test_the_fixture_keeps_its_truth_out_of_the_data`, by
+    the other route: not a truth *key* left in `data`, but the truth painted
+    into the pixels.
+
+    A stage that moves reveals sample that was outside the field of view; it
+    does not create pixels. Shift a frame-sized image and the interpolator has
+    to invent the vacated border, and the width of what it invents *is* the
+    shift — the withheld trajectory, readable off the edges with no registration
+    at all, and a band of flat correlated structure sitting inside the very data
+    the run registers on.
+    """
+    movie = _built("drift-correction").data["movie"]
+    worst = {"px": 0, "frame": -1, "channel": -1, "edge": -1}
+    for t, frame in enumerate(movie):
+        for c, plane in enumerate(frame):
+            # All four edges: flip to bring each one to the top in turn.
+            for edge, view in enumerate((plane, plane[::-1], plane.T, plane.T[::-1])):
+                width = _flat_border_px(view)
+                if width > worst["px"]:
+                    worst = {"px": width, "frame": t, "channel": c, "edge": edge}
+    assert worst["px"] <= MAX_FLAT_BORDER_PX, (
+        f"drift-correction: {worst['px']} px of flat border at frame "
+        f"{worst['frame']}, channel {worst['channel']}, edge {worst['edge']} — "
+        "the field of view is showing pixels no acquisition produced"
+    )
 
 
 def test_the_fixture_provides_every_layer_the_case_loads(case, built):
