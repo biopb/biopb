@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from ._schema import CURRENT_SPEC_VERSION, REQUIRED_SECTIONS
+from ._schema import CURRENT_SPEC_VERSION, EVIDENCE_SECTIONS, REQUIRED_SECTIONS
 from ._validate import first_h1, h2_sections, validate
 from .conftest import make_body, write_skill
 
@@ -94,6 +94,25 @@ def test_each_required_section_is_individually_required(skills_dir, dropped):
     entries, rep = validate(skills_dir)
     assert entries == []
     assert dropped in messages(rep)
+
+
+@pytest.mark.parametrize("section", EVIDENCE_SECTIONS)
+def test_an_evidence_section_is_optional_and_silent_when_absent(skills_dir, section):
+    """Not even a warning. A skill whose workflow has never failed has nothing to
+    put in a failure table, and a nag is answered by inventing a row."""
+    write_skill(skills_dir, "my-skill", body=make_body())
+    entries, rep = validate(skills_dir)
+    assert [e.id for e in entries] == ["my-skill"]
+    assert section not in messages(rep)
+
+
+@pytest.mark.parametrize("section", EVIDENCE_SECTIONS)
+def test_an_evidence_section_is_accepted_when_present(skills_dir, section):
+    body = make_body(sections=REQUIRED_SECTIONS + (section,))
+    write_skill(skills_dir, "my-skill", body=body)
+    entries, rep = validate(skills_dir)
+    assert rep.errors == []
+    assert [e.id for e in entries] == ["my-skill"]
 
 
 def test_missing_frontmatter_is_an_error(skills_dir):

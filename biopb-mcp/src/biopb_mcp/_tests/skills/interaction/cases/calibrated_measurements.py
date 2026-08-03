@@ -55,7 +55,7 @@ SKILL = "calibrated-measurements"
 
 #: (Z, Y, X) µm per voxel — the fact the fixture strips and the persona holds.
 #: Anisotropic on purpose: a run that assumes cubic voxels is wrong by the Z:XY
-#: ratio alone, which is the body's second failure-table row.
+#: ratio alone, which is the first row of the body's failure table.
 SPACING_UM = (0.5, 0.1, 0.1)
 
 # Both tight, because both quantities are exact by construction: the volume is a

@@ -6,6 +6,7 @@ import pytest
 
 from ._schema import (
     CURRENT_SPEC_VERSION,
+    EVIDENCE_SECTIONS,
     KEBAB,
     REQUIRED_SECTIONS,
     SEMVER,
@@ -57,11 +58,17 @@ def test_kebab_rejects(s):
     assert not KEBAB.match(s)
 
 
-def test_required_sections_are_normalized_form():
+def test_section_names_are_normalized_form():
     # h2_sections() lowercases and strips punctuation before comparing, so the
     # constants must already be in that form or nothing would ever match.
-    for s in REQUIRED_SECTIONS:
+    for s in REQUIRED_SECTIONS + EVIDENCE_SECTIONS:
         assert s == s.lower().strip(" .:")
+
+
+def test_the_evidence_sections_are_not_also_required():
+    # The whole point of the split: a section the gate demands is a section that
+    # gets written from imagination on the skills that have nothing to report.
+    assert not set(EVIDENCE_SECTIONS) & set(REQUIRED_SECTIONS)
 
 
 def test_entry_to_dict_is_complete_and_ordered():

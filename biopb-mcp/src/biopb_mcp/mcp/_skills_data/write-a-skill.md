@@ -102,19 +102,32 @@ The frontmatter fields, and how to determine each:
    there is none, which is just as useful to say. It belongs beside the check,
    where the agent decides whether to go on.
 
-3. **Draft the six required sections**: *When to use*, *When NOT to use*,
-   *Parameters*, *Steps*, *Failure modes*, *Next steps*. Two carry most of the
-   value and are the ones most often skipped:
-
-   - **When NOT to use** — the negative case an agent cannot infer (do not apply
-     background subtraction to a ratiometric image; do not deconvolve before
-     quantifying).
-   - **Failure modes** — a symptom → cause → fix table. An agent cannot debug an
-     unfamiliar pipeline from first principles, but it can match a signature.
+3. **Draft the four required sections**: *When to use*, *When NOT to use*,
+   *Parameters*, *Steps*. Each is answerable from the run you have just done.
+   The one most often skipped is **When NOT to use** — the negative case an agent
+   cannot infer (do not apply background subtraction to a ratiometric image; do
+   not deconvolve before quantifying).
 
    Give parameters as a table of name, unit, and *how to derive the value from
    the data*. `radius = 1.5x the largest object diameter` is usable; `radius=50`
    is not.
+
+   **A *Failure modes* table is optional, and it is a record, not a forecast.**
+   Add a symptom → cause → fix row when a failure has actually been observed —
+   dogfooding it (step 5), a measurement, a user report — and give the fix that
+   worked. Never fill it by imagining what could go wrong: an invented row is
+   indistinguishable from an observed one once it is in the table, and an agent
+   matching a symptom to an invented cause debugs confidently in the wrong
+   direction. One row per failure that happened, like a regression test, and **no
+   section at all** where nothing has failed yet — the validator does not ask for
+   one. *Next steps* is optional on the same terms: the handoffs your steps really
+   produce, not the adjacent workflows you can imagine.
+
+   **Where the evidence goes is the PR, not the row.** Whoever reads this file has
+   the body and nothing else — no repository, no pull request, no measurement
+   script — so "we measured this" is a sentence they can neither check nor act on.
+   What belongs in the row is the part that survives on its own: the number the
+   symptom can be compared against, and the version or regime it holds for.
 
 4. **Put checkpoints in the steps, by name.** "Check with the user when
    appropriate" produces either constant interruption or none at all:
@@ -141,8 +154,9 @@ The frontmatter fields, and how to determine each:
 5. **Dogfood it** *(visual check)*. Follow the drafted steps verbatim against
    real data, in the session you are already in — including the checkpoints.
    Anything you fix by improvising is a gap in the skill: fix the file, not the
-   run. Then read the draft for hidden state: every variable and layer it uses
-   must be created by its own steps, not left over from this conversation.
+   run — and where a *Failure modes* row is earned. Then read the draft for
+   hidden state: every variable and layer it uses must be created by its own
+   steps, not left over from this conversation.
 
    A genuinely clean-room run needs `restart_kernel`, which **destroys the
    namespace, every layer, and any running job**. That is a *validate-and-gate*:
@@ -155,8 +169,10 @@ The frontmatter fields, and how to determine each:
    - `description` reads like the user's request; that string is what
      `find_skills` ranks on.
    - `tags` reuse tags you have seen on existing skills.
-   - All six sections are present as `##` headings.
+   - The four required sections are present as `##` headings.
+   - Every failure row names a failure that actually happened (step 3).
    - Every parameter has a derivation rule, not a magic constant.
+   - Every `[[skill-id]]` links a skill that exists.
    - The body is under roughly 200 lines — a proxy for the rule below.
 
    **Then ablate it.** A skill earns its length by fixing what a model gets wrong
@@ -200,8 +216,7 @@ The frontmatter fields, and how to determine each:
 |---|---|---|
 | A saved skill never appears in `find_skills` | Saved outside `~/.config/biopb/skills`, or the filename starts with `_` (private), or skills are switched off | Check the path and `services.skills_enabled` |
 | Section written as bold text or a deeper heading | Required sections are `##` headings | Use `## ` with the exact section names |
-| The body has grown past ~200 lines | An algorithm is living in the skill | Move it to a plugin or a package pointer (step 2) |
-| The body is long but every line reads as necessary | Never ablated — obviousness is invisible from the inside | Diff it against a cold small-model run (step 6) |
+| The body is long but every line reads as necessary | Never ablated — obviousness is invisible from the inside | Diff it against a cold model run (step 6) |
 
 ## Next steps
 
@@ -212,5 +227,3 @@ The frontmatter fields, and how to determine each:
   not on a site deploy — CI validates the frontmatter and the required sections
   on the pull request. Keeping the local copy is what covers the gap until then.
 - Editing a published skill: change the body, bump `version`, leave `id` alone.
-- Link related skills with `[[skill-id]]` so multi-step work composes into a
-  chain, and only link ids that exist.
