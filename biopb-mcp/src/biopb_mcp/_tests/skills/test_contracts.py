@@ -290,12 +290,13 @@ def test_transform_stack_returns_float64(StackReg, drifting_movie):
 
 
 def test_phase_cross_correlation_still_defaults_to_phase_normalization():
-    """The first row of the skill's failure table exists because this default
-    whitens frequency bins holding only numerical noise, so a smooth
-    low-contrast movie recovers ~0 drift and reports success. The body's fix is
-    `normalization=None`. Both halves are asserted here: if skimage ever changed
-    the default the row would be wrong, and if the parameter went away the fix
-    would be unrunnable.
+    """A failure row in two bodies exists because this default whitens
+    frequency bins holding only numerical noise: `drift-correction` recovers ~0
+    drift on a smooth movie and reports success, and `stitch-tiles` measured the
+    share of tile pairs it registers correctly falling from 92% to 68%. Both fix
+    it with `normalization=None`. Both halves are asserted here: if skimage ever
+    changed the default the rows would be wrong, and if the parameter went away
+    the fix would be unrunnable.
     """
     import inspect
 
@@ -304,3 +305,25 @@ def test_phase_cross_correlation_still_defaults_to_phase_normalization():
     params = inspect.signature(phase_cross_correlation).parameters
     assert "normalization" in params
     assert params["normalization"].default == "phase"
+
+
+def test_phase_cross_correlation_still_returns_three_values():
+    """`stitch-tiles` unpacks `shift, _, _ = phase_cross_correlation(...)`.
+
+    The arity is not obvious from the docs — older releases returned the error
+    and phase difference only on request — and a body that unpacks the wrong
+    number of values fails at the first pair, on every run, for every user.
+    """
+    import numpy as np
+    from skimage.registration import phase_cross_correlation
+
+    reference = np.random.default_rng(0).random((64, 64))
+    result = phase_cross_correlation(
+        reference, np.roll(reference, 3, axis=1), normalization=None
+    )
+    assert isinstance(result, tuple) and len(result) == 3
+    shift = np.asarray(result[0], float)
+    assert shift.shape == (2,)
+    # And it means what the body's `pair_offset` assumes: the offset that maps
+    # the moving image onto the reference, sign included.
+    assert tuple(shift) == (0.0, -3.0)
