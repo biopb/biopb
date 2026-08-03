@@ -102,9 +102,9 @@ def test_tool_calls_go_to_the_session_and_never_to_the_respondent():
     assert respondent.heard == ["All set."]
 
 
-def test_a_turn_that_both_speaks_and_calls_is_not_a_question():
-    """Models narrate while acting. Counting that as a blocking question would
-    inflate every structural assertion in §5."""
+def test_narration_alongside_a_tool_call_does_not_reach_the_user():
+    """Models narrate while acting, and a status update is not a question.
+    Only a turn that actually asks something is routed."""
     agent = ScriptedAgent(
         [
             AgentTurn(
@@ -117,6 +117,56 @@ def test_a_turn_that_both_speaks_and_calls_is_not_a_question():
     converse(FakeSession(), agent, respondent, task="t")
 
     assert respondent.heard == [], "narration was mistaken for a question"
+
+
+def test_a_question_asked_while_acting_still_reaches_the_user():
+    """The swallowed question. Routing used to key on "did this turn call a
+    tool", so a model that asked *and* kept working was never asked on the
+    user's behalf — it then said "I have asked, I will wait", and the run
+    ended on that sign-off with the question never delivered."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Which channel is structural?",
+                tool_calls=(ToolCall("i", "server_status", {}),),
+            ),
+            _says("Thanks, done."),
+        ]
+    )
+    respondent = ScriptedRespondent(
+        [("structural", "Channel 1, the membrane."), ("done", DONE)]
+    )
+    session = FakeSession()
+
+    trace = converse(session, agent, respondent, task="t")
+
+    assert "Which channel is structural?" in respondent.heard
+    assert "Channel 1, the membrane." in [
+        e.text for e in trace.events if e.role == "user"
+    ]
+    assert trace.tool_names == ["server_status"], "the tool still ran"
+
+
+def test_a_working_turn_is_never_ended_by_the_sentinel():
+    """The mirrored bug. `DONE` on a turn that also called tools means "not a
+    question to me", not "we are finished" — the agent was working. Ending
+    there would make every rhetorical question inside a working turn a
+    terminated arm."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Is that the structural one? Let me check.",
+                tool_calls=(ToolCall("i", "server_status", {}),),
+            ),
+            _calls("execute_code", code="offsets = ..."),
+        ]
+    )
+    respondent = ScriptedRespondent([], fallback=DONE)
+
+    trace = converse(FakeSession(), agent, respondent, task="t", max_turns=4)
+
+    assert trace.stopped != FINISHED, "a working turn was read as a hand-off"
+    assert trace.tool_names == ["server_status", "execute_code"]
 
 
 # --- stopping --------------------------------------------------------------

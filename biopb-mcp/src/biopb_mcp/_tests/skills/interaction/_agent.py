@@ -90,6 +90,23 @@ class AgentTurn:
         return not self.tool_calls and not self.text.strip()
 
     @property
+    def asks_something(self) -> bool:
+        """Whether this turn puts a question to the user, tools or not.
+
+        **Deliberately not** :attr:`is_question`, which is about whether the
+        agent *blocked*. A model that asks while it keeps working has still
+        asked, and a user sitting there would see it — so routing has to read
+        this and the ask budget goes on reading `is_question`.
+
+        The test is a question mark, the same heuristic
+        `Trace.blocking_questions` documents: it cannot see "let me know which
+        channel is structural", and it over-fires on a rhetorical question.
+        The loop's answer to the over-firing is to refuse to *end* a run on a
+        turn that also called tools.
+        """
+        return bool(self.text.strip()) and "?" in self.text
+
+    @property
     def was_truncated(self) -> bool:
         """Cut off at the token budget rather than finished.
 

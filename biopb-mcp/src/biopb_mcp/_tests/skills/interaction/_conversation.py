@@ -295,6 +295,31 @@ def converse(
                 trace.stopped = TOOL_CAP
                 return trace
             idle_turns = 0
+
+            # A question asked while acting is still a question. Routing used
+            # to key on "did this turn call a tool", which conflated *should
+            # the user see this* with *did the agent block* — so a model that
+            # asked and kept working had the question swallowed, then said "I
+            # have asked, I will wait", and the run ended on the sign-off with
+            # nobody having been asked anything.
+            if step.asks_something:
+                try:
+                    answer = respondent.reply(step.text)
+                except EmptyCompletion as failure:
+                    trace.stopped = RESPONDENT_FAILED
+                    trace.events.append(
+                        Event(
+                            turn=turn, role="harness", text=str(failure), is_error=True
+                        )
+                    )
+                    return trace
+                # `DONE` here means "not a question to me", not "we are
+                # finished": the agent was working, not handing off. Ending
+                # the run on it would turn every rhetorical question inside a
+                # working turn into a terminated arm — the same bug, mirrored.
+                if answer.strip() != DONE:
+                    messages.append({"role": "user", "content": answer})
+                    trace.events.append(Event(turn=turn, role="user", text=answer))
             continue
 
         idle_turns += 1

@@ -402,6 +402,16 @@ turns past their last real action and were then reported `turn-cap` with
 tool call (healthy runs never exceeded two) now stop the run as `stalled`, which
 is flagged as itself rather than as a severance.
 
+**A question asked while acting is still a question.** Routing keyed on whether
+the turn called a tool, which conflated *should the user see this* with *did
+the agent block*. A model that asked its four questions in the same turn as a
+tool call had them swallowed, said "I have asked, I will wait" on the next
+turn, and the run ended on that sign-off with nobody having been asked
+anything — reported `no-result` against the skill. Any turn carrying a question
+is now routed whether or not it acted; the ask budget still counts what it
+counted before. The mirror of the bug is guarded too: `DONE` in reply to a turn
+that also called tools means "not a question to me", never "we are finished".
+
 Two things *are* asserted, and neither judges a skill: that the report reached
 disk with a transcript per arm, and that the ablation took effect. The second is
 not a finding — if `skills_enabled: false` stopped withholding the catalog, the
