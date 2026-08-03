@@ -68,6 +68,11 @@ RETRIEVES = [
     ("vignetting", "flatfield"),
     ("shading", "flatfield"),
     ("shading correction tiles", "flatfield"),
+    ("stitch", "stitch-tiles"),
+    ("stitch tiles", "stitch-tiles"),
+    ("mosaic", "stitch-tiles"),
+    ("tile grid", "stitch-tiles"),
+    ("overlapping tiles", "stitch-tiles"),
 ]
 
 # Queries that must not drag a skill in. Over-retrieval is not harmless: the
