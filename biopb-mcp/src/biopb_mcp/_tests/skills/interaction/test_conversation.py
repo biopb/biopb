@@ -559,3 +559,29 @@ def test_a_tool_call_clears_the_stall_counter():
     trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=16)
 
     assert trace.stopped == TURN_CAP, "a working conversation was called stalled"
+
+
+def test_a_rejected_request_reports_what_it_sent():
+    """`reasoning_content must be passed back` names a missing field, not
+    which turn or what surrounded it — and reproducing that costs a paid run,
+    because it depends on what the real tools returned. So the shape travels
+    with the error."""
+    from ._agent import RequestRejected
+
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "a"}, {"id": "b"}],
+            "reasoning_content": "...",
+        },
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+    ]
+
+    text = str(RequestRejected("openai:m", messages, RuntimeError("400 nope")))
+
+    assert "400 nope" in text
+    assert "tool_calls=2" in text
+    assert "reasoning_content" in text, "the key that matters has to be visible"
+    assert "go" not in text, "content must not be dumped into the reason column"

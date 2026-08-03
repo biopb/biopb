@@ -37,6 +37,38 @@ from ._bridge import parse_arguments
 from ._models import ModelChoice, agent_choice, echoed_fields
 
 
+class RequestRejected(RuntimeError):
+    """The provider refused the request, with the *shape* of what was sent.
+
+    **A rejection names the message it dislikes; the harness has to name the
+    conversation it built.** `reasoning_content in the thinking mode must be
+    passed back` says a turn was missing something, not which turn or what the
+    surrounding messages looked like — and reproducing it costs a paid run,
+    because it depends on what the real tools returned. So the shape travels
+    with the error: roles, the keys on each message, and how many tool calls
+    it carried. Never the content, which is large and is already in the trace.
+    """
+
+    def __init__(self, model: str, messages: list[dict], cause: Exception) -> None:
+        shape = "\n    ".join(_describe(m) for m in messages[-10:])
+        super().__init__(
+            f"{model} rejected the request: {cause}\n"
+            f"  last {min(len(messages), 10)} of {len(messages)} messages sent:\n"
+            f"    {shape}"
+        )
+        self.messages = messages
+        self.cause = cause
+
+
+def _describe(message: dict) -> str:
+    """One message as role + keys + tool-call count. No content."""
+    calls = len(message.get("tool_calls") or ())
+    keys = ",".join(sorted(k for k in message if k != "role"))
+    return f"{message.get('role'):<9} keys=[{keys}]" + (
+        f" tool_calls={calls}" if calls else ""
+    )
+
+
 @dataclass(frozen=True)
 class ToolCall:
     id: str
@@ -234,13 +266,16 @@ class ToolCallingAgent:
         return OpenAI(**kwargs)
 
     def respond(self, messages: list[dict], tools: list[dict]) -> AgentTurn:
-        completion = self._client().chat.completions.create(
-            model=self.choice.model,
-            messages=messages,
-            tools=tools,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
+        try:
+            completion = self._client().chat.completions.create(
+                model=self.choice.model,
+                messages=messages,
+                tools=tools,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+        except Exception as exc:
+            raise RequestRejected(self.name, messages, exc) from exc
         choice = completion.choices[0].message
         calls = tuple(
             ToolCall(
