@@ -3,7 +3,7 @@ id: write-a-skill
 title: Write a new biopb skill file
 description: Turn a workflow the user has just validated into a reviewed skill file for the biopb catalog.
 tags: [workflow, authoring]
-version: 1.1.0
+version: 1.2.0
 checklist: []
 ---
 
@@ -15,8 +15,9 @@ The user has finished a workflow worth repeating and wants it captured, or asks
 directly for a new skill. A skill is a markdown recipe retrieved by
 `find_skills`, and it can live in either of two places: the user's own
 `~/.config/biopb/skills/`, available to them immediately, or the curated catalog
-published on biopb.org, which a maintainer reviews. Same file either way — the
-destination is the user's choice, made at the end (step 7).
+that ships inside biopb-mcp, which a maintainer reviews and which goes live on
+the next release. Same file either way — the destination is the user's choice,
+made at the end (step 7).
 
 A skill is worth writing when the procedure is **multi-step**, has **decisions
 between the steps**, and is **standard practice in bioimaging rather than in
@@ -46,7 +47,7 @@ The frontmatter fields, and how to determine each:
 | `title` | One line, imperative. What the user gets |
 | `description` | One sentence. This is what `find_skills` ranks on — write it as the user's request, not as an implementation summary |
 | `tags` | A list of categories describing the skill. Reuse tags you have seen on published skills where they fit — consistent tags are what make discovery work |
-| `version` | `1.0.0` for a new skill. Bump on every content edit; the site derives `updated` from git, so never set a date by hand |
+| `version` | `1.0.0` for a new skill. Bump on every content edit — it is the only version signal a reader gets. There is no `updated` field: a shipped skill is dated by the release it rode, a local one by its file mtime, so never write a date by hand |
 | `checklist` | What the steps actually touch: `viewer`, `tensor`, `dask`, `ops:<kind>`, `plugin:<name>` (the plugin's **file stem**, e.g. `plugin:rolling_ball` ↔ `rolling_ball.py` — also the name it is bound under in the kernel namespace, so the body calls `rolling_ball.subtract_background(...)`), `pkg:<name>` with a version bound — `~=X.Y.Z` for a third party (a floor *and* an upper bound at the next minor, so the API the body quotes cannot move under it; never a bare floor, never `==`, and never a comma pair, which the runtime reader splits), `>=X.Y.Z` only for `biopb-mcp` itself. Not decoration and not a gate — the agent resolves this list against the live session before starting (see step 2) so it can tell the user what is missing and adapt, rather than discovering it mid-run. A skill that drives the kernel carries `pkg:biopb-mcp>=0.13.0`, the first release exposing the interface it is written against; raise that bound only if the skill needs something newer. An empty list is a real answer, not an omission: a skill whose steps touch nothing in the session has nothing to resolve |
 
 ## Steps
@@ -178,8 +179,9 @@ The frontmatter fields, and how to determine each:
      it is allowed). It is picked up on the next `find_skills`, with no restart,
      and reported as `origin: local` so later sessions can tell it apart from a
      reviewed skill. Editing the file takes effect immediately too.
-   - **Get it into the public catalog** — it goes through review by the biopb
-     maintainers, who own the `biopb-site` repository. Offer to write a short
+   - **Get it into the public catalog** — the catalog is `mcp/_skills_data/` in
+     the `biopb` repository, so promotion is a pull request moving this identical
+     file there, reviewed by the biopb maintainers. Offer to write a short
      summary alongside the file that they can send. Do not assume the user knows
      git or pull requests, and do not push anything yourself.
 
@@ -206,8 +208,9 @@ The frontmatter fields, and how to determine each:
 - A skill saved to `~/.config/biopb/skills` is live on the next `find_skills`,
   and stays personal and unreviewed (`origin: local`). Tell the user where it
   went, so they can edit or delete it without asking.
-- A skill accepted by the maintainers is live within one deploy of the site —
-  CI validates the frontmatter and the required sections at that point.
+- A skill accepted by the maintainers ships with the **next biopb-mcp release**,
+  not on a site deploy — CI validates the frontmatter and the required sections
+  on the pull request. Keeping the local copy is what covers the gap until then.
 - Editing a published skill: change the body, bump `version`, leave `id` alone.
 - Link related skills with `[[skill-id]]` so multi-step work composes into a
   chain, and only link ids that exist.
