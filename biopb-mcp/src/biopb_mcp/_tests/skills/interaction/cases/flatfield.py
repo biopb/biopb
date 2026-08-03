@@ -290,10 +290,16 @@ def save_artifacts(outcome: Outcome, where: Path) -> None:
     # bad, which is exactly backwards.
     save_png(np.abs(flat - truth_field), where / "field-error.png", vmax=scale)
 
-    darkfield = attempt.arrays.get("darkfield")
-    offset = float(np.asarray(darkfield).reshape(())) if darkfield is not None else 0.0
+    # `read_scalar`, the same reader `verify` uses, rather than a bare reshape:
+    # the most plausible wrong binding here is a 2-D darkfield *image* (what
+    # BaSiC returns, against a task asking for one number), and reshaping that
+    # raises. `verify` already scores it as unavailable, so the bare version
+    # threw away a scored arm to fail on the picture explaining it. No offset is
+    # the right stand-in: the correction then shows what the run's own `flat`
+    # does on its own, which is the comparison the image is for.
+    offset, _ = read_scalar(attempt, "darkfield")
     save_png(
-        (np.asarray(tiles[0], float) - offset) / np.maximum(flat, 1e-6),
+        (np.asarray(tiles[0], float) - (offset or 0.0)) / np.maximum(flat, 1e-6),
         where / "tile-corrected.png",
     )
 
