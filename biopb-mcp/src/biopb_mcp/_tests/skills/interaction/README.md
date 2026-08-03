@@ -124,6 +124,30 @@ The second is not a finding — if `skills_enabled: false` stopped withholding
 the catalog, the delta would read as zero for a reason unrelated to the skill,
 which is a green table asserting the opposite of the truth.
 
+## Paying for two corners instead of four
+
+```sh
+BIOPB_SKILL_ARMS=asked   # skill+asked and noskill+asked only; `all` is the default
+```
+
+The two `+silent` arms answer a question about the **fixture** — is the withheld
+fact really unobtainable from the pixels — and not about the skill. Editing a
+body cannot change their answer, and the skill's own delta is `skill+asked`
+against `noskill+asked`, which neither of them touches. So once a fixture's
+asymmetry is established they are droppable, and dropping them halves the
+wall-clock of a case.
+
+Re-run the full square when the fixture changes, and when a report makes the
+asymmetry look decorative. `drift-correction` is the standing reason to keep
+doing it: a capable agent recovered its withheld channel anyway, by registering
+on both and keeping the self-consistent one — a fixture can be built so the
+heuristics its author thought of point the wrong way and still not make the fact
+unobtainable.
+
+A partial report says so in its own header (`2 of 4 arms — not run: …`) and in
+`summary.json` (`arms_not_run`), because a short table otherwise reads exactly
+like a square whose other corners died.
+
 ## What the first full run showed
 
 Agent `glm-5.1`, respondent `qwen3.5-plus`, one sample per corner:
@@ -176,11 +200,12 @@ Nothing else: no API key for the smoke tests, and no network beyond loopback.
 
 ## Watching a run
 
-A case is four conversations and the better part of half an hour, so the engine
-prints one line per arm — when it starts, and how it ended:
+A case is four conversations and the better part of half an hour — two and half
+that under `BIOPB_SKILL_ARMS=asked` — so the engine prints one line per arm, when
+it starts and how it ended:
 
 ```
-[calibrated-measurements] 4 arms against `twelve-nuclei-anisotropic` -> .skill-outcomes/interaction/calibrated-measurements
+[calibrated-measurements] 4 of 4 arms against `twelve-nuclei-anisotropic` -> .skill-outcomes/interaction/calibrated-measurements
 [calibrated-measurements] 1/4 skill+asked: running
 [calibrated-measurements] 1/4 skill+asked: ok in 6.2 min — within every tolerance
 [calibrated-measurements] 2/4 skill+silent: running

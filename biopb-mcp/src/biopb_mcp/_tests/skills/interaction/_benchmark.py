@@ -26,6 +26,10 @@ configuration: the kernel, napari, dask and every library stay exactly as they
 are and only the curated procedure goes. §6's rule — disclose the environment,
 withhold only the skill — and the reason a hand-cut hole would have been worse.
 
+The right-hand column is about the **fixture**, not the skill, so
+`BIOPB_SKILL_ARMS=asked` drops it and halves the cost of a case. See
+:data:`ARMS_ENV`.
+
 **No run's outcome fails anything.** Out of turns, wrong answer, gave up, even a
 harness error — each becomes a *row with a reason*. These are one sample per
 corner against a non-deterministic agent, so a pass/fail verdict would be false
@@ -59,7 +63,7 @@ from ._fixture import (
     curated_for,
     write_report,
 )
-from ._models import agent_choice, respondent_choice
+from ._models import agent_choice, respondent_choice, setting
 from ._respondent import Persona, SilentRespondent, model_respondent
 from ._session import SessionUnavailable, live_session
 
@@ -179,6 +183,7 @@ class Arm:
 
     name: str
     skills: bool
+    asked: bool
     about: str
 
 
@@ -186,30 +191,69 @@ ARMS = (
     Arm(
         "skill+asked",
         True,
+        True,
         "everything available: the curated procedure and a user who answers",
     ),
     Arm(
         "skill+silent",
         True,
+        False,
         "the procedure, but nobody answers — does the withheld fact cost anything",
     ),
     Arm(
         "noskill+asked",
         False,
+        True,
         "no curated procedure, but a user who answers — does the skill add anything",
     ),
     Arm(
         "noskill+silent",
         False,
+        False,
         "neither: the floor this whole layer is measured against",
     ),
 )
 
+#: Which corners to spend on. The default is the whole 2x2.
+#:
+#: **The two `+silent` arms measure the fixture, not the skill.** They ask
+#: whether the withheld fact is really unobtainable from the pixels -- a
+#: property of the construction in `cases/`, which does not change when a body
+#: is edited, and which `test_cases.py` already checks the cheap half of by
+#: asserting no truth key appears in `data`. The skill's own delta is
+#: `skill+asked` against `noskill+asked`, and it needs neither silent arm.
+#:
+#: So they are droppable once a fixture's asymmetry has been established, and
+#: dropping them halves the wall-clock of a case. Re-run the full set when the
+#: fixture changes, or when a report's `skill+asked` row makes the asymmetry look
+#: decorative. `drift-correction` is the standing reason to keep re-running it:
+#: a capable agent recovered its withheld fact anyway (§5c).
+ARMS_ENV = "BIOPB_SKILL_ARMS"
+ARM_SETS: dict[str, tuple[Arm, ...]] = {
+    "all": ARMS,
+    "asked": tuple(a for a in ARMS if a.asked),
+}
+
+
+def selected_arms() -> tuple[Arm, ...]:
+    """The corners this run will spend on, per ``BIOPB_SKILL_ARMS``.
+
+    Unknown values raise rather than fall back to the full set: the two are
+    twenty minutes apart per case, and a typo that quietly spends the larger
+    number is discovered by looking at the clock.
+    """
+    choice = setting(ARMS_ENV, "all").strip().lower()
+    if choice not in ARM_SETS:
+        raise ValueError(
+            f"{ARMS_ENV}={choice!r} is not one of {sorted(ARM_SETS)} — "
+            "`all` is the 2x2, `asked` drops the two silent arms, which measure "
+            "the fixture rather than the skill."
+        )
+    return ARM_SETS[choice]
+
 
 def _respondent_for(arm: Arm, case: Case):
-    return (
-        model_respondent(case.persona) if "+asked" in arm.name else SilentRespondent()
-    )
+    return model_respondent(case.persona) if arm.asked else SilentRespondent()
 
 
 @dataclass
@@ -415,15 +459,17 @@ def progress(message: str) -> None:
 
 
 def run_case(case: Case) -> Run:
-    """Every corner, once. A failing arm becomes a row, never an exception."""
+    """Every selected corner, once. A failing arm becomes a row, never an
+    exception."""
+    arms = selected_arms()
     fixture = case.build_fixture()
     progress(
-        f"\n[{case.skill}] {len(ARMS)} arms against `{fixture.case_id}` "
-        f"-> {where_for(case)}"
+        f"\n[{case.skill}] {len(arms)} of {len(ARMS)} arms against "
+        f"`{fixture.case_id}` -> {where_for(case)}"
     )
     results = []
-    for n, arm in enumerate(ARMS, start=1):
-        progress(f"[{case.skill}] {n}/{len(ARMS)} {arm.name}: running")
+    for n, arm in enumerate(arms, start=1):
+        progress(f"[{case.skill}] {n}/{len(arms)} {arm.name}: running")
         started = time.monotonic()
         try:
             result = run_arm(case, arm, fixture)
@@ -434,7 +480,7 @@ def run_case(case: Case) -> Run:
         result.seconds = time.monotonic() - started
         outcome, reason = result.classify()
         progress(
-            f"[{case.skill}] {n}/{len(ARMS)} {arm.name}: {outcome} "
+            f"[{case.skill}] {n}/{len(arms)} {arm.name}: {outcome} "
             f"in {result.seconds / 60:.1f} min — {reason}"
         )
         results.append(result)
@@ -462,6 +508,8 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
     columns = _metric_columns(results)
     rows = [r.row(case.blocking_budget) for r in results]
     agent, respondent = agent_choice(), respondent_choice()
+    ran = [r.arm for r in results]
+    skipped = [a for a in ARMS if a not in ran]
 
     def fmt(value):
         return "—" if value is None else f"{value:.4g}"
@@ -474,6 +522,19 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         f"Fixture: `{fixture.case_id}` — {fixture.about or 'no description'}  ",
         "Tolerances: " + ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns),
         "",
+    ]
+    if skipped:
+        # Named, not merely absent: a short table is otherwise indistinguishable
+        # from a 2x2 whose other corners died, and the missing corners are the
+        # ones that say whether the fixture's asymmetry is real.
+        lines += [
+            f"**{len(ran)} of {len(ARMS)} arms** — not run: "
+            + ", ".join(f"`{a.name}`" for a in skipped)
+            + f" (`{ARMS_ENV}`). Those measure the fixture rather than the "
+            "skill; the delta below is unaffected.",
+            "",
+        ]
+    lines += [
         "One sample per corner. These runs are non-deterministic; read the",
         "table as an observation, not a measurement.",
         "",
@@ -499,17 +560,22 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         "",
         "## What each corner is for",
         "",
-        *(f"- `{a.name}` — {a.about}" for a in ARMS),
+        *(f"- `{a.name}` — {a.about}" for a in ran),
         "",
         "## Reading it",
         "",
         "- **skill+asked vs noskill+asked** is the skill's behavioural delta, and",
         "  it is the number this whole layer exists to produce.",
-        "- **skill+asked vs skill+silent** is whether the withheld fact costs",
-        "  anything. If it does not, the fixture's asymmetry is decorative and",
-        "  the interaction premise does not hold for this case.",
-        "- **noskill+silent** is the floor. A corner at or near the tolerances",
-        "  means the task is easy enough that nothing here discriminates.",
+    ]
+    if not skipped:
+        lines += [
+            "- **skill+asked vs skill+silent** is whether the withheld fact costs",
+            "  anything. If it does not, the fixture's asymmetry is decorative and",
+            "  the interaction premise does not hold for this case.",
+            "- **noskill+silent** is the floor. A corner at or near the tolerances",
+            "  means the task is easy enough that nothing here discriminates.",
+        ]
+    lines += [
         f"- `asked` counts blocking questions; `write-a-skill` step 4 budgets"
         f" {case.blocking_budget}.",
         "",
@@ -530,6 +596,9 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
                 "agent": agent.name,
                 "respondent": respondent.name,
                 "tolerance": dict(columns),
+                # So a two-arm report is machine-distinguishable from a 2x2
+                # whose other corners died, which the rows alone cannot say.
+                "arms_not_run": [a.name for a in skipped],
                 "arms": rows,
             },
             indent=2,

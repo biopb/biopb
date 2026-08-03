@@ -356,6 +356,20 @@ curated procedure goes. The ablation is checked on what the catalog *returns*,
 not on whether `find_skills` was called: the tool stays registered either way and
 `load_catalog()` is what gates.
 
+**The right-hand column measures the fixture, not the skill**, and
+`BIOPB_SKILL_ARMS=asked` drops it. Whether the withheld fact is obtainable from
+the pixels is a property of the construction in `cases/` — it does not change
+when a body is edited, and `test_cases.py` already asserts the cheap half of it
+hermetically (no truth key appears in `data`). The delta the layer exists to
+produce is `skill+asked` against `noskill+asked`, which neither silent arm
+touches, so dropping them halves a case's wall-clock without changing what is
+being measured. Run the full square when the fixture changes, or when a report
+makes its asymmetry look decorative — `drift-correction` is the standing reason
+to keep checking, since a capable agent recovered its withheld fact anyway. A
+partial report names the corners it did not run, in `summary.md` and as
+`arms_not_run` in `summary.json`: a two-row table would otherwise be
+indistinguishable from a square whose other corners died.
+
 **No run's outcome fails a test.** Each arm becomes a row with an outcome and a
 reason — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`, `gave-up`,
 `no-result`, `unscorable-result`, `harness-error` — plus flags that change how to
@@ -572,6 +586,12 @@ uv run --no-project --python .venv/bin/python --with pystackreg \
 # the benchmark (§5): a GL display (or the xvfb package — the session
 # brings its own virtual display), two API keys, ~20 min per skill
 uv run --no-project --python .venv/bin/python --with openai --with anthropic \
+  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+
+# the same, at half the cost: the skill's delta without the two arms that
+# measure the fixture (§5c). What to run when a body changed and no fixture did
+BIOPB_SKILL_ARMS=asked uv run --no-project --python .venv/bin/python \
+  --with openai --with anthropic \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
 ```
 

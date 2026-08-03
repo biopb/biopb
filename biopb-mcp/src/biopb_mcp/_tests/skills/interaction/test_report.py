@@ -26,6 +26,7 @@ import pytest
 from . import _benchmark, conftest
 from ._benchmark import (
     ARMS,
+    ARMS_ENV,
     FLAG_CATALOG_MISMATCH,
     FLAG_CUT_OFF,
     FLAG_NEVER_ASKED,
@@ -41,9 +42,11 @@ from ._benchmark import (
     Result,
     Run,
     catalog_size,
+    selected_arms,
 )
 from ._conversation import FINISHED, SILENT, TURN_CAP
 from ._fixture import Attempt, Fixture, Metric, Outcome
+from ._models import ENV_FILE_ENV, reload_env_file
 from .cases import CASES
 
 FIXTURE = Fixture(
@@ -245,6 +248,70 @@ def test_the_report_lands_under_its_own_skill(report):
     _, _, where = report
     assert where.name == CASES[0].skill
     assert (where / "summary.md").is_file()
+
+
+# --- which corners get paid for --------------------------------------------
+
+
+@pytest.fixture
+def arms_env(tmp_path, monkeypatch):
+    """`BIOPB_SKILL_ARMS` from the environment and nowhere else.
+
+    `setting()` falls back to the dotenv, so a developer who put the variable in
+    their `.env` would otherwise decide the default test's answer.
+    """
+    monkeypatch.delenv(ARMS_ENV, raising=False)
+    monkeypatch.setenv(ENV_FILE_ENV, str(tmp_path / "absent.env"))
+    reload_env_file()
+    yield monkeypatch
+    monkeypatch.undo()
+    reload_env_file()
+
+
+def test_the_default_is_the_whole_square(arms_env):
+    assert selected_arms() == ARMS
+
+
+def test_asked_drops_exactly_the_silent_arms(arms_env):
+    """The point of the option: the skill's delta is the two `+asked` corners,
+    so the other two are droppable without touching what the layer measures."""
+    arms_env.setenv(ARMS_ENV, "asked")
+    chosen = selected_arms()
+    assert [a.name for a in chosen] == ["skill+asked", "noskill+asked"]
+    assert {a.skills for a in chosen} == {True, False}  # the delta survives
+
+
+def test_an_unknown_selection_raises_rather_than_running_everything(arms_env):
+    """A typo that silently spent the full square would be found by looking at
+    the clock, twenty minutes per case later."""
+    arms_env.setenv(ARMS_ENV, "askd")
+    with pytest.raises(ValueError, match="askd"):
+        selected_arms()
+
+
+def test_a_partial_report_names_what_it_did_not_run(tmp_path, monkeypatch):
+    """A two-row table is otherwise indistinguishable from a 2x2 whose other
+    corners died, and the missing rows are the fixture's, not the skill's."""
+    monkeypatch.setattr(_benchmark, "artifact_root", lambda: tmp_path)
+    asked = [a for a in ARMS if a.asked]
+    text = Run(
+        case=CASES[0],
+        fixture=FIXTURE,
+        results=[result(a, outcome=scored(0.05)) for a in asked],
+    ).summary()
+    data = json.loads((_benchmark.where_for(CASES[0]) / "summary.json").read_text())
+
+    assert "2 of 4 arms" in text
+    assert "`skill+silent`" in text and "`noskill+silent`" in text
+    assert data["arms_not_run"] == ["skill+silent", "noskill+silent"]
+    # The reading guide must not send anyone to a row that is not there.
+    assert "skill+asked vs skill+silent" not in text
+
+
+def test_a_full_report_says_nothing_about_skipping(report):
+    text, data, _ = report
+    assert data["arms_not_run"] == []
+    assert "arms** — not run" not in text
 
 
 # --- a run that never started ----------------------------------------------
