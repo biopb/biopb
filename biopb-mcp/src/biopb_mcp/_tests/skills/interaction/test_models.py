@@ -317,9 +317,9 @@ def test_a_real_answer_still_comes_back_as_text(monkeypatch, reason):
     would be a worse failure than the one it replaces."""
     _fake_openai(monkeypatch, content="  Channel 1.  ", finish_reason=reason)
     assert (
-        OpenAICompatText(parse_choice("openai:m")).complete(
-            system="s", messages=[], max_tokens=300
-        )
+        OpenAICompatText(parse_choice("openai:m"))
+        .complete(system="s", messages=[], max_tokens=300)
+        .text
         == "Channel 1."
     )
 
@@ -329,9 +329,9 @@ def test_a_real_answer_still_comes_back_as_text(monkeypatch, reason):
         stop_reason=reason,
     )
     assert (
-        AnthropicText(parse_choice("anthropic:m")).complete(
-            system="s", messages=[], max_tokens=300
-        )
+        AnthropicText(parse_choice("anthropic:m"))
+        .complete(system="s", messages=[], max_tokens=300)
+        .text
         == "Channel 1."
     )
 
@@ -369,3 +369,43 @@ def test_spending_the_whole_budget_on_reasoning_is_not_unreachable(monkeypatch):
     and skipping the run for it would hide the one this layer measures."""
     _fake_openai(monkeypatch, content="", finish_reason="length")
     assert reachable(OpenAICompatText(parse_choice("openai:m"))) == ""
+
+
+def test_the_reply_carries_what_the_provider_wants_back(monkeypatch):
+    """The respondent replays its own history on every later question, so a
+    turn stripped of `reasoning_content` fails the *next* one — a turn after
+    its cause, which is what made this read as intermittent."""
+    module = types.ModuleType("openai")
+
+    class _Msg:
+        content = "Channel 1."
+        reasoning_content = "weighing the two channels"
+
+    class _Completions:
+        def create(self, **kwargs):
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=_Msg(), finish_reason="stop")]
+            )
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=_Completions())
+
+    module.OpenAI = _OpenAI
+    monkeypatch.setitem(sys.modules, "openai", module)
+
+    reply = OpenAICompatText(parse_choice("openai:m")).complete(
+        system="s", messages=[], max_tokens=300
+    )
+    assert reply.text == "Channel 1."
+    assert reply.provider_fields == {"reasoning_content": "weighing the two channels"}
+
+
+def test_a_provider_with_nothing_to_echo_sends_nothing_extra(monkeypatch):
+    _fake_openai(monkeypatch, content="ok", finish_reason="stop")
+    assert (
+        OpenAICompatText(parse_choice("openai:m"))
+        .complete(system="s", messages=[], max_tokens=300)
+        .provider_fields
+        == {}
+    )

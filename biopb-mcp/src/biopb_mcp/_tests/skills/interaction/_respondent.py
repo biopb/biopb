@@ -180,13 +180,18 @@ class ModelRespondent:
         own instead.
         """
         self.history.append({"role": "user", "content": message})
-        text = self.backend.complete(
+        reply = self.backend.complete(
             system=self.persona.system_prompt(),
             messages=self.history,
             max_tokens=self.max_tokens,
         )
-        self.history.append({"role": "assistant", "content": text})
-        return text
+        # The same echo the agent's loop does, for the same reason: this
+        # history is replayed on every later question, so a turn stripped of
+        # what the provider wants back fails the *next* one.
+        self.history.append(
+            {**reply.provider_fields, "role": "assistant", "content": reply.text}
+        )
+        return reply.text
 
 
 def model_respondent(persona: Persona, **kwargs) -> ModelRespondent:

@@ -34,12 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ._bridge import parse_arguments
-from ._models import ModelChoice, agent_choice
-
-#: Keys a provider may return on an assistant message and require back. Tried
-#: in order; the first one present is carried under its own name, because a
-#: provider that spells it `reasoning` will not accept `reasoning_content`.
-ECHOED_FIELDS = ("reasoning_content", "reasoning")
+from ._models import ModelChoice, agent_choice, echoed_fields
 
 
 @dataclass(frozen=True)
@@ -255,14 +250,9 @@ class ToolCallingAgent:
             )
             for c in (choice.tool_calls or ())
         )
-        echoed = {}
-        for key in ECHOED_FIELDS:
-            if value := getattr(choice, key, None):
-                echoed[key] = value
-                break
         return AgentTurn(
             text=choice.content or "",
             tool_calls=calls,
             finish_reason=completion.choices[0].finish_reason or "",
-            provider_fields=echoed,
+            provider_fields=echoed_fields(choice),
         )
