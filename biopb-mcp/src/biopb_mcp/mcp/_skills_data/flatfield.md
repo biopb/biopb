@@ -140,24 +140,34 @@ that was not there.
    it exists because the obvious quality metric does not work:
 
    ```python
-   print(f"range {flat.max() / flat.min():.2f}, "
+   raw = np.median(np.asarray(TILES, float), axis=0)      # already resident, step 3
+   print(f"field range {flat.max() / flat.min():.2f}, raw {raw.max() / raw.min():.2f}, "
          f"centre/corner {flat[flat.shape[0] // 2, flat.shape[1] // 2] / flat[0, 0]:.2f}")
    ```
 
    Put `flat` on the viewer and look at it. It should be **smooth, monotonic
-   outward from a single bright region, and free of specimen structure**. Then
-   check the range: ordinary vignetting spans **1.2–2.5x** across the frame. A
-   range above ~4 means the darkfield was over-subtracted — a quantile used as
-   an estimate lands here — and a range near 1.0 means there was nothing to
-   correct. Both are step 2 coming back.
+   outward from a single bright region, and free of specimen structure**.
+
+   Then read the range against **this** optical path rather than against a
+   constant, using the raw stack as its own reference. A positive offset added to
+   every pixel compresses a ratio, so the raw median always spans *less* than the
+   field does — and the whole of that gap is the `DARKFIELD` you subtracted. So a
+   field spanning 4x over a raw stack spanning 1.5x is not vignetting; it is the
+   offset doing the work, which is over-subtraction. A field range near 1.0 means
+   there was nothing to correct. Both are step 2 coming back.
+
+   As a prior only: ordinary vignetting spanned **1.2–2.5x** on the systems these
+   numbers were measured on. That follows the objective and the illuminator, so
+   the number actually worth comparing against is a previous fit on this same
+   configuration — one you can keep from step 6.
 
    **The range is a coarse guard, not a proof.** It catches over-subtraction,
    which blows up, and it catches a field that is not there. It will *not* catch
    a modest under-subtraction: a run that assumed a zero offset where the true
-   one was 200 counts reports a range of 1.4 against a true 2.0, comfortably
-   inside the expected band while the field is eight times further off than it
-   needed to be. That is the reason step 2 asks instead of guessing — nothing
-   downstream recovers it.
+   one was 200 counts reports a range of 1.4 against a true 2.0 — an entirely
+   believable field, eight times further off than it needed to be, and nothing
+   about 1.4 says so. That is the reason step 2 asks instead of guessing —
+   nothing downstream recovers it.
 
    **Residual spread across tiles is not this check either**, though it is the
    obvious thing to reach for. It is dominated by real variation between frames
@@ -203,8 +213,8 @@ that was not there.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Corners come out *brighter* than the centre | The data was already flat-field corrected, so a second vignette was fitted and divided out | Step 2. Discard and use the original |
-| `flat` has a range above ~4, and the corners blow up | `DARKFIELD` was over-subtracted — often a low quantile used as an estimate rather than a ceiling | Lower it; it must be below the darkest pixel by the specimen's background |
-| Correction is visible but weak, and the range is under ~1.2 | `DARKFIELD` assumed 0 when the camera has an offset | Step 2 — this is worth more than any other change |
+| `flat` spans far more than the raw stack does, and the corners blow up | `DARKFIELD` was over-subtracted — often a low quantile used as an estimate rather than a ceiling | Lower it; it must be below the darkest pixel by the specimen's background |
+| Correction is visible but weak, and `flat` barely spans more than the raw stack | `DARKFIELD` assumed 0 when the camera has an offset | Step 2 — this is worth more than any other change |
 | `flat` shows recognisable specimen structure | Too few frames, or a specimen that barely moves between them | Fit on more frames, or on frames from the same optics with different fields of view |
 | `flat` is nearly featureless and the images are unchanged | `KEEP` starved (4 or less), or there is genuinely no vignette | Raise `KEEP` to 16; if it stays flat, report that no correction was needed |
 | Tiles that individually look right, but the mosaic still shows a checkerboard | A field was fitted per tile, cancelling the real differences between them | One `flat` per channel per optical configuration |
