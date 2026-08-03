@@ -34,7 +34,39 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ._bridge import parse_arguments
-from ._models import ModelChoice, agent_choice
+from ._models import ModelChoice, agent_choice, echoed_fields
+
+
+class RequestRejected(RuntimeError):
+    """The provider refused the request, with the *shape* of what was sent.
+
+    **A rejection names the message it dislikes; the harness has to name the
+    conversation it built.** `reasoning_content in the thinking mode must be
+    passed back` says a turn was missing something, not which turn or what the
+    surrounding messages looked like — and reproducing it costs a paid run,
+    because it depends on what the real tools returned. So the shape travels
+    with the error: roles, the keys on each message, and how many tool calls
+    it carried. Never the content, which is large and is already in the trace.
+    """
+
+    def __init__(self, model: str, messages: list[dict], cause: Exception) -> None:
+        shape = "\n    ".join(_describe(m) for m in messages[-10:])
+        super().__init__(
+            f"{model} rejected the request: {cause}\n"
+            f"  last {min(len(messages), 10)} of {len(messages)} messages sent:\n"
+            f"    {shape}"
+        )
+        self.messages = messages
+        self.cause = cause
+
+
+def _describe(message: dict) -> str:
+    """One message as role + keys + tool-call count. No content."""
+    calls = len(message.get("tool_calls") or ())
+    keys = ",".join(sorted(k for k in message if k != "role"))
+    return f"{message.get('role'):<9} keys=[{keys}]" + (
+        f" tool_calls={calls}" if calls else ""
+    )
 
 
 @dataclass(frozen=True)
@@ -55,12 +87,60 @@ class AgentTurn:
 
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
-    #: Whatever the provider returned, for the trace. Never asserted on.
+    #: The provider's own word for why generation stopped, carried into the
+    #: trace. **A turn with no text and no tool calls is ambiguous without
+    #: it**: the model deciding it has nothing left to say and the model being
+    #: cut off mid-reasoning are the same empty turn, and they mean opposite
+    #: things about the skill. Empty for agents that do not have one.
+    finish_reason: str = ""
+    #: Fields the provider requires echoed back on the assistant message.
+    #:
+    #: **A reasoning model's conversation is not just text and tool calls.**
+    #: Several providers return the reasoning alongside them and then *reject
+    #: the next request* if it is not sent back — DeepSeek's is
+    #: `reasoning_content`, and a request that drops it fails with "the
+    #: `reasoning_content` in the thinking mode must be passed back to the
+    #: API". Rebuilding the assistant turn from the parts this harness happens
+    #: to care about silently discards them, so they are carried here and
+    #: merged back verbatim, under whatever key they arrived on.
+    provider_fields: dict[str, Any] = field(default_factory=dict)
+    #: Whatever else the provider returned, for the trace. Never asserted on.
     raw: Any = None
 
     @property
     def is_question(self) -> bool:
         return not self.tool_calls and bool(self.text.strip())
+
+    @property
+    def is_empty(self) -> bool:
+        """Nothing said and nothing called — no next move to make."""
+        return not self.tool_calls and not self.text.strip()
+
+    @property
+    def asks_something(self) -> bool:
+        """Whether this turn puts a question to the user, tools or not.
+
+        **Deliberately not** :attr:`is_question`, which is about whether the
+        agent *blocked*. A model that asks while it keeps working has still
+        asked, and a user sitting there would see it — so routing has to read
+        this and the ask budget goes on reading `is_question`.
+
+        The test is a question mark, the same heuristic
+        `Trace.blocking_questions` documents: it cannot see "let me know which
+        channel is structural", and it over-fires on a rhetorical question.
+        The loop's answer to the over-firing is to refuse to *end* a run on a
+        turn that also called tools.
+        """
+        return bool(self.text.strip()) and "?" in self.text
+
+    @property
+    def was_truncated(self) -> bool:
+        """Cut off at the token budget rather than finished.
+
+        `length` is the OpenAI-compatible spelling and `max_tokens` the
+        Anthropic one; both mean the budget ran out mid-generation.
+        """
+        return self.finish_reason in ("length", "max_tokens")
 
 
 class ChatAgent(Protocol):
@@ -120,6 +200,7 @@ class ReplayAgent:
                     ToolCall(c["id"], c["name"], c.get("arguments") or {})
                     for c in r.get("tool_calls") or ()
                 ),
+                finish_reason=r.get("finish_reason", ""),
             )
             for r in records
             if r.get("role") == "agent"
@@ -155,7 +236,12 @@ class ToolCallingAgent:
 
     choice: ModelChoice | None = None
     temperature: float = 0.0
-    max_tokens: int = 4096
+    #: Headroom for reasoning *and* the tool call that follows it. A reasoning
+    #: model bills both from here, and the measured agent spent 3570 of 4096 on
+    #: reasoning alone in a first turn against an almost empty context — a
+    #: margin thin enough that a harder turn truncates, and a truncated turn is
+    #: an empty one. The cost of the larger budget is nothing until it is used.
+    max_tokens: int = 16384
 
     def __post_init__(self) -> None:
         self.choice = self.choice or agent_choice()
@@ -180,13 +266,16 @@ class ToolCallingAgent:
         return OpenAI(**kwargs)
 
     def respond(self, messages: list[dict], tools: list[dict]) -> AgentTurn:
-        completion = self._client().chat.completions.create(
-            model=self.choice.model,
-            messages=messages,
-            tools=tools,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
+        try:
+            completion = self._client().chat.completions.create(
+                model=self.choice.model,
+                messages=messages,
+                tools=tools,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+        except Exception as exc:
+            raise RequestRejected(self.name, messages, exc) from exc
         choice = completion.choices[0].message
         calls = tuple(
             ToolCall(
@@ -199,5 +288,6 @@ class ToolCallingAgent:
         return AgentTurn(
             text=choice.content or "",
             tool_calls=calls,
-            raw={"finish_reason": completion.choices[0].finish_reason},
+            finish_reason=completion.choices[0].finish_reason or "",
+            provider_fields=echoed_fields(choice),
         )

@@ -112,6 +112,33 @@ class ToolResult:
         return f"{self.name} -> {'ERROR ' if self.is_error else ''}{self.text}"
 
 
+def describe_block(block) -> str:
+    """One MCP content block as the text an agent sees. Never silently empty.
+
+    **A dropped block reads as a broken tool.** `take_screenshot` returns an
+    `ImageContent` — `.data` and `.mimeType`, no `.text` — so a filter that
+    kept only blocks with text handed the agent an empty string for a
+    screenshot that had in fact been captured. In a measured run the agent
+    built a montage specifically to look at, got nothing back twice, concluded
+    "the screenshot tool isn't returning images", and spent the rest of the arm
+    working around a tool that was working.
+
+    A text model cannot read the PNG either way; what it can do is tell "no
+    image" apart from "an image I cannot see", and only one of those is worth
+    building a workaround for. Passing the pixels to a vision-capable agent is
+    a separate change — tool results are strings on this API, so an image has
+    to travel as its own user message.
+    """
+    if text := getattr(block, "text", None):
+        return text
+    if (data := getattr(block, "data", None)) is not None:
+        kind = getattr(block, "mimeType", "") or "binary"
+        # base64 -> bytes, near enough for a size the agent can reason about.
+        kb = max(1, len(data) * 3 // 4 // 1024)
+        return f"[{kind}, ~{kb} KB — returned, but not readable as text]"
+    return f"[{getattr(block, 'type', 'unknown')} content block]"
+
+
 @dataclass
 class ToolSpec:
     """A tool as the server advertises it — the schema an agent is handed."""
@@ -173,9 +200,7 @@ class LiveSession:
         result = self._loop.submit(
             self._session.call_tool(name, arguments), CALL_TIMEOUT
         )
-        text = "\n".join(
-            block.text for block in result.content if getattr(block, "text", None)
-        )
+        text = "\n".join(describe_block(block) for block in result.content)
         return ToolResult(name=name, text=text, is_error=bool(result.isError))
 
     def read_resource(self, uri: str) -> str:

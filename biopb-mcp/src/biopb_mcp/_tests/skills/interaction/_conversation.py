@@ -27,6 +27,7 @@ from typing import Any
 
 from ._agent import AgentTurn, ChatAgent
 from ._bridge import to_function_tools
+from ._models import EmptyCompletion
 from ._respondent import DONE, Respondent
 
 #: Bounds on one run. Generous enough for the seven-step drift workflow with
@@ -42,6 +43,48 @@ TURN_CAP = "turn-cap"
 TOOL_CAP = "tool-cap"
 SILENT = "agent-said-nothing"
 
+#: What the agent says, alone on the last line, to declare the task finished.
+#:
+#: **Termination used to rest on somebody's judgement.** `SilentRespondent`
+#: could not end a run at all — it answers "I don't know" to a sign-off like
+#: everything else — and `ModelRespondent` ended one *wrongly*, reading "I've
+#: asked the key questions, I'll wait for their answers" as a hand-off. A
+#: declared sentinel takes the judgement out: the agent says when it is done,
+#: and every respondent behaves the same.
+TASK_COMPLETE = "__BIOPB_TASK_COMPLETE__"
+
+#: The protocol appended to every task, so a case cannot forget it.
+COMPLETION_PROTOCOL = f"""
+
+When the work is finished and the names above are bound, end your final
+message with {TASK_COMPLETE} alone on its own line. Write it only when you are
+done — not while describing what you are about to do.
+"""
+
+#: The two ways a *provider* ends a run, as opposed to a model deciding to.
+#: They are named separately from `SILENT` and `FINISHED` because they look
+#: exactly like them from the outside and are not the agent's doing: a
+#: reasoning model bills its reasoning against `max_tokens`, so a budget that
+#: holds the answer can still be spent before the answer starts. Both are
+#: scored as harness errors, which is what they are.
+AGENT_TRUNCATED = "agent-truncated"
+RESPONDENT_FAILED = "respondent-failed"
+
+#: The conversation stopped progressing: the agent keeps talking and never acts
+#: again. `SilentRespondent` cannot end a run — it answers "I don't know" to
+#: everything, including a sign-off — so an agent that finishes its work and
+#: says so is answered with a non-answer and says so again, to the turn cap.
+#: Measured: both silent arms did exactly this, trailing 42 and 55 tool-free
+#: turns after their last real action, and scored `turn-cap` with
+#: `cut-off-but-scored` on work that was complete.
+STALLED = "stalled"
+
+#: Consecutive agent turns with no tool call before the run is called stalled.
+#: Set from measurement: healthy runs never exceeded **2** in either sweep, and
+#: the livelocked ones ran 42 and 55 — so this sits well clear of a legitimate
+#: run of questions (the ask budget is 3) and far below the pathology.
+MAX_IDLE_TURNS = 8
+
 
 @dataclass
 class Event:
@@ -53,6 +96,11 @@ class Event:
     tool_calls: list[dict] = field(default_factory=list)
     name: str = ""
     is_error: bool = False
+    #: Agent turns only: the provider's own word for why generation stopped.
+    #: Recorded because an empty turn cannot otherwise be told apart from a
+    #: truncated one after the fact, and that is the distinction a red run
+    #: turns on.
+    finish_reason: str = ""
 
 
 @dataclass
@@ -70,6 +118,12 @@ class Trace:
     def questions(self) -> list[str]:
         """Everything the agent said *to the user*, asking or not."""
         return [e.text for e in self.events if e.role == "agent" and e.text]
+
+    @property
+    def answers(self) -> list[str]:
+        """Everything the respondent said back. Zero of these against a
+        non-empty :attr:`questions` is the shape of a broken respondent."""
+        return [e.text for e in self.events if e.role == "user"]
 
     @property
     def blocking_questions(self) -> list[str]:
@@ -152,6 +206,13 @@ class Trace:
                     lines.append(f"**agent** (turn {e.turn}) calls {calls}")
                 if e.text:
                     lines.append(f"**agent → user** (turn {e.turn}): {e.text}")
+                # Only when it is the surprising one: `stop`/`tool_calls` is
+                # every ordinary turn and would be noise on all of them.
+                if e.finish_reason in ("length", "max_tokens"):
+                    lines.append(
+                        f"_(turn {e.turn} cut off at the token budget: "
+                        f"finish_reason={e.finish_reason})_"
+                    )
             elif e.role == "tool":
                 flag = " *(error)*" if e.is_error else ""
                 body = e.text if len(e.text) < 1200 else e.text[:1200] + " …"
@@ -162,6 +223,23 @@ class Trace:
                 lines.append(f"_{e.role}: {e.text}_")
             lines.append("")
         return "\n".join(lines)
+
+
+def declares_done(text: str) -> bool:
+    """Whether *text* ends by declaring the task complete.
+
+    **Last line, exact match** — not "contains". An agent that mentions the
+    sentinel while describing the protocol ("I'll write ... when finished")
+    leaves other words on that line, so quoting it costs nothing. Requiring it
+    alone at the end makes an accidental ending take real effort.
+    """
+    lines = text.strip().splitlines()
+    return bool(lines) and lines[-1].strip() == TASK_COMPLETE
+
+
+def with_protocol(task: str) -> str:
+    """*task* plus the completion protocol every run is held to."""
+    return task.rstrip() + "\n" + COMPLETION_PROTOCOL
 
 
 def converse(
@@ -187,6 +265,8 @@ def converse(
         task=task,
     )
     calls_made = 0
+    idle_turns = 0
+    echo_key = ""
 
     for turn in range(max_turns):
         trace.turns_used = turn + 1
@@ -202,12 +282,33 @@ def converse(
                     {"id": c.id, "name": c.name, "arguments": c.arguments}
                     for c in step.tool_calls
                 ],
+                finish_reason=step.finish_reason,
             )
         )
+
+        # What this turn has to carry. **Every assistant message or none** —
+        # a history where some have the key and some do not is rejected, and
+        # the model does not think on every turn, so "echo what arrived" is
+        # not enough on its own. Measured against the gateway over five trials
+        # each: key omitted, 3/5 accepted; key present as "", 5/5; key present
+        # with a real value, 5/5. The empty string is as good as the real one,
+        # and the rejection is flaky rather than deterministic — which is why
+        # this looked like an intermittent bug for four rounds of guessing.
+        echo = dict(step.provider_fields)
+        if echo and not echo_key:
+            # First sight of the key: earlier turns predate it and would make
+            # the history mixed, so bring them up to it.
+            echo_key = next(iter(echo))
+            for earlier in messages:
+                if earlier.get("role") == "assistant" and echo_key not in earlier:
+                    earlier[echo_key] = ""
+        elif not echo and echo_key:
+            echo = {echo_key: ""}
 
         if step.tool_calls:
             messages.append(
                 {
+                    **echo,
                     "role": "assistant",
                     "content": step.text or None,
                     "tool_calls": [
@@ -245,21 +346,111 @@ def converse(
             if calls_made >= max_tool_calls:
                 trace.stopped = TOOL_CAP
                 return trace
+            idle_turns = 0
+
+            # A question asked while acting is still a question. Routing used
+            # to key on "did this turn call a tool", which conflated *should
+            # the user see this* with *did the agent block* — so a model that
+            # asked and kept working had the question swallowed, then said "I
+            # have asked, I will wait", and the run ended on the sign-off with
+            # nobody having been asked anything.
+            if step.asks_something:
+                try:
+                    answer = respondent.reply(step.text)
+                except EmptyCompletion as failure:
+                    trace.stopped = RESPONDENT_FAILED
+                    trace.events.append(
+                        Event(
+                            turn=turn, role="harness", text=str(failure), is_error=True
+                        )
+                    )
+                    return trace
+                # `DONE` here means "not a question to me", not "we are
+                # finished": the agent was working, not handing off. Ending
+                # the run on it would turn every rhetorical question inside a
+                # working turn into a terminated arm — the same bug, mirrored.
+                #
+                # It is still recorded. `DONE` is the respondent *replying*,
+                # and a trace with no reply at all is what
+                # `asked-but-unanswered` reads as a broken respondent — so
+                # leaving it out would report a respondent that answered
+                # correctly as one that never answered. Only the trace gets
+                # it: the agent has no use for the sentinel and was not
+                # waiting on one.
+                trace.events.append(Event(turn=turn, role="user", text=answer))
+                if answer.strip() != DONE:
+                    messages.append({"role": "user", "content": answer})
             continue
 
-        if not step.text.strip():
+        idle_turns += 1
+
+        if step.is_empty:
             # Nothing said and nothing called: there is no next move to make.
-            trace.stopped = SILENT
+            # Whose doing that was is the provider's to say — a model with
+            # nothing left to say and a model cut off mid-reasoning produce
+            # the identical turn, and only one of them is about the skill.
+            if step.was_truncated:
+                trace.stopped = AGENT_TRUNCATED
+                trace.events.append(
+                    Event(
+                        turn=turn,
+                        role="harness",
+                        text=(
+                            "agent turn was cut off at the token budget, not "
+                            "finished: raise ToolCallingAgent.max_tokens"
+                        ),
+                        is_error=True,
+                    )
+                )
+            else:
+                trace.stopped = SILENT
             return trace
 
-        answer = respondent.reply(step.text)
+        # Before the respondent sees it: the agent declaring itself done is not
+        # a question, and routing it would only invite a judgement about
+        # whether it was one.
+        if declares_done(step.text):
+            trace.stopped = FINISHED
+            return trace
+
+        try:
+            answer = respondent.reply(step.text)
+        except EmptyCompletion as failure:
+            # The respondent never answered. Ending here as FINISHED would
+            # report the agent as having handed off, which is the one reading
+            # this failure most resembles and the most expensive to believe.
+            trace.stopped = RESPONDENT_FAILED
+            trace.events.append(
+                Event(turn=turn, role="harness", text=str(failure), is_error=True)
+            )
+            return trace
+
         if answer.strip() == DONE:
             trace.stopped = FINISHED
             return trace
 
-        messages.append({"role": "assistant", "content": step.text})
+        messages.append({**echo, "role": "assistant", "content": step.text})
         messages.append({"role": "user", "content": answer})
         trace.events.append(Event(turn=turn, role="user", text=answer))
+
+        if idle_turns >= MAX_IDLE_TURNS:
+            # Talking without acting, this many turns running. Nothing new is
+            # entering the conversation, so the remaining budget buys nothing
+            # but tokens and a `turn-cap` on work that may be finished.
+            trace.stopped = STALLED
+            trace.events.append(
+                Event(
+                    turn=turn,
+                    role="harness",
+                    text=(
+                        f"no tool call in {idle_turns} turns — the conversation "
+                        "stopped progressing; the respondent may be unable to "
+                        "end it (SilentRespondent never returns DONE)"
+                    ),
+                    is_error=True,
+                )
+            )
+            return trace
 
     trace.stopped = TURN_CAP
     return trace

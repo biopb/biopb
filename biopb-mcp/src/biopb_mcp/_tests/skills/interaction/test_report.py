@@ -31,6 +31,7 @@ from ._benchmark import (
     FLAG_CUT_OFF,
     FLAG_NEVER_ASKED,
     FLAG_OVER_BUDGET,
+    FLAG_UNANSWERED,
     GAVE_UP,
     HARNESS_ERROR,
     NO_RESULT,
@@ -44,7 +45,13 @@ from ._benchmark import (
     catalog_size,
     selected_arms,
 )
-from ._conversation import FINISHED, SILENT, TURN_CAP
+from ._conversation import (
+    AGENT_TRUNCATED,
+    FINISHED,
+    RESPONDENT_FAILED,
+    SILENT,
+    TURN_CAP,
+)
 from ._fixture import Attempt, Fixture, Metric, Outcome
 from ._models import ENV_FILE_ENV, reload_env_file
 from .cases import CASES
@@ -62,12 +69,15 @@ FIXTURE = Fixture(
 
 
 class FakeTrace:
-    def __init__(self, stopped=FINISHED, turns=5, asked=(), tools=()):
+    def __init__(self, stopped=FINISHED, turns=5, asked=(), tools=(), answers=None):
         self.stopped = stopped
         self.turns_used = turns
         self.questions = list(asked)
         self.blocking_questions = [q for q in asked if "?" in q]
         self.tool_names = list(tools)
+        # Answered unless a test says otherwise: an unanswered question is the
+        # exceptional case and should have to be asked for by name.
+        self.answers = ["ok"] * len(asked) if answers is None else list(answers)
 
 
 def outcome(*metrics: Metric, arrays=None) -> Outcome:
@@ -154,6 +164,34 @@ def test_asking_too_much_and_never_asking_are_both_flagged():
 def test_a_scored_but_severed_run_says_so():
     cut = result(trace=FakeTrace(stopped=TURN_CAP), outcome=scored(0.1))
     assert FLAG_CUT_OFF in cut.flags()
+
+
+def test_a_run_that_asked_and_was_never_answered_is_flagged():
+    """An `asked` arm whose respondent never replied ran the `silent`
+    condition under the `asked` label, so its row is not comparable to the
+    thing it exists to be compared against."""
+    unanswered = result(
+        trace=FakeTrace(asked=["which channel is structural?"], answers=()),
+        outcome=scored(0.1),
+    )
+    assert FLAG_UNANSWERED in unanswered.flags()
+
+    answered = result(
+        trace=FakeTrace(asked=["which channel is structural?"]), outcome=scored(0.1)
+    )
+    assert FLAG_UNANSWERED not in answered.flags()
+
+
+def test_a_provider_failure_is_a_harness_error_not_an_agent_outcome():
+    """Both of these look exactly like the agent finishing or giving up, and
+    scoring them against the skill is how one broken respondent gets reported
+    as four bad rows."""
+    for stopped in (RESPONDENT_FAILED, AGENT_TRUNCATED):
+        verdict, reason = result(
+            trace=FakeTrace(stopped=stopped), outcome=scored(0.1)
+        ).classify()
+        assert verdict == HARNESS_ERROR, stopped
+        assert reason, "a harness error has to say which one"
 
 
 def test_the_catalog_flag_fires_in_both_directions():
@@ -376,3 +414,17 @@ def test_a_failed_smoke_test_is_recorded_and_a_skipped_one_is_not(monkeypatch):
     conftest.pytest_runtest_logreport(Report(f"{conftest.SMOKE}::skipped", False))
     conftest.pytest_runtest_logreport(Report("test_benchmark.py::other", True))
     assert conftest.smoke_failures() == [f"{conftest.SMOKE}::boom"]
+
+
+def test_the_arm_sets_partition_the_square(monkeypatch):
+    """`asked` and `silent` are complements, and together they are `all` — so
+    two half-price runs cover the same ground as one full one."""
+    monkeypatch.setenv(ARMS_ENV, "asked")
+    _benchmark._dotenv_reset = None
+    asked = set(selected_arms())
+    monkeypatch.setenv(ARMS_ENV, "silent")
+    silent = set(selected_arms())
+
+    assert asked and silent
+    assert not (asked & silent)
+    assert asked | silent == set(ARMS)

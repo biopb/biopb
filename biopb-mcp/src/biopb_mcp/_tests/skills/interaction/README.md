@@ -112,11 +112,21 @@ transcripts land under `.skill-outcomes/interaction/<skill>/`.
 `reason` — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`,
 `gave-up`, `no-result`, `unscorable-result`, `harness-error` — plus flags that
 change how to read it: `cut-off-but-scored`, `over-ask-budget(n)`,
-`never-asked`, `catalog-mismatch`.
+`never-asked`, `asked-but-unanswered`, `stalled`, `catalog-mismatch`.
 
 Every arm runs inside its own `try`, so a corner that dies becomes a row rather
 than an exception that destroys the other three. The report is the deliverable;
 a poor fixture is still informative, a missing report is not.
+
+**Telling a provider failure from a behaviour.** Both sides bill their reasoning
+against `max_tokens`, so a budget sized for the answer can be gone before the
+answer starts, and the empty result that comes back is indistinguishable from
+the agent handing off (respondent) or giving up (agent). Neither is laundered
+into a reply: the backend raises `EmptyCompletion`, the run stops as
+`respondent-failed` or `agent-truncated`, and both are `harness-error` rather
+than a row about the skill. `asked-but-unanswered` catches the same thing from
+the other end — an `asked` arm that got no answers ran the `silent` condition
+under the wrong label, and its row is not comparable to anything.
 
 Two things *are* asserted, and neither judges the skill: that `summary.md`
 reached disk with a transcript per arm, and that the **ablation took effect**.

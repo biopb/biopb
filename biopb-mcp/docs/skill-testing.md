@@ -377,10 +377,63 @@ indistinguishable from a square whose other corners died.
 reason — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`, `gave-up`,
 `no-result`, `unscorable-result`, `harness-error` — plus flags that change how to
 read it: `cut-off-but-scored`, `over-ask-budget(n)`, `never-asked`,
-`catalog-mismatch`. Ordering matters: a cap beats a bad number, so a run severed
-mid-workflow is not reported as a wrong answer. Every arm runs inside its own
-`try`, so a corner that dies becomes a row instead of an exception that destroys
-the other three.
+`asked-but-unanswered`, `stalled`, `catalog-mismatch`. Ordering matters: a cap beats a bad
+number, so a run severed mid-workflow is not reported as a wrong answer, and a
+*provider* failure beats everything, because it is not about the skill at all.
+Every arm runs inside its own `try`, so a corner that dies becomes a row instead
+of an exception that destroys the other three.
+
+**A budget failure is not a behaviour.** Both models bill their reasoning
+against `max_tokens`, so a budget that comfortably holds the answer can be spent
+before the answer starts — and what comes back is empty. On the respondent that
+looks like a hand-off, on the agent like a model with nothing left to say, and
+read either way it is scored against the skill. So the empty completion is never
+laundered into a reply: the backend raises, the loop stops as `respondent-failed`
+or `agent-truncated`, and both classify as `harness-error`. Every agent turn
+records the provider's own `finish_reason`, so the distinction survives into the
+transcript instead of having to be re-derived against a live endpoint.
+
+**A reasoning turn is not just text and tool calls.** Some providers return the
+reasoning alongside them and reject the *next* request if the history is
+inconsistent about it — every assistant message carries the field or none does.
+The model does not reason on every turn, so echoing what arrived leaves holes.
+Both sides that hold history (the loop's `messages`, and `ModelRespondent`'s
+own) carry it, backfilling turns that predate the provider's first use of the
+key; a provider that never sends the field never starts receiving one. The
+check is flaky rather than deterministic, so a short conversation can pass by
+luck: measured at 3/5 accepted with the key omitted against 5/5 with it
+present.
+
+**A conversation that stops progressing is ended.** `SilentRespondent` answers "I
+don't know" to everything — including a sign-off — so it can never end a run:
+an agent that finishes and says so is met with a non-answer and says so again,
+to the turn cap. Measured on both silent arms, which trailed 42 and 55 tool-free
+turns past their last real action and were then reported `turn-cap` with
+`cut-off-but-scored` on work that was complete. Eight consecutive turns with no
+tool call (healthy runs never exceeded two) now stop the run as `stalled`, which
+is flagged as itself rather than as a severance.
+
+**A question asked while acting is still a question.** Routing keyed on whether
+the turn called a tool, which conflated *should the user see this* with *did
+the agent block*. A model that asked its four questions in the same turn as a
+tool call had them swallowed, said "I have asked, I will wait" on the next
+turn, and the run ended on that sign-off with nobody having been asked
+anything — reported `no-result` against the skill. Any turn carrying a question
+is now routed whether or not it acted; the ask budget still counts what it
+counted before. The mirror of the bug is guarded too: `DONE` in reply to a turn
+that also called tools means "not a question to me", never "we are finished".
+
+**The agent declares when it is done.** Termination used to rest on somebody's
+judgement, and both respondents got it wrong in opposite directions:
+`SilentRespondent` cannot end a run at all, and `ModelRespondent` ended one
+early by reading "I've asked the key questions, I'll wait for their answers" as
+a hand-off. The harness appends a completion protocol to every task — end the
+final message with `__BIOPB_TASK_COMPLETE__` alone on its own line — and the
+loop ends on that, before the respondent sees the turn. Honoured only on a
+tool-free turn and only as an exact final line, so quoting the protocol while
+describing it costs nothing. The respondent's `DONE` stays as a fallback and
+the stall guard as the backstop, because an agent that forgets the sentinel
+must still terminate.
 
 Two things *are* asserted, and neither judges a skill: that the report reached
 disk with a transcript per arm, and that the ablation took effect. The second is

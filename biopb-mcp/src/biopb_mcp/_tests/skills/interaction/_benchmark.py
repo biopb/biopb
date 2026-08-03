@@ -54,7 +54,17 @@ from typing import Callable
 import numpy as np
 
 from ._agent import ToolCallingAgent
-from ._conversation import SILENT, TOOL_CAP, TURN_CAP, converse, scrape
+from ._conversation import (
+    AGENT_TRUNCATED,
+    RESPONDENT_FAILED,
+    SILENT,
+    STALLED,
+    TOOL_CAP,
+    TURN_CAP,
+    converse,
+    scrape,
+    with_protocol,
+)
 from ._fixture import (
     Attempt,
     Fixture,
@@ -63,7 +73,7 @@ from ._fixture import (
     curated_for,
     write_report,
 )
-from ._models import agent_choice, respondent_choice, setting
+from ._models import agent_choice, reachable, respondent_choice, setting, text_backend
 from ._respondent import Persona, SilentRespondent, model_respondent
 from ._session import SessionUnavailable, live_session
 
@@ -97,6 +107,14 @@ FLAG_OVER_BUDGET = "over-ask-budget"
 FLAG_NEVER_ASKED = "never-asked"
 FLAG_CUT_OFF = "cut-off-but-scored"
 FLAG_CATALOG_MISMATCH = "catalog-mismatch"
+#: Asked, and was never once answered. On an `asked` arm that is not a result,
+#: it is the respondent being broken — the arm measured the `silent` condition
+#: under the `asked` label, and its row is not comparable to anything.
+FLAG_UNANSWERED = "asked-but-unanswered"
+#: The run ended because it stopped progressing, not because the agent finished.
+#: Distinct from `cut-off-but-scored`: a stalled run was not severed mid-workflow,
+#: it was talking in circles — usually because the respondent could not end it.
+FLAG_STALLED = "stalled"
 
 #: A missing session is worth telling apart from any other harness failure: it
 #: means the machine, not the run.
@@ -232,6 +250,10 @@ ARMS_ENV = "BIOPB_SKILL_ARMS"
 ARM_SETS: dict[str, tuple[Arm, ...]] = {
     "all": ARMS,
     "asked": tuple(a for a in ARMS if a.asked),
+    # The complement. Termination has nowhere else to come from in these two —
+    # `SilentRespondent` never returns DONE — so they are where the completion
+    # sentinel and the stall guard are actually exercised.
+    "silent": tuple(a for a in ARMS if not a.asked),
 }
 
 
@@ -247,7 +269,7 @@ def selected_arms() -> tuple[Arm, ...]:
         raise ValueError(
             f"{ARMS_ENV}={choice!r} is not one of {sorted(ARM_SETS)} — "
             "`all` is the 2x2, `asked` drops the two silent arms, which measure "
-            "the fixture rather than the skill."
+            "the fixture rather than the skill, and `silent` is their complement."
         )
     return ARM_SETS[choice]
 
@@ -290,6 +312,15 @@ class Result:
             return HARNESS_ERROR, "the arm produced neither a trace nor a score"
 
         stopped = self.trace.stopped
+        # Before anything about the agent: these two are the *provider* ending
+        # the run, and they are indistinguishable from an agent finishing or
+        # giving up unless they are read first. Scoring them against the skill
+        # is how a broken respondent gets reported as four bad rows.
+        if stopped == RESPONDENT_FAILED:
+            return HARNESS_ERROR, "the respondent never answered; see the trace"
+        if stopped == AGENT_TRUNCATED:
+            return HARNESS_ERROR, "the agent was cut off at its token budget"
+
         if not self.outcome.scored:
             if stopped == TURN_CAP:
                 return OUT_OF_TURNS, "hit the turn cap with nothing scorable bound"
@@ -324,9 +355,13 @@ class Result:
             out.append(f"{FLAG_OVER_BUDGET}({asked})")
         if asked == 0:
             out.append(FLAG_NEVER_ASKED)
+        if asked and not self.trace.answers:
+            out.append(FLAG_UNANSWERED)
         severed = self.trace.stopped in (TURN_CAP, TOOL_CAP)
         if self.outcome is not None and self.outcome.scored and severed:
             out.append(FLAG_CUT_OFF)
+        if self.trace.stopped == STALLED:
+            out.append(FLAG_STALLED)
         if bool(self.catalog_hits) != self.arm.skills:
             out.append(FLAG_CATALOG_MISMATCH)
         return out
@@ -407,7 +442,7 @@ def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
             session,
             ToolCallingAgent(),
             _respondent_for(arm, case),
-            case.task,
+            with_protocol(case.task),
             max_turns=case.max_turns,
             max_tool_calls=case.max_tool_calls,
         )
@@ -630,4 +665,16 @@ def unavailable(case: Case) -> str:
             f"the agent is {agent_choice().name}, from the family that wrote these "
             "skills — it could pass by recognising its own prose (§5a)."
         )
+    # Last, because it is the only one that costs a request: a model the
+    # endpoint does not serve fails every arm identically, and a shell export
+    # beating the dotenv is the ordinary way to arrive there.
+    for side, choice in (
+        ("agent", agent_choice()),
+        ("respondent", respondent_choice()),
+    ):
+        if why := reachable(text_backend(choice)):
+            return (
+                f"{side} {choice.name} at {choice.base_url or 'the provider default'} "
+                f"is not usable: {why}"
+            )
     return ""

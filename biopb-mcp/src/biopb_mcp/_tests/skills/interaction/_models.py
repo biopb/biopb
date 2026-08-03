@@ -31,9 +31,9 @@ from __future__ import annotations
 
 import functools
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 #: Where a key may live besides the environment. A non-interactive shell does
 #: not read `~/.bashrc` past its `case $- in *i*` guard, so an export added at
@@ -276,15 +276,104 @@ def respondent_choice() -> ModelChoice:
     )
 
 
+class EmptyCompletion(RuntimeError):
+    """A provider returned no usable text, and said so.
+
+    **This exists so that a budget failure cannot be mistaken for a reply.** A
+    reasoning model bills its reasoning against the same `max_tokens` as its
+    answer, so a budget that would comfortably hold the answer can be consumed
+    entirely before the answer starts: the provider returns
+    `finish_reason="length"` with empty content, which is a *truncation*, not a
+    short response. An earlier version returned `""` here and let the caller
+    read it as a hand-off, which ended runs at the first question and scored
+    them against the agent.
+
+    ``reason`` is the provider's own word for it (`length`, `max_tokens`, or
+    `no-text` when it gave none), so a trace says which happened.
+    """
+
+    def __init__(self, model: str, reason: str, max_tokens: int) -> None:
+        super().__init__(
+            f"{model} returned no text (reason={reason!r}, max_tokens={max_tokens}). "
+            "A reasoning model spends its reasoning from this same budget; raise "
+            "max_tokens rather than reading the empty result as an answer."
+        )
+        self.model = model
+        self.reason = reason
+        self.max_tokens = max_tokens
+
+
+#: Keys a provider may return on an assistant message and require back on the
+#: next request. Tried in order; the first one *present* is carried under its
+#: own name, because a provider spelling it `reasoning` will not accept
+#: `reasoning_content`. Shared with `_agent.py`: both sides of the conversation
+#: hold history, so both have to echo, and one definition keeps them honest.
+ECHOED_FIELDS = ("reasoning_content", "reasoning")
+
+
+def echoed_fields(message: Any) -> dict:
+    """What *message* carries that has to be sent back with it."""
+    for key in ECHOED_FIELDS:
+        value = getattr(message, key, None)
+        if value is not None:
+            return {key: value}
+    return {}
+
+
+@dataclass(frozen=True)
+class Reply:
+    """A completion, and whatever the provider wants back with it.
+
+    **A reasoning turn is not just its text.** The text is what a caller
+    wants; `provider_fields` is what the *next* request needs in order to be
+    accepted at all, and dropping it fails a turn later than its cause.
+    """
+
+    text: str
+    provider_fields: dict = field(default_factory=dict)
+
+
 class TextBackend(Protocol):
     """A chat model with a system prompt and **no tools** — what a respondent
-    is. The agent needs tool calling and keeps its own client (`_agent.py`)."""
+    is. The agent needs tool calling and keeps its own client (`_agent.py`).
+
+    Raises :class:`EmptyCompletion` rather than returning an empty string: the
+    caller cannot tell the two apart, and one of them is a bug.
+    """
 
     name: str
 
     def complete(
         self, *, system: str, messages: list[dict], max_tokens: int
-    ) -> str: ...
+    ) -> Reply: ...
+
+
+def reachable(backend: TextBackend) -> str:
+    """Why *backend* cannot be used at all, or ``""``.
+
+    **A model name that the endpoint does not serve is an environment fault,
+    and it should cost one skip rather than four dead arms.** `why_unavailable`
+    only knows whether a *key* is present; it cannot know that
+    `BIOPB_SKILL_AGENT` names something this gateway retired, or that a shell
+    export is quietly beating the dotenv — and both of those spend every arm
+    before saying so, each one failing identically for a reason that has
+    nothing to do with the skill.
+
+    One negligible completion answers it. An :class:`EmptyCompletion` counts as
+    *reachable*: the model answered, and having spent its budget on reasoning
+    is a different problem from not existing.
+    """
+    try:
+        backend.complete(
+            system="Reply with the single word: ok",
+            messages=[{"role": "user", "content": "ok"}],
+            max_tokens=16,
+        )
+    except EmptyCompletion:
+        return ""
+    except Exception as exc:  # noqa: BLE001 - any failure here is disqualifying
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 @dataclass
@@ -298,7 +387,7 @@ class OpenAICompatText:
     def name(self) -> str:
         return self.choice.name
 
-    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> str:
+    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> Reply:
         from openai import OpenAI
 
         kwargs = {"api_key": self.choice.key}
@@ -310,7 +399,13 @@ class OpenAICompatText:
             temperature=self.temperature,
             max_tokens=max_tokens,
         )
-        return (completion.choices[0].message.content or "").strip()
+        choice = completion.choices[0]
+        text = (choice.message.content or "").strip()
+        if not text:
+            raise EmptyCompletion(
+                self.name, choice.finish_reason or "no-text", max_tokens
+            )
+        return Reply(text, echoed_fields(choice.message))
 
 
 @dataclass
@@ -324,7 +419,7 @@ class AnthropicText:
     def name(self) -> str:
         return self.choice.name
 
-    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> str:
+    def complete(self, *, system: str, messages: list[dict], max_tokens: int) -> Reply:
         import anthropic
 
         kwargs = {"api_key": self.choice.key}
@@ -337,9 +432,19 @@ class AnthropicText:
             system=system,
             messages=messages,
         )
-        return "".join(
+        # Thinking blocks are dropped here but *are* billed against max_tokens,
+        # and on the current models thinking is on unless it is turned off — so
+        # a budget spent thinking arrives as content with no text block in it.
+        text = "".join(
             block.text for block in response.content if block.type == "text"
         ).strip()
+        if not text:
+            raise EmptyCompletion(
+                self.name, response.stop_reason or "no-text", max_tokens
+            )
+        # Anthropic needs no echo here: thinking is a content block and this
+        # backend never asks for it. `Reply` stays the shape either way.
+        return Reply(text)
 
 
 def text_backend(choice: ModelChoice) -> TextBackend:
