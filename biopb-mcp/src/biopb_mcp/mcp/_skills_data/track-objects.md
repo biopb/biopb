@@ -27,20 +27,20 @@ where it was missed, and keeps lineage where cells divide.
 - **Counting, not following.** Objects per frame, area over time, intensity in a
   fixed region: none of these need identity, and tracking adds a large failure
   surface for nothing.
-- **Nothing distinguishes the objects at either scale.** If a typical step is
-  comparable to the spacing between neighbours *and* the same object no longer
-  overlaps itself between frames, neither metric in the table below has anything
-  to work with. Acquire faster; no linker recovers this.
+- **Nothing distinguishes the objects.** If a typical step is comparable to the
+  spacing between neighbours and the objects are alike in size and shape, then
+  neither where they are nor what they look like identifies them. Acquire
+  faster; no linker recovers this.
 
 ## Parameters
 
 | Name | Unit | How to derive it |
 |---|---|---|
 | `LABELS` | `(T, Y, X)` | The segmented series, one label image per frame, in acquisition order. Ids need not agree across frames — that is what this produces. 3D is `(T, Z, Y, X)` and changes only the coordinate columns in step 3. `guide://data` for getting it out of a layer or off the tensor server |
-| `METRIC` | — | `laptrack` takes any `cdist` metric **or a callable**, so this is a real choice, and it sets the units of `CUTOFF` and the columns in step 3. **Centroid distance** (`sqeuclidean`, the default) — every number in this skill was measured on it. Switch to **`1 - IoU`** as a callable (step 4) when you have full masks *and* an object still covers part of its own previous footprint: it follows the mask, so growth and shape change stop reading as motion, and neighbours ambiguous by position are unambiguous by overlap. On anisotropic voxels put the coordinates in µm — one pixel cutoff cannot mean one speed limit along both z and y |
+| `METRIC` | — | `laptrack` takes any `cdist` metric **or a callable**, so this is a real choice, and it sets the units of `CUTOFF` and the columns in step 3. **Centroid distance** (`sqeuclidean`, the default) — every number in this skill was measured on it. With full masks, prefer **`1 - gIoU`** as a callable (step 4): it follows the mask, so growth and shape change stop reading as motion, and neighbours ambiguous by position are unambiguous by their footprints. Use *generalized* IoU, not IoU — plain IoU is 0 for every pair that does not overlap, so it cannot rank them and needs objects that move less than their own size; gIoU keeps falling as they separate and is applicable wherever centroid distance is. On anisotropic voxels put the coordinates in µm — one pixel cutoff cannot mean one speed limit along both z and y |
 | `PIXEL_UM` | µm/px | From the acquisition. Ask (step 2) — no pixel carries it. With a z-step, ask for that too: it is a second number, not the same one |
 | `INTERVAL_S` | s | Seconds between frames, likewise from the acquisition |
-| `CUTOFF` | depends on `METRIC` | **Centroid:** `MAX_STEP_PX = max_speed_um_per_min * (INTERVAL_S / 60) / PIXEL_UM`, the largest step one object can plausibly take between two frames, from what the user says their cells do — cross-checked against the data in step 6. **Do not take the library default**, which is 15 px whatever your magnification and frame rate are. **Overlap:** `1 - MIN_IOU`, where `MIN_IOU` is the least overlap you would accept as the same object; a fraction, so it does not move with magnification or frame rate |
+| `CUTOFF` | depends on `METRIC` | **Centroid:** `MAX_STEP_PX = max_speed_um_per_min * (INTERVAL_S / 60) / PIXEL_UM`, the largest step one object can plausibly take between two frames, from what the user says their cells do — cross-checked against the data in step 6. **Do not take the library default**, which is 15 px whatever your magnification and frame rate are. **gIoU:** a number in `[0, 2)` — 0 for identical masks, **1.0 for two that exactly touch**, and rising toward 2 as they separate (for equal boxes: 1.33 one width apart, 1.5 two widths). So a cutoff at or below 1.0 silently means *"must overlap"*, which throws away what gIoU is for; put it above 1.0 by as much as the largest separation you would accept, and check it in step 6 like any other |
 | `MAX_GAP` | frames | One more than the longest run of frames an object may be missing. An object absent from a *single* frame reappears at a frame difference of **2**, so the smallest useful value is 2 |
 | `DIVIDES` | — | Whether these objects divide, and whether the user wants lineage. From the user, not from the images |
 
@@ -80,13 +80,11 @@ where it was missed, and keeps lineage where cells divide.
    det = det.sort_values("frame").reset_index(drop=True)
    ```
 
-   Add `"z"` before `"y"` for a 3D series, and scale the coordinate columns into
-   µm if the voxel is anisotropic (see `METRIC`). For **overlap** the
-   coordinates are not positions at all: the two columns are what identifies a
-   mask, so add `det["frame_f"] = det["frame"].astype(float)` and pass
-   `["frame_f", "label"]` — a *copy*, because `frame_col` is consumed separately
-   from `coordinate_cols` and the metric still needs to know which frame it is
-   looking at.
+   Add `"z"` before `"y"` for a 3D series, and scale the coordinates into µm if
+   the voxel is anisotropic (see `METRIC`). For **gIoU** they are not positions
+   at all — what identifies a mask is `(frame, label)`, so add
+   `det["frame_f"] = det["frame"].astype(float)` and pass `["frame_f", "label"]`.
+   A copy, because `frame_col` is consumed separately from `coordinate_cols`.
 
 4. **Link, on the metric you chose.** Centroid:
 
@@ -113,31 +111,40 @@ where it was missed, and keeps lineage where cells divide.
    `splitting_metric`, `merging_metric` — and they are independent, so setting
    only the first leaves the other rounds on squared distances.
 
-   For **overlap**, the metric is a callable over the two coordinate rows, and
-   the cutoffs stop being distances:
+   For **gIoU**, the metric is a callable over the two coordinate rows, and the
+   cutoffs stop being distances:
 
    ```python
    lt = LapTrack(
-       metric=iou_distance, cutoff=1 - MIN_IOU,
-       gap_closing_metric=iou_distance, gap_closing_cutoff=1 - MIN_IOU,
+       metric=giou_distance, cutoff=CUTOFF,
+       gap_closing_metric=giou_distance, gap_closing_cutoff=CUTOFF,
        gap_closing_max_frame_count=MAX_GAP,
-       splitting_metric=iou_distance,
-       splitting_cutoff=(1 - MIN_IOU) if DIVIDES else False,
+       splitting_metric=giou_distance,
+       splitting_cutoff=CUTOFF if DIVIDES else False,
    )
    track_df, split_df, merge_df = lt.predict_dataframe(
        det, coordinate_cols=["frame_f", "label"], frame_col="frame")
    ```
 
-   where `iou_distance(u, v)` returns `1 - IoU` for the two `(frame, label)`
-   masks it is handed. **Precompute the overlaps and let the callable be a
-   lookup**: `cdist` calls it once per candidate pair, so mask arithmetic inside
-   it is what makes overlap linking slow. One pass of
-   `np.bincount(a[both] * (b.max() + 1) + b[both])` over each frame pair gives
-   every intersection at once; pairs that never overlap are absent, which is the
-   answer `1.0` and above any sane cutoff.
+   `giou_distance(u, v)` returns, for the two `(frame, label)` masks it is
+   handed,
+
+   ```
+   1 - gIoU  where  gIoU = |A n B| / |A u B| - (|C| - |A u B|) / |C|
+   ```
+
+   with `C` the smallest box enclosing both masks — the second term is what
+   keeps falling once the masks come apart, where `|A n B|` has already hit 0.
+
+   **Precompute it and let the callable be a lookup**: `cdist` calls the metric
+   once per candidate pair, so mask arithmetic inside it is what makes this
+   slow. Per frame pair, one `np.bincount(a[both] * (b.max() + 1) + b[both])`
+   gives every intersection at once, and `regionprops` bboxes broadcast into
+   every `|C|` — build the whole matrix, since unlike IoU the non-overlapping
+   entries are the informative ones and cannot be left out.
 
    The three cutoffs are one number in three places, scaled by the time each
-   one spans (centroid) or left alone (overlap, which is already a fraction).
+   one spans (centroid) or left alone (gIoU, which is already scale-free).
    **`splitting_cutoff` and `merging_cutoff` are `False` by default**, which is
    the part that does not follow from the geometry: left alone, a division ends
    one track and starts two tracks belonging to nobody, and nothing says so.
@@ -165,9 +172,9 @@ where it was missed, and keeps lineage where cells divide.
    column and you report 2.5× the cells that were there.
 
 6. **Validate before reporting anything** *(blocking)*. Three numbers, none of
-   which needs a ground truth. Written for the centroid route; on overlap the
-   same three questions are asked of the realised IoUs instead — how many sit at
-   `MIN_IOU`, what the worst accepted one is, and the track count:
+   which needs a ground truth. Written for the centroid route; on gIoU the same
+   three questions are asked of the realised distances — how many sit at the
+   cutoff, what the worst accepted one is, and the track count:
 
    ```python
    by = det.groupby("track_id")
@@ -199,7 +206,7 @@ where it was missed, and keeps lineage where cells divide.
    step grows toward the spacing, centroid linking degrades — at 2.9× this
    movie's step it holds 73.8% of links, and no cutoff recovers the rest. That
    is the boundary the `METRIC` row is about: past it, position has stopped
-   identifying the object, and overlap is the question to ask instead.
+   identifying the object, and the mask is what still does.
 
 7. **Report the tracks and the settings.** `viewer.add_tracks` wants one row per
    detection as `[track_id, t, y, x]` — that column order, id first, which is
