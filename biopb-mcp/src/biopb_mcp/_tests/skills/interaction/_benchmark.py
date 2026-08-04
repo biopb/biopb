@@ -53,6 +53,7 @@ from typing import Callable
 
 import numpy as np
 
+from . import _plane
 from ._agent import ToolCallingAgent
 from ._conversation import (
     AGENT_TRUNCATED,
@@ -68,9 +69,9 @@ from ._conversation import (
 from ._fixture import (
     Attempt,
     Fixture,
+    FixtureSpec,
     Outcome,
     artifact_root,
-    curated_for,
     write_report,
 )
 from ._models import agent_choice, reachable, respondent_choice, setting, text_backend
@@ -122,10 +123,34 @@ FLAG_STALLED = "stalled"
 #: comparable. `execute_code` is arbitrary Python and always will be, so the
 #: layer's defence is that this cannot happen quietly (`_session` tripwire).
 FLAG_PEEKED = "read-harness-internals"
+#: A fixture array on the run's plane is no longer the bytes the harness put
+#: there. Like `read-harness-internals` this voids rather than qualifies the
+#: number — and it voids every *later* arm too, since the plane outlives the
+#: session. A fixture id is a one-way hash of a name the agent never sees, so
+#: reaching this needs deliberate effort; the flag exists so that effort cannot
+#: pass unnoticed.
+FLAG_CONTAMINATED = "fixture-overwritten"
 
 #: A missing session is worth telling apart from any other harness failure: it
 #: means the machine, not the run.
 NO_SESSION = "session unavailable: "
+
+
+#: The two environments a fixture array can arrive in. Peers, not a ladder:
+#: neither is a default and neither substitutes for the other. The right one is
+#: whichever the skill was written against — a skill about in-memory numpy is
+#: correctly tested with `array`, and a viewer layer holding a plain array is a
+#: real thing an agent meets, not a concession. A skill written for lazy data
+#: gets `tensor`, which is the real path (`client.get_tensor`) with a real
+#: server behind it; there is deliberately no faked-lazy option in between.
+PRESENTATIONS = ("array", "tensor")
+
+#: Where a `tensor` case's array ids arrive in the kernel namespace, as
+#: ``{layer name: array_id}``. A convention rather than something a skill
+#: claims, so a case that presents `tensor` has to say so in its task prompt —
+#: an id minted at run time cannot be written into a prompt in advance, and an
+#: agent told nothing would have to guess at a source the catalog does not list.
+TENSOR_HANDLE = "fixture_tensors"
 
 
 @dataclass(frozen=True)
@@ -135,11 +160,28 @@ class Layer:
     ``kind`` picks `add_image` or `add_labels`, which is not cosmetic: a Labels
     layer is what makes a segmentation addressable as objects, and several
     skills' Parameters tables ask for one by name.
+
+    ``presentation`` is part of the case for the same reason the fixture is:
+    changing it changes what is being measured.
     """
 
     name: str
     key: str
     kind: str = "image"
+    presentation: str = "array"
+    #: `tensor` only, and explicit rather than automatic — where laziness is the
+    #: point, the chunking *is* the thing under test. `None` uploads the array
+    #: as one chunk, which is the right choice only when the case is not about
+    #: chunk boundaries.
+    chunks: tuple[int, ...] | None = None
+    #: `tensor` only: the axis semantics the plane will echo back. The server
+    #: rejects a non-canonical order, so this is the case's declaration of what
+    #: its array's axes mean.
+    dim_labels: tuple[str, ...] | None = None
+
+    @property
+    def lazy(self) -> bool:
+        return self.presentation == "tensor"
 
 
 @dataclass(frozen=True)
@@ -151,19 +193,30 @@ class Case:
     `cases/drift_correction.py` for the worked example, and `cases/__init__.py`
     for the three-line procedure.
 
-    The fixture is a callable rather than a value so a case module costs
+    **A case is non-decomposable.** Task, persona, fixture, verifier and
+    tolerances are one artifact, and where the pixels come from — a procedure
+    or a file on disk — is decided here, when the case is written, never
+    resolved at run time. Covering one skill both ways is *two cases*, each
+    with its own `case_id`, and `(skill, case_id)` is what names a run's
+    artifacts (`docs/skill-fixtures.md`).
+
+    The fixture is a spec rather than a built value so a case module costs
     nothing at import: 30 of these are collected by every ordinary test run,
     and only the one being benchmarked should build megabytes of arrays.
     """
 
     #: Skill id, as `find_skills` and `skill://<id>` know it.
     skill: str
+    #: What this case is, within that skill: names the run and its artifacts,
+    #: and — for a curated fixture — locates its data on disk.
+    case_id: str
     #: What the agent is asked to do, including where its results should land.
     task: str
     #: Who it is talking to, and the fact the fixture strips out.
     persona: Persona
-    #: ``() -> Fixture``: the data, the truth withheld from it, the tolerances.
-    build: Callable[[], Fixture]
+    #: Where this case's data comes from. Exactly one, and no fallback:
+    #: substituting it would make a different experiment with the same name.
+    fixture: FixtureSpec
     #: Where the fixture's arrays land on the viewer, in order.
     layers: Sequence[Layer]
     #: What the verifier wants -> the kernel expression that yields it.
@@ -196,10 +249,13 @@ class Case:
     def query(self) -> str:
         return self.catalog_query or self.skill
 
+    @property
+    def label(self) -> str:
+        return f"{self.skill}/{self.case_id}"
+
     def build_fixture(self) -> Fixture:
-        """This case's fixture — real data if this machine has any, else the
-        procedural one the case ships (`_fixture.curated_for`)."""
-        return curated_for(self.skill) or self.build()
+        """This case's one fixture, stamped with the identity declared above."""
+        return self.fixture.build(self.skill, self.case_id)
 
 
 @dataclass(frozen=True)
@@ -301,6 +357,8 @@ class Result:
     error: str = ""
     #: Harness-owned paths the kernel opened, from `LiveSession.peeked()`.
     peeked: tuple[str, ...] = ()
+    #: Fixture arrays on the plane whose bytes changed under this arm.
+    contaminated: tuple[str, ...] = ()
 
     @property
     def metrics(self) -> dict[str, float | None]:
@@ -361,6 +419,8 @@ class Result:
         # then died still has to say so.
         if self.peeked:
             out.append(f"{FLAG_PEEKED}({len(self.peeked)})")
+        if self.contaminated:
+            out.append(f"{FLAG_CONTAMINATED}({','.join(self.contaminated)})")
         if self.trace is None:
             return out
         asked = len(self.trace.blocking_questions)
@@ -399,8 +459,13 @@ class Result:
 
 
 def where_for(case: Case) -> Path:
-    """Where this case's report and transcripts land."""
-    return artifact_root() / "interaction" / case.skill
+    """Where this case's report and transcripts land.
+
+    Keyed on `(skill, case_id)`, not on the skill: a skill covered two ways is
+    two cases, and one directory for both would have the second silently
+    overwrite the first's report.
+    """
+    return artifact_root() / "interaction" / case.skill / case.case_id
 
 
 def catalog_size(text: str) -> int:
@@ -426,31 +491,110 @@ def catalog_size(text: str) -> int:
     return 1 if parsed else 0
 
 
-def _load_fixture(session, case: Case, fixture: Fixture) -> None:
+def uploaded_ids(case: Case, fixture: Fixture) -> dict[str, str]:
+    """``layer key -> array_id`` for this case's `tensor` layers, uploaded once.
+
+    Paid once per case rather than per arm: a case is four arms, and these are
+    the large fixtures by construction. The ids are memoised on the plane, so a
+    second call over the same run returns what the first uploaded.
+    """
+    lazy = [layer for layer in case.layers if layer.lazy]
+    if not lazy:
+        return {}
+    plane = _plane.ensure_plane()
+    ids = _UPLOADED.setdefault((case.skill, case.case_id), {})
+    for layer in lazy:
+        if layer.key not in ids:
+            array_id = plane.upload(
+                f"{case.skill}-{case.case_id}-{layer.key}",
+                np.asarray(fixture.data[layer.key]),
+                chunks=layer.chunks,
+                dim_labels=layer.dim_labels,
+            )
+            ids[layer.key] = array_id
+            _FINGERPRINTS[array_id] = plane.fingerprint(array_id)
+    return ids
+
+
+#: Per case, and per run: `(skill, case_id) -> {layer key: array_id}`.
+_UPLOADED: dict[tuple[str, str], dict[str, str]] = {}
+#: What each uploaded fixture looked like when the harness put it there.
+_FINGERPRINTS: dict[str, str] = {}
+
+
+def contaminated(ids: Mapping[str, str]) -> tuple[str, ...]:
+    """Fixture arrays whose served bytes are no longer what was uploaded.
+
+    A fixture id is `sha256(a per-run secret name)[:12]` and the name is never
+    sent anywhere, so this should be unreachable. It is checked anyway, because
+    the alternative is trusting an argument about a surface that runs arbitrary
+    Python — and an arm that ran against different data than it reports is not
+    a weak row, it is a wrong one.
+    """
+    plane = _plane.running_plane()
+    if plane is None:
+        return ()
+    changed = []
+    for key, array_id in ids.items():
+        try:
+            now = plane.fingerprint(array_id)
+        except Exception as exc:  # noqa: BLE001 - a flag, never a failed run
+            changed.append(f"{key}: unreadable ({type(exc).__name__})")
+            continue
+        if now != _FINGERPRINTS.get(array_id):
+            changed.append(key)
+    return tuple(changed)
+
+
+def _load_fixture(
+    session, case: Case, fixture: Fixture, ids: Mapping[str, str]
+) -> None:
     """Put the fixture on the viewer as *setup*, not as something the agent did.
 
     Injecting before handover keeps the fixture out of the agent's context and
     stops it burning turns on a setup the harness can do instantly. It goes
     through `session.setup`, recorded at turn -1, so the trace still answers
     "what did the agent do" honestly.
+
+    A `tensor` layer is added by id through `viewer.add_tensor`, which is the
+    same call the agent would make. Note the array is addressable but **not
+    discoverable**: an uploaded source is deliberately not synced to the
+    catalog, so `query_sources()` will not find it. The ids therefore arrive in
+    the namespace under :data:`TENSOR_HANDLE` — a harness convention, exactly
+    like the `collect` names, and `test_cases.py` asserts the task says so.
     """
+    handles = {}
     for layer in case.layers:
+        if layer.lazy:
+            handles[layer.name] = ids[layer.key]
+            session.setup(f"viewer.add_tensor({ids[layer.key]!r}, name={layer.name!r})")
+            continue
         session.put_array("_fixture_array", np.asarray(fixture.data[layer.key]))
         adder = "add_labels" if layer.kind == "labels" else "add_image"
         session.setup(
             f"viewer.{adder}(_fixture_array, name={layer.name!r})\ndel _fixture_array"
         )
+    if handles:
+        session.setup(f"{TENSOR_HANDLE} = {handles!r}")
     session.setup("print('layers:', [lyr.name for lyr in viewer.layers])")
 
 
-def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
+def run_arm(
+    case: Case, arm: Arm, fixture: Fixture, ids: Mapping[str, str] | None = None
+) -> Result:
     """One corner: its own session, so the ablation is a real configuration."""
-    with live_session(skills_enabled=arm.skills, plugins=case.plugins) as session:
+    ids = {} if ids is None else ids
+    plane = _plane.running_plane() if ids else None
+    with live_session(
+        skills_enabled=arm.skills,
+        plugins=case.plugins,
+        tensor_url=plane.url if plane is not None else "",
+    ) as session:
         # Read here rather than inferred from behaviour: the agent may well call
         # `find_skills` in the ablation arm and simply get nothing back, and
         # `load_catalog()` is what gates, not whether the tool was registered.
         catalog_hits = catalog_size(session.call("find_skills", query=case.query).text)
-        _load_fixture(session, case, fixture)
+        _load_fixture(session, case, fixture, ids)
         trace = converse(
             session,
             ToolCallingAgent(),
@@ -480,6 +624,8 @@ def run_arm(case: Case, arm: Arm, fixture: Fixture) -> Result:
         outcome=outcome,
         catalog_hits=catalog_hits,
         peeked=peeked,
+        # After the session is gone, so the arm cannot still be writing.
+        contaminated=contaminated(ids),
     )
 
 
@@ -520,16 +666,22 @@ def run_case(case: Case) -> Run:
     exception."""
     arms = selected_arms()
     fixture = case.build_fixture()
+    # Before the first arm, and once: bringing the plane up and uploading are
+    # both setup, and paying for them inside arm 1 would put a minute of
+    # bring-up into that row's wall-clock and nowhere else's.
+    ids = uploaded_ids(case, fixture)
     progress(
         f"\n[{case.skill}] {len(arms)} of {len(ARMS)} arms against "
         f"`{fixture.case_id}` -> {where_for(case)}"
     )
+    if ids:
+        progress(f"[{case.skill}] on the run's plane as {sorted(ids.values())}")
     results = []
     for n, arm in enumerate(arms, start=1):
         progress(f"[{case.skill}] {n}/{len(arms)} {arm.name}: running")
         started = time.monotonic()
         try:
-            result = run_arm(case, arm, fixture)
+            result = run_arm(case, arm, fixture, ids)
         except SessionUnavailable as exc:
             result = Result(arm=arm, error=f"{NO_SESSION}{exc}")
         except Exception as exc:  # noqa: BLE001 - the row is the point
@@ -572,14 +724,20 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         return "—" if value is None else f"{value:.4g}"
 
     lines = [
-        f"# {case.skill} — interaction benchmark",
+        f"# {case.label} — interaction benchmark",
         "",
         f"Agent under test: **{agent.name}**  ",
         f"Respondent: **{respondent.name}**  ",
-        f"Fixture: `{fixture.case_id}` — {fixture.about or 'no description'}  ",
+        f"Fixture: `{fixture.case_id}` [{fixture.kind}] — "
+        f"{fixture.about or 'no description'}  ",
         "Tolerances: " + ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns),
         "",
     ]
+    if fixture.citation:
+        # Carried into the report rather than left to whoever remembers: real
+        # data comes from someone, and a result quoted without them is the
+        # obligation quietly dropped.
+        lines += [f"Data: {fixture.citation}", ""]
     if skipped:
         # Named, not merely absent: a short table is otherwise indistinguishable
         # from a 2x2 whose other corners died, and the missing corners are the
@@ -649,6 +807,9 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         json.dumps(
             {
                 "skill": case.skill,
+                "case": case.case_id,
+                "kind": fixture.kind,
+                "citation": fixture.citation,
                 "fixture": fixture.case_id,
                 "agent": agent.name,
                 "respondent": respondent.name,
@@ -674,6 +835,16 @@ def unavailable(case: Case) -> str:
     """
     from . import _session
 
+    # First, because it is free and it is about the *case* rather than the
+    # machine's model access: a case written against an acquisition this tree
+    # does not have cannot run, and must never quietly run against something
+    # else.
+    usable, why = case.fixture.available(case.skill, case.case_id)
+    if not usable:
+        return f"fixture: {why}"
+    wants_plane = any(layer.lazy for layer in case.layers)
+    if wants_plane and (why := _plane.plane_unavailable()):
+        return f"this case is presented on a data plane, and {why}"
     if reason := _session.why_unavailable():
         return reason
     for side, choice in (

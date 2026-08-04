@@ -231,8 +231,10 @@ CALL_TIMEOUT = 300.0
 #: also carries whatever the agent's code decided to print.
 SENTINEL = "__BIOPB_SKILL_HARNESS__"
 
-#: An address nothing listens on, to keep `client` at None. Port 1 is
-#: privileged and unbound; the connect fails fast rather than hanging.
+#: An address nothing listens on, to keep `client` at None for a case presented
+#: as `array`. Port 1 is privileged and unbound; the connect fails fast rather
+#: than hanging. A case presented on the run's plane passes that plane's url
+#: instead — see `live_session(tensor_url=...)`.
 UNREACHABLE_TENSOR_URL = "grpc://127.0.0.1:1"
 
 
@@ -623,13 +625,23 @@ def _write_config(
 
 @contextmanager
 def live_session(
-    *, skills_enabled: bool = True, plugins: Sequence[str] = ()
+    *,
+    skills_enabled: bool = True,
+    plugins: Sequence[str] = (),
+    tensor_url: str = "",
 ) -> Iterator[LiveSession]:
     """Bring a session up, hand back a driver, and reap it on the way out.
 
     ``skills_enabled=False`` withholds the curated catalog and nothing else
     -- the ablation arm of the benchmark. ``plugins`` seeds the kernel plugins
     a case's skill declares.
+
+    ``tensor_url`` is the run's data plane, for a case presented on one. Empty
+    -- the usual state -- points the child at an address nothing answers, so
+    ``client is None`` and the agent meets the environment every `array` case's
+    task prompt describes. Either way the *control* plane is bypassed
+    entirely: ``$BIOPB_TENSOR_URL`` is read before it is consulted, which is
+    what keeps a benchmark run from touching the developer's own deployment.
     """
     if reason := why_unavailable():
         raise SessionUnavailable(reason)
@@ -652,7 +664,7 @@ def live_session(
         )
     }
     os.environ["XDG_CONFIG_HOME"] = str(scratch / "config")
-    os.environ["BIOPB_TENSOR_URL"] = UNREACHABLE_TENSOR_URL
+    os.environ["BIOPB_TENSOR_URL"] = tensor_url or UNREACHABLE_TENSOR_URL
     os.environ.pop("QT_QPA_PLATFORM", None)  # a real GL platform, not offscreen
 
     # The tripwire, inherited by the session child and its kernel. `sitecustomize`

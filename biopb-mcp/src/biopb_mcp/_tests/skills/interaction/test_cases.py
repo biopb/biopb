@@ -19,22 +19,26 @@ That is the property this layer needs to survive a catalogue of thirty.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
-from .._validate import NOT_SKILLS
+from .._validate import NOT_SKILLS, validate
 from ..conftest import SKILLS_DIR
+from ._benchmark import PRESENTATIONS, TENSOR_HANDLE
 from ._fixture import Attempt, Fixture
 from .cases import CASES, NOT_BENCHMARKED
 
 
 def _ids(case):
-    return case.skill
+    return case.label
 
 
 #: Built once each: a fixture is megabytes of numpy and several cases share
-#: these tests.
-_FIXTURES: dict[str, Fixture] = {}
+#: these tests. Keyed on `(skill, case_id)` — a skill covered two ways is two
+#: cases, and keying on the skill alone would hand the second the first's data.
+_FIXTURES: dict[tuple[str, str], Fixture] = {}
 
 
 @pytest.fixture(params=CASES, ids=_ids)
@@ -42,15 +46,26 @@ def case(request):
     return request.param
 
 
-def _built(skill: str) -> Fixture:
-    if skill not in _FIXTURES:
-        _FIXTURES[skill] = next(c for c in CASES if c.skill == skill).build()
-    return _FIXTURES[skill]
+def _case(label: str):
+    return next(c for c in CASES if c.label == label)
+
+
+def _built(label: str) -> Fixture:
+    case = _case(label)
+    key = (case.skill, case.case_id)
+    if key not in _FIXTURES:
+        _FIXTURES[key] = case.build_fixture()
+    return _FIXTURES[key]
 
 
 @pytest.fixture
 def built(case) -> Fixture:
-    return _built(case.skill)
+    """This case's own fixture — skipped, never substituted, when the machine
+    cannot produce it."""
+    usable, why = case.fixture.available(case.skill, case.case_id)
+    if not usable:
+        pytest.skip(f"{case.label}: {why}")
+    return _built(case.label)
 
 
 def test_there_is_at_least_one_case():
@@ -96,6 +111,84 @@ def test_an_exemption_carries_a_reason():
         assert len(why.split()) >= 5, f"{skill}: {why!r} does not say why"
 
 
+#: `checklist:` tokens that say a skill expects a data plane — to read lazily
+#: from one, to upload a result to one, or both. They map to the same
+#: presentation, because the tensor path is the only place either happens:
+#: `client.get_tensor` is what hands a session a dask array in production, and
+#: `client is None` is what an `array` case gives instead.
+LAZY_TOKENS = ("dask", "tensor")
+
+
+def test_a_skill_written_for_lazy_data_reports_whether_a_case_presents_it():
+    """A coverage ledger, and it **warns rather than fails**.
+
+    The unit is the skill, not the case: a case presenting `array` for a skill
+    that declares `dask` is not wrong, it tests the in-memory branch, which is
+    a real branch. What it is, is *incomplete* — and since a skill may have
+    several cases, the fix is another case rather than a correction to this
+    one. A gate here would demand cases nobody has written yet and would punish
+    an honest partial benchmark exactly as hard as a wrong one.
+
+    It belongs beside `NOT_BENCHMARKED`, which records "this skill is outside
+    the layer, and why". This records "this skill is *partly* inside it, and
+    which part".
+    """
+    entries, _ = validate(SKILLS_DIR)
+    lazy_cases = {c.skill for c in CASES if any(layer.lazy for layer in c.layers)}
+    for entry in entries:
+        declared = [t for t in LAZY_TOKENS if t in entry.checklist]
+        if (
+            not declared
+            or entry.id in lazy_cases
+            or entry.id not in {c.skill for c in CASES}
+        ):
+            continue
+        warnings.warn(
+            f"{entry.id} declares {declared}, but every case presents `array`, "
+            "so every arm runs with `client is None` — neither the lazy read "
+            "path nor any step that uploads a result has been benchmarked",
+            stacklevel=1,
+        )
+
+
+def test_no_two_cases_share_an_identity():
+    """`(skill, case_id)` names a run's artifacts, its cached fixture and its
+    report. Two cases colliding on it would overwrite one report with the
+    other's and hand the second run the first's data — silently, since nothing
+    downstream can tell the two apart."""
+    seen = [c.label for c in CASES]
+    duplicated = sorted({label for label in seen if seen.count(label) > 1})
+    assert not duplicated, f"these cases collide on (skill, case_id): {duplicated}"
+
+
+def test_every_case_names_itself():
+    for case in CASES:
+        assert case.case_id.strip(), f"{case.skill}: a case with no case_id"
+
+
+def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
+    tmp_path, monkeypatch
+):
+    """The regression this whole design exists to prevent.
+
+    `$BIOPB_SKILL_FIXTURES` used to be a policy switch: whatever sat under it
+    replaced a case's own fixture, silently and per machine. **Substituting the
+    data makes it a different experiment with the same name** — the truth
+    changes, the achievable accuracy changes, and the conclusion can invert,
+    which was measured rather than supposed (`docs/skill-fixtures.md`). It is a
+    root path now, and a procedural case must not so much as look at it.
+    """
+    case = CASES[0]
+    decoy = tmp_path / case.skill / case.case_id
+    decoy.mkdir(parents=True)
+    (decoy / "case.json").write_text('{"data": {}, "truth": {}}', encoding="utf-8")
+    monkeypatch.setenv("BIOPB_SKILL_FIXTURES", str(tmp_path))
+
+    built = case.build_fixture()
+    assert built.kind == "synthetic"
+    assert built.data, "the case built nothing, so the decoy was consulted"
+
+
 # --- the case is runnable --------------------------------------------------
 
 
@@ -104,7 +197,10 @@ def test_every_case_is_complete_enough_to_run(case):
     assert case.task.strip(), f"{case.skill}: no task prompt"
     assert case.layers, f"{case.skill}: no fixture layer to load"
     assert case.collect, f"{case.skill}: nothing would be collected"
-    assert callable(case.score) and callable(case.build)
+    assert callable(case.score)
+    assert callable(getattr(case.fixture, "build", None)), (
+        f"{case.label}: `fixture` is not a FixtureSpec"
+    )
     assert case.query
 
 
@@ -123,6 +219,40 @@ def test_every_layer_kind_is_one_the_harness_can_add(case):
     for layer in case.layers:
         assert layer.kind in ("image", "labels"), (
             f"{case.skill}: layer {layer.name!r} wants a {layer.kind!r} layer"
+        )
+
+
+def test_every_layer_is_presented_in_a_way_the_harness_can_produce(case):
+    for layer in case.layers:
+        assert layer.presentation in PRESENTATIONS, (
+            f"{case.label}: layer {layer.name!r} asks for "
+            f"{layer.presentation!r}, not one of {PRESENTATIONS}"
+        )
+
+
+def test_a_case_on_a_plane_tells_the_agent_where_its_data_is(case):
+    """A `tensor` fixture is addressable but **not discoverable** — an uploaded
+    source is deliberately not synced to the catalog, so `query_sources()` will
+    not find it. The ids arrive in the namespace instead, and an agent nobody
+    told would be scored on failing to guess at a source it could not list."""
+    if not any(layer.lazy for layer in case.layers):
+        return
+    assert TENSOR_HANDLE in case.task, (
+        f"{case.label}: presents a layer on the data plane, but its task never "
+        f"mentions `{TENSOR_HANDLE}`, which is where the array ids arrive"
+    )
+
+
+def test_nothing_asks_for_chunking_it_will_not_get(case):
+    """`chunks` is uploaded to the plane, so on an `array` layer it is a silent
+    no-op — and a silent no-op on the parameter that decides whether the
+    out-of-core route is exercised at all is the worst kind."""
+    for layer in case.layers:
+        if layer.lazy:
+            continue
+        assert layer.chunks is None and layer.dim_labels is None, (
+            f"{case.label}: layer {layer.name!r} sets chunks/dim_labels but is "
+            f"presented as {layer.presentation!r}, where neither reaches anything"
         )
 
 
@@ -163,7 +293,9 @@ def test_the_drifted_movie_invents_no_pixels():
     at all, and a band of flat correlated structure sitting inside the very data
     the run registers on.
     """
-    movie = _built("drift-correction").data["movie"]
+    movie = np.asarray(
+        _built("drift-correction/two-channels-one-structural").data["movie"]
+    )
     worst = {"px": 0, "frame": -1, "channel": -1, "edge": -1}
     for t, frame in enumerate(movie):
         for c, plane in enumerate(frame):

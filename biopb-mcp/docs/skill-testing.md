@@ -8,6 +8,9 @@ reader), `.github/workflows/skill-contracts.yaml` +
 `.github/scripts/skill_contracts.py` (the per-package CI job).
 **Related:** [`skill-interface.md`](skill-interface.md) — what a skill *is*, how
 it ships, and how `checklist:` resolves at runtime.
+[`skill-fixtures.md`](skill-fixtures.md) — the fixture model behind §5d: one
+fixture per case fixed at authoring time, `(skill, case_id)` identity, and the
+`array`/`tensor` presentations with a run-scoped data plane behind the latter.
 
 ---
 
@@ -506,12 +509,34 @@ feature density all point at the wrong channel, and a capable agent still
 recovered the answer by registering on both and keeping the self-consistent one.
 A µm-per-voxel figure has no such back door.
 
-**Truth is data, not a formula**, so real data can replace a synthetic case
-without touching the verifier: point `BIOPB_SKILL_FIXTURES` at a tree of
-`case.json` + `arrays.npz` per skill and `curated_for()` uses it instead. A
-curated movie carries whatever a human annotated — a trajectory measured off a
+**Truth is data, not a formula**, so one verifier serves either kind of fixture:
+generated or acquired, both hand it a mapping and it reads the keys it needs. A
+curated fixture carries whatever a human annotated — a trajectory measured off a
 bead, but never the un-drifted reference image, because no such acquisition
 exists.
+
+**Which kind a case uses is decided when the case is written.** A case is
+non-decomposable — task, persona, fixture, verifier and tolerances are one
+artifact — so `Case.fixture` is a single `FixtureSpec` fixed at authoring time,
+either `Procedural(builder)` or `OnDisk()`, with no ordering between them and no
+fallback. Substituting the data would make it a different experiment under the
+same name: different truth, different achievable accuracy, different conclusions.
+
+Measured rather than argued: the `align-stack-by-features` procedural fixture
+ranked two method families in the *opposite* order from real tissue (1 cold arm in
+9 chose descriptor matching on synthetic blobs, 2 in 3 on real sections), and its
+tolerances were calibrated to 3.0 px where the reference scored 0.56 px — the same
+reference scores 3.69 px on real data and fails that gate. The earlier model
+(`curated_for(skill) or build()`) would have published both results as one number,
+per machine, silently.
+
+So `BIOPB_SKILL_FIXTURES` is a **root path, not a policy switch**: it says where a
+curated case finds its data, never which fixture a case runs. A case whose data is
+absent reports why and skips — the same discipline as a missing API key — and a
+skill worth covering both ways is **two cases**, each with its own `case_id`,
+which is what `(skill, case_id)` keys the artifacts, reports and cached fixtures
+on. [`skill-fixtures.md`](skill-fixtures.md) is the full design, including the
+parts not yet built.
 
 **A metric that cannot be computed is `unavailable`, never passing**, and an
 `Outcome` that scored *nothing* has not passed — it has not been tested. That
@@ -540,9 +565,10 @@ module-level `CASE`:
 ```python
 CASE = Case(
     skill="calibrated-measurements",
+    case_id="twelve-nuclei-anisotropic",   # with `skill`, names the run
     task=TASK,                        # the prompt, incl. where results land
     persona=MICROSCOPIST,             # who holds the withheld fact
-    build=Ellipsoids(),               # () -> Fixture
+    fixture=Procedural(Ellipsoids()), # the one fixture this case owns
     layers=(Layer("nuclei", "image"),
             Layer("nuclei_labels", "labels", kind="labels")),
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},

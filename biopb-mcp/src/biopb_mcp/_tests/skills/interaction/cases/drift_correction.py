@@ -41,7 +41,7 @@ import numpy as np
 from scipy import ndimage
 
 from .._benchmark import Case, Layer
-from .._fixture import Attempt, Fixture, Metric, Outcome, save_png
+from .._fixture import Attempt, Fixture, Metric, Outcome, Procedural, save_png
 from .._respondent import Persona
 
 SKILL = "drift-correction"
@@ -156,7 +156,6 @@ class AmbiguousChannels:
     run *does* register on. See `test_the_drifted_movie_invents_no_pixels`.
     """
 
-    case_id: str = "two-channels-one-structural"
     per_frame_px: float = 1.7
     n_frames: int = 24
     n_objects: int = 60
@@ -203,9 +202,6 @@ class AmbiguousChannels:
         drift = float(np.hypot(*offsets[-1]))
         objects = float(np.hypot(*common) * (self.n_frames - 1))
         return Fixture(
-            skill_id=SKILL,
-            case_id=self.case_id,
-            kind="synthetic",
             provenance=(
                 f"procedural: 2 channels, seed {self.seed}, {self.n_frames} frames, "
                 f"{drift:.1f} px of stage drift, {self.n_objects} objects also "
@@ -506,9 +502,10 @@ MICROSCOPIST = Persona(
 
 CASE = Case(
     skill=SKILL,
+    case_id="two-channels-one-structural",
     task=TASK,
     persona=MICROSCOPIST,
-    build=AmbiguousChannels(),
+    fixture=Procedural(AmbiguousChannels()),
     layers=(Layer("timelapse", "movie"),),
     collect={"offsets": "offsets", "corrected": "corrected"},
     score=verify,

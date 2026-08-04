@@ -2,10 +2,15 @@
 
 Adding a skill to the benchmark is:
 
-1. write ``cases/<skill>.py`` exporting a module-level `CASE`: the task prompt,
-   the persona holding the fact the fixture withholds, a builder for that
-   fixture, and a verifier for what the run leaves in the kernel;
+1. write ``cases/<skill>.py`` exporting a module-level `CASE`: an id for the
+   case, the task prompt, the persona holding the fact the fixture withholds,
+   the one `FixtureSpec` that case is written against, and a verifier for what
+   the run leaves in the kernel;
 2. there is no step 2. The module is discovered by being here.
+
+One module is one `CASE`, so covering a skill two ways — a procedural fixture
+and a real acquisition, which are two experiments and not two settings of one —
+is two modules with two `case_id`s.
 
 No test code, no registration line, no engine change. `test_benchmark.py`
 parametrizes over :data:`CASES`, so a new case brings its own arms, report and

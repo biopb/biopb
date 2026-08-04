@@ -45,6 +45,7 @@ from .._fixture import (
     Fixture,
     Metric,
     Outcome,
+    Procedural,
     read_array,
     relative_error,
     save_png,
@@ -77,7 +78,6 @@ class Ellipsoids:
     trying to measure.
     """
 
-    case_id: str = "twelve-nuclei-anisotropic"
     shape: tuple[int, int, int] = (16, 256, 256)
     seed: int = 0
 
@@ -111,9 +111,6 @@ class Ellipsoids:
         voxel_um3 = float(np.prod(SPACING_UM))
         _agrees_with_regionprops(labels, counts * voxel_um3)
         return Fixture(
-            skill_id=SKILL,
-            case_id=self.case_id,
-            kind="synthetic",
             provenance=(
                 f"procedural: {len(centres)} ellipsoids, seed {self.seed}, "
                 f"{self.shape} voxels at {SPACING_UM} µm (Z, Y, X)"
@@ -287,9 +284,10 @@ MICROSCOPIST = Persona(
 
 CASE = Case(
     skill=SKILL,
+    case_id="twelve-nuclei-anisotropic",
     task=TASK,
     persona=MICROSCOPIST,
-    build=Ellipsoids(),
+    fixture=Procedural(Ellipsoids()),
     layers=(
         Layer("nuclei", "image"),
         Layer("nuclei_labels", "labels", kind="labels"),
