@@ -8,6 +8,9 @@ reader), `.github/workflows/skill-contracts.yaml` +
 `.github/scripts/skill_contracts.py` (the per-package CI job).
 **Related:** [`skill-interface.md`](skill-interface.md) — what a skill *is*, how
 it ships, and how `checklist:` resolves at runtime.
+[`skill-fixtures.md`](skill-fixtures.md) — proposed replacement for §5d's fixture
+model: one fixture per case, fixed at authoring time, and lazy/tensor
+presentation for skills written against lazy data.
 
 ---
 
@@ -506,12 +509,30 @@ feature density all point at the wrong channel, and a capable agent still
 recovered the answer by registering on both and keeping the self-consistent one.
 A µm-per-voxel figure has no such back door.
 
-**Truth is data, not a formula**, so real data can replace a synthetic case
-without touching the verifier: point `BIOPB_SKILL_FIXTURES` at a tree of
-`case.json` + `arrays.npz` per skill and `curated_for()` uses it instead. A
-curated movie carries whatever a human annotated — a trajectory measured off a
+**Truth is data, not a formula**, so one verifier serves either kind of fixture:
+generated or acquired, both hand it a mapping and it reads the keys it needs. A
+curated fixture carries whatever a human annotated — a trajectory measured off a
 bead, but never the un-drifted reference image, because no such acquisition
 exists.
+
+**Which kind a case uses should be decided when the case is written, and today it
+is not.** `Case.build_fixture()` is `curated_for(skill) or build()`, so every case
+is silently overridable by whatever happens to sit under `BIOPB_SKILL_FIXTURES` on
+the machine running it. That framing is wrong: a case is non-decomposable, and
+substituting its data makes it a different experiment under the same name —
+different truth, different achievable accuracy, and different conclusions.
+
+Measured rather than argued: the `align-stack-by-features` procedural fixture
+ranked two method families in the *opposite* order from real tissue (1 cold arm in
+9 chose descriptor matching on synthetic blobs, 2 in 3 on real sections), and its
+tolerances were calibrated to 3.0 px where the reference scored 0.56 px — the same
+reference scores 3.69 px on real data and fails that gate. A harness that swapped
+one for the other at run time would publish both results as one number.
+
+[`skill-fixtures.md`](skill-fixtures.md) is the replacement: a case owns exactly
+one fixture, `BIOPB_SKILL_FIXTURES` is demoted to a root path rather than a policy
+switch, and a case whose data is absent skips rather than quietly becoming a
+different case.
 
 **A metric that cannot be computed is `unavailable`, never passing**, and an
 `Outcome` that scored *nothing* has not passed — it has not been tested. That
