@@ -17,6 +17,11 @@ parametrizes over :data:`CASES`, so a new case brings its own arms, report and
 transcripts with it, and `test_cases.py` starts checking its persona and its
 fixture by its arriving.
 
+A module whose name starts with `_` belongs to a **deferred** skill — one the
+runtime does not serve — and lands in :data:`DEFERRED_CASES` instead. It is not
+benchmarked, because there is no catalog entry to withhold and so no delta to
+measure; it is checked exactly as hard.
+
 **Every shipped skill has to appear somewhere.** A skill that cannot be
 benchmarked is a decision, not an oversight, so it goes in
 :data:`NOT_BENCHMARKED` with the reason. `test_cases.py` asserts the catalogue
@@ -43,7 +48,7 @@ NOT_BENCHMARKED: dict[str, str] = {
 }
 
 
-def _discover() -> tuple[Case, ...]:
+def _discover(deferred: bool) -> tuple[Case, ...]:
     """Every `CASE` in this package, in module-name order.
 
     Import-time discovery rather than a hand-maintained tuple: with a catalogue
@@ -52,7 +57,7 @@ def _discover() -> tuple[Case, ...]:
     """
     found = []
     for info in sorted(pkgutil.iter_modules(__path__), key=lambda i: i.name):
-        if info.name.startswith("_"):
+        if info.name.startswith("_") is not deferred:
             continue
         module = importlib.import_module(f"{__name__}.{info.name}")
         case = getattr(module, "CASE", None)
@@ -66,6 +71,22 @@ def _discover() -> tuple[Case, ...]:
 
 
 #: Every skill benchmarked by this layer.
-CASES: tuple[Case, ...] = _discover()
+CASES: tuple[Case, ...] = _discover(deferred=False)
 
-__all__ = ["CASES", "NOT_BENCHMARKED"]
+#: Cases for skills the runtime does not serve — the `_` prefix, `write-a-skill`'s
+#: "private" marker, on the case module as well as on the skill file.
+#:
+#: **Kept apart from :data:`CASES`, and checked exactly as hard.** They are apart
+#: because a deferred skill is absent from the catalog, so every arm of a 2x2 over
+#: it would be the same arm: there is nothing to ablate and nothing to pay for.
+#: They are checked because "deferred" is a statement about what the *runtime*
+#: serves, not a licence for the data to rot — a case nobody verifies is a case
+#: that is correct until the first time anyone looks, and the whole point of
+#: banking one is that promoting the skill later does not begin by rebuilding it.
+#:
+#: `test_cases.py` runs every hermetic check over both tuples. The checks needing
+#: the fixture itself skip when its data is not on this machine, which is the
+#: ordinary state for a curated case and says so.
+DEFERRED_CASES: tuple[Case, ...] = _discover(deferred=True)
+
+__all__ = ["CASES", "DEFERRED_CASES", "NOT_BENCHMARKED"]
