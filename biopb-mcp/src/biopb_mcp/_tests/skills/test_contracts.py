@@ -68,7 +68,6 @@ _WORKSPACE = {"biopb", "biopb-mcp", "biopb-tensor-server", "biopb-control"}
 # package-tier skill without adding an entry fails the coverage test.
 COVERED: dict[str, set[str]] = {
     "drift-correction": {"pystackreg"},
-    "track-objects": {"laptrack"},
 }
 
 
@@ -287,11 +286,25 @@ def test_transform_stack_returns_float64(StackReg, drifting_movie):
     assert sr.transform_stack(movie, tmats=tmats).dtype == np.float64
 
 
-# --- laptrack, for track-objects ------------------------------------------
+# --- laptrack, for the deferred track-objects ------------------------------
 #
-# Every assertion here is a sentence in the body. Three of them are about
+# Every assertion here is a sentence in that body. Three of them are about
 # defaults rather than about arity, because that is where this library's
 # surface is sharp: a wrong default here does not raise, it returns tracks.
+#
+# **Parked, deliberately, and not in COVERED.** `_track-objects.md` is deferred
+# -- laptrack pins `scipy!=1.15.*`, and on Python 3.10 the newest scipy is
+# 1.15.3, so §4a's gate correctly refuses a token whose only resolution moves a
+# live kernel's scipy backwards. A deferred skill declares nothing the coverage
+# check can see, so listing it in COVERED would fail `test_covered_is_not_stale`
+# instead of recording anything.
+#
+# They stay because the work of writing them is done and they are what an
+# un-deferral has to pass: the day the skill ships (a 3.11 floor, or an upstream
+# release without that pin) the only change is one line in COVERED. Until then
+# `skill_contracts.py` installs no laptrack -- it derives its packages from the
+# shipped catalog -- so in CI these skip, and they run for anyone who asks for
+# the package by hand.
 
 
 @pytest.fixture(scope="module")

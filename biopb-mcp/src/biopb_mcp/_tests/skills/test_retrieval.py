@@ -68,11 +68,6 @@ RETRIEVES = [
     ("vignetting", "flatfield"),
     ("shading", "flatfield"),
     ("shading correction tiles", "flatfield"),
-    ("track", "track-objects"),
-    ("tracking", "track-objects"),
-    ("cell tracking", "track-objects"),
-    ("lineage", "track-objects"),
-    ("follow cells over time", "track-objects"),
     ("stitch", "stitch-tiles"),
     ("stitch tiles", "stitch-tiles"),
     ("mosaic", "stitch-tiles"),
@@ -96,13 +91,12 @@ REJECTS = [
     ("registration", "flatfield"),
     ("illumination", "drift-correction"),
     ("vignetting", "calibrated-measurements"),
-    # `drift-correction` and `track-objects` are the pair an agent lands on
-    # from a single word about a movie, and they are opposites: one cancels
-    # motion, the other measures it. Each body says so in its *When NOT to
-    # use*, but that only helps once the right file has been retrieved.
+    # `track-objects` is written but deferred (its package cannot be installed
+    # on 3.10 without moving scipy backwards), so only the half of the pair
+    # that ships is assertable here. It is still worth asserting: these two are
+    # opposites -- one cancels motion, the other measures it -- and this is the
+    # guard that has to hold on the day the other one starts shipping.
     ("track", "drift-correction"),
-    ("drift", "track-objects"),
-    ("registration", "track-objects"),
 ]
 
 

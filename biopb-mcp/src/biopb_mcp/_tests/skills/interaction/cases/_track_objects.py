@@ -1,5 +1,16 @@
 """`track-objects` as benchmark data: how big is a pixel, and how long is a frame?
 
+**Deferred, and the reason is not about this case.** `laptrack` pins
+`scipy!=1.15.*`; on Python 3.10 the newest scipy is 1.15.3 (1.16 requires
+3.11), so the only resolution of `pkg:laptrack~=0.17.1` there moves scipy
+*backwards* under a kernel that has already imported it. §4a calls that a
+rejection rather than a caveat, and it is right to: no wording in a body
+protects that user. So the skill is written, measured and not served, and
+un-deferring it is a Python floor of 3.11 or an upstream release without the
+pin — not an edit to anything here. Everything below is checked as hard as a
+shipped case; only the benchmark arms are absent, since there is no catalog
+entry to withhold.
+
 The skill takes a label movie whose ids mean nothing across frames and returns
 one identity per object. The construction knows the answer exactly, because it
 chose the trajectories before it drew anything.
