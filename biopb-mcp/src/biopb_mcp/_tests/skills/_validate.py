@@ -170,7 +170,13 @@ def validate(skills_dir: Path) -> tuple[list[SkillEntry], Report]:
     entries: list[SkillEntry] = []
     seen: set[str] = set()
     for path in sorted(skills_dir.glob("*.md")):
-        if path.stem in NOT_SKILLS:
+        # A leading `_` is the runtime's "private" marker (mcp/_skills.py's
+        # `_scan_shipped`), used here for a skill written and banked but not
+        # served -- one whose value has not been shown for the tier that
+        # consumes the catalog. The two readers have to agree about which files
+        # are skills (`test_what_validates_is_what_the_runtime_loads`), so the
+        # rule lives on both sides or the first deferred skill breaks the pin.
+        if path.stem in NOT_SKILLS or path.name.startswith("_"):
             continue
         entry = process(path, rep)
         if entry is None:

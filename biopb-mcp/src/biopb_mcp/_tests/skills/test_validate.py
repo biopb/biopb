@@ -277,3 +277,37 @@ def test_the_old_key_name_is_rejected_on_the_authors_path(skills_dir):
     )
     _, rep = validate(skills_dir)
     assert any("renamed to `checklist:`" in m for m in rep.errors), rep.errors
+
+
+# --- the deferral marker ------------------------------------------------------
+#
+# A leading `_` means "written and banked, but not served": `mcp/_skills.py`'s
+# `_scan_shipped` has always honoured it, and the gate has to agree or
+# `test_what_validates_is_what_the_runtime_loads` breaks on the first deferred
+# skill. These check the rule against a tmp tree rather than against whatever
+# the catalogue happens to contain, so they say the same thing on a machine
+# where nothing is deferred -- which is every machine, until the day it isn't.
+
+
+def test_a_deferred_skill_is_not_on_the_authors_path(skills_dir):
+    """Not "it validates and is hidden" -- it is not a skill here at all. A
+    deferred file is banked work that no longer has to satisfy the shipping
+    rules, and holding it to them would be a gate on something nobody serves."""
+    write_skill(skills_dir, "served")
+    write_skill(skills_dir, "_deferred")
+
+    entries, rep = validate(skills_dir)
+    assert [e.id for e in entries] == ["served"]
+    assert not rep.errors
+
+
+def test_a_deferred_skill_is_skipped_even_when_it_is_malformed(skills_dir):
+    """The property that makes the marker worth anything: banked work stops
+    being held to the shipping rules, so a file kept for later cannot fail the
+    build for a colleague who never touched it."""
+    write_skill(skills_dir, "served")
+    write_skill(skills_dir, "_deferred", raw="not: [valid\nfrontmatter at all\n")
+
+    entries, rep = validate(skills_dir)
+    assert [e.id for e in entries] == ["served"]
+    assert not rep.errors, "a deferred file was held to the shipping rules"

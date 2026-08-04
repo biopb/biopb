@@ -78,7 +78,14 @@ def test_there_is_at_least_one_case():
 
 
 def _shipped() -> set[str]:
-    return {p.stem for p in SKILLS_DIR.glob("*.md") if p.stem not in NOT_SKILLS}
+    # `_`-prefixed files are deferred: written and banked, but not served by the
+    # runtime, so this layer owes them nothing. Their case module carries the
+    # same prefix and lands in `cases.DEFERRED_CASES` for the same reason.
+    return {
+        p.stem
+        for p in SKILLS_DIR.glob("*.md")
+        if p.stem not in NOT_SKILLS and not p.name.startswith("_")
+    }
 
 
 def test_every_shipped_skill_is_benchmarked_or_declared_unbenchmarkable():
