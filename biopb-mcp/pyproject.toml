@@ -36,7 +36,22 @@ dependencies = [
     # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
     # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
     # requirement explicit.
-    "scipy",
+    #
+    # !=1.15.*: the whole 1.15 series raises `AttributeError: 'coo_matrix'
+    # object has no attribute 'indices'` from
+    # `scipy.sparse.csgraph.min_weight_full_bipartite_matching` for coo input
+    # (scipy#22501, fixed in 1.16.0; csr is unaffected on every version).
+    # Reproduced here on 1.15.3, clean on 1.14.1 and 1.16.0. This kernel is an
+    # environment an *agent* runs arbitrary scientific code in, so a documented
+    # call that raises is worth excluding rather than debugging once per user.
+    # It also happens to be what upstream tracking libraries pin against, which
+    # is what lets a `pkg:` skill declare one without the resolver moving scipy
+    # backwards under a live kernel (`docs/skill-testing.md` §4a).
+    #
+    # Costs nothing on 3.11+, which already resolve past 1.15 to 1.16+. On 3.10
+    # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
+    # 1.14.1. Retire this with the 3.10 floor, not before.
+    "scipy != 1.15.*",
     # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
     # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
     # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
