@@ -111,15 +111,17 @@ turns over.
    ```python
    feats = [describe(s) for s in STACK]
    pos, log = [EuclideanTransform()], [("reference", 0)]
+   last = 0                      # the most recent section actually placed
    for k in range(1, len(STACK)):
        model, n = estimate(feats[0], feats[k])
        if model is not None and n >= MIN_INLIERS:
-           pos.append(model); log.append(("direct", n)); continue
-       model, n = estimate(feats[k - 1], feats[k])
+           pos.append(model); last = k; log.append(("direct", n)); continue
+       model, n = estimate(feats[last], feats[k])      # not blindly k-1
        if model is None:
            pos.append(None); log.append(("failed", n)); continue
-       # compose onto the NEIGHBOUR'S POSITION, never onto the reference
-       pos.append(EuclideanTransform(matrix=pos[k - 1].params @ model.params))
+       # compose onto the LAST PLACED POSITION, never onto the reference
+       pos.append(EuclideanTransform(matrix=pos[last].params @ model.params))
+       last = k
        log.append(("chained", n))
    ```
 
@@ -223,7 +225,8 @@ Every row below was hit while building this; `scikit-image` 0.26.
 | Sections land tens of px out while the inlier counts look healthy, and NCC against the reference is the only thing that looks odd | Keypoints passed to the transform in `(row, col)`; every `skimage.transform` is `(x, y)`. The fit is self-consistent in the swapped frame, so the inlier count is unchanged | `[:, ::-1]` on both point sets (step 3). Measured: 95.7 px with rotation, still 33.9 px on a translation-only stack |
 | `FailedEstimationAccessError: FailedEstimation is not callable` | A failed `ransac` returns a falsy object, not `None`, from 0.26 — an `is None` guard lets it through | Truth-test the returned model (step 3) |
 | One section is wildly out and the rest are fine; its log entry says `direct` with a single-digit inlier count | RANSAC reports a consistent model at `min_samples` points because 3 points fit 3 parameters exactly | Gate on `MIN_INLIERS` (step 4). Measured: 1–4 inliers gave a median 371 px error, 182 px in the stack this was found in |
-| Every section past the first fallback is hundreds of px out, in a stack whose fits all succeeded | The fallback transform composed onto the *reference* instead of onto the neighbour's already-resolved position — it maps section k onto k−1, not onto the reference | `pos[k-1].params @ model.params` (step 4). Measured: 0.7–2.5 px re-anchored against 212–358 px | 
+| Every section past the first fallback is hundreds of px out, in a stack whose fits all succeeded | The fallback transform composed onto the *reference* instead of onto the last placed section's position — it maps section k onto its neighbour, not onto the reference | `pos[last].params @ model.params` (step 4). Measured: 0.7–2.5 px re-anchored against 212–358 px |
+| `AttributeError: 'NoneType' object has no attribute 'params'` partway down a stack | A section that failed both fits is `None` in `pos`, and the next section composed onto it | Fall back to the last *placed* section, not to `k-1` (step 4). Composing onto a failed neighbour is silently wrong even where it does not raise |
 | The aligned stack is worse than the input, with no error anywhere | `warp` given `pos[k]` directly; it wants the output → input map | Pass `inv(pos[k].params)` (step 5). Measured: reference-to-last NCC −0.060 applied forwards, 0.535 inverted, −0.024 unaligned |
 
 ## Next steps
