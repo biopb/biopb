@@ -27,18 +27,20 @@ where it was missed, and keeps lineage where cells divide.
 - **Counting, not following.** Objects per frame, area over time, intensity in a
   fixed region: none of these need identity, and tracking adds a large failure
   surface for nothing.
-- **The objects are indistinguishable and dense relative to how far they move.**
-  When a typical step is comparable to the spacing between neighbours, no linker
-  recovers identity — see the regime note in step 6.
+- **Nothing distinguishes the objects at either scale.** If a typical step is
+  comparable to the spacing between neighbours *and* the same object no longer
+  overlaps itself between frames, neither metric in the table below has anything
+  to work with. Acquire faster; no linker recovers this.
 
 ## Parameters
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `LABELS` | `(T, Y, X)` | The segmented series, one label image per frame, in acquisition order. Ids need not agree across frames — that is what this produces. `guide://data` for getting it out of a layer or off the tensor server |
-| `PIXEL_UM` | µm/px | From the acquisition. Ask (step 2) — no pixel carries it |
+| `LABELS` | `(T, Y, X)` | The segmented series, one label image per frame, in acquisition order. Ids need not agree across frames — that is what this produces. 3D is `(T, Z, Y, X)` and changes only the coordinate columns in step 3. `guide://data` for getting it out of a layer or off the tensor server |
+| `METRIC` | — | `laptrack` takes any `cdist` metric **or a callable**, so this is a real choice, and it sets the units of `CUTOFF` and the columns in step 3. **Centroid distance** (`sqeuclidean`, the default) — every number in this skill was measured on it. Switch to **`1 - IoU`** as a callable (step 4) when you have full masks *and* an object still covers part of its own previous footprint: it follows the mask, so growth and shape change stop reading as motion, and neighbours ambiguous by position are unambiguous by overlap. On anisotropic voxels put the coordinates in µm — one pixel cutoff cannot mean one speed limit along both z and y |
+| `PIXEL_UM` | µm/px | From the acquisition. Ask (step 2) — no pixel carries it. With a z-step, ask for that too: it is a second number, not the same one |
 | `INTERVAL_S` | s | Seconds between frames, likewise from the acquisition |
-| `MAX_STEP_PX` | px | `max_speed_um_per_min * (INTERVAL_S / 60) / PIXEL_UM` — the largest step one object can plausibly take between two frames, from what the user says their cells do. Cross-checked against the data in step 6. **Do not take the library default**, which is 15 px whatever your magnification and frame rate are |
+| `CUTOFF` | depends on `METRIC` | **Centroid:** `MAX_STEP_PX = max_speed_um_per_min * (INTERVAL_S / 60) / PIXEL_UM`, the largest step one object can plausibly take between two frames, from what the user says their cells do — cross-checked against the data in step 6. **Do not take the library default**, which is 15 px whatever your magnification and frame rate are. **Overlap:** `1 - MIN_IOU`, where `MIN_IOU` is the least overlap you would accept as the same object; a fraction, so it does not move with magnification or frame rate |
 | `MAX_GAP` | frames | One more than the longest run of frames an object may be missing. An object absent from a *single* frame reappears at a frame difference of **2**, so the smallest useful value is 2 |
 | `DIVIDES` | — | Whether these objects divide, and whether the user wants lineage. From the user, not from the images |
 
@@ -71,14 +73,22 @@ where it was missed, and keeps lineage where cells divide.
 
    ```python
    from skimage.measure import regionprops
-   rows = [(t, r.label, r.centroid[0], r.centroid[1])
+   rows = [(t, r.label, *r.centroid)
            for t, frame in enumerate(np.asarray(LABELS))
            for r in regionprops(frame)]
    det = pd.DataFrame(rows, columns=["frame", "label", "y", "x"])
    det = det.sort_values("frame").reset_index(drop=True)
    ```
 
-4. **Link, with every cutoff squared.**
+   Add `"z"` before `"y"` for a 3D series, and scale the coordinate columns into
+   µm if the voxel is anisotropic (see `METRIC`). For **overlap** the
+   coordinates are not positions at all: the two columns are what identifies a
+   mask, so add `det["frame_f"] = det["frame"].astype(float)` and pass
+   `["frame_f", "label"]` — a *copy*, because `frame_col` is consumed separately
+   from `coordinate_cols` and the metric still needs to know which frame it is
+   looking at.
+
+4. **Link, on the metric you chose.** Centroid:
 
    ```python
    from laptrack import LapTrack
@@ -92,20 +102,45 @@ where it was missed, and keeps lineage where cells divide.
        det, coordinate_cols=["y", "x"], frame_col="frame")
    ```
 
-   **The default metric is `sqeuclidean`, so every cutoff is a squared
+   **The default metric is `sqeuclidean`, so every cutoff there is a squared
    distance.** Writing `cutoff=MAX_STEP_PX` means `MAX_STEP_PX` px², a cutoff
    √MAX_STEP_PX px wide — nothing raises, and at a 15 px prior it recovers
    **45.3%** of the true links instead of 90.1%, in 847 tracks instead of 161,
    with a mean speed **45% too low**. If squaring is a thing you would rather not
-   have to remember, pass `metric="euclidean"` (and `gap_closing_metric`,
-   `splitting_metric`) and give the cutoffs as plain distances; measured on the
-   same movie the two forms agree to within 0.2 points.
+   have to remember, pass `metric="euclidean"` and give the cutoffs as plain
+   distances; measured on the same movie the two forms agree to within 0.2
+   points. **There are four metric fields** — `metric`, `gap_closing_metric`,
+   `splitting_metric`, `merging_metric` — and they are independent, so setting
+   only the first leaves the other rounds on squared distances.
+
+   For **overlap**, the metric is a callable over the two coordinate rows, and
+   the cutoffs stop being distances:
+
+   ```python
+   lt = LapTrack(
+       metric=iou_distance, cutoff=1 - MIN_IOU,
+       gap_closing_metric=iou_distance, gap_closing_cutoff=1 - MIN_IOU,
+       gap_closing_max_frame_count=MAX_GAP,
+       splitting_metric=iou_distance,
+       splitting_cutoff=(1 - MIN_IOU) if DIVIDES else False,
+   )
+   track_df, split_df, merge_df = lt.predict_dataframe(
+       det, coordinate_cols=["frame_f", "label"], frame_col="frame")
+   ```
+
+   where `iou_distance(u, v)` returns `1 - IoU` for the two `(frame, label)`
+   masks it is handed. **Precompute the overlaps and let the callable be a
+   lookup**: `cdist` calls it once per candidate pair, so mask arithmetic inside
+   it is what makes overlap linking slow. One pass of
+   `np.bincount(a[both] * (b.max() + 1) + b[both])` over each frame pair gives
+   every intersection at once; pairs that never overlap are absent, which is the
+   answer `1.0` and above any sane cutoff.
 
    The three cutoffs are one number in three places, scaled by the time each
-   one spans. **`splitting_cutoff` and `merging_cutoff` are `False` by
-   default**, which is the part that does not follow from the geometry: left
-   alone, a division ends one track and starts two tracks belonging to nobody,
-   and nothing says so.
+   one spans (centroid) or left alone (overlap, which is already a fraction).
+   **`splitting_cutoff` and `merging_cutoff` are `False` by default**, which is
+   the part that does not follow from the geometry: left alone, a division ends
+   one track and starts two tracks belonging to nobody, and nothing says so.
 
 5. **Map the result back by your own keys, never by position.**
 
@@ -130,7 +165,9 @@ where it was missed, and keeps lineage where cells divide.
    column and you report 2.5× the cells that were there.
 
 6. **Validate before reporting anything** *(blocking)*. Three numbers, none of
-   which needs a ground truth:
+   which needs a ground truth. Written for the centroid route; on overlap the
+   same three questions are asked of the realised IoUs instead — how many sit at
+   `MIN_IOU`, what the worst accepted one is, and the track count:
 
    ```python
    by = det.groupby("track_id")
@@ -155,13 +192,14 @@ where it was missed, and keeps lineage where cells divide.
    - **Track count against objects per frame.** Comfortably more tracks than
      objects means fragmentation; fewer means identities are being merged.
 
-   **Regime for every number quoted here**: 5 seeds of a synthetic 24-frame
-   movie, ~1,660 detections, 65 founder cells in 5 colonies with 50 divisions,
-   7% of detections dropped, median step 5.3 px against a median
-   nearest-neighbour distance of 17 px, at 0.5 µm/px and 90 s. Where the step
-   grows toward the spacing the whole problem degrades — at 2.9× this movie's
-   step the same method holds 73.8% of links, and no parameter recovers the
-   rest.
+   **Regime for every number quoted here**: centroid linking, on 5 seeds of a
+   synthetic 24-frame movie — ~1,660 detections, 65 founder cells in 5 colonies
+   with 50 divisions, 7% of detections dropped, median step 5.3 px against a
+   median nearest-neighbour distance of 17 px, at 0.5 µm/px and 90 s. Where the
+   step grows toward the spacing, centroid linking degrades — at 2.9× this
+   movie's step it holds 73.8% of links, and no cutoff recovers the rest. That
+   is the boundary the `METRIC` row is about: past it, position has stopped
+   identifying the object, and overlap is the question to ask instead.
 
 7. **Report the tracks and the settings.** `viewer.add_tracks` wants one row per
    detection as `[track_id, t, y, x]` — that column order, id first, which is
@@ -176,7 +214,7 @@ where it was missed, and keeps lineage where cells divide.
   the bias is invisible in the tracks themselves: the fast steps are the ones
   that failed to link. Report it with the fraction of detections that ended up
   linked, never alone.
-- **Do not tune `MAX_STEP_PX` until the tracks look right.** Continuity is a
+- **Do not tune the cutoff until the tracks look right.** Continuity is a
   weak signal: over 11–22 px, a 2× range, link accuracy moves by 0.4 points
   while the speed the tracks report moves by 4; over 5–45 px accuracy is still
   65–90% while the speed runs from 30% under to 22% over. Tracks that look
