@@ -107,6 +107,15 @@ reason instead; `test_cases.py` asserts the shipped catalogue is covered by one
 or the other, so "what does this cover" never has to be answered by reading the
 directory.
 
+A **deferred** skill — written and banked, but not served by the runtime, the
+`_` prefix — has its case module carry the same prefix and land in
+`cases.DEFERRED_CASES`. It is not benchmarked: with no catalog entry to
+withhold, all four arms would be the same arm. It is **checked exactly as
+hard**, because deferral is a statement about what the runtime serves and not a
+licence for the data to rot. `test_the_two_deferral_markers_agree` pins the two
+prefixes together, since promoting a skill means renaming two files in two
+directories.
+
 No test code either way: `test_benchmark.py` parametrizes over `CASES`, so the
 new case brings its own arms, report and transcripts, and `test_cases.py` starts
 checking its persona, its fixture and its verifier by its arriving. Report and

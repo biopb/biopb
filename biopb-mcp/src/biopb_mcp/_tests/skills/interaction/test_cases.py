@@ -12,9 +12,12 @@ being quietly wrong that no amount of running would reveal:
 - a task that asks for one name while the harness scrapes another scores a run
   on something it was never told to bind.
 
-Every check runs over `cases.CASES`, so a skill added to the benchmark is
+Every check runs over `cases.CASES` **and `cases.DEFERRED_CASES`**, so a case is
 checked by arriving rather than by someone remembering to write a test for it.
-That is the property this layer needs to survive a catalogue of thirty.
+That is the property this layer needs to survive a catalogue of thirty — and the
+reason deferral does not exempt anything here: a skill the runtime does not serve
+still has data that can rot, and banking a case is pointless if nobody would
+notice it going stale.
 """
 
 from __future__ import annotations
@@ -28,7 +31,14 @@ from .._validate import NOT_SKILLS, validate
 from ..conftest import SKILLS_DIR
 from ._benchmark import PRESENTATIONS, TENSOR_HANDLE
 from ._fixture import Attempt, Fixture
-from .cases import CASES, NOT_BENCHMARKED
+from .cases import CASES, DEFERRED_CASES, NOT_BENCHMARKED
+
+#: Everything with data to check. A deferred case is not benchmarked — there is
+#: no catalog entry to withhold, so its 2x2 would be four copies of one arm —
+#: but "the runtime does not serve this skill" says nothing about whether its
+#: fixture, persona and verifier are still coherent. Checked here, so a banked
+#: case is correct because something looked, not because nobody did.
+ALL_CASES = CASES + DEFERRED_CASES
 
 
 def _ids(case):
@@ -41,13 +51,13 @@ def _ids(case):
 _FIXTURES: dict[tuple[str, str], Fixture] = {}
 
 
-@pytest.fixture(params=CASES, ids=_ids)
+@pytest.fixture(params=ALL_CASES, ids=_ids)
 def case(request):
     return request.param
 
 
 def _case(label: str):
-    return next(c for c in CASES if c.label == label)
+    return next(c for c in ALL_CASES if c.label == label)
 
 
 def _built(label: str) -> Fixture:
@@ -78,7 +88,14 @@ def test_there_is_at_least_one_case():
 
 
 def _shipped() -> set[str]:
-    return {p.stem for p in SKILLS_DIR.glob("*.md") if p.stem not in NOT_SKILLS}
+    # `_`-prefixed files are deferred: written and banked, but not served by the
+    # runtime, so this layer owes them nothing. Their case module carries the
+    # same prefix and lands in `cases.DEFERRED_CASES` for the same reason.
+    return {
+        p.stem
+        for p in SKILLS_DIR.glob("*.md")
+        if p.stem not in NOT_SKILLS and not p.name.startswith("_")
+    }
 
 
 def test_every_shipped_skill_is_benchmarked_or_declared_unbenchmarkable():
@@ -109,6 +126,37 @@ def test_nothing_claims_to_cover_a_skill_that_does_not_ship():
 def test_an_exemption_carries_a_reason():
     for skill, why in NOT_BENCHMARKED.items():
         assert len(why.split()) >= 5, f"{skill}: {why!r} does not say why"
+
+
+def _deferred() -> set[str]:
+    """Skills written and banked but not served — the runtime's `_` marker."""
+    return {
+        p.stem[1:]
+        for p in SKILLS_DIR.glob("_*.md")
+        if p.stem not in NOT_SKILLS and p.stem[1:]
+    }
+
+
+def test_the_two_deferral_markers_agree():
+    """A case is deferred iff its skill is, and the pin is here because the two
+    markers are set in different files by different edits.
+
+    Promoting a skill by renaming one file would otherwise leave its case in
+    `DEFERRED_CASES`, where nothing benchmarks it — a served skill with no arms
+    and a green suite. Demoting one the other way would leave a case in `CASES`,
+    whose ablation arms would all measure the same empty catalog.
+    """
+    deferred_skills, shipped = _deferred(), _shipped()
+    misfiled = sorted({c.skill for c in DEFERRED_CASES} & shipped)
+    assert not misfiled, (
+        f"these cases are deferred but their skill ships, so nothing "
+        f"benchmarks a skill that is served: {misfiled}"
+    )
+    orphaned = sorted({c.skill for c in CASES} & deferred_skills)
+    assert not orphaned, (
+        f"these cases are benchmarked but their skill is deferred, so every "
+        f"arm would run against the same empty catalog: {orphaned}"
+    )
 
 
 #: `checklist:` tokens that say a skill expects a data plane — to read lazily
@@ -156,13 +204,13 @@ def test_no_two_cases_share_an_identity():
     report. Two cases colliding on it would overwrite one report with the
     other's and hand the second run the first's data — silently, since nothing
     downstream can tell the two apart."""
-    seen = [c.label for c in CASES]
+    seen = [c.label for c in ALL_CASES]
     duplicated = sorted({label for label in seen if seen.count(label) > 1})
     assert not duplicated, f"these cases collide on (skill, case_id): {duplicated}"
 
 
 def test_every_case_names_itself():
-    for case in CASES:
+    for case in ALL_CASES:
         assert case.case_id.strip(), f"{case.skill}: a case with no case_id"
 
 

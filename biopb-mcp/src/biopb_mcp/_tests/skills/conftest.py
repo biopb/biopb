@@ -96,6 +96,10 @@ def skill_factory(skills_dir: Path):
 @pytest.fixture(scope="session")
 def shipped_skill_files() -> list[Path]:
     """Every shipped skill file, excluding any prose docs beside them."""
-    files = [p for p in sorted(SKILLS_DIR.glob("*.md")) if p.stem not in NOT_SKILLS]
+    files = [
+        p
+        for p in sorted(SKILLS_DIR.glob("*.md"))
+        if p.stem not in NOT_SKILLS and not p.name.startswith("_")
+    ]
     assert files, f"no skill files found under {SKILLS_DIR}"
     return files
