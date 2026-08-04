@@ -530,6 +530,39 @@ TP/FP/FN against what `plugin:segmentation_qc` actually matches, and
 against it meaningless, so that fails at build time rather than reporting a quiet
 zero later.
 
+**A case may decline to have a synthetic fixture at all.** Set `build=None` and
+give `no_synthetic_reason`, and the case runs only where `BIOPB_SKILL_FIXTURES`
+holds a tree for it; `unavailable()` turns its absence into a skip naming the
+missing data, and the hermetic checks in `test_cases.py` skip with the same
+reason rather than reporting green over a fixture that was never built. The usual
+argument against this — *keep the default suite hermetic* — does not apply to
+this layer: §5c is not a gate and does not run in CI, because it needs a display,
+two API keys and the better part of half an hour. The real cost is narrower and
+worth naming: a colleague without the data sees a skip. A skip is visible; a
+misleading pass is not.
+
+That option exists because **a synthetic fixture can be directionally wrong, not
+merely imprecise.** The `align-stack-by-features` fixture rendered every object
+as an identical isotropic Gaussian — near worst-case for SIFT (no scale variety,
+no stable dominant orientation) and near best-case for the alternatives, since
+sparse impulse content gives sharp correlation peaks and reduces the task to
+point-set registration. Measured across cold arms, 1 in 9 chose descriptor
+matching on that content against 2 in 3 on real tissue, and the fixture's ranking
+of the two method families was the *reverse* of real data's. Nothing in a green
+run says so. So: when a skill's conclusion depends on a content statistic —
+texture against points, isotropy, dynamic range — either the fixture reproduces
+that statistic or the case says it cannot.
+
+Two consequences for curated fixtures. **Tolerances belong to the fixture, not
+the case**: limits calibrated on synthetic data do not transfer, and `case.json`
+must carry its own (`Fixture.tolerance` already overrides the module default, so
+inheriting silently is the failure mode to avoid — on real sections the
+`align-stack-by-features` reference scored 3.69 px against a 3.0 px limit
+calibrated on blobs). And **provenance carries the citation**: a curated tree is
+someone's acquisition under someone's licence, and sources such as ACDC ship a
+mandatory citation. `provenance` is the field it travels in, and it is required
+already.
+
 ### 5e. One file per skill, and what gates about it
 
 The engine (`_benchmark.py`) owns the arms, the outcome classification and the

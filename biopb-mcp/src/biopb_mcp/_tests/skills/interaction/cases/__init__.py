@@ -7,6 +7,16 @@ Adding a skill to the benchmark is:
    fixture, and a verifier for what the run leaves in the kernel;
 2. there is no step 2. The module is discovered by being here.
 
+A module whose name starts with ``_`` is skipped, which is how a *deferred*
+skill's case is kept in-tree without claiming to cover anything.
+
+A case may set ``build=None`` when the skill has no honest synthetic analogue,
+giving ``no_synthetic_reason``; it then runs only where `$BIOPB_SKILL_FIXTURES`
+supplies real data, and skips — loudly, with the reason — everywhere else. See
+`biopb-mcp/docs/skill-testing.md` §5d for when that is the right call, and for
+the measured case of a synthetic fixture that ranked two method families in the
+opposite order from real data.
+
 No test code, no registration line, no engine change. `test_benchmark.py`
 parametrizes over :data:`CASES`, so a new case brings its own arms, report and
 transcripts with it, and `test_cases.py` starts checking its persona and its

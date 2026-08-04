@@ -42,15 +42,29 @@ def case(request):
     return request.param
 
 
-def _built(skill: str) -> Fixture:
+def _built(skill: str) -> Fixture | None:
     if skill not in _FIXTURES:
-        _FIXTURES[skill] = next(c for c in CASES if c.skill == skill).build()
+        case = next(c for c in CASES if c.skill == skill)
+        _FIXTURES[skill] = case.build_fixture()
     return _FIXTURES[skill]
 
 
 @pytest.fixture
 def built(case) -> Fixture:
-    return _built(case.skill)
+    """This case's fixture, or a skip naming what is missing.
+
+    A curated-only case has nothing to check on a machine without the data, and
+    these are the checks that run in ordinary CI — so they have to *say* they
+    did not run. Silently reporting green over a case whose fixture never
+    existed is the failure mode this whole file is written against.
+    """
+    fixture = _built(case.skill)
+    if fixture is None:
+        pytest.skip(
+            f"{case.skill} is curated-only ({case.no_synthetic_reason}) and no "
+            f"curated fixture is present on this machine"
+        )
+    return fixture
 
 
 def test_there_is_at_least_one_case():
@@ -104,8 +118,24 @@ def test_every_case_is_complete_enough_to_run(case):
     assert case.task.strip(), f"{case.skill}: no task prompt"
     assert case.layers, f"{case.skill}: no fixture layer to load"
     assert case.collect, f"{case.skill}: nothing would be collected"
-    assert callable(case.score) and callable(case.build)
+    assert callable(case.score)
+    assert case.build is None or callable(case.build)
     assert case.query
+
+
+def test_a_case_without_a_synthetic_fixture_says_why(case):
+    """Curated-only is a claim about the *data*, and it has to be written down.
+
+    The cost is real — the case cannot run in CI or on a colleague's machine —
+    so "there is no honest procedural analogue" has to be argued once, here,
+    rather than being the silent result of nobody writing a builder.
+    """
+    if case.build is not None:
+        return
+    assert len(case.no_synthetic_reason.split()) >= 5, (
+        f"{case.skill}: build is None but no_synthetic_reason "
+        f"{case.no_synthetic_reason!r} does not say why"
+    )
 
 
 def test_the_task_asks_for_exactly_what_is_collected(case):
@@ -163,7 +193,10 @@ def test_the_drifted_movie_invents_no_pixels():
     at all, and a band of flat correlated structure sitting inside the very data
     the run registers on.
     """
-    movie = _built("drift-correction").data["movie"]
+    fixture = _built("drift-correction")
+    if fixture is None:  # curated-only, and no curated tree here
+        pytest.skip("drift-correction has no fixture on this machine")
+    movie = fixture.data["movie"]
     worst = {"px": 0, "frame": -1, "channel": -1, "edge": -1}
     for t, frame in enumerate(movie):
         for c, plane in enumerate(frame):

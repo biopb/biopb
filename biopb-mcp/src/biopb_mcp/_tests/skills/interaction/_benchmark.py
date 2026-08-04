@@ -163,7 +163,10 @@ class Case:
     #: Who it is talking to, and the fact the fixture strips out.
     persona: Persona
     #: ``() -> Fixture``: the data, the truth withheld from it, the tolerances.
-    build: Callable[[], Fixture]
+    #: ``None`` for a skill with no honest synthetic analogue — then the case
+    #: runs only where a curated tree exists, and `no_synthetic_reason` says
+    #: why. See `build_fixture`.
+    build: Callable[[], Fixture] | None
     #: Where the fixture's arrays land on the viewer, in order.
     layers: Sequence[Layer]
     #: What the verifier wants -> the kernel expression that yields it.
@@ -180,6 +183,11 @@ class Case:
     #: What to ask `find_skills`, to check the ablation actually took effect.
     #: Defaults to the skill id.
     catalog_query: str = ""
+    #: Required when `build` is None: why this skill has no synthetic analogue
+    #: worth scoring. Like `NOT_BENCHMARKED`, the reason must be about the
+    #: *data* — "the conclusion depends on a content statistic no procedural
+    #: fixture reproduces" is a fact; "nobody has written one" is a TODO.
+    no_synthetic_reason: str = ""
     #: Case-folded substrings that must appear in the persona's rendered
     #: prompt: the fact the fixture strips, so the run is answerable at all.
     persona_must_know: Sequence[str] = ()
@@ -196,10 +204,19 @@ class Case:
     def query(self) -> str:
         return self.catalog_query or self.skill
 
-    def build_fixture(self) -> Fixture:
+    def build_fixture(self) -> Fixture | None:
         """This case's fixture — real data if this machine has any, else the
-        procedural one the case ships (`_fixture.curated_for`)."""
-        return curated_for(self.skill) or self.build()
+        procedural one the case ships (`_fixture.curated_for`).
+
+        ``None`` only for a curated-only case on a machine with no curated
+        tree. That is a *reported absence*, never a pass: `unavailable` turns it
+        into a skip with the reason attached, so a run that could not happen
+        never reads as a run that found nothing wrong.
+        """
+        curated = curated_for(self.skill)
+        if curated is not None:
+            return curated
+        return self.build() if self.build is not None else None
 
 
 @dataclass(frozen=True)
@@ -672,7 +689,17 @@ def unavailable(case: Case) -> str:
     spawned or spent. §5a is one of them: an agent from the family that wrote
     these skills could pass by recognising its own prose.
     """
-    from . import _session
+    from . import _fixture, _session
+
+    # Cheapest and most specific: a curated-only case on a machine with no
+    # curated tree. Checked before the session and the keys, so the message
+    # names the missing data rather than whatever else happens to be absent.
+    if case.build is None and curated_for(case.skill) is None:
+        return (
+            f"{case.skill} has no synthetic fixture ({case.no_synthetic_reason}), "
+            f"and no curated one was found — point ${_fixture.FIXTURE_DIR_ENV} at a "
+            f"tree containing {case.skill}/<case_id>/case.json"
+        )
 
     if reason := _session.why_unavailable():
         return reason
