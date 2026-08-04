@@ -131,6 +131,8 @@ REJECTS = [
     ("filament", "calibrated-measurements"),
     ("centreline", "segmentation-qc-metrics"),
     ("segmentation", "detect-filaments"),
+    ("foci", "calibrated-measurements"),
+    ("spots", "segmentation-qc-metrics"),
 ]
 
 
