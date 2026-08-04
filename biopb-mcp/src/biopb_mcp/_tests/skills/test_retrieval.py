@@ -131,6 +131,11 @@ REJECTS = [
     ("filament", "calibrated-measurements"),
     ("centreline", "segmentation-qc-metrics"),
     ("segmentation", "detect-filaments"),
+    # `skeleton-network-metrics` and `calibrated-measurements` both end in
+    # morphology numbers in microns, and the word that must not conflate them is
+    # the one each is about: a network has a length, an object has a size.
+    ("skeleton", "calibrated-measurements"),
+    ("branching", "segmentation-qc-metrics"),
 ]
 
 
