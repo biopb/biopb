@@ -41,7 +41,15 @@ from pathlib import Path
 import numpy as np
 
 from .._benchmark import Case, Layer
-from .._fixture import Attempt, Fixture, Metric, Outcome, read_scalar, save_png
+from .._fixture import (
+    Attempt,
+    Fixture,
+    Metric,
+    Outcome,
+    Procedural,
+    read_scalar,
+    save_png,
+)
 from .._respondent import Persona
 
 SKILL = "segmentation-qc-metrics"
@@ -62,7 +70,6 @@ class TwoRuns:
     prediction belongs to which annotation.
     """
 
-    case_id: str = "hand-annotation-versus-model"
     shape: tuple[int, int] = (256, 256)
     rows: int = 6
     cols: int = 7
@@ -126,9 +133,6 @@ class TwoRuns:
         _agrees_with_the_plugin(gt, pred, truth)
 
         return Fixture(
-            skill_id=SKILL,
-            case_id=self.case_id,
-            kind="synthetic",
             provenance=(
                 f"procedural: seed {self.seed}, {self.n_gt} annotated objects, "
                 f"{n_pred} predicted — {matched} matched, {self.n_spurious} "
@@ -282,9 +286,10 @@ ANNOTATOR = Persona(
 
 CASE = Case(
     skill=SKILL,
+    case_id="hand-annotation-versus-model",
     task=TASK,
     persona=ANNOTATOR,
-    build=TwoRuns(),
+    fixture=Procedural(TwoRuns()),
     layers=(
         Layer("labels_run_a", "labels_run_a", kind="labels"),
         Layer("labels_run_b", "labels_run_b", kind="labels"),

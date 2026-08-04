@@ -29,12 +29,14 @@ from .conftest import smoke_failures
 
 pytestmark = pytest.mark.interaction
 
-#: Runs are expensive, and both tests read the same one. Keyed by skill so a
-#: module-scoped parametrized fixture can hand back the run it already paid for.
-_RUNS: dict[str, Run] = {}
+#: Runs are expensive, and both tests read the same one. Keyed by
+#: `(skill, case_id)` so a module-scoped parametrized fixture can hand back the
+#: run it already paid for — and so a skill covered two ways does not have its
+#: second case handed the first's results.
+_RUNS: dict[tuple[str, str], Run] = {}
 
 
-@pytest.fixture(scope="module", params=CASES, ids=lambda case: case.skill)
+@pytest.fixture(scope="module", params=CASES, ids=lambda case: case.label)
 def run(request) -> Run:
     case = request.param
     if reason := unavailable(case):
@@ -47,10 +49,11 @@ def run(request) -> Run:
             f"the session smoke tests failed ({len(broken)}), so the stack is "
             f"what broke and not the skill: {broken[0]}"
         )
-    if case.skill not in _RUNS:
-        _RUNS[case.skill] = run_case(case)
-        print("\n\n" + _RUNS[case.skill].summary() + "\n")
-    done = _RUNS[case.skill]
+    key = (case.skill, case.case_id)
+    if key not in _RUNS:
+        _RUNS[key] = run_case(case)
+        print("\n\n" + _RUNS[key].summary() + "\n")
+    done = _RUNS[key]
     if done.failed_to_start:
         pytest.skip(done.results[0].error)
     return done

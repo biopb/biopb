@@ -68,9 +68,9 @@ from ._conversation import (
 from ._fixture import (
     Attempt,
     Fixture,
+    FixtureSpec,
     Outcome,
     artifact_root,
-    curated_for,
     write_report,
 )
 from ._models import agent_choice, reachable, respondent_choice, setting, text_backend
@@ -151,19 +151,30 @@ class Case:
     `cases/drift_correction.py` for the worked example, and `cases/__init__.py`
     for the three-line procedure.
 
-    The fixture is a callable rather than a value so a case module costs
+    **A case is non-decomposable.** Task, persona, fixture, verifier and
+    tolerances are one artifact, and where the pixels come from — a procedure
+    or a file on disk — is decided here, when the case is written, never
+    resolved at run time. Covering one skill both ways is *two cases*, each
+    with its own `case_id`, and `(skill, case_id)` is what names a run's
+    artifacts (`docs/skill-fixtures.md`).
+
+    The fixture is a spec rather than a built value so a case module costs
     nothing at import: 30 of these are collected by every ordinary test run,
     and only the one being benchmarked should build megabytes of arrays.
     """
 
     #: Skill id, as `find_skills` and `skill://<id>` know it.
     skill: str
+    #: What this case is, within that skill: names the run and its artifacts,
+    #: and — for a curated fixture — locates its data on disk.
+    case_id: str
     #: What the agent is asked to do, including where its results should land.
     task: str
     #: Who it is talking to, and the fact the fixture strips out.
     persona: Persona
-    #: ``() -> Fixture``: the data, the truth withheld from it, the tolerances.
-    build: Callable[[], Fixture]
+    #: Where this case's data comes from. Exactly one, and no fallback:
+    #: substituting it would make a different experiment with the same name.
+    fixture: FixtureSpec
     #: Where the fixture's arrays land on the viewer, in order.
     layers: Sequence[Layer]
     #: What the verifier wants -> the kernel expression that yields it.
@@ -196,10 +207,13 @@ class Case:
     def query(self) -> str:
         return self.catalog_query or self.skill
 
+    @property
+    def label(self) -> str:
+        return f"{self.skill}/{self.case_id}"
+
     def build_fixture(self) -> Fixture:
-        """This case's fixture — real data if this machine has any, else the
-        procedural one the case ships (`_fixture.curated_for`)."""
-        return curated_for(self.skill) or self.build()
+        """This case's one fixture, stamped with the identity declared above."""
+        return self.fixture.build(self.skill, self.case_id)
 
 
 @dataclass(frozen=True)
@@ -399,8 +413,13 @@ class Result:
 
 
 def where_for(case: Case) -> Path:
-    """Where this case's report and transcripts land."""
-    return artifact_root() / "interaction" / case.skill
+    """Where this case's report and transcripts land.
+
+    Keyed on `(skill, case_id)`, not on the skill: a skill covered two ways is
+    two cases, and one directory for both would have the second silently
+    overwrite the first's report.
+    """
+    return artifact_root() / "interaction" / case.skill / case.case_id
 
 
 def catalog_size(text: str) -> int:
@@ -572,14 +591,20 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         return "—" if value is None else f"{value:.4g}"
 
     lines = [
-        f"# {case.skill} — interaction benchmark",
+        f"# {case.label} — interaction benchmark",
         "",
         f"Agent under test: **{agent.name}**  ",
         f"Respondent: **{respondent.name}**  ",
-        f"Fixture: `{fixture.case_id}` — {fixture.about or 'no description'}  ",
+        f"Fixture: `{fixture.case_id}` [{fixture.kind}] — "
+        f"{fixture.about or 'no description'}  ",
         "Tolerances: " + ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns),
         "",
     ]
+    if fixture.citation:
+        # Carried into the report rather than left to whoever remembers: real
+        # data comes from someone, and a result quoted without them is the
+        # obligation quietly dropped.
+        lines += [f"Data: {fixture.citation}", ""]
     if skipped:
         # Named, not merely absent: a short table is otherwise indistinguishable
         # from a 2x2 whose other corners died, and the missing corners are the
@@ -649,6 +674,9 @@ def write_summary(case: Case, results: Sequence[Result], fixture: Fixture) -> st
         json.dumps(
             {
                 "skill": case.skill,
+                "case": case.case_id,
+                "kind": fixture.kind,
+                "citation": fixture.citation,
                 "fixture": fixture.case_id,
                 "agent": agent.name,
                 "respondent": respondent.name,
@@ -674,6 +702,13 @@ def unavailable(case: Case) -> str:
     """
     from . import _session
 
+    # First, because it is free and it is about the *case* rather than the
+    # machine's model access: a case written against an acquisition this tree
+    # does not have cannot run, and must never quietly run against something
+    # else.
+    usable, why = case.fixture.available(case.skill, case.case_id)
+    if not usable:
+        return f"fixture: {why}"
     if reason := _session.why_unavailable():
         return reason
     for side, choice in (

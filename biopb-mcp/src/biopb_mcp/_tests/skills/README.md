@@ -166,6 +166,6 @@ said. It was deleted, and the reasoning is worth keeping:
   every skill would have owed the same.
 
 What was worth keeping moved into `interaction/`: the fixture protocol, the
-substitutable curated-data path (`BIOPB_SKILL_FIXTURES`), the tolerances, and
+on-disk fixture path (rooted at `BIOPB_SKILL_FIXTURES`), the tolerances, and
 the verifiers themselves — which now score what a model actually left in the
 kernel instead of what a transcription computed.

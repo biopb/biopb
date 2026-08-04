@@ -29,12 +29,13 @@ from .cases import CASES, NOT_BENCHMARKED
 
 
 def _ids(case):
-    return case.skill
+    return case.label
 
 
 #: Built once each: a fixture is megabytes of numpy and several cases share
-#: these tests.
-_FIXTURES: dict[str, Fixture] = {}
+#: these tests. Keyed on `(skill, case_id)` — a skill covered two ways is two
+#: cases, and keying on the skill alone would hand the second the first's data.
+_FIXTURES: dict[tuple[str, str], Fixture] = {}
 
 
 @pytest.fixture(params=CASES, ids=_ids)
@@ -42,15 +43,26 @@ def case(request):
     return request.param
 
 
-def _built(skill: str) -> Fixture:
-    if skill not in _FIXTURES:
-        _FIXTURES[skill] = next(c for c in CASES if c.skill == skill).build()
-    return _FIXTURES[skill]
+def _case(label: str):
+    return next(c for c in CASES if c.label == label)
+
+
+def _built(label: str) -> Fixture:
+    case = _case(label)
+    key = (case.skill, case.case_id)
+    if key not in _FIXTURES:
+        _FIXTURES[key] = case.build_fixture()
+    return _FIXTURES[key]
 
 
 @pytest.fixture
 def built(case) -> Fixture:
-    return _built(case.skill)
+    """This case's own fixture — skipped, never substituted, when the machine
+    cannot produce it."""
+    usable, why = case.fixture.available(case.skill, case.case_id)
+    if not usable:
+        pytest.skip(f"{case.label}: {why}")
+    return _built(case.label)
 
 
 def test_there_is_at_least_one_case():
@@ -96,6 +108,44 @@ def test_an_exemption_carries_a_reason():
         assert len(why.split()) >= 5, f"{skill}: {why!r} does not say why"
 
 
+def test_no_two_cases_share_an_identity():
+    """`(skill, case_id)` names a run's artifacts, its cached fixture and its
+    report. Two cases colliding on it would overwrite one report with the
+    other's and hand the second run the first's data — silently, since nothing
+    downstream can tell the two apart."""
+    seen = [c.label for c in CASES]
+    duplicated = sorted({label for label in seen if seen.count(label) > 1})
+    assert not duplicated, f"these cases collide on (skill, case_id): {duplicated}"
+
+
+def test_every_case_names_itself():
+    for case in CASES:
+        assert case.case_id.strip(), f"{case.skill}: a case with no case_id"
+
+
+def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
+    tmp_path, monkeypatch
+):
+    """The regression this whole design exists to prevent.
+
+    `$BIOPB_SKILL_FIXTURES` used to be a policy switch: whatever sat under it
+    replaced a case's own fixture, silently and per machine. **Substituting the
+    data makes it a different experiment with the same name** — the truth
+    changes, the achievable accuracy changes, and the conclusion can invert,
+    which was measured rather than supposed (`docs/skill-fixtures.md`). It is a
+    root path now, and a procedural case must not so much as look at it.
+    """
+    case = CASES[0]
+    decoy = tmp_path / case.skill / case.case_id
+    decoy.mkdir(parents=True)
+    (decoy / "case.json").write_text('{"data": {}, "truth": {}}', encoding="utf-8")
+    monkeypatch.setenv("BIOPB_SKILL_FIXTURES", str(tmp_path))
+
+    built = case.build_fixture()
+    assert built.kind == "synthetic"
+    assert built.data, "the case built nothing, so the decoy was consulted"
+
+
 # --- the case is runnable --------------------------------------------------
 
 
@@ -104,7 +154,10 @@ def test_every_case_is_complete_enough_to_run(case):
     assert case.task.strip(), f"{case.skill}: no task prompt"
     assert case.layers, f"{case.skill}: no fixture layer to load"
     assert case.collect, f"{case.skill}: nothing would be collected"
-    assert callable(case.score) and callable(case.build)
+    assert callable(case.score)
+    assert callable(getattr(case.fixture, "build", None)), (
+        f"{case.label}: `fixture` is not a FixtureSpec"
+    )
     assert case.query
 
 
@@ -163,7 +216,9 @@ def test_the_drifted_movie_invents_no_pixels():
     at all, and a band of flat correlated structure sitting inside the very data
     the run registers on.
     """
-    movie = _built("drift-correction").data["movie"]
+    movie = np.asarray(
+        _built("drift-correction/two-channels-one-structural").data["movie"]
+    )
     worst = {"px": 0, "frame": -1, "channel": -1, "edge": -1}
     for t, frame in enumerate(movie):
         for c, plane in enumerate(frame):

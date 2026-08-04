@@ -62,7 +62,7 @@ time and are never written to a trace, an artifact or a log.
 | `_models.py` | The provider table: which model on each side, at which address, with which key |
 | `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `ToolCallingAgent` |
 | `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
-| `_fixture.py` | What a run is given and what it recovers: `Fixture`, `Attempt`, `Metric`, `Outcome`, the curated-data path, artifact writing. Knows no skill |
+| `_fixture.py` | What a run is given and what it recovers: `Fixture`, `Attempt`, `Metric`, `Outcome`, the fixture specs (`Procedural`/`OnDisk`) and the refs they hand out, artifact writing. Knows no skill |
 | `_benchmark.py` | The engine: `Case`, the 2x2 arms, outcome classification, the report. Knows no skill |
 | `cases/` | One module per skill, each a single `CASE`. Data, not code |
 | `_conversation.py` | The two-model loop, the caps, the `Trace` |
@@ -71,7 +71,8 @@ time and are never written to a trace, an artifact or a log.
 | `test_conversation.py` | That the loop works, with no model *and* no session |
 | `test_report.py` | That the engine classifies and reports, on hand-built outcomes |
 | `test_cases.py` | That every case's persona, fixture and verifier hold up — and that the catalogue is covered |
-| `test_fixture_protocol.py` | The scoring protocol itself, including the curated path almost no machine has data for |
+| `test_fixture_protocol.py` | The scoring protocol itself, including the on-disk path almost no machine has data for |
+| `test_fixture_tree.py` | `-m fixtures`: hashes a curated tree against its manifest. Out-of-band, never inside a run |
 | `test_models.py` | That provider selection resolves, and that §5a holds of the defaults |
 
 ## Adding a skill
@@ -83,9 +84,10 @@ module is discovered by being there.
 ```python
 CASE = Case(
     skill="calibrated-measurements",
+    case_id="twelve-nuclei-anisotropic",   # with `skill`, names the run
     task=TASK,                        # the prompt, incl. where results land
     persona=MICROSCOPIST,             # who holds the fact the fixture withholds
-    build=Ellipsoids(),               # () -> Fixture: data, truth, tolerances
+    fixture=Procedural(Ellipsoids()), # data, truth, tolerances -- and only this
     layers=(Layer("nuclei", "image"),
             Layer("nuclei_labels", "labels", kind="labels")),
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},

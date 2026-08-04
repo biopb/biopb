@@ -340,11 +340,13 @@ def test_the_report_names_both_models_and_the_fixture(report):
     assert FIXTURE.about in text
 
 
-def test_the_report_lands_under_its_own_skill(report):
-    """So a second case does not overwrite the first — the thing that made the
-    old single-skill layout a problem the moment there were two."""
+def test_the_report_lands_under_its_own_case(report):
+    """Under `<skill>/<case_id>`, so neither a second skill nor a second case
+    for the same skill overwrites the first — the thing that made the old
+    single-directory-per-skill layout a problem the moment there were two."""
     _, _, where = report
-    assert where.name == CASES[0].skill
+    assert where.name == CASES[0].case_id
+    assert where.parent.name == CASES[0].skill
     assert (where / "summary.md").is_file()
 
 

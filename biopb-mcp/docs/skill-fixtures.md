@@ -1,7 +1,27 @@
 # Fixtures for the interaction layer — a design
 
-Status: **proposal**. Supersedes PR #704, and corrects the framing that
-`biopb-mcp/docs/skill-testing.md` §5d currently carries.
+Status: **partly implemented**. Supersedes PR #704, and corrects the framing
+`biopb-mcp/docs/skill-testing.md` §5d used to carry.
+
+| Section | State |
+|---|---|
+| The principle; what it deletes | **landed** — `curated_for()` and its precedence are gone |
+| The shape (`FixtureSpec`, `Procedural`, `OnDisk`) | **landed** |
+| Data and truth as references (`ArrayRef`) | **landed**, as `NpzRef` + `FileRef` |
+| Identity — `(skill, case_id)` everywhere | **landed** |
+| The tree carries a manifest; out-of-band hashing | **landed** (`-m fixtures`) |
+| A presentation ladder (`array`/`dask`/`tensor`) | not started |
+| The run-scoped data plane | not started |
+| Per-skill presentation coverage warning | not started, and waits on the ladder |
+
+Two deviations from what is written below, both narrowing:
+
+- **`MemmapRef` was not built.** `FileRef` memory-maps `.npy` itself, so a
+  separate class would have been the same object under a second name.
+- **`.npz` is not in `FileRef`'s reader registry.** An archive holds many
+  arrays, so naming the file does not name an array; a `.npz` in a case's
+  layout resolves through `NpzRef` on the key that referenced it, which is why
+  the layout below maps *key → filename* rather than the reverse.
 
 ## The principle
 
@@ -130,16 +150,21 @@ So ground truth can be the `_gt.nii.gz` sitting beside its image, or a label vol
 the size of the acquisition, without repacking and without residency.
 
 An on-disk case's `case.json` then describes only the *data layout* — not limits,
-which belong to the case module:
+which belong to the case module beside the verifier that reports against them,
+and not provenance or citation, which belong to the manifest below so that a
+curated case has exactly one place recording what was acquired:
 
 ```json
 {
-  "provenance": "ACDC test/patient101 frame01; Bernard et al., IEEE TMI 37(11):2514, 2018",
-  "citation": "doi:10.1109/TMI.2018.2837502",
+  "about": "one ACDC patient, slices re-placed independently",
   "data":  {"stack":  "patient101_frame01.nii.gz"},
   "truth": {"labels": "patient101_frame01_gt.nii.gz"}
 }
 ```
+
+The mapping is *key → filename* rather than filename → keys because a `.npz`
+carries many arrays: `{"stack": "arrays.npz"}` resolves to the member named
+`stack`, so one archive can back several keys with no new syntax.
 
 The data/truth partition rule — a key in both is an error, because a truth the run
 can see is not a truth — is unchanged and still checkable on keys alone.
@@ -366,9 +391,14 @@ fixture=Procedural(AmbiguousChannels()),
 PR #704 is superseded rather than rebased: its `build=None` +
 `no_synthetic_reason` is the override model patched, and this removes the model.
 
-`skill-testing.md` §5d needs the same correction — it currently says real data
-"can replace a synthetic case without touching the verifier", which is precisely
-the framing being retired.
+Done, and it went as described: the five builders also stopped restating
+`skill_id`/`case_id`/`kind`, which the spec now stamps from the case that owns
+them — a second place to name a case is a second place for the name to drift,
+with the report saying one thing and the artifact directory another.
+
+`skill-testing.md` §5d has been corrected in the same change; it used to say real
+data "can replace a synthetic case without touching the verifier", which is
+precisely the framing being retired.
 
 ## Settled
 

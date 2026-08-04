@@ -43,7 +43,15 @@ import numpy as np
 from scipy import ndimage
 
 from .._benchmark import Case, Layer
-from .._fixture import Attempt, Fixture, Metric, Outcome, read_array, save_png
+from .._fixture import (
+    Attempt,
+    Fixture,
+    Metric,
+    Outcome,
+    Procedural,
+    read_array,
+    save_png,
+)
 from .._respondent import Persona
 
 SKILL = "stitch-tiles"
@@ -119,7 +127,6 @@ def placement_error(estimate: np.ndarray, truth: np.ndarray) -> np.ndarray:
 class SnakeGrid:
     """A tile grid whose shape and acquisition path only the microscopist knows."""
 
-    case_id: str = "path-known-only-to-the-operator"
     seed: int = 23
 
     def __call__(self) -> Fixture:
@@ -184,9 +191,6 @@ class SnakeGrid:
         )
 
         return Fixture(
-            skill_id=SKILL,
-            case_id=self.case_id,
-            kind="synthetic",
             provenance=(
                 f"procedural: {rows * cols} tiles of {H}x{W}, seed {self.seed}, "
                 f"{rows}x{cols} grid acquired serpentine at {OVERLAP_PCT}% "
@@ -344,9 +348,10 @@ MICROSCOPIST = Persona(
 
 CASE = Case(
     skill=SKILL,
+    case_id="path-known-only-to-the-operator",
     task=TASK,
     persona=MICROSCOPIST,
-    build=SnakeGrid(),
+    fixture=Procedural(SnakeGrid()),
     layers=(Layer("tiles", "tiles"),),
     collect={"pos": "pos", "mosaic": "mosaic"},
     score=verify,

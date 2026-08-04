@@ -48,6 +48,7 @@ from .._fixture import (
     Fixture,
     Metric,
     Outcome,
+    Procedural,
     read_array,
     read_scalar,
     save_png,
@@ -133,7 +134,6 @@ def field_error_pct(estimate, truth) -> float:
 class VignettedTiles:
     """A tile collection whose camera offset only the microscopist knows."""
 
-    case_id: str = "offset-known-only-to-the-operator"
     n_tiles: int = 24
     shape: tuple[int, int] = (256, 256)
     seed: int = 11
@@ -165,9 +165,6 @@ class VignettedTiles:
         assert 1.5 < span < 2.5, f"the vignette is {span:.1f}x, no longer ordinary"
 
         return Fixture(
-            skill_id=SKILL,
-            case_id=self.case_id,
-            kind="synthetic",
             provenance=(
                 f"procedural: {self.n_tiles} tiles of {self.shape[0]}x"
                 f"{self.shape[1]}, seed {self.seed}, camera offset "
@@ -377,9 +374,10 @@ MICROSCOPIST = Persona(
 
 CASE = Case(
     skill=SKILL,
+    case_id="offset-known-only-to-the-operator",
     task=TASK,
     persona=MICROSCOPIST,
-    build=VignettedTiles(),
+    fixture=Procedural(VignettedTiles()),
     layers=(Layer("tiles", "tiles"),),
     collect={"flat": "flat", "darkfield": "darkfield"},
     score=verify,
