@@ -4,7 +4,7 @@ title: Measure labeled objects in physical units, not pixels
 description: Report object areas, volumes, and diameters in microns instead of pixels, using the image's real voxel spacing.
 tags: [measurement, quantification]
 version: 1.0.0
-checklist: [viewer, tensor, pkg:biopb-mcp>=0.13.0]
+checklist: [viewer, tensor, dask, pkg:biopb-mcp>=0.13.0]
 ---
 
 # Measure labeled objects in physical units, not pixels
@@ -78,7 +78,17 @@ generated from a previous step. Read `guide://data` before pulling pixels and me
    reported in pixels, and proceed either way. Do not guess from the objective or
    the file name.
 
-4. **Measure with `spacing=`.** The only difference from an uncalibrated call:
+4. **Choose the route from the size of `LABELS`.** `regionprops_table` takes
+   numpy arrays, so a lazy array materializes `LABELS` **and** `IMAGE` in full,
+   at once, on the first line of step 5. Compare `LABELS.nbytes + IMAGE.nbytes`
+   against what the *kernel* has free, not what the machine has, and leave
+   headroom for `regionprops`' own intermediates — take half of free memory as
+   the ceiling. Under it, **5a**; over it or unsure, **5b**. A single stack is
+   usually 5a; a whole-slide or multi-tile field is 5b.
+
+5. **Measure with `spacing=`.**
+
+   **(a) The array fits.** The only difference from an uncalibrated call:
 
    ```python
    import pandas as pd
@@ -88,10 +98,57 @@ generated from a previous step. Read `guide://data` before pulling pixels and me
        lab_arr, intensity_image=img_arr, properties=PROPERTIES, spacing=spacing))
    ```
 
-   These arrays are lazy, so this call is what materializes them in full — crop
-   first, or promote it to a job, before running it on a whole volume.
+   **(b) It does not.** Measure each object from its own bounding box: nothing
+   larger than one object is ever resident, and `spacing=` means exactly what it
+   means in 5a. First the boxes — one pass over the labels, none of it held:
 
-   In 3D, `area` **is the volume** — there is no `volume` property. Rename on the
+   ```python
+   import dask, dask.array as da, numpy as np, pandas as pd, scipy.ndimage as ndi
+   from skimage.measure import regionprops_table
+
+   def _boxes(block, block_info=None):
+       origin = [loc[0] for loc in block_info[0]["array-location"]]
+       found = {}
+       for i, sl in enumerate(ndi.find_objects(block), start=1):
+           if sl is not None:
+               found[i] = tuple((s.start + o, s.stop + o)
+                                for s, o in zip(sl, origin))
+       return np.array(found, dtype=object).reshape((1,) * block.ndim)
+
+   boxes = {}
+   for part in da.map_blocks(_boxes, lab_arr, dtype=object,
+                             chunks=(1,) * lab_arr.ndim).compute().ravel():
+       for i, box in part.items():          # a box may span blocks: min/max merge
+           old = boxes.get(i)
+           boxes[i] = box if old is None else tuple(
+               (min(a[0], b[0]), max(a[1], b[1])) for a, b in zip(old, box))
+   ```
+
+   Then one crop per object. A crop is measured **in its own coordinates**, so
+   every position-valued column needs its box origin added back — and the two
+   families do not take the same offset, because `spacing=` converts `centroid`
+   to physical units and leaves `bbox` in indices:
+
+   ```python
+   def _one(lab_crop, img_crop, i, origin):
+       t = regionprops_table(np.where(lab_crop == i, i, 0),   # mask out neighbours
+                             intensity_image=img_crop,
+                             properties=PROPERTIES, spacing=spacing)
+       for key, col in t.items():
+           ax = int(key.rsplit("-", 1)[1]) % lab_crop.ndim if key[-1].isdigit() else 0
+           if key.startswith("centroid"):
+               t[key] = col + origin[ax] * spacing[ax]   # physical
+           elif key.startswith("bbox"):
+               t[key] = col + origin[ax]                 # indices
+       return pd.DataFrame(t)
+
+   df = pd.concat(dask.compute(*[
+       dask.delayed(_one)(lab_arr[s], img_arr[s], i, [a for a, _ in box])
+       for i, box in sorted(boxes.items())
+       for s in [tuple(slice(a, b) for a, b in box)]]), ignore_index=True)
+   ```
+
+   Either route, in 3D `area` **is the volume** — there is no `volume` property. Rename on the
    way out so the unit is carried by the column name, which is what survives into
    a spreadsheet:
 
@@ -103,30 +160,45 @@ generated from a previous step. Read `guide://data` before pulling pixels and me
    })
    ```
 
-5. **Visual check** *(non-blocking)*. Report the object count, the median and
+6. **Visual check** *(non-blocking)*. Report the object count, the median and
    IQR of the size column, and the fraction touching the border, then say whether
    the median is plausible for the stated object type. This is the step that
    catches a spacing that is off by 10³: a nucleus of 500 µm³ is wrong in a way
    that 500 voxels is not.
 
-6. **Hand back the table and the exact spacing used.** End with the parameter
+7. **Hand back the table and the exact spacing used.** End with the parameter
    dict, so the run is reproducible and a later batch pass does not re-derive it:
 
    ```python
    # layer names, or array_ids when the run came off the tensor server
    print({"labels": LABELS_REF, "image": IMAGE_REF,
           "spacing": spacing, "unit": UNIT, "properties": PROPERTIES,
-          "n_objects": int(len(df))})
+          "route": "whole" or "per-object", "n_objects": int(len(df))})
    ```
 
 ## Guardrails
 
-- **A lazy array handed to `regionprops_table` materializes it.** Measure a
-  computed crop or a single plane while iterating, and promote the full-volume
-  pass to a job.
+- **A lazy array handed to `regionprops_table` materializes it.** That is what
+  step 4 decides; while iterating on parameters, measure a computed crop or a
+  single plane either way, and promote the full pass to a job.
 - **Centroids come back in physical units when `spacing` is given** — 7.5 µm, not
   row 1. Re-deriving array indices from them silently indexes the wrong voxel;
   measure a second time without spacing if indices are needed.
+- **5b assumes `LABELS` is numbered consistently across chunks.** Labels produced
+  by a per-block `scipy.ndimage.label` are not: each half of an object that
+  straddles a chunk face gets its own number, so it is measured as two objects,
+  each too small. Nothing in the table says so — check how `LABELS` was made, and
+  if it came from a mask, relabel with the `chunked_label` kernel plugin first.
+- **5b costs one task per object** — roughly 3 ms each, so ~10⁵ objects is minutes
+  and ~10⁶ is impractical. Above that, only the properties that decompose into
+  per-pixel sums are affordable: `area`, `intensity_mean`, and `centroid` come
+  from a single `da.bincount` pass over the labels, and everything shape-derived
+  has to go. Say which properties were dropped rather than shrinking the table
+  silently.
+- **Do not reach for `dask_image.ndmeasure` for this.** Its `labeled_comprehension`
+  masks the whole array once per label, so cost scales as objects × pixels: on a
+  1024², 400-object field it took 67 s against 1.1 s for 5b, and it cannot produce
+  `perimeter`, `solidity`, or `euler_number` at all.
 
 ## Failure modes
 
@@ -138,3 +210,4 @@ generated from a previous step. Read `guide://data` before pulling pixels and me
 | `NotImplementedError: perimeter supports isotropic spacings only` | `perimeter` / `perimeter_crofton` reject anisotropic spacing | Measure perimeter on an isotropic plane, or resample to isotropic first |
 | `eccentricity` / `axis_major_length` shift when spacing is added | Correct, not a bug — anisotropic voxels genuinely change the fitted ellipse | Report the calibrated value; note the spacing alongside it |
 | `ValueError` on the length of `spacing`, or Z-sized numbers on a channel axis | `layer.scale` read positionally — a non-spatial axis counted as one, or an interleaved-colour layer whose scale is one element short (napari does not count the samples axis) | Match entries to `LABELS`' axis labels, not to positions (step 2) |
+| After 5b positions are wrong while sizes are right — every object near the origin, or `centroid` right but `bbox` off | Crops are measured in their own coordinates, and the two position families take *different* offsets: under `spacing=`, `centroid` is physical and `bbox` stays in array indices | Offset `centroid` by `origin × spacing`, `bbox` by `origin` (step 5b) |
