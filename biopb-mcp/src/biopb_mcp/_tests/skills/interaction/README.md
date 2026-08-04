@@ -73,6 +73,8 @@ time and are never written to a trace, an artifact or a log.
 | `test_cases.py` | That every case's persona, fixture and verifier hold up — and that the catalogue is covered |
 | `test_fixture_protocol.py` | The scoring protocol itself, including the on-disk path almost no machine has data for |
 | `test_fixture_tree.py` | `-m fixtures`: hashes a curated tree against its manifest. Out-of-band, never inside a run |
+| `_plane.py` | The run-scoped tensor server a `tensor`-presented case needs. Conditional: nothing starts unless a case asks |
+| `test_plane.py` | That plane — hermetic checks on its config, plus `-m interaction` ones against a real server |
 | `test_models.py` | That provider selection resolves, and that §5a holds of the defaults |
 
 ## Adding a skill
@@ -88,8 +90,10 @@ CASE = Case(
     task=TASK,                        # the prompt, incl. where results land
     persona=MICROSCOPIST,             # who holds the fact the fixture withholds
     fixture=Procedural(Ellipsoids()), # data, truth, tolerances -- and only this
-    layers=(Layer("nuclei", "image"),
+    layers=(Layer("nuclei", "image"),          # in-memory numpy, client is None
             Layer("nuclei_labels", "labels", kind="labels")),
+    #  ... or presentation="tensor", chunks=(1, 256, 256) for a lazy skill,
+    #  which brings up one data plane for the whole run.
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},
     score=verify,                     # (fixture, attempt) -> Outcome
     save_artifacts=save_artifacts,

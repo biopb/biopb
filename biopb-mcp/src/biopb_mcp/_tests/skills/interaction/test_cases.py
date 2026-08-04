@@ -19,11 +19,14 @@ That is the property this layer needs to survive a catalogue of thirty.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
-from .._validate import NOT_SKILLS
+from .._validate import NOT_SKILLS, validate
 from ..conftest import SKILLS_DIR
+from ._benchmark import PRESENTATIONS, TENSOR_HANDLE
 from ._fixture import Attempt, Fixture
 from .cases import CASES, NOT_BENCHMARKED
 
@@ -108,6 +111,46 @@ def test_an_exemption_carries_a_reason():
         assert len(why.split()) >= 5, f"{skill}: {why!r} does not say why"
 
 
+#: `checklist:` tokens that say a skill expects a data plane — to read lazily
+#: from one, to upload a result to one, or both. They map to the same
+#: presentation, because the tensor path is the only place either happens:
+#: `client.get_tensor` is what hands a session a dask array in production, and
+#: `client is None` is what an `array` case gives instead.
+LAZY_TOKENS = ("dask", "tensor")
+
+
+def test_a_skill_written_for_lazy_data_reports_whether_a_case_presents_it():
+    """A coverage ledger, and it **warns rather than fails**.
+
+    The unit is the skill, not the case: a case presenting `array` for a skill
+    that declares `dask` is not wrong, it tests the in-memory branch, which is
+    a real branch. What it is, is *incomplete* — and since a skill may have
+    several cases, the fix is another case rather than a correction to this
+    one. A gate here would demand cases nobody has written yet and would punish
+    an honest partial benchmark exactly as hard as a wrong one.
+
+    It belongs beside `NOT_BENCHMARKED`, which records "this skill is outside
+    the layer, and why". This records "this skill is *partly* inside it, and
+    which part".
+    """
+    entries, _ = validate(SKILLS_DIR)
+    lazy_cases = {c.skill for c in CASES if any(layer.lazy for layer in c.layers)}
+    for entry in entries:
+        declared = [t for t in LAZY_TOKENS if t in entry.checklist]
+        if (
+            not declared
+            or entry.id in lazy_cases
+            or entry.id not in {c.skill for c in CASES}
+        ):
+            continue
+        warnings.warn(
+            f"{entry.id} declares {declared}, but every case presents `array`, "
+            "so every arm runs with `client is None` — neither the lazy read "
+            "path nor any step that uploads a result has been benchmarked",
+            stacklevel=1,
+        )
+
+
 def test_no_two_cases_share_an_identity():
     """`(skill, case_id)` names a run's artifacts, its cached fixture and its
     report. Two cases colliding on it would overwrite one report with the
@@ -176,6 +219,40 @@ def test_every_layer_kind_is_one_the_harness_can_add(case):
     for layer in case.layers:
         assert layer.kind in ("image", "labels"), (
             f"{case.skill}: layer {layer.name!r} wants a {layer.kind!r} layer"
+        )
+
+
+def test_every_layer_is_presented_in_a_way_the_harness_can_produce(case):
+    for layer in case.layers:
+        assert layer.presentation in PRESENTATIONS, (
+            f"{case.label}: layer {layer.name!r} asks for "
+            f"{layer.presentation!r}, not one of {PRESENTATIONS}"
+        )
+
+
+def test_a_case_on_a_plane_tells_the_agent_where_its_data_is(case):
+    """A `tensor` fixture is addressable but **not discoverable** — an uploaded
+    source is deliberately not synced to the catalog, so `query_sources()` will
+    not find it. The ids arrive in the namespace instead, and an agent nobody
+    told would be scored on failing to guess at a source it could not list."""
+    if not any(layer.lazy for layer in case.layers):
+        return
+    assert TENSOR_HANDLE in case.task, (
+        f"{case.label}: presents a layer on the data plane, but its task never "
+        f"mentions `{TENSOR_HANDLE}`, which is where the array ids arrive"
+    )
+
+
+def test_nothing_asks_for_chunking_it_will_not_get(case):
+    """`chunks` is uploaded to the plane, so on an `array` layer it is a silent
+    no-op — and a silent no-op on the parameter that decides whether the
+    out-of-core route is exercised at all is the worst kind."""
+    for layer in case.layers:
+        if layer.lazy:
+            continue
+        assert layer.chunks is None and layer.dim_labels is None, (
+            f"{case.label}: layer {layer.name!r} sets chunks/dim_labels but is "
+            f"presented as {layer.presentation!r}, where neither reaches anything"
         )
 
 

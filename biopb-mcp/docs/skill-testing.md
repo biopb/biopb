@@ -9,8 +9,8 @@ reader), `.github/workflows/skill-contracts.yaml` +
 **Related:** [`skill-interface.md`](skill-interface.md) — what a skill *is*, how
 it ships, and how `checklist:` resolves at runtime.
 [`skill-fixtures.md`](skill-fixtures.md) — the fixture model behind §5d: one
-fixture per case, fixed at authoring time. Its identity, on-disk and manifest
-halves have landed; the presentation ladder (lazy/tensor) has not.
+fixture per case fixed at authoring time, `(skill, case_id)` identity, and the
+`array`/`tensor` presentations with a run-scoped data plane behind the latter.
 
 ---
 

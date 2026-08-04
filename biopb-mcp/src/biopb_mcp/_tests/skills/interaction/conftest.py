@@ -29,6 +29,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from . import _plane
+
 HERE = Path(__file__).parent
 SMOKE = "test_session_smoke.py"
 
@@ -54,6 +58,19 @@ def pytest_collection_modifyitems(items):
     ordered = sorted((item for _, item in here), key=lambda i: i.path.name != SMOKE)
     for slot, item in zip(slots, ordered, strict=True):
         items[slot] = item
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reap_the_plane():
+    """Stop the run's data plane with the run, if one was ever started.
+
+    `_plane` registers an `atexit` hook as a backstop, but the plane is a child
+    process holding a port and a file-cache lock, and a teardown that runs
+    while pytest can still report is worth more than one that runs as the
+    interpreter is going down.
+    """
+    yield
+    _plane.stop_plane()
 
 
 def pytest_runtest_logreport(report):

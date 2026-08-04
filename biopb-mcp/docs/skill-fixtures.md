@@ -1,7 +1,9 @@
 # Fixtures for the interaction layer — a design
 
-Status: **partly implemented**. Supersedes PR #704, and corrects the framing
-`biopb-mcp/docs/skill-testing.md` §5d used to carry.
+Status: **implemented**. Supersedes PR #704, and corrects the framing
+`biopb-mcp/docs/skill-testing.md` §5d used to carry. The table below is what
+each section became; the deviations after it are where building the thing
+changed the design.
 
 | Section | State |
 |---|---|
@@ -10,11 +12,11 @@ Status: **partly implemented**. Supersedes PR #704, and corrects the framing
 | Data and truth as references (`ArrayRef`) | **landed**, as `NpzRef` + `FileRef` |
 | Identity — `(skill, case_id)` everywhere | **landed** |
 | The tree carries a manifest; out-of-band hashing | **landed** (`-m fixtures`) |
-| A presentation ladder (`array`/`dask`/`tensor`) | not started |
-| The run-scoped data plane | not started |
-| Per-skill presentation coverage warning | not started, and waits on the ladder |
+| Presentation — **`array`/`tensor`**, `dask` dropped | **landed** |
+| The run-scoped data plane | **landed** |
+| Per-skill presentation coverage warning | **landed**, and warns for all 5 benchmarked skills today |
 
-Two deviations from what is written below, both narrowing:
+Four deviations from what is written below, each argued where it applies:
 
 - **`MemmapRef` was not built.** `FileRef` memory-maps `.npy` itself, so a
   separate class would have been the same object under a second name.
@@ -22,6 +24,13 @@ Two deviations from what is written below, both narrowing:
   arrays, so naming the file does not name an array; a `.npz` in a case's
   layout resolves through `NpzRef` on the key that referenced it, which is why
   the layout below maps *key → filename* rather than the reverse.
+- **The `dask` presentation was dropped**, leaving `array` and `tensor`. A local
+  mmap wearing dask's type is not an environment any session has either, so it
+  would have measured a lazy skill off its own path at the cost of a second
+  loading mechanism.
+- **Arm isolation is not the scheme split described below**, which rested on a
+  cleanup call that does not exist. It is the fixture id being a one-way hash of
+  a per-run secret name, plus a fingerprint check that flags any change.
 
 ## The principle
 
@@ -169,7 +178,7 @@ carries many arrays: `{"stack": "arrays.npz"}` resolves to the member named
 The data/truth partition rule — a key in both is an error, because a truth the run
 can see is not a truth — is unchanged and still checkable on keys alone.
 
-## A presentation ladder, so lazy skills can be tested at all
+## Two presentations, because a faked-lazy one measures nothing
 
 The largest gap, and it is not in the fixture but in the path from fixture to
 agent:
@@ -191,27 +200,47 @@ class Layer:
     name: str
     key: str
     kind: str = "image"            # image | labels
-    presentation: str = "array"    # array | dask | tensor
+    presentation: str = "array"    # array | tensor
     chunks: tuple[int, ...] | None = None
+    dim_labels: tuple[str, ...] | None = None
 ```
 
 | presentation | what the agent finds | cost |
 |---|---|---|
 | `array` | in-memory numpy on a viewer layer, `client is None` | none |
-| `dask` | `da.from_array(np.load(path, mmap_mode="r"), chunks=...)` — lazy, no server | one setup snippet |
 | `tensor` | `client` non-None, `viewer.add_tensor(array_id)`: lazy, pyramided | a data plane for the run (below) |
 
-**None of these is the default, and none is a fallback for another.** They are
-three legitimate environments, and the right one is whichever the skill was
-written against. A skill about in-memory numpy is correctly tested with `array`; a
-viewer layer holding a plain array is a real thing an agent meets, not a
-concession. Presentation is part of the case for the same reason the fixture is —
-changing it changes what is being measured.
+**An earlier draft of this document had a third, `dask`** — a `da.from_array`
+over a memory-mapped file, lazy but with no server. It is not here, and the
+reason generalises: **that would have been a data environment no production
+session has either.** The lazy path a skill is actually written for is
+`client.get_tensor`, which returns a dask array over Flight; a local mmap wearing
+the same type would still have measured the skill off its own route, while
+costing a second loading mechanism to build and maintain. Two presentations that
+are each real beat three where the middle one is a prop.
 
-`chunks` is explicit rather than `"auto"` because where laziness is the point the
-chunking *is* the thing under test: a route that only fails at a chunk boundary —
-the out-of-core measurement route, `chunked_label` — is not exercised by a
-single-chunk array.
+**Neither is the default and neither is a fallback for the other.** They are two
+legitimate environments, and the right one is whichever the skill was written
+against. A skill about in-memory numpy is correctly tested with `array`; a viewer
+layer holding a plain array is a real thing an agent meets, not a concession.
+Presentation is part of the case for the same reason the fixture is — changing it
+changes what is being measured.
+
+`chunks` is explicit rather than left to the uploader's default because where
+laziness is the point the chunking *is* the thing under test: a route that only
+fails at a chunk boundary — the out-of-core measurement route, `chunked_label` —
+is not exercised by a single-chunk array. The upload takes the case's chunk shape
+verbatim, so this is a real control rather than a hint.
+
+### The ids arrive in the namespace, because the catalog will not carry them
+
+An uploaded source is deliberately **not synced to the catalog**
+(`upload_manager.py`), so `query_sources()` cannot find a fixture and the agent
+cannot browse to it. Nor can a task prompt name the id: it is minted at run time.
+So the harness binds `fixture_tensors = {layer name: array_id}` in the kernel
+namespace as setup, and a case presenting `tensor` must say so in its prompt —
+the same kind of harness convention as the `collect` names, and asserted the same
+way.
 
 ### The skill's own `checklist:` says what is left uncovered
 
@@ -225,8 +254,9 @@ than a correction to this one.
 So this reports a **coverage gap, and warns**:
 
 ```
-calibrated-measurements declares {dask, tensor}; its cases present {array}.
-  uncovered: dask, tensor — the out-of-core route (step 5b) has no case.
+drift-correction declares ['dask', 'tensor'], but every case presents `array`,
+so every arm runs with `client is None` — neither the lazy read path nor any
+step that uploads a result has been benchmarked
 ```
 
 Never a failure. A gate here would demand cases be written before the design
@@ -268,38 +298,58 @@ Only `Fixture.data` is uploaded. `truth` never reaches the plane, so the leak th
 whole layer depends on not happening is prevented structurally rather than by
 care.
 
-### Isolation between arms comes from the adapter model, not from a new feature
+### Isolation between arms comes from the id, not from cleanup
 
 The plane outlives the individual arm, so in principle an agent's uploads would be
 visible to the arms after it — an isolation property today's kernel-scoped model
-gives for free. The server already draws the line needed, in a place nothing can
-cross:
+gives for free.
 
-> `CachedSourceAdapter is created via DoPut, not config`
-> — `adapters/cached_source.py`
+**An earlier draft of this section was wrong about how to get it back.** It
+proposed declaring fixtures as file-backed `sources:` so that agent writes, which
+can only ever be `cache://`, were distinguishable by scheme, and then "dropping
+the cache sources" between arms. Two facts kill that:
 
-**An upload can only ever become a `cache://` source.** Config-declared sources
-are file-backed and cannot be created, replaced or mutated by DoPut. So:
+- **There is no API to drop a cache source.** `remove_source` raises unless the
+  url starts with `dnd://` (`source_manager.py`), and cache adapters are expected
+  to accumulate until the server stops (`cached_source.py`). The cleanup step the
+  scheme split existed to enable does not exist.
+- **Declaring them file-backed is not cheap either.** There is no npy/npz adapter,
+  so a procedurally generated fixture would have to be written as zarr first — a
+  second serialisation path, to enable a cleanup that cannot be performed.
 
-- **fixture data is declared, not uploaded.** The harness writes each `tensor`
-  layer into a temp directory and lists it in the server's `sources:` config, so
-  it arrives file-backed and is immutable to every agent by construction.
-- **anything an agent writes is a `cache://` source**, distinguishable by scheme
-  and by nothing else being possible.
-- **cleanup between arms is "drop the cache sources"** — the fixtures are
-  untouched, because they were never in that namespace.
+The isolation is already there, in the id:
 
-No read-only mode is required, which is fortunate: the server has none, and one
-would break the skills whose own steps upload a result (`drift-correction` step 7,
-`stitch-tiles` step 7). Those steps stay exercisable — their output simply lands
-in the namespace that gets wiped.
+```python
+source_id = f"cache_{sha256(source_name).hexdigest()[:12]}"   # upload_manager.py
+```
 
-Note in passing that `cache://` ids are deterministic, so two arms uploading the
-same array would collide on id; #178's per-upload `content_version` already gives
-each a fresh chunk namespace, and wiping between arms makes the question moot.
+**The id an agent sees is a one-way hash of a name it is never told.** The adapter
+keeps the id and the url (`cache://<source_id>`); the name appears in no
+descriptor, no layer and no catalog entry. So the harness uploads each fixture
+under a **per-run random name**, and an agent holding the id cannot construct the
+name that would let it replace the data. Accidental collision is impossible rather
+than unlikely, which matters because the natural name for a skill's own output
+(`drift-correction` step 7, `stitch-tiles` step 7) is derived from the task.
 
-If the plane cannot start, cases presenting `tensor` skip through `unavailable()`
-with that reason; `dask` and `array` cases are unaffected.
+That is an argument about a surface that runs arbitrary Python, so it is also
+checked: the harness fingerprints a corner of each fixture at upload and again
+after every arm, and a change **flags the row** — `fixture-overwritten`, the same
+shape as `read-harness-internals`, voiding the number rather than qualifying it,
+and voiding every later arm too. Prevention is structural; the check is there so
+that defeating it cannot be quiet.
+
+What follows from having no per-arm sweep is that an agent's own uploads persist
+for the rest of the run. That is affordable — they are bounded by the chunk cache,
+and the plane's whole state is a temp directory discarded at teardown.
+
+The plane must run **`--writable`** (the server defaults to read-only), which is
+required anyway: a read-only plane would fail every skill step that uploads a
+result rather than measure it.
+
+If the plane cannot start — or `biopb_tensor_server` is not installed, which is
+normal, since biopb-mcp cannot depend on a package that is never on PyPI — cases
+presenting `tensor` skip through `unavailable()` with that reason, and `array`
+cases are unaffected.
 
 ## Identity
 
@@ -402,7 +452,7 @@ precisely the framing being retired.
 
 ## Settled
 
-- **`array`, `dask` and `tensor` are all legal**, chosen per case to match what the
+- **`array` and `tensor` are both legal**, chosen per case to match what the
   skill was written against — no default and no ranking. When `tensor` is chosen,
   one data plane serves the whole run.
 - **The tree carries a root manifest**, with provenance, citation, licence and
@@ -412,8 +462,9 @@ precisely the framing being retired.
 - **Presentation coverage is reported per skill and only warns.** A skill whose
   cases do not exercise everything its `checklist:` declares is incompletely
   benchmarked, which is a backlog entry, not an error.
-- **Arms are isolated by scheme**: fixtures are file-backed config sources, agent
-  writes can only be `cache://`, and cache sources are dropped between arms.
+- **Arms are isolated by id**: a fixture's id is a one-way hash of a per-run
+  secret name, so it cannot be reached from anything an agent is given; a
+  fingerprint check flags any change anyway.
 - **Shape and dtype are checked in-band** at build time; the SHA stays
   out-of-band.
 
@@ -424,8 +475,8 @@ Nothing is left open by design; what follows is what landing it implies.
 The five existing cases need **no migration**: `array` is a legal presentation, so
 they stay exactly as written. Only their `case_id` becomes explicit.
 
-The first thing the coverage warning will say, on day one:
-`calibrated-measurements` declares `dask` and `tensor`, its one case presents
-`array`, so the out-of-core route that most of its body is about has never been
-benchmarked. That is a backlog entry this design creates the means to close, not
-a defect it introduces.
+What the coverage warning says on day one, and it is worse than predicted:
+**all five benchmarked skills** declare `dask` or `tensor` and none has a case
+that presents one, so every arm ever run has had `client is None`. That is a
+backlog entry this design creates the means to close, not a defect it introduces —
+and it is now a line of pytest output rather than something nobody had counted.
