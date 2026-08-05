@@ -91,6 +91,12 @@ RETRIEVES = [
     ("biosensor", "ratiometric-fret"),
     ("bleedthrough", "ratiometric-fret"),
     ("donor acceptor", "ratiometric-fret"),
+    ("pixel classifier", "pixel-classifier-segmentation"),
+    ("classifier", "pixel-classifier-segmentation"),
+    ("classification", "pixel-classifier-segmentation"),
+    ("train classifier", "pixel-classifier-segmentation"),
+    ("scribbles", "pixel-classifier-segmentation"),
+    ("annotation", "pixel-classifier-segmentation"),
     ("stitch", "stitch-tiles"),
     ("stitch tiles", "stitch-tiles"),
     ("mosaic", "stitch-tiles"),
@@ -148,6 +154,17 @@ REJECTS = [
     ("measure", "ratiometric-fret"),
     ("fret", "flatfield"),
     ("fret", "drift-correction"),
+    # `pixel-classifier-segmentation` and `segmentation-qc-metrics` both own the
+    # word "segmentation" and both talk about classes and per-class scores. One
+    # *produces* a segmentation from annotation, the other *scores* one against
+    # a truth, and an agent holding a hand-drawn truth wants the second.
+    ("qc", "pixel-classifier-segmentation"),
+    ("ground truth", "pixel-classifier-segmentation"),
+    ("f1 iou", "pixel-classifier-segmentation"),
+    ("classifier", "segmentation-qc-metrics"),
+    ("scribbles", "segmentation-qc-metrics"),
+    # Producing a mask from a trained model is not tracing ridges out of one.
+    ("filament", "pixel-classifier-segmentation"),
 ]
 
 
