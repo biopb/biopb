@@ -17,6 +17,18 @@ Two estimators, and the data picks which one:
   Grussmayer & Radenovic 2019), when only one image exists: a deconvolved
   widefield, a SIM or eSRRF reconstruction, a single micrograph.
 
+**Never run decorrelation on a localization render.** Having only one image, it
+measures how *sharp* the picture is rather than how *faithful* it is, and for a
+point cloud those come apart: a sparsely sampled render is genuinely sharp and
+genuinely unfaithful, while a densely sampled one is shot-noise-limited and
+faithful. So it rewards sparseness and punishes density, which is inverted for
+SMLM, where density is what buys resolution. Measured on a matched pair --
+identical structure, precision and localization count, differing only in how
+many molecules those localizations came from -- the truth ratio is 2.82x and
+decorrelation reports **0.11x**, worse than the 0.52x a naive random FRC split
+gives. Merging repeat blinks first does not rescue it (0.08x). Use ``frc`` on
+localizations, always.
+
 Delivered as a kernel plugin rather than as a snippet in a skill body for the same
 reason ``segmentation_qc`` is: the arithmetic is short but wrong in ways that are
 invisible in the output. Every one of these changes the reported number by tens of
@@ -766,7 +778,9 @@ def decorrelation_resolution(
     """Single-image resolution by decorrelation analysis (Descloux et al. 2019).
 
     Use when no second independent realization exists: a deconvolved widefield, a
-    SIM or eSRRF reconstruction, one micrograph. Where FRC asks "out to what
+    SIM or eSRRF reconstruction, one micrograph. **Not on a localization render**
+    -- see the module docstring; it inverts there, and by a larger factor than
+    the FRC mistake it would be standing in for. Where FRC asks "out to what
     frequency do two noisy copies agree", this asks "out to what frequency does the
     image agree with a whitened copy of itself" -- a disk of radius *r* in Fourier
     space is correlated against the phase-only spectrum, and the radius at which
