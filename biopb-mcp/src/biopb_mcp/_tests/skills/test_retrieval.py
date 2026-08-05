@@ -79,6 +79,12 @@ RETRIEVES = [
     ("blurred stack", "deconvolve-widefield"),
     ("widefield", "deconvolve-widefield"),
     ("restoration", "deconvolve-widefield"),
+    ("filament", "detect-filaments"),
+    ("filaments", "detect-filaments"),
+    ("trace filaments", "detect-filaments"),
+    ("filament width", "detect-filaments"),
+    ("ridge detection", "detect-filaments"),
+    ("centreline", "detect-filaments"),
     ("stitch", "stitch-tiles"),
     ("stitch tiles", "stitch-tiles"),
     ("mosaic", "stitch-tiles"),
@@ -117,6 +123,14 @@ REJECTS = [
     ("deconvolution", "drift-correction"),
     ("illumination", "deconvolve-widefield"),
     ("drift", "deconvolve-widefield"),
+    # `detect-filaments` produces a mask-like output and reports a size in
+    # microns, which puts it one word away from both of the skills that own
+    # those. Tracing filaments is not scoring a segmentation against a truth,
+    # and a filament width is not a calibrated object measurement.
+    ("filament", "segmentation-qc-metrics"),
+    ("filament", "calibrated-measurements"),
+    ("centreline", "segmentation-qc-metrics"),
+    ("segmentation", "detect-filaments"),
 ]
 
 
