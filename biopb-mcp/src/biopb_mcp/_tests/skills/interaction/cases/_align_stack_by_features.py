@@ -4,7 +4,7 @@ The skill takes a stack whose sections were each placed independently and
 returns one where the same structure sits at the same coordinates.
 
 **This case was rewritten because its first fixture was wrong**, and the way it
-was wrong is the reason `docs/skill-fixtures.md` exists. That fixture rendered
+was wrong is the reason `docs/fixtures.md` exists. That fixture rendered
 every object as an identical isotropic Gaussian blob, and on such content
 descriptor matching is not the strong method — a cold ablation chose it in 1 arm
 of 9 on the blobs against 2 of 3 on real sections, i.e. **the fixture ranked two
