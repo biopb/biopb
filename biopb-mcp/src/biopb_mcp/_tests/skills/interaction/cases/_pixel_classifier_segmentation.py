@@ -1,5 +1,51 @@
 """`pixel-classifier-segmentation` as benchmark data: does the run know it broke?
 
+**Deferred tier — banked, not served.** The `_` prefix on this module and on
+`_pixel-classifier-segmentation.md` keeps the skill out of the catalog. It is
+here because a Sonnet-class model derives nearly all of it unaided, and the
+catalog is consumed at that tier; it is kept because a Haiku-class one derives
+none of it, and lower-tier usability is named as real backlog in
+`skill-candidates.md`. The measurement, four cold arms per tier, identical
+prompts and fixed signature, no skill and no repo:
+
+    tier     macro IoU a   macro IoU b   collapse        overstatement
+    Haiku    0.60-0.64     0.33-0.64     0.000-0.474     0.103-0.270  (0/4 pass)
+    Sonnet   0.69-0.72     0.57-0.71     0.000-0.179     0.028-0.113  (2/3 pass)
+    reference    0.708         0.709     0.000           0.043
+
+Every Sonnet arm recovered the withheld fact **from the histograms**, without
+asking — one wrote "median 902 vs 1348, MAD 56 vs 104 ... almost certainly a
+lamp/exposure change between acquisitions ... any feature that is a bare
+function of intensity has to be normalized per-field" as a code comment. All
+three then did per-field robust normalisation (step 3), diagnosed pixel-wise CV
+as leaking across contiguous strokes and built stroke-grouped CV instead (step
+6), reported resubstitution accuracy explicitly labelled "not as evidence of
+generalization" (step 9), counted components and compared class balance between
+fields (step 7). One added a modal filter (step 5) and **beat the reference on
+the scribbled field**, 0.7225 against 0.7076. That is the body, derived.
+
+The four Haiku arms did none of it: all four quoted training-pixel accuracy as
+their quality number, all four named the 4 px rim as their best class where its
+true IoU was 0.44-0.59, none counted components (2128-12688 bodies on a field
+with 7 cells), and all four read the second field's balance shift as biology.
+
+So the information asymmetry this case is built on does not survive at the
+consuming tier, which is what makes it deferred rather than shipped. Nothing
+below is weakened by that: the fixture, the verifier and the tolerances are
+checked exactly as hard, so promoting it later does not begin by rebuilding it.
+
+One arm found a property of this fixture its author had not measured, and it is
+recorded here because it is real. Field b is brighter *and relatively noisier* —
+its 16-84 spread is 22.6% of its median against field a's 18.6% — so per-field
+normalisation by that spread leaves field b's texture systematically smaller.
+Since local-variance features carry most of the model's importance, that is a
+second-order domain shift on top of the level shift, and it is why an oracle
+trained on field a's own truth still loses 0.114 here. The arm diagnosed it from
+its own output ("several cells predicted as pure background, only the edge ring
+correct") and rescaled each texture feature by its own image's median absolute
+value. Worth knowing before this is ever promoted: `second_field_collapse` is
+not measuring one effect.
+
 Two acquisitions of one three-class field, scribbles on the first only. The two
 large classes have the **same mean and the same standard deviation** and differ
 only in correlation length, so no threshold separates them and a texture
