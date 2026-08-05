@@ -3,7 +3,7 @@
 The skill turns a donor channel and a FRET channel into a ratio that means
 something. The withheld fact is step 2's gate — the two coefficients measured on
 single-label control samples — and it is categorically absent from the data
-(`biopb-mcp/docs/skill-testing.md` §5d) for a reason that is textbook rather than
+(`biopb-mcp/docs/skills.md` §10) for a reason that is textbook rather than
 constructed.
 
 The forward model is the standard three-cube one::
