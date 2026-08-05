@@ -12,7 +12,7 @@ constructed it; a curated one knows whatever a human annotated. Both hand the
 verifier a mapping, and the verifier reads the keys it needs — so one verifier
 serves either kind. What that does *not* license is swapping one for the other
 under a running case: a case owns exactly one fixture, fixed when it was
-written (`docs/skill-fixtures.md`).
+written (`docs/fixtures.md`).
 
 *A metric it cannot compute is unavailable, not passing.* A real movie has no
 un-drifted reference image, so any metric needing one is absent from the report.
@@ -431,7 +431,7 @@ class FixtureSpec(Protocol):
     There is no ordering between implementations and no fallback between them.
     Substituting the data makes it a different experiment with the same name:
     the truth changes, the achievable accuracy changes, and the conclusion can
-    invert — measured, not hypothetical (`docs/skill-fixtures.md`). A skill
+    invert — measured, not hypothetical (`docs/fixtures.md`). A skill
     worth covering both ways gets **two cases**, each with its own id and its
     own tolerances.
 

@@ -1,6 +1,6 @@
 """A skill body is an un-versioned assertion about someone else's API.
 
-`biopb-mcp/docs/skill-testing.md` §4. The satisfiability gate next door answers "may this
+`biopb-mcp/docs/skills.md` §9. The satisfiability gate next door answers "may this
 package be installed at all"; this answers the two questions after it — "does it
 import once installed" (#670: `stardist` resolves clean and imports nothing,
 because its TensorFlow dependency hides under an extra) and "does the surface the

@@ -1,6 +1,6 @@
 # The interaction layer
 
-[`biopb-mcp/docs/skill-testing.md`](../../../../docs/skill-testing.md) §5. Put a
+[`biopb-mcp/docs/skills.md`](../../../../../docs/skills.md) §10. Put a
 model in front of the **shipped** skill body, against a **real** session, and
 score what comes out.
 
@@ -189,7 +189,7 @@ No monotonic pattern, so the spread is run-to-run variance rather than the
 manipulations: **no delta can be claimed from this, in either direction.**
 
 That is the layer's real output so far, and it is worth more than a green
-light. `n=1` per corner is not a measurement — see `biopb-mcp/docs/skill-testing.md` §5c
+light. `n=1` per corner is not a measurement — see `biopb-mcp/docs/skills.md` §10c
 for what follows.
 
 ## Why this tier is the one with teeth

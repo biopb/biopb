@@ -37,7 +37,7 @@ reading that line is a score compared against a different system.
 ## No synthetic data
 
 Every case here is `OnDisk`, against a curated tree. That is a deliberate
-narrowing rather than a coincidence: `docs/skill-fixtures.md` records a
+narrowing rather than a coincidence: `docs/fixtures.md` records a
 synthetic fixture that ranked two method families in the *opposite* order from
 real tissue, which is exactly the failure a functional benchmark cannot survive.
 

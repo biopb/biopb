@@ -242,7 +242,10 @@ durable planes and the web origin in
   `packages/tensor-flight-client/` (the TS data-plane SDK). See `web/README.md`
   and `web/ARCHITECTURE.md`.
 - **Release / build:** `docs/release-model.md`.
-- **Testing the skills catalog:** `biopb-mcp/docs/skill-testing.md` — how a shipped skill
-  is checked: structure, retrieval and contract tests in CI; simulated-user
-  interaction runs against a real session locally, as a benchmark rather than a
-  gate.
+- **The skills catalog:** `biopb-mcp/docs/skills.md` — what a skill is, how it
+  ships, and how it is checked: structure, retrieval and contract tests in CI;
+  simulated-user interaction runs against a real session locally, as a benchmark
+  rather than a gate.
+- **Agent benchmarks:** `biopb-mcp/docs/fixtures.md` — what a run is given and
+  how it is scored, shared by the skill benchmark and the task suite
+  (`_tests/agentbench/`, `_tests/skills/interaction/`, `_tests/tasks/`).

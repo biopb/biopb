@@ -29,7 +29,7 @@ field of spurious ones, and a case that only scored recall would rate
 "threshold at nothing" a perfect run.
 
 The reference implementation these tolerances come from is in the pull request
-that added this case, per `biopb-mcp/docs/skill-testing.md` §7.
+that added this case, per `biopb-mcp/docs/skills.md` §11b.
 """
 
 from __future__ import annotations

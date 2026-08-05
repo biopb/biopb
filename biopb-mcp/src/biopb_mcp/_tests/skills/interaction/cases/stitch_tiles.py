@@ -9,7 +9,7 @@ row-major mirrors every other row — which is glaring in the mosaic and invisib
 in every number a run prints about itself.
 
 **This fixture is heuristic-defeating, not categorically absent, and that is a
-weaker construction** (`biopb-mcp/docs/skill-testing.md` §5d). Unlike
+weaker construction** (`biopb-mcp/docs/skills.md` §10). Unlike
 `flatfield`'s camera offset, this answer *is* recoverable from the data: the
 twelve shape-and-path combinations are enumerable, and registering under each
 and keeping the one whose accepted pairs form a single connected component would

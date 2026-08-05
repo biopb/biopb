@@ -15,7 +15,7 @@ So the split is by cost, not by importance:
   denote two experiments.
 - **the hash, here**, run deliberately::
 
-      uv run --no-sync pytest -m fixtures biopb-mcp/src/biopb_mcp/_tests/skills
+      uv run --no-sync pytest -m fixtures biopb-mcp/src/biopb_mcp/_tests/agentbench
 
   after syncing a tree, or when a result looks wrong. It catches altered pixels,
   which no header read can.

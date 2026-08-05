@@ -45,7 +45,7 @@ SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
 # The interaction benchmark (§5) is deliberately NOT here, though it also needs
 # a skill's package: it drives a real napari session against a real model, so it
 # needs a GL display and API keys, and it reports rather than gates. It runs on a
-# workstation -- see biopb-mcp/docs/skill-testing.md §5.
+# workstation -- see biopb-mcp/docs/skills.md §10.
 CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
 
 # Prose docs that live beside the skills. Keep in step with `_validate.NOT_SKILLS`.

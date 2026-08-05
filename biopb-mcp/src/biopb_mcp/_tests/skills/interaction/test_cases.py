@@ -223,7 +223,7 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
     replaced a case's own fixture, silently and per machine. **Substituting the
     data makes it a different experiment with the same name** — the truth
     changes, the achievable accuracy changes, and the conclusion can invert,
-    which was measured rather than supposed (`docs/skill-fixtures.md`). It is a
+    which was measured rather than supposed (`docs/fixtures.md`). It is a
     root path now, and a procedural case must not so much as look at it.
     """
     case = CASES[0]

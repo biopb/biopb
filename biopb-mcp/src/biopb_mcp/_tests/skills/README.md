@@ -1,6 +1,6 @@
 # The skills authoring gate
 
-The deterministic layers of [`biopb-mcp/docs/skill-testing.md`](../../../../docs/skill-testing.md)
+The deterministic layers of [`biopb-mcp/docs/skills.md`](../../../../docs/skills.md)
 — no agent, no session, no display — run against the skills this package ships
 (`biopb_mcp/mcp/_skills_data/*.md`).
 
@@ -114,7 +114,7 @@ per-cell shape could express (#680).
 A **real** biopb-mcp session — shim-spawned child, real kernel, real napari,
 real dask, the nine real tools over real MCP — with the skill body arriving
 through the real `_skills.py`, and a model in front of it talking to a simulated
-user who holds a fact the fixture withheld. `biopb-mcp/docs/skill-testing.md` §5 and
+user who holds a fact the fixture withheld. `biopb-mcp/docs/skills.md` §10 and
 `interaction/README.md`.
 
 ```sh
