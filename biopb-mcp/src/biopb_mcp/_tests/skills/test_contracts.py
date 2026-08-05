@@ -516,3 +516,66 @@ def test_phase_cross_correlation_still_returns_three_values():
     # And it means what the body's `pair_offset` assumes: the offset that maps
     # the moving image onto the reference, sign included.
     assert tuple(shift) == (0.0, -3.0)
+
+
+# --- skimage, for deconvolve-widefield -------------------------------------
+
+
+def test_richardson_lucy_still_clips_to_the_unit_range_by_default():
+    """The body's loudest failure row, and the one a cold arm caught unaided.
+
+    `clip=True` is the default and clamps the output to `[-1, 1]`. On raw ADU
+    data that is not a mild correction, it is a flat 1.0 -- the whole result,
+    silently. The body's fix is to normalise by `img.max()` first *or* pass
+    `clip=False`, and both halves are pinned here: if the default ever flipped
+    the row would be wrong, and if the parameter vanished the fix would be
+    unrunnable.
+    """
+    import inspect
+
+    import numpy as np
+    from skimage.restoration import richardson_lucy
+
+    params = inspect.signature(richardson_lucy).parameters
+    assert "clip" in params
+    assert params["clip"].default is True
+    assert "num_iter" in params, "the body passes num_iter= by name"
+
+    image = np.full((8, 8), 5.0)
+    psf = np.ones((3, 3)) / 9.0
+    clamped = richardson_lucy(image, psf, num_iter=5, clip=True)
+    free = richardson_lucy(image, psf, num_iter=5, clip=False)
+    assert clamped.max() == pytest.approx(1.0), (
+        "clip=True no longer clamps to the unit range; the failure row and the "
+        "normalise-first instruction in deconvolve-widefield are now wrong"
+    )
+    assert free.max() > 5.0, "clip=False should leave the ADU scale alone"
+
+
+def test_peak_local_max_excludes_a_border_as_wide_as_min_distance():
+    """Why step 4 passes `exclude_border=False` rather than leaving the default.
+
+    `exclude_border` defaults to `True`, which means *`min_distance`*, not one
+    voxel. In a 40-plane stack with `min_distance=20` that leaves a single legal
+    z and the bead search returns **nothing** -- so a run silently falls back to
+    a theoretical PSF although a bead stack was supplied, which is a third of
+    the available restoration thrown away with no error.
+    """
+    import inspect
+
+    import numpy as np
+    from skimage.feature import peak_local_max
+
+    params = inspect.signature(peak_local_max).parameters
+    assert params["exclude_border"].default is True
+
+    vol = np.zeros((40, 64, 64))
+    for z in (14, 20, 26):
+        vol[z, 32, 32] = 1.0
+    default = peak_local_max(vol, min_distance=20, num_peaks=40)
+    opted_out = peak_local_max(vol, min_distance=20, num_peaks=40, exclude_border=False)
+    assert len(default) < len(opted_out), (
+        "the default no longer excludes a min_distance-wide border; the "
+        "exclude_border=False instruction and its failure row are now wrong"
+    )
+    assert len(opted_out) >= 1
