@@ -228,7 +228,7 @@ qt_api = "pyqt6"
 # seconds each over a torch-sized graph), so it is deselected by default and run
 # as its own CI step. A command-line -m overrides this one, which is how
 # `-m satisfiability` and `-m contract` still work.
-addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not availability and not interaction and not fixtures'"
+addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not availability and not interaction and not fixtures and not tasks'"
 markers = [
     # Resolves each skill's pkg: tokens against the installed environment to
     # reject a package that installs only by moving biopb's own deps. Metadata
@@ -249,6 +249,12 @@ markers = [
     # the run it guards, and would do it once per arm. Run after syncing a
     # tree, or when a result looks wrong. biopb-mcp/docs/skill-fixtures.md.
     "fixtures: checks an on-disk fixture tree against its manifest",
+    # Runs an agent at a named piece of work against curated real data, in a
+    # real session, with nothing withheld -- no skill ablation, one arm, N
+    # samples. Same costs as `interaction` (GL display, API key, never in CI)
+    # and a different question: not whether a skill helps, but whether the work
+    # gets done. _tests/tasks/README.md.
+    "tasks: runs an agent at a real task against curated data",
 ]
 
 [tool.pytest_env]
