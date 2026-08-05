@@ -189,7 +189,14 @@ def staged_package() -> Path:
     import subprocess
     import zipfile
 
-    root = Path(__file__).resolve().parents[6]
+    from ._fixture import checkout_root
+
+    root = checkout_root()
+    if root is None:
+        raise SessionUnavailable(
+            "no checkout around this module, so there is no workspace to build "
+            "the biopb-mcp wheel from"
+        )
     out = Path(tempfile.mkdtemp(prefix="biopb-skill-wheel-"))
     try:
         subprocess.run(
