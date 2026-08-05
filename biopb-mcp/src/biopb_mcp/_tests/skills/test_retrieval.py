@@ -68,6 +68,11 @@ RETRIEVES = [
     ("vignetting", "flatfield"),
     ("shading", "flatfield"),
     ("shading correction tiles", "flatfield"),
+    ("track", "track-objects"),
+    ("tracking", "track-objects"),
+    ("cell tracking", "track-objects"),
+    ("lineage", "track-objects"),
+    ("follow cells over time", "track-objects"),
     ("stitch", "stitch-tiles"),
     ("stitch tiles", "stitch-tiles"),
     ("mosaic", "stitch-tiles"),
@@ -91,6 +96,13 @@ REJECTS = [
     ("registration", "flatfield"),
     ("illumination", "drift-correction"),
     ("vignetting", "calibrated-measurements"),
+    # `drift-correction` and `track-objects` are the pair an agent lands on
+    # from a single word about a movie, and they are opposites: one cancels
+    # motion, the other measures it. Each body says so in its *When NOT to
+    # use*, but that only helps once the right file has been retrieved.
+    ("track", "drift-correction"),
+    ("drift", "track-objects"),
+    ("registration", "track-objects"),
 ]
 
 
