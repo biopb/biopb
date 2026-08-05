@@ -73,6 +73,12 @@ RETRIEVES = [
     ("cell tracking", "track-objects"),
     ("lineage", "track-objects"),
     ("follow cells over time", "track-objects"),
+    ("deconvolution", "deconvolve-widefield"),
+    ("deconvolve", "deconvolve-widefield"),
+    ("deconvolve widefield stack", "deconvolve-widefield"),
+    ("blurred stack", "deconvolve-widefield"),
+    ("widefield", "deconvolve-widefield"),
+    ("restoration", "deconvolve-widefield"),
     ("stitch", "stitch-tiles"),
     ("stitch tiles", "stitch-tiles"),
     ("mosaic", "stitch-tiles"),
@@ -103,6 +109,14 @@ REJECTS = [
     ("track", "drift-correction"),
     ("drift", "track-objects"),
     ("registration", "track-objects"),
+    # `deconvolve-widefield` and `flatfield` are both "the image is not what
+    # the sample looked like, fix it before measuring", and both bodies talk
+    # about a correction applied to a whole stack. Blur along z is not uneven
+    # illumination, and neither is a moved field of view.
+    ("deconvolution", "flatfield"),
+    ("deconvolution", "drift-correction"),
+    ("illumination", "deconvolve-widefield"),
+    ("drift", "deconvolve-widefield"),
 ]
 
 
