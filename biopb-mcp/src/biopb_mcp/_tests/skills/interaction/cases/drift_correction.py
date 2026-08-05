@@ -40,9 +40,16 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 
+from ....agentbench._fixture import (
+    Attempt,
+    Fixture,
+    Metric,
+    Outcome,
+    Procedural,
+    save_png,
+)
+from ....agentbench._respondent import Persona
 from .._benchmark import Case, Layer
-from .._fixture import Attempt, Fixture, Metric, Outcome, Procedural, save_png
-from .._respondent import Persona
 
 SKILL = "drift-correction"
 

@@ -42,7 +42,7 @@ def no_dotenv(tmp_path, monkeypatch):
 
     **The real environment has to go too**, not just the file. `setting()` ranks
     the environment above the dotenv on purpose, so a developer with
-    `BIOPB_SKILL_AGENT` exported from their shell profile — the ordinary way to
+    `BIOPB_AGENT` exported from their shell profile — the ordinary way to
     run this layer — silently overrode the file each of these tests writes, and
     the assertions read a machine's configuration instead of the fixture's. CI
     exports none of them, so this passed everywhere except where it mattered.
@@ -94,8 +94,8 @@ def test_the_two_sides_are_configured_independently(monkeypatch):
     a single shared base-URL variable made impossible to express."""
     monkeypatch.setenv(AGENT_ENV, "deepseek:deepseek-chat")
     monkeypatch.setenv(RESPONDENT_ENV, "ollama:qwen3")
-    monkeypatch.setenv("BIOPB_SKILL_AGENT_BASE_URL", "https://agent.example/v1")
-    monkeypatch.setenv("BIOPB_SKILL_RESPONDENT_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("BIOPB_AGENT_BASE_URL", "https://agent.example/v1")
+    monkeypatch.setenv("BIOPB_RESPONDENT_BASE_URL", "http://localhost:11434/v1")
 
     agent, respondent = agent_choice(), respondent_choice()
 
@@ -106,7 +106,7 @@ def test_the_two_sides_are_configured_independently(monkeypatch):
 
 def test_a_base_url_override_beats_the_provider_default(monkeypatch):
     monkeypatch.setenv(RESPONDENT_ENV, "openai:gpt-4o-mini")
-    monkeypatch.setenv("BIOPB_SKILL_RESPONDENT_BASE_URL", "http://proxy.internal/v1")
+    monkeypatch.setenv("BIOPB_RESPONDENT_BASE_URL", "http://proxy.internal/v1")
     assert respondent_choice().base_url == "http://proxy.internal/v1"
 
 
@@ -142,7 +142,7 @@ def test_the_environment_beats_the_file(tmp_path, no_dotenv):
     """An explicit export must override a file somebody forgot about. The
     other direction makes a surprising result harder to explain, not easier."""
     env = tmp_path / ".env"
-    env.write_text("BIOPB_SKILL_AGENT=deepseek:deepseek-chat\n")
+    env.write_text("BIOPB_AGENT=deepseek:deepseek-chat\n")
     no_dotenv.setenv(ENV_FILE_ENV, str(env))
     reload_env_file()
     assert agent_choice().provider.name == "deepseek"

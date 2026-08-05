@@ -53,9 +53,9 @@ from typing import Callable
 
 import numpy as np
 
-from . import _plane
-from ._agent import ToolCallingAgent
-from ._conversation import (
+from ...agentbench import _plane
+from ...agentbench._agent import ToolCallingAgent
+from ...agentbench._conversation import (
     AGENT_TRUNCATED,
     RESPONDENT_FAILED,
     SILENT,
@@ -66,7 +66,7 @@ from ._conversation import (
     scrape,
     with_protocol,
 )
-from ._fixture import (
+from ...agentbench._fixture import (
     Attempt,
     Fixture,
     FixtureSpec,
@@ -74,9 +74,15 @@ from ._fixture import (
     artifact_root,
     write_report,
 )
-from ._models import agent_choice, reachable, respondent_choice, setting, text_backend
-from ._respondent import Persona, SilentRespondent, model_respondent
-from ._session import SessionUnavailable, live_session
+from ...agentbench._models import (
+    agent_choice,
+    reachable,
+    respondent_choice,
+    setting,
+    text_backend,
+)
+from ...agentbench._respondent import Persona, SilentRespondent, model_respondent
+from ...agentbench._session import SessionUnavailable, live_session
 
 #: Bounds on one run. Not the loop's own defaults: these workflows promote
 #: compute to background jobs, and a run severed mid-workflow leaves
@@ -833,7 +839,7 @@ def unavailable(case: Case) -> str:
     spawned or spent. §5a is one of them: an agent from the family that wrote
     these skills could pass by recognising its own prose.
     """
-    from . import _session
+    from ...agentbench import _session
 
     # First, because it is free and it is about the *case* rather than the
     # machine's model access: a case written against an acquisition this tree

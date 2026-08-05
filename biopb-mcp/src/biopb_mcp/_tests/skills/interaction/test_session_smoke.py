@@ -23,8 +23,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from . import _session
-from ._session import SessionUnavailable, live_session
+from ...agentbench import _session
+from ...agentbench._session import SessionUnavailable, live_session
 from .cases import drift_correction
 
 pytestmark = pytest.mark.interaction

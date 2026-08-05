@@ -195,7 +195,7 @@ class ModelRespondent:
 
 
 def model_respondent(persona: Persona, **kwargs) -> ModelRespondent:
-    """A respondent for *persona*, on whatever `BIOPB_SKILL_RESPONDENT` names."""
+    """A respondent for *persona*, on whatever `BIOPB_RESPONDENT` names."""
     return ModelRespondent(
         persona=persona, backend=text_backend(respondent_choice()), **kwargs
     )

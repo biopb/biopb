@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from . import _plane
+from ...agentbench import _plane
 
 HERE = Path(__file__).parent
 SMOKE = "test_session_smoke.py"
