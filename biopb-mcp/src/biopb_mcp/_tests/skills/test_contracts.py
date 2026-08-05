@@ -579,3 +579,68 @@ def test_peak_local_max_excludes_a_border_as_wide_as_min_distance():
         "exclude_border=False instruction and its failure row are now wrong"
     )
     assert len(opted_out) >= 1
+
+
+# --- skimage/scipy, for detect-filaments -----------------------------------
+
+
+def test_sato_still_looks_for_dark_ridges_by_default():
+    """Step 3 passes `black_ridges=False`, and the body's first failure row says
+    why.
+
+    The default is a brightfield convention: dark lines on a bright field. Every
+    fluorescence filament is the other polarity, so left at the default the
+    response is a picture of the background -- which is not an error, an empty
+    result, or anything a run notices before it has thresholded it.
+    """
+    import inspect
+
+    from skimage.filters import sato
+
+    assert inspect.signature(sato).parameters["black_ridges"].default is True
+
+    img = np.zeros((64, 64))
+    img[32, 8:56] = 1.0  # one bright horizontal line
+    img = ndimage.gaussian_filter(img, 1.5)
+    right = sato(img, sigmas=[1.5, 2.0], black_ridges=False)
+    wrong = sato(img, sigmas=[1.5, 2.0], black_ridges=True)
+    assert right[32, 32] > 10 * right[2, 2], (
+        "black_ridges=False no longer responds to a bright ridge; step 3 is wrong"
+    )
+    assert wrong[32, 32] < right[32, 32], (
+        "the default polarity no longer misses a bright ridge, and the failure "
+        "row about it is now wrong"
+    )
+
+
+def test_a_diagonal_skeleton_is_invisible_to_four_connectivity():
+    """Why step 6 labels with `structure=np.ones((3, 3))`.
+
+    This is the one that cost a cold arm its run: a one-pixel skeleton running
+    diagonally is 8-connected, so a 4-connected label call sees a string of
+    isolated pixels and any length filter deletes the lot. The signature of the
+    bug -- diagonal filaments gone, axis-aligned ones intact -- is
+    indistinguishable from a threshold that kept only the bright filaments.
+
+    Both halves are pinned: `ndi.label`'s default, and `remove_small_objects`'s,
+    since the body names them together.
+    """
+    import inspect
+
+    from skimage.morphology import remove_small_objects
+
+    diagonal = np.zeros((32, 32), bool)
+    for i in range(4, 28):
+        diagonal[i, i] = True
+
+    four = ndimage.label(diagonal)[1]
+    eight = ndimage.label(diagonal, structure=np.ones((3, 3)))[1]
+    assert four == 24 and eight == 1, (
+        f"a 24-px diagonal labels as {four} objects 4-connected and {eight} "
+        "8-connected; step 6's `structure=np.ones((3, 3))` is now wrong"
+    )
+
+    # The other name the body warns about, and it defaults the same way.
+    assert (
+        inspect.signature(remove_small_objects).parameters["connectivity"].default == 1
+    )
