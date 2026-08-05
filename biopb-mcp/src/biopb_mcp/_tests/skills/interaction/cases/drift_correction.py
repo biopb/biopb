@@ -23,7 +23,7 @@ thing to register on. Register there and the objects' common motion is
 indistinguishable from stage drift, so it is silently added to the trajectory —
 the fit does not fail, it succeeds at measuring the wrong thing.
 
-**A caveat this fixture has already earned** (`biopb-mcp/docs/skill-testing.md` §5c). A
+**A caveat this fixture has already earned** (`biopb-mcp/docs/skills.md` §10c). A
 capable agent recovered the structural channel anyway, by registering on both
 and keeping the self-consistent one. Designing a fixture so the *heuristics its
 author thought of* point the wrong way is not the same as making the fact

@@ -236,7 +236,7 @@ class TestDefaultConfig:
         # has something to answer with and there is nothing to fetch.
         assert services["skills_enabled"] is True
         assert services["skills_local_dir"] == ""
-        # The fetch knobs went with the network path (biopb-mcp/docs/skill-interface.md §1).
+        # Skills are package data, not a fetch (biopb-mcp/docs/skills.md §1).
         assert "skills_catalog_url" not in services
         assert "skills_cache_ttl" not in services
         # No nested object survives.

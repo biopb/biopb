@@ -1,6 +1,6 @@
 """The interaction layer — does a skill get asked the questions it needs?
 
-``biopb-mcp/docs/skill-testing.md`` §5. The layers next door ask whether a skill file is
+``biopb-mcp/docs/skills.md`` §10. The layers next door ask whether a skill file is
 well-formed, whether the API it quotes still exists, and whether anyone can
 retrieve it. This one puts a **model** in front of the shipped body, against a
 **real session**, and scores what comes out.
