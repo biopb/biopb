@@ -2,8 +2,8 @@
 
 The skill takes a punctate channel and a parent segmentation and returns how many
 foci sit in each parent. The withheld fact is step 2's question — **what the
-counted population is** — and it is the categorical kind (`docs/skill-testing.md`
-§5d): some nuclei carry a few much larger blobs, overlapping the foci in
+counted population is** — and it is the categorical kind (`docs/skills.md`
+§10): some nuclei carry a few much larger blobs, overlapping the foci in
 brightness, and nothing in the pixels says whether those are foci, aggregate or
 an artefact. Only the person who stained the sample knows.
 
