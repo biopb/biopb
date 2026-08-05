@@ -10,19 +10,22 @@ prompts and fixed signature, no skill and no repo:
 
     tier     macro IoU a   macro IoU b   collapse        overstatement
     Haiku    0.60-0.64     0.33-0.64     0.000-0.474     0.103-0.270  (0/4 pass)
-    Sonnet   0.69-0.72     0.57-0.71     0.000-0.179     0.028-0.113  (2/3 pass)
+    Sonnet   0.70-0.79     0.62-0.82     0.000-0.139     0.034-0.090  (4/4 pass)
     reference    0.708         0.709     0.000           0.043
 
 Every Sonnet arm recovered the withheld fact **from the histograms**, without
 asking — one wrote "median 902 vs 1348, MAD 56 vs 104 ... almost certainly a
 lamp/exposure change between acquisitions ... any feature that is a bare
 function of intensity has to be normalized per-field" as a code comment. All
-three then did per-field robust normalisation (step 3), diagnosed pixel-wise CV
-as leaking across contiguous strokes and built stroke-grouped CV instead (step
-6), reported resubstitution accuracy explicitly labelled "not as evidence of
-generalization" (step 9), counted components and compared class balance between
-fields (step 7). One added a modal filter (step 5) and **beat the reference on
-the scribbled field**, 0.7225 against 0.7076. That is the body, derived.
+four then normalised each field on its own statistics (step 3), diagnosed
+pixel-wise CV as leaking across contiguous strokes and built stroke-grouped CV
+instead (step 6), reported resubstitution accuracy explicitly labelled "not as
+evidence of generalization" (step 9), counted components and compared class
+balance between fields (step 7). Two added a spatial pass (step 5). That is the
+body, derived — and two arms **beat the reference**: 0.7225 on the scribbled
+field, and 0.795/0.815 on both from the arm that reached for CLAHE, whose
+per-tile equalisation absorbs the illumination gradient as well as the level
+shift and takes the rim to 0.744/0.797 where the reference gets 0.543.
 
 The four Haiku arms did none of it: all four quoted training-pixel accuracy as
 their quality number, all four named the 4 px rim as their best class where its
@@ -67,26 +70,28 @@ can hold a completely reasonable belief that it has handled scale.
 The withheld fact is **whether the second field came off the same acquisition**.
 It is the §10 kind — categorically absent, not merely hard. A field that is
 brighter is equally well explained by a longer exposure and by a brighter
-sample, and no amount of looking at either array distinguishes them. Four cold
-runs all read the shift as biology ("different cellular density", "fewer or
-smaller cells", "different depth plane"); three were right by luck and the
-fourth had lost half its answer.
+sample, and no amount of looking at either array distinguishes them. The four
+cold Haiku runs all read the shift as biology ("different cellular density",
+"fewer or smaller cells", "different depth plane"); three were right by luck and
+the fourth had lost half its answer. The Sonnet arms did not — they read the
+level shift straight off the histograms, which is the finding that deferred this.
 
 **There is a back door and it should be named** (`skills.md` §10). Per-field
 min-max normalisation defends against this shift without anyone asking, and
-three of four cold arms reached for it reflexively (scoring 0.000-0.080 on
+three of the four Haiku arms reached for it reflexively (scoring 0.000-0.080 on
 `second_field_collapse` while the fourth scored 0.474). So a green
 `second_field_collapse` does not prove the run interacted — it proves the run
 was not damaged, by whichever route, and a run that walked through the back door
 has done something defensible rather than something lucky.
 
 `accuracy_overstatement` is the metric no reflex covers: it asks what the run
-*believed*, and all four cold arms believed something wrong whether or not their
+*believed*, and all four Haiku arms believed something wrong whether or not their
 labels came out — 0.981 to 0.995 claimed against true accuracies of 0.72 to 0.89.
+It is also the metric that separates the tiers most cleanly, 0/4 against 4/4.
 
 `accuracy_overstatement` is one-sided on purpose. Understating is a run that was
 careful; overstating is a run that told the user a number it had no basis for,
-which is the failure this skill exists to prevent and the one all four cold arms
+which is the failure this skill exists to prevent and the one all four Haiku arms
 hit.
 
 The reference implementation these tolerances come from is in the pull request
@@ -146,10 +151,13 @@ ACQUISITION = {
 #:   per-field min-max (the reflex) ......... 0.292         0.013
 #:   reference at sigma_max 32 .............. 0.328         0.049
 #:   image never normalised per field ....... 0.292         0.341
-#:   four cold arms ......................... 0.363-0.398   0.000-0.474
+#:   four cold Haiku arms ................... 0.363-0.398   0.000-0.474
+#:   four cold Sonnet arms .................. 0.205-0.304   0.000-0.139
 #:
 #: `second_field_collapse` is the measurement and 0.25 sits in a real gap: the
-#: worst surviving route scores 0.049 and the broken ones 0.341 and 0.474. The
+#: worst surviving route scores 0.139 — a sound Sonnet arm, and the reason this
+#: row is here rather than the 0.049 of the ablations — and the broken ones
+#: 0.341 and 0.474. Narrower than it first measured, but still a gap. The
 #: oracle's 0.114 is the *irreducible* part — trained on the first field's own
 #: truth, the second is still harder — so a limit under that would fail a run
 #: for the fixture's own physics. It is a ratio rather than the second field's
@@ -165,7 +173,7 @@ ACQUISITION = {
 #: including the ones that fail everything else. It is here so a run cannot buy
 #: a clean `collapse` ratio by being equally poor on both fields.
 #:
-#: `accuracy_overstatement` is the one all four cold arms failed. Measured on
+#: `accuracy_overstatement` is the one all four Haiku arms failed. Measured on
 #: this fixture: stroke-wise holdout says 0.9296 and the second field really
 #: scores 0.8870, so an honest run overstates by **0.043**. Training-pixel
 #: accuracy is exactly **1.000**, so quoting it overstates by 0.113 even for a
