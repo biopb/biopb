@@ -85,6 +85,12 @@ RETRIEVES = [
     ("filament width", "detect-filaments"),
     ("ridge detection", "detect-filaments"),
     ("centreline", "detect-filaments"),
+    ("fret", "ratiometric-fret"),
+    ("fret ratio", "ratiometric-fret"),
+    ("ratiometric", "ratiometric-fret"),
+    ("biosensor", "ratiometric-fret"),
+    ("bleedthrough", "ratiometric-fret"),
+    ("donor acceptor", "ratiometric-fret"),
     ("stitch", "stitch-tiles"),
     ("stitch tiles", "stitch-tiles"),
     ("mosaic", "stitch-tiles"),
@@ -131,6 +137,17 @@ REJECTS = [
     ("filament", "calibrated-measurements"),
     ("centreline", "segmentation-qc-metrics"),
     ("segmentation", "detect-filaments"),
+    # `ratiometric-fret` aligns two detectors and fixes channel intensities
+    # before it divides, which puts it one word away from all three skills that
+    # own those. Registering two cameras onto the same field is not correcting a
+    # stage that moved, and a channel ratio is neither an illumination field nor
+    # a calibrated object measurement.
+    ("registration", "ratiometric-fret"),
+    ("drift", "ratiometric-fret"),
+    ("illumination", "ratiometric-fret"),
+    ("measure", "ratiometric-fret"),
+    ("fret", "flatfield"),
+    ("fret", "drift-correction"),
 ]
 
 
