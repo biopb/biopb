@@ -48,19 +48,16 @@ where it was missed, and keeps lineage where cells divide.
 
 1. **Check the requirements** *(blocking)*. Resolve `checklist:` against
    `server_status`; `guide://kernel` covers what to do about a gap. Read the
-   `pkg:laptrack` version with `importlib.metadata.version("laptrack")` and not
-   `laptrack.__version__` — the module attribute reads `0.17.0` inside the
-   `0.17.1` distribution, so the import-time check reports a correctly installed
-   package as too old.
+   `pkg:laptrack` version with `importlib.metadata.version("laptrack")`, not
+   `laptrack.__version__` — the attribute reads `0.17.0` inside the `0.17.1`
+   distribution, so an import-time check calls a correct install too old.
 
    Without `laptrack`, the degraded path is a global assignment per frame pair
-   (`scipy.optimize.linear_sum_assignment` over the pairwise distances, `MAX_STEP_PX`
-   as the admissible cost) — step 4 without the second round. It is a real
-   fallback: on the movie described in step 6 it recovers **87.0%** of the true
-   links against the full method's **90.1%**. What it does not do is close gaps
-   or handle divisions, so it fragments a track wherever one detection is
-   missing — 190 tracks for 65 cells rather than 161, and no lineage at all.
-   Say which was used.
+   (`scipy.optimize.linear_sum_assignment`, `MAX_STEP_PX` the admissible cost) —
+   step 4 without the second round. Real, not lesser: **87.0%** of the true links
+   against **90.1%**. But it closes no gaps and finds no divisions, so it
+   fragments at every missed detection — 190 tracks for 65 cells against 161, and
+   no lineage at all. Say which was used.
 
 2. **Confirm the scale and the biology** *(confirm-input, blocking)*. Four facts,
    one question: the pixel size, the frame interval, the fastest these objects
@@ -100,19 +97,13 @@ where it was missed, and keeps lineage where cells divide.
        det, coordinate_cols=["y", "x"], frame_col="frame")
    ```
 
-   **The default metric is `sqeuclidean`, so every cutoff there is a squared
-   distance.** Writing `cutoff=MAX_STEP_PX` means `MAX_STEP_PX` px², a cutoff
-   √MAX_STEP_PX px wide — nothing raises, and at a 15 px prior it recovers
-   **45.3%** of the true links instead of 90.1%, in 847 tracks instead of 161,
-   with a mean speed **45% too low**. If squaring is a thing you would rather not
-   have to remember, pass `metric="euclidean"` and give the cutoffs as plain
-   distances; measured on the same movie the two forms agree to within 0.2
-   points. **There are four metric fields** — `metric`, `gap_closing_metric`,
-   `splitting_metric`, `merging_metric` — and they are independent, so setting
-   only the first leaves the other rounds on squared distances.
+   **The default metric is `sqeuclidean`, so those cutoffs are squared
+   distances**, and `metric`, `gap_closing_metric`, `splitting_metric` and
+   `merging_metric` are four independent fields — setting one leaves the rest
+   squared. Use `metric="euclidean"` throughout if you would rather not square;
+   the two forms agree to within 0.2 points.
 
-   For **gIoU**, the metric is a callable over the two coordinate rows, and the
-   cutoffs stop being distances:
+   For **gIoU** the metric is a callable and the cutoffs stop being distances:
 
    ```python
    lt = LapTrack(
@@ -126,28 +117,20 @@ where it was missed, and keeps lineage where cells divide.
        det, coordinate_cols=["frame_f", "label"], frame_col="frame")
    ```
 
-   `giou_distance(u, v)` returns, for the two `(frame, label)` masks it is
-   handed,
+   `giou_distance(u, v)` returns `1 - gIoU` for the two `(frame, label)` masks,
+   where `gIoU = |A n B| / |A u B| - (|C| - |A u B|) / |C|` and `C` is the
+   smallest box enclosing both — that second term is what keeps falling once the
+   masks come apart and `|A n B|` has already hit 0.
 
-   ```
-   1 - gIoU  where  gIoU = |A n B| / |A u B| - (|C| - |A u B|) / |C|
-   ```
-
-   with `C` the smallest box enclosing both masks — the second term is what
-   keeps falling once the masks come apart, where `|A n B|` has already hit 0.
-
-   **Precompute it and let the callable be a lookup**: `cdist` calls the metric
-   once per candidate pair, so mask arithmetic inside it is what makes this
-   slow. Per frame pair, one `np.bincount(a[both] * (b.max() + 1) + b[both])`
-   gives every intersection at once, and `regionprops` bboxes broadcast into
-   every `|C|` — build the whole matrix, since unlike IoU the non-overlapping
-   entries are the informative ones and cannot be left out.
+   **Precompute it; let the callable be a lookup.** `cdist` calls the metric
+   once per candidate pair. One `np.bincount(a[both] * (b.max() + 1) + b[both])`
+   per frame pair gives every intersection, and `regionprops` bboxes broadcast
+   into every `|C|`. Build the whole matrix — unlike IoU, the non-overlapping
+   entries are the informative ones.
 
    The three cutoffs are one number in three places, scaled by the time each
-   one spans (centroid) or left alone (gIoU, which is already scale-free).
-   **`splitting_cutoff` and `merging_cutoff` are `False` by default**, which is
-   the part that does not follow from the geometry: left alone, a division ends
-   one track and starts two tracks belonging to nobody, and nothing says so.
+   spans (centroid) or left alone (gIoU, already scale-free), and
+   `splitting_cutoff`/`merging_cutoff` default to `False`.
 
 5. **Map the result back by your own keys, never by position.**
 
@@ -156,20 +139,14 @@ where it was missed, and keeps lineage where cells divide.
    det = det.merge(track_df[ids], on=["frame", "label"])
    ```
 
-   `predict_dataframe` returns the rows **sorted by frame under a fresh
-   0..N-1 index**, carrying your own columns along. On a detection table that
-   was already frame-sorted the order happens to survive; on one that was not,
-   assigning `det["track_id"] = track_df["track_id"].values` silently scrambles
-   every identity — measured at 0.2% of true links recovered, with 99.3% of the
-   links it does make joining different objects. The join costs nothing and does
-   not care.
+   `predict_dataframe` returns rows **frame-sorted under a fresh 0..N-1 index**,
+   carrying your own columns along. If your table was already frame-sorted the
+   order happens to survive; if it was not, `det["track_id"] =
+   track_df["track_id"].values` scrambles every identity without raising.
 
-   **`track_id` and `tree_id` are different answers.** `track_id` breaks at a
-   division and is what you want for motion — a speed, a displacement, a
-   direction. `tree_id` holds the whole lineage and is what you want for
-   counting cells or following a family. On the movie below the same run gives
-   161 `track_id`s and 67 `tree_id`s for 65 founder cells: count the wrong
-   column and you report 2.5× the cells that were there.
+   **`track_id` breaks at a division; `tree_id` does not.** Motion — a speed, a
+   displacement, a direction — is `track_id`. Counting cells or following a
+   family is `tree_id`.
 
 6. **Validate before reporting anything** *(blocking)*. Three numbers, none of
    which needs a ground truth. Written for the centroid route; on gIoU the same
@@ -187,33 +164,29 @@ where it was missed, and keeps lineage where cells divide.
          f"{det.groupby('frame').size().median():.0f} objects per frame")
    ```
 
-   - **Links piled up against the cutoff mean it is too small.** Measured on the
-     movie below: 39% / 20% / 6.8% / 1.0% of links within 10% of the cutoff at
-     cutoffs of 5 / 8 / 11 / 15 px, against a reported speed 30% / 12% / 5% / 3%
-     below truth. Under a few percent is healthy.
-   - **That check is one-sided and cannot see a cutoff that is too large** — at
-     3× the right value only 0.3% of links sit near it, and the speed is 22%
-     *over*. What catches that is the largest realised step in µm/min: if it
-     exceeds what the user said in step 2, the linker is jumping between
-     neighbours. This is why step 2 asks for a speed rather than a cutoff.
-   - **Track count against objects per frame.** Comfortably more tracks than
-     objects means fragmentation; fewer means identities are being merged.
+   - **Links piled against the cutoff mean it is too small**: 39% / 20% / 6.8% /
+     1.0% of links within 10% of the cutoff at 5 / 8 / 11 / 15 px, against a
+     speed 30% / 12% / 5% / 3% below truth. Under a few percent is healthy.
+   - **It cannot see a cutoff that is too large.** At 3× the right value only
+     0.3% of links sit near it and the speed is 22% *over*. The largest realised
+     step in µm/min is what catches that: above what the user said in step 2, the
+     linker is jumping between neighbours — which is why step 2 asks for a speed
+     and not a cutoff.
+   - **Track count against objects per frame**: many more tracks means
+     fragmentation, fewer means identities are being merged.
 
-   **Regime for every number quoted here**: centroid linking, on 5 seeds of a
-   synthetic 24-frame movie — ~1,660 detections, 65 founder cells in 5 colonies
-   with 50 divisions, 7% of detections dropped, median step 5.3 px against a
-   median nearest-neighbour distance of 17 px, at 0.5 µm/px and 90 s. Where the
-   step grows toward the spacing, centroid linking degrades — at 2.9× this
-   movie's step it holds 73.8% of links, and no cutoff recovers the rest. That
-   is the boundary the `METRIC` row is about: past it, position has stopped
-   identifying the object, and the mask is what still does.
+   **Regime for every number here**: centroid linking, 5 seeds of a synthetic
+   24-frame movie — ~1,660 detections, 65 founders in 5 colonies with 50
+   divisions, 7% of detections dropped, median step 5.3 px against a median
+   nearest-neighbour distance of 17 px, at 0.5 µm/px and 90 s. As the step grows
+   toward the spacing this degrades — at 2.9× it holds 73.8% of links and no
+   cutoff recovers the rest, which is the boundary the `METRIC` row is about.
 
 7. **Report the tracks and the settings.** `viewer.add_tracks` wants one row per
-   detection as `[track_id, t, y, x]` — that column order, id first, which is
-   not the order of the table you have been carrying (`inspect_object` for the
-   rest of its arguments). Print the dict that reproduces the run beside it: the
+   detection as `[track_id, t, y, x]` — id first, not the order of the table you
+   have been carrying. Print the dict that reproduces the run beside it: the
    three cutoffs, `MAX_GAP`, `PIXEL_UM`, `INTERVAL_S`, and which id column each
-   reported number was counted from.
+   number was counted from.
 
 ## Guardrails
 
@@ -221,12 +194,12 @@ where it was missed, and keeps lineage where cells divide.
   the bias is invisible in the tracks themselves: the fast steps are the ones
   that failed to link. Report it with the fraction of detections that ended up
   linked, never alone.
-- **Do not tune the cutoff until the tracks look right.** Continuity is a
-  weak signal: over 11–22 px, a 2× range, link accuracy moves by 0.4 points
-  while the speed the tracks report moves by 4; over 5–45 px accuracy is still
-  65–90% while the speed runs from 30% under to 22% over. Tracks that look
-  continuous are satisfied by a cutoff that is measurably wrong in either
-  direction, which is why step 6 checks the two ends instead.
+- **Do not pad the cutoff "to be safe", and do not tune it until the tracks
+  look right.** Padding buys nothing and costs identities: continuity is a weak
+  signal, so over a 2× range of the cutoff link accuracy moves 0.4 points while
+  the speed the tracks report moves 4, and over 5–45 px accuracy is still 65–90%
+  while the speed runs from 30% under to 22% over. A padded cutoff looks exactly
+  like a right one, and reports a faster cell.
 
 ## Failure modes
 
