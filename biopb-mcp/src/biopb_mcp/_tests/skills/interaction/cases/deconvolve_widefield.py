@@ -43,9 +43,16 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy.signal import fftconvolve
 
+from ....agentbench._fixture import (
+    Attempt,
+    Fixture,
+    Metric,
+    Outcome,
+    Procedural,
+    read_scalar,
+)
+from ....agentbench._respondent import Persona
 from .._benchmark import Case, Layer
-from .._fixture import Attempt, Fixture, Metric, Outcome, Procedural, read_scalar
-from .._respondent import Persona
 
 SKILL = "deconvolve-widefield"
 

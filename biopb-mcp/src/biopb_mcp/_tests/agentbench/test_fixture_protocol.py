@@ -14,6 +14,7 @@ workstation later, halfway through a paid run.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -364,3 +365,20 @@ def test_the_artifact_root_is_overridable(tmp_path, monkeypatch):
     assert artifact_root() == tmp_path / "elsewhere"
     monkeypatch.delenv(ARTIFACT_DIR_ENV)
     assert artifact_root().name == ".skill-outcomes"
+
+
+def test_artifacts_land_inside_the_checkout(monkeypatch):
+    """The default artifact root is in the tree, not above it.
+
+    A regression guard with a story: the root used to be a hardcoded
+    ``parents[6]``, correct only while this module sat six levels down. Moving
+    it one directory up made it resolve *outside* the checkout -- past the
+    gitignore, into a place nobody would look for a report -- and every test
+    still passed, because none of them asserted where the artifacts go.
+    """
+    monkeypatch.delenv(ARTIFACT_DIR_ENV, raising=False)
+    checkout = Path(__file__).resolve().parents[5]
+    assert (checkout / ".git").exists(), (
+        f"{checkout} is not the checkout root; this test's own anchor has drifted"
+    )
+    assert artifact_root() == checkout / ".skill-outcomes"

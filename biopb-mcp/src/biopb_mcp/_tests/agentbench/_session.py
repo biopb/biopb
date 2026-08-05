@@ -57,8 +57,8 @@ from typing import Any
 import numpy as np
 
 #: Env the tripwire reads in the child: where to write, and what to watch.
-ENV_GUARD_LOG = "BIOPB_SKILL_GUARD_LOG"
-ENV_GUARD_MARKERS = "BIOPB_SKILL_GUARD_MARKERS"
+ENV_GUARD_LOG = "BIOPB_GUARD_LOG"
+ENV_GUARD_MARKERS = "BIOPB_GUARD_MARKERS"
 
 #: Installed into every child process of a run, as `sitecustomize` on its
 #: `PYTHONPATH`. Records — never blocks — reads of anything the harness owns.
@@ -229,7 +229,7 @@ CALL_TIMEOUT = 300.0
 
 #: Printed by kernel-side snippets so the façade can find a path in output that
 #: also carries whatever the agent's code decided to print.
-SENTINEL = "__BIOPB_SKILL_HARNESS__"
+SENTINEL = "__BIOPB_HARNESS__"
 
 #: An address nothing listens on, to keep `client` at None for a case presented
 #: as `array`. Port 1 is privileged and unbound; the connect fails fast rather

@@ -24,6 +24,15 @@ import os
 
 import pytest
 
+from ...agentbench._conversation import (
+    AGENT_TRUNCATED,
+    FINISHED,
+    RESPONDENT_FAILED,
+    SILENT,
+    TURN_CAP,
+)
+from ...agentbench._fixture import Attempt, Fixture, Metric, Outcome
+from ...agentbench._models import ENV_FILE_ENV, reload_env_file
 from . import _benchmark, conftest
 from ._benchmark import (
     ARMS,
@@ -47,15 +56,6 @@ from ._benchmark import (
     catalog_size,
     selected_arms,
 )
-from ._conversation import (
-    AGENT_TRUNCATED,
-    FINISHED,
-    RESPONDENT_FAILED,
-    SILENT,
-    TURN_CAP,
-)
-from ._fixture import Attempt, Fixture, Metric, Outcome
-from ._models import ENV_FILE_ENV, reload_env_file
 from .cases import CASES
 
 FIXTURE = Fixture(
@@ -244,7 +244,7 @@ def test_a_failed_bring_up_leaves_the_process_environment_as_it_found_it(
     no connection to the cause. Staging the wheel is the step most likely to
     raise (it shells out to `uv build`), which is why it belongs inside.
     """
-    from . import _session
+    from ...agentbench import _session
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "mine"))
     monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://example:1234")

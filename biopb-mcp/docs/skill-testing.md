@@ -282,15 +282,15 @@ emits markdown, and there is no number with a knowable right answer.
 ### 5a. The agent matrix
 
 ```
-BIOPB_SKILL_AGENT=openai:gpt-5                    # default
-BIOPB_SKILL_RESPONDENT=anthropic:claude-sonnet-5  # default
+BIOPB_AGENT=openai:gpt-5                    # default
+BIOPB_RESPONDENT=anthropic:claude-sonnet-5  # default
 ```
 
 Both sides are `provider:model` and are configured independently, with separate
 base-URL overrides (`BIOPB_SKILL_{AGENT,RESPONDENT}_BASE_URL`). Known
 providers: `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` — each a
 `(sdk, base_url, key_env)` triple.
-Keys may come from the environment or a `.env` (`BIOPB_SKILL_ENV_FILE`, the repo
+Keys may come from the environment or a `.env` (`BIOPB_ENV_FILE`, the repo
 root, then the biopb config dir), and are never written to a trace or an
 artifact. Anthropic agents were involved in the authoring of the skills and can
 pass by recognising their own prose rather than by reading it, so the agent under
@@ -485,7 +485,7 @@ delta would read as zero for a reason unrelated to the skill.
 expensive call. Both are reported, not asserted.
 
 **Outputs.** Per case, under `.skill-outcomes/interaction/<skill>/` (override
-with `BIOPB_SKILL_OUTCOME_DIR`, gitignored): `summary.md` and `summary.json`,
+with `BIOPB_OUTCOME_DIR`, gitignored): `summary.md` and `summary.json`,
 and per arm a `transcript.md`, a `trace.jsonl`, the verifier's `summary.json`,
 and the case's artifacts — PNGs and CSVs. The number is the result; the artifact
 explains it, which in an imaging project is usually what a person needs.
@@ -530,7 +530,7 @@ reference scores 3.69 px on real data and fails that gate. The earlier model
 (`curated_for(skill) or build()`) would have published both results as one number,
 per machine, silently.
 
-So `BIOPB_SKILL_FIXTURES` is a **root path, not a policy switch**: it says where a
+So `BIOPB_FIXTURES` is a **root path, not a policy switch**: it says where a
 curated case finds its data, never which fixture a case runs. A case whose data is
 absent reports why and skips — the same discipline as a missing API key — and a
 skill worth covering both ways is **two cases**, each with its own `case_id`,

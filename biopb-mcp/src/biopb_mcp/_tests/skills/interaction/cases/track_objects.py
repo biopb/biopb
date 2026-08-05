@@ -36,9 +36,16 @@ from pathlib import Path
 
 import numpy as np
 
+from ....agentbench._fixture import (
+    Attempt,
+    Fixture,
+    Metric,
+    Outcome,
+    Procedural,
+    read_scalar,
+)
+from ....agentbench._respondent import Persona
 from .._benchmark import Case, Layer
-from .._fixture import Attempt, Fixture, Metric, Outcome, Procedural, read_scalar
-from .._respondent import Persona
 
 SKILL = "track-objects"
 

@@ -5,8 +5,8 @@ lives here rather than being hardcoded into either. The two sides are named and
 configured **independently**:
 
 ```
-BIOPB_SKILL_AGENT=openai:gpt-5
-BIOPB_SKILL_RESPONDENT=anthropic:claude-sonnet-5
+BIOPB_AGENT=openai:gpt-5
+BIOPB_RESPONDENT=anthropic:claude-sonnet-5
 ```
 
 That independence is not cosmetic. Anthropic is *a* respondent choice, not the
@@ -41,17 +41,17 @@ from typing import Any, Protocol
 #: which is a confusing way to spend an afternoon. A file is simply read.
 #:
 #: `.env` at the repo root is already gitignored. Order: an explicit
-#: `BIOPB_SKILL_ENV_FILE`, then the repo root, then the biopb config dir.
-ENV_FILE_ENV = "BIOPB_SKILL_ENV_FILE"
-CONFIG_ENV_FILE = Path.home() / ".config" / "biopb" / "skill-harness.env"
+#: `BIOPB_ENV_FILE`, then the repo root, then the biopb config dir.
+ENV_FILE_ENV = "BIOPB_ENV_FILE"
+CONFIG_ENV_FILE = Path.home() / ".config" / "biopb" / "harness.env"
 HOME_ENV_FILE = Path.home() / ".env"
 
 #: Which side is being configured. Separate variables so agent and respondent
 #: can sit on different providers, or the same one at different addresses.
-AGENT_ENV = "BIOPB_SKILL_AGENT"
-RESPONDENT_ENV = "BIOPB_SKILL_RESPONDENT"
-AGENT_BASE_URL_ENV = "BIOPB_SKILL_AGENT_BASE_URL"
-RESPONDENT_BASE_URL_ENV = "BIOPB_SKILL_RESPONDENT_BASE_URL"
+AGENT_ENV = "BIOPB_AGENT"
+RESPONDENT_ENV = "BIOPB_RESPONDENT"
+AGENT_BASE_URL_ENV = "BIOPB_AGENT_BASE_URL"
+RESPONDENT_BASE_URL_ENV = "BIOPB_RESPONDENT_BASE_URL"
 
 DEFAULT_AGENT = "openai:gpt-5"
 DEFAULT_RESPONDENT = "anthropic:claude-sonnet-5"
@@ -167,7 +167,7 @@ PROVIDERS: dict[str, Provider] = {
     # Local, and the key is a placeholder the SDK insists on rather than a
     # secret. Useful for rehearsing a run without spending anything.
     "ollama": Provider(
-        "ollama", "openai", "BIOPB_SKILL_OLLAMA_KEY", "http://localhost:11434/v1"
+        "ollama", "openai", "BIOPB_OLLAMA_KEY", "http://localhost:11434/v1"
     ),
 }
 
@@ -354,7 +354,7 @@ def reachable(backend: TextBackend) -> str:
     **A model name that the endpoint does not serve is an environment fault,
     and it should cost one skip rather than four dead arms.** `why_unavailable`
     only knows whether a *key* is present; it cannot know that
-    `BIOPB_SKILL_AGENT` names something this gateway retired, or that a shell
+    `BIOPB_AGENT` names something this gateway retired, or that a shell
     export is quietly beating the dotenv — and both of those spend every arm
     before saying so, each one failing identically for a reason that has
     nothing to do with the skill.

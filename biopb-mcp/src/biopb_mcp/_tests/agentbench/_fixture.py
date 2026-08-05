@@ -396,7 +396,7 @@ class FileRef:
 #: The **root path** under which on-disk fixtures live. Not a policy switch:
 #: setting it changes where a curated case finds its data, never which fixture
 #: a case runs. A case owns one fixture, chosen when it was written.
-FIXTURE_DIR_ENV = "BIOPB_SKILL_FIXTURES"
+FIXTURE_DIR_ENV = "BIOPB_FIXTURES"
 
 #: What a machine actually has, and where a curated fixture's provenance,
 #: citation and per-file record live. A fixture directory with no entry here is
@@ -475,7 +475,7 @@ class OnDisk:
     answer rather than the difficulty. Such a case is written against an
     acquisition from the start.
 
-    Rooted at ``$BIOPB_SKILL_FIXTURES/<skill_id>/<case_id>/``: the case's own
+    Rooted at ``$BIOPB_FIXTURES/<skill_id>/<case_id>/``: the case's own
     identity locates its data, so there is nothing to select and nothing to
     sort. It holds one file:
 
@@ -627,17 +627,31 @@ def _agrees_with_manifest(entry, files: Mapping[str, str], refs: Mapping[str, An
 #: Every case emits a number *and* an artifact: the number says what happened,
 #: the artifact explains it. Imaging failures are recognisable in a second by
 #: eye and awkward to characterise in an assertion.
-ARTIFACT_DIR_ENV = "BIOPB_SKILL_OUTCOME_DIR"
+ARTIFACT_DIR_ENV = "BIOPB_OUTCOME_DIR"
 
 
 def artifact_root() -> Path:
+    """Where a suite's reports and transcripts land, by default in the checkout.
+
+    Landing beside the source is deliberate: these are meant to be opened and
+    paged through, not hunted for in a temp dir.
+
+    The root is *searched for* rather than counted to. It used to be
+    ``parents[6]``, right for one location and silently wrong the moment this
+    module moved a directory -- it then resolved above the checkout, where the
+    gitignore does not reach and nobody would think to look for a report. A
+    depth that only works from one path is a landmine for the next move, so the
+    marker is what gets looked for.
+    """
     raw = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
     if raw:
         return Path(raw).expanduser()
-    # .../biopb-mcp/src/biopb_mcp/_tests/skills/interaction/_fixture.py -> the
-    # checkout root. Landing beside the source is deliberate: these are meant to
-    # be opened and paged through, not hunted for in a temp dir.
-    return Path(__file__).resolve().parents[6] / ".skill-outcomes"
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists():
+            return parent / ".skill-outcomes"
+    # An installed copy with no checkout around it: keep artifacts beside
+    # whoever ran the thing rather than somewhere up the filesystem.
+    return Path.cwd() / ".skill-outcomes"
 
 
 def write_report(outcome: Outcome, root: Path) -> Path:

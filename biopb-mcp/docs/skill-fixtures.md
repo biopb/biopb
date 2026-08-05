@@ -40,7 +40,7 @@ on disk — is decided *when the case is written*, not resolved at run time.
 
 Today's model contradicts this. `Case.build_fixture()` is
 `curated_for(skill) or build()`: every case is silently overridable by whatever
-happens to sit under `$BIOPB_SKILL_FIXTURES` on the machine running it. That is
+happens to sit under `$BIOPB_FIXTURES` on the machine running it. That is
 wrong, and not merely untidy — **substituting the data makes it a different
 experiment with the same name.** The truth changes, the achievable accuracy
 changes, and the conclusion can invert.
@@ -60,7 +60,7 @@ machine that cannot produce it, the case does not run, and says so.
 ## What the principle deletes
 
 - `curated_for()`'s precedence, entirely.
-- `$BIOPB_SKILL_FIXTURES` as a policy switch. It is demoted to what it should
+- `$BIOPB_FIXTURES` as a policy switch. It is demoted to what it should
   always have been: **the root path under which on-disk fixtures live**. Setting it
   changes where data is found, never which experiment runs.
 - The "tolerances do not transfer between synthetic and curated" problem, which was
@@ -117,7 +117,7 @@ class Procedural:
 class OnDisk:
     """Real data the case was written against.
 
-    Rooted at $BIOPB_SKILL_FIXTURES/<skill>/<case_id>/ — the case's own identity
+    Rooted at $BIOPB_FIXTURES/<skill>/<case_id>/ — the case's own identity
     locates its data, so there is nothing to select and nothing to sort.
     """
     kind: Kind = "curated"
@@ -367,7 +367,7 @@ results, and read the wrong fixture — silently.
 
 ## The tree carries a manifest
 
-`$BIOPB_SKILL_FIXTURES/manifest.json` describes what a machine actually has, so
+`$BIOPB_FIXTURES/manifest.json` describes what a machine actually has, so
 the fixtures present can be listed, their citations collected, and their contents
 checked — none of which is possible against a bare convention.
 

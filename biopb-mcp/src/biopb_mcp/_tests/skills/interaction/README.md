@@ -24,8 +24,8 @@ Both sides are `provider:model`, named separately, so they can be different
 vendors — or the same compatible API at two addresses:
 
 ```sh
-export BIOPB_SKILL_AGENT=openai:gpt-5                  # default
-export BIOPB_SKILL_RESPONDENT=anthropic:claude-sonnet-5 # default
+export BIOPB_AGENT=openai:gpt-5                  # default
+export BIOPB_RESPONDENT=anthropic:claude-sonnet-5 # default
 export OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
 
 uv run --no-project --python .venv/bin/python --with openai --with anthropic \
@@ -35,7 +35,7 @@ uv run --no-project --python .venv/bin/python --with openai --with anthropic \
 Known providers: `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` — each a
 `(sdk, base_url, key_env)` triple, and most of them the OpenAI-compatible API
 at a different address. Override an address with
-`BIOPB_SKILL_AGENT_BASE_URL` / `BIOPB_SKILL_RESPONDENT_BASE_URL`. A bare model
+`BIOPB_AGENT_BASE_URL` / `BIOPB_RESPONDENT_BASE_URL`. A bare model
 name is refused rather than guessed: which vendor serves a model is exactly the
 fact §5a turns on, and inferring it from the name would make the rule depend on
 vendors' naming conventions.
@@ -43,7 +43,7 @@ vendors' naming conventions.
 **§5a constrains the agent, not the respondent.** The respondent is skill-blind
 and answers from a fact table, and having written the skills does not help with
 that — so Anthropic is a fine respondent and is the default, while the default
-*agent* is deliberately not from the authoring family. `test_models.py` asserts
+*agent* is deliberately not from the authoring family. `agentbench/test_models.py` asserts
 both, off the provider table rather than off a comment.
 
 `ollama` needs no key, which makes it the cheap way to rehearse a run end to end
@@ -55,27 +55,27 @@ time and are never written to a trace, an artifact or a log.
 
 ## What is here
 
+The session, the loop, the provider table, the fixture protocol and the
+run-scoped data plane are **not** here — they are
+[`_tests/agentbench/`](../../agentbench/), which knows nothing about skills and
+is shared with the task suite. What stays here is only what is about the skill
+question:
+
 | File | Holds |
 |---|---|
-| `_session.py` | Bring-up: a real shim-spawned session, a synchronous façade over the async MCP client, and the environment facts that are forced rather than inherited |
-| `_bridge.py` | MCP tool schemas → the function-calling shape a chat model expects |
-| `_models.py` | The provider table: which model on each side, at which address, with which key |
-| `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `ToolCallingAgent` |
-| `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
-| `_fixture.py` | What a run is given and what it recovers: `Fixture`, `Attempt`, `Metric`, `Outcome`, the fixture specs (`Procedural`/`OnDisk`) and the refs they hand out, artifact writing. Knows no skill |
-| `_benchmark.py` | The engine: `Case`, the 2x2 arms, outcome classification, the report. Knows no skill |
+| `_benchmark.py` | The engine: `Case`, the 2x2 arms, outcome classification, the report |
 | `cases/` | One module per skill, each a single `CASE`. Data, not code |
-| `_conversation.py` | The two-model loop, the caps, the `Trace` |
 | `test_benchmark.py` | The pytest surface: run every case, assert only that it reported |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
-| `test_conversation.py` | That the loop works, with no model *and* no session |
 | `test_report.py` | That the engine classifies and reports, on hand-built outcomes |
 | `test_cases.py` | That every case's persona, fixture and verifier hold up — and that the catalogue is covered |
-| `test_fixture_protocol.py` | The scoring protocol itself, including the on-disk path almost no machine has data for |
-| `test_fixture_tree.py` | `-m fixtures`: hashes a curated tree against its manifest. Out-of-band, never inside a run |
-| `_plane.py` | The run-scoped tensor server a `tensor`-presented case needs. Conditional: nothing starts unless a case asks |
-| `test_plane.py` | That plane — hermetic checks on its config, plus `-m interaction` ones against a real server |
-| `test_models.py` | That provider selection resolves, and that §5a holds of the defaults |
+| `conftest.py` | Smoke runs first, and a failed smoke *skips* the benchmark rather than merely preceding it |
+
+`_benchmark.py` still says "knows no skill", and that is still true of the
+engine — the 2x2 is a shape, not a subject. It stays here rather than in
+`agentbench` because the *ablation* is the skill question: withholding
+`services.skills_enabled` is what the left-hand column means, and a suite that
+varies nothing has no use for an `Arm`.
 
 ## Adding a skill
 

@@ -27,10 +27,10 @@ import warnings
 import numpy as np
 import pytest
 
+from ...agentbench._fixture import Attempt, Fixture
 from .._validate import NOT_SKILLS, validate
 from ..conftest import SKILLS_DIR
 from ._benchmark import PRESENTATIONS, TENSOR_HANDLE
-from ._fixture import Attempt, Fixture
 from .cases import CASES, DEFERRED_CASES, NOT_BENCHMARKED
 
 #: Everything with data to check. A deferred case is not benchmarked — there is
@@ -219,7 +219,7 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
 ):
     """The regression this whole design exists to prevent.
 
-    `$BIOPB_SKILL_FIXTURES` used to be a policy switch: whatever sat under it
+    `$BIOPB_FIXTURES` used to be a policy switch: whatever sat under it
     replaced a case's own fixture, silently and per machine. **Substituting the
     data makes it a different experiment with the same name** — the truth
     changes, the achievable accuracy changes, and the conclusion can invert,
@@ -230,7 +230,7 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
     decoy = tmp_path / case.skill / case.case_id
     decoy.mkdir(parents=True)
     (decoy / "case.json").write_text('{"data": {}, "truth": {}}', encoding="utf-8")
-    monkeypatch.setenv("BIOPB_SKILL_FIXTURES", str(tmp_path))
+    monkeypatch.setenv("BIOPB_FIXTURES", str(tmp_path))
 
     built = case.build_fixture()
     assert built.kind == "synthetic"
@@ -416,7 +416,7 @@ def test_the_persona_is_told_not_to_volunteer(case):
     """The one instruction the whole tier depends on. Asserted on the rendered
     prompt rather than trusted to the template, because the template is exactly
     what a well-meaning edit would loosen."""
-    from ._respondent import DONE
+    from ...agentbench._respondent import DONE
 
     prompt = case.persona.system_prompt()
     assert "never volunteer" in prompt.casefold()
