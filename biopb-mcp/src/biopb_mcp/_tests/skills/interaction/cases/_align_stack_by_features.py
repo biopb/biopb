@@ -61,8 +61,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .._benchmark import Case, Layer
-from .._fixture import (
+from ....agentbench._fixture import (
     Attempt,
     Fixture,
     Metric,
@@ -71,7 +70,8 @@ from .._fixture import (
     read_array,
     save_png,
 )
-from .._respondent import Persona
+from ....agentbench._respondent import Persona
+from .._benchmark import Case, Layer
 
 SKILL = "align-stack-by-features"
 CASE_ID = "ovule-serial-sections"
