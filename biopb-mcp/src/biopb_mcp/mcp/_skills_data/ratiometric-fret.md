@@ -46,7 +46,7 @@ between cells, fields or conditions.
 | `DONOR`, `FRET`, `ACCEPTOR` | (Y, X) or (T, Y, X) | The three cubes: donor ex/donor em, donor ex/acceptor em, acceptor ex/acceptor em. Which layer is which is a **question for the user**, step 2. A two-channel ratiometric sensor has no `ACCEPTOR` and drops the direct-excitation term |
 | `BT` | fraction | Donor bleedthrough: median of `FRET / DONOR` inside the cell on a **donor-only** control acquired at the same filters, exposure and excitation power. Not derivable from the experiment itself — step 2 |
 | `DE` | fraction | Acceptor direct excitation: median of `FRET / ACCEPTOR` on an **acceptor-only** control, same settings |
-| `GAIN` | — | Acceptor-arm over donor-arm sensitivity. An optical-system constant, not a property of one field: ask for it, carry it from a calibrated position, or set it to 1 and state that the ratio is in instrument units |
+| `GAIN` | — | Acceptor-arm over donor-arm sensitivity. An optical-system constant, not a property of one field: ask for it, carry it from a calibrated position, or set it to 1 and state that the ratio is in instrument units. Because `GAIN` and the filter set together set the scale, **a corrected ratio has no expected range** — "0.5 to 2.0 is normal" is not a check, and treating it as one rejects correct numbers |
 | `MASK` | — | Where there is enough donor signal to divide by. Derive it from the **background-subtracted donor channel**, never from the ratio |
 
 ## Steps
@@ -63,10 +63,19 @@ between cells, fields or conditions.
      the same filters, exposure and excitation power. If they do not, **stop and
      say so**: splitting the FRET channel into sensitized emission and
      leak-through is not identifiable from a doubly-labelled field. You can
-     deliver a raw ratio for display, not a fold-change. Synthetic: fitting
-     `F ~ a*D + b*A` on the experiment itself recovered `a` = 0.31-0.42 against a
-     true 0.35, over-subtracted, drove the resting population through zero and
-     lost the fold-change entirely.
+     deliver a raw ratio for display, not a fold-change.
+
+     Two substitutes suggest themselves and **neither works**. A plausible
+     literature default is not the conservative choice — the coefficients enter
+     as an additive term, so a wrong one moves every fold-change rather than
+     scaling it: subtracting a correct donor leak while leaving direct
+     excitation out still left 70-89% of level error and 20-33% of contrast
+     error. Nor does a fold-change survive on the grounds that the settings were
+     constant across conditions; an additive offset compresses ratios toward
+     each other, and synthetic, a true 3.05x came back as **1.64x**. Fitting the
+     coefficients on the experiment itself is the other one — `F ~ a*D + b*A`
+     recovered `a` = 0.31-0.42 against a true 0.35, over-subtracted, drove the
+     resting population through zero and lost the fold-change entirely.
    - **Whether the two channels come from two detectors** — an image splitter or
      a dual camera. Step 3 applies only if they do.
    - **Display or quantification.** A ratio renormalised to look good keeps every
@@ -126,13 +135,10 @@ between cells, fields or conditions.
        return float(np.median(frame[frame > 0] if warped else frame))
    ```
 
-5. **Mask, from the donor channel.** A ratio is undefined where the denominator
-   is noise, and a floor on the denominator does not rescue it — TIRF, floors
-   from 0 to 10 counts changed nothing inside the mask (max 65 → 22, fewer than
-   0.001% of pixels above 10x the median) because the mask had already removed
-   the pixels a floor would have caught. Threshold the background-subtracted
-   donor channel and keep the cell footprint; the floor is only there to keep the
-   arithmetic finite.
+5. **Mask, from the background-subtracted donor channel.** A floor on the
+   denominator is not the lever it looks like — TIRF, floors from 0 to 10 counts
+   changed nothing inside the mask, because the mask had already removed every
+   pixel a floor would have caught. It is there to keep the arithmetic finite.
 
 6. **The corrected ratio.** Everything above was to make these three lines mean
    something:
@@ -143,8 +149,8 @@ between cells, fields or conditions.
    ratio[MASK] = sensitized[MASK] / DONOR[MASK] / GAIN
    ```
 
-7. **Validate, before calling any number final** *(blocking)*. Three checks, and
-   the second is the one an unaided run leaves out.
+7. **Validate, before calling any number final** *(blocking)*. Two checks, and
+   both are ones an unaided run leaves out.
 
    - **Run the correction on the control slides themselves.** A donor-only and an
      acceptor-only control must both come out at a ratio of zero. This is close
@@ -163,15 +169,13 @@ between cells, fields or conditions.
      biology backwards. Do not require the correlation to vanish: on the same
      field the correctly corrected ratio was rank-correlated with donor intensity
      at **-0.41**, because real biology varies with expression level.
-   - **Report a distribution inside the mask.** Never a statistic over the ratio
-     image: outside the cell that image is noise over noise, p99 of 14.6 against
-     an in-cell median of 6.29, and the whole-frame mean came out at 1.79 — off
-     by 3.5x with nothing visibly wrong.
-
 8. **Hand off with the picture and the numbers.** Put the ratio on the viewer
    over the donor channel with a fixed contrast range, and give the median and
-   inter-quartile range per condition, the two coefficients used, and the
-   registration residual. A ratio image alone cannot be checked by anybody.
+   inter-quartile range **per condition, inside the mask**, the two coefficients
+   used, and the registration residual. Never a statistic over the whole ratio
+   image: outside the cell it is noise over noise, TIRF p99 of 14.6 against an
+   in-cell median of 6.29, and the whole-frame mean came out at 1.79 — off by
+   3.5x with nothing visibly wrong.
 
 ## Failure modes
 
@@ -181,7 +185,7 @@ between cells, fields or conditions.
 | Phase correlation says the alignment is finished | It only sees translation. TIRF: 0.071 px reported while the ratio dipole read 0.381 px whole-field | `dipole_residual`, per block, on the spread |
 | The ratio rises with donor brightness and the dimmest pixels all read the same low value | Background left in the channels; dim pixels converge on the ratio of the two backgrounds, 1.10 on this data | Subtract per channel per frame, before dividing |
 | The background on the registered channel is low by about the fraction of the frame the warp vacated, and the other channel's is fine | The warp writes exact zeros into the vacated border, and a mean or a low percentile counts them as detector counts | A median absorbs it: 0.78% of the frame zeroed moved the mean 0.78% and the median 0.05%. Otherwise exclude the zeros, on that channel only |
-| The fold-change between conditions is roughly half what was expected | Uncorrected bleedthrough adds a constant to every ratio, which compresses fold-changes. Synthetic: a true 3.05x reported as 1.64x | Subtract `BT * DONOR`, and `DE * ACCEPTOR` too — correcting the donor leak alone still left 20-33% of the contrast error |
+| The fold-change between conditions is roughly half what was expected | A missing or guessed coefficient adds a constant to every ratio, which compresses fold-changes rather than scaling them. Synthetic: a true 3.05x reported as 1.64x | Subtract `BT * DONOR`, and `DE * ACCEPTOR` too — a correct donor leak with direct excitation left out still cost 20-33% of the contrast. Constant acquisition settings do not rescue this |
 | The ratio image looks right and the reported number is 3-4x off | The statistic was taken over the frame rather than inside the mask. TIRF: whole-frame mean 1.79 against an in-cell median 6.29 | Report inside the mask |
 | Coefficients fitted on the experimental field, and the resting population came out at or below zero | Not identifiable: the sensitized-emission term correlates with the donor channel, so the fit absorbs it and over-subtracts | Controls, or say the fold-change cannot be delivered |
 | Ratios do not agree with a previous experiment's although the fold-change does | The ratio was renormalised for display. Synthetic: 165% off in level with contrast intact | Keep the unnormalised ratio for quantification and normalise only a display copy |
