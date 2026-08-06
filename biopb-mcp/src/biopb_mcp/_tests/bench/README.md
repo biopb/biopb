@@ -279,6 +279,27 @@ already there. `namespace` already carries the name, so nothing on disk moves,
 and the coverage gate fires the moment the skill ships uncovered — which is a
 better pin than the two filename prefixes that used to have to agree.
 
+**A case may also exist for a candidate that was screened and *rejected*.**
+`local-thickness`, `fibre-orientation` and `strahler-ordering` are these: no
+skill, no banked draft, and no intention of writing one. They are here because
+`docs/skill-candidates.md` rejects on the ground that a Sonnet-class model
+already does the work well — a verdict that is **conditional on the consuming
+tier**, and that the same doc measured collapsing one tier down. The prose
+recorded the verdict; nothing recorded the fixture, the truth and the tolerance
+that produced it, so re-checking a rejection meant rebuilding the benchmark from
+a paragraph. A case is where that stops being true.
+
+Two consequences worth knowing when reading one. Its tolerance is written to sit
+between a *reference* and the specific wrong routes named in the doc, not
+between pass and fail in the abstract — so each carries the table it was derived
+from in its module docstring, and the module is where to change it. And a
+rejected candidate has no skill to isolate, so these are **integration tests**:
+`strahler-ordering` hands over a segmented volume rather than a traced tree,
+which makes the run skeletonize and cluster junctions before it can order
+anything. That is more work than the candidate was nominated for, and it is the
+right shape for a case that is measuring whether the whole route lands on the
+number rather than whether one claim holds.
+
 No test code either way: `test_bench.py` parametrizes over the selected cases,
 so the new one brings its own report and transcripts, and `test_cases.py`
 starts checking its persona, its fixture and its verifier by its arriving.
