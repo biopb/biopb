@@ -764,7 +764,16 @@ def write_summary(run: Run) -> str:
     case, fixture, results = run.case, run.fixture, run.results
     columns = _metric_columns(results)
     rows = [r.row(case.blocking_budget) for r in results]
-    agent, respondent = agent_choice(), respondent_choice()
+    agent = agent_choice()
+    # Resolved only under `--bench-responder=model`. Two reasons it is not a
+    # plain `respondent_choice().name`: a silent run has no respondent model to
+    # name, and stamping one anyway made this file disagree with its own
+    # `summary.md`; and `respondent_choice()` raises on a malformed
+    # BIOPB_RESPONDENT, which would take out the report of a run already paid
+    # for that never had a respondent model in it.
+    respondent = (
+        respondent_choice().name if run.options.responder == "model" else "silent"
+    )
     many = run.options.samples > 1
 
     def fmt(value):
@@ -776,9 +785,7 @@ def write_summary(run: Run) -> str:
         f"Session: `{session_id()}`  ",
         f"Configuration: **{run.options.configuration}**  ",
         f"Agent under test: **{agent.name}**  ",
-        "Respondent: **"
-        + (respondent.name if run.options.responder == "model" else "silent")
-        + "**  ",
+        f"Respondent: **{respondent}**  ",
         f"Fixture: `{fixture.case_id}` [{fixture.kind}] — "
         f"{fixture.about or 'no description'}  ",
         f"Provenance: {fixture.provenance}  ",
@@ -866,7 +873,7 @@ def write_summary(run: Run) -> str:
                 "provenance": fixture.provenance,
                 "fixture": fixture.case_id,
                 "agent": agent.name,
-                "respondent": respondent.name,
+                "respondent": respondent,
                 "options": run.options.as_json(),
                 "configuration": run.options.configuration,
                 "tolerance": dict(columns),
@@ -883,11 +890,28 @@ def write_summary(run: Run) -> str:
 # --- can this machine run it at all -----------------------------------------
 
 
-def unavailable(case: Case) -> str:
-    """Why this case cannot be benchmarked here, or ``""``.
+def models_in_play(options: Options) -> tuple[tuple[str, object], ...]:
+    """The `(side, choice)` pairs this configuration will actually call.
+
+    The respondent is only one of them under `--bench-responder=model`.
+    `SilentRespondent` is local and answers from a constant, so a silent session
+    needs no respondent key, no respondent endpoint, and no request spent
+    proving either — see `respondent_for`.
+    """
+    sides = [("agent", agent_choice())]
+    if options.responder == "model":
+        sides.append(("respondent", respondent_choice()))
+    return tuple(sides)
+
+
+def unavailable(case: Case, options: Options) -> str:
+    """Why this case cannot be benchmarked *in this configuration*, or ``""``.
 
     The environment checks that are cheap and answerable before anything is
-    spawned or spent.
+    spawned or spent. It takes the options because half of what it checks is
+    about the models the configuration will reach for, and those differ by
+    switch: demanding a respondent key from a `--bench-responder=silent` session
+    would skip every case on a machine that can run all of them.
     """
     from ..agentbench import _session
 
@@ -903,10 +927,8 @@ def unavailable(case: Case) -> str:
         return f"this case is presented on a data plane, and {why}"
     if reason := _session.why_unavailable():
         return reason
-    for side, choice in (
-        ("agent", agent_choice()),
-        ("respondent", respondent_choice()),
-    ):
+    sides = models_in_play(options)
+    for side, choice in sides:
         if why := choice.why_unavailable():
             return f"{side}: {why}"
     # §5a, and it constrains a *skill* case only: an agent from the family that
@@ -921,10 +943,7 @@ def unavailable(case: Case) -> str:
     # Last, because it is the only one that costs a request: a model the
     # endpoint does not serve fails every case identically, and a shell export
     # beating the dotenv is the ordinary way to arrive there.
-    for side, choice in (
-        ("agent", agent_choice()),
-        ("respondent", respondent_choice()),
-    ):
+    for side, choice in sides:
         if why := reachable(text_backend(choice)):
             return (
                 f"{side} {choice.name} at {choice.base_url or 'the provider default'} "

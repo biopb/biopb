@@ -41,7 +41,7 @@ def run(request, bench_options) -> Run:
     configuration. Parametrized in `conftest.py`, over the cases the options
     asked for."""
     case = request.param
-    if reason := unavailable(case):
+    if reason := unavailable(case, bench_options):
         pytest.skip(reason)
     # `conftest.py` puts the smoke tests first so this is answerable. A broken
     # stack does not produce a weak benchmark, it produces a meaningless one

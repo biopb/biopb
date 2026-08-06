@@ -16,6 +16,11 @@ def pytest_addoption(parser):
     registered, so `pytest _tests` would reject the flag that `pytest
     _tests/bench` accepts.
 
+    The consequence for callers, documented in `bench/README.md`: a `--bench-*`
+    flag needs an argument **at or below this directory**. `pytest biopb-mcp`
+    and a bare `pytest` from the repo root never load this file at startup and
+    reject the flags as unrecognized.
+
     `bench._options` is stdlib-only for the same reason from the other side:
     this import runs on every pytest invocation in the repo, including the ones
     that never collect a benchmark.

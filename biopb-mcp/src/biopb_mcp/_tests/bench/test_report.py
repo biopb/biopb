@@ -56,10 +56,12 @@ from ._engine import (
     Result,
     Run,
     catalog_ids,
+    models_in_play,
     respondent_for,
     select,
     session_dir,
     session_id,
+    unavailable,
     write_session,
 )
 from ._options import (
@@ -330,6 +332,97 @@ def test_the_same_switches_apply_to_a_case_of_either_kind(monkeypatch):
         assert respondent_for(case, Options(responder="model")) == "a-model"
 
 
+# --- what the configuration needs to exist ----------------------------------
+
+
+class FakeChoice:
+    """A model the availability checks can be pointed at."""
+
+    def __init__(self, name, why=""):
+        self.name, self.why, self.base_url = name, why, ""
+
+    def why_unavailable(self):
+        return self.why
+
+
+class RunnableAnywhere:
+    """A case with nothing of its own to be unavailable about.
+
+    So the only thing left for `unavailable()` to object to is the models —
+    which is the whole subject here.
+    """
+
+    layers = ()
+    about_a_skill = False
+
+    def available(self):
+        return True, ""
+
+
+@pytest.fixture
+def only_the_models(monkeypatch):
+    """Everything that is not a model check answers yes, and reachability is
+    counted rather than performed."""
+    from ..agentbench import _session
+
+    probed = []
+    monkeypatch.setattr(_session, "why_unavailable", lambda: "")
+    monkeypatch.setattr(_engine, "text_backend", lambda choice: choice)
+    monkeypatch.setattr(
+        _engine, "reachable", lambda choice: probed.append(choice) or ""
+    )
+    monkeypatch.setattr(_engine, "agent_choice", lambda: FakeChoice("the-agent"))
+    return probed
+
+
+def test_a_silent_session_needs_no_respondent_model(only_the_models, monkeypatch):
+    """`SilentRespondent` answers from a constant, so a silent run reaches for
+    no respondent at all.
+
+    Demanding one anyway skipped **every case** on a machine holding one key —
+    the ordinary way to run the control condition — and reported it as an
+    environment problem with the cases.
+    """
+    monkeypatch.setattr(
+        _engine, "respondent_choice", lambda: FakeChoice("the-respondent", "no key")
+    )
+    case = RunnableAnywhere()
+
+    assert unavailable(case, Options(responder="silent")) == ""
+    assert unavailable(case, Options(responder="model")) == "respondent: no key"
+
+
+def test_a_silent_session_spends_no_request_proving_a_model_it_will_not_call(
+    only_the_models, monkeypatch
+):
+    """The reachability probe is the one check here that costs money, and a
+    respondent endpoint is not on the path of a silent run."""
+    monkeypatch.setattr(
+        _engine, "respondent_choice", lambda: FakeChoice("the-respondent")
+    )
+    case = RunnableAnywhere()
+
+    assert unavailable(case, Options(responder="silent")) == ""
+    assert [c.name for c in only_the_models] == ["the-agent"]
+
+    only_the_models.clear()
+    assert unavailable(case, Options(responder="model")) == ""
+    assert [c.name for c in only_the_models] == ["the-agent", "the-respondent"]
+
+
+def test_the_models_in_play_are_the_ones_the_switch_selects(monkeypatch):
+    """One list, read by both the key check and the reachability probe, so the
+    two cannot disagree about who this session talks to."""
+    monkeypatch.setattr(_engine, "agent_choice", lambda: FakeChoice("the-agent"))
+    monkeypatch.setattr(
+        _engine, "respondent_choice", lambda: FakeChoice("the-respondent")
+    )
+    silent = [side for side, _ in models_in_play(Options(responder="silent"))]
+    spoken = [side for side, _ in models_in_play(Options(responder="model"))]
+    assert silent == ["agent"]
+    assert spoken == ["agent", "respondent"]
+
+
 # --- classification --------------------------------------------------------
 
 
@@ -581,6 +674,35 @@ def test_the_report_states_the_configuration_it_ran_under(report):
     assert data["configuration"] == "skills=on responder=model"
     assert data["options"]["skills"] is True
     assert data["options"]["responder"] == "model"
+
+
+def test_a_silent_report_names_no_respondent_model_in_either_form(
+    tmp_path, monkeypatch
+):
+    """`summary.md` and `summary.json` are one report in two forms, and a
+    reader who compares two sessions reads whichever is to hand.
+
+    The JSON used to stamp `respondent_choice().name` unconditionally, so a
+    silent run's markdown said "silent" while its JSON named a model that had
+    answered nothing — the machine-readable half asserting the opposite of the
+    configuration, on exactly the arm a delta is measured against.
+    """
+    monkeypatch.setattr(_engine, "artifact_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        _engine, "respondent_choice", lambda: FakeChoice("a-real-model")
+    )
+    run = Run(
+        case=SKILL_CASE,
+        fixture=FIXTURE,
+        options=Options(responder="silent"),
+        results=[result(outcome=scored(0.2))],
+    )
+    text = run.summary()
+    data = json.loads((_engine.where_for(SKILL_CASE) / "summary.json").read_text())
+
+    assert "Respondent: **silent**" in text
+    assert data["respondent"] == "silent"
+    assert "a-real-model" not in text
 
 
 def test_an_ablated_report_says_so_in_its_own_header(tmp_path, monkeypatch):

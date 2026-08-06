@@ -44,6 +44,16 @@ ago should not be the answer to "why did this take two hours".
 | `--bench-responder` | `BIOPB_BENCH_RESPONDER` | `model` (default), `silent` | who answers the agent |
 | `--bench-samples` | `BIOPB_BENCH_SAMPLES` | a positive integer, default 1 | how many times each case |
 
+**The target must be at or below `_tests/`.** `pytest .../_tests`,
+`pytest .../_tests/bench` and `pytest .../_tests/bench/test_report.py` all take
+these flags; `pytest biopb-mcp` and a bare `pytest` from the repo root reject
+them with *unrecognized arguments*. The flags are declared in
+`_tests/conftest.py`, and pytest runs `pytest_addoption` only on the conftests it
+loads at **startup** — the rootdir's, and those on the path down to the
+arguments. A conftest that collection reaches later is too late to add a flag, so
+an argument *above* `_tests/` never sees the declaration. Declaring them any
+deeper (in `bench/conftest.py`) would narrow this further, to `bench/` alone.
+
 ```sh
 # the shipped configuration, every case
 pytest .../bench -m bench -s
@@ -189,6 +199,12 @@ every model is a legitimate subject for it.
 
 `ollama` needs no key, which makes it the cheap way to rehearse a run end to end
 before spending anything.
+
+**A `--bench-responder=silent` session needs only the agent's key.** The silent
+respondent is local and answers from a constant, so that arm reaches for no
+respondent model at all — no key read, no endpoint probed, nothing spent on one.
+The availability check follows the switch rather than the defaults
+(`_engine.models_in_play`), so one key is enough to run the control condition.
 
 The provider SDKs are imported lazily and are **not** dependencies of this
 package — one `--with` line each. Keys are read from the environment at call
