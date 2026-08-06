@@ -33,6 +33,8 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
+from ._skills_layout import is_skill_file
+
 logger = logging.getLogger(__name__)
 
 # The shipped skills, as package data (see pyproject [tool.setuptools.package-data]).
@@ -213,11 +215,7 @@ def _scan_shipped() -> list[dict]:
     """Every readable packaged ``*.md``. Fail-open per file."""
     directory = _data_dir()
     try:
-        names = sorted(
-            p.name
-            for p in directory.iterdir()
-            if p.name.endswith(".md") and not p.name.startswith("_")
-        )
+        names = sorted(p.name for p in directory.iterdir() if is_skill_file(p.name))
     except (FileNotFoundError, NotADirectoryError, OSError):
         _warn_empty_once(f"{directory} is missing or unreadable")
         return []
@@ -292,7 +290,7 @@ def _scan_local() -> list[dict]:
 
     out = []
     for path in paths:
-        if path.stem.startswith("_"):  # private, like the kernel-plugin loader
+        if not is_skill_file(path.name):
             continue
         try:
             entry = _local_entry(path)

@@ -17,6 +17,8 @@ from pathlib import Path
 
 import yaml
 
+from biopb_mcp.mcp._skills_layout import is_skill_file
+
 from ._schema import (
     CURRENT_SPEC_VERSION,
     KEBAB,
@@ -26,10 +28,6 @@ from ._schema import (
     coerce_list,
 )
 
-# Prose docs that may live alongside the skill files. Skipped by exact name
-# rather than by "not kebab-case", which would silently swallow a misnamed real
-# skill.
-NOT_SKILLS = {"README", "ROADMAP"}
 _FRONTMATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 
 
@@ -170,13 +168,10 @@ def validate(skills_dir: Path) -> tuple[list[SkillEntry], Report]:
     entries: list[SkillEntry] = []
     seen: set[str] = set()
     for path in sorted(skills_dir.glob("*.md")):
-        # A leading `_` is the runtime's "private" marker (mcp/_skills.py's
-        # `_scan_shipped`), used here for a skill written and banked but not
-        # served -- one whose value has not been shown for the tier that
-        # consumes the catalog. The two readers have to agree about which files
-        # are skills (`test_what_validates_is_what_the_runtime_loads`), so the
-        # rule lives on both sides or the first deferred skill breaks the pin.
-        if path.stem in NOT_SKILLS or path.name.startswith("_"):
+        # The gate and the runtime have to agree about which files are skills
+        # (`test_what_validates_is_what_the_runtime_loads`), so the rule is not
+        # spelled here -- see `mcp/_skills_layout.py`.
+        if not is_skill_file(path.name):
             continue
         entry = process(path, rep)
         if entry is None:
