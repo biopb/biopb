@@ -53,6 +53,11 @@ Plugin                What it is
 ``chunked_label``     Connected components on a chunked dask array, linked
                       across chunk boundaries — which per-block
                       ``scipy.ndimage.label`` silently does not do.
+``image_resolution``  Resolution in physical units: Fourier ring correlation
+                      for two independent images (or one localization list),
+                      decorrelation analysis for a single one. Localization
+                      precision is not resolution, and neither is a focus
+                      metric.
 ===================== ==========================================================
 
 All of them are yours to edit: the installer seeds them once and never overwrites

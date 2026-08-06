@@ -1,6 +1,6 @@
 """A skill body is an un-versioned assertion about someone else's API.
 
-`biopb-mcp/docs/skill-testing.md` §4. The satisfiability gate next door answers "may this
+`biopb-mcp/docs/skills.md` §9. The satisfiability gate next door answers "may this
 package be installed at all"; this answers the two questions after it — "does it
 import once installed" (#670: `stardist` resolves clean and imports nothing,
 because its TensorFlow dependency hides under an extra) and "does the surface the
@@ -643,4 +643,84 @@ def test_a_diagonal_skeleton_is_invisible_to_four_connectivity():
     # The other name the body warns about, and it defaults the same way.
     assert (
         inspect.signature(remove_small_objects).parameters["connectivity"].default == 1
+    )
+
+
+# --- skimage/scipy, for ratiometric-fret ------------------------------------
+
+
+def test_phase_correlation_returns_the_shift_to_apply_to_the_moving_image():
+    """The sign convention, pinned because getting it wrong is silent.
+
+    `phase_cross_correlation(reference, moving)` returns the shift that
+    `ndi.shift` applies to *moving* to bring it onto *reference*. Negating it
+    does not leave the image where it was — it moves it the same distance the
+    other way, so the error **doubles** and the result still looks like a
+    registered image. That is what makes it worth a test rather than a comment:
+    `ratiometric-fret` step 3 warps one channel onto the other, and a doubled
+    misregistration is exactly the failure its own dipole check is there to
+    catch, arriving from the code meant to fix it.
+    """
+    import numpy as np
+    from scipy import ndimage as ndi
+    from skimage.registration import phase_cross_correlation
+
+    rng = np.random.default_rng(0)
+    reference = ndi.gaussian_filter(rng.random((128, 128)), 3)
+    truth = (4.0, -3.0)
+    # `grid-wrap`, so the only thing under test is the sign. A border-filling
+    # mode puts a smeared band into a field whose contrast is 2.6% of its mean,
+    # and phase correlation locks onto the band instead: measured, `nearest`
+    # returns (0, -1) for this same 5 px displacement. `wrap` is not the
+    # periodic one either -- it repeats an edge sample, which costs the round
+    # trip below a whole pixel.
+    moving = ndi.shift(reference, [-truth[0], -truth[1]], order=1, mode="grid-wrap")
+
+    shift, _, _ = phase_cross_correlation(reference, moving, upsample_factor=20)
+    assert np.allclose(shift, truth, atol=0.1), (
+        f"phase_cross_correlation returned {shift}, not the shift to apply to "
+        "the moving image; ratiometric-fret step 3 warps the wrong way now"
+    )
+
+    applied = ndi.shift(moving, shift, order=1, mode="grid-wrap")
+    negated = ndi.shift(moving, -np.asarray(shift), order=1, mode="grid-wrap")
+    residual, *_ = phase_cross_correlation(reference, applied, upsample_factor=20)
+    doubled, *_ = phase_cross_correlation(reference, negated, upsample_factor=20)
+    assert np.hypot(*residual) < 0.1
+    assert np.hypot(*doubled) > 1.8 * np.hypot(*truth), (
+        "negating the shift no longer doubles the error — the reason the sign "
+        "is worth pinning has changed"
+    )
+
+
+def test_a_warped_channel_gets_exact_zeros_at_the_border():
+    """Why step 4's background takes `warped=True` on the channel that moved.
+
+    `ndi.shift` and `ndi.affine_transform` both default to `mode='constant'`
+    with `cval=0.0`, so registering a channel writes a band of exact zeros into
+    the vacated border. On a camera whose background sits at a few hundred
+    counts those zeros are nothing the detector ever produced, and they drag the
+    per-frame median that is about to be subtracted from that channel — biasing
+    every ratio computed from it, and only on the channel that was warped.
+    """
+    import inspect
+
+    import numpy as np
+    from scipy import ndimage as ndi
+
+    for function in (ndi.shift, ndi.affine_transform):
+        params = inspect.signature(function).parameters
+        assert params["mode"].default == "constant", f"{function.__name__}: mode"
+        assert params["cval"].default == 0.0, f"{function.__name__}: cval"
+
+    rng = np.random.default_rng(1)
+    frame = 400.0 + rng.normal(0.0, 5.0, (128, 128))
+    warped = ndi.shift(frame, (6.0, 0.0), order=1)
+    assert (warped == 0.0).sum() >= 6 * 128, "the warp left no zeroed border"
+
+    naive = float(np.median(warped))
+    excluding = float(np.median(warped[warped > 0]))
+    assert abs(excluding - 400.0) < abs(naive - 400.0), (
+        "excluding the zeros no longer helps the background estimate; "
+        "ratiometric-fret's `warped=True` argument and its failure row are wrong"
     )

@@ -3,7 +3,7 @@
 The skill takes a collection of frames shot through the same optics and returns
 the illumination field they share. The withheld fact is step 2's second
 question — the camera's fixed offset — and it is the cleanest kind this layer
-has (`biopb-mcp/docs/skill-testing.md` §5d): **categorically absent from the
+has (`biopb-mcp/docs/skills.md` §10): **categorically absent from the
 data**, not merely hidden behind heuristics the fixture's author thought of.
 
 The forward model is ``I_i = F * S_i * a_i + D``: an illumination field, a

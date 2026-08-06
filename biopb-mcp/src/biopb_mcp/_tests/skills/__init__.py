@@ -1,6 +1,6 @@
 """The skills authoring gate — structure, contract and retrieval.
 
-The deterministic layers of ``biopb-mcp/docs/skill-testing.md``: no agent, no session, no
+The deterministic layers of ``biopb-mcp/docs/skills.md``: no agent, no session, no
 display. They run against the skills this package ships
 (``biopb_mcp/mcp/_skills_data/*.md``), which is why they live here rather than
 beside the website that used to publish them — see §1 of that doc.

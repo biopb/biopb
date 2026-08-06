@@ -1,6 +1,6 @@
 """Run every §5 case and report. A benchmark, not a gate.
 
-`biopb-mcp/docs/skill-testing.md` §5. The engine is `_benchmark.py` and the data is
+`biopb-mcp/docs/skills.md` §10. The engine is `_benchmark.py` and the data is
 `cases/`; this file is only the pytest surface over them, so a new skill costs a
 `Case` and nothing here.
 

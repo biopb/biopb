@@ -2,7 +2,7 @@
 
 Tolerant on read (coercion, inference), strict on the result. All skill-file
 format variation is absorbed here so what the author is held to is one thing.
-See ``biopb-mcp/docs/skill-interface.md`` §1 and §5.
+See ``biopb-mcp/docs/skills.md`` §1 and §4.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ REQUIRED_SECTIONS = (
 # failure table about a workflow that has not failed yet, an author writes what
 # sounds plausible, and speculation is indistinguishable from observation once it
 # is a table row. So they grow like a regression suite instead -- a row per
-# failure someone actually hit. See docs/skill-interface.md 5b.
+# failure someone actually hit. See docs/skills.md 4b.
 EVIDENCE_SECTIONS = (
     "failure modes",
     "next steps",
@@ -64,7 +64,7 @@ class SkillEntry:
     spec_version: int
     # What step 1 verifies against `server_status`, named `requires:` until the
     # rename. It informs the agent; it has never gated anything, and the old
-    # name promised otherwise -- see skill-interface.md §4.
+    # name promised otherwise -- see skills.md §3.
     checklist: list
 
     def to_dict(self) -> dict:

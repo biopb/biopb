@@ -29,6 +29,7 @@ it is the suite that decides when to spend, not the machinery.
 | `test_fixture_protocol.py` | The scoring protocol itself, including the on-disk path almost no machine has data for |
 | `test_fixture_tree.py` | `-m fixtures`: hashes a curated tree against its manifest. Out-of-band, never inside a run |
 | `test_models.py` | That provider selection resolves, and that §5a holds of the defaults |
+| `test_layout.py` | That nobody reaches these modules as if they were siblings — the import that merges clean and then stops a whole package collecting |
 | `test_plane.py` | That plane — hermetic checks on its config, plus live ones against a real server |
 
 ## Environment

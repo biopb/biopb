@@ -1,6 +1,6 @@
 """The benchmark engine: arms, outcomes, the report. Skill-agnostic.
 
-`biopb-mcp/docs/skill-testing.md` §5. Nothing here knows what drift is. A skill's whole
+`biopb-mcp/docs/skills.md` §10. Nothing here knows what drift is. A skill's whole
 contribution is one :class:`Case` — a task prompt, a persona, a fixture builder,
 a verifier, and the names it wants back out of the kernel — and this module runs
 the arms, classifies what happened, and writes the report.
@@ -204,7 +204,7 @@ class Case:
     or a file on disk — is decided here, when the case is written, never
     resolved at run time. Covering one skill both ways is *two cases*, each
     with its own `case_id`, and `(skill, case_id)` is what names a run's
-    artifacts (`docs/skill-fixtures.md`).
+    artifacts (`docs/fixtures.md`).
 
     The fixture is a spec rather than a built value so a case module costs
     nothing at import: 30 of these are collected by every ordinary test run,

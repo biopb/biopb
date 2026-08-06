@@ -63,7 +63,7 @@ pytestmark = pytest.mark.satisfiability
 # party can be installed. Resolving it here would reach for the *published*
 # biopb-mcp and report the workspace being "downgraded" to it. What such a floor
 # should mean now that skills and runtime ship together is an open question in
-# biopb-mcp/docs/skill-testing.md §1.
+# biopb-mcp/docs/skills.md §6.
 _WORKSPACE = {"biopb", "biopb-mcp", "biopb-tensor-server", "biopb-control"}
 
 
