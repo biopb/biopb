@@ -112,6 +112,6 @@ def test_the_guard_accepts_the_canonical_form():
     assert not _stale_imports(
         "from ....agentbench._fixture import Attempt\n"
         "from ...agentbench import _plane\n"
-        "from .._benchmark import Case\n"
+        "from .._case import Case\n"
         "from .cases import CASES\n"
     )

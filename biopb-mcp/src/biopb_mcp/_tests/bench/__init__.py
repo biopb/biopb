@@ -4,17 +4,20 @@
 is well-formed, whether the API it quotes still exists, and whether anyone can
 retrieve it. This one runs the thing.
 
-It answers two questions, and they were two packages until the day it became
-clear they were one engine with a field set differently:
+It answers two questions, and they were two packages until it became clear they
+were one engine reading one field:
 
-* **does *this skill* change what an agent does** — the case names a skill, and
-  half the arms withhold the catalog to get a delta;
-* **can an agent do *this work*** — the case names none, nothing is withheld,
-  and repetition rather than a control is where the information comes from.
+* **does *this skill* change what an agent does** — the case names a skill, so
+  the same cases run again with the catalog withheld and the delta is the
+  finding;
+* **can an agent do *this work*** — the case names none, there is nothing to
+  withhold, and repetition rather than a control is where the information comes
+  from.
 
-Keeping them apart cost two engines, two outcome vocabularies that agreed by
-hand, two report writers and two answers to "where are the cases". What it
-bought was a distinction that one column in the report now carries.
+The difference is a `skill=` on a :class:`~._case.Case` and which sessions are
+worth comparing afterwards. It is not a difference in what a run does: one
+invocation is one configuration, set by switch, for every case in it — a skill
+case and a task case in the same run are treated identically.
 
 Two properties make this the tier with teeth, and one makes it the hardest to
 read.
@@ -34,9 +37,14 @@ the ground truth is obtainable *only by asking*: strip the fact from the data,
 give it to a respondent, and a numeric verifier tests the interaction for free.
 Which fact to strip is the fixture's whole design problem — a *scale*, a
 *unit*, a *provenance*, categorically absent from the pixels rather than merely
-hard to guess (§5d). A case with no skill inverts that: its prompt is
-self-sufficient and its persona holds no answer, so asking neither rescues nor
-penalises a run and only makes it resemble a session.
+hard to guess (§5d). A case can also invert that: a self-sufficient prompt whose
+persona holds no answer, where asking neither rescues nor penalises a run and
+only makes it resemble a session. **What declares which shape a case has is
+`persona_must_know`, not `skill`.** The two coincided while every case with no
+skill was a task written against real data, and they stopped coinciding the day
+a case could withhold a fact without naming a served skill — so
+:mod:`.test_cases` reads the declaration, and a case is not assumed to withhold
+nothing merely because no skill claims it.
 
 **And it is not deterministic.** A red run's cause space is the skill body, the
 model, the tool schemas, the kernel, Qt, dask and the fixture. So the trace is
@@ -57,11 +65,10 @@ Two rules that are fixtures in their own right:
   are configured independently, and the authoring family is a fine respondent.
 
 **A case's contribution is data.** :mod:`._case` is the vocabulary,
-:mod:`._engine` owns the grid, the outcome classification and the report and
-knows no subject, :mod:`._options` is what a run may vary, and :mod:`.cases`
-holds one :class:`~._case.Case` per subject. Adding one writes a single module
-there and no test code, which is what has to stay true of a catalogue heading
-for thirty.
+:mod:`._options` is what a run may vary, :mod:`._engine` selects, runs, scores
+and reports and knows no subject, and :mod:`.cases` holds one
+:class:`~._case.Case` per subject. Adding one writes a single module there and
+no test code, which is what has to stay true of a catalogue heading for thirty.
 
 Marked ``bench``, deselected by default, and never in CI (§1).
 """

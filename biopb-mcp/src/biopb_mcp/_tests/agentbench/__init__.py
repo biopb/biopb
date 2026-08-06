@@ -6,21 +6,22 @@ the session, the two-model loop, the provider table, the fixture protocol and
 the run-scoped data plane, and stops there.
 
 That boundary is the reason it exists as its own package. The machinery grew up
-inside :mod:`.._tests.skills.interaction`, where it was written skill-agnostic
-from the start and said so — ``_fixture`` and ``_benchmark`` both carried
-"knows no skill" in their own docstrings. But *living* under ``skills/`` meant a
-second suite could only reuse it by importing across a sibling that had nothing
-to do with it, and the honest fix is the one that costs a move: the neutral half
-becomes a package, and each suite keeps only what is about its own question.
+inside the old ``_tests/skills/interaction/``, where it was written
+skill-agnostic from the start and said so — its fixture and engine modules both
+carried "knows no skill" in their own docstrings. But *living* under ``skills/``
+meant a second suite could only reuse it by importing across a sibling that had
+nothing to do with it, and the honest fix is the one that costs a move: the
+neutral half becomes a package, and each suite keeps only what is about its own
+question.
 
-Two suites consume it, and the split between them is what each one *varies*:
-
-- :mod:`.._tests.skills.interaction` varies **the catalogue** — a 2x2 of skill
-  offered/withheld against a user who answers/stays silent, because a skill's
-  claim is a behavioural delta and a delta needs a control.
-- a case that names no skill varies **nothing**. It asks whether an agent can
-  do a named piece of work at all, so one session is the whole measurement.
-  There is no ablation because there is no claim to isolate.
+One suite consumes it today — :mod:`..bench`, which holds the cases, the
+engine and the pytest surface, and which asks two questions of the same
+machinery (does *this skill* change what an agent does; can an agent do *this
+work*). Nothing here knows which of the two a run is about, and nothing here
+knows how a run was configured: whether the catalogue was offered and who
+answers the agent are arguments this package is *given*
+(``live_session(skills_enabled=...)``, whichever :class:`._respondent.Respondent`
+is passed to the loop), never a decision it makes.
 
 What is here:
 
@@ -44,7 +45,9 @@ What is here:
     nothing starts unless a case asks.
 
 The hermetic tests beside them run with the ordinary suite. Nothing here is
-marked, because nothing here spends money — a suite's paid run carries its own
-marker (``interaction``, ``tasks``), and it is the suite that decides when to
-spend, not the machinery.
+marked, because nothing here spends money — the paid run carries the ``bench``
+marker over in :mod:`..bench`, and it is that suite which decides when to
+spend and on what, not the machinery. Two exceptions, marked where they sit:
+``test_plane``'s live checks (``bench`` — they start a real server) and
+``test_fixture_tree`` (``fixtures`` — it hashes a curated tree out of band).
 """

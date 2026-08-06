@@ -19,8 +19,8 @@ and a real acquisition, which are two experiments and not two settings of one â€
 is two modules with two `case_id`s.
 
 No test code, no registration line, no engine change. `test_bench.py`
-parametrizes over :data:`CASES`, so a new case brings its own arms, report and
-transcripts with it, and `test_cases.py` starts checking its persona and its
+parametrizes over :data:`CASES`, so a new case brings its own samples, report
+and transcripts with it, and `test_cases.py` starts checking its persona and its
 fixture by its arriving.
 
 **Every module here is a case, and every case runs.** There used to be a second
