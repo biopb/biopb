@@ -48,7 +48,9 @@ SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
 # workstation -- see biopb-mcp/docs/skills.md §10.
 CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
 
-# Prose docs that live beside the skills. Keep in step with `_validate.NOT_SKILLS`.
+# Prose docs that live beside the skills. This set and the leading-`_` rule in
+# `declared_packages` are both copies of `_validate.validate`'s -- no test pins
+# them together, because this runs before an env exists and cannot import it.
 NOT_SKILLS = {"README", "ROADMAP"}
 
 # The workspace's own distributions: a floor on one is a statement about this
@@ -62,7 +64,12 @@ def declared_packages() -> list[str]:
     """Every third-party `pkg:` spec in the shipped catalog, deduplicated."""
     specs: set[str] = set()
     for path in sorted(SKILLS_DIR.glob("*.md")):
-        if path.stem in NOT_SKILLS:
+        # Same two exclusions as `_validate.validate`: prose, and a leading `_`
+        # for a skill banked but not served. A deferred skill's `pkg:` token is
+        # a claim about a file no agent can retrieve, so proving it would gate
+        # every PR on a package nobody resolves -- and the packages a skill gets
+        # deferred over are exactly the ones that fail here.
+        if path.stem in NOT_SKILLS or path.name.startswith("_"):
             continue
         match = FRONTMATTER.match(path.read_text(encoding="utf-8"))
         if not match:
