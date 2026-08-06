@@ -339,7 +339,7 @@ class ToolSpec:
 #:
 #: The ablation still holds through here, and is not re-implemented: the
 #: `skill://` resource resolves through `load_catalog()`, which returns `[]`
-#: when `services.skills_enabled` is off, so a `noskill` arm that reads the uri
+#: when `services.skills_enabled` is off, so an ablated run that reads the uri
 #: gets "No skill '<id>' in the catalog" — the server's own answer, not one the
 #: harness invented.
 CLIENT_TOOLS: tuple[ToolSpec, ...] = (
@@ -411,7 +411,7 @@ class LiveSession:
     instructions: str
     tools: list[ToolSpec]
     scratch: Path
-    #: Whether the curated catalog was offered at all (the ablation arm).
+    #: Whether the curated catalog was offered at all (`--bench-skills`).
     skills_enabled: bool
     #: Where the tripwire writes. Absent until something is recorded.
     guard_log: Path = Path()
@@ -589,7 +589,7 @@ def _write_config(
     """A config tree of our own, so neither the developer's settings nor their
     personal skills reach the child.
 
-    ``skills_enabled=False`` is the **ablation arm**: the ``find_skills`` tool
+    ``skills_enabled=False`` is what **`--bench-skills=false`** sets: the ``find_skills`` tool
     stays registered but ``load_catalog()`` returns an empty list, so the agent
     can call it and get nothing back, while the kernel, napari, dask and every
     library stay exactly as they were. That is §5's rule — disclose the
@@ -640,8 +640,8 @@ def live_session(
     """Bring a session up, hand back a driver, and reap it on the way out.
 
     ``skills_enabled=False`` withholds the curated catalog and nothing else
-    -- the ablation arm of the benchmark. ``plugins`` seeds the kernel plugins
-    a case's skill declares.
+    -- the ablated half of a skill's delta, `--bench-skills=false`. ``plugins``
+    seeds the kernel plugins a case's skill declares.
 
     ``tensor_url`` is the run's data plane, for a case presented on one. Empty
     -- the usual state -- points the child at an address nothing answers, so

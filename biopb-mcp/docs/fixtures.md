@@ -4,12 +4,13 @@
 `_tests/agentbench/test_fixture_protocol.py` (its own tests),
 `_tests/agentbench/test_fixture_tree.py` (the `-m fixtures` check),
 `biopb-mcp/tools/author_*_fixture.py` (authoring a curated case's data).
-**Related:** [`skills.md`](skills.md) §10 — the interaction benchmark, one of
-the two suites written in this vocabulary; `_tests/tasks/README.md` — the other.
+**Related:** [`skills.md`](skills.md) §10 — the benchmark written in this
+vocabulary; `_tests/bench/README.md` — how to run it.
 
-Two suites put a model in front of a real biopb session and score what comes
-back. Both hand a verifier a `Fixture` and an `Attempt` and read back an
-`Outcome`, and nothing in this layer knows what drift is or what a landmark is.
+One runner puts a model in front of a real biopb session and scores what comes
+back, whether the case is a claim about a skill or about a piece of work. Every
+case hands a verifier a `Fixture` and an `Attempt` and reads back an `Outcome`,
+and nothing in this layer knows what drift is or what a landmark is.
 
 ---
 
@@ -24,7 +25,7 @@ The truth changes, the achievable accuracy changes, and the conclusion can
 invert. That last one is measured rather than argued: the
 `align-stack-by-features` procedural fixture rendered every object as an
 identical isotropic Gaussian and ranked two method families in the **opposite
-order** from real tissue — 1 cold arm in 9 chose descriptor matching on the
+order** from real tissue — 1 cold run in 9 chose descriptor matching on the
 synthetic content, against 2 in 3 on real sections. Its tolerances were
 calibrated to 3.0 px where the reference scored 0.56 px; the same reference on
 real sections scores 3.69 px and fails that gate. A harness that swapped one for
@@ -70,7 +71,7 @@ verifier a mapping, so one verifier serves either kind.
 support this measurement*, and `Outcome.passed` is false when **nothing** was
 scored. That covers both halves of one problem: a curated fixture whose truth
 does not support a measurement, and an agent that left nothing behind or bound a
-name to the wrong shape. Without it the silent arm of every 2×2 would read as a
+name to the wrong shape. Without it every silent-responder run would read as a
 clean run.
 
 Verifiers read a run's leavings through `read_array` / `read_scalar`, which
@@ -103,7 +104,7 @@ Where a second derivation is cheap, a procedural builder asserts the two agree
 before handing the fixture over: `segmentation-qc-metrics` checks its closed-form
 TP/FP/FN against what `plugin:segmentation_qc` actually matches, and
 `calibrated-measurements` checks its voxel-count truth against
-`regionprops(spacing=)`. A fixture whose truth is wrong makes every arm scored
+`regionprops(spacing=)`. A fixture whose truth is wrong makes every run scored
 against it meaningless, so that fails at build time rather than reporting a quiet
 zero later.
 
@@ -181,10 +182,10 @@ $BIOPB_FIXTURES/
     └── case.json                       # the data/truth partition, and nothing else
 ```
 
-`<namespace>` is the **skill id** for an interaction case and the literal
-`tasks` for a task case — the suite's own name for the family the case belongs
-to. The case's identity locates its data, so there is nothing to select and
-nothing to sort.
+`<namespace>` is the **skill id** for a case that names one, and the literal
+`tasks` for a case that does not — `Case.namespace`, which is also the first
+half of the case's label and of its artifact path. The case's identity locates
+its data, so there is nothing to select and nothing to sort.
 
 ```json
 {
@@ -247,7 +248,7 @@ uv run --no-sync pytest -m fixtures biopb-mcp/src/biopb_mcp/_tests/agentbench
 Run after syncing a tree, or when a result looks wrong. It walks the manifest,
 hashes each file, and reports drift — including a fixture present on disk but
 absent from the manifest. Hashing multi-gigabyte volumes on a mount would cost
-more than the run it guards, and would do it again on every arm, so it is never
+more than the run it guards, and would do it again on every sample, so it is never
 part of a benchmark run. Everything skips on a machine with no tree.
 
 ## 8. Presentation — how a fixture reaches the agent
@@ -268,11 +269,10 @@ server" presentation: the lazy path a skill is written for is `client.get_tensor
 over Flight, and a local mmap wearing dask's type would measure the skill off its
 own route while costing a second loading mechanism.
 
-Each suite owns its own `Layer` (`skills/interaction/_benchmark.py`,
-`tasks/_runner.py`) because what a layer can be differs — `tasks` adds `points`,
-which is how a person's clicked correspondences actually reach napari, and a
-landmark task handed a raw `(N, 2)` array would be testing a different route.
-The fields they share:
+`Layer` is `bench/_case.py`, and `kind` is what decides which `viewer.add_*`
+call the harness makes. `points` is not cosmetic among them: it is how a
+person's clicked correspondences actually reach napari, and a landmark task
+handed a raw `(N, 2)` array would be testing a different route.
 
 ```python
 Layer(name, key, kind="image", presentation="array", chunks=None, dim_labels=None)
@@ -286,12 +286,15 @@ fails at a chunk boundary is not exercised by a single-chunk array.
 
 Only `tensor` cases need one, so it is conditional — no selected case asks,
 nothing starts. When one does, the lifetime is the **whole run**: one server with
-its own temp data dir, started once, serving every case and every arm.
-`$BIOPB_TENSOR_URL` is exported into each session child's environment and
-inherited down to the kernel.
+its own temp data dir, started once, serving every case and every sample.
+`$BIOPB_TENSOR_URL` is exported into the session child's environment and
+inherited down to the kernel — but only for a case that actually uploaded
+something. An `array` case still gets the unreachable address and a `None`
+client, in the same invocation, after the plane is up.
 
-- **Upload is paid once.** A skill case runs four arms; a per-arm plane would
-  upload the same volume four times, and these are the large fixtures.
+- **Upload is paid once.** A case runs a session per sample and an invocation
+  runs many cases; a per-session plane would upload the same volumes again every
+  time, and these are the large fixtures.
 - **It is the production shape.** A durable plane that sessions come and go
   against is the runtime tree in `biopb-mcp/CLAUDE.md`.
 - **The developer's own catalog is neither read nor written**, because the
@@ -315,9 +318,9 @@ name the id, since it is minted at run time. The harness binds
 a case presenting `tensor` says so in its prompt — the same kind of harness
 convention as the `collect` names, and asserted the same way.
 
-### Arms are isolated by the id, not by cleanup
+### Sessions are isolated by the id, not by cleanup
 
-The plane outlives the individual arm, so in principle one arm's uploads are
+The plane outlives the individual session, so in principle one session's uploads are
 visible to the next. The isolation is in the id:
 
 ```python
@@ -333,7 +336,7 @@ a skill's own output is derived from the task.
 
 That is an argument about a surface running arbitrary Python, so it is also
 checked: a corner of each fixture is fingerprinted at upload and again after each
-arm, and a change flags the row `fixture-overwritten`, voiding the number rather
+sample, and a change flags the row `fixture-overwritten`, voiding the number rather
 than qualifying it. Prevention is structural; the check is there so that
 defeating it cannot be quiet.
 
@@ -352,7 +355,7 @@ to this one.
 
 ```
 drift-correction declares ['dask', 'tensor'], but every case presents `array`,
-so every arm runs with `client is None` — neither the lazy read path nor any
+so every run has `client is None` — neither the lazy read path nor any
 step that uploads a result has been benchmarked
 ```
 

@@ -649,7 +649,7 @@ def artifact_root() -> Path:
     root = checkout_root()
     # An installed copy with no checkout around it: keep artifacts beside
     # whoever ran the thing rather than somewhere up the filesystem.
-    return (root or Path.cwd()) / ".skill-outcomes"
+    return (root or Path.cwd()) / ".bench-outcomes"
 
 
 def checkout_root() -> Path | None:

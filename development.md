@@ -247,5 +247,6 @@ durable planes and the web origin in
   simulated-user interaction runs against a real session locally, as a benchmark
   rather than a gate.
 - **Agent benchmarks:** `biopb-mcp/docs/fixtures.md` — what a run is given and
-  how it is scored, shared by the skill benchmark and the task suite
-  (`_tests/agentbench/`, `_tests/skills/interaction/`, `_tests/tasks/`).
+  how it is scored. One runner over one case directory, whether the case is a
+  claim about a skill or about a piece of work (`_tests/agentbench/` for the
+  machinery, `_tests/bench/` for the cases and the run).

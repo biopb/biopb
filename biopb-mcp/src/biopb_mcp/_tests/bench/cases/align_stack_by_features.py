@@ -33,10 +33,12 @@ differently, or are they *deformed*?), but a rigid model is also the reasonable
 default guess, so `skill+silent` can reach it without asking. `skill` versus
 `no-skill` is the comparison this case informs.
 
-**The skill is deferred** (`_`-prefixed, and so is this module): the ablation
-showed Sonnet implements SIFT + RANSAC correctly unprompted on real sections. The
-case is kept correct rather than deleted, so that promoting the skill for a lower
-tier does not begin by rebuilding its benchmark.
+**The skill is banked, not served** (`_`-prefixed): the ablation showed Sonnet
+implements SIFT + RANSAC correctly unprompted on real sections. This case is
+not, and names no `skill`: with no catalog entry to withhold there is no
+ablation to run, so it runs the shipped corner and asks whether the work gets
+done. Promoting the skill later means adding `skill=` here and nothing else —
+`namespace` already carries its name, so no data and no artifact path moves.
 
 ## The fixture this case needs
 
@@ -61,7 +63,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ....agentbench._fixture import (
+from ...agentbench._fixture import (
     Attempt,
     Fixture,
     Metric,
@@ -70,10 +72,10 @@ from ....agentbench._fixture import (
     read_array,
     save_png,
 )
-from ....agentbench._respondent import Persona
-from .._benchmark import Case, Layer
+from ...agentbench._respondent import Persona
+from .._case import Case, Layer
 
-SKILL = "align-stack-by-features"
+NAMESPACE = "align-stack-by-features"
 CASE_ID = "ovule-serial-sections"
 
 #: Sections, and the window each was cut into. Stated here because the task
@@ -313,7 +315,7 @@ HISTOLOGIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id=CASE_ID,
     task=TASK,
     persona=HISTOLOGIST,
@@ -325,7 +327,6 @@ CASE = Case(
     collect={"aligned": "aligned"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="serial sections",
     # It must be able to answer step 2: were the sections placed differently, or
     # are they deformed, and is the changing content expected.
     persona_must_know=("mounted", "placed", "distorted", "sequence"),

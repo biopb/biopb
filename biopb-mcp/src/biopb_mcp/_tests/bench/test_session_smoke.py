@@ -1,19 +1,25 @@
 """Can a real session be brought up, driven, and reaped — with no model at all?
 
-This is the floor the interaction layer stands on. §5 is the least isolable
-tier in the suite: a red run's cause space includes the skill body, the model,
-the tool schemas, the kernel, Qt, dask and the fixture. These tests exist so
-that when the stack is the problem, *they* fail — separately, deterministically,
-and before a single token is spent.
+This is the floor the whole layer stands on. It is the least isolable tier in
+the suite: a red run's cause space includes the skill body, the model, the tool
+schemas, the kernel, Qt, dask and the fixture. These tests exist so that when
+the stack is the problem, *they* fail — separately, deterministically, and
+before a single token is spent.
 
 They also pin the three environment facts the harness forces rather than
 inherits, each of which silently changes what a run tests: a real napari viewer
-(on the user's display or the launcher's own Xvfb), no tensor plane so the
-fixture reaches the agent as a layer and nothing else, and a config tree of our
-own so the catalog under test is the shipped one.
+(on the user's display or the launcher's own Xvfb), no tensor plane so an
+`array` fixture reaches the agent as a layer and nothing else, and a config tree
+of our own so the catalog under test is the shipped one.
 
-Marked `interaction` and deselected by default. Slow (a kernel, napari and dask
-per test) but free — no key, no network beyond loopback.
+The last two tests are **per case**, and they are the ones that pay for
+themselves: a fixture that will not reach the viewer, or a deliverable name the
+harness cannot read back, wastes a paid conversation and looks exactly like a
+model failing the task. They run over the same case list the run itself will
+use, so `--bench-cases=tasks` does not smoke-test nine cases it is not going to run.
+
+Marked `bench` and deselected by default. Slow (a kernel, napari and dask per
+session) but free — no key, no network beyond loopback.
 """
 
 from __future__ import annotations
@@ -23,11 +29,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ...agentbench import _session
-from ...agentbench._session import SessionUnavailable, live_session
+from ..agentbench import _plane, _session
+from ..agentbench._conversation import Trace, scrape
+from ..agentbench._session import SessionUnavailable, live_session
+from ._case import TENSOR_HANDLE
+from ._engine import load_fixture, uploaded_ids
 from .cases import drift_correction
 
-pytestmark = pytest.mark.interaction
+pytestmark = pytest.mark.bench
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +50,15 @@ def session():
             yield live
     except SessionUnavailable as exc:
         pytest.skip(str(exc))
+
+
+@pytest.fixture
+def bench_case(request):
+    """One case this run would pay for. Parametrized in `conftest.py`."""
+    ok, why = request.param.available()
+    if not ok:
+        pytest.skip(f"fixture: {why}")
+    return request.param
 
 
 def test_the_nine_tools_are_there_with_their_schemas(session):
@@ -219,8 +237,8 @@ def test_the_session_serving_a_skill_is_not_mistaken_for_peeking(session):
 
 
 def test_the_viewer_is_real(session):
-    """A working viewer is what §5 scores against; on a display-less box the
-    launcher's own Xvfb provides it. `QT_QPA_PLATFORM=offscreen` is not a
+    """A working viewer is what this layer scores against; on a display-less box
+    the launcher's own Xvfb provides it. `QT_QPA_PLATFORM=offscreen` is not a
     substitute -- napari builds, then `add_image` dies in vispy's GL probe --
     which is why the harness forces a real GL platform."""
     real, detail = session.has_real_viewer()
@@ -230,16 +248,21 @@ def test_the_viewer_is_real(session):
 def test_there_is_no_tensor_plane(session):
     """Forced, not incidental. A developer box often has a data plane up, and
     then the agent can wander into whatever catalog that machine holds -- so a
-    finding might not reproduce anywhere else."""
+    finding might not reproduce anywhere else.
+
+    A case presented on the plane gets the *run's* plane, one server for the
+    whole invocation. The gate stays per case regardless: a session is handed a
+    `tensor_url` only when its own case uploaded something, so this holds even
+    once some other case has brought a plane up."""
     assert session.client_is_none(), (
         "client is live; this run would depend on the machine's own catalog"
     )
 
 
 def test_an_array_makes_the_round_trip(session):
-    """The scraping contract every interaction case depends on: the harness can
-    put a fixture into the kernel and read a result back out. Via files, not
-    literals -- a fixture movie is megabytes and tool output is truncated."""
+    """The scraping contract every case depends on: the harness can put a
+    fixture into the kernel and read a result back out. Via files, not literals
+    -- a fixture movie is megabytes and tool output is truncated."""
     sent = np.random.default_rng(0).random((6, 2, 24, 24)).astype(np.float32)
     session.put_array("movie", sent)
 
@@ -258,8 +281,8 @@ def test_a_missing_result_reads_as_absent_not_as_an_error(session):
 
 
 def test_the_fixture_can_be_a_napari_layer(session):
-    """How a §5 fixture actually reaches the agent, with no tensor plane: as a
-    layer on the viewer, which every skill's Parameters table accepts as a
+    """How an `array` fixture actually reaches the agent, with no tensor plane:
+    as a layer on the viewer, which every skill's Parameters table accepts as a
     source. This is the call that fails without a GL context."""
     movie = np.random.default_rng(1).random((4, 2, 16, 16)).astype(np.float32)
     session.put_array("_fx", movie)
@@ -275,7 +298,7 @@ def test_the_fixture_can_be_a_napari_layer(session):
 
 
 def test_tool_calls_are_recorded_for_the_gate_spy(session):
-    """Structural assertions (§5) ask whether a blocking question preceded the
+    """Structural assertions ask whether a blocking question preceded the
     expensive call. That needs a record of what was called and when, and setup
     the harness itself did must not appear in it as agent behaviour."""
     before = len(session.calls)
@@ -285,3 +308,62 @@ def test_tool_calls_are_recorded_for_the_gate_spy(session):
 
     session.setup("pass")
     assert session.calls[-1][0] == -1, "harness setup must not read as a turn"
+
+
+# --- per case, and the reason this file is worth its wall-clock -------------
+
+
+def test_this_cases_fixture_reaches_a_viewer_and_its_results_come_back(bench_case):
+    """The whole setup path and the whole scrape path, with nobody driving them.
+
+    This is what a paid run does before the agent says anything and after it
+    stops: bring up a session, upload what the case presents on the plane, add
+    every layer, and — at the other end — read the names the verifier will be
+    handed. A case that fails either half is scored `no-result`, which is
+    indistinguishable from an agent that failed, twenty minutes and one
+    conversation later.
+
+    One session for both halves. Two would double the smoke bill of a run over
+    a catalogue, and neither half dirties what the other needs.
+    """
+    if reason := _session.why_unavailable():
+        pytest.skip(reason)
+    if any(layer.lazy for layer in bench_case.layers) and (
+        why := _plane.plane_unavailable()
+    ):
+        pytest.skip(f"this case is presented on a data plane, and {why}")
+
+    fixture = bench_case.build_fixture()
+    ids = uploaded_ids(bench_case, fixture)
+    plane = _plane.running_plane() if ids else None
+    with live_session(
+        skills_enabled=True,
+        plugins=bench_case.plugins,
+        tensor_url=plane.url if plane is not None else "",
+    ) as session:
+        load_fixture(session, bench_case, fixture, ids)
+        names = session.setup("print([lyr.name for lyr in viewer.layers])").text
+        for layer in bench_case.layers:
+            assert layer.name in names, (
+                f"`{layer.name}` never reached the viewer; the kernel reports {names}"
+            )
+        if ids:
+            handles = session.setup(f"print(sorted({TENSOR_HANDLE}))").text
+            for layer in bench_case.layers:
+                if layer.lazy:
+                    assert layer.name in handles, (
+                        f"`{layer.name}` is presented on the plane but its id is "
+                        f"not in {TENSOR_HANDLE}, which the task tells the agent "
+                        "to read"
+                    )
+
+        wanted = list(bench_case.collect.values())
+        session.setup(
+            "import numpy as _np\n"
+            + "\n".join(f"{name} = _np.zeros((3, 2))" for name in wanted)
+        )
+        trace = Trace(agent="none", respondent="none", task="smoke")
+        got = scrape(session, trace, dict(bench_case.collect))
+        for key in bench_case.collect:
+            assert key in got, f"`{key}` was bound in the kernel but not scraped"
+            assert np.asarray(got[key]).shape == (3, 2)

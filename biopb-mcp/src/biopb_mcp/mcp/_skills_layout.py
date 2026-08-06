@@ -35,6 +35,10 @@ def is_skill_file(name: str) -> bool:
     downstream may read a deferred file: it is absent from the catalog, so a
     retrieval pin naming it or a package gate proving its dependencies is
     asserting something about a file no agent can reach.
+
+    That is a rule about the *file*, not about the subject. The benchmark runs a
+    case for a banked skill like any other (`_tests/bench/cases/`) -- it names no
+    skill, reads nothing here, and measures whether the work gets done at all.
     """
     return (
         name.endswith(".md")

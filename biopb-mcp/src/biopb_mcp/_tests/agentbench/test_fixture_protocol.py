@@ -364,7 +364,7 @@ def test_the_artifact_root_is_overridable(tmp_path, monkeypatch):
     monkeypatch.setenv(ARTIFACT_DIR_ENV, str(tmp_path / "elsewhere"))
     assert artifact_root() == tmp_path / "elsewhere"
     monkeypatch.delenv(ARTIFACT_DIR_ENV)
-    assert artifact_root().name == ".skill-outcomes"
+    assert artifact_root().name == ".bench-outcomes"
 
 
 def test_artifacts_land_inside_the_checkout(monkeypatch):
@@ -381,4 +381,4 @@ def test_artifacts_land_inside_the_checkout(monkeypatch):
     assert (checkout / ".git").exists(), (
         f"{checkout} is not the checkout root; this test's own anchor has drifted"
     )
-    assert artifact_root() == checkout / ".skill-outcomes"
+    assert artifact_root() == checkout / ".bench-outcomes"

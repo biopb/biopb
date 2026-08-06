@@ -228,7 +228,13 @@ qt_api = "pyqt6"
 # seconds each over a torch-sized graph), so it is deselected by default and run
 # as its own CI step. A command-line -m overrides this one, which is how
 # `-m satisfiability` and `-m contract` still work.
-addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not availability and not interaction and not fixtures and not tasks'"
+#
+# --strict-markers because deselection is what keeps the expensive layers out of
+# the ordinary run, and a marker that stops existing does not deselect anything:
+# renaming `interaction` to `bench` left four real-server tests in `agentbench`
+# carrying a name nothing matched, so they ran with the default suite and hung
+# it. A warning was the only sign. Now an unregistered marker is an error.
+addopts = "--ignore-glob='*_vendor*' --strict-markers -m 'not satisfiability and not availability and not bench and not fixtures'"
 markers = [
     # Resolves each skill's pkg: tokens against the installed environment to
     # reject a package that installs only by moving biopb's own deps. Metadata
@@ -239,22 +245,18 @@ markers = [
     # place: unavailable rejects a required token and is recorded for an
     # optional one. See _tests/skills/README.md.
     "availability: resolves a skill's declared packages for every supported platform",
-    # Puts a model in front of the shipped skill body against a REAL session --
-    # kernel, napari, dask, the nine real tools. Slow, needs a GL-capable
-    # display, and the agent rows need an API key; never in CI.
-    # biopb-mcp/docs/skills.md §10 and _tests/skills/interaction/README.md.
-    "interaction: drives a real biopb-mcp session, and sometimes a model",
+    # Puts a model in front of a REAL session -- kernel, napari, dask, the nine
+    # real tools -- and scores what comes out, either against a shipped skill
+    # body or against a named piece of work. Slow, needs a GL-capable display,
+    # and the model rows need an API key; never in CI. One marker, because it
+    # is one runner: which cases an invocation pays for is `--cases`, not a
+    # second marker. biopb-mcp/docs/skills.md §10 and _tests/bench/README.md.
+    "bench: drives a real biopb-mcp session, and sometimes a model",
     # Hashes a curated fixture tree against its manifest. Out-of-band on
     # purpose: hashing multi-gigabyte volumes on a mount would cost more than
     # the run it guards, and would do it once per arm. Run after syncing a
     # tree, or when a result looks wrong. biopb-mcp/docs/fixtures.md.
     "fixtures: checks an on-disk fixture tree against its manifest",
-    # Runs an agent at a named piece of work against curated real data, in a
-    # real session, with nothing withheld -- no skill ablation, one arm, N
-    # samples. Same costs as `interaction` (GL display, API key, never in CI)
-    # and a different question: not whether a skill helps, but whether the work
-    # gets done. _tests/tasks/README.md.
-    "tasks: runs an agent at a real task against curated data",
 ]
 
 [tool.pytest_env]
