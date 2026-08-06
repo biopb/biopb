@@ -96,6 +96,13 @@ RETRIEVES = [
     ("mosaic", "stitch-tiles"),
     ("tile grid", "stitch-tiles"),
     ("overlapping tiles", "stitch-tiles"),
+    ("smlm", "measure-smlm-resolution"),
+    ("storm", "measure-smlm-resolution"),
+    ("palm", "measure-smlm-resolution"),
+    ("single molecule localization", "measure-smlm-resolution"),
+    ("super-resolution resolution", "measure-smlm-resolution"),
+    ("fourier ring correlation", "measure-smlm-resolution"),
+    ("localization precision", "measure-smlm-resolution"),
 ]
 
 # Queries that must not drag a skill in. Over-retrieval is not harmless: the
