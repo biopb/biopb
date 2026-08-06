@@ -378,6 +378,48 @@ class TestDecorrelation:
         assert d.kc in set(d.kc_per_filter)
         assert "decorrelation resolution" in d.summary()
 
+    def test_it_inverts_on_a_point_cloud_which_is_why_the_docstring_forbids_it(self):
+        """Pins the reason ``frc`` is the only estimator offered for localizations.
+
+        Two samplings of one structure: many points, and few. The sparse render is
+        genuinely sharp and genuinely unfaithful; the dense one is shot-noise
+        limited and faithful. With a single image there is nothing to tell those
+        apart, so decorrelation calls the sparse one finer -- backwards, and by a
+        larger factor than the FRC splitting mistake it would be standing in for.
+        """
+        side = 512
+        f = np.fft.fftfreq(side)
+        q = np.hypot(f[:, None], f[None, :])
+        spec = np.fft.fft2(np.random.default_rng(0).standard_normal((side, side)))
+        with np.errstate(divide="ignore"):
+            spec = spec * np.where(q > 0, q**-1.5, 0.0)  # low-frequency-heavy, as
+        spec[q > 0.25] = 0  # biological structure is
+        m = np.real(np.fft.ifft2(spec))
+        m -= m.min()
+        cdf = np.cumsum((m / m.sum()).ravel())
+
+        got = {}
+        # Same total counts in both, so the two renders carry the same number of
+        # dots; only the number of distinct sites those dots came from differs.
+        for label, n_sites, repeats in (("dense", 200_000, 1), ("sparse", 4_000, 50)):
+            rng = np.random.default_rng(0)
+            flat = np.minimum(np.searchsorted(cdf, rng.random(n_sites)), m.size - 1)
+            img = (
+                np.bincount(np.repeat(flat, repeats), minlength=m.size)
+                .reshape(side, side)
+                .astype(float)
+            )
+            got[label] = ir.decorrelation_resolution(img)
+
+        assert got["sparse"].resolution < got["dense"].resolution, (
+            "decorrelation is expected to invert on point clouds; if it now orders "
+            "them correctly, the module docstring's prohibition is stale"
+        )
+        # Sharper than the inversion: the sparse render, which is the *worse*
+        # reconstruction, comes back pinned at the sampling floor -- reported as
+        # perfect. There is no threshold at which a caller could catch that.
+        assert got["sparse"].nyquist_limited
+
     def test_to_dict_drops_the_curves(self):
         d = ir.decorrelation_resolution(bandlimited(N, 0.2))
         flat = d.to_dict()
