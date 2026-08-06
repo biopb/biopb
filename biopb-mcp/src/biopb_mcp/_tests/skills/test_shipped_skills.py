@@ -12,7 +12,9 @@ also the one that can change the runtime they describe.
 
 from __future__ import annotations
 
+import importlib.util
 import re
+from pathlib import Path
 
 import pytest
 
@@ -86,6 +88,48 @@ def test_what_validates_is_what_the_runtime_loads(shipped):
     entries, _ = shipped
     loaded = {e["id"] for e in _skills._scan_shipped()}
     assert loaded == {e.id for e in entries}
+
+
+def _checkout_root() -> Path:
+    """The repository this module runs from, searched for by marker.
+
+    Counted depths (`parents[5]`) are right until the file moves and then wrong
+    without failing -- the agentbench fixtures were bitten by exactly that and
+    switched to a search; see `_tests/agentbench/_fixture.checkout_root`. A
+    missing marker is not an error here: the caller skips instead.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists():
+            return parent
+    return Path("/nonexistent")
+
+
+def test_the_package_gate_reads_the_same_skill_files(shipped_skill_files):
+    """The third reader is `.github/scripts/skill_contracts.py`, which decides
+    whose `pkg:` tokens CI installs and proves.
+
+    It cannot import the package -- it runs before any env exists -- so it loads
+    the layout rule from the checkout by path. That path is a string, and this
+    suite is the only thing positioned to check it still resolves: the contracts
+    workflow triggers on `_skills_data/**` and `_tests/skills/**`, so a rename
+    under `mcp/` would not even run the gate that would have noticed.
+
+    Asserting on the *files* rather than on the resulting package set is the
+    point. A deferred skill that declares only workspace packages drops out of
+    that set anyway, which is how the gate spent its first month walking the
+    catalog wrongly with nothing to show for it.
+    """
+    script_path = _checkout_root() / ".github" / "scripts" / "skill_contracts.py"
+    if not script_path.exists():
+        pytest.skip(f"no checkout around this package ({script_path} is absent)")
+
+    spec = importlib.util.spec_from_file_location("skill_contracts", script_path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    assert {p.name for p in script.skill_files()} == {
+        p.name for p in shipped_skill_files
+    }
 
 
 # --- checklist: grammar -------------------------------------------------------

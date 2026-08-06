@@ -26,6 +26,7 @@ Deliberately stdlib + pyyaml + packaging only: it runs before any env exists.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import subprocess
 import sys
@@ -36,7 +37,8 @@ import yaml
 from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[2]
-SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
+MCP_PKG = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp"
+SKILLS_DIR = MCP_PKG / "_skills_data"
 # What runs in each per-package env: the signature contracts (§4), and nothing
 # else. These assertions are *derived from the shipped catalog* -- the packages
 # below come out of the skills' own frontmatter, and each assertion pins an API
@@ -48,29 +50,54 @@ SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
 # workstation -- see biopb-mcp/docs/skills.md §10.
 CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
 
-# Prose docs that live beside the skills. This set and the leading-`_` rule in
-# `declared_packages` are both copies of `_validate.validate`'s -- no test pins
-# them together, because this runs before an env exists and cannot import it.
-NOT_SKILLS = {"README", "ROADMAP"}
-
 # The workspace's own distributions: a floor on one is a statement about this
 # repo's release history, not a third party's API.
 WORKSPACE = {"biopb", "biopb-mcp", "biopb-tensor-server", "biopb-control"}
 
 FRONTMATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
+# Which files are skills is decided in exactly one place, and this runs before
+# any env exists -- so the module is loaded from the checkout by path rather
+# than imported. It is stdlib-only and import-free for that reason. Move or
+# rename it and this raises here, in CI, instead of quietly reverting to a
+# second opinion: a private copy is what let this gate prove the packages of
+# deferred skills, which is the one thing it must not do (a deferred file is
+# absent from the catalog, so its `pkg:` token is a claim about a file no agent
+# can retrieve -- and the packages a skill gets deferred over are exactly the
+# ones that fail to resolve here).
+LAYOUT = MCP_PKG / "_skills_layout.py"
+
+
+def _load_layout():
+    if not LAYOUT.exists():
+        raise SystemExit(
+            f"::error::{LAYOUT} is missing. This gate loads the skills layout "
+            "rule from the checkout rather than importing it, because it runs "
+            "before any env exists. If that module moved, repoint LAYOUT -- do "
+            "not give this script a second opinion about which files are skills."
+        )
+    spec = importlib.util.spec_from_file_location("_skills_layout", LAYOUT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def skill_files() -> list[Path]:
+    """The shipped skill files, by the same rule the runtime and gate apply.
+
+    Split out of `declared_packages` so the suite can check it: comparing the
+    package *sets* would not catch a bad walk, since a deferred skill declaring
+    only workspace packages drops out here anyway. See
+    `_tests/skills/test_shipped_skills.py`.
+    """
+    is_skill_file = _load_layout().is_skill_file
+    return sorted(p for p in SKILLS_DIR.glob("*.md") if is_skill_file(p.name))
+
 
 def declared_packages() -> list[str]:
     """Every third-party `pkg:` spec in the shipped catalog, deduplicated."""
     specs: set[str] = set()
-    for path in sorted(SKILLS_DIR.glob("*.md")):
-        # Same two exclusions as `_validate.validate`: prose, and a leading `_`
-        # for a skill banked but not served. A deferred skill's `pkg:` token is
-        # a claim about a file no agent can retrieve, so proving it would gate
-        # every PR on a package nobody resolves -- and the packages a skill gets
-        # deferred over are exactly the ones that fail here.
-        if path.stem in NOT_SKILLS or path.name.startswith("_"):
-            continue
+    for path in skill_files():
         match = FRONTMATTER.match(path.read_text(encoding="utf-8"))
         if not match:
             continue

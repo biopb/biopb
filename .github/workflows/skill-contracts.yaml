@@ -33,6 +33,9 @@ on:
       - dev
     paths:
       - 'biopb-mcp/src/biopb_mcp/mcp/_skills_data/**'
+      # The rule for which of those files is a skill. The script loads it by
+      # path, so a change here can change what this gate walks.
+      - 'biopb-mcp/src/biopb_mcp/mcp/_skills_layout.py'
       - 'biopb-mcp/src/biopb_mcp/_tests/skills/**'
       - '.github/workflows/skill-contracts.yaml'
       - '.github/scripts/skill_contracts.py'
@@ -42,6 +45,9 @@ on:
       - dev
     paths:
       - 'biopb-mcp/src/biopb_mcp/mcp/_skills_data/**'
+      # The rule for which of those files is a skill. The script loads it by
+      # path, so a change here can change what this gate walks.
+      - 'biopb-mcp/src/biopb_mcp/mcp/_skills_layout.py'
       - 'biopb-mcp/src/biopb_mcp/_tests/skills/**'
       - '.github/workflows/skill-contracts.yaml'
       - '.github/scripts/skill_contracts.py'

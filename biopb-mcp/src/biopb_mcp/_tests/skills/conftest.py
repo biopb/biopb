@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from biopb_mcp.mcp._skills_layout import is_skill_file
+
 from ._schema import REQUIRED_SECTIONS
-from ._validate import NOT_SKILLS
 
 # The skills this package ships. A real path, not a Traversable: these tests run
 # from the checkout, and the strict validator wants glob/read_text.
@@ -96,10 +97,6 @@ def skill_factory(skills_dir: Path):
 @pytest.fixture(scope="session")
 def shipped_skill_files() -> list[Path]:
     """Every shipped skill file, excluding any prose docs beside them."""
-    files = [
-        p
-        for p in sorted(SKILLS_DIR.glob("*.md"))
-        if p.stem not in NOT_SKILLS and not p.name.startswith("_")
-    ]
+    files = [p for p in sorted(SKILLS_DIR.glob("*.md")) if is_skill_file(p.name)]
     assert files, f"no skill files found under {SKILLS_DIR}"
     return files

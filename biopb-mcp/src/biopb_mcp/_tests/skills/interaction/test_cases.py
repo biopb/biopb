@@ -27,8 +27,10 @@ import warnings
 import numpy as np
 import pytest
 
+from biopb_mcp.mcp._skills_layout import NOT_SKILLS, is_skill_file
+
 from ...agentbench._fixture import Attempt, Fixture
-from .._validate import NOT_SKILLS, validate
+from .._validate import validate
 from ..conftest import SKILLS_DIR
 from ._benchmark import PRESENTATIONS, TENSOR_HANDLE
 from .cases import CASES, DEFERRED_CASES, NOT_BENCHMARKED
@@ -91,11 +93,7 @@ def _shipped() -> set[str]:
     # `_`-prefixed files are deferred: written and banked, but not served by the
     # runtime, so this layer owes them nothing. Their case module carries the
     # same prefix and lands in `cases.DEFERRED_CASES` for the same reason.
-    return {
-        p.stem
-        for p in SKILLS_DIR.glob("*.md")
-        if p.stem not in NOT_SKILLS and not p.name.startswith("_")
-    }
+    return {p.stem for p in SKILLS_DIR.glob("*.md") if is_skill_file(p.name)}
 
 
 def test_every_shipped_skill_is_benchmarked_or_declared_unbenchmarkable():
@@ -130,10 +128,12 @@ def test_an_exemption_carries_a_reason():
 
 def _deferred() -> set[str]:
     """Skills written and banked but not served — the runtime's `_` marker."""
+    # The prose check is on the stem *after* the marker: the file is `_x.md`, so
+    # `p.stem` is `_README` and never matches NOT_SKILLS on its own.
     return {
         p.stem[1:]
         for p in SKILLS_DIR.glob("_*.md")
-        if p.stem not in NOT_SKILLS and p.stem[1:]
+        if p.stem[1:] and p.stem[1:] not in NOT_SKILLS
     }
 
 
