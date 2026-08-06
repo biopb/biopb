@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ....agentbench._fixture import (
+from ...agentbench._fixture import (
     Attempt,
     Fixture,
     Metric,
@@ -50,10 +50,10 @@ from ....agentbench._fixture import (
     Procedural,
     save_png,
 )
-from ....agentbench._respondent import Persona
-from .._benchmark import Case, Layer
+from ...agentbench._respondent import Persona
+from .._case import Case, Layer
 
-SKILL = "count-foci-per-cell"
+NAMESPACE = "count-foci-per-cell"
 
 #: From measurement, not from taste. The reference scores 0.02 and the two
 #: routes this case is built to separate score 1.11 and 2.02, so the limit sits
@@ -432,7 +432,7 @@ OPERATOR = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="aggregates-only-the-operator-can-name",
     task=TASK,
     persona=OPERATOR,
@@ -445,7 +445,6 @@ CASE = Case(
     collect={"counts": "counts"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="foci",
     # It must be able to answer: the fixture withholds what the counted
     # population is, and this person knows it, knows the spot size, and knows
     # that empty cells are the readout.

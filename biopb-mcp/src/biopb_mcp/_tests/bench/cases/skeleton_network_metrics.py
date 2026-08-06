@@ -56,7 +56,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage as ndi
 
-from ....agentbench._fixture import (
+from ...agentbench._fixture import (
     Attempt,
     Fixture,
     Metric,
@@ -65,10 +65,10 @@ from ....agentbench._fixture import (
     read_scalar,
     save_png,
 )
-from ....agentbench._respondent import Persona
-from .._benchmark import Case, Layer
+from ...agentbench._respondent import Persona
+from .._case import Case, Layer
 
-SKILL = "skeleton-network-metrics"
+NAMESPACE = "skeleton-network-metrics"
 CASE_ID = "mitochondria-on-anisotropic-voxels"
 
 #: From the table above, not from taste. The reference scores 4.2% / 0 / 0 and
@@ -507,7 +507,7 @@ CELL_BIOLOGIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id=CASE_ID,
     task=TASK,
     persona=CELL_BIOLOGIST,
@@ -523,7 +523,6 @@ CASE = Case(
     },
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="skeleton",
     # It must be able to answer: the fixture withholds the voxel size and the
     # length below which a branch is not biology, and this person knows both.
     persona_must_know=("0.1 microns", "0.5 microns", "two microns", "ragged"),

@@ -1,8 +1,10 @@
 """`pixel-classifier-segmentation` as benchmark data: does the run know it broke?
 
-**Deferred tier — banked, not served.** The `_` prefix on this module and on
-`_pixel-classifier-segmentation.md` keeps the skill out of the catalog. It is
-here because a Sonnet-class model derives nearly all of it unaided, and the
+**The skill is banked, not served.** The `_` prefix on
+`_pixel-classifier-segmentation.md` keeps it out of the catalog; this case
+names no `skill` for that reason, and runs the shipped corner rather than an
+ablation over an entry that is not there. The skill is banked because a
+Sonnet-class model derives nearly all of it unaided, and the
 catalog is consumed at that tier; it is kept because a Haiku-class one derives
 none of it, and lower-tier usability is named as real backlog in
 `skill-candidates.md`. The measurement, four cold arms per tier, identical
@@ -33,9 +35,11 @@ true IoU was 0.44-0.59, none counted components (2128-12688 bodies on a field
 with 7 cells), and all four read the second field's balance shift as biology.
 
 So the information asymmetry this case is built on does not survive at the
-consuming tier, which is what makes it deferred rather than shipped. Nothing
-below is weakened by that: the fixture, the verifier and the tolerances are
-checked exactly as hard, so promoting it later does not begin by rebuilding it.
+consuming tier, which is what keeps the skill banked rather than shipped.
+Nothing below is weakened by that: the fixture, the verifier and the tolerances
+are checked exactly as hard, and the case is *run* — the work is real whether or
+not a skill for it is served, and promoting the skill later does not begin by
+rebuilding its benchmark.
 
 One arm found a property of this fixture its author had not measured, and it is
 recorded here because it is real. Field b is brighter *and relatively noisier* —
@@ -106,7 +110,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage as ndi
 
-from ....agentbench._fixture import (
+from ...agentbench._fixture import (
     Attempt,
     Fixture,
     Metric,
@@ -116,10 +120,10 @@ from ....agentbench._fixture import (
     read_scalar,
     save_png,
 )
-from ....agentbench._respondent import Persona
-from .._benchmark import Case, Layer
+from ...agentbench._respondent import Persona
+from .._case import Case, Layer
 
-SKILL = "pixel-classifier-segmentation"
+NAMESPACE = "pixel-classifier-segmentation"
 
 MEDIUM, INTERIOR, EDGE = 1, 2, 3
 CLASSES = {MEDIUM: "medium", INTERIOR: "interior", EDGE: "edge"}
@@ -622,7 +626,7 @@ BENCH_SCIENTIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="a-second-field-at-a-different-exposure",
     task=TASK,
     persona=BENCH_SCIENTIST,
@@ -639,7 +643,6 @@ CASE = Case(
     },
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="pixel classifier",
     # It must be able to answer the withheld one: the exposure changed between
     # the two fields, and nothing in either array says so.
     persona_must_know=("raised the exposure", "halo", "seven in each"),

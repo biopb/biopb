@@ -18,10 +18,9 @@ Two suites consume it, and the split between them is what each one *varies*:
 - :mod:`.._tests.skills.interaction` varies **the catalogue** — a 2x2 of skill
   offered/withheld against a user who answers/stays silent, because a skill's
   claim is a behavioural delta and a delta needs a control.
-- ``_tests.tasks`` varies **nothing**. It asks whether an agent can do a named
-  piece of work against real data at all, so it runs one arm and reports the
-  number. There is no ablation because there is no claim to isolate. (It
-  arrives in the follow-up change; this package is the half it needs.)
+- a case that names no skill varies **nothing**. It asks whether an agent can
+  do a named piece of work at all, so one session is the whole measurement.
+  There is no ablation because there is no claim to isolate.
 
 What is here:
 

@@ -58,7 +58,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 
-from ....agentbench._fixture import (
+from ...agentbench._fixture import (
     Attempt,
     Fixture,
     Metric,
@@ -68,8 +68,8 @@ from ....agentbench._fixture import (
     read_scalar,
     save_png,
 )
-from ....agentbench._respondent import Persona
-from .._benchmark import Case, Layer
+from ...agentbench._respondent import Persona
+from .._case import Case, Layer
 
 SKILL = "ratiometric-fret"
 

@@ -352,10 +352,10 @@ def reachable(backend: TextBackend) -> str:
     """Why *backend* cannot be used at all, or ``""``.
 
     **A model name that the endpoint does not serve is an environment fault,
-    and it should cost one skip rather than four dead arms.** `why_unavailable`
+    and it should cost one skip rather than a session of dead rows.** `why_unavailable`
     only knows whether a *key* is present; it cannot know that
     `BIOPB_AGENT` names something this gateway retired, or that a shell
-    export is quietly beating the dotenv — and both of those spend every arm
+    export is quietly beating the dotenv — and both of those spend every run
     before saying so, each one failing identically for a reason that has
     nothing to do with the skill.
 

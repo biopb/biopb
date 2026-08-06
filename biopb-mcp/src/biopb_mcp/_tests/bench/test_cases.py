@@ -8,49 +8,72 @@ being quietly wrong that no amount of running would reveal:
   green run looks identical;
 - a fixture whose truth is visible in its data scores runs on a question they
   could read the answer to;
-- a verifier that passes an empty attempt makes every arm look fine;
+- a verifier that passes an empty attempt makes every run look fine;
 - a task that asks for one name while the harness scrapes another scores a run
   on something it was never told to bind.
 
-Every check runs over `cases.CASES` **and `cases.DEFERRED_CASES`**, so a case is
-checked by arriving rather than by someone remembering to write a test for it.
-That is the property this layer needs to survive a catalogue of thirty — and the
-reason deferral does not exempt anything here: a skill the runtime does not serve
-still has data that can rot, and banking a case is pointless if nobody would
-notice it going stale.
+Every check runs over every case in `cases/`, so a case is checked by arriving
+rather than by someone remembering to write a test for it. That is the property
+this layer needs to survive a catalogue of thirty, and it is why there is no
+longer a tuple of cases that are checked here and run nowhere: a case worth
+checking is a case worth running.
+
+**The run options do not reach this file.** `--bench-cases=skills` narrows what an
+invocation pays for; it does not narrow what has to be true. A case excluded
+from tonight's run is checked tonight anyway, because these cost nothing and
+the alternative is a filter that quietly turns off the tests as well.
+
+What is *specific to one case* — a verifier's own unit tests, a fixture with a
+property only it can have — is `test_verifiers.py`. This file only knows things
+that are true of every case.
 """
 
 from __future__ import annotations
 
 import warnings
 
-import numpy as np
 import pytest
 
-from biopb_mcp.mcp._skills_layout import NOT_SKILLS, is_skill_file
+from ..agentbench._fixture import Attempt, Fixture
 
-from ...agentbench._fixture import Attempt, Fixture
-from .._validate import validate
-from ..conftest import SKILLS_DIR
-from ._benchmark import PRESENTATIONS, TENSOR_HANDLE
-from .cases import CASES, DEFERRED_CASES, NOT_BENCHMARKED
+# Reaching into the authoring gate, on purpose: the coverage checks below are
+# claims about the shipped catalogue, and `SKILLS_DIR` and the strict validator
+# are spelled there once. A second spelling of where the skills live is exactly
+# what `mcp/_skills_layout.py` exists to stop.
+from ..skills._validate import validate
+from ..skills.conftest import SKILLS_DIR
+from ._case import LAYER_KINDS, PRESENTATIONS, TENSOR_HANDLE
+from .cases import CASES, NOT_BENCHMARKED
 
-#: Everything with data to check. A deferred case is not benchmarked — there is
-#: no catalog entry to withhold, so its 2x2 would be four copies of one arm —
-#: but "the runtime does not serve this skill" says nothing about whether its
-#: fixture, persona and verifier are still coherent. Checked here, so a banked
-#: case is correct because something looked, not because nobody did.
-ALL_CASES = CASES + DEFERRED_CASES
+#: Everything with data to check, which is now everything the layer runs. There
+#: used to be a second tuple of cases nothing ran — the ones whose skill is
+#: banked rather than served — checked here and benchmarked nowhere. They are
+#: ordinary cases now: no skill to withhold, and the same checks.
+ALL_CASES = CASES
+
+SKILL_CASES = tuple(c for c in ALL_CASES if c.about_a_skill)
+TASK_CASES = tuple(c for c in ALL_CASES if not c.about_a_skill)
+
+#: Cases whose prompt is **self-sufficient**: they name no fact the run has to
+#: elicit, so asking neither rescues nor penalises and the persona is there for
+#: realism alone.
+#:
+#: `persona_must_know` is the declaration, not `skill`. Those coincided while
+#: every case with no skill was a task written against real data — and then the
+#: banked skills' cases arrived, which have no skill *and* withhold a fact the
+#: verifier depends on. Reading the shape off `skill` would have applied the
+#: wrong half of this file to four of them.
+SELF_SUFFICIENT = tuple(c for c in ALL_CASES if not c.persona_must_know)
 
 
 def _ids(case):
     return case.label
 
 
-#: Built once each: a fixture is megabytes of numpy and several cases share
-#: these tests. Keyed on `(skill, case_id)` — a skill covered two ways is two
-#: cases, and keying on the skill alone would hand the second the first's data.
-_FIXTURES: dict[tuple[str, str], Fixture] = {}
+#: Built once each: a fixture is megabytes of numpy and several tests share
+#: them. Keyed on the full label — a subject covered two ways is two cases, and
+#: keying on the skill alone would hand the second the first's data.
+_FIXTURES: dict[str, Fixture] = {}
 
 
 @pytest.fixture(params=ALL_CASES, ids=_ids)
@@ -58,26 +81,41 @@ def case(request):
     return request.param
 
 
-def _case(label: str):
-    return next(c for c in ALL_CASES if c.label == label)
+@pytest.fixture(params=SKILL_CASES or [None], ids=_ids)
+def skill_case(request):
+    if request.param is None:
+        pytest.skip("no case in this tree makes a claim about a skill")
+    return request.param
 
 
-def _built(label: str) -> Fixture:
-    case = _case(label)
-    key = (case.skill, case.case_id)
-    if key not in _FIXTURES:
-        _FIXTURES[key] = case.build_fixture()
-    return _FIXTURES[key]
+@pytest.fixture(params=TASK_CASES or [None], ids=_ids)
+def task_case(request):
+    if request.param is None:
+        pytest.skip("no case in this tree is about work rather than a skill")
+    return request.param
+
+
+@pytest.fixture(params=SELF_SUFFICIENT or [None], ids=_ids)
+def self_sufficient_case(request):
+    if request.param is None:
+        pytest.skip("every case in this tree withholds something")
+    return request.param
+
+
+def built_fixture(case) -> Fixture:
+    if case.label not in _FIXTURES:
+        _FIXTURES[case.label] = case.build_fixture()
+    return _FIXTURES[case.label]
 
 
 @pytest.fixture
 def built(case) -> Fixture:
     """This case's own fixture — skipped, never substituted, when the machine
     cannot produce it."""
-    usable, why = case.fixture.available(case.skill, case.case_id)
+    usable, why = case.available()
     if not usable:
         pytest.skip(f"{case.label}: {why}")
-    return _built(case.label)
+    return built_fixture(case)
 
 
 def test_there_is_at_least_one_case():
@@ -86,13 +124,22 @@ def test_there_is_at_least_one_case():
     assert CASES
 
 
+def test_both_kinds_of_case_are_represented():
+    """One `Case` covers a claim about a skill and a claim about nothing, and
+    the difference is one field. If either side of that emptied out, half the
+    checks below would pass by having nothing to run on — which reads exactly
+    like the other half passing."""
+    assert SKILL_CASES, "no case names a skill, so nothing here is ablated"
+    assert TASK_CASES, "no case is about the work alone"
+
+
 # --- the catalogue is covered ----------------------------------------------
 
 
 def _shipped() -> set[str]:
-    # `_`-prefixed files are deferred: written and banked, but not served by the
-    # runtime, so this layer owes them nothing. Their case module carries the
-    # same prefix and lands in `cases.DEFERRED_CASES` for the same reason.
+    """Skills the runtime serves. `is_skill_file` is the one rule for that."""
+    from biopb_mcp.mcp._skills_layout import is_skill_file
+
     return {p.stem for p in SKILLS_DIR.glob("*.md") if is_skill_file(p.name)}
 
 
@@ -114,8 +161,7 @@ def test_nothing_claims_to_cover_a_skill_that_does_not_ship():
     """A case or an exemption left behind by a deleted skill. Cheap to check,
     and it is how the contract layer's module came to be written entirely for a
     skill that no longer existed."""
-    shipped = _shipped()
-    stale = ({c.skill for c in CASES} | set(NOT_BENCHMARKED)) - shipped
+    stale = ({c.skill for c in CASES if c.skill} | set(NOT_BENCHMARKED)) - _shipped()
     assert not stale, (
         f"these name skills that are not in the catalogue: {sorted(stale)}"
     )
@@ -124,39 +170,6 @@ def test_nothing_claims_to_cover_a_skill_that_does_not_ship():
 def test_an_exemption_carries_a_reason():
     for skill, why in NOT_BENCHMARKED.items():
         assert len(why.split()) >= 5, f"{skill}: {why!r} does not say why"
-
-
-def _deferred() -> set[str]:
-    """Skills written and banked but not served — the runtime's `_` marker."""
-    # The prose check is on the stem *after* the marker: the file is `_x.md`, so
-    # `p.stem` is `_README` and never matches NOT_SKILLS on its own.
-    return {
-        p.stem[1:]
-        for p in SKILLS_DIR.glob("_*.md")
-        if p.stem[1:] and p.stem[1:] not in NOT_SKILLS
-    }
-
-
-def test_the_two_deferral_markers_agree():
-    """A case is deferred iff its skill is, and the pin is here because the two
-    markers are set in different files by different edits.
-
-    Promoting a skill by renaming one file would otherwise leave its case in
-    `DEFERRED_CASES`, where nothing benchmarks it — a served skill with no arms
-    and a green suite. Demoting one the other way would leave a case in `CASES`,
-    whose ablation arms would all measure the same empty catalog.
-    """
-    deferred_skills, shipped = _deferred(), _shipped()
-    misfiled = sorted({c.skill for c in DEFERRED_CASES} & shipped)
-    assert not misfiled, (
-        f"these cases are deferred but their skill ships, so nothing "
-        f"benchmarks a skill that is served: {misfiled}"
-    )
-    orphaned = sorted({c.skill for c in CASES} & deferred_skills)
-    assert not orphaned, (
-        f"these cases are benchmarked but their skill is deferred, so every "
-        f"arm would run against the same empty catalog: {orphaned}"
-    )
 
 
 #: `checklist:` tokens that say a skill expects a data plane — to read lazily
@@ -182,36 +195,33 @@ def test_a_skill_written_for_lazy_data_reports_whether_a_case_presents_it():
     which part".
     """
     entries, _ = validate(SKILLS_DIR)
+    benchmarked = {c.skill for c in CASES if c.skill}
     lazy_cases = {c.skill for c in CASES if any(layer.lazy for layer in c.layers)}
     for entry in entries:
         declared = [t for t in LAZY_TOKENS if t in entry.checklist]
-        if (
-            not declared
-            or entry.id in lazy_cases
-            or entry.id not in {c.skill for c in CASES}
-        ):
+        if not declared or entry.id in lazy_cases or entry.id not in benchmarked:
             continue
         warnings.warn(
             f"{entry.id} declares {declared}, but every case presents `array`, "
-            "so every arm runs with `client is None` — neither the lazy read "
+            "so every run has `client is None` — neither the lazy read "
             "path nor any step that uploads a result has been benchmarked",
             stacklevel=1,
         )
 
 
 def test_no_two_cases_share_an_identity():
-    """`(skill, case_id)` names a run's artifacts, its cached fixture and its
-    report. Two cases colliding on it would overwrite one report with the
+    """`(namespace, case_id)` names a run's artifacts, its cached fixture and
+    its report. Two cases colliding on it would overwrite one report with the
     other's and hand the second run the first's data — silently, since nothing
     downstream can tell the two apart."""
     seen = [c.label for c in ALL_CASES]
     duplicated = sorted({label for label in seen if seen.count(label) > 1})
-    assert not duplicated, f"these cases collide on (skill, case_id): {duplicated}"
+    assert not duplicated, f"these cases collide on (namespace, case_id): {duplicated}"
 
 
 def test_every_case_names_itself():
     for case in ALL_CASES:
-        assert case.case_id.strip(), f"{case.skill}: a case with no case_id"
+        assert case.case_id.strip(), f"{case.namespace}: a case with no case_id"
 
 
 def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
@@ -226,8 +236,8 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
     which was measured rather than supposed (`docs/fixtures.md`). It is a
     root path now, and a procedural case must not so much as look at it.
     """
-    case = CASES[0]
-    decoy = tmp_path / case.skill / case.case_id
+    case = next(c for c in CASES if c.fixture.kind == "synthetic")
+    decoy = tmp_path / case.namespace / case.case_id
     decoy.mkdir(parents=True)
     (decoy / "case.json").write_text('{"data": {}, "truth": {}}', encoding="utf-8")
     monkeypatch.setenv("BIOPB_FIXTURES", str(tmp_path))
@@ -242,31 +252,41 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
 
 def test_every_case_is_complete_enough_to_run(case):
     """The fields a run cannot proceed without, checked without running one."""
-    assert case.task.strip(), f"{case.skill}: no task prompt"
-    assert case.layers, f"{case.skill}: no fixture layer to load"
-    assert case.collect, f"{case.skill}: nothing would be collected"
+    assert case.task.strip(), f"{case.label}: no task prompt"
+    assert case.layers, f"{case.label}: no fixture layer to load"
+    assert case.collect, f"{case.label}: nothing would be collected"
     assert callable(case.score)
     assert callable(getattr(case.fixture, "build", None)), (
         f"{case.label}: `fixture` is not a FixtureSpec"
     )
-    assert case.query
 
 
 def test_the_task_asks_for_exactly_what_is_collected(case):
-    """The scrape names are a **harness convention**, not a claim the skill
+    """The scrape names are a **harness convention**, not a claim the subject
     makes — so the prompt has to state them, or the run is scored on names the
     agent was never told to bind."""
     for expression in case.collect.values():
         assert expression in case.task, (
-            f"{case.skill}: the task never mentions {expression!r}, "
+            f"{case.label}: the task never mentions {expression!r}, "
             "which is where its result is read from"
+        )
+
+
+def test_the_task_names_every_layer_it_is_given(case):
+    """A layer the prompt never mentions is one the agent has to discover by
+    listing the viewer, which is a different task from the one written down."""
+    for layer in case.layers:
+        assert layer.name in case.task, (
+            f"{case.label}: puts a layer `{layer.name}` on the viewer that the "
+            "task text never mentions"
         )
 
 
 def test_every_layer_kind_is_one_the_harness_can_add(case):
     for layer in case.layers:
-        assert layer.kind in ("image", "labels"), (
-            f"{case.skill}: layer {layer.name!r} wants a {layer.kind!r} layer"
+        assert layer.kind in LAYER_KINDS, (
+            f"{case.label}: layer {layer.name!r} wants a {layer.kind!r} layer, "
+            f"and the harness can add {sorted(LAYER_KINDS)}"
         )
 
 
@@ -281,13 +301,18 @@ def test_every_layer_is_presented_in_a_way_the_harness_can_produce(case):
 def test_a_case_on_a_plane_tells_the_agent_where_its_data_is(case):
     """A `tensor` fixture is addressable but **not discoverable** — an uploaded
     source is deliberately not synced to the catalog, so `query_sources()` will
-    not find it. The ids arrive in the namespace instead, and an agent nobody
-    told would be scored on failing to guess at a source it could not list."""
-    if not any(layer.lazy for layer in case.layers):
+    not find it. What the agent gets instead is the layer the harness already
+    added and the ids under :data:`TENSOR_HANDLE`, and the prompt has to point
+    at one of them: an agent nobody told would be scored on failing to guess at
+    a source it could not list."""
+    lazy = [layer for layer in case.layers if layer.lazy]
+    if not lazy:
         return
-    assert TENSOR_HANDLE in case.task, (
-        f"{case.label}: presents a layer on the data plane, but its task never "
-        f"mentions `{TENSOR_HANDLE}`, which is where the array ids arrive"
+    assert TENSOR_HANDLE in case.task or all(
+        layer.name in case.task for layer in lazy
+    ), (
+        f"{case.label}: presents on the data plane, but its task names neither "
+        f"`{TENSOR_HANDLE}` nor the layers it creates"
     )
 
 
@@ -304,6 +329,29 @@ def test_nothing_asks_for_chunking_it_will_not_get(case):
         )
 
 
+def test_a_skill_case_can_ask_the_catalog_about_itself(skill_case):
+    """`query` is what the run asks `find_skills` to prove the ablation took
+    effect. It falls back to the skill id, so this can only fail by someone
+    setting `catalog_query` to nothing on purpose."""
+    assert skill_case.query
+
+
+def test_a_case_with_no_skill_asks_the_catalog_for_everything(task_case):
+    """Its catalog read is *provenance*, not a manipulation: the record of what
+    was on offer when this number was produced.
+
+    A `catalog_query` would narrow that record to a retrieval, and on the case
+    of a banked skill it narrows it to nothing — the entry is not served, the
+    session says the catalog was offered, and `test_the_catalog_matched_the_switch`
+    fails a run that was configured exactly as intended.
+    """
+    assert not task_case.catalog_query, (
+        f"{task_case.label}: names no skill but narrows the catalog read to "
+        f"{task_case.catalog_query!r}, which records a retrieval where the "
+        "report wants what was on offer"
+    )
+
+
 # --- the fixture -----------------------------------------------------------
 
 
@@ -315,54 +363,10 @@ def test_the_fixture_keeps_its_truth_out_of_the_data(built):
     assert not shared, f"{built.label}: {sorted(shared)} is both given and withheld"
 
 
-#: Widest run of identical rows or columns tolerated at a frame border. A
-#: synthetic field is sparse, so some edge really is flat background: measured
-#: over six seeds, every frame of every channel stays under 6 px. Rendering
-#: frame-sized and shifting in place instead of cropping a padded canvas reached
-#: 25 px, and the width tracked the offset.
-MAX_FLAT_BORDER_PX = 10
-
-
-def _flat_border_px(frame, tol=1e-3) -> int:
-    """Rows at the top edge of `frame` that are copies of their neighbour."""
-    varies = np.abs(np.diff(frame, axis=0)).mean(axis=1) > tol
-    return int(np.argmax(varies)) if varies.any() else frame.shape[0]
-
-
-def test_the_drifted_movie_invents_no_pixels():
-    """The same leak as `test_the_fixture_keeps_its_truth_out_of_the_data`, by
-    the other route: not a truth *key* left in `data`, but the truth painted
-    into the pixels.
-
-    A stage that moves reveals sample that was outside the field of view; it
-    does not create pixels. Shift a frame-sized image and the interpolator has
-    to invent the vacated border, and the width of what it invents *is* the
-    shift — the withheld trajectory, readable off the edges with no registration
-    at all, and a band of flat correlated structure sitting inside the very data
-    the run registers on.
-    """
-    movie = np.asarray(
-        _built("drift-correction/two-channels-one-structural").data["movie"]
-    )
-    worst = {"px": 0, "frame": -1, "channel": -1, "edge": -1}
-    for t, frame in enumerate(movie):
-        for c, plane in enumerate(frame):
-            # All four edges: flip to bring each one to the top in turn.
-            for edge, view in enumerate((plane, plane[::-1], plane.T, plane.T[::-1])):
-                width = _flat_border_px(view)
-                if width > worst["px"]:
-                    worst = {"px": width, "frame": t, "channel": c, "edge": edge}
-    assert worst["px"] <= MAX_FLAT_BORDER_PX, (
-        f"drift-correction: {worst['px']} px of flat border at frame "
-        f"{worst['frame']}, channel {worst['channel']}, edge {worst['edge']} — "
-        "the field of view is showing pixels no acquisition produced"
-    )
-
-
 def test_the_fixture_provides_every_layer_the_case_loads(case, built):
     for layer in case.layers:
         assert layer.key in built.data, (
-            f"{case.skill}: layer {layer.name!r} loads data[{layer.key!r}], "
+            f"{case.label}: layer {layer.name!r} loads data[{layer.key!r}], "
             f"which the fixture does not build ({sorted(built.data)})"
         )
 
@@ -375,20 +379,27 @@ def test_the_fixture_says_where_it_came_from(built):
     assert built.about.strip()
 
 
+def test_a_curated_fixture_names_whose_data_it_is(built):
+    """Real data comes from someone, and saying so is not optional. A synthetic
+    seed owes nobody a citation, which is why this is not asked of one."""
+    if built.kind == "curated":
+        assert built.citation.strip(), f"{built.label}: curated, and uncited"
+
+
 def test_a_run_that_left_nothing_scores_nothing(case, built):
     """The anti-vacuous check on the verifier itself.
 
-    A verifier that passes an empty attempt would make every arm look fine,
+    A verifier that passes an empty attempt would make every run look fine,
     including the ones where the agent gave up — and `Outcome.passed` refusing
     to call "nothing scored" a pass only helps if the verifier reports
     unavailable rather than inventing a zero.
     """
     outcome = case.score(built, Attempt(subject="left-nothing"))
     assert not outcome.passed
-    assert outcome.metrics, f"{case.skill}: the verifier reported no metrics at all"
+    assert outcome.metrics, f"{case.label}: the verifier reported no metrics at all"
     assert all(not m.scored for m in outcome.metrics)
     assert all(m.unavailable for m in outcome.metrics), (
-        f"{case.skill}: a metric went unscored without saying why"
+        f"{case.label}: a metric went unscored without saying why"
     )
 
 
@@ -397,7 +408,7 @@ def test_every_metric_the_verifier_reports_has_a_tolerance(case, built):
     come from the metrics, and a limit of zero would be a silent always-fail."""
     outcome = case.score(built, Attempt(subject="left-nothing"))
     for metric in outcome.metrics:
-        assert metric.limit > 0, f"{case.skill}: {metric.name} has no usable limit"
+        assert metric.limit > 0, f"{case.label}: {metric.name} has no usable limit"
 
 
 # --- the persona -----------------------------------------------------------
@@ -409,14 +420,14 @@ def test_every_fact_reaches_the_prompt(case):
     fixture would be withholding something nobody can obtain."""
     prompt = case.persona.system_prompt()
     for key, value in case.persona.facts.items():
-        assert value in prompt, f"{case.skill}: {key!r} never reaches the prompt"
+        assert value in prompt, f"{case.label}: {key!r} never reaches the prompt"
 
 
 def test_the_persona_is_told_not_to_volunteer(case):
     """The one instruction the whole tier depends on. Asserted on the rendered
     prompt rather than trusted to the template, because the template is exactly
     what a well-meaning edit would loosen."""
-    from ...agentbench._respondent import DONE
+    from ..agentbench._respondent import DONE
 
     prompt = case.persona.system_prompt()
     assert "never volunteer" in prompt.casefold()
@@ -430,7 +441,7 @@ def test_the_background_gives_nothing_away(case):
     background = case.persona.background.casefold()
     for key, value in case.persona.facts.items():
         assert value.casefold() not in background, (
-            f"{case.skill}: {key!r} is in the freely-shared background"
+            f"{case.label}: {key!r} is in the freely-shared background"
         )
 
 
@@ -445,18 +456,47 @@ def test_the_persona_knows_the_sample_and_not_the_procedure(case):
     prompt = case.persona.system_prompt().casefold()
     for known in case.persona_must_know:
         assert known.casefold() in prompt, (
-            f"{case.skill}: the respondent cannot answer about {known!r}"
+            f"{case.label}: the respondent cannot answer about {known!r}"
         )
     for procedural in case.persona_must_not_know:
         assert procedural.casefold() not in prompt, (
-            f"{case.skill}: the respondent knows {procedural!r}, "
+            f"{case.label}: the respondent knows {procedural!r}, "
             "which is the skill's job"
         )
 
 
-def test_the_case_declares_what_its_persona_must_hold(case):
+def test_a_skill_case_declares_what_its_persona_must_hold(skill_case):
     """Both lists non-empty, because either one empty makes the check above
     vacuous — and a vacuous version of it is indistinguishable from a passing
     one from the outside, which is the failure mode this whole file is about."""
-    assert case.persona_must_know, f"{case.skill}: nothing declared as askable"
-    assert case.persona_must_not_know, f"{case.skill}: no procedural terms fenced off"
+    assert skill_case.persona_must_know, f"{skill_case.label}: nothing declared askable"
+    assert skill_case.persona_must_not_know, (
+        f"{skill_case.label}: no procedural terms fenced off"
+    )
+
+
+def test_a_self_sufficient_case_holds_no_deliverable_in_its_persona(
+    self_sufficient_case,
+):
+    """A persona that can be asked for the answer measures nothing.
+
+    This is the check for the shape that declares nothing to elicit: the prompt
+    is complete, the persona is there for realism, and so a fact naming one of
+    the scraped deliverables is a fact about the answer. A case that *does*
+    withhold something is checked by `persona_must_not_know` instead, which is
+    written in that case's own vocabulary and does not have to guess.
+
+    The names are matched as substrings, which only carries because a
+    deliverable here is a kernel identifier. `count-foci-per-cell` collects
+    `counts`, and its persona says "what counts as a focus" — a word this check
+    cannot tell from the variable, and the reason it is not applied to a case
+    whose persona is supposed to be answering questions.
+    """
+    case = self_sufficient_case
+    facts = " ".join(case.persona.facts).casefold()
+    facts += " " + " ".join(case.persona.facts.values()).casefold()
+    for name in case.collect.values():
+        assert name.casefold() not in facts, (
+            f"{case.label}: the persona knows `{name}`, which is what the "
+            "run is supposed to work out"
+        )

@@ -9,11 +9,12 @@ uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills
 ```
 
 Three layers are held back from that default run, each by a marker.
-`satisfiability` and `availability` each need real resolver runs (below).
-`interaction` needs a
+`satisfiability` and `availability` each need real resolver runs (below). The
+third, `bench`, is not in this directory at all: the interaction layer moved to
+[`_tests/bench/`](../bench/) when it merged with the task benchmark, since one
+engine serves both and a skill is only one kind of case it runs. It needs a
 display, two API keys and about twenty minutes, and — unlike everything else
-here — is **not a gate at all**: it is a benchmark that reports what four
-conversations did (`interaction/README.md`).
+here — is **not a gate at all**.
 
 ## What is covered
 
@@ -26,7 +27,7 @@ conversations did (`interaction/README.md`).
 | `test_satisfiability.py` | Contract | Would installing a declared package move something already in this environment? |
 | `test_availability.py` | Contract | Can a declared package be installed on every interpreter and platform we ship to? |
 | `test_contracts.py` | Contract | Does the third-party API a body quotes still look like that? |
-| `interaction/` | Interaction | A model in front of the shipped body, against a real session, scored on numbers *(§5; a benchmark, not a gate)* |
+| `../bench/` | Interaction | A model in front of the shipped body, against a real session, scored on numbers *(§5; a benchmark, not a gate)* |
 | `test_packaging.py` | — | Do the skills actually reach the wheel? |
 
 `test_shipped_skills.py` is where the authoring rules live: the
@@ -49,9 +50,9 @@ token outside the vocabulary, a link to a skill that does not exist, a
 description that runs to two sentences — and, from `test_retrieval.py`, that you
 owe the new skill a phrasing entry.
 
-You also owe it either a benchmark case (`interaction/cases/<skill>.py`) or a
-line in `interaction/cases.NOT_BENCHMARKED` saying why it cannot have one;
-`interaction/test_cases.py` fails until one of the two exists.
+You also owe it either a benchmark case (`../bench/cases/<skill>.py`) or a line
+in `bench/cases.NOT_BENCHMARKED` saying why it cannot have one;
+`bench/test_cases.py` fails until one of the two exists.
 
 ## The `satisfiability` marker — damage
 
@@ -109,21 +110,24 @@ That one-job shape is the point, not an optimization: five independent pytest
 runs cannot know "failed on 1 of 5", so all-or-nothing was the only verdict the
 per-cell shape could express (#680).
 
-## The `interaction` marker
+## The `bench` marker — not in this directory
 
 A **real** biopb-mcp session — shim-spawned child, real kernel, real napari,
 real dask, the nine real tools over real MCP — with the skill body arriving
 through the real `_skills.py`, and a model in front of it talking to a simulated
-user who holds a fact the fixture withheld. `biopb-mcp/docs/skills.md` §10 and
-`interaction/README.md`.
+user who holds a fact the fixture withheld. It lives in
+[`_tests/bench/`](../bench/) with the task benchmark, because the two are one
+engine and `--bench-cases` is what tells them apart.
+`biopb-mcp/docs/skills.md` §10 and `bench/README.md`.
 
 ```sh
-uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/bench -m bench -s \
+  --bench-cases=skills
 ```
 
-The trailing `-s` is what makes the per-arm progress lines visible; pytest
-discards a passing test's output. `interaction/README.md` has the other way to
-watch a run.
+The trailing `-s` is what makes the per-run progress lines visible; pytest
+discards a passing test's output. `bench/README.md` has the other way to watch
+a run.
 
 **It needs a GL-capable display**, and not merely offscreen Qt: napari builds
 under `QT_QPA_PLATFORM=offscreen` and then `add_image` dies in vispy's GL probe.
@@ -131,8 +135,9 @@ Without one the tests skip with instructions. It also needs two API keys, and
 costs four conversations per skill.
 
 **It is a benchmark, not a gate, and no run's outcome fails a test.** Each of
-the four arms — skill offered or withheld, respondent answering or silent —
-reports an outcome and a reason. The report is the deliverable.
+the four configurations — the catalog offered or withheld, the respondent
+answering or silent — is its own invocation, and each reports an outcome and a
+reason per sample. The report is the deliverable.
 
 Nothing here is stood in for, deliberately — a hand-written tool surface would
 put `execute_code`'s return shape and the `guide://` bodies back into a
@@ -142,10 +147,11 @@ The cost is that a red run's cause space includes the kernel, Qt and dask, so
 skill is at fault — and it runs without a model or a key.
 
 Most of that directory is *not* marked and runs with the ordinary suite: the
-conversation loop, the report writer, the fixture protocol, and — per skill —
-its persona, its fixture and its verifier (`interaction/test_cases.py`). A case
-whose persona volunteers the answer, or whose verifier passes a run that left
-nothing behind, is a normal red test and never a surprise mid-run.
+conversation loop, the report writer, the run options, the fixture protocol,
+and — per case — its persona, its fixture and its verifier
+(`bench/test_cases.py`). A case whose persona volunteers the answer, or whose
+verifier passes a run that left nothing behind, is a normal red test and never
+a surprise mid-run.
 
 ## There used to be an `outcome` marker
 
@@ -165,7 +171,8 @@ said. It was deleted, and the reasoning is worth keeping:
   skill, most of it reference implementations and tolerance measurement, and
   every skill would have owed the same.
 
-What was worth keeping moved into `interaction/`: the fixture protocol, the
+What was worth keeping moved into what is now `_tests/bench/`: the fixture
+protocol, the
 on-disk fixture path (rooted at `BIOPB_FIXTURES`), the tolerances, and
 the verifiers themselves — which now score what a model actually left in the
 kernel instead of what a transcription computed.

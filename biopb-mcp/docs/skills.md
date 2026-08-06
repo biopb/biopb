@@ -1,11 +1,12 @@
 # Skills — curated agent workflows, and how they are tested
 
 **Component:** `biopb-mcp` — `mcp/_skills.py` (runtime), `mcp/_skills_data/*.md`
-(the skills), `_tests/skills/` (the authoring gate),
-`_tests/skills/interaction/` (the benchmark),
+(the skills), `_tests/skills/` (the authoring gate), `_tests/bench/` (the
+benchmark),
 `.github/workflows/skill-contracts.yaml` (the per-package CI job).
 **Related:** [`fixtures.md`](fixtures.md) — what a run is given and how it is
-scored, shared with `_tests/tasks/`. The MCP `guide://*` resources and the
+scored, for a skill benchmark and a task benchmark alike. The MCP `guide://*`
+resources and the
 server's `_BASE_INSTRUCTIONS`.
 
 Part I (§1–§5) is what a skill *is* and how it ships. Part II (§6–§12) is what
@@ -331,7 +332,7 @@ numeric verifier tests the interaction for free.
 | **Structure** (§7) | Is the file well-formed, and does it obey the authoring rules? | `test_schema.py`, `test_validate.py`, `test_shipped_skills.py`, `test_packaging.py` | yes, in `mcp-ci` |
 | **Retrieval** (§8) | Does `find_skills` surface it for the right request? | `test_retrieval.py` | yes, in `mcp-ci` |
 | **Contract** (§9) | Can its packages be installed here, are they available everywhere, do they import, and does the API it quotes still exist? | `test_satisfiability.py`, `test_availability.py`, `test_contracts.py` | yes — damage per matrix cell and availability in one job, both in `mcp-ci`; the rest in `skill-contracts.yaml` |
-| **Interaction** (§10) | Does a model following it produce the right numbers? | `interaction/` | **no** — a benchmark; and the case *data* under it does gate |
+| **Interaction** (§10) | Does a model following it produce the right numbers? | `_tests/bench/` | **no** — a benchmark; and the case *data* under it does gate |
 
 Everything that gates is in this repo, so a skill edit and the runtime change it
 depends on land in the same PR.
@@ -339,10 +340,10 @@ depends on land in the same PR.
 Markers hold work back from the default run (`biopb-mcp/pyproject.toml`
 `addopts`): `satisfiability` (each token is a real resolver run; `mcp-ci` runs it
 as its own step on every matrix cell), `availability` (nine resolver runs per
-token; `mcp-ci` runs it once, in a job of its own), and `interaction` (needs a
+token; `mcp-ci` runs it once, in a job of its own), and `bench` (needs a
 display, API keys and about twenty minutes). Everything else in `_tests/skills/`
-— including every hermetic check on an interaction case (§10d) — runs with the
-ordinary suite.
+and `_tests/bench/` — including every hermetic check on a case (§10d) — runs
+with the ordinary suite.
 
 **Stochastic gates get muted within two weeks of the first flake, and then you
 have neither the gate nor the trust.** That is why §10's runs report rather than
@@ -563,12 +564,15 @@ answer by registering on both and keeping the self-consistent one. Such a back
 door is not fatal — a run that walks through it has done something defensible
 rather than something lucky, and the case then measures whether it got the
 answer right by whichever route — but the case module should say which kind it
-is, because it changes what a green arm means.
+is, because it changes what a green run means.
 
 The machinery is [`_tests/agentbench/`](../src/biopb_mcp/_tests/agentbench/),
-which knows nothing about skills; `_tests/tasks/` is its other consumer, asking
-"can an agent do this work" with no ablation at all. What a run is given and how
-it is scored is [`fixtures.md`](fixtures.md).
+which knows nothing about skills, and the runner is
+[`_tests/bench/`](../src/biopb_mcp/_tests/bench/). A case there either names a
+skill — an ablation, and the delta below — or names none, and asks "can an agent
+do this work" against real data with nothing withheld. Same engine, same report,
+and `--bench-cases` is which of them an invocation pays for. What a run is given
+and how it is scored is [`fixtures.md`](fixtures.md).
 
 ### 10a. The agent matrix
 
@@ -607,23 +611,23 @@ scored against.
 The agent reaches `skill://<id>` through a **client-supplied** verb
 (`_session.CLIENT_TOOLS`), because a resource is not a tool and the
 chat-completions wire carries only tools. Without it `find_skills` returns a uri
-nothing can dereference, and the skill arms run on catalog metadata while
+nothing can dereference, and a skills-on run works from catalog metadata while
 appearing to have the procedure. `test_session_smoke.py` asserts the body arrives
 through `call` and not only through the harness's own accessor. The ablation is
-unaffected: `skill://` resolves via `load_catalog()`, so a `noskill` arm reading
+unaffected: `skill://` resolves via `load_catalog()`, so an ablated run reading
 the uri gets the server's "not in the catalog" answer.
 
 #### The run must not be able to read its own answer
 
 `execute_code` is arbitrary Python by design, so a run *can* open the fixture that
 defines its answer — `truth`, the tolerances, the persona's facts — or the skill
-markdown an ablated arm is meant to lack. This is a validity problem, not a
+markdown an ablated run is meant to lack. This is a validity problem, not a
 security one: the agent is curious rather than adversarial, and it says what it
 did in the trace. Two measures, because neither is sufficient alone.
 
 **The child imports the shipped wheel, not the checkout.** Running from a source
 tree puts `_tests/` inside the installed package, one `os.path.dirname` from any
-agent that looks — and one measured arm made exactly that walk. `staged_package()`
+agent that looks — and one measured run made exactly that walk. `staged_package()`
 builds a wheel (which excludes `_tests`) and puts it first on the child's
 `PYTHONPATH`, so the answer key is not in the process that could read it. It is
 also the more faithful run: it is what a user has. Loud on failure — an unstaged
@@ -636,7 +640,7 @@ paths. It records rather than refuses: refusing would change the environment und
 test, and would break the session child's own reads of `_skills_data`. The
 discriminator is the *process* — the session child serves `skill://`, the kernel
 is where agent code runs — and it is applied in the parent (`LiveSession.peeked`),
-so the hook stays a dumb recorder. `FLAG_PEEKED` carries it onto the arm's row;
+so the hook stays a dumb recorder. `FLAG_PEEKED` carries it onto the sample's row;
 unlike the other flags it means the number is void rather than qualified.
 
 The cost is that a red run's cause space includes the kernel, Qt, dask and the
@@ -672,41 +676,46 @@ never reads as something the agent did.
 
 ### 10c. A benchmark, not a gate
 
-A skill's claim is a behavioural delta, so measuring it needs a baseline. Each
-case runs a 2×2 and reports the corners:
+A skill's claim is a behavioural delta, so measuring it needs a baseline —
+which means **two runs**, not one. The configuration is two switches on the
+invocation, and the square is four commands:
 
-| | respondent answers | respondent silent |
+| | `--bench-responder=model` | `=silent` |
 |---|---|---|
-| **skill offered** | does the whole thing work | does *asking* matter |
-| **skill withheld** | does the *skill* matter | the floor |
+| `--bench-skills=true` | does the whole thing work | does *asking* matter |
+| `=false` | does the *skill* matter | the floor |
 
 Withholding is `services.skills_enabled: false` — a real shipped configuration,
 so the kernel, napari, dask and every library stay as they are and only the
-curated procedure goes. The ablation is checked on what the catalog *returns*,
-not on whether `find_skills` was called: the tool stays registered either way and
-`load_catalog()` is what gates.
+curated procedure goes. That the switch took effect is checked on what the
+catalog *returns*, not on whether `find_skills` was called: the tool stays
+registered either way and `load_catalog()` is what gates.
 
-**The right-hand column measures the fixture, not the skill**, and
-`BIOPB_SKILL_ARMS=asked` drops it. Whether the withheld fact is obtainable from
-the pixels is a property of the construction in `cases/` — it does not change
-when a body is edited, and `test_cases.py` already asserts the cheap half of it
-hermetically. The delta the layer exists to produce is `skill+asked` against
-`noskill+asked`, which neither silent arm touches, so dropping them halves a
-case's wall-clock without changing what is being measured. Run the full square
-when the fixture changes, or when a report makes its asymmetry look decorative —
+**One invocation is one configuration**, so no single report contains a delta:
+the delta is two session directories, and `session.json` records the switches
+that make them comparable. That is deliberate. An arm used to be a harness
+configuration the *engine* chose per case, which meant a case's kind decided
+what a run cost, and a report had to explain a table whose rows were configured
+differently from one another.
+
+**The bottom-right pair measures the fixture, not the skill.** Whether the
+withheld fact is obtainable from the pixels is a property of the construction in
+`cases/` — it does not change when a body is edited, and `test_cases.py` already
+asserts the cheap half of it hermetically. The delta the layer exists to produce
+is the two `--bench-responder=model` runs, so once a fixture's asymmetry is
+established the silent pair is what to stop paying for. Re-run them when the
+fixture changes, or when a report makes the asymmetry look decorative —
 `drift-correction` is the standing reason to keep checking, since a capable agent
-recovered its withheld fact anyway. A partial report names the corners it did not
-run, in `summary.md` and as `arms_not_run` in `summary.json`: a two-row table
-would otherwise be indistinguishable from a square whose other corners died.
+recovered its withheld fact anyway.
 
-**No run's outcome fails a test.** Each arm becomes a row with an outcome and a
+**No run's outcome fails a test.** Each sample becomes a row with an outcome and a
 reason — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`, `gave-up`,
 `no-result`, `unscorable-result`, `harness-error` — plus flags that change how to
 read it: `cut-off-but-scored`, `over-ask-budget(n)`, `never-asked`,
 `asked-but-unanswered`, `stalled`, `catalog-mismatch`. Ordering matters: a cap
 beats a bad number, so a run severed mid-workflow is not reported as a wrong
 answer, and a *provider* failure beats everything, because it is not about the
-skill at all. Every arm runs inside its own `try`, so a corner that dies becomes a
+skill at all. Every sample runs inside its own `try`, so one that dies becomes a
 row instead of an exception that destroys the other three.
 
 Five properties of the loop, each of which cost a wrong number to find:
@@ -730,7 +739,7 @@ Five properties of the loop, each of which cost a wrong number to find:
   "I don't know" to everything — including a sign-off — so it can never end a run.
   Eight consecutive turns with no tool call stop the run as `stalled`, which is
   flagged as itself rather than as a severance. Healthy runs never exceeded two;
-  the two silent arms that motivated the guard trailed 42 and 55 tool-free turns
+  the two silent runs that motivated the guard trailed 42 and 55 tool-free turns
   past their last real action.
 - **A question asked while acting is still a question.** Routing keyed on whether
   the turn called a tool conflates *should the user see this* with *did the agent
@@ -747,25 +756,26 @@ Five properties of the loop, each of which cost a wrong number to find:
   stays as a fallback and the stall guard as the backstop.
 
 Two things *are* asserted, and neither judges a skill: that the report reached
-disk with a transcript per arm, and that the ablation took effect. The second is
-not a finding — if `skills_enabled: false` stopped withholding the catalog, the
-delta would read as zero for a reason unrelated to the skill.
+disk with a transcript per sample, and that the catalog matched the switch. The second
+is not a finding — if `skills_enabled: false` stopped withholding the catalog,
+the delta would read as zero for a reason unrelated to the skill.
 
 `asked` counts blocking questions against the budget `write-a-skill` step 4 sets
 (at most three), and the trace records whether a question preceded the first
 expensive call. Both are reported, not asserted.
 
-**Outputs.** Per case, under `.skill-outcomes/interaction/<skill>/<case_id>/`
-(override with `BIOPB_OUTCOME_DIR`, gitignored): `summary.md` and `summary.json`,
-and per arm a `transcript.md`, a `trace.jsonl`, the verifier's `summary.json`, and
-the case's artifacts. A run is bounded at 90 turns and 200 tool calls — generous
+**Outputs.** Per case, under `.bench-outcomes/<namespace>/<case_id>/` — the
+namespace being the skill id, or `tasks` for a case that names none (override
+the root with `BIOPB_OUTCOME_DIR`, gitignored): `summary.md` and `summary.json`,
+and per `sample-N/` a `transcript.md`, a `trace.jsonl`, the verifier's
+`summary.json`, and the case's artifacts. A run is bounded at 90 turns and 200 tool calls — generous
 on purpose, since these workflows promote compute to background jobs and a cap
 that stops a working run only produces unreadable results.
 
 ### 10d. One file per skill, and what gates about it
 
-The engine (`_benchmark.py`) owns the arms, the outcome classification and the
-report, and knows no skill. The scoring vocabulary
+The engine (`bench/_engine.py`) owns the grid, the outcome classification and
+the report, and knows no skill. The scoring vocabulary
 (`agentbench/_fixture.py`) knows no skill either. A skill contributes exactly one
 module under `cases/` exporting a module-level `CASE`:
 
@@ -787,7 +797,21 @@ CASE = Case(
 ```
 
 Modules are discovered by being there — no registration line, no engine change,
-no test code. `test_benchmark.py` parametrizes over them.
+no test code. `test_bench.py` parametrizes over them.
+
+**Omitting `skill` is what makes a case a task** rather than a claim about a
+skill: nothing is ablated, and `--bench-samples` replaces the control as the
+source of information.
+Same dataclass, same engine, same report — the field is the whole difference,
+and `--bench-cases` is how an invocation picks one kind or the other.
+
+A **banked** skill's case is written that way too: the `_` marker keeps its
+skill out of the catalog, so there is no entry to withhold and a square would be
+four copies of one corner — but the work is real, and the case runs, with
+`namespace=` carrying the skill's name so nothing on disk moves when it is
+promoted. Those cases used to be collected into a tuple that nothing ran.
+Withholding is unrelated to any of this: a case declares that it withholds
+something by naming it in `persona_must_know`, and several with no `skill` do.
 
 The hermetic checks in `test_cases.py` run in CI over every case, so a case is
 checked by arriving rather than by someone remembering to write a test for it:
@@ -806,7 +830,7 @@ checked by arriving rather than by someone remembering to write a test for it:
   loads, and says where it came from.
 - **The verifier refuses an empty attempt** — it must report metrics, all
   unscored, each with a reason. A verifier that passed a run that left nothing
-  behind would make every arm look fine.
+  behind would make every run look fine.
 - **The task names what the harness scrapes**, since the collect names are a
   harness convention rather than something the skill asks for.
 - **Presentation coverage**, which warns rather than fails
@@ -831,7 +855,7 @@ edit. The procedure is `write-a-skill` step 6; three rules earned in practice:
 
 - **Disclose the environment, withhold only the skill.** A run that withheld the
   third-party packages too had the models hand-roll everything, manufacturing
-  evidence for one rule and destroying it for another. §10c's ablation arm follows
+  evidence for one rule and destroying it for another. §10c's ablated run follows
   the same rule mechanically.
 - **Do not ask a model what is obvious.** It introspects badly. Test behaviour,
   not self-report.
@@ -894,7 +918,7 @@ has to do the measurement. Keeping the gating layers cheap and deterministic is
 what keeps them trusted (§6).
 
 **Where the fixture ends up.** If the skill also gets a benchmark case, put the
-generator in `interaction/cases/<skill>.py` and let the same construction back
+generator in `_tests/bench/cases/<skill>.py` and let the same construction back
 both, so a number quoted in the body and a tolerance set in the case mean the
 same thing. `flatfield`'s does. If it gets no case, the measurement script has
 done its job in the PR and does not need a home in the tree.
@@ -916,25 +940,25 @@ uv run --no-project --python .venv/bin/python --with pystackreg \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py
 
 # the benchmark (§10): a GL display (or the xvfb package — the session
-# brings its own virtual display), two API keys, ~20 min per skill
+# brings its own virtual display), two API keys, ~20 min per case
 uv run --no-project --python .venv/bin/python --with openai --with anthropic \
-  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+  python -m pytest biopb-mcp/src/biopb_mcp/_tests/bench -m bench -s
 
-# the same, at half the cost: the skill's delta without the two arms that
-# measure the fixture (§10c). What to run when a body changed and no fixture did
-BIOPB_SKILL_ARMS=asked uv run --no-project --python .venv/bin/python \
-  --with openai --with anthropic \
-  python -m pytest biopb-mcp/src/biopb_mcp/_tests/skills/interaction -m interaction -s
+# the other half of a skill's delta: the same cases with the catalog withheld.
+# One invocation is one configuration, so a delta is two of these (§10c)
+uv run --no-project --python .venv/bin/python --with openai --with anthropic \
+  python -m pytest biopb-mcp/src/biopb_mcp/_tests/bench -m bench -s \
+  --bench-cases=skills --bench-skills=false
 ```
 
 `-s` is not optional in practice: pytest discards a *passing* test's captured
-output, so without it the engine's per-arm progress lines never appear and the
+output, so without it the engine's per-sample progress lines never appear and the
 terminal sits blank for the whole run. From a second terminal, the artifact
-directory is the other progress view — every arm writes its transcript before it
+directory is the other progress view — every sample writes its transcript before it
 is scored:
 
 ```sh
-watch -n5 'find .skill-outcomes/interaction -newermt "-1 hour" | sort'
+watch -n5 'find .bench-outcomes -newermt "-1 hour" | sort'
 ```
 
 **Adding a skill.** Drop the `.md` in `mcp/_skills_data/` — the suite discovers

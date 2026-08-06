@@ -11,9 +11,9 @@ ordinary suite:
 uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/agentbench
 ```
 
-A suite's *paid* run carries its own marker — `-m interaction` for
-[`skills/interaction/`](../skills/interaction/), `-m tasks` for `tasks/` — and
-it is the suite that decides when to spend, not the machinery.
+The *paid* run carries its own marker — `-m bench`, in
+[`bench/`](../bench/) — and it is that suite which decides when to spend, and
+which cases to spend on, not the machinery.
 
 | File | Holds |
 |---|---|

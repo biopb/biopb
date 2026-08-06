@@ -21,8 +21,9 @@ likewise deferred and optional: biopb-mcp cannot depend on it (it is never on
 PyPI), so a machine without it reports `tensor` cases as unavailable rather
 than failing them.
 
-**Run-scoped.** One server for the whole run: a case is four arms, and a plane
-per arm would upload the same volume four times — and these are the large
+**Run-scoped.** One server for the whole pytest invocation: a case is one
+session per sample and an invocation is many cases, and a plane per session
+would upload the same volumes again every time — and these are the large
 fixtures by construction. It is also the production shape, where a durable
 plane outlives the sessions that come and go against it.
 
@@ -31,7 +32,7 @@ skills' own steps upload results (`drift-correction` step 7, `stitch-tiles`
 step 7) — so an agent can create sources, and there is *no API to drop one*:
 `remove_source` refuses any url that is not `dnd://`, and cache adapters are
 expected to accumulate until the server stops. So isolation cannot come from
-cleaning up between arms. It comes from the id:
+cleaning up between sessions. It comes from the id:
 
     source_id = f"cache_{sha256(source_name)[:12]}"       (upload_manager.py)
 
@@ -42,8 +43,8 @@ uploaded under a per-run random name therefore cannot be collided with by
 accident and cannot be replaced by an agent that only knows the id.
 
 That is an argument, so it is also checked: :meth:`TensorPlane.fingerprint`
-samples a corner of the served array, and `_benchmark` compares it after every
-arm. A changed fingerprint does not fail a test — it flags the row, the same
+samples a corner of the served array, and `bench/_engine` compares it after
+every sample. A changed fingerprint does not fail a test — it flags the row, the same
 way `read-harness-internals` does, because `execute_code` is arbitrary Python
 and the layer's defence is that nothing can happen *quietly*.
 """
@@ -150,7 +151,7 @@ class TensorPlane:
         """A hash of a corner of what the plane currently serves for *array_id*.
 
         One small read rather than a pass over the volume: this is checked once
-        per arm, and its job is to notice that the bytes changed at all.
+        per sample, and its job is to notice that the bytes changed at all.
         """
         tensor = self.client.get_tensor(array_id)
         corner = tuple(slice(0, min(4, int(n))) for n in tensor.shape)
@@ -286,7 +287,7 @@ def running_plane() -> TensorPlane | None:
 def stop_plane() -> None:
     """Stop the run's plane, if there is one.
 
-    Cleanup is the process and its temp tree, not a per-arm sweep: there is no
+    Cleanup is the process and its temp tree, not a per-session sweep: there is no
     API to drop a `cache://` source, so what an agent uploaded lives until the
     plane stops. That is affordable because it is bounded by the chunk cache,
     and safe because a fixture's id cannot be reached from anything the agent

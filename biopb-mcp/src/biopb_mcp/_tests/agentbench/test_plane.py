@@ -6,8 +6,8 @@ directories, and both are one-line mistakes that would only surface as a failed
 paid run — or, worse, as a benchmark quietly reading and writing the
 developer's own catalog.
 
-The other half spawns a real server, so it is marked `interaction` and never
-runs in CI. It is worth its seconds because it is the only place the isolation
+The other half spawns a real server, so it is marked `bench` and never runs in
+CI. It is worth its seconds because it is the only place the isolation
 argument is *checked* rather than argued:
 
     source_id = f"cache_{sha256(source_name)[:12]}"
@@ -16,7 +16,7 @@ the id is a one-way hash of a name the harness never sends, so an agent holding
 the id cannot reach the fixture. `test_a_reupload_under_the_same_name_is_seen`
 demonstrates both halves of that at once — the name *does* let you replace the
 data, and the fingerprint check notices — which is what makes the flag in
-`_benchmark` a mechanism instead of a comment.
+`bench/_engine` a mechanism instead of a comment.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ def plane():
         started.stop()
 
 
-@pytest.mark.interaction
+@pytest.mark.bench
 def test_an_uploaded_fixture_comes_back_as_the_bytes_that_went_in(plane):
     volume = np.arange(64, dtype=np.uint16).reshape(4, 4, 4)
     array_id = plane.upload("a-case-stack", volume, chunks=(2, 4, 4))
@@ -90,7 +90,7 @@ def test_an_uploaded_fixture_comes_back_as_the_bytes_that_went_in(plane):
     assert np.array_equal(got, volume)
 
 
-@pytest.mark.interaction
+@pytest.mark.bench
 def test_the_chunking_the_case_asked_for_is_the_chunking_it_gets(plane):
     """Where laziness is the point the chunking *is* the thing under test: a
     route that only fails at a chunk boundary is not exercised by a
@@ -101,7 +101,7 @@ def test_the_chunking_the_case_asked_for_is_the_chunking_it_gets(plane):
     assert tuple(plane.client.get_descriptor(array_id).chunk_shape) == (1, 4, 8)
 
 
-@pytest.mark.interaction
+@pytest.mark.bench
 def test_an_agent_holding_the_id_cannot_name_the_source(plane):
     """The isolation property, stated as what is *absent*: the id is
     `sha256(name)[:12]`, and nothing the agent can see carries the name — not
@@ -114,7 +114,7 @@ def test_an_agent_holding_the_id_cannot_name_the_source(plane):
     assert "secretly-named" not in str(descriptor)
 
 
-@pytest.mark.interaction
+@pytest.mark.bench
 def test_a_reupload_under_the_same_name_is_seen(plane):
     """Both halves of the argument at once.
 

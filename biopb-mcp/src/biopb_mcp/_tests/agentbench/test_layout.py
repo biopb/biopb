@@ -1,7 +1,7 @@
 """Nobody reaches agentbench's modules by a path that no longer exists.
 
 This guards a failure that git cannot see and a reviewer has no reason to look
-for. A new case module under `skills/interaction/cases/` is a **new file**, so
+for. A new case module under `bench/cases/` is a **new file**, so
 it merges cleanly against a branch that moved `_fixture` and `_respondent` out
 from under it — and then `cases/__init__.py` imports every case, one stale
 `from .._fixture import ...` raises, and the whole interaction package stops

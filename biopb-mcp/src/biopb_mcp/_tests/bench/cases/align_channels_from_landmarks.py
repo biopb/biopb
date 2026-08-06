@@ -50,7 +50,7 @@ from ...agentbench._fixture import (
     read_scalar,
 )
 from ...agentbench._respondent import Persona
-from .._runner import Layer, TaskCase
+from .._case import Case, Layer
 
 N_PROBES = 400
 
@@ -97,23 +97,36 @@ MICROSCOPIST = Persona(
         "and the microscope, not the maths. If you are asked something you "
         "would not know from having run the experiment, say so."
     ),
-    facts=(
-        # Everything real about the acquisition, and nothing that is an answer.
-        # The task is self-sufficient, so asking is neither rewarded nor
-        # punished -- it only makes the run resemble a session.
-        "The sample is a cultured monolayer, fixed, on a coverslip.",
-        "It was imaged on a confocal microscope, four channels, at 60x.",
-        "`moving` is the nuclear stain; `fixed` is a cytoplasmic marker.",
-        "Both channels are of the same field, acquired in the same session.",
-        "The two channels went through different optical paths, which is why "
-        "they do not overlay.",
-        "The correspondences were clicked by eye, at nuclei that were "
-        "identifiable in both channels.",
-        "Clicking by eye is good to a pixel or two, not better.",
-        "Pixel size is 108 nm, but the analysis was asked for in pixels.",
-        "There is no independent measurement of how the two channels differ -- "
-        "that is what the clicked points are for.",
-    ),
+    # Everything real about the acquisition, and nothing that is an answer. The
+    # task is self-sufficient, so asking is neither rewarded nor punished -- it
+    # only makes the run resemble a session.
+    #
+    # A mapping, because `Persona` renders `- {key}: {value}` and keeps the
+    # table as data so a test can assert no fact reached the agent by another
+    # route. This was a tuple once and nothing noticed: the suite only ever
+    # joined it, and the first thing to call `system_prompt()` would have been
+    # the respondent, mid-run, with a session open.
+    facts={
+        "sample": "a cultured monolayer, fixed, on a coverslip.",
+        "microscope": "a confocal, four channels, at 60x.",
+        "channels": "`moving` is the nuclear stain; `fixed` is a cytoplasmic marker.",
+        "field": "both channels are of the same field, acquired in one session.",
+        "why they differ": (
+            "the two channels went through different optical paths, which is "
+            "why they do not overlay."
+        ),
+        "the points": (
+            "the correspondences were clicked by eye, at nuclei that were "
+            "identifiable in both channels."
+        ),
+        "how good the clicks are": "clicking by eye is good to a pixel or two, "
+        "not better.",
+        "pixel size": "108 nm, but the analysis was asked for in pixels.",
+        "what nobody measured": (
+            "there is no independent measurement of how the two channels "
+            "differ -- that is what the clicked points are for."
+        ),
+    },
 )
 
 
@@ -217,7 +230,7 @@ def _save_artifacts(outcome: Outcome, root: Path) -> None:
     )
 
 
-CASE = TaskCase(
+CASE = Case(
     case_id="align-channels-from-landmarks",
     task=TASK,
     persona=MICROSCOPIST,
