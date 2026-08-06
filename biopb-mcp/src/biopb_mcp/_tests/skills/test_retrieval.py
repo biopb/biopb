@@ -148,6 +148,12 @@ REJECTS = [
     ("measure", "ratiometric-fret"),
     ("fret", "flatfield"),
     ("fret", "drift-correction"),
+    # Counting foci per cell is served by no shipped skill -- the candidate is
+    # deferred -- so these must surface nothing rather than the nearest
+    # measurement skill. A spot count per parent is neither a calibrated object
+    # measurement nor a segmentation scored against a truth.
+    ("foci", "calibrated-measurements"),
+    ("spots", "segmentation-qc-metrics"),
 ]
 
 
