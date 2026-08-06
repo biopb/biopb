@@ -24,15 +24,49 @@ def _result(stdout="", result_text="", error_text="", status="ok"):
     }
 
 
-def _job_reply(window_alive=True, **payload):
+def _job_envelope(r, window_alive=True):
     """A kernel ``execute`` result whose stdout carries the job runner's
-    single-line ``<<JOB_JSON>>`` payload.
+    single-line ``<<JOB_JSON>>`` payload, with *r* as the call's return value.
 
     The snippet wraps the call result as ``{"r": <result>, "w": <window
-    alive?>}``; ``payload`` becomes ``r`` and ``window_alive`` becomes ``w``.
+    alive?>}``.
     """
-    envelope = {"r": payload, "w": window_alive}
-    return _result(stdout=_server._JOB_DELIM + json.dumps(envelope) + "\n")
+    return _result(
+        stdout=_server._JOB_DELIM + json.dumps({"r": r, "w": window_alive}) + "\n"
+    )
+
+
+def _job_reply(window_alive=True, **payload):
+    """:func:`_job_envelope` for the common case where the call returns a dict
+    (a job snapshot, a submit result): ``payload`` becomes ``r``."""
+    return _job_envelope(payload, window_alive=window_alive)
+
+
+def _install_replies(host, *, returns=None, queue=None, digest=()):
+    """Install kernel replies that dispatch on the *snippet*, not on call order.
+
+    Agent-facing tools carry a user-activity digest round-trip
+    (``_server._user_activity_note``) alongside the call each test is actually
+    about. Answering that by content — rather than letting it consume a slot in
+    an ordered ``side_effect`` list — keeps every test's queue one-to-one with
+    the calls it asserts on, so an auxiliary round-trip can be added or removed
+    without renumbering unrelated tests.
+
+    ``queue`` is consumed in order; ``returns`` answers anything after it (or
+    everything, if no queue). ``digest`` is the user-job list the digest call
+    returns — empty by default, i.e. "the user ran nothing".
+    """
+    pending = list(queue or [])
+
+    def execute(code, *_args, **_kwargs):
+        if "_jobs.user_digest(" in code:
+            return _job_envelope(list(digest))
+        if pending:
+            return pending.pop(0)
+        return returns if returns is not None else _result()
+
+    host.execute.side_effect = execute
+    return host
 
 
 def _snapshot(
@@ -150,6 +184,21 @@ class TestResources:
         assert "predates the plugin" in section
         assert "failed to load" in section
         assert "biopb-mcp-seed-plugins" in section
+
+    def test_guide_tells_the_agent_it_shares_the_namespace(self):
+        # The runtime note ("the user ran job-N") says a change happened; this
+        # section is what makes that legible -- without it the agent has no model
+        # of a second writer, and reads the note as noise.
+        guide = _server.get_kernel_guide()
+        section = guide[guide.index("## You are not the only writer") :]
+        assert "observe" in section
+        assert "poll_job" in section
+        # The three rules that keep the two writers off each other: it is told
+        # after the fact, it waits when busy, and it does not stop their cell --
+        # including the workaround it would otherwise reach for.
+        assert "rejected as busy" in section
+        assert "refuses a user job" in section
+        assert "restart_kernel" in section
 
     def test_guide_skill_section_gated_on_the_catalog_switch(self):
         # With the catalog off there is no find_skills to hand back a
@@ -313,50 +362,64 @@ class TestExecuteCode:
         assert "not initialized" in result
 
     def test_submits_code_via_job_runner(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-1", status="running"
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _server.set_promote_after(0.0)  # return a handle immediately
         result = _server.execute_code("print('hi')")
-        snippet = server_with_host.execute.call_args_list[0][0][0]
-        assert "_jobs.submit(" in snippet
+        # By content, not by position: the tool also carries the user-activity
+        # digest round-trip, so "the first call" is not the submit.
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "_jobs.submit(" in c[0][0]
+        ]
         assert "print('hi')" in snippet  # code embedded via repr
         assert "job-1" in result  # job handle returned
 
     def test_inline_result_when_job_finishes_fast(self, server_with_host):
         # submit -> running, first poll -> terminal ok with output.
-        server_with_host.execute.side_effect = [
-            _job_reply(job_id="job-1", status="running"),
-            _job_reply(**_snapshot(stdout="hello\n", result_text="3")),
-        ]
+        _install_replies(
+            server_with_host,
+            queue=[
+                _job_reply(job_id="job-1", status="running"),
+                _job_reply(**_snapshot(stdout="hello\n", result_text="3")),
+            ],
+        )
         result = _server.execute_code("print('hello'); 1 + 2")
         assert "hello" in result
         assert "3" in result
 
     def test_no_output_message(self, server_with_host):
-        server_with_host.execute.side_effect = [
-            _job_reply(job_id="job-1", status="running"),
-            _job_reply(**_snapshot(stdout="", result_text="")),
-        ]
+        _install_replies(
+            server_with_host,
+            queue=[
+                _job_reply(job_id="job-1", status="running"),
+                _job_reply(**_snapshot(stdout="", result_text="")),
+            ],
+        )
         result = _server.execute_code("x = 42")
         assert result == "(no output)"
 
     def test_error_path_includes_traceback(self, server_with_host):
-        server_with_host.execute.side_effect = [
-            _job_reply(job_id="job-1", status="running"),
-            _job_reply(
-                **_snapshot(
-                    status="error",
-                    error_text="Traceback...\nZeroDivisionError: division by zero",
-                )
-            ),
-        ]
+        _install_replies(
+            server_with_host,
+            queue=[
+                _job_reply(job_id="job-1", status="running"),
+                _job_reply(
+                    **_snapshot(
+                        status="error",
+                        error_text="Traceback...\nZeroDivisionError: division by zero",
+                    )
+                ),
+            ],
+        )
         result = _server.execute_code("1 / 0")
         assert "division by zero" in result
 
     def test_promotes_to_job_handle_when_slow(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-7", status="running"
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-7", status="running")
         )
         _server.set_promote_after(0.0)
         result = _server.execute_code("while True: pass")
@@ -365,8 +428,9 @@ class TestExecuteCode:
         assert "poll_job" in result
 
     def test_busy_rejects_second_job(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            error="busy", running_job_id="job-3"
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(error="busy", running_job_id="job-3"),
         )
         result = _server.execute_code("x = 1")
         assert "already running" in result
@@ -382,18 +446,22 @@ class TestExecuteCode:
         assert "interrupted" in result
 
     def test_inline_result_appends_window_closed_note(self, server_with_host):
-        server_with_host.execute.side_effect = [
-            _job_reply(job_id="job-1", status="running", window_alive=False),
-            _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
-        ]
+        _install_replies(
+            server_with_host,
+            queue=[
+                _job_reply(job_id="job-1", status="running", window_alive=False),
+                _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
+            ],
+        )
         result = _server.execute_code("viewer.add_image(arr)")
         assert "done" in result
         assert "viewer window is closed" in result
         assert "restart_kernel" in result
 
     def test_job_handle_appends_window_closed_note(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-7", status="running", window_alive=False
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(job_id="job-7", status="running", window_alive=False),
         )
         _server.set_promote_after(0.0)
         result = _server.execute_code("while True: pass")
@@ -403,30 +471,40 @@ class TestExecuteCode:
 
 class TestJobTools:
     def test_poll_job_formats_status(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            **_snapshot(status="running", stdout="step 1\n", elapsed=2.5)
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                **_snapshot(status="running", stdout="step 1\n", elapsed=2.5)
+            ),
         )
         result = _server.poll_job("job-1")
         assert "job-1: running" in result
         assert "step 1" in result
 
     def test_poll_job_unknown(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-9", status="unknown", error_text=""
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(job_id="job-9", status="unknown", error_text=""),
         )
         assert "No such job" in _server.poll_job("job-9")
 
     def test_poll_job_terminal_appends_window_closed_note(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            window_alive=False, **_snapshot(status="ok", stdout="done\n")
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                window_alive=False, **_snapshot(status="ok", stdout="done\n")
+            ),
         )
         result = _server.poll_job("job-1")
         assert "viewer window is closed" in result
 
     def test_poll_job_running_omits_window_note(self, server_with_host):
         # A still-running job: no terminal result yet, so no closed-window note.
-        server_with_host.execute.return_value = _job_reply(
-            window_alive=False, **_snapshot(status="running", stdout="step\n")
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                window_alive=False, **_snapshot(status="running", stdout="step\n")
+            ),
         )
         result = _server.poll_job("job-1")
         assert "viewer window is closed" not in result
@@ -439,6 +517,111 @@ class TestJobTools:
 # -----------------------------------------------------------------------
 # inspect_object
 # -----------------------------------------------------------------------
+
+
+class TestUserActivityNote:
+    """The agent's notice that a human wrote to its namespace.
+
+    See ``docs/user-console.md``: the user runs cells through the same job
+    runner, so the agent's picture of the namespace can go stale between calls
+    with nothing in its own results to say so.
+    """
+
+    _DIGEST = [
+        {"job_id": "job-7", "status": "ok", "elapsed": 1.0},
+        {"job_id": "job-8", "status": "error", "elapsed": 2.0},
+    ]
+
+    def test_no_note_when_the_user_ran_nothing(self, server_with_host):
+        _install_replies(server_with_host, returns=_job_reply(**_snapshot()))
+        assert _server._user_activity_note(server_with_host) == ""
+
+    def test_note_lists_the_jobs_and_points_at_poll_job(self, server_with_host):
+        _install_replies(server_with_host, digest=self._DIGEST)
+        note = _server._user_activity_note(server_with_host)
+        assert "job-7 (ok)" in note and "job-8 (error)" in note
+        assert "poll_job('job-7')" in note
+        # Says *that* something changed and where to look -- not what changed,
+        # which would be a second thing to keep true.
+        assert "re-check" in note
+
+    def test_note_acks_so_a_finished_cell_is_reported_once(self, server_with_host):
+        _install_replies(server_with_host, digest=self._DIGEST)
+        _server._user_activity_note(server_with_host)
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "user_digest(" in c[0][0]
+        ]
+        assert "ack=True" in snippet
+
+    def test_singular_phrasing_for_one_cell(self, server_with_host):
+        _install_replies(server_with_host, digest=self._DIGEST[:1])
+        note = _server._user_activity_note(server_with_host)
+        assert "1 cell was run" in note
+
+    def test_malformed_digest_yields_no_note(self, server_with_host):
+        # Auxiliary, like the window-liveness probe: it must never break the
+        # result the agent actually asked for.
+        for bad in ("not-a-list", [{"no_job_id": 1}], [None]):
+            _install_replies(server_with_host, digest=None)
+            server_with_host.execute.side_effect = None
+            server_with_host.execute.return_value = _job_envelope(bad)
+            assert _server._user_activity_note(server_with_host) == ""
+
+    def test_unreachable_kernel_yields_no_note(self, server_with_host):
+        # Nothing is acked on this path either, so the notice is deferred to the
+        # next call rather than dropped.
+        server_with_host.execute.side_effect = None
+        server_with_host.execute.return_value = _result(status="busy")
+        assert _server._user_activity_note(server_with_host) == ""
+
+    def test_execute_code_carries_the_note(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            queue=[
+                _job_reply(job_id="job-1", status="running"),
+                _job_reply(**_snapshot(stdout="done\n")),
+            ],
+            digest=self._DIGEST,
+        )
+        result = _server.execute_code("x = 1")
+        assert "done" in result  # the agent's own result still leads
+        assert "job-7 (ok)" in result
+
+    def test_poll_job_carries_the_note(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(**_snapshot(status="ok", stdout="out\n")),
+            digest=self._DIGEST,
+        )
+        assert "job-7 (ok)" in _server.poll_job("job-1")
+
+    def test_busy_on_a_user_cell_tells_the_agent_to_wait(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                error="busy", running_job_id="job-9", running_job_origin="user"
+            ),
+        )
+        result = _server.execute_code("x = 1")
+        assert "The user is running a cell" in result
+        assert "job-9" in result
+        # The agent must not be pointed at interrupt_kernel here: it would be
+        # refused, and the suggestion alone invites it to try.
+        assert "interrupt_kernel" not in result
+        assert "restart_kernel" not in result
+
+    def test_busy_on_its_own_job_keeps_the_stop_advice(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                error="busy", running_job_id="job-3", running_job_origin="agent"
+            ),
+        )
+        result = _server.execute_code("x = 1")
+        assert "already running" in result
+        assert "interrupt_kernel" in result
 
 
 class TestInspectObject:
@@ -493,6 +676,37 @@ class TestInterruptRestart:
     def test_interrupt_no_host(self):
         _server._kernel_host = None
         assert "not initialized" in _server.interrupt_kernel()
+
+    def test_interrupt_asks_as_the_agent(self, server_with_host):
+        # The requester is what lets the runner refuse a user's cell; without it
+        # the refusal below can never trigger.
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-3", interrupted=True)
+        )
+        _server.interrupt_kernel()
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "interrupt_current(" in c[0][0]
+        ]
+        assert "requester='agent'" in snippet
+
+    def test_interrupt_refused_on_a_user_job(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                job_id="job-3",
+                interrupted=False,
+                status="running",
+                refused="user_job",
+            ),
+        )
+        result = _server.interrupt_kernel()
+        # Must not read as "nothing was running" -- the agent would retry or move
+        # on, when what it should do is wait for a person.
+        assert "No running job" not in result
+        assert "started by the user" in result
+        assert "poll_job('job-3')" in result
 
     def test_restart_delegates_to_host(self, server_with_host):
         result = _server.restart_kernel()

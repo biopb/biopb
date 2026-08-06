@@ -91,6 +91,21 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `in
       print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
   ```
 
+## You are not the only writer of this namespace
+The user can run their own code in this kernel, from the observe web page. It is the
+same namespace and the same viewer, so their cells can rebind a variable you set, add
+or remove a layer, or import something you did not.
+
+* **You will be told, after the fact.** When user cells have run since your last call,
+  a note listing them (`job-N (status)`) is appended to your `execute_code` / `poll_job`
+  / `server_status` result. Read them with `poll_job`, and re-check what you rely on
+  (`dir()`, `viewer.layers`, `inspect_object`) instead of trusting what you last saw.
+* **One job at a time, for both of you.** If the user is running a cell, your
+  `execute_code` is rejected as busy — wait and poll, do not try to clear it.
+* **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
+  only your own). Do not reach for `restart_kernel` to get around that: it would
+  destroy the user's variables and layers along with yours.
+
 Reading pixels, moving them between the server / a layer / your own variables,
 and the round trip for data too large to hold: `guide://data`.
 """

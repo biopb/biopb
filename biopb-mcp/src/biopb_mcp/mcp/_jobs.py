@@ -13,6 +13,12 @@ Design notes
 * **One job at a time.** A second :func:`submit` while a job is running is
   rejected with the running job id (the single shared viewer / namespace makes
   concurrent mutation unsafe).
+* **Two writers, serialized.** Jobs carry an ``origin`` — ``"agent"`` (the
+  ``execute_code`` tool) or ``"user"`` (a cell run from the observe page). They
+  share this one runner, so the rejection above is also what keeps the human and
+  the agent off each other's toes: no preemption, no queue, one ordering of
+  writes to the namespace. :func:`user_digest` is how the agent finds out its
+  namespace changed under it; see ``docs/user-console.md``.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
   main thread.  GUI mutations from the worker thread are marshaled via
   :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
@@ -73,13 +79,15 @@ class _Job:
         "error_text",
         "cancel_reason",
         "interrupted",
+        "origin",
+        "seen_by_agent",
         "thread",
         "started",
         "started_wall",
         "finished",
     )
 
-    def __init__(self, job_id, code=""):
+    def __init__(self, job_id, code="", origin="agent"):
         self.job_id = job_id
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
@@ -99,6 +107,14 @@ class _Job:
         # result, instead of an unexplained cancellation. None for agent-driven
         # or untagged stops.
         self.cancel_reason = None
+        # Who started this job: "agent" (the execute_code tool) or "user" (a cell
+        # from the observe page). Set at submit and never inferred later — a job
+        # outlives the request that started it, and poll/export read this long
+        # after that request is gone.
+        self.origin = origin
+        # Whether the agent has been told about this *user* job (via
+        # user_digest). Unset on an agent's own jobs, which need no notice.
+        self.seen_by_agent = False
         self.thread = None
         self.started = time.monotonic()
         # Wall-clock epoch at submit, for human-readable audit timestamps in the
@@ -119,6 +135,7 @@ class _Job:
             "result_text": self.result_text,
             "error_text": self.error_text,
             "cancel_reason": self.cancel_reason,
+            "origin": self.origin,
             "elapsed": self.elapsed(),
             "created": self.started_wall,
         }
@@ -267,14 +284,28 @@ def _has_running_job():
 
 
 def _prune():
-    terminal = [jid for jid, j in _jobs.items() if j.status != "running"]
+    # Evict oldest-first, but never a user job the agent has not been told about
+    # yet: that digest entry is the agent's only notice that its namespace
+    # changed under it, and evicting the record silently drops the notice. So
+    # the cap can be exceeded — bounded by how many cells a human types between
+    # two agent calls, which is small.
+    terminal = [
+        jid
+        for jid, j in _jobs.items()
+        if j.status != "running" and not (j.origin == "user" and not j.seen_by_agent)
+    ]
     while len(_jobs) > _MAX_RETAINED_JOBS and terminal:
         del _jobs[terminal.pop(0)]
 
 
-def submit(code):
-    """Start *code* in a background thread; return ``{"job_id": ...}`` or,
-    if a job is already running, ``{"error": "busy", "running_job_id": ...}``.
+def submit(code, origin="agent"):
+    """Start *code* in a background thread; return ``{"job_id": ...}`` or, if a
+    job is already running, ``{"error": "busy", "running_job_id": ...,
+    "running_job_origin": ...}``.
+
+    *origin* is ``"agent"`` or ``"user"`` (see :class:`_Job`). The busy return
+    carries the running job's origin because the caller's advice depends on it:
+    the agent may stop its *own* job, but a user's cell is not its to stop.
     """
     global _job_seq
     with _lock:
@@ -284,10 +315,14 @@ def submit(code):
         _install_streams()
         for jid, j in _jobs.items():
             if j.status == "running":
-                return {"error": "busy", "running_job_id": jid}
+                return {
+                    "error": "busy",
+                    "running_job_id": jid,
+                    "running_job_origin": j.origin,
+                }
         _job_seq += 1
         job_id = f"job-{_job_seq}"
-        job = _Job(job_id, code)
+        job = _Job(job_id, code, origin=origin)
         _jobs[job_id] = job
         _prune()
         thread = threading.Thread(
@@ -364,7 +399,7 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt_current(reason=None):
+def interrupt_current(reason=None, requester="user"):
     """Force-stop the running job: cooperative cancel *plus* a ``KeyboardInterrupt``
     raised directly into the job's worker thread.
 
@@ -375,10 +410,27 @@ def interrupt_current(reason=None):
     forces the worker thread via :func:`_raise_in_thread`. The exception lands at
     the next bytecode, so a blocking C call ends when it returns. ``{"interrupted":
     False, "status": "idle"}`` when the kernel is idle.
+
+    *requester* is who is asking — ``"user"`` (the observe UI, the default: a
+    person may stop anything running in their own session) or ``"agent"``. An
+    **agent is refused a user-origin job** (``{"refused": "user_job"}``): the
+    stop would be silent, since attribution runs one way only — a user stop
+    reaches the agent through ``cancel_reason``, but the human would see nothing
+    beyond an unexplained ``interrupted`` badge. The human has the observe UI and
+    can stop their own work; the agent has no consent to. ``restart_kernel``
+    stays open to the agent — it is the advertised guaranteed stop, and it is
+    destructive by announcement rather than silently.
     """
     job = _running_job()
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
+    if requester == "agent" and job.origin == "user":
+        return {
+            "job_id": job.job_id,
+            "interrupted": False,
+            "status": "running",
+            "refused": "user_job",
+        }
     job.interrupted = True  # finalize as "interrupted"
     _cancel(job.job_id, reason=reason)
     ident = job.thread.ident if job.thread is not None else None
@@ -404,12 +456,43 @@ def jobs_summary():
         {
             "job_id": j.job_id,
             "status": j.status,
+            "origin": j.origin,
             "elapsed": j.elapsed(),
             "stdout_len": len(j.stdout.getvalue()),
             "code_preview": _code_preview(j.code),
         }
         for j in _jobs.values()
     ]
+
+
+def user_digest(ack=False):
+    """User-run jobs the agent has not been told about yet, oldest-first.
+
+    Returns ``[{"job_id", "status", "elapsed"}, ...]``. This is the agent's only
+    notice that a second writer touched its namespace — a redefined variable, a
+    deleted layer — so it is read on every agent-facing round trip and rendered
+    into that call's result (``_server._user_activity_note``). Pull, not push:
+    an MCP server->client notification is not reliably surfaced mid-turn, and
+    when the agent is idle there is no turn to interrupt.
+
+    With *ack*, the **terminal** entries are marked reported. A still-running
+    user cell deliberately stays in the digest, so the agent is told its final
+    status exactly once instead of only ever hearing that it started — and while
+    it runs, the repeat is what explains a busy kernel.
+    """
+    with _lock:
+        pending = [
+            j for j in _jobs.values() if j.origin == "user" and not j.seen_by_agent
+        ]
+        digest = [
+            {"job_id": j.job_id, "status": j.status, "elapsed": j.elapsed()}
+            for j in pending
+        ]
+        if ack:
+            for j in pending:
+                if j.status != "running":
+                    j.seen_by_agent = True
+        return digest
 
 
 def export():

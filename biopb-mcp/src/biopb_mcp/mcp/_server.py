@@ -455,6 +455,43 @@ def _window_note(window_alive) -> str:
     return ""
 
 
+def _user_activity_note(host) -> str:
+    """Notice that the *user* ran cells in this kernel since the agent's last
+    call, to append to an agent-facing result (and empty when they did not).
+
+    The agent is not the only writer of this namespace: a person can run code
+    from the observe page, through the same job runner (``docs/user-console.md``).
+    That leaves the agent's picture of the namespace stale with nothing in its
+    own results to say so — hence this note, appended at the same seam as
+    ``_window_note``, which is how every other user-attributed fact already
+    reaches the agent (``cancel_reason``, ``teardown_reason``).
+
+    Deliberately says *that* something changed, not *what*: the agent is pointed
+    at ``poll_job`` and told to re-verify, which is cheap and cannot go stale
+    itself. Reading acks the terminal entries, so a completed user job is
+    reported exactly once — but only on a clean round-trip: a busy or wedged
+    kernel yields no note and acks nothing, so the notice is deferred, never
+    dropped.
+    """
+    digest, _res, _w = _run_job_call(host, "user_digest(ack=True)")
+    # Auxiliary, like the window-liveness probe riding the same payload: a
+    # kernel that answers with anything but the expected list yields no note
+    # rather than breaking the result the agent actually asked for.
+    if not digest or not isinstance(digest, list):
+        return ""
+    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
+        return ""
+    listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    plural = "cell was" if len(digest) == 1 else "cells were"
+    first = digest[0]["job_id"]
+    return (
+        f"\n\nⓘ {len(digest)} {plural} run by the user since your last call: "
+        f"{listed}. Read them with poll_job('{first}'). Variables and layers may "
+        "have changed — re-check with dir() / viewer.layers rather than trusting "
+        "what you last saw."
+    )
+
+
 def _format_job_status(snap: dict) -> str:
     """Render a job snapshot (poll_job output)."""
     job_id = snap.get("job_id", "?")
@@ -637,17 +674,30 @@ def execute_code(python_code: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
+    # Read once at entry, append to whichever path returns below.
+    user_note = _user_activity_note(host)
+
     submitted, res, window_alive = _run_job_call(
         host, "submit(" + repr(python_code) + ")"
     )
     if submitted is None:
-        return _format_execute_result(res)
+        return _format_execute_result(res) + user_note
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
+        # Whose job is running decides the advice. Telling the agent to
+        # "stop it with interrupt_kernel" while a *person* is running a cell
+        # would have it kill their work; interrupt_kernel refuses that anyway
+        # (_jobs.interrupt_current), so the wording must not send it there.
+        if submitted.get("running_job_origin") == "user":
+            return (
+                f"The user is running a cell ({running}) in this kernel. Only one "
+                f"job runs at a time — wait for it and poll_job('{running}'); do "
+                "not interrupt it." + user_note
+            )
         return (
             f"A job ({running}) is already running. Poll it with "
             f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another."
+            "restart_kernel before starting another." + user_note
         )
 
     job_id = submitted["job_id"]
@@ -657,10 +707,10 @@ def execute_code(python_code: str) -> str:
         time.sleep(0.4)
         snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
-            return _format_execute_result(res)
+            return _format_execute_result(res) + user_note
         if snap.get("status") != "running":
             # terminal: inline result
-            return _format_execute_result(snap) + _window_note(window_alive)
+            return _format_execute_result(snap) + _window_note(window_alive) + user_note
 
     # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
@@ -668,7 +718,10 @@ def execute_code(python_code: str) -> str:
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with interrupt_kernel or restart_kernel.\n"
-        "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
+        "Partial output:\n"
+        + (partial or "(none yet)")
+        + _window_note(window_alive)
+        + user_note
     )
 
 
@@ -684,13 +737,14 @@ def poll_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
+    user_note = _user_activity_note(host)
     snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
     if snap is None:
-        return _format_execute_result(res)
+        return _format_execute_result(res) + user_note
     if snap.get("status") == "unknown":
-        return f"No such job '{job_id}'."
+        return f"No such job '{job_id}'." + user_note
     note = _window_note(window_alive) if snap.get("status") != "running" else ""
-    return _format_job_status(snap) + note
+    return _format_job_status(snap) + note + user_note
 
 
 @mcp.tool()
@@ -722,13 +776,24 @@ def interrupt_kernel() -> str:
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
     it returns to Python; if the kernel stays stuck, use restart_kernel — the
     guaranteed stop.
+
+    Stops YOUR job only. A cell the user ran from the observe page shares this
+    kernel and this one-job-at-a-time runner, but is not yours to stop: this
+    refuses it, and you should wait for it instead.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
-    data, res, _w = _run_job_call(host, "interrupt_current()")
+    data, res, _w = _run_job_call(host, "interrupt_current(requester='agent')")
     if data is None:
         return _format_execute_result(res)
+    if data.get("refused") == "user_job":
+        running = data.get("job_id")
+        return (
+            f"Refused: {running} was started by the user, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{running}'). (The user can "
+            "stop their own cell from the observe page.)"
+        )
     if data.get("interrupted"):
         return (
             f"Interrupted job {data.get('job_id')} (KeyboardInterrupt raised in "
@@ -889,7 +954,9 @@ def server_status() -> str:
             "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
-    return "\n".join(lines)
+    # Only on this path: the early returns above are all "kernel not usable",
+    # where the digest round-trip cannot land anyway.
+    return "\n".join(lines) + _user_activity_note(host)
 
 
 # ---------------------------------------------------------------------------
