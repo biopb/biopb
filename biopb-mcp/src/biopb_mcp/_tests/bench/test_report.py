@@ -629,10 +629,65 @@ def report(tmp_path, monkeypatch):
     return text, json.loads((where / "summary.json").read_text()), where
 
 
+def _table(text: str) -> list[list[str]]:
+    """The rows of the markdown table, as cells."""
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in text.splitlines()
+        if line.startswith(("| ", "|---"))
+    ]
+
+
 def test_the_columns_come_from_the_metrics_that_were_reported(report):
     text, _, _ = report
     assert "| err_px |" in text
     assert "err_px ≤ 1" in text
+
+
+def test_every_row_of_the_table_is_as_wide_as_its_rule(report):
+    """A markdown renderer takes its column count from the `|---|` rule and
+    discards whatever a header has past it. So a width the header and the rule
+    disagree about is not a cosmetic defect — it silently deletes a column."""
+    text = report[0]
+    assert len({len(row) for row in _table(text)}) == 1, f"ragged table:\n{text}"
+
+
+def test_a_run_where_no_sample_scored_still_renders_its_reasons(tmp_path, monkeypatch):
+    """The report most worth reading, and the one the table shape broke on.
+
+    With no outcome anywhere there are no metric columns, and the table used to
+    be a fixed skeleton with a joined metric string concatenated into it — so an
+    empty join left a phantom cell, the header came out one wider than its rule,
+    and the column a renderer drops is the last one: `reason`, which on an
+    all-dead run is the only column with anything in it.
+    """
+    monkeypatch.setattr(_engine, "artifact_root", lambda: tmp_path)
+    text = Run(
+        case=SKILL_CASE,
+        fixture=FIXTURE,
+        options=Options(samples=2),
+        results=[
+            Result(sample=1, error="RuntimeError: boom"),
+            Result(sample=2, error="SessionUnavailable: no display"),
+        ],
+    ).summary()
+
+    rows = _table(text)
+    assert {len(row) for row in rows} == {7}, f"ragged table:\n{text}"
+    assert rows[0] == [
+        "sample",
+        "outcome",
+        "turns",
+        "asked",
+        "tools",
+        "min",
+        "reason",
+    ]
+    # The point of the whole report in this state.
+    assert rows[2][-1] == "RuntimeError: boom"
+    assert rows[3][-1] == "SessionUnavailable: no display"
+    # And the header line says so rather than trailing off after the colon.
+    assert "Tolerances: none — no sample produced a metric" in text
 
 
 def test_every_sample_reaches_the_table_including_the_one_that_died(report):

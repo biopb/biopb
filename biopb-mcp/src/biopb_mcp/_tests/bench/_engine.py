@@ -775,6 +775,20 @@ def write_summary(run: Run) -> str:
         respondent_choice().name if run.options.responder == "model" else "silent"
     )
     many = run.options.samples > 1
+    # `columns` is empty when no sample produced an outcome — every one died, or
+    # the session never came up. That is the report most worth reading, so the
+    # table is built from one header list rather than by concatenating a joined
+    # metric string into a fixed skeleton: the skeleton's separators padded an
+    # empty join into a phantom cell, leaving the header one wider than its
+    # `|---|` rule, and a renderer resolves that by dropping the last column —
+    # `reason`, which on an all-dead run is the only column with anything in it.
+    metrics = [name for name, _ in columns]
+    header = ["sample", "outcome", *metrics, "turns", "asked", "tools", "min", "reason"]
+    tolerances = (
+        ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns)
+        if columns
+        else "none — no sample produced a metric"
+    )
 
     def fmt(value):
         return "—" if value is None else f"{value:.4g}"
@@ -791,7 +805,7 @@ def write_summary(run: Run) -> str:
         f"Provenance: {fixture.provenance}  ",
         f"Options: `{run.options.describe()}`  ",
         f"Skills the catalog offered: {catalog_line(results)}  ",
-        "Tolerances: " + ", ".join(f"{name} ≤ {limit:g}" for name, limit in columns),
+        f"Tolerances: {tolerances}",
         "",
     ]
     if fixture.citation:
@@ -803,17 +817,25 @@ def write_summary(run: Run) -> str:
         "These runs are non-deterministic; read the table as an observation,",
         "not a measurement.",
         "",
-        "| sample | outcome | "
-        + " | ".join(name for name, _ in columns)
-        + " | turns | asked | tools | min | reason |",
-        "|---|---|" + "---|" * (len(columns) + 5),
+        "| " + " | ".join(header) + " |",
+        "|" + "---|" * len(header),
     ]
     for row in rows:
-        cells = " | ".join(fmt(row["metrics"].get(name)) for name, _ in columns)
         lines.append(
-            f"| {row['sample']} | **{row['outcome']}** | {cells} | {row['turns']} "
-            f"| {row['blocking_questions']} | {row['tool_calls']} "
-            f"| {row['seconds'] / 60:.1f} | {row['reason']} |"
+            "| "
+            + " | ".join(
+                [
+                    str(row["sample"]),
+                    f"**{row['outcome']}**",
+                    *(fmt(row["metrics"].get(name)) for name in metrics),
+                    str(row["turns"]),
+                    str(row["blocking_questions"]),
+                    str(row["tool_calls"]),
+                    f"{row['seconds'] / 60:.1f}",
+                    row["reason"],
+                ]
+            )
+            + " |"
         )
 
     if flagged := [r for r in rows if r["flags"]]:
