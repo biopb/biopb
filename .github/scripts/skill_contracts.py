@@ -45,10 +45,12 @@ SKILLS_DIR = ROOT / "biopb-mcp" / "src" / "biopb_mcp" / "mcp" / "_skills_data"
 # The interaction benchmark (§5) is deliberately NOT here, though it also needs
 # a skill's package: it drives a real napari session against a real model, so it
 # needs a GL display and API keys, and it reports rather than gates. It runs on a
-# workstation -- see biopb-mcp/docs/skill-testing.md §5.
+# workstation -- see biopb-mcp/docs/skills.md §10.
 CONTRACTS = Path("biopb-mcp/src/biopb_mcp/_tests/skills/test_contracts.py")
 
-# Prose docs that live beside the skills. Keep in step with `_validate.NOT_SKILLS`.
+# Prose docs that live beside the skills. This set and the leading-`_` rule in
+# `declared_packages` are both copies of `_validate.validate`'s -- no test pins
+# them together, because this runs before an env exists and cannot import it.
 NOT_SKILLS = {"README", "ROADMAP"}
 
 # The workspace's own distributions: a floor on one is a statement about this

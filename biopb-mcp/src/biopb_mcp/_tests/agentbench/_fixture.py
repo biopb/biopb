@@ -12,7 +12,7 @@ constructed it; a curated one knows whatever a human annotated. Both hand the
 verifier a mapping, and the verifier reads the keys it needs — so one verifier
 serves either kind. What that does *not* license is swapping one for the other
 under a running case: a case owns exactly one fixture, fixed when it was
-written (`docs/skill-fixtures.md`).
+written (`docs/fixtures.md`).
 
 *A metric it cannot compute is unavailable, not passing.* A real movie has no
 un-drifted reference image, so any metric needing one is absent from the report.
@@ -431,7 +431,7 @@ class FixtureSpec(Protocol):
     There is no ordering between implementations and no fallback between them.
     Substituting the data makes it a different experiment with the same name:
     the truth changes, the achievable accuracy changes, and the conclusion can
-    invert — measured, not hypothetical (`docs/skill-fixtures.md`). A skill
+    invert — measured, not hypothetical (`docs/fixtures.md`). A skill
     worth covering both ways gets **two cases**, each with its own id and its
     own tolerances.
 
@@ -646,12 +646,25 @@ def artifact_root() -> Path:
     raw = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
     if raw:
         return Path(raw).expanduser()
-    for parent in Path(__file__).resolve().parents:
-        if (parent / ".git").exists():
-            return parent / ".skill-outcomes"
+    root = checkout_root()
     # An installed copy with no checkout around it: keep artifacts beside
     # whoever ran the thing rather than somewhere up the filesystem.
-    return Path.cwd() / ".skill-outcomes"
+    return (root or Path.cwd()) / ".skill-outcomes"
+
+
+def checkout_root() -> Path | None:
+    """The repository this module is running from, or ``None`` if installed.
+
+    Searched for by marker rather than counted to. Two call sites wanted it as
+    a hardcoded ``parents[6]`` and both broke silently the moment this package
+    moved a directory up -- one wrote artifacts outside the checkout, the other
+    could not find the workspace to build a wheel from. Neither failed a test,
+    because a depth is right until it is not and nothing asserts on it.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
 
 
 def write_report(outcome: Outcome, root: Path) -> Path:

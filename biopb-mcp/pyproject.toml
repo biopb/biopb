@@ -46,7 +46,7 @@ dependencies = [
     # call that raises is worth excluding rather than debugging once per user.
     # It also happens to be what upstream tracking libraries pin against, which
     # is what lets a `pkg:` skill declare one without the resolver moving scipy
-    # backwards under a live kernel (`docs/skill-testing.md` §4a).
+    # backwards under a live kernel (`docs/skills.md` §9a).
     #
     # Costs nothing on 3.11+, which already resolve past 1.15 to 1.16+. On 3.10
     # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
@@ -193,7 +193,7 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 # only source the runtime reads — a skill is documentation about a specific
 # runtime version, so it rides that version's upgrade cycle rather than being
 # fetched. There is no catalog index: the frontmatter is the metadata and
-# mcp/_skills.py parses it. See biopb-mcp/docs/skill-interface.md §1.
+# mcp/_skills.py parses it. See biopb-mcp/docs/skills.md §1.
 "biopb_mcp.mcp" = ["_skills_data/*.md"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
@@ -228,7 +228,7 @@ qt_api = "pyqt6"
 # seconds each over a torch-sized graph), so it is deselected by default and run
 # as its own CI step. A command-line -m overrides this one, which is how
 # `-m satisfiability` and `-m contract` still work.
-addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not availability and not interaction and not fixtures'"
+addopts = "--ignore-glob='*_vendor*' -m 'not satisfiability and not availability and not interaction and not fixtures and not tasks'"
 markers = [
     # Resolves each skill's pkg: tokens against the installed environment to
     # reject a package that installs only by moving biopb's own deps. Metadata
@@ -242,13 +242,19 @@ markers = [
     # Puts a model in front of the shipped skill body against a REAL session --
     # kernel, napari, dask, the nine real tools. Slow, needs a GL-capable
     # display, and the agent rows need an API key; never in CI.
-    # biopb-mcp/docs/skill-testing.md §5 and _tests/skills/interaction/README.md.
+    # biopb-mcp/docs/skills.md §10 and _tests/skills/interaction/README.md.
     "interaction: drives a real biopb-mcp session, and sometimes a model",
     # Hashes a curated fixture tree against its manifest. Out-of-band on
     # purpose: hashing multi-gigabyte volumes on a mount would cost more than
     # the run it guards, and would do it once per arm. Run after syncing a
-    # tree, or when a result looks wrong. biopb-mcp/docs/skill-fixtures.md.
+    # tree, or when a result looks wrong. biopb-mcp/docs/fixtures.md.
     "fixtures: checks an on-disk fixture tree against its manifest",
+    # Runs an agent at a named piece of work against curated real data, in a
+    # real session, with nothing withheld -- no skill ablation, one arm, N
+    # samples. Same costs as `interaction` (GL display, API key, never in CI)
+    # and a different question: not whether a skill helps, but whether the work
+    # gets done. _tests/tasks/README.md.
+    "tasks: runs an agent at a real task against curated data",
 ]
 
 [tool.pytest_env]

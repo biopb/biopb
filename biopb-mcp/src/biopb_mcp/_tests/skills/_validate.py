@@ -1,7 +1,7 @@
 """Strict reader for skill files: the authoring gate.
 
 The single choke point for skill-file format variation
-(``biopb-mcp/docs/skill-interface.md`` §5): tolerant read -> strict result.
+(``biopb-mcp/docs/skills.md`` §4): tolerant read -> strict result.
 Warnings are advisory; ERRORS mean the file does not ship.
 
 Pure with respect to the filesystem — it writes nothing. It used to end by

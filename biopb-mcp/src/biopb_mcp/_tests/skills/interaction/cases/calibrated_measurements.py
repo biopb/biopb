@@ -1,7 +1,7 @@
 """`calibrated-measurements` as benchmark data: how big is a voxel?
 
 The cleanest withheld fact in the catalogue, and the reason this case was
-written second. `biopb-mcp/docs/skill-testing.md` §5c records what the drift fixture
+written second. `biopb-mcp/docs/skills.md` §10c records what the drift fixture
 taught: designing data so the heuristics its author thought of point the wrong
 way is not the same as making a fact **unobtainable**, and a capable agent
 recovered drift's structural channel by trying both. A voxel size is not like

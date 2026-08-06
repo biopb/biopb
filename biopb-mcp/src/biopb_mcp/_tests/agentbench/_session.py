@@ -1,6 +1,6 @@
 """A real biopb-mcp session, brought up and driven from synchronous test code.
 
-`biopb-mcp/docs/skill-testing.md` §5b: a real shim-spawned session child, a
+`biopb-mcp/docs/skills.md` §10b: a real shim-spawned session child, a
 real IPython kernel, a real napari viewer, real dask — and the nine real tools
 reached over real MCP. Nothing here stands in for the runtime. That is the
 whole point: a hand-written tool surface would put `execute_code`'s return
@@ -189,7 +189,14 @@ def staged_package() -> Path:
     import subprocess
     import zipfile
 
-    root = Path(__file__).resolve().parents[6]
+    from ._fixture import checkout_root
+
+    root = checkout_root()
+    if root is None:
+        raise SessionUnavailable(
+            "no checkout around this module, so there is no workspace to build "
+            "the biopb-mcp wheel from"
+        )
     out = Path(tempfile.mkdtemp(prefix="biopb-skill-wheel-"))
     try:
         subprocess.run(
