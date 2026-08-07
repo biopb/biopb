@@ -178,6 +178,37 @@ class TestJobRunnerUnit:
     def test_raise_in_thread_no_ident(self):
         assert _jobs._raise_in_thread(None, KeyboardInterrupt) == 0
 
+    def test_external_interrupt_is_labeled_not_reported_as_an_error(self, runner):
+        # A KeyboardInterrupt this runner did not raise -- an external SIGINT
+        # relayed through a run_on_main slot. Unlabeled it renders as the
+        # submitted code failing, which for a user's cell reads as their own
+        # code breaking rather than as a stop someone else caused.
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        while _jobs.poll(jid)["status"] != "running":
+            time.sleep(0.02)
+        job = _jobs._jobs[jid]
+        assert _jobs._raise_in_thread(job.thread.ident, KeyboardInterrupt) == 1
+        snap = self._wait(jid)
+
+        assert snap["status"] == "interrupted"  # not "error"
+        assert snap["cancel_reason"] == _jobs._EXTERNAL_INTERRUPT_MSG
+        # The reason is prefixed onto the traceback, so poll_job / execute_code
+        # render the attribution rather than a bare KeyboardInterrupt.
+        assert snap["error_text"].startswith(_jobs._EXTERNAL_INTERRUPT_MSG)
+        assert "KeyboardInterrupt" in snap["error_text"]
+
+    def test_an_owned_interrupt_keeps_its_own_reason(self, runner):
+        # interrupt_current still owns the attribution when it is the cause --
+        # the external path must not overwrite a reason someone else set.
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        while _jobs.poll(jid)["status"] != "running":
+            time.sleep(0.02)
+        _jobs.interrupt_current(reason="forced by Bob")
+        snap = self._wait(jid)
+        assert snap["status"] == "interrupted"
+        assert snap["cancel_reason"] == "forced by Bob"
+        assert _jobs._EXTERNAL_INTERRUPT_MSG not in snap["error_text"]
+
     # -- submitted code is recorded (observe UI) ----------------------------
 
     def test_job_stores_submitted_code(self, runner):

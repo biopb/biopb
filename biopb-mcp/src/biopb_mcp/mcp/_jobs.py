@@ -56,6 +56,17 @@ _REFRESH_PREFIX = "client = _conn.client\n"
 # Keep at most this many terminal job records before evicting the oldest.
 _MAX_RETAINED_JOBS = 32
 
+# Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
+# kernel ignores SIGINT except while servicing a message (ipykernel installs
+# default_int_handler only between its pre/post handler hooks), so the realistic
+# source is the one place that sends one: KernelHost._run_once interrupting the
+# kernel when a *quick* snippet overruns its timeout.
+_EXTERNAL_INTERRUPT_MSG = (
+    "Stopped by an interrupt sent to the whole kernel, not by an error in this "
+    "code. Most likely a short tool call (server_status / poll_job / a "
+    "screenshot) overran its timeout and interrupted the kernel to unwedge it."
+)
+
 # How long run_on_main waits for the main thread to service a marshaled call
 # before giving up (seconds).  Generous: GUI ops are normally fast, but a first
 # multiscale texture upload can take a while.
@@ -254,6 +265,21 @@ def _run(job, code):
     exc = None
     try:
         _exec_capture(_REFRESH_PREFIX + code, _ip.user_ns, job)
+    except KeyboardInterrupt:
+        exc = True
+        job.error_text = traceback.format_exc()
+        # A KeyboardInterrupt this runner did not cause was delivered from
+        # outside: a SIGINT to the kernel, relayed here because the job was
+        # inside a run_on_main slot on the main thread when it landed. It is a
+        # *stop*, not a defect in the submitted code, so label and attribute it
+        # rather than hand back a bare traceback -- the same reasoning that gave
+        # interrupt_current its flag, applied to the door it does not own.
+        # Sharpest for a user cell: the agent is refused interrupt_current on
+        # one, yet an overrunning tool probe can still end it this way, and
+        # unlabeled it reads to the human as their own code breaking.
+        if not job.interrupted:
+            job.interrupted = True
+            job.cancel_reason = job.cancel_reason or _EXTERNAL_INTERRUPT_MSG
     except BaseException:  # noqa: BLE001 - capture everything for the agent
         exc = True
         job.error_text = traceback.format_exc()
