@@ -130,6 +130,37 @@ build-time `/data_plane` baked by CI would have been missing the prefix and woul
 have silently defeated it, so the value is derived at runtime instead and one
 bundle serves every deployment.
 
+## Developing against a prefix
+
+`pnpm dev` can stand in for a prefixed control, so the prefixed app does not have
+to be built to be worked on. Set `BIOPB_URL_PREFIX` to the same value on both
+sides:
+
+```sh
+BIOPB_URL_PREFIX=/node/$host/$port biopb control start
+BIOPB_URL_PREFIX=/node/$host/$port pnpm dev
+```
+
+`vite.config.ts` then reproduces all three things the control does: sets vite
+`base` so the shell's asset URLs carry the prefix, injects
+`window.__BIOPB_BASE__` through a dev-only `transformIndexHtml` plugin, and
+builds its proxy keys with the prefix. It injects the *same global* the control
+does rather than teaching `base.ts` to read `import.meta.env.BASE_URL`, so the
+app keeps one source of truth and dev exercises the production code path instead
+of a parallel one.
+
+The prefixed path is forwarded to the control **unrewritten**, so the stripping
+middleware is genuinely under test; start the control without the flag and
+requests 404 rather than silently diverging. Unset, every part of this is a no-op
+and the dev server is an ordinary root-origin one.
+
+Note the dev proxy must carry every root the app calls — `/api`, `/data_plane`,
+`/health`, `/session/<id>/api`, `/session/<id>/console`. A missing root does not
+error: it falls through to vite's SPA fallback and the caller gets HTML where it
+expected JSON. `consoleEnabled()` and `authRequired()` read `/health` and treat
+any failure as `false`, so an unproxied `/health` silently reported "no token
+needed, no console" on every dev server regardless of what the control said.
+
 ## Still true after this
 
 The control speaks plain HTTP with no TLS (biopb/biopb#614), so publishing it
