@@ -125,6 +125,7 @@ def _setup_observe(config):
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
+            console_enabled=get_setting(config, "observe.console_enabled"),
             allowed_origins=get_setting(config, "transport.allowed_origins"),
             allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         )

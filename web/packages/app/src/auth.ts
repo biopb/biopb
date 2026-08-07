@@ -63,6 +63,22 @@ export async function authRequired(): Promise<boolean> {
   }
 }
 
+/** Whether this control will proxy a session's user console, from the same
+ * public `/health` probe. It is only half the answer — the session child has its
+ * own `observe.console_enabled` — and the console must be offered only when both
+ * agree, so a false here is final. Defaults to false when the probe can't be
+ * read: an editor whose every submit 404s is worse than no editor. */
+export async function consoleEnabled(): Promise<boolean> {
+  try {
+    const r = await fetch("/health");
+    if (!r.ok) return false;
+    const j = await r.json();
+    return !!j.console_enabled;
+  } catch {
+    return false;
+  }
+}
+
 /** Send the browser to the unlock page, returning here afterwards. */
 export function redirectToUnlock(): void {
   const here = window.location.pathname;

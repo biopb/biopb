@@ -64,13 +64,17 @@ def observe_state(host):
     old_host = _server._kernel_host
     old_max = _observe._max_output_chars
     old_poll = _observe._poll_interval_ms
+    old_console = _observe._console_enabled
     old_mounted = _observe._mounted_http
     _server.set_kernel_host(host)
-    _observe.configure(max_output_chars=20000, poll_interval_ms=3000)
+    _observe.configure(
+        max_output_chars=20000, poll_interval_ms=3000, console_enabled=True
+    )
     yield
     _server._kernel_host = old_host
     _observe._max_output_chars = old_max
     _observe._poll_interval_ms = old_poll
+    _observe._console_enabled = old_console
     _observe._mounted_http = old_mounted
     _observe._mw = None
 
@@ -308,6 +312,108 @@ def test_post_without_json_content_type_ok(client):
     assert r.status_code == 200
 
 
+# -- the user console -------------------------------------------------------
+
+
+def _console_client():
+    """A client for the app as currently configured (console on/off)."""
+    return TestClient(
+        _observe._build_standalone_app(), base_url="http://127.0.0.1:8766"
+    )
+
+
+def test_console_submits_as_the_user(client, host):
+    # The whole point of the route: the cell enters the *same* job runner the
+    # agent uses, tagged so everything downstream can tell the two apart.
+    host.execute.return_value = _reply({"job_id": "job-4", "status": "running"})
+    r = client.post("/console/execute", json={"code": "viewer.layers"})
+    assert r.status_code == 200
+    assert r.json()["job_id"] == "job-4"
+    snippet = host.execute.call_args[0][0]
+    assert "_jobs.submit(" in snippet
+    assert "origin='user'" in snippet
+    assert "viewer.layers" in snippet  # embedded via repr
+
+
+def test_console_requires_a_json_content_type(client):
+    # Restored on this route only (the sibling POSTs keep the exemption, see
+    # test_post_without_json_content_type_ok): a cross-site form POST cannot set
+    # application/json, so this is a live CSRF defense on the one route that
+    # submits code.
+    r = client.post(
+        "/console/execute",
+        headers={"content-type": "text/plain"},
+        content=b'{"code": "1"}',
+    )
+    assert r.status_code == 400
+
+
+def test_console_keeps_the_origin_guard(client):
+    for headers, expected in [
+        ({"origin": "http://evil.com"}, 403),
+        ({"host": "evil.com"}, 421),
+    ]:
+        r = client.post(
+            "/console/execute",
+            headers={"content-type": "application/json", **headers},
+            json={"code": "1"},
+        )
+        assert r.status_code == expected
+
+
+@pytest.mark.parametrize("body", [{}, {"code": ""}, {"code": "   "}, {"code": 7}])
+def test_console_rejects_a_missing_or_empty_cell(client, body):
+    assert client.post("/console/execute", json=body).status_code == 400
+
+
+def test_console_rejects_a_malformed_body(client):
+    r = client.post(
+        "/console/execute",
+        headers={"content-type": "application/json"},
+        content=b"not json",
+    )
+    assert r.status_code == 400
+
+
+def test_console_reports_a_collision_as_409_with_whose_job(client, host):
+    # One job at a time, no preemption and no queue -- so a collision is an
+    # expected outcome, and the page needs to know *whose* job it lost to.
+    host.execute.return_value = _reply(
+        {"error": "busy", "running_job_id": "job-3", "running_job_origin": "agent"}
+    )
+    r = client.post("/console/execute", json={"code": "1"})
+    assert r.status_code == 409
+    body = r.json()
+    assert body["running_job_id"] == "job-3"
+    assert body["running_job_origin"] == "agent"
+
+
+def test_console_kernel_lock_busy_is_a_retryable_503(client, host):
+    # Distinct from the 409 above: this is the kernel *lock*, held for a moment
+    # by another quick snippet. Nothing is running; retrying will work.
+    host.execute.return_value = _raw(status="busy")
+    r = client.post("/console/execute", json={"code": "1"})
+    assert r.status_code == 503
+    assert r.json()["retry"] is True
+
+
+def test_console_route_absent_when_disabled(host):
+    _observe.configure(console_enabled=False)
+    client = _console_client()
+    # Not a refusing route -- no route. Same shape as the control's gate, so
+    # "can code be submitted here?" has one answer rather than a status to read.
+    assert client.post("/console/execute", json={"code": "1"}).status_code == 404
+    # The data API is untouched: the switch narrows one surface only.
+    assert client.get("/api/jobs").status_code == 200
+
+
+def test_status_advertises_the_console_switch(host):
+    for enabled in (True, False):
+        _observe.configure(console_enabled=enabled)
+        r = _console_client().get("/api/status")
+        assert r.json()["console_enabled"] is enabled
+
+
 # -- busy kernel ------------------------------------------------------------
 
 
@@ -356,3 +462,4 @@ def test_config_defaults():
     assert get_setting({}, "observe.enabled") is True  # opt-out
     assert get_setting({}, "observe.max_output_chars") == 20000
     assert get_setting({}, "observe.poll_interval_ms") == 3000
+    assert get_setting({}, "observe.console_enabled") is True  # opt-out

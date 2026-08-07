@@ -85,18 +85,31 @@ wanted, it must be a **distinct** credential — not this one.
 
 ### The content-type detail
 
-`_observe.py:119-121` skips the SDK's content-type validation because "our control POSTs
-carry no JSON body". The console POST does carry one, and `Content-Type: application/json`
-is **unforgeable by a cross-site form POST** — it is a live CSRF defense, not ceremony.
-The console route must therefore *restore* the check the sibling routes skip, rather than
-inherit `_route`'s guard unchanged. This is easy to miss precisely because the guard is
-shared.
+`_check_origin` skips the SDK's content-type validation because "our control POSTs carry
+no JSON body". The console POST does carry one, and `Content-Type: application/json` is
+**unforgeable by a cross-site form POST** (it is not a CORS-simple value, so it
+preflights) — a live CSRF defense, not ceremony. So the console gets `_json_route`:
+`_route` plus `TransportSecurityMiddleware._validate_content_type`. Added as a *second*
+wrapper rather than folded into `_route`, so the exemption stays true of the routes it
+describes and a body-carrying route cannot inherit the body-less guard by accident.
 
 ### Config
 
 `observe.console_enabled` (default `true`) is the opt-out for a site that wants observe
-read-only. It cannot opt *in* past the public-bind refusal — a knob may narrow the
-surface, never widen it.
+read-only. Off drops the route entirely rather than serving a refusing one — the same
+shape as the control's gate, so "is there a way to submit code here?" has one answer
+rather than a status code to interpret. It cannot opt *in* past the public-bind refusal:
+a knob may narrow the surface, never widen it.
+
+### How the page knows
+
+Availability is the **conjunction** of the two gates, and the page must know before it
+renders an editor — one whose every submit 404s is worse than none. So each side
+advertises its own half: the control's `/health` gains `console_enabled` (alongside
+`auth_required`, unauthenticated for the same reason — the bundle needs it before it
+holds a token), and the child's `/api/status` reports its config knob. `ObservePage`
+renders the editor only when both are true. Neither side is asked to know the other's
+answer.
 
 ## Serialization — reject, never queue, never preempt
 
@@ -116,8 +129,16 @@ concurrency story — **no changes to `_jobs` locking**. Two readings were rejec
 
 The human's escape from a busy kernel is the interrupt they already have. The UI must
 therefore render busy as **state, not as an error after the click**: the Run button
-disabled, labelled `kernel busy · job-7 (agent) running`, with the existing Interrupt
-button beside it.
+disabled, labelled `kernel busy · job-7 (agent)`, with the existing Interrupt button
+beside it. The route's `409` (carrying `running_job_id` + `running_job_origin`) is the
+race backstop for a collision the disabled button did not prevent, not the primary way
+the user learns the kernel is busy.
+
+Two "busy"es meet on this route and must not be conflated: a **409** is the job runner's
+one-at-a-time rule (something is running — wait or interrupt), while a **503** is the
+kernel *lock*, held for a moment by another quick snippet (nothing is running; retry
+works). Collapsing them would tell a user to interrupt a kernel that is merely
+mid-round-trip.
 
 ## Attribution — `origin` on the job
 
@@ -214,4 +235,4 @@ Naturally three stacked PRs against `dev`, the control gate reviewable on its ow
    `serve_control_api`, proxy tests for the public-bind refusal and the traversal cases
    already covered for `api`. **Done.**
 3. **`_observe.py` + `ObservePage.tsx`** — the child route (with the restored content-type
-   check), `observe.console_enabled`, the editor and its busy state.
+   check), `observe.console_enabled`, the editor and its busy state. **Done.**
