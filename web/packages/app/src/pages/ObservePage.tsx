@@ -121,7 +121,13 @@ export default function ObservePage() {
     try {
       const s = await (await fetch(base + "/api/status")).json();
       if (typeof s.poll_interval_ms === "number") setPollMs(s.poll_interval_ms);
-      setChildConsole(!!s.console_enabled);
+      // Only when the field is actually there. A degraded status payload (the
+      // child's 503 with no kernel host, the proxy's 502 on a wedged session)
+      // parses fine and carries no `console_enabled` — reading it as `false`
+      // would unmount the editor and throw away a half-typed cell over a blip.
+      // This is static config, not state: absent means unknown, not off.
+      if (typeof s.console_enabled === "boolean")
+        setChildConsole(s.console_enabled);
       const bits = [s.alive ? "alive" : "dead"];
       if (s.busy) bits.push("busy");
       if (!s.ready) bits.push("starting");
@@ -251,8 +257,15 @@ export default function ObservePage() {
       }
       const d = await r.json().catch(() => ({}) as Record<string, unknown>);
       if (r.status === 409) {
-        const who = d.running_job_origin === "user" ? "you" : "the agent";
-        return `${who} already has a cell running (${d.running_job_id}). Wait for it, or Interrupt.`;
+        // Reachable despite the disabled button: `poll()` below is not awaited,
+        // so a fast second click lands before the jobs list reports the cell as
+        // running — and that collision is with the user's *own* job, which is
+        // the branch whose wording has to agree with "you".
+        const who =
+          d.running_job_origin === "user"
+            ? "you already have"
+            : "the agent already has";
+        return `${who} a cell running (${d.running_job_id}). Wait for it, or Interrupt.`;
       }
       if (!r.ok) return String(d.error || `submit failed (${r.status})`);
       poll(); // show the new job immediately
