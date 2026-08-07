@@ -417,6 +417,14 @@ class ObserveConfig:
         "How often (ms) the observe page polls the job list/status. Deliberately "
         "slow: each poll is a kernel round-trip competing with agent calls.",
     )
+    console_enabled: bool = _h(
+        True,
+        "Offer the user console: a code cell on the observe page that runs in "
+        "this session's kernel, serialized against the agent by the same "
+        "one-job-at-a-time rule. Off drops the route entirely. This can only "
+        "narrow the surface -- the control refuses to proxy the console at all "
+        "unless it is loopback-bound, whatever this says.",
+    )
 
 
 @dataclass

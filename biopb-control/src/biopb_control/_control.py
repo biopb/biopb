@@ -473,10 +473,17 @@ def build_app(
         # whether to gate itself behind the unlock page. It tracks the *token*,
         # not the network mode: always true in remote (which requires one), and
         # true in local mode too when an optional token was supplied.
+        # `console_enabled` rides the same public probe for the same reason: the
+        # observe page must know whether to offer a code cell before it renders
+        # one, and an editor whose every POST 404s is worse than no editor. It
+        # discloses nothing a caller cannot already infer -- reaching this
+        # endpoint from off-box *is* the evidence that the bind is public and the
+        # console therefore off.
         return JSONResponse(
             {
                 "control": "ok",
                 "auth_required": token is not None,
+                "console_enabled": console_enabled,
                 "data_plane": supervisor.snapshot(),
             }
         )

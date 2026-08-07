@@ -197,6 +197,15 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
+def test_health_advertises_the_console_gate(control):
+    # The observe page must know before it renders an editor, and only the
+    # control knows this half. Unauthenticated like `auth_required`, and for the
+    # same reason: the bundle needs it before it holds a token.
+    _status, _headers, body = _get(f"{control}/health")
+    # The fixture binds 127.0.0.1, so the console is on here.
+    assert json.loads(body)["console_enabled"] is True
+
+
 def test_root_serves_the_spa_shell(control):
     # `/` serves the SPA shell (index.html) from the bundle, not a redirect or
     # the proxy. The React router then renders the dashboard for this path.

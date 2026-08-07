@@ -6,6 +6,7 @@ import {
   useState,
 } from "react";
 import { useParams } from "react-router-dom";
+import { consoleEnabled } from "../auth";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 // Per-session observe UI, ported from the buildless _OBSERVE_HTML that each MCP
@@ -16,6 +17,7 @@ import { useDocumentTitle } from "../hooks/useDocumentTitle";
 interface JobSummary {
   job_id: string;
   status: string; // running | ok | error | interrupted
+  origin?: string; // agent | user — who submitted the cell
   elapsed: number;
   code_preview?: string;
 }
@@ -51,6 +53,12 @@ export default function ObservePage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("…");
   const [pollMs, setPollMs] = useState(3000);
+  // The console is offered only when BOTH the control will proxy it (it is
+  // loopback-bound) and this session child serves it (observe.console_enabled).
+  // Either half false means every submit would 404, so render no editor at all.
+  const [childConsole, setChildConsole] = useState(false);
+  const [controlConsole, setControlConsole] = useState(false);
+  const showConsole = childConsole && controlConsole;
 
   const lastNewest = useRef<string | null>(null);
   // Latest expanded set + details for the poll closure (which fetches details for
@@ -113,6 +121,7 @@ export default function ObservePage() {
     try {
       const s = await (await fetch(base + "/api/status")).json();
       if (typeof s.poll_interval_ms === "number") setPollMs(s.poll_interval_ms);
+      setChildConsole(!!s.console_enabled);
       const bits = [s.alive ? "alive" : "dead"];
       if (s.busy) bits.push("busy");
       if (!s.ready) bits.push("starting");
@@ -121,6 +130,18 @@ export default function ObservePage() {
       setStatus("unreachable");
     }
   }, [base]);
+
+  // The control's half of the console answer. Fixed for the life of the page
+  // (it follows the control's bind), so probe once rather than on every poll.
+  useEffect(() => {
+    let live = true;
+    consoleEnabled().then((on) => {
+      if (live) setControlConsole(on);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   useEffect(() => {
     poll();
@@ -208,6 +229,38 @@ export default function ObservePage() {
     URL.revokeObjectURL(url);
   }, [base]);
 
+  // The job holding the kernel, if any. Drives the Run button's disabled state,
+  // so a collision is shown *before* the click rather than as a failed action:
+  // one job runs at a time, and there is no preemption or queue.
+  const running = jobs?.find((j) => j.status === "running") ?? null;
+
+  const runCell = useCallback(
+    async (code: string): Promise<string | null> => {
+      let r: Response;
+      try {
+        r = await fetch(base + "/console/execute", {
+          method: "POST",
+          // Not decoration: a JSON content-type is one a cross-site form POST
+          // cannot set, and the child requires it on this route for exactly
+          // that reason.
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+      } catch (e) {
+        return String(e);
+      }
+      const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+      if (r.status === 409) {
+        const who = d.running_job_origin === "user" ? "you" : "the agent";
+        return `${who} already has a cell running (${d.running_job_id}). Wait for it, or Interrupt.`;
+      }
+      if (!r.ok) return String(d.error || `submit failed (${r.status})`);
+      poll(); // show the new job immediately
+      return null;
+    },
+    [base, poll],
+  );
+
   const interrupt = useCallback(async () => {
     const d = await jpost(base + "/api/kernel/interrupt");
     if (d && d.interrupted === false && d.status === "idle")
@@ -246,6 +299,7 @@ export default function ObservePage() {
         </button>
       </header>
       <main>
+        {showConsole ? <ConsolePanel running={running} onRun={runCell} /> : null}
         <div id="jobs">
           {jobs == null ? (
             <div className="empty">loading…</div>
@@ -266,6 +320,68 @@ export default function ObservePage() {
         </div>
       </main>
       <style>{OBS_CSS}</style>
+    </div>
+  );
+}
+
+/** The user's own cell, run in the same kernel the agent drives.
+ *
+ * Busy is rendered as *state* — a disabled button naming who holds the kernel —
+ * not as an error after the click. A rejected cell is the serialization rule
+ * working, and showing it as a red failure would train the user to reach for
+ * Interrupt reflexively. */
+function ConsolePanel({
+  running,
+  onRun,
+}: {
+  running: JobSummary | null;
+  onRun: (code: string) => Promise<string | null>;
+}) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const busy = running !== null;
+
+  const submit = useCallback(async () => {
+    if (!code.trim() || busy || submitting) return;
+    setSubmitting(true);
+    setError(await onRun(code));
+    setSubmitting(false);
+  }, [code, busy, submitting, onRun]);
+
+  const label = busy
+    ? `kernel busy · ${running!.job_id} (${running!.origin === "user" ? "you" : "agent"})`
+    : submitting
+      ? "running…"
+      : "▶ Run  (Ctrl+Enter)";
+
+  return (
+    <div className="console">
+      <div className="label">your cell — runs in this session&apos;s kernel</div>
+      <textarea
+        className="console-input"
+        value={code}
+        spellCheck={false}
+        placeholder="viewer.layers"
+        onChange={(e) => setCode(e.target.value)}
+        onKeyDown={(e) => {
+          // Ctrl/Cmd+Enter submits; plain Enter stays a newline (this is code).
+          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+            e.preventDefault();
+            submit();
+          }
+        }}
+      />
+      <div className="console-bar">
+        <button
+          className="primary"
+          disabled={busy || submitting || !code.trim()}
+          onClick={submit}
+        >
+          {label}
+        </button>
+        {error ? <span className="console-err">{error}</span> : null}
+      </div>
     </div>
   );
 }
@@ -315,6 +431,9 @@ function JobRow({
     <div className={"job" + (open ? " open" : "")}>
       <div className="row" onClick={onToggle}>
         <span className="jid">{job.job_id}</span>
+        {/* Provenance is only worth showing for the cells you ran: "agent" is
+            the norm here and a badge on every row would be noise. */}
+        {job.origin === "user" ? <span className="badge you">you</span> : null}
         <span className={"badge " + job.status}>{job.status}</span>
         <span className="preview">{job.code_preview || ""}</span>
         <span className="elapsed">{job.elapsed}s</span>
@@ -369,6 +488,7 @@ const OBS_CSS = `
   .obs-page .row:hover { background: #1a1a1a; }
   .obs-page .jid { font-weight: 600; }
   .obs-page .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; text-transform: uppercase; }
+  .obs-page .you { background: #34305a; color: #b9b0ff; }
   .obs-page .running { background: #243; color: #7e7; }
   .obs-page .ok { background: #234; color: #8bf; }
   .obs-page .error { background: #422; color: #f99; }
@@ -386,4 +506,14 @@ const OBS_CSS = `
   .obs-page pre.code { background: #0a0d0a; border-left: 2px solid #2a5; max-height: 30vh; }
   .obs-page .meta { color: #888; font-size: 12px; margin-bottom: 4px; }
   .obs-page .empty { color: #777; padding: 20px; text-align: center; }
+  .obs-page .console { border: 1px solid #333; border-radius: 5px; padding: 10px 12px;
+             margin-bottom: 12px; background: #161616; }
+  .obs-page .console-input { width: 100%; box-sizing: border-box; min-height: 68px;
+             resize: vertical; background: #0c0c0c; color: #ddd; border: 1px solid #333;
+             border-radius: 4px; padding: 8px;
+             font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .obs-page .console-input:focus { outline: none; border-color: #2a5; }
+  .obs-page .console-bar { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .obs-page .console button:disabled { opacity: .55; cursor: default; background: #222; }
+  .obs-page .console-err { color: #f99; font-size: 12px; }
 `;

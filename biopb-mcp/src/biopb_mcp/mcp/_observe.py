@@ -37,6 +37,17 @@ front proxies these ``/api/*`` calls (``/session/<id>/api/*`` -> this child), th
 trusted loopback hop presents a loopback Host and no Origin, so the guard still
 passes; the SPA derives its API base from ``window.location`` (the
 ``/session/<id>`` prefix), so this process needs no knowledge of its prefix.
+
+**The user console** (``/console/execute``, ``observe.console_enabled``) is the
+one route here that submits code: it is how a human runs a cell in this kernel,
+alongside the agent and through the same one-at-a-time job runner
+(``docs/user-console.md``). It lives under its own path root, not under
+``/api/``, because the *control* proxies the two differently — ``api`` always,
+``console`` only when the control is loopback-bound. That decision cannot be made
+here: the proxy hop strips Host and Origin, so this process cannot tell a browser
+from the trusted hop, and its own guard passes either way. So this module's job
+is only to be honest about which routes exist; the reachability question belongs
+to ``biopb-control``.
 """
 
 import functools
@@ -65,6 +76,7 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 # configure() before the routes are registered/served.
 _max_output_chars = 20000
 _poll_interval_ms = 3000
+_console_enabled = True
 _extra_origins = ()
 _extra_hosts = ()
 
@@ -80,6 +92,7 @@ def configure(
     *,
     max_output_chars=None,
     poll_interval_ms=None,
+    console_enabled=None,
     allowed_origins=(),
     allowed_hosts=(),
 ):
@@ -87,13 +100,22 @@ def configure(
 
     ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
     allowlist (e.g. a reverse-proxy front), mirroring the ``transport`` section.
+
+    ``console_enabled`` off drops the console route entirely rather than serving
+    a refusing one — the same shape as the control's gate, so "is there a way to
+    submit code here?" has one answer, not a status code to interpret. It can
+    only narrow: with the control's gate closed the route is unreachable however
+    this is set.
     """
-    global _max_output_chars, _poll_interval_ms, _extra_origins, _extra_hosts
+    global _max_output_chars, _poll_interval_ms, _console_enabled
+    global _extra_origins, _extra_hosts
     global _mw
     if max_output_chars is not None:
         _max_output_chars = int(max_output_chars)
     if poll_interval_ms is not None:
         _poll_interval_ms = int(poll_interval_ms)
+    if console_enabled is not None:
+        _console_enabled = bool(console_enabled)
     _extra_origins = tuple(allowed_origins)
     _extra_hosts = tuple(allowed_hosts)
     _mw = None  # rebuilt with the new extras on next request
@@ -147,6 +169,28 @@ def _route(fn):
                 {"error": "internal error", "detail": str(exc)},
                 status_code=500,
             )
+
+    return wrapper
+
+
+def _json_route(fn):
+    """:func:`_route` plus the SDK's ``Content-Type: application/json`` rule.
+
+    :func:`_check_origin` deliberately skips that rule because the other control
+    POSTs carry no body — but a JSON content-type is one a cross-site form POST
+    **cannot** set (it is not a CORS-simple value, so it preflights), which makes
+    it a real CSRF defense on the one route that submits code. Restored here
+    rather than added to ``_route`` so the exemption above stays true of the
+    routes it describes, and so a body-carrying route cannot inherit the
+    body-less guard by accident.
+    """
+    guarded = _route(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(request):
+        if not _get_mw()._validate_content_type(request.headers.get("content-type")):
+            return PlainTextResponse("Invalid Content-Type header", status_code=400)
+        return await guarded(request)
 
     return wrapper
 
@@ -273,6 +317,57 @@ async def _api_restart(request):
     return JSONResponse({"ok": True})
 
 
+async def _console_execute(request):
+    """Run a cell the *user* typed, in the same kernel the agent uses.
+
+    Submitted through the one job runner with ``origin='user'``, so the two
+    writers are serialized by the rule that already exists: one job at a time.
+    A collision is therefore an ordinary, expected outcome — reported as ``409``
+    with *whose* job is running so the page can render it as state ("kernel busy
+    · job-7 (agent)") rather than as a failed action. There is no preemption and
+    no queue: a person who wants the kernel now uses Interrupt, which is theirs
+    to use and attributes the stop to them.
+    """
+    host, err = _require_host()
+    if err is not None:
+        return err
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed body is the client's error
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if not isinstance(code, str) or not code.strip():
+        return JSONResponse({"error": "missing 'code'"}, status_code=400)
+
+    submitted, res, _w = _server._run_job_call(
+        host, "submit(" + repr(code) + ", origin='user')"
+    )
+    if submitted is None:
+        # Distinct from the job-busy case below: this is the kernel *lock*, held
+        # by another quick snippet for a moment. Transient, so retryable.
+        if res.get("status") == "busy":
+            return JSONResponse(
+                {"error": "kernel busy", "retry": True}, status_code=503
+            )
+        return JSONResponse(
+            {
+                "error": res.get("status") or "kernel error",
+                "detail": _server._format_execute_result(res),
+            },
+            status_code=502,
+        )
+    if submitted.get("error") == "busy":
+        return JSONResponse(
+            {
+                "error": "busy",
+                "running_job_id": submitted.get("running_job_id"),
+                "running_job_origin": submitted.get("running_job_origin"),
+            },
+            status_code=409,
+        )
+    return JSONResponse(submitted)
+
+
 async def _api_status(request):
     host, err = _require_host()
     if err is not None:
@@ -280,10 +375,14 @@ async def _api_status(request):
     # poll_interval_ms rides the status payload so the observe SPA (served by the
     # control front, not this child) can adopt the launcher-tuned cadence instead
     # of hardcoding it — the page is now static and can't be server-templated.
+    # console_enabled rides here so the page knows whether to offer an editor at
+    # all. It is only *this* half of the answer -- the control's gate is the
+    # other -- so the SPA needs both before it renders one (see ObservePage).
     return JSONResponse(
         {
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
+            "console_enabled": _console_enabled,
         }
     )
 
@@ -301,6 +400,19 @@ _ROUTES = [
     ("/api/status", ["GET"], _route(_api_status)),
 ]
 
+# Under its own root, so the control can proxy it on a different rule than
+# /api/* (biopb-control `_session_proxy_roots`).
+_CONSOLE_ROUTES = [
+    ("/console/execute", ["POST"], _json_route(_console_execute)),
+]
+
+
+def _routes():
+    """The routes to serve: the data API, plus the console when enabled."""
+    if _console_enabled:
+        return _ROUTES + _CONSOLE_ROUTES
+    return _ROUTES
+
 
 # ---------------------------------------------------------------------------
 # Wiring: http (mount on the MCP app) / stdio (standalone server)
@@ -316,10 +428,13 @@ def register_http_routes():
     stdout handler).
     """
     global _mounted_http
-    for path, methods, handler in _ROUTES:
+    for path, methods, handler in _routes():
         _server.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
-    logger.info("observe API mounted on the MCP app at /api/*")
+    logger.info(
+        "observe API mounted on the MCP app at /api/* (console: %s)",
+        "on" if _console_enabled else "off",
+    )
 
 
 def _build_standalone_app():
@@ -329,7 +444,7 @@ def _build_standalone_app():
     (no server is ever run from it). Production always goes through
     :func:`register_http_routes` on the MCP app.
     """
-    return Starlette(routes=[Route(p, h, methods=m) for p, m, h in _ROUTES])
+    return Starlette(routes=[Route(p, h, methods=m) for p, m, h in _routes()])
 
 
 def describe(mcp_port=None):
