@@ -61,6 +61,8 @@ def _install_replies(host, *, returns=None, queue=None, digest=()):
     def execute(code, *_args, **_kwargs):
         if "_jobs.user_digest(" in code:
             return _job_envelope(list(digest))
+        if "_jobs.ack_user_digest(" in code:
+            return _job_envelope(0)
         if pending:
             return pending.pop(0)
         return returns if returns is not None else _result()
@@ -540,31 +542,52 @@ class TestUserActivityNote:
         _install_replies(server_with_host, digest=self._DIGEST)
         note = _server._user_activity_note(server_with_host)
         assert "job-7 (ok)" in note and "job-8 (error)" in note
-        assert "poll_job('job-7')" in note
+        # No job id in the instruction: pointing at one of several invites the
+        # agent to read that one, call the notice discharged, and never see the
+        # rest -- which it is not offered again.
+        assert "poll_job" in note
+        assert "poll_job('" not in note
         # Says *that* something changed and where to look -- not what changed,
         # which would be a second thing to keep true.
         assert "re-check" in note
 
-    def test_note_acks_so_a_finished_cell_is_reported_once(self, server_with_host):
-        _install_replies(server_with_host, digest=self._DIGEST)
+    def test_ack_is_a_second_call_naming_only_terminal_jobs(self, server_with_host):
+        # The read must not ack: execute_interactive sends before it starts its
+        # timeout clock, so a probe that times out still runs at the kernel
+        # later -- acking inside it would retire a notice nobody received.
+        running = {"job_id": "job-9", "status": "running", "elapsed": 1.0}
+        _install_replies(server_with_host, digest=[*self._DIGEST, running])
         _server._user_activity_note(server_with_host)
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "user_digest(" in c[0][0]
-        ]
-        assert "ack=True" in snippet
+        calls = [c[0][0] for c in server_with_host.execute.call_args_list]
+        assert any("_jobs.user_digest()" in c for c in calls)
+        (ack,) = [c for c in calls if "ack_user_digest(" in c]
+        # Terminal ones only: a job reported `running` was not given its final
+        # status, so it must stay pending.
+        assert "'job-7'" in ack and "'job-8'" in ack
+        assert "job-9" not in ack
 
-    def test_singular_phrasing_for_one_cell(self, server_with_host):
-        _install_replies(server_with_host, digest=self._DIGEST[:1])
+    def test_no_ack_when_there_is_nothing_to_report(self, server_with_host):
+        _install_replies(server_with_host, digest=[])
+        assert _server._user_activity_note(server_with_host) == ""
+        calls = [c[0][0] for c in server_with_host.execute.call_args_list]
+        assert not [c for c in calls if "ack_user_digest(" in c]
+
+    def test_note_says_a_repeat_is_not_a_new_cell(self, server_with_host):
+        # user_digest re-reports a still-running cell every round trip, so the
+        # wording must not read as "another cell ran since last time" -- an
+        # agent polling a 5-minute user cell would re-verify on every poll.
+        _install_replies(
+            server_with_host,
+            digest=[{"job_id": "job-9", "status": "running", "elapsed": 2.0}],
+        )
         note = _server._user_activity_note(server_with_host)
-        assert "1 cell was run" in note
+        assert "since your last call" not in note
+        assert "repeats until it ends" in note
 
     def test_malformed_digest_yields_no_note(self, server_with_host):
         # Auxiliary, like the window-liveness probe: it must never break the
         # result the agent actually asked for.
         for bad in ("not-a-list", [{"no_job_id": 1}], [None]):
-            _install_replies(server_with_host, digest=None)
             server_with_host.execute.side_effect = None
             server_with_host.execute.return_value = _job_envelope(bad)
             assert _server._user_activity_note(server_with_host) == ""

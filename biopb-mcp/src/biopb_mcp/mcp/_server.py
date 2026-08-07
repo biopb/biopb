@@ -455,9 +455,44 @@ def _window_note(window_alive) -> str:
     return ""
 
 
-def _user_activity_note(host) -> str:
-    """Notice that the *user* ran cells in this kernel since the agent's last
-    call, to append to an agent-facing result (and empty when they did not).
+def _user_digest(host) -> list:
+    """The user-run cells the agent has not been told about, or ``[]``.
+
+    A pure read — see :func:`_ack_user_digest` for why the ack is a second call.
+    Auxiliary, like the window-liveness probe: a kernel that answers with
+    anything but the expected list yields no digest rather than breaking the
+    result the agent actually asked for.
+    """
+    digest, _res, _w = _run_job_call(host, "user_digest()")
+    if not digest or not isinstance(digest, list):
+        return []
+    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
+        return []
+    return digest
+
+
+def _ack_user_digest(host, digest) -> None:
+    """Retire the *terminal* entries of *digest*, once the note carrying them is
+    on its way back to the agent.
+
+    Split from the read because acking inside it consumed notices that were
+    never delivered: ``execute_interactive`` sends the request before it starts
+    its timeout clock, so a probe that times out is still queued at the kernel
+    and runs when the main thread frees up — setting the flag for a note nobody
+    received. Acking only after this process has parsed a reply keeps the
+    guarantee that a notice is deferred, never dropped.
+
+    Running entries are excluded here rather than in the kernel: they were
+    reported as ``running``, which is not the final status the agent is promised,
+    so they must stay pending even if they have finished since.
+    """
+    ids = [d["job_id"] for d in digest if d.get("status") != "running"]
+    if ids:
+        _run_job_call(host, "ack_user_digest(" + repr(ids) + ")")
+
+
+def _render_user_note(digest) -> str:
+    """The digest as a line appended to an agent-facing result, or ``""``.
 
     The agent is not the only writer of this namespace: a person can run code
     from the observe page, through the same job runner (``docs/user-console.md``).
@@ -466,30 +501,31 @@ def _user_activity_note(host) -> str:
     ``_window_note``, which is how every other user-attributed fact already
     reaches the agent (``cancel_reason``, ``teardown_reason``).
 
-    Deliberately says *that* something changed, not *what*: the agent is pointed
-    at ``poll_job`` and told to re-verify, which is cheap and cannot go stale
-    itself. Reading acks the terminal entries, so a completed user job is
-    reported exactly once — but only on a clean round-trip: a busy or wedged
-    kernel yields no note and acks nothing, so the notice is deferred, never
-    dropped.
+    Deliberately says *that* something changed, not *what*: the agent is told to
+    re-verify, which is cheap and cannot go stale itself. It names **no** job id
+    in the instruction either — pointing at one of several invites an agent to
+    read that one, call the notice discharged, and never see the rest, which it
+    will not be offered again.
     """
-    digest, _res, _w = _run_job_call(host, "user_digest(ack=True)")
-    # Auxiliary, like the window-liveness probe riding the same payload: a
-    # kernel that answers with anything but the expected list yields no note
-    # rather than breaking the result the agent actually asked for.
-    if not digest or not isinstance(digest, list):
-        return ""
-    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
+    if not digest:
         return ""
     listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
-    plural = "cell was" if len(digest) == 1 else "cells were"
-    first = digest[0]["job_id"]
     return (
-        f"\n\nⓘ {len(digest)} {plural} run by the user since your last call: "
-        f"{listed}. Read them with poll_job('{first}'). Variables and layers may "
-        "have changed — re-check with dir() / viewer.layers rather than trusting "
-        "what you last saw."
+        "\n\nⓘ The user ran code in this kernel: "
+        f"{listed}. A finished cell is reported once; a running one repeats "
+        "until it ends, so a repeat is not a new cell. Read them with poll_job. "
+        "Variables and layers may have changed — re-check with dir() / "
+        "viewer.layers rather than trusting what you last saw."
     )
+
+
+def _user_activity_note(host) -> str:
+    """Read, render, and retire the user-activity notice, in that order."""
+    digest = _user_digest(host)
+    note = _render_user_note(digest)
+    if note:
+        _ack_user_digest(host, digest)
+    return note
 
 
 def _format_job_status(snap: dict) -> str:
@@ -675,7 +711,10 @@ def execute_code(python_code: str) -> str:
         return "Error: kernel host not initialized"
 
     # Read once at entry, append to whichever path returns below.
-    user_note = _user_activity_note(host)
+    digest = _user_digest(host)
+    user_note = _render_user_note(digest)
+    if user_note:
+        _ack_user_digest(host, digest)
 
     submitted, res, window_alive = _run_job_call(
         host, "submit(" + repr(python_code) + ")"
@@ -689,6 +728,13 @@ def execute_code(python_code: str) -> str:
         # would have it kill their work; interrupt_kernel refuses that anyway
         # (_jobs.interrupt_current), so the wording must not send it there.
         if submitted.get("running_job_origin") == "user":
+            # A running user job stays in the digest by design, so the note is
+            # about to report the very job this branch is reporting. Drop it
+            # when that is *all* it says; keep it when the user also finished
+            # other cells, since those were acked above and will not be offered
+            # again.
+            if [d.get("job_id") for d in digest] == [running]:
+                user_note = ""
             return (
                 f"The user is running a cell ({running}) in this kernel. Only one "
                 f"job runs at a time — wait for it and poll_job('{running}'); do "
@@ -774,12 +820,15 @@ def interrupt_kernel() -> str:
     thread) can't reach it — this raises the exception directly into the worker.
     Best-effort: it lands at the next bytecode, so a
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
-    it returns to Python; if the kernel stays stuck, use restart_kernel — the
+    it returns to Python; if YOUR job stays stuck, use restart_kernel — the
     guaranteed stop.
 
     Stops YOUR job only. A cell the user ran from the observe page shares this
     kernel and this one-job-at-a-time runner, but is not yours to stop: this
-    refuses it, and you should wait for it instead.
+    refuses it, and you should wait for it instead. A refusal is not a stuck
+    kernel and restart_kernel is not the way around it — restarting would destroy
+    the user's running cell, variables and layers along with yours. Wait, or ask
+    them.
     """
     host = _kernel_host
     if host is None:
@@ -841,6 +890,12 @@ def restart_kernel() -> str:
     respawns a fresh kernel, rebuilding the tensor client and the napari
     viewer. All variables defined in previous execute_code calls are lost; a
     new viewer window replaces the old one.
+
+    This destroys the USER's work too, not only yours — their running cell,
+    their variables, their layers — and it is not undoable or announced to them
+    beforehand. So it is not the way past a refused interrupt_kernel or a kernel
+    busy with a user cell: neither is a runaway. Use it when the kernel is truly
+    wedged, and prefer asking first when someone is working in it.
     """
     host = _kernel_host
     if host is None:

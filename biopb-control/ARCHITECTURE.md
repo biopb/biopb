@@ -95,8 +95,9 @@ authenticated, for itself and for everything it fronts.
 - **The `/session/<id>` proxy is an allowlist, not a denylist.** A session child's
   `/mcp` is arbitrary code execution sharing the same port as its observe API, and
   path normalization would let a denylist be walked around (`api/../mcp`
-  collapsing onto `/mcp`). Only a first path segment of `observe` or `api` is
-  proxied; parent traversal is rejected.
+  collapsing onto `/mcp`). Only a first path segment of `api` — or `console`,
+  under the rule below — is proxied; parent traversal is rejected. (`observe` is
+  not proxied at all: the page is the control's own SPA shell, served in-process.)
 - **The user console is a separate root, gated on this listener's bind.** A code
   cell on the observe page runs in that session's kernel, so it is an RCE on the
   same origin the allowlist above exists to keep RCE off. Folding it into `api`

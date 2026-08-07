@@ -41,9 +41,21 @@ def test_one_job_cell_structure():
     assert len(code) == 2
     job = code[-1]
     src = "".join(job["source"])
-    assert "# [job-1 · ok · 0.1s ·" in src  # audit header comment
+    assert "# [job-1 · agent · ok · 0.1s ·" in src  # audit header comment
     assert "x = 1" in src
     assert job["metadata"]["biopb"]["job_id"] == "job-1"
+    # Who ran it, in both places. A record predating `origin` reads as the
+    # agent, which is what every pre-console session was.
+    assert job["metadata"]["biopb"]["origin"] == "agent"
+
+
+def test_a_user_cell_is_attributed_in_the_export():
+    # The export is an audit, so a human's cell must not read as the agent's:
+    # `mask = mask > 0.7` from the observe page is indistinguishable otherwise.
+    nb = _notebook.build_notebook([_snap(origin="user")])
+    job = [c for c in nb["cells"] if c["cell_type"] == "code"][-1]
+    assert "· user ·" in "".join(job["source"])
+    assert job["metadata"]["biopb"]["origin"] == "user"
     # stdout -> stream, result_text -> execute_result
     kinds = {o["output_type"] for o in job["outputs"]}
     assert kinds == {"stream", "execute_result"}

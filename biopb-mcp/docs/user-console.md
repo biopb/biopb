@@ -156,10 +156,18 @@ fact already reaches it (`cancel_reason` on a job, `_teardown_reason` on a not-r
 result, `_WINDOW_CLOSED_NOTE` on a result with no viewer).
 
 Each job carries a `seen_by_agent` flag rather than a global seq watermark, so the rule
-can be stated per job: `user_digest(ack=True)` reports every unseen user job and marks
-the **terminal** ones seen. A still-running user cell therefore stays in the digest — the
-agent hears its final status exactly once instead of only ever hearing that it started,
-and while it runs the repeat is what explains a busy kernel.
+can be stated per job. Reading (`user_digest()`) never consumes; retiring is a **second**
+call (`ack_user_digest(ids)`) the server makes only after it has parsed a reply and
+rendered the note. Acking inside the read consumed notices that were never delivered:
+`execute_interactive` sends the request before it starts its timeout clock, so a probe
+that times out is still queued at the kernel and runs when the main thread frees up.
+
+The server acks only the ids it reported as **terminal**, and `ack_user_digest` does not
+re-read the status — deliberately. A cell that finished between the read and the ack was
+reported `running`, which is not the final status the agent is promised, so it must stay
+pending; re-reading would retire exactly that job unheard. A still-running cell therefore
+stays in the digest, and while it runs the repeat is what explains a busy kernel — so the
+note says so, rather than claiming each repeat is new activity.
 
 Every agent-facing round trip (`execute_code`, `poll_job`, `server_status`) then appends,
 at the same seam `_window_note` uses in `_server.py`:

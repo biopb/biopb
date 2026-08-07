@@ -141,6 +141,10 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 # root keeps the statement checkable — `api` always, `console` local-mode only,
 # `/mcp` never — and makes "is RCE reachable from the browser?" one boolean.
 #
+# That boolean assumes the root is **POST-only**, and `session_proxy` enforces
+# it rather than trusting the child to: the CSRF gate skips safe methods, so a
+# cross-site GET to any proxied root is forwarded unchecked.
+#
 # Known limitation: this reads the control's own **bind**, so a loopback control
 # deliberately published by a reverse proxy (the topology biopb-mcp CLAUDE.md
 # points at for untrusted networks) reads as local and gets the console. That
@@ -887,6 +891,19 @@ def build_app(
         segments = sub_path.split("/")
         if segments[0] not in session_roots or ".." in segments:
             return JSONResponse({"error": "not found"}, status_code=404)
+        # The console is POST-only *here*, not merely in the child that happens
+        # to serve it that way. The CSRF gate upstream only inspects unsafe
+        # methods -- correct, since safe verbs must not change state -- so a
+        # cross-site GET (`<img src=".../console/execute?code=...">`) is
+        # forwarded unchecked, exactly as a GET to /api/jobs is. That is harmless
+        # only while nothing under this root acts on a GET, which is a promise
+        # about code living in another package. Pinning the method here makes the
+        # root's claim ("reaching the console requires a request a hostile page
+        # cannot forge") true at the layer that makes it, and fences off a future
+        # GET route that would silently reopen it. Checked before resolving the
+        # session, so it discloses nothing about which ids exist.
+        if segments[0] == _SESSION_CONSOLE_ROOT and request.method != "POST":
+            return JSONResponse({"error": "method not allowed"}, status_code=405)
         rec = _sessions.resolve(session_id)
         if rec is None:
             return JSONResponse(

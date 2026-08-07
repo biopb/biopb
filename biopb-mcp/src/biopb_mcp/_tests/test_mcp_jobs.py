@@ -274,26 +274,31 @@ class TestJobOrigin:
         assert [d["job_id"] for d in digest] == [user_jid]
         assert digest[0]["status"] == "ok"
 
-        # A plain read does not consume it...
-        assert [d["job_id"] for d in _jobs.user_digest(ack=True)] == [user_jid]
-        # ...but an acked one does, so a finished user job is reported once.
-        assert _jobs.user_digest(ack=True) == []
+        # Reading never consumes; only an explicit ack does, so a finished
+        # user job is reported exactly once.
+        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
+        assert _jobs.ack_user_digest([user_jid]) == 1
+        assert _jobs.user_digest() == []
 
     def test_running_user_job_stays_in_the_digest_until_it_ends(self, runner):
         jid = _jobs.submit(
             "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
         )["job_id"]
         try:
-            # Acked while running, yet still reported: otherwise the agent would
-            # hear that a cell started and never learn how it ended.
-            assert _jobs.user_digest(ack=True)[0]["status"] == "running"
-            assert _jobs.user_digest(ack=True)[0]["status"] == "running"
+            # Reading never consumes, so a running cell stays reported:
+            # otherwise the agent would hear that a cell started and never
+            # learn how it ended. (Excluding it from the ack is the *caller's*
+            # job -- _server._ack_user_digest filters on the reported status,
+            # because re-reading it here is the race this split closes.)
+            assert _jobs.user_digest()[0]["status"] == "running"
+            assert _jobs.user_digest()[0]["status"] == "running"
         finally:
             _jobs.interrupt_current()
         self._wait(jid)
-        final = _jobs.user_digest(ack=True)
+        final = _jobs.user_digest()
         assert [d["status"] for d in final] == ["interrupted"]
-        assert _jobs.user_digest(ack=True) == []
+        _jobs.ack_user_digest([jid])
+        assert _jobs.user_digest() == []
 
     def test_prune_never_evicts_an_unreported_user_job(self, runner):
         # The digest entry is the agent's only notice that its namespace changed
@@ -303,7 +308,8 @@ class TestJobOrigin:
             self._wait(_jobs.submit("a = 1")["job_id"])
 
         assert user_jid in _jobs._jobs
-        assert [d["job_id"] for d in _jobs.user_digest(ack=True)] == [user_jid]
+        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
+        _jobs.ack_user_digest([user_jid])
 
         # Once reported it is an ordinary record again, and prunes normally.
         for _ in range(_jobs._MAX_RETAINED_JOBS + 5):

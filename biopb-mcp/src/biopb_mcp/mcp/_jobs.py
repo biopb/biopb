@@ -465,7 +465,7 @@ def jobs_summary():
     ]
 
 
-def user_digest(ack=False):
+def user_digest():
     """User-run jobs the agent has not been told about yet, oldest-first.
 
     Returns ``[{"job_id", "status", "elapsed"}, ...]``. This is the agent's only
@@ -475,24 +475,41 @@ def user_digest(ack=False):
     an MCP server->client notification is not reliably surfaced mid-turn, and
     when the agent is idle there is no turn to interrupt.
 
-    With *ack*, the **terminal** entries are marked reported. A still-running
-    user cell deliberately stays in the digest, so the agent is told its final
-    status exactly once instead of only ever hearing that it started — and while
-    it runs, the repeat is what explains a busy kernel.
+    A pure read: marking entries reported is :func:`ack_user_digest`, a
+    **separate** call the caller makes only once the notice has actually reached
+    it. Acking here instead would consume the notice on a round trip whose reply
+    never arrived — ``execute_interactive`` sends before it starts its clock, so
+    a probe that times out is still queued at the kernel and runs when the main
+    thread frees up, setting the flag for a note nobody received.
     """
     with _lock:
-        pending = [
-            j for j in _jobs.values() if j.origin == "user" and not j.seen_by_agent
-        ]
-        digest = [
+        return [
             {"job_id": j.job_id, "status": j.status, "elapsed": j.elapsed()}
-            for j in pending
+            for j in _jobs.values()
+            if j.origin == "user" and not j.seen_by_agent
         ]
-        if ack:
-            for j in pending:
-                if j.status != "running":
-                    j.seen_by_agent = True
-        return digest
+
+
+def ack_user_digest(job_ids):
+    """Mark the jobs in *job_ids* as reported; return how many were marked.
+
+    *job_ids* is what the caller actually told the agent **and reported as
+    terminal** — never the whole digest. The status is deliberately **not**
+    consulted here: a job reported ``running`` that finished a moment later must
+    stay pending, because "the user ran job-7 (running)" is not the final status
+    the agent is promised exactly once. Re-reading the status instead would ack
+    precisely that job and retire it unheard — the race this split exists to
+    close. A status is monotone into terminal, so an id reported terminal is
+    still terminal now; no re-check can add information.
+    """
+    wanted = set(job_ids)
+    with _lock:
+        acked = 0
+        for job in _jobs.values():
+            if job.origin == "user" and not job.seen_by_agent and job.job_id in wanted:
+                job.seen_by_agent = True
+                acked += 1
+        return acked
 
 
 def export():
