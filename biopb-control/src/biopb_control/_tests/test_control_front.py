@@ -7,9 +7,11 @@ request/response bodies, and the ``/ws/render`` WebSocket -- with the mount
 prefix stripped, and (3) the control is the single web origin: it serves the
 built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
 links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
-as real files. A trivial stdlib HTTP server and a ``websockets`` echo server
-stand in for the tensor sidecar so no real tensor server is needed; a tmp bundle
-stands in for ``web/packages/app/dist``.
+as real files, and (4) which session-child roots it will proxy at all — ``api``
+always, the ``console`` (an RCE into that session's kernel) only on a
+loopback-bound control, ``/mcp`` never. A trivial stdlib HTTP server and a
+``websockets`` echo server stand in for the tensor sidecar so no real tensor
+server is needed; a tmp bundle stands in for ``web/packages/app/dist``.
 """
 
 import json
@@ -27,8 +29,11 @@ from biopb import _sessions
 from websockets.sync.client import connect as ws_connect
 
 from biopb_control._control import (
-    _is_session_api_path,
+    _SESSION_ALLOWED_ROOTS,
+    _is_proxied_session_path,
     _loopback_url,
+    _session_proxy_roots,
+    build_app,
     serve_control_api,
 )
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -48,10 +53,30 @@ from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
         ("/session/s1/mcp", False),  # non-API surface (proxy allowlist 404s it)
         ("/sessionfoo/api/x", False),  # not a /session/<id>/ path
         ("/api/status", False),  # control's own API, handled by the other branch
+        # Not proxied by default, so not gated by default either -- the console
+        # root only exists where _session_proxy_roots put it (test below).
+        ("/session/s1/console/execute", False),
     ],
 )
-def test_is_session_api_path(path, guarded):
-    assert _is_session_api_path(path) is guarded
+def test_is_proxied_session_path(path, guarded):
+    assert _is_proxied_session_path(path) is guarded
+
+
+def test_console_root_is_gated_wherever_it_is_proxied():
+    # The auth gate reads the proxy's own root set, so enabling the console
+    # cannot open an unauthenticated execute path: the same switch that makes it
+    # reachable makes it guarded.
+    roots = _session_proxy_roots(console_enabled=True)
+    assert _is_proxied_session_path("/session/s1/console/execute", roots) is True
+    assert _is_proxied_session_path("/session/s1/api/jobs", roots) is True
+    assert _is_proxied_session_path("/session/s1/mcp", roots) is False
+
+
+def test_console_root_is_off_by_default():
+    assert "console" not in _session_proxy_roots(console_enabled=False)
+    assert "console" in _session_proxy_roots(console_enabled=True)
+    # Enabling the console only adds; it never displaces the always-on root.
+    assert _session_proxy_roots(console_enabled=True) >= _SESSION_ALLOWED_ROOTS
 
 
 def _free_port() -> int:
@@ -1001,6 +1026,136 @@ def test_session_proxy_allowlists_api_surface(control, upstream):
         with pytest.raises(urllib.error.HTTPError) as exc:
             _get(f"{control}/session/s1/{path}")
         assert exc.value.code == 404, path
+
+
+def test_session_console_is_proxied_on_a_loopback_control(control, upstream):
+    # The user console (code into the session's kernel) rides the same hop as the
+    # data API, under its own root. The `control` fixture binds 127.0.0.1, which
+    # is what enables it.
+    _register_session("s1", upstream)
+    req = urllib.request.Request(
+        f"{control}/session/s1/console/execute",
+        data=b'{"code": "1 + 1"}',
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        echoed = json.loads(resp.read())
+    assert echoed["path"] == "/console/execute"
+    assert echoed["method"] == "POST"
+
+
+def test_session_console_is_gated_like_the_api(control, upstream):
+    # The console is the one proxied path whose payload is arbitrary code, so it
+    # must not be reachable by DNS-rebinding or as a cross-site write. Same gate,
+    # asserted here because a new root that slipped past _guarded would be an
+    # unauthenticated execute.
+    _register_session("s1", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(
+            f"{control}/session/s1/console/execute",
+            headers={"Host": "evil.example:8813"},
+        )
+    assert exc.value.code == 421
+
+    req = urllib.request.Request(
+        f"{control}/session/s1/console/execute",
+        data=b"{}",
+        method="POST",
+        headers={"Sec-Fetch-Site": "cross-site", "Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
+
+
+def test_console_root_is_post_only(control, upstream):
+    # The CSRF gate skips safe methods (correctly -- safe verbs must not change
+    # state), so a cross-site GET is forwarded unchecked to whatever the child
+    # serves. `<img src=".../console/execute?code=...">` is the shape. Pinning
+    # POST here means that claim does not depend on the child's method list.
+    _register_session("s1", upstream)
+    for method in ("GET", "HEAD", "PUT", "DELETE"):
+        req = urllib.request.Request(
+            f"{control}/session/s1/console/execute?code=1", method=method
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 405, method
+    # The data API keeps every verb: only the console is narrowed.
+    status, _headers, _body = _get(f"{control}/session/s1/api/jobs")
+    assert status == 200
+
+
+@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
+def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
+    # The behavioral half of the local-mode gate, asserted on build_app so the
+    # "off" case needs no public listener. The session child is deliberately a
+    # closed port, which separates the two outcomes cleanly: 404 means the root
+    # is not a route at all (nothing was forwarded), 502 means it was routed and
+    # only the child was absent. Answering the question with no upstream also
+    # keeps this independent of what a child would reply.
+    from starlette.testclient import TestClient
+
+    _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    app = build_app(
+        DataPlaneSupervisor(spec),
+        8.0,
+        f"http://127.0.0.1:{_free_port()}",
+        console_enabled=console_enabled,
+    )
+    # A loopback base_url: TestClient otherwise sends `Host: testserver`, which
+    # the gate refuses (421) before the routing question under test is reached.
+    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
+        resp = client.post("/session/s1/console/execute", json={"code": "1 + 1"})
+        assert resp.status_code == expected
+        # The data API is unaffected either way -- the switch narrows one root.
+        assert client.get("/session/s1/api/jobs").status_code == 502
+
+
+class _StopServe(Exception):
+    """Abort serve_control_api once build_app has been called (nothing binds)."""
+
+
+@pytest.mark.parametrize(
+    "host, expected",
+    [("127.0.0.1", True), ("localhost", True), ("0.0.0.0", False), ("::", False)],
+)
+def test_bind_address_decides_the_console(
+    monkeypatch, tmp_path, upstream, host, expected
+):
+    # The gate reads *this* listener's bind through the shared predicate: a
+    # loopback control enables the console, a network-reachable one does not --
+    # regardless of --remote or the data plane's own bind. Asserted on the call
+    # into build_app, so the "public" cases need no public listener.
+    captured = {}
+
+    def _capture(*_args, console_enabled, **_kwargs):
+        captured["console"] = console_enabled
+        raise _StopServe
+
+    monkeypatch.setattr("biopb_control._control.build_app", _capture)
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    with pytest.raises(_StopServe):
+        serve_control_api(
+            host,
+            _free_port(),
+            DataPlaneSupervisor(spec),
+            ensure_timeout=8.0,
+            data_web_url=upstream,
+        )
+    assert captured["console"] is expected
 
 
 def test_unknown_session_returns_404(control):

@@ -59,6 +59,12 @@ never imports — the proxy reaches it over loopback like any other client.
   accepted regardless of which external hostname the browser used to reach the
   control. (Rebinding/token protection for the origin as a whole is a
   follow-up, same as the data-plane proxy's.)
+- ``/session/<id>/console/*`` is the same hop for the **user console** — a code
+  cell on the observe page that runs in that session's kernel — and is proxied
+  **only when this control is loopback-bound** (``_session_proxy_roots``). It is
+  a separate root precisely so that "can a browser reach an RCE here?" stays one
+  checkable statement: ``api`` always, ``console`` local-mode only, ``/mcp``
+  never.
 
 This module lands the namespaced origin, the data-plane API proxy, per-session
 observe routing, and the control-served SPA bundle — the full single-origin
@@ -122,6 +128,43 @@ _HOP_BY_HOP = frozenset(
 # to /mcp past a naive "startswith('mcp')" check.
 _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 
+# The **conditionally** proxied root: the user console, a code cell on the observe
+# page that runs in the session's kernel (biopb-mcp ``docs/user-console.md``).
+# Kept out of the set above rather than added to it, because the two are gated
+# differently and the difference is the whole point: `api` is always proxied,
+# `console` only when this control is loopback-bound.
+#
+# Why a separate root at all. The allowlist exists to keep the child's /mcp — an
+# RCE on the same port — off this origin. An execute route folded into `api`
+# would put arbitrary code back through exactly that hole, silently: the
+# allowlist would still be there, still enforced, and no longer true. A distinct
+# root keeps the statement checkable — `api` always, `console` local-mode only,
+# `/mcp` never — and makes "is RCE reachable from the browser?" one boolean.
+#
+# That boolean assumes the root is **POST-only**, and `session_proxy` enforces
+# it rather than trusting the child to: the CSRF gate skips safe methods, so a
+# cross-site GET to any proxied root is forwarded unchecked.
+#
+# Known limitation: this reads the control's own **bind**, so a loopback control
+# deliberately published by a reverse proxy (the topology biopb-mcp CLAUDE.md
+# points at for untrusted networks) reads as local and gets the console. That
+# operator is already responsible for the token in front of the data plane; a
+# control-side opt-out flag is the follow-up if the reverse-proxy topology stops
+# being the exception.
+_SESSION_CONSOLE_ROOT = "console"
+
+
+def _session_proxy_roots(console_enabled: bool) -> frozenset[str]:
+    """The session-child path roots this control will proxy.
+
+    One source for both the proxy's own gate and the auth middleware, so the
+    guard and the thing it guards cannot disagree about what is reachable.
+    """
+    if console_enabled:
+        return _SESSION_ALLOWED_ROOTS | {_SESSION_CONSOLE_ROOT}
+    return _SESSION_ALLOWED_ROOTS
+
+
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
 # (GET/HEAD/OPTIONS) don't.
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -174,23 +217,23 @@ def _tail_file(path: Path, max_lines: int, max_bytes: int) -> tuple[list[str], b
     return lines, truncated
 
 
-def _is_session_api_path(path: str) -> bool:
-    """True for ``/session/<id>/<root>/...`` where ``<root>`` is a proxied session
-    surface — i.e. exactly what ``session_proxy`` forwards to the child.
+def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
+    """True for ``/session/<id>/<root>/...`` where ``<root>`` is in *roots* —
+    i.e. exactly what ``session_proxy`` forwards to the child.
 
-    Derived from the *same* ``_SESSION_ALLOWED_ROOTS`` the proxy's own gate uses,
-    so the guard and the thing it guards cannot drift: any path the proxy would
-    forward (including a bare ``/session/<id>/api`` with no further segment) is
-    gated, and any future root added to the allowlist is covered automatically.
-    Not ``/session/<id>/observe`` (the SPA shell), and not a bare
-    ``/session/<id>``."""
+    Takes the *same* root set the proxy's own gate uses, so the guard and the
+    thing it guards cannot drift: any path the proxy would forward (including a
+    bare ``/session/<id>/api`` with no further segment) is gated, and a root
+    added to the set is covered on both sides at once. Not
+    ``/session/<id>/observe`` (the SPA shell), and not a bare ``/session/<id>``.
+    """
     if not path.startswith("/session/"):
         return False
     rest = path[len("/session/") :]  # "<id>/<sub_path...>" (session ids are slash-free)
     slash = rest.find("/")
     if slash == -1:
         return False  # bare /session/<id>
-    return rest[slash + 1 :].split("/")[0] in _SESSION_ALLOWED_ROOTS
+    return rest[slash + 1 :].split("/")[0] in roots
 
 
 class _ControlAuthMiddleware:
@@ -224,11 +267,25 @@ class _ControlAuthMiddleware:
     via DNS-rebinding. The ``/observe`` shell (a plain SPA GET serving only the
     app bundle) stays open. ``/data_plane/*`` keeps its own gate (the sidecar
     re-validates the forwarded token), so it is not touched here.
+
+    ``session_roots`` is the proxy's own root set, so whatever that forwards is
+    what this gates — including ``/session/<id>/console/*`` when the console is
+    enabled, which is the one path where the request being gated is arbitrary
+    code. Note the gate is **necessary but not sufficient** for the console: it
+    judges the caller, not the topology, and would happily authorize an execute
+    on a public origin. What keeps the console off a public origin is that the
+    root is not proxied there at all (:func:`_session_proxy_roots`).
     """
 
-    def __init__(self, app: ASGIApp, token: str | None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        token: str | None,
+        session_roots=_SESSION_ALLOWED_ROOTS,
+    ) -> None:
         self.app = app
         self._token = token
+        self._session_roots = session_roots
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and self._guarded(scope["path"]):
@@ -239,11 +296,10 @@ class _ControlAuthMiddleware:
                 return
         await self.app(scope, receive, send)
 
-    @staticmethod
-    def _guarded(path: str) -> bool:
+    def _guarded(self, path: str) -> bool:
         if path.startswith("/api/"):
             return True
-        return _is_session_api_path(path)
+        return _is_proxied_session_path(path, self._session_roots)
 
     def _deny(self, method: str, get: _web_auth.HeaderGetter) -> Response | None:
         """The response to send if the request is refused, else ``None``."""
@@ -356,6 +412,7 @@ def build_app(
     data_web_url: str,
     token: str | None = None,
     static_dir: str | Path | None = None,
+    console_enabled: bool = False,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -369,7 +426,17 @@ def build_app(
     session's observe shell (``/session/<id>/observe``) are all React routes of
     that one SPA. Split out from :func:`serve_control_api` so it is unit-testable
     against a fake upstream without binding uvicorn.
+
+    ``console_enabled`` proxies ``/session/<id>/console/*`` — the user console,
+    which **executes code in that session's kernel**. Default off, and the
+    decision is the caller's because only it knows this control's bind address:
+    :func:`serve_control_api` derives it from a loopback bind, so a
+    network-reachable control never carries the console however it is
+    configured downstream. Deliberately *not* delegated to the session child —
+    the proxy hop strips Host and Origin, so the child cannot tell a browser
+    from this trusted loopback hop and cannot make this call.
     """
+    session_roots = _session_proxy_roots(console_enabled)
     ws_base = data_web_url.replace("http://", "ws://", 1).replace(
         "https://", "wss://", 1
     )
@@ -813,16 +880,30 @@ def build_app(
         sub_path = request.path_params["path"]
         # Allowlist the session data API only — the observe page itself is
         # the control-served SPA shell (session_observe below), so only /api/*
-        # proxies here. The child's /mcp agent transport is deliberately off this
-        # origin — agents reach it directly on the child's own loopback port
-        # (stdio shim bridge / `biopb mcp view`), never via the control — and this
-        # hop strips /mcp's entire auth (Host/Origin), so exposing it would be an
-        # RCE hole on the public origin. Require an allowed first segment AND
-        # reject any parent-traversal, so no path (raw, encoded, or dot-collapsed
-        # by httpx) can escape /api/* into /mcp.
+        # proxies here (plus /console/* where the console is enabled). The
+        # child's /mcp agent transport is deliberately off this origin — agents
+        # reach it directly on the child's own loopback port (stdio shim bridge /
+        # `biopb mcp view`), never via the control — and this hop strips /mcp's
+        # entire auth (Host/Origin), so exposing it would be an RCE hole on the
+        # public origin. Require an allowed first segment AND reject any
+        # parent-traversal, so no path (raw, encoded, or dot-collapsed by httpx)
+        # can escape an allowed root into /mcp.
         segments = sub_path.split("/")
-        if segments[0] not in _SESSION_ALLOWED_ROOTS or ".." in segments:
+        if segments[0] not in session_roots or ".." in segments:
             return JSONResponse({"error": "not found"}, status_code=404)
+        # The console is POST-only *here*, not merely in the child that happens
+        # to serve it that way. The CSRF gate upstream only inspects unsafe
+        # methods -- correct, since safe verbs must not change state -- so a
+        # cross-site GET (`<img src=".../console/execute?code=...">`) is
+        # forwarded unchecked, exactly as a GET to /api/jobs is. That is harmless
+        # only while nothing under this root acts on a GET, which is a promise
+        # about code living in another package. Pinning the method here makes the
+        # root's claim ("reaching the console requires a request a hostile page
+        # cannot forge") true at the layer that makes it, and fences off a future
+        # GET route that would silently reopen it. Checked before resolving the
+        # session, so it discloses nothing about which ids exist.
+        if segments[0] == _SESSION_CONSOLE_ROOT and request.method != "POST":
+            return JSONResponse({"error": "method not allowed"}, status_code=405)
         rec = _sessions.resolve(session_id)
         if rec is None:
             return JSONResponse(
@@ -951,7 +1032,9 @@ def build_app(
 
     # The /api/* auth gate wraps the whole app but acts only on /api/* (pure ASGI,
     # so the streaming proxies pass through untouched).
-    middleware = [Middleware(_ControlAuthMiddleware, token=token)]
+    middleware = [
+        Middleware(_ControlAuthMiddleware, token=token, session_roots=session_roots)
+    ]
     return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
@@ -1031,13 +1114,28 @@ def serve_control_api(
     # The data-plane token gates the control's own /api/* too (single
     # origin). None in local mode -> the gate falls back to a loopback Host check
     # instead.
+    #
+    # The user console (arbitrary code in a session's kernel) rides this origin
+    # only when the origin is same-machine. Derived from *this* listener's bind
+    # through the shared predicate, not from --remote or the plane's bind: what
+    # decides is who can reach this web front. Deliberately not gated by the
+    # token instead — the data-plane token authorizes reading pixels, is readable
+    # from the local credential file by design (biopb/biopb#470), and rides the
+    # render WebSocket as a query param; fine for viewing, and not a credential
+    # to trade for a shell. Remote console, if ever wanted, needs its own.
+    console_enabled = not _web_auth.host_is_public_bind(host)
     app = build_app(
         supervisor,
         ensure_timeout,
         data_web_url,
         token=spec.token,
         static_dir=spec.static_dir,
+        console_enabled=console_enabled,
     )
+    if not console_enabled:
+        logger.info(
+            "session console disabled: control bound to %s (not loopback)", host
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":

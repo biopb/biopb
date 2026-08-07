@@ -455,6 +455,79 @@ def _window_note(window_alive) -> str:
     return ""
 
 
+def _user_digest(host) -> list:
+    """The user-run cells the agent has not been told about, or ``[]``.
+
+    A pure read — see :func:`_ack_user_digest` for why the ack is a second call.
+    Auxiliary, like the window-liveness probe: a kernel that answers with
+    anything but the expected list yields no digest rather than breaking the
+    result the agent actually asked for.
+    """
+    digest, _res, _w = _run_job_call(host, "user_digest()")
+    if not digest or not isinstance(digest, list):
+        return []
+    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
+        return []
+    return digest
+
+
+def _ack_user_digest(host, digest) -> None:
+    """Retire the *terminal* entries of *digest*, once the note carrying them is
+    on its way back to the agent.
+
+    Split from the read because acking inside it consumed notices that were
+    never delivered: ``execute_interactive`` sends the request before it starts
+    its timeout clock, so a probe that times out is still queued at the kernel
+    and runs when the main thread frees up — setting the flag for a note nobody
+    received. Acking only after this process has parsed a reply keeps the
+    guarantee that a notice is deferred, never dropped.
+
+    Running entries are excluded here rather than in the kernel: they were
+    reported as ``running``, which is not the final status the agent is promised,
+    so they must stay pending even if they have finished since.
+    """
+    ids = [d["job_id"] for d in digest if d.get("status") != "running"]
+    if ids:
+        _run_job_call(host, "ack_user_digest(" + repr(ids) + ")")
+
+
+def _render_user_note(digest) -> str:
+    """The digest as a line appended to an agent-facing result, or ``""``.
+
+    The agent is not the only writer of this namespace: a person can run code
+    from the observe page, through the same job runner (``docs/user-console.md``).
+    That leaves the agent's picture of the namespace stale with nothing in its
+    own results to say so — hence this note, appended at the same seam as
+    ``_window_note``, which is how every other user-attributed fact already
+    reaches the agent (``cancel_reason``, ``teardown_reason``).
+
+    Deliberately says *that* something changed, not *what*: the agent is told to
+    re-verify, which is cheap and cannot go stale itself. It names **no** job id
+    in the instruction either — pointing at one of several invites an agent to
+    read that one, call the notice discharged, and never see the rest, which it
+    will not be offered again.
+    """
+    if not digest:
+        return ""
+    listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    return (
+        "\n\nⓘ The user ran code in this kernel: "
+        f"{listed}. A finished cell is reported once; a running one repeats "
+        "until it ends, so a repeat is not a new cell. Read them with poll_job. "
+        "Variables and layers may have changed — re-check with dir() / "
+        "viewer.layers rather than trusting what you last saw."
+    )
+
+
+def _user_activity_note(host) -> str:
+    """Read, render, and retire the user-activity notice, in that order."""
+    digest = _user_digest(host)
+    note = _render_user_note(digest)
+    if note:
+        _ack_user_digest(host, digest)
+    return note
+
+
 def _format_job_status(snap: dict) -> str:
     """Render a job snapshot (poll_job output)."""
     job_id = snap.get("job_id", "?")
@@ -637,17 +710,40 @@ def execute_code(python_code: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
+    # Read once at entry, append to whichever path returns below.
+    digest = _user_digest(host)
+    user_note = _render_user_note(digest)
+    if user_note:
+        _ack_user_digest(host, digest)
+
     submitted, res, window_alive = _run_job_call(
         host, "submit(" + repr(python_code) + ")"
     )
     if submitted is None:
-        return _format_execute_result(res)
+        return _format_execute_result(res) + user_note
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
+        # Whose job is running decides the advice. Telling the agent to
+        # "stop it with interrupt_kernel" while a *person* is running a cell
+        # would have it kill their work; interrupt_kernel refuses that anyway
+        # (_jobs.interrupt_current), so the wording must not send it there.
+        if submitted.get("running_job_origin") == "user":
+            # A running user job stays in the digest by design, so the note is
+            # about to report the very job this branch is reporting. Drop it
+            # when that is *all* it says; keep it when the user also finished
+            # other cells, since those were acked above and will not be offered
+            # again.
+            if [d.get("job_id") for d in digest] == [running]:
+                user_note = ""
+            return (
+                f"The user is running a cell ({running}) in this kernel. Only one "
+                f"job runs at a time — wait for it and poll_job('{running}'); do "
+                "not interrupt it." + user_note
+            )
         return (
             f"A job ({running}) is already running. Poll it with "
             f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another."
+            "restart_kernel before starting another." + user_note
         )
 
     job_id = submitted["job_id"]
@@ -657,10 +753,10 @@ def execute_code(python_code: str) -> str:
         time.sleep(0.4)
         snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
-            return _format_execute_result(res)
+            return _format_execute_result(res) + user_note
         if snap.get("status") != "running":
             # terminal: inline result
-            return _format_execute_result(snap) + _window_note(window_alive)
+            return _format_execute_result(snap) + _window_note(window_alive) + user_note
 
     # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
@@ -668,7 +764,10 @@ def execute_code(python_code: str) -> str:
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with interrupt_kernel or restart_kernel.\n"
-        "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
+        "Partial output:\n"
+        + (partial or "(none yet)")
+        + _window_note(window_alive)
+        + user_note
     )
 
 
@@ -684,13 +783,14 @@ def poll_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
+    user_note = _user_activity_note(host)
     snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
     if snap is None:
-        return _format_execute_result(res)
+        return _format_execute_result(res) + user_note
     if snap.get("status") == "unknown":
-        return f"No such job '{job_id}'."
+        return f"No such job '{job_id}'." + user_note
     note = _window_note(window_alive) if snap.get("status") != "running" else ""
-    return _format_job_status(snap) + note
+    return _format_job_status(snap) + note + user_note
 
 
 @mcp.tool()
@@ -720,15 +820,29 @@ def interrupt_kernel() -> str:
     thread) can't reach it — this raises the exception directly into the worker.
     Best-effort: it lands at the next bytecode, so a
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
-    it returns to Python; if the kernel stays stuck, use restart_kernel — the
+    it returns to Python; if YOUR job stays stuck, use restart_kernel — the
     guaranteed stop.
+
+    Stops YOUR job only. A cell the user ran from the observe page shares this
+    kernel and this one-job-at-a-time runner, but is not yours to stop: this
+    refuses it, and you should wait for it instead. A refusal is not a stuck
+    kernel and restart_kernel is not the way around it — restarting would destroy
+    the user's running cell, variables and layers along with yours. Wait, or ask
+    them.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
-    data, res, _w = _run_job_call(host, "interrupt_current()")
+    data, res, _w = _run_job_call(host, "interrupt_current(requester='agent')")
     if data is None:
         return _format_execute_result(res)
+    if data.get("refused") == "user_job":
+        running = data.get("job_id")
+        return (
+            f"Refused: {running} was started by the user, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{running}'). (The user can "
+            "stop their own cell from the observe page.)"
+        )
     if data.get("interrupted"):
         return (
             f"Interrupted job {data.get('job_id')} (KeyboardInterrupt raised in "
@@ -776,6 +890,12 @@ def restart_kernel() -> str:
     respawns a fresh kernel, rebuilding the tensor client and the napari
     viewer. All variables defined in previous execute_code calls are lost; a
     new viewer window replaces the old one.
+
+    This destroys the USER's work too, not only yours — their running cell,
+    their variables, their layers — and it is not undoable or announced to them
+    beforehand. So it is not the way past a refused interrupt_kernel or a kernel
+    busy with a user cell: neither is a runaway. Use it when the kernel is truly
+    wedged, and prefer asking first when someone is working in it.
     """
     host = _kernel_host
     if host is None:
@@ -889,7 +1009,9 @@ def server_status() -> str:
             "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
-    return "\n".join(lines)
+    # Only on this path: the early returns above are all "kernel not usable",
+    # where the digest round-trip cannot land anyway.
+    return "\n".join(lines) + _user_activity_note(host)
 
 
 # ---------------------------------------------------------------------------

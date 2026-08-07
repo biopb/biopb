@@ -69,6 +69,7 @@ namespace, which would collide at the root. So the control serves
 | `/data_plane/api/*`, `/data_plane/ws/render` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
+| `/session/<id>/console/*` | that session's user console — **loopback-bound control only** | loopback proxy |
 | `/mcp` | agent JSON-RPC — **not routed here**; shim → child, direct | — |
 
 The SPA is built with base `/` so its assets resolve from the root under any shell
@@ -94,8 +95,22 @@ authenticated, for itself and for everything it fronts.
 - **The `/session/<id>` proxy is an allowlist, not a denylist.** A session child's
   `/mcp` is arbitrary code execution sharing the same port as its observe API, and
   path normalization would let a denylist be walked around (`api/../mcp`
-  collapsing onto `/mcp`). Only a first path segment of `observe` or `api` is
-  proxied; parent traversal is rejected.
+  collapsing onto `/mcp`). Only a first path segment of `api` — or `console`,
+  under the rule below — is proxied; parent traversal is rejected. (`observe` is
+  not proxied at all: the page is the control's own SPA shell, served in-process.)
+- **The user console is a separate root, gated on this listener's bind.** A code
+  cell on the observe page runs in that session's kernel, so it is an RCE on the
+  same origin the allowlist above exists to keep RCE off. Folding it into `api`
+  would leave that allowlist enforced but no longer true, so it gets its own root
+  and is proxied only when the control is loopback-bound — `api` always, `console`
+  local-mode only, `/mcp` never. The control decides because only it knows its own
+  bind: the proxy hop strips Host and Origin, so the child cannot tell a browser
+  from this trusted hop. Not gated by the token instead: that credential
+  authorizes reading pixels, is readable from a local file by design, and rides
+  the render WS as a query param — fine for viewing, not a thing to trade for a
+  shell. Known limit: a loopback control published by a reverse proxy reads as
+  local; that operator owns the exposure decision, as they already do for the
+  data-plane token.
 - **Supervised restart is control-routed, not blind-proxied.** The tensor
   sidecar's self-restart spawns a detached process — correct standalone, but under
   supervision it would race the supervisor for the port. So the control marks its
