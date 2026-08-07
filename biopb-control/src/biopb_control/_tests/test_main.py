@@ -177,3 +177,54 @@ def test_public_control_host_with_token_starts():
     )
     assert rc == 0
     assert kwargs["control_host"] == "0.0.0.0"
+
+
+def test_url_prefix_flag_reaches_the_spec():
+    rc, spec, _ = _capture(_BASE_ARGV + ["--url-prefix", "/node/h/29847"], {})
+    assert rc == 0
+    assert spec.url_prefix == "/node/h/29847"
+
+
+def test_url_prefix_falls_back_to_the_env():
+    # `biopb control start` passes --url-prefix explicitly, but a direct
+    # `python -m biopb_control run` (an OnDemand before.sh exporting it) reads
+    # BIOPB_URL_PREFIX here (biopb/biopb#728).
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_URL_PREFIX": "/node/h/29847"})
+    assert rc == 0
+    assert spec.url_prefix == "/node/h/29847"
+
+
+def test_url_prefix_flag_wins_over_env():
+    rc, spec, _ = _capture(
+        _BASE_ARGV + ["--url-prefix", "/from-flag"],
+        {"BIOPB_URL_PREFIX": "/from-env"},
+    )
+    assert rc == 0
+    assert spec.url_prefix == "/from-flag"
+
+
+def test_no_url_prefix_anywhere_is_none():
+    rc, spec, _ = _capture(_BASE_ARGV, {})
+    assert rc == 0
+    assert spec.url_prefix is None
+
+
+def test_hostile_url_prefix_is_refused_before_start():
+    # A prefix that is not a plain same-origin path would end up in the served
+    # <base href>, repointing every relative URL in the SPA. Refuse to start, and
+    # say which segment (biopb/biopb#728).
+    rc, spec, _ = _capture(_BASE_ARGV + ["--url-prefix", "/\\evil.com"], {})
+    assert rc == 2
+    assert spec is None  # run_control never reached
+
+
+def test_hostile_url_prefix_from_the_env_is_refused_too():
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_URL_PREFIX": "/a?b"})
+    assert rc == 2
+    assert spec is None
+
+
+def test_url_prefix_reaches_the_spec_normalized():
+    rc, spec, _ = _capture(_BASE_ARGV + ["--url-prefix", "/node/h/29847/"], {})
+    assert rc == 0
+    assert spec.url_prefix == "/node/h/29847"

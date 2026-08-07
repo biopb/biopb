@@ -32,8 +32,10 @@ from biopb_control._control import (
     _SESSION_ALLOWED_ROOTS,
     _is_proxied_session_path,
     _loopback_url,
+    _rewrite_shell_html,
     _session_proxy_roots,
     build_app,
+    normalize_url_prefix,
     serve_control_api,
 )
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -1214,6 +1216,306 @@ def test_websocket_render_is_proxied(ws_upstream, tmp_path):
             assert ws.recv() == b"\x00\x01\x02"  # binary upstream -> client
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# --url-prefix: publishing this origin under a reverse-proxy path prefix
+# (biopb/biopb#728 — an Open OnDemand /node/<host>/<port>/ route).
+# --------------------------------------------------------------------------- #
+_PREFIX = "/node/mantis-051/29847"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("/node/h/29847", "/node/h/29847"),
+        ("node/h/29847", "/node/h/29847"),  # leading slash supplied
+        ("/node/h/29847/", "/node/h/29847"),  # trailing slash dropped
+        ("//node//h//", "/node/h"),  # empty segments collapsed
+        ("  /node/h  ", "/node/h"),
+        ("/", None),  # the root origin is "no prefix"
+        ("", None),
+        (None, None),
+    ],
+)
+def test_normalize_url_prefix(raw, expected):
+    assert normalize_url_prefix(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        # WHATWG URL parsing resolves <base href="/\evil.com/"> against the
+        # document to http://evil.com/ -- a backslash right after the leading
+        # slash enters the authority, so every relative URL in the SPA leaves the
+        # origin. Browsers strip tabs/newlines *before* parsing, so those reach
+        # the same position.
+        "/\\evil.com",
+        "\\\\evil.com",
+        "/a\t\\evil.com",
+        "/a\n\\evil.com",
+        "/a /b",
+        # A scheme-ish prefix must not survive as one.
+        "https://evil.com/x",
+        # Query/fragment in a <base href> silently rewrites what relatives mean.
+        "/a?b",
+        "/a#b",
+        # Percent-encoding cannot be both decoded (what the middleware strips
+        # from scope["path"]) and encoded (what the shell carries) at once.
+        "/a%2fb",
+        # Dot segments make the served <base href> and the stripped path disagree.
+        "/a/../b",
+        "/a/./b",
+        # HTML/JS metacharacters: escaped at both injection sites too, so this is
+        # the outer of two layers.
+        '/a"onerror=x',
+        "/a<script>",
+        "/a</script><script>",
+    ],
+)
+def test_normalize_url_prefix_rejects_non_paths(hostile):
+    # Fail closed: a prefix that is not a plain same-origin path is a refusal to
+    # start, not a document whose every relative URL points somewhere else.
+    with pytest.raises(ValueError, match="invalid URL prefix segment"):
+        normalize_url_prefix(hostile)
+
+
+def test_build_app_rejects_a_hostile_prefix(tmp_path, web_bundle):
+    # The rule binds at the single consumer, so no entry point can route around
+    # it by constructing a spec directly.
+    spec = DataPlaneSpec(config=tmp_path / "config.json", grpc_port=_free_port())
+    with pytest.raises(ValueError):
+        build_app(
+            DataPlaneSupervisor(spec),
+            8.0,
+            "http://127.0.0.1:1",
+            static_dir=web_bundle,
+            url_prefix="/\\evil.com",
+        )
+
+
+def test_rewrite_shell_html_injects_base_and_runtime_global():
+    out = _rewrite_shell_html(
+        '<!doctype html><html><head><meta charset="utf-8" />'
+        '<link rel="icon" href="/favicon.ico" />'
+        '<script type="module" crossorigin src="/assets/index-abc.js"></script>'
+        '<link rel="stylesheet" href="//cdn.example/x.css">'
+        '<a href="relative/page">x</a>'
+        "</head><body></body></html>",
+        "/node/h/29847",
+    )
+    # <base> comes first in <head>, before anything that could resolve against it.
+    assert out.index("<base href=") < out.index("<meta")
+    assert '<base href="/node/h/29847/">' in out
+    # The runtime hook the SPA reads instead of the build-time BASE_URL.
+    assert 'window.__BIOPB_BASE__="/node/h/29847"' in out
+    # Root-absolute refs are rewritten (<base> cannot touch them)...
+    assert 'href="/node/h/29847/favicon.ico"' in out
+    assert 'src="/node/h/29847/assets/index-abc.js"' in out
+    # ...while protocol-relative and already-relative URLs are left alone.
+    assert 'href="//cdn.example/x.css"' in out
+    assert 'href="relative/page"' in out
+
+
+def test_rewrite_shell_html_without_head_still_injects_first():
+    out = _rewrite_shell_html('<div id="root"></div>', "/p")
+    assert out.startswith('<base href="/p/">')
+
+
+@pytest.fixture
+def prefix_bundle(tmp_path):
+    """A bundle whose index.html looks like the real Vite output: a <head> and
+    root-absolute refs to the entry chunk and the icons."""
+    d = tmp_path / "prefixed-webapp"
+    (d / "assets").mkdir(parents=True)
+    (d / "index.html").write_text(
+        "<!doctype html><html><head>"
+        '<link rel="icon" href="/favicon.ico" />'
+        '<script type="module" crossorigin src="/assets/app.js"></script>'
+        '</head><body><div id="root"></div><!-- biopb-spa-shell --></body></html>'
+    )
+    (d / "assets" / "app.js").write_text("console.log('biopb');")
+    return d
+
+
+@pytest.fixture
+def prefixed_control(upstream, tmp_path, prefix_bundle):
+    """A control published under ``_PREFIX``; yields its base URL (no prefix)."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        static_dir=prefix_bundle,
+        url_prefix=_PREFIX,
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        yield f"http://127.0.0.1:{api_port}"
+    finally:
+        server.shutdown()
+
+
+def test_prefixed_shell_carries_the_prefix(prefixed_control):
+    # The portal passes the full path through, so the shell must come back
+    # pointing at itself under the prefix -- otherwise every asset ref leaves the
+    # app's namespace and the page is a blank <div id="root">.
+    status, headers, body = _get(f"{prefixed_control}{_PREFIX}/")
+    assert status == 200
+    assert "text/html" in (headers.get("Content-Type") or "")
+    html = body.decode()
+    assert "biopb-spa-shell" in html
+    assert f'<base href="{_PREFIX}/">' in html
+    assert f'window.__BIOPB_BASE__="{_PREFIX}"' in html
+    assert f'src="{_PREFIX}/assets/app.js"' in html
+
+
+def test_prefixed_deep_link_and_asset_resolve(prefixed_control):
+    # A deep link under the prefix falls back to the shell, and the asset the
+    # shell now points at is served as the real file.
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}/viewer")
+    assert status == 200
+    assert "biopb-spa-shell" in body.decode()
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}/assets/app.js")
+    assert status == 200
+    assert "console.log('biopb')" in body.decode()
+
+
+def test_bare_prefix_with_no_trailing_slash_serves_the_shell(prefixed_control):
+    # `/node/h/p` (the prefix itself) is the app root, not a 404.
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}")
+    assert status == 200
+    assert "biopb-spa-shell" in body.decode()
+
+
+def test_unprefixed_requests_still_work(prefixed_control):
+    # biopb-mcp's _control_client and the installer poll /health over loopback
+    # with no prefix; configuring one for the portal must not break them.
+    status, _headers, body = _get(f"{prefixed_control}/health")
+    assert status == 200
+    assert json.loads(body)["control"] == "ok"
+    status, _headers, body = _get(f"{prefixed_control}/api/status")
+    assert status == 200 and json.loads(body)["control"] == "ok"
+    # And the shell served to a direct localhost hit still boots: the browser
+    # asks for <prefix>/assets/... on this same origin, which strips back off.
+    _status, _headers, body = _get(f"{prefixed_control}/")
+    assert f'src="{_PREFIX}/assets/app.js"' in body.decode()
+
+
+def test_prefix_matches_only_on_a_segment_boundary(prefixed_control):
+    # `/node/mantis-051/29847x` shares a string prefix but is not under it, so it
+    # is left alone and falls through to the SPA catch-all like any unknown path
+    # -- never half-stripped into `x/...`.
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}x/api/status")
+    assert status == 200
+    assert "biopb-spa-shell" in body.decode()  # the shell, not the control API
+
+
+def test_prefixed_control_api_is_reachable(prefixed_control):
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}/api/status")
+    assert status == 200
+    assert json.loads(body)["control"] == "ok"
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}/health")
+    assert status == 200 and json.loads(body)["control"] == "ok"
+
+
+def test_prefixed_data_plane_proxy_strips_both_prefixes(prefixed_control):
+    # Prefix stripped by the middleware, /data_plane by the Mount: the sidecar
+    # still sees a root-relative path and knows nothing of either namespace.
+    status, _headers, body = _get(f"{prefixed_control}{_PREFIX}/data_plane/api/x?a=1")
+    assert status == 200
+    assert json.loads(body)["path"] == "/api/x?a=1"
+
+
+def test_prefixed_session_api_is_proxied(prefixed_control, upstream):
+    _register_session("s-prefixed", upstream)
+    _status, _headers, body = _get(
+        f"{prefixed_control}{_PREFIX}/session/s-prefixed/api/jobs?limit=5"
+    )
+    assert json.loads(body)["path"] == "/api/jobs?limit=5"
+
+
+@pytest.fixture
+def tokened_prefixed_control(upstream, tmp_path, prefix_bundle):
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        token=_TOKEN,
+        static_dir=prefix_bundle,
+        url_prefix=_PREFIX,
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        yield f"http://127.0.0.1:{api_port}"
+    finally:
+        server.shutdown()
+
+
+def test_prefixed_api_is_still_token_gated(tokened_prefixed_control):
+    # The reason the prefix stripper has to be the OUTERMOST middleware: the auth
+    # gate matches on scope["path"], so a still-prefixed /node/h/p/api/... would
+    # not look like /api/ to it and would reach the verb ungated -- an auth
+    # bypass, not a 404.
+    for path in ("/api/status", "/api/data_plane/restart"):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{tokened_prefixed_control}{_PREFIX}{path}")
+        assert exc.value.code == 401, path
+    status, _headers, body = _get(
+        f"{tokened_prefixed_control}{_PREFIX}/api/status",
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert status == 200 and json.loads(body)["control"] == "ok"
+
+
+def test_prefixed_session_api_is_still_token_gated(tokened_prefixed_control, upstream):
+    _register_session("s-gated", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_prefixed_control}{_PREFIX}/session/s-gated/api/jobs")
+    assert exc.value.code == 401
+
+
+def test_prefixed_websocket_render_is_proxied(ws_upstream, tmp_path):
+    # The render WebSocket is a `websocket` scope, not `http` -- it has to be
+    # stripped too, or the browser's ${apiBase}/ws/render never connects.
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        url_prefix=_PREFIX,
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=ws_upstream
+    )
+    try:
+        with ws_connect(
+            f"ws://127.0.0.1:{api_port}{_PREFIX}/data_plane/ws/render?token=t"
+        ) as ws:
+            ws.send("hello")
+            assert ws.recv() == "echo:hello"
+            assert ws.recv() == b"\x00\x01\x02"
+    finally:
+        server.shutdown()
+
+
+def test_no_prefix_serves_the_shell_verbatim(control):
+    # The whole feature is a no-op when unconfigured: no <base>, no injected
+    # global, index.html served as the file it is.
+    _status, _headers, body = _get(f"{control}/")
+    html = body.decode()
+    assert "<base href=" not in html
+    assert "__BIOPB_BASE__" not in html
 
 
 # --------------------------------------------------------------------------- #

@@ -36,6 +36,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--web-host", default="127.0.0.1")
     run.add_argument("--web-port", type=int, default=8814)
     run.add_argument("--static-dir", default=None)
+    run.add_argument(
+        "--url-prefix",
+        default=None,
+        help="path prefix a reverse proxy publishes this web origin under, e.g. "
+        "/node/$host/$port for an Open OnDemand app (or BIOPB_URL_PREFIX). "
+        "Configuration only -- never inferred from a request header.",
+    )
     run.add_argument("--log-level", default="INFO")
     run.add_argument("--server-log", default=None, help="data-plane stdout/stderr log")
     run.add_argument(
@@ -131,6 +138,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Validate the URL prefix here so a bad one is a named configuration error
+    # rather than a traceback out of build_app. Normalizing twice is harmless
+    # (it is pure and idempotent); build_app stays the authority.
+    from ._control import normalize_url_prefix
+
+    url_prefix = args.url_prefix or os.environ.get("BIOPB_URL_PREFIX") or None
+    try:
+        url_prefix = normalize_url_prefix(url_prefix)
+    except ValueError as exc:
+        print(f"biopb-control: {exc}", file=sys.stderr)
+        return 2
+
     spec = DataPlaneSpec(
         config=Path(args.config),
         grpc_host=args.grpc_host,
@@ -142,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
         log_level=args.log_level,
         server_log=Path(args.server_log) if args.server_log else None,
         token=token,
+        # Env fallback for a direct `python -m biopb_control run`; `biopb control
+        # start` passes it explicitly (and inherits the env anyway).
+        url_prefix=url_prefix,
     )
     return run_control(
         spec,

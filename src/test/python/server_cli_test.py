@@ -303,6 +303,22 @@ class TestControlRunArgv:
         assert argv[argv.index("--control-host") + 1] == "127.0.0.1"
         assert argv[argv.index("--web-host") + 1] == "127.0.0.1"
 
+    def test_url_prefix_is_forwarded_only_when_set(self, tmp_path):
+        # Unlike the token, the prefix is not a secret -- it is a compute node's
+        # hostname and a port -- so it rides the argv (biopb/biopb#728).
+        assert "--url-prefix" not in self._argv(tmp_path, grpc_bind="127.0.0.1")
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="127.0.0.1",
+            url_prefix="/node/mantis-051/29847",
+        )
+        assert argv[argv.index("--url-prefix") + 1] == "/node/mantis-051/29847"
+
 
 class TestUiTunnelHint:
     """With the UI off the network, the SSH tunnel is the supported way to reach
