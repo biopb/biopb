@@ -35,6 +35,15 @@ export default defineConfig({
         target: "http://localhost:8813",
         changeOrigin: true,
       },
+      // The user console is a *separate* root from the session api on purpose
+      // (the control proxies it only on a loopback bind), so it needs its own
+      // rule — without it a submitted cell POSTs into the SPA fallback above,
+      // gets index.html back, and fails on the JSON parse with the editor
+      // looking perfectly functional.
+      "^/session/[^/]+/console": {
+        target: "http://localhost:8813",
+        changeOrigin: true,
+      },
     },
   },
 });
