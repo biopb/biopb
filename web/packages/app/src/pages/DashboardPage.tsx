@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { withBase } from "../base";
 import {
   authHeaders,
   authRequired,
@@ -107,7 +108,7 @@ export default function DashboardPage() {
 
   const pollStatus = useCallback(async () => {
     try {
-      const s = await (await fetchAuth("/api/status")).json();
+      const s = await (await fetchAuth(withBase("/api/status"))).json();
       setConn("control: ok · " + (s.sessions || 0) + " session(s)");
       setConnOk(true);
       setDataPlane(s.data_plane || {});
@@ -120,7 +121,7 @@ export default function DashboardPage() {
 
   const pollSessions = useCallback(async () => {
     try {
-      const data = await (await fetchAuth("/api/sessions")).json();
+      const data = await (await fetchAuth(withBase("/api/sessions"))).json();
       setSessions((data && data.sessions) || []);
     } catch {
       /* keep last */
@@ -129,7 +130,7 @@ export default function DashboardPage() {
 
   const pollAgents = useCallback(async () => {
     try {
-      const data = await (await fetchAuth("/api/agents")).json();
+      const data = await (await fetchAuth(withBase("/api/agents"))).json();
       setAgents((data && data.agents) || []);
     } catch {
       /* keep last */
@@ -138,7 +139,7 @@ export default function DashboardPage() {
 
   const pollAlgos = useCallback(async () => {
     try {
-      const data = await (await fetchAuth("/api/algorithms")).json();
+      const data = await (await fetchAuth(withBase("/api/algorithms"))).json();
       setAlgos((data && data.servers) || []);
       setPlugins((data && data.plugins) || null);
     } catch {
@@ -203,7 +204,7 @@ export default function DashboardPage() {
         return;
       setAgentsBusy(true);
       const res = await jpost(
-        "/api/agents/" + encodeURIComponent(id) + "/" + act,
+        withBase("/api/agents/") + encodeURIComponent(id) + "/" + act,
       );
       if (res && res.error) alert("Failed: " + res.error);
       await pollAgents();
@@ -220,7 +221,7 @@ export default function DashboardPage() {
       <header>
         <img
           className="topbar-logo"
-          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          src={withBase("/biopb-logo.png")}
           alt=""
           aria-hidden="true"
         />
@@ -243,7 +244,7 @@ export default function DashboardPage() {
         {/* biopb-mcp's own global settings (transport/kernel/dask/algorithm
             servers), served by the control at /api/mcp_config. A top-level nav
             link — it is neither a data-plane nor a per-session concern. */}
-        <a className="hdr-link" href="/mcp/admin" target="_blank" rel="noopener">
+        <a className="hdr-link" href={withBase("/mcp/admin")} target="_blank" rel="noopener">
           <svg
             className="gear-icon"
             viewBox="0 0 16 16"
@@ -288,13 +289,13 @@ export default function DashboardPage() {
             ) : null}
           </dl>
           <div className="controls">
-            <button disabled={verbBusy} onClick={() => verb("/api/data_plane/ensure")}>
+            <button disabled={verbBusy} onClick={() => verb(withBase("/api/data_plane/ensure"))}>
               Ensure up
             </button>
             <button
               disabled={verbBusy}
               onClick={() =>
-                verb("/api/data_plane/restart", "Restart the data plane?")
+                verb(withBase("/api/data_plane/restart"), "Restart the data plane?")
               }
             >
               Restart
@@ -304,7 +305,7 @@ export default function DashboardPage() {
               disabled={verbBusy}
               onClick={() =>
                 verb(
-                  "/api/data_plane/stop",
+                  withBase("/api/data_plane/stop"),
                   "Stop the data plane? Clients lose it until an Ensure.",
                 )
               }
@@ -313,7 +314,7 @@ export default function DashboardPage() {
             </button>
             <a
               className={"link" + (linksOff ? " off" : "")}
-              href="/viewer"
+              href={withBase("/viewer")}
               target="_blank"
               rel="noopener"
             >
@@ -321,7 +322,7 @@ export default function DashboardPage() {
             </a>
             <a
               className={"link" + (linksOff ? " off" : "")}
-              href="/admin"
+              href={withBase("/admin")}
               target="_blank"
               rel="noopener"
             >
@@ -330,7 +331,7 @@ export default function DashboardPage() {
             {/* The data-plane log tail. Available regardless of plane state (a
                 crashed plane's log is exactly what you want to read), so unlike
                 the viewer/config links it is never disabled. */}
-            <a className="link" href="/logs" target="_blank" rel="noopener">
+            <a className="link" href={withBase("/logs")} target="_blank" rel="noopener">
               Logs →
             </a>
           </div>

@@ -14,6 +14,8 @@
 // (`auth_required`). The bundle itself, `/health`, and `/unlock` are always
 // served unauthenticated so the app can bootstrap far enough to ask for a token.
 
+import { appPath, withBase } from "./base";
+
 const TOKEN_KEY = "biopb_token";
 
 export function getToken(): string | null {
@@ -54,7 +56,7 @@ export function captureUrlToken(): boolean {
  * transient failure never traps the user on the unlock page. */
 export async function authRequired(): Promise<boolean> {
   try {
-    const r = await fetch("/health");
+    const r = await fetch(withBase("/health"));
     if (!r.ok) return false;
     const j = await r.json();
     return !!j.auth_required;
@@ -70,7 +72,7 @@ export async function authRequired(): Promise<boolean> {
  * read: an editor whose every submit 404s is worse than no editor. */
 export async function consoleEnabled(): Promise<boolean> {
   try {
-    const r = await fetch("/health");
+    const r = await fetch(withBase("/health"));
     if (!r.ok) return false;
     const j = await r.json();
     return !!j.console_enabled;
@@ -81,8 +83,10 @@ export async function consoleEnabled(): Promise<boolean> {
 
 /** Send the browser to the unlock page, returning here afterwards. */
 export function redirectToUnlock(): void {
-  const here = window.location.pathname;
+  // `here` is a router path (so UnlockPage can navigate() back to it), while the
+  // assign target is a real URL and needs the prefix.
+  const here = appPath(window.location.pathname);
   const next =
     here && here !== "/unlock" ? "?next=" + encodeURIComponent(here) : "";
-  window.location.assign("/unlock" + next);
+  window.location.assign(withBase("/unlock") + next);
 }

@@ -206,8 +206,10 @@ jobs:
           pnpm -C web run sync-version
           pnpm -C web --filter @biopb/tensor-flight-client build
           # The control front is the single web origin: it serves this bundle at
-          # its root and proxies the data API + WS under /data_plane. Base is "/".
-          VITE_TENSOR_API="/data_plane" pnpm -C web --filter @biopb/web build
+          # its root and proxies the data API + WS under /data_plane. Base is "/";
+          # the data-plane base and any --url-prefix are resolved at runtime, so
+          # there is no build-time env to bake.
+          pnpm -C web --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C web/packages/app dist
 
       # Curated CC0 sample images (docs/release-model.md). A fresh, config-less

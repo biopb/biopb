@@ -974,6 +974,23 @@ def _guard_ports_free(base_port: int, grpc_bind: str, data_plane: bool) -> None:
         raise typer.Exit(1)
 
 
+def _resolve_url_prefix(url_prefix: Optional[str]) -> Optional[str]:
+    """Normalize ``--url-prefix`` / ``$BIOPB_URL_PREFIX``, or exit naming the fault.
+
+    Rejected here, before anything is spawned or bound, because the prefix ends
+    up in the served ``<base href>``: a value that is not a plain same-origin
+    path would repoint every relative URL in the SPA (biopb/biopb#728). The rule
+    itself lives in biopb_control, next to the code that consumes it.
+    """
+    from biopb_control._control import normalize_url_prefix
+
+    try:
+        return normalize_url_prefix(url_prefix)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2)
+
+
 def _control_run_argv(
     *,
     config: Path,
@@ -984,6 +1001,7 @@ def _control_run_argv(
     data_plane: bool,
     grpc_bind: str,
     tls: bool = False,
+    url_prefix: Optional[str] = None,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -1035,6 +1053,9 @@ def _control_run_argv(
     ]
     if static_dir and static_dir.exists():
         argv += ["--static-dir", str(static_dir)]
+    if url_prefix:
+        # Not secret (it is a hostname and a port), unlike the token above.
+        argv += ["--url-prefix", url_prefix]
     if not data_plane:
         argv.append("--no-data-plane")
     if tls:
@@ -1099,6 +1120,18 @@ _OPT_TOKEN = typer.Option(
     "the browser too; local clients read it from the credential file the control "
     "writes, so biopb-mcp needs no environment of its own (biopb/biopb#470).",
 )
+_OPT_URL_PREFIX = typer.Option(
+    None,
+    "--url-prefix",
+    envvar="BIOPB_URL_PREFIX",
+    help="Path prefix a reverse proxy publishes the browser UI under, instead of "
+    "the origin root — e.g. --url-prefix /node/$host/$port for an Open OnDemand "
+    "interactive app, whose route passes the full path through and rewrites "
+    "nothing. Requests under the prefix are stripped before routing and the SPA "
+    "shell is rewritten to point back at it; unprefixed requests keep working. "
+    "Explicit configuration only: the prefix is never read off a request header "
+    "such as X-Forwarded-Prefix.",
+)
 _OPT_DATA_PLANE = typer.Option(
     True,
     "--data-plane/--no-data-plane",
@@ -1120,6 +1153,7 @@ def control_start(
     tls: Optional[bool] = _OPT_TLS,
     token: Optional[str] = _OPT_TOKEN,
     data_plane: bool = _OPT_DATA_PLANE,
+    url_prefix: Optional[str] = _OPT_URL_PREFIX,
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -1160,6 +1194,7 @@ def control_start(
     """
     _require_biopb_control()
     grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
+    url_prefix = _resolve_url_prefix(url_prefix)
     tls = _resolve_tls(tls, grpc_bind)
     if tls:
         _require_tls_extra()
@@ -1202,6 +1237,7 @@ def control_start(
                 data_plane=data_plane,
                 grpc_bind=grpc_bind,
                 tls=tls,
+                url_prefix=url_prefix,
             )
 
             log_file = _control_log_file()
@@ -1457,6 +1493,7 @@ def control_run(
     tls: Optional[bool] = _OPT_TLS,
     token: Optional[str] = _OPT_TOKEN,
     data_plane: bool = _OPT_DATA_PLANE,
+    url_prefix: Optional[str] = _OPT_URL_PREFIX,
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -1480,6 +1517,7 @@ def control_run(
     """
     _require_biopb_control()
     grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
+    url_prefix = _resolve_url_prefix(url_prefix)
     tls = _resolve_tls(tls, grpc_bind)
     if tls:
         _require_tls_extra()
@@ -1513,6 +1551,7 @@ def control_run(
         log_level=log_level,
         server_log=_get_log_file(),
         token=resolved_token,
+        url_prefix=url_prefix,
     )
     code = run_control(
         spec,
@@ -1572,6 +1611,11 @@ def dashboard(
         # returns only once the control API is listening). It signals its outcome
         # by raising typer.Exit; a non-zero code means the plane never came up, so
         # bail out rather than open a browser at a dead URL.
+        #
+        # EVERY parameter has to be passed explicitly: called as a plain function
+        # the typer defaults are not applied, so an omitted one arrives as the
+        # `OptionInfo` sentinel — truthy, and not the type the body expects.
+        # test_ui_passes_every_control_start_parameter holds this to the signature.
         try:
             control_start(
                 config=DEFAULT_CONFIG,
@@ -1583,6 +1627,7 @@ def dashboard(
                 token=None,
                 data_plane=True,
                 remote=remote,
+                url_prefix=None,
             )
         except typer.Exit as started:
             if started.exit_code:

@@ -26,6 +26,7 @@ import {
   navIdForErrorPath,
 } from "../components/admin/adminSections";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { withBase } from "../base";
 
 type Config = Record<string, unknown>;
 
@@ -37,7 +38,7 @@ const RESTART_TIMEOUT_MS = 60_000;
  * The control's verb blocks until the plane is back (or errors); the caller's
  * poll loop then confirms serving state. See biopb/biopb#418. */
 async function restartViaControl(): Promise<void> {
-  const r = await fetch("/api/data_plane/restart", {
+  const r = await fetch(withBase("/api/data_plane/restart"), {
     method: "POST",
     headers: authHeaders(),
   });
@@ -390,7 +391,7 @@ export function AdminPage() {
       <header className="app-topbar">
         <img
           className="topbar-logo"
-          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          src={withBase("/biopb-logo.png")}
           alt=""
           aria-hidden="true"
         />

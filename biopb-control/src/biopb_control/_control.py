@@ -31,7 +31,10 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      shell (``/session/<id>/observe``) are all
                                      React routes of that one SPA — no build-time
                                      namespacing, base ``/``. (No bundle ->
-                                     API-only.)
+                                     API-only.) ``url_prefix`` republishes the
+                                     whole origin under a reverse-proxy path
+                                     prefix at run time; see
+                                     ``docs/url-prefix.md``.
 - ``/data_plane/{api,ws,livez,...}`` is reverse-proxied to the supervised tensor
   server's HTTP sidecar — a ``Mount`` that strips its prefix, so the sidecar
   (which serves ``/api/*`` + ``/ws/render`` at its own root) needs no knowledge of
@@ -77,9 +80,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import socket
 import sys
 import threading
+from html import escape as _escape_html
 from pathlib import Path
 
 import httpx
@@ -92,6 +97,7 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     Response,
     StreamingResponse,
@@ -234,6 +240,198 @@ def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
     if slash == -1:
         return False  # bare /session/<id>
     return rest[slash + 1 :].split("/")[0] in roots
+
+
+# --- publishing this origin under a path prefix (biopb/biopb#728) ---------- #
+#
+# The control is normally the origin root, but a portal can publish it under a
+# path prefix -- the driver is an Open OnDemand interactive app, whose
+# `/node/<host>/<port>/` route passes the full, untouched path to the backend and
+# rewrites nothing in the response. The prefix carries the compute node's
+# hostname and a per-session port, both allocated at job start, so there is no
+# build-time answer (`vite build --base=...` cannot bake it) and it has to be
+# learned at run time.
+#
+# Two halves: `_URLPrefixMiddleware` takes the prefix *off* the request path so
+# every route matches unchanged, and `_rewrite_shell_html` puts it *back* into the
+# served index.html so the browser asks for prefixed URLs to begin with.
+#
+# The prefix comes from explicit configuration ONLY -- never from a request header
+# such as X-Forwarded-Prefix. A request-controlled `<base href>` lets any caller
+# repoint every relative URL in the document at an origin of their choosing, which
+# is a considerably worse bug than the one being fixed. Nothing needs inferring:
+# an OnDemand `before.sh` knows $host and $port before the job starts.
+
+
+# What a prefix segment may contain: the unreserved + sub-delim URL path
+# characters, and nothing else. Deliberately excludes three classes, each of
+# which would let a *configured* prefix mean something other than "a path on this
+# origin":
+#
+#   - ``\`` and whitespace/controls. WHATWG URL parsing resolves
+#     ``<base href="/\evil.com/">`` to ``http://evil.com/`` — a backslash after
+#     the leading slash enters the authority, so every relative URL in the
+#     document (and every ``new URL(x, document.baseURI)`` the SPA runs) leaves
+#     the origin. Browsers strip tabs and newlines *before* parsing, so those
+#     smuggle a backslash into the same position.
+#   - ``?`` and ``#``. A query or fragment in a ``<base href>`` silently changes
+#     what every relative URL resolves to.
+#   - ``%``. ``scope["path"]`` reaches the middleware percent-*decoded* while the
+#     shell carries the prefix *encoded*, so an encoded prefix cannot be both at
+#     once. Barring it keeps the two representations identical by construction.
+#
+# ``:`` is legal in a path segment but excluded too, so that the likely operator
+# slip -- pasting a whole URL, ``--url-prefix https://host/biopb`` -- fails loudly
+# instead of quietly becoming the path ``/https:/host/biopb``.
+#
+# This is hardening, not a patched exploit: the prefix comes from configuration,
+# and whoever sets it can already pass --static-dir or PYTHONPATH. It is what
+# makes "the prefix can only ever name a path on this origin" a property of the
+# code rather than of the operator's care.
+_SAFE_PREFIX_SEGMENT = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=@-]+")
+
+
+def normalize_url_prefix(value: str | None) -> str | None:
+    """Canonicalize a configured URL prefix to ``/a/b``, or ``None`` for no prefix.
+
+    One leading slash, no trailing slash, empty segments dropped; ``None``,
+    ``""`` and ``"/"`` all mean "serve at the root". Applied by
+    :func:`build_app` — the single consumer — so every entry point (``python -m
+    biopb_control run``, the foreground CLI, tests) normalizes by the same rule.
+
+    Raises :class:`ValueError` for anything that is not a plain same-origin path
+    (see :data:`_SAFE_PREFIX_SEGMENT`, and ``.``/``..``, which would make the
+    served ``<base href>`` and the path the middleware strips disagree). Callers
+    surface it as a configuration error — refusing to start beats serving a
+    document whose every relative URL points somewhere unintended.
+    """
+    if not value:
+        return None
+    segments = [s for s in value.strip().split("/") if s]
+    if not segments:
+        return None
+    for segment in segments:
+        if segment in (".", "..") or not _SAFE_PREFIX_SEGMENT.fullmatch(segment):
+            raise ValueError(
+                f"invalid URL prefix segment {segment!r} in {value!r}: a prefix "
+                "must be a plain path on this origin (letters, digits and "
+                "._~-!$&'()*+,;=@ per segment)"
+            )
+    return "/" + "/".join(segments)
+
+
+class _URLPrefixMiddleware:
+    """Strip the configured URL prefix off incoming request paths.
+
+    For ``http`` and ``websocket`` scopes whose path lies under *prefix*, rewrite
+    ``scope["path"]`` (and ``raw_path``) to the remainder. Every route below then
+    sees byte-for-byte the request it would see at the origin root, so nothing
+    else in this module knows the prefix exists — the existing route table, the
+    two proxy ``Mount``s and the auth gate are all covered by that one property.
+
+    Two constraints hold this in place:
+
+    - It must be the **outermost** middleware. :class:`_ControlAuthMiddleware`
+      decides what to gate by reading ``scope["path"]`` directly, so an unstripped
+      ``/node/h/p/api/data_plane/restart`` would sail past its
+      ``startswith("/api/")`` check — an auth bypass, not merely a 404.
+    - An unprefixed request must pass through **untouched**, not 404: biopb-mcp's
+      ``_control_client`` and the installer poll ``http://127.0.0.1:8813/health``
+      over loopback with no prefix, and they keep working while a prefix is
+      configured for the portal.
+
+    Deliberately **not** the ASGI ``root_path`` convention (leave the path whole,
+    name the prefix in ``scope["root_path"]``), and not a hybrid either.
+    ``Mount`` composes ``root_path + matched_path`` for its sub-app while
+    ``get_route_path`` subtracts ``root_path`` from ``path`` only when the path
+    still starts with it — so a stripped path plus a ``root_path`` makes that
+    subtraction silently no-op inside ``/data_plane`` and ``/session/{id}``, and
+    the sub-app sees its own mount prefix again (``/ws/render`` stops matching).
+    The un-stripped variant would work for routing but hands
+    ``_ControlAuthMiddleware`` a prefixed path, which is the bypass above. Nothing
+    here builds absolute URLs from ``root_path`` — the browser side is carried by
+    the rewritten shell — so stripping outright is both the simpler and the
+    correct half.
+    """
+
+    def __init__(self, app: ASGIApp, prefix: str) -> None:
+        self.app = app
+        self._prefix = prefix
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            rest = self._strip(scope.get("path", ""))
+            if rest is not None:
+                scope = dict(scope)
+                scope["path"] = rest
+                # raw_path is the still-encoded path; strip the same bytes when it
+                # carries the prefix verbatim, and otherwise leave it alone —
+                # routing reads scope["path"], so a percent-encoded prefix costs
+                # nothing but a stale raw_path.
+                raw = scope.get("raw_path")
+                encoded = self._prefix.encode("utf-8")
+                if isinstance(raw, bytes) and raw.startswith(encoded):
+                    scope["raw_path"] = raw[len(encoded) :] or b"/"
+        await self.app(scope, receive, send)
+
+    def _strip(self, path: str) -> str | None:
+        """*path* without the prefix, or ``None`` when it is not prefixed."""
+        if path == self._prefix:
+            return "/"
+        if path.startswith(self._prefix + "/"):
+            return path[len(self._prefix) :]
+        return None
+
+
+# Root-absolute ``src=``/``href=`` values in the SPA shell. ``<base href>`` has no
+# effect on these — it resolves only *relative* URLs — so they are rewritten
+# outright. The ``(?!/)`` leaves protocol-relative ``//host/...`` alone.
+_ROOT_ABSOLUTE_REF = re.compile(r"""\b(src|href)=(["'])/(?!/)""")
+_HEAD_OPEN = re.compile(r"<head[^>]*>", re.IGNORECASE)
+
+
+def _rewrite_shell_html(shell: str, prefix: str) -> str:
+    """Return the SPA shell (*index.html*) rearranged to live under *prefix*.
+
+    Three edits, confined to ``index.html`` — no JS or CSS is touched, because the
+    built bundle needs none: its lazy route chunks are relative module specifiers
+    (``import("./DashboardPage-*.js")``), which resolve against the importing
+    module's URL and so follow the prefix for free.
+
+    - ``<base href="<prefix>/">`` first in ``<head>``, so every *relative* URL in
+      the document and every runtime ``new URL(x, document.baseURI)`` lands under
+      the prefix;
+    - each root-absolute ``src=``/``href=`` rewritten to ``<prefix>/…`` (the entry
+      chunk, the stylesheet, the icons) — what ``<base>`` cannot do;
+    - ``window.__BIOPB_BASE__``, the runtime hook the SPA reads in place of the
+      build-time ``import.meta.env.BASE_URL``.
+
+    The rewrite is computed once and served to *every* request — this never sees
+    the request path — so an unprefixed ``http://127.0.0.1:8813/`` gets the
+    prefixed document too. Its assets still load (the browser asks for
+    ``<prefix>/assets/…`` on the same origin and the middleware strips the prefix
+    straight back off), but the *app* must not take ``__BIOPB_BASE__`` at face
+    value there: a router basename of ``<prefix>`` against a location of ``/``
+    renders an empty tree. ``web/packages/app/src/base.ts`` therefore honours the
+    prefix only when ``location.pathname`` is actually under it, which is what
+    keeps that root — the one ``biopb ui`` opens — working alongside the portal
+    route.
+    """
+    # Escape for each context the prefix lands in, even though
+    # normalize_url_prefix has already confined it to path characters: json.dumps
+    # quotes the script literal (and `</` must not close the tag early), and the
+    # three attribute sites take HTML escaping. Two layers, so neither the
+    # charset nor the escaping is load-bearing on its own.
+    literal = json.dumps(prefix).replace("</", "<\\/")
+    attr = _escape_html(prefix, quote=True)
+    injected = f'<base href="{attr}/"><script>window.__BIOPB_BASE__={literal};</script>'
+    rewritten = _ROOT_ABSOLUTE_REF.sub(
+        lambda m: f"{m.group(1)}={m.group(2)}{attr}/", shell
+    )
+    head = _HEAD_OPEN.search(rewritten)
+    if head is None:  # no <head> to open: the injection still has to come first
+        return injected + rewritten
+    return rewritten[: head.end()] + injected + rewritten[head.end() :]
 
 
 class _ControlAuthMiddleware:
@@ -413,6 +611,7 @@ def build_app(
     token: str | None = None,
     static_dir: str | Path | None = None,
     console_enabled: bool = False,
+    url_prefix: str | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -435,8 +634,15 @@ def build_app(
     configured downstream. Deliberately *not* delegated to the session child —
     the proxy hop strips Host and Origin, so the child cannot tell a browser
     from this trusted loopback hop and cannot make this call.
+
+    ``url_prefix`` publishes this origin under a path prefix (``/node/<host>/
+    <port>`` — an Open OnDemand interactive app) rather than at ``/``: requests
+    under it are stripped before routing and the served SPA shell is rewritten to
+    point back at it. ``None`` (the default) is the plain root origin and changes
+    nothing. It is normalized here, the single consumer.
     """
     session_roots = _session_proxy_roots(console_enabled)
+    url_prefix = normalize_url_prefix(url_prefix)
     ws_base = data_web_url.replace("http://", "ws://", 1).replace(
         "https://", "wss://", 1
     )
@@ -449,6 +655,20 @@ def build_app(
     if web_root is not None and not (web_root / "index.html").is_file():
         logger.warning("web bundle not found at %s; serving API only", web_root)
         web_root = None
+
+    # Under a URL prefix the shell is served rewritten (see _rewrite_shell_html).
+    # Computed once here rather than per request: the bundle is static, and every
+    # non-asset GET hands back this same document. An unreadable index.html
+    # degrades to the plain FileResponse instead of failing the whole app.
+    shell_html: str | None = None
+    if web_root is not None and url_prefix:
+        index = web_root / "index.html"
+        try:
+            shell_html = _rewrite_shell_html(
+                index.read_text(encoding="utf-8"), url_prefix
+            )
+        except (OSError, UnicodeDecodeError):
+            logger.exception("could not rewrite %s for %s", index, url_prefix)
 
     # One pooled client to the sidecar for the process lifetime. Held in a
     # closure (not ``app.state``) because the proxy runs inside a *mounted*
@@ -795,6 +1015,8 @@ def build_app(
         # router then renders the right surface for the URL. web_root is checked
         # by the caller, so index.html exists here.
         assert web_root is not None
+        if shell_html is not None:
+            return HTMLResponse(shell_html)  # rewritten for url_prefix
         return FileResponse(web_root / "index.html")
 
     async def spa(request: Request) -> Response:
@@ -1038,10 +1260,16 @@ def build_app(
             await session_client.aclose()
 
     # The /api/* auth gate wraps the whole app but acts only on /api/* (pure ASGI,
-    # so the streaming proxies pass through untouched).
-    middleware = [
+    # so the streaming proxies pass through untouched). The prefix stripper goes
+    # OUTSIDE it: the gate reads scope["path"] directly, so a still-prefixed
+    # /node/h/p/api/... would not match its startswith("/api/") and would reach
+    # the verb ungated.
+    middleware = []
+    if url_prefix:
+        middleware.append(Middleware(_URLPrefixMiddleware, prefix=url_prefix))
+    middleware.append(
         Middleware(_ControlAuthMiddleware, token=token, session_roots=session_roots)
-    ]
+    )
     return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
@@ -1138,6 +1366,7 @@ def serve_control_api(
         token=spec.token,
         static_dir=spec.static_dir,
         console_enabled=console_enabled,
+        url_prefix=spec.url_prefix,
     )
     if not console_enabled:
         logger.info(

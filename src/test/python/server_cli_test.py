@@ -10,6 +10,7 @@ biopb-tensor-server's own suite. OS calls are mocked so the tests are
 deterministic and fast on any platform; time.sleep is neutralized.
 """
 
+import inspect
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -303,6 +304,22 @@ class TestControlRunArgv:
         assert argv[argv.index("--control-host") + 1] == "127.0.0.1"
         assert argv[argv.index("--web-host") + 1] == "127.0.0.1"
 
+    def test_url_prefix_is_forwarded_only_when_set(self, tmp_path):
+        # Unlike the token, the prefix is not a secret -- it is a compute node's
+        # hostname and a port -- so it rides the argv (biopb/biopb#728).
+        assert "--url-prefix" not in self._argv(tmp_path, grpc_bind="127.0.0.1")
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="127.0.0.1",
+            url_prefix="/node/mantis-051/29847",
+        )
+        assert argv[argv.index("--url-prefix") + 1] == "/node/mantis-051/29847"
+
 
 class TestUiTunnelHint:
     """With the UI off the network, the SSH tunnel is the supported way to reach
@@ -506,6 +523,52 @@ class TestDashboardCommand:
             res = CliRunner().invoke(cli.app, ["dashboard", "--remote"])
         assert res.exit_code == 0, res.output
         assert start.call_args.kwargs["remote"] is True
+
+    def test_ui_passes_every_control_start_parameter(self, monkeypatch):
+        """`dashboard` calls `control_start` as a plain function, so typer applies
+        no defaults: a parameter it forgets arrives as the `OptionInfo` sentinel
+        rather than that option's value. `OptionInfo` defines no `__bool__`, so it
+        is truthy and slips past `if not value` guards to fail somewhere further
+        in — `url_prefix` did exactly that, crashing every `biopb ui` that had to
+        start a control. Hold the call site to the signature so the next option
+        added to `control_start` cannot repeat it."""
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        expected = set(
+            inspect.signature(cli.control_start).parameters
+        )  # before mocking
+        start = MagicMock(side_effect=typer.Exit(0))
+        monkeypatch.setattr(cli, "control_start", start)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(cli.app, ["dashboard", "--no-browser"])
+        assert res.exit_code == 0, res.output
+        assert expected - set(start.call_args.kwargs) == set()
+        assert start.call_args.args == ()  # all by keyword, so order cannot drift
+
+    def test_ui_starts_a_control_through_the_real_control_start(self, monkeypatch):
+        """The mocked tests above never exercise `control_start`'s real signature,
+        which is how the `url_prefix` crash reached a release-shaped path. Let the
+        real function run as far as `_resolve_url_prefix` (which raised
+        `AttributeError: 'OptionInfo' object has no attribute 'strip'`) and stop it
+        just after, before anything is spawned.
+
+        Needs biopb-control actually installed, and deliberately does not stub
+        `_require_biopb_control` away to fake it: that gate is what stops
+        `_resolve_url_prefix` reaching its `from biopb_control._control import ...`
+        when the package is absent, so stubbing it turns the lean-control CI job
+        into a ModuleNotFoundError rather than the clean exit users get there."""
+        pytest.importorskip("biopb_control")
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        reached = []
+
+        def _stop() -> None:  # first call site past the option resolution
+            reached.append(True)
+            raise typer.Exit(0)
+
+        monkeypatch.setattr(cli, "_ensure_dirs", _stop)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(cli.app, ["dashboard", "--no-browser"])
+        assert res.exit_code == 0, res.output + repr(res.exception)
+        assert reached, "control_start returned before resolving its options"
 
 
 class TestVersionCommand:

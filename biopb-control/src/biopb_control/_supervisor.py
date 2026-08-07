@@ -98,6 +98,10 @@ class DataPlaneSpec:
     log_level: str = "INFO"
     server_log: Optional[Path] = None
     token: Optional[str] = None
+    # Path prefix a reverse proxy publishes the control's web origin under (an
+    # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
+    # by the web front (_control.build_app normalizes it); None = root origin.
+    url_prefix: Optional[str] = None
 
 
 @dataclass

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { appPath, withBase } from "./base";
 import { useAppStore } from "./store";
 import type { ReadyzSnapshot } from "@biopb/tensor-flight-client";
 
@@ -62,13 +63,14 @@ export function ClientBootstrap() {
       setSearchParams(searchParams, { replace: true });
     }
 
-    // In dev, default to the proxied plane so plain `pnpm dev` works without an
-    // env var: vite.config forwards /data_plane (incl. the ws) to the control on
-    // :8813. Prod bakes VITE_TENSOR_API=/data_plane at build time; the absolute
-    // localhost:8814 default only serves the legacy standalone-sidecar case.
-    const apiBase =
-      import.meta.env.VITE_TENSOR_API ??
-      (import.meta.env.DEV ? "/data_plane" : "http://localhost:8814");
+    // The data plane is always reached through the control, which proxies it at
+    // /data_plane on this same origin — in dev too, where vite.config forwards
+    // /data_plane (incl. the ws) to the control on :8813. Derived at runtime
+    // rather than baked as VITE_TENSOR_API, because a build-time "/data_plane"
+    // would be missing the --url-prefix the control is published under and would
+    // silently defeat it. This also carries the render WebSocket: it resolves
+    // `${apiBase}/ws/render` against the page origin (useRenderWebSocket).
+    const apiBase = withBase("/data_plane");
 
     (async () => {
       try {
@@ -92,7 +94,9 @@ export function ClientBootstrap() {
         const token = sessionStorage.getItem("biopb_token") ?? "";
         if (!token) {
           // Preserve the current path so unlock returns here (e.g. /admin).
-          const here = window.location.pathname;
+          // appPath, not the raw pathname: `next` is handed to the router, which
+          // is already relative to the basename.
+          const here = appPath(window.location.pathname);
           const next = here && here !== "/unlock" ? `?next=${encodeURIComponent(here)}` : "";
           navigate(`/unlock${next}`);
           return;
