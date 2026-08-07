@@ -53,9 +53,20 @@ control-side check is already the child's only auth (CLAUDE.md, Security model).
 control knows whether it is loopback-bound or `--remote`. Therefore the local-mode gate is
 control-side, full stop; the child's route may exist unconditionally.
 
-`serve_control_api` already receives the control's own bind `host` (`_control.py:1011`),
-so the gate is `_web_auth.host_is_public_bind(host)` computed there and passed into
-`build_app` as one boolean. No new plumbing from `__main__`.
+`serve_control_api` already receives the control's own bind `host`, so the gate is
+`_web_auth.host_is_public_bind(host)` computed there and passed into `build_app` as one
+boolean (`console_enabled`). No new plumbing from `__main__`. `_session_proxy_roots()`
+turns that boolean into the root set, and **both** the proxy's own gate and the auth
+middleware read that one set — so the switch that makes the console reachable is the same
+switch that makes it guarded; an unauthenticated execute path is unrepresentable.
+
+**Known limitation, deliberately accepted.** The gate reads this listener's *bind*, so a
+loopback control deliberately published by a reverse proxy — the topology biopb-mcp's
+CLAUDE.md points at for untrusted networks — reads as local and gets the console. That
+operator is already responsible for the token in front of the data plane and for what
+their proxy exposes. A control-side `--no-session-console` flag is the follow-up if that
+topology stops being the exception; `console_enabled` is already the parameter it would
+set.
 
 ### Why not "just gate it with the token"
 
@@ -193,6 +204,6 @@ Naturally three stacked PRs against `dev`, the control gate reviewable on its ow
    `interrupt_kernel` refusal, the `guide://kernel` paragraph. **Done.**
 2. **`_control.py`** — the `console` root, `host_is_public_bind` gate via
    `serve_control_api`, proxy tests for the public-bind refusal and the traversal cases
-   already covered for `api`.
+   already covered for `api`. **Done.**
 3. **`_observe.py` + `ObservePage.tsx`** — the child route (with the restored content-type
    check), `observe.console_enabled`, the editor and its busy state.
