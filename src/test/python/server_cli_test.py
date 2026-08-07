@@ -549,9 +549,15 @@ class TestDashboardCommand:
         which is how the `url_prefix` crash reached a release-shaped path. Let the
         real function run as far as `_resolve_url_prefix` (which raised
         `AttributeError: 'OptionInfo' object has no attribute 'strip'`) and stop it
-        just after, before anything is spawned."""
+        just after, before anything is spawned.
+
+        Needs biopb-control actually installed, and deliberately does not stub
+        `_require_biopb_control` away to fake it: that gate is what stops
+        `_resolve_url_prefix` reaching its `from biopb_control._control import ...`
+        when the package is absent, so stubbing it turns the lean-control CI job
+        into a ModuleNotFoundError rather than the clean exit users get there."""
+        pytest.importorskip("biopb_control")
         monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
-        monkeypatch.setattr(cli, "_require_biopb_control", lambda: None)
         reached = []
 
         def _stop() -> None:  # first call site past the option resolution
