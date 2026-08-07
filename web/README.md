@@ -51,8 +51,7 @@ pnpm dev                         # Vite dev server (HMR) on :5173
 websocket), and `/session` to a live control on `http://localhost:8813` (start
 one with `biopb control start`). In dev the viewer defaults its data plane to the
 proxied `/data_plane`, so plain `pnpm dev` renders end-to-end against that control
-— no env var needed. Override with `VITE_TENSOR_API=<url> pnpm dev` only to point
-the viewer at a standalone sidecar instead.
+— no env var needed, in dev or in a build.
 
 ## Build
 
@@ -60,8 +59,10 @@ the viewer at a standalone sidecar instead.
 pnpm build                       # tensor-flight-client, then @biopb/web -> packages/app/dist
 ```
 
-`VITE_TENSOR_API=/data_plane` is the only build-time env the viewer needs (it
-points the viewer at the control-proxied data plane). The control serves the
+No build-time env is needed. The viewer resolves the control-proxied data plane
+(`/data_plane`) at runtime, together with any path prefix the control is
+published under (`--url-prefix`, see `docs/url-prefix.md`), so one bundle serves
+every deployment. The control serves the
 resulting `packages/app/dist`; point it there with
 `biopb control start --static-dir <repo>/web/packages/app/dist` (the default is
 the installed bundle at `~/.local/share/biopb/webapp`). CI tars `packages/app/dist`

@@ -5,8 +5,13 @@ import react from "@vitejs/plugin-react";
 // root and proxies the data plane under /data_plane and each MCP session under
 // /session/<id>. So the build is always root-based (base "/"): index.html
 // requests /assets/*, which resolve at the control root no matter which prefix
-// (/, /viewer, /session/<id>/observe) the SPA shell was served under. The router
-// basename tracks import.meta.env.BASE_URL ("/") in main.tsx.
+// (/, /viewer, /session/<id>/observe) the SPA shell was served under.
+//
+// Base stays "/" even when the control is published below the root
+// (`--url-prefix`, an Open OnDemand app): that prefix names a compute node and a
+// port allocated at job start, so it cannot be baked here. The control injects it
+// into the served index.html instead and the app reads it at runtime — see
+// src/base.ts, which feeds the router basename and every URL the app builds.
 export default defineConfig({
   base: "/",
   plugins: [react()],

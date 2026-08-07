@@ -99,9 +99,9 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
     // The socket needs an absolute ws/wss URL. Older Safari does NOT coerce a
     // relative or http(s) URL to ws in the WebSocket constructor — it throws
     // "The string did not match the expected pattern" — so build it ourselves.
-    // apiBase may be an absolute http(s) URL (legacy standalone), a relative path
-    // like "/data_plane" (control front, VITE_TENSOR_API="/data_plane"), or ""
-    // (same-origin). The render socket lives under the same base as the data API:
+    // apiBase is the control-proxied data plane on this origin — "/data_plane",
+    // or "<prefix>/data_plane" when the control is published below the root
+    // (--url-prefix). The render socket lives under the same base as the data API:
     // the control proxies it at /data_plane/ws/render (stripping the prefix). So
     // use apiBase in dev too — the vite proxy forwards /data_plane (ws:true) to the
     // control, whereas a bare /ws/render matches no proxy rule and fails the

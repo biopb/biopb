@@ -5,6 +5,7 @@ import { MetaPanel } from "../components/MetaPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { withBase } from "../base";
 
 export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
@@ -18,7 +19,7 @@ export function HomePage() {
       <header className="app-topbar">
         <img
           className="topbar-logo"
-          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          src={withBase("/biopb-logo.png")}
           alt=""
           aria-hidden="true"
         />

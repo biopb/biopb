@@ -85,7 +85,8 @@ jobs:
         run: pnpm -C web install --frozen-lockfile
 
       - name: Typecheck + build
-        # Mirror the product build: the app bakes VITE_TENSOR_API=/data_plane (the
-        # proxied data plane behind control). This is verify-only — the shipped
-        # bundle is built by tensor-server-ci.yaml / release.yaml.
-        run: VITE_TENSOR_API="/data_plane" pnpm -C web -r run build
+        # No build-time env: the app derives its data-plane base at runtime from
+        # the origin it was served under (web/packages/app/src/base.ts), so the
+        # same bundle works at "/" and under a --url-prefix. Verify-only — the
+        # shipped bundle is built by tensor-server-ci.yaml / release.yaml.
+        run: pnpm -C web -r run build

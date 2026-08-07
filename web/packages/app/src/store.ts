@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
+import { withBase } from "./base";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
@@ -94,7 +95,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   connectionState: "idle",
   connectionError: null,
   devMode: false,
-  apiBase: "http://localhost:8814",
+  apiBase: withBase("/data_plane"),
 
   sources: [],
   sourcesLoading: false,
@@ -215,7 +216,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   clearSession() {
     sessionStorage.removeItem("biopb_token");
-    window.location.href = "/unlock";
+    window.location.href = withBase("/unlock");
   },
 
   startCatalogPolling() {

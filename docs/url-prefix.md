@@ -97,22 +97,38 @@ app: the browser asks for `<prefix>/assets/…` on the same origin, and the
 middleware strips the prefix straight back off. A direct
 `http://127.0.0.1:8813/` therefore keeps working alongside the portal route.
 
-## The web-side contract
+## The web side
 
 `window.__BIOPB_BASE__` is the runtime global the SPA consumes; it is absent when
-no prefix is configured (read it as `""`). Consuming it is a separate change in
-`web/`:
+no prefix is configured. `web/packages/app/src/base.ts` owns it:
 
-- `main.tsx` — router `basename` from the global, not `import.meta.env.BASE_URL`.
-- `ClientBootstrap.tsx` — `apiBase` becomes `<prefix>/data_plane`. That also
-  fixes the render WebSocket for free, since `useRenderWebSocket.ts` resolves
-  `${apiBase}/ws/render` against `window.location.origin`.
-- The root-absolute fetches: `auth.ts` (`/health`), `AdminPage.tsx`
-  (`/api/data_plane/restart`), `McpAdminPage.tsx` (`/api/mcp_config`).
-- The `"/biopb-logo.png"` reference inside the entry chunk.
+- `BASE` — the normalized prefix, `""` at the origin root. Re-validated against
+  the same shape the control enforces, degrading to `""` rather than trusting a
+  value that could send the app off-origin.
+- `withBase(path)` — a root-relative path placed under the prefix. **Every
+  root-absolute URL the app builds goes through this**: API fetches, full-page
+  navigations (`window.location`), `<a href>`, and asset `src`s. A bare
+  `fetch("/api/x")` works at the root and silently leaves the app's namespace
+  under a prefix, which is the whole bug.
+- `appPath(pathname)` — the inverse, turning a real `window.location.pathname`
+  back into a router path. Without it, a pathname captured under a prefix and
+  handed to `navigate()` would be resolved against the basename *again* and land
+  at `/node/h/p/node/h/p/admin`.
 
-`vite.config.ts` can keep `base: "/"` — the runtime global, not the build-time
-base, is what carries the prefix.
+Router paths are the exception and stay as they are: `<Route path="/viewer">` and
+`navigate("/viewer")` are already relative to `<BrowserRouter basename>`, which
+`main.tsx` sets from `BASE`.
+
+The data plane needs no special handling beyond `apiBase = withBase("/data_plane")`
+in `ClientBootstrap.tsx`. That also carries the render WebSocket for free, since
+`useRenderWebSocket.ts` resolves `${apiBase}/ws/render` against the page origin,
+and `tensor-flight-client` is already parameterized on `apiBase`.
+
+`vite.config.ts` keeps `base: "/"` — the runtime global, not the build-time base,
+carries the prefix. There is deliberately **no** `VITE_TENSOR_API` any more: a
+build-time `/data_plane` baked by CI would have been missing the prefix and would
+have silently defeated it, so the value is derived at runtime instead and one
+bundle serves every deployment.
 
 ## Still true after this
 
