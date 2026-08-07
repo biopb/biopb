@@ -1611,6 +1611,11 @@ def dashboard(
         # returns only once the control API is listening). It signals its outcome
         # by raising typer.Exit; a non-zero code means the plane never came up, so
         # bail out rather than open a browser at a dead URL.
+        #
+        # EVERY parameter has to be passed explicitly: called as a plain function
+        # the typer defaults are not applied, so an omitted one arrives as the
+        # `OptionInfo` sentinel — truthy, and not the type the body expects.
+        # test_ui_passes_every_control_start_parameter holds this to the signature.
         try:
             control_start(
                 config=DEFAULT_CONFIG,
@@ -1622,6 +1627,7 @@ def dashboard(
                 token=None,
                 data_plane=True,
                 remote=remote,
+                url_prefix=None,
             )
         except typer.Exit as started:
             if started.exit_code:

@@ -406,10 +406,16 @@ def _rewrite_shell_html(shell: str, prefix: str) -> str:
     - ``window.__BIOPB_BASE__``, the runtime hook the SPA reads in place of the
       build-time ``import.meta.env.BASE_URL``.
 
-    Serving this same document to an *unprefixed* request still boots: the browser
-    then asks for ``<prefix>/assets/…`` on the same origin and the middleware
-    strips the prefix straight back off, so ``http://127.0.0.1:8813/`` keeps
-    working alongside the portal route.
+    The rewrite is computed once and served to *every* request — this never sees
+    the request path — so an unprefixed ``http://127.0.0.1:8813/`` gets the
+    prefixed document too. Its assets still load (the browser asks for
+    ``<prefix>/assets/…`` on the same origin and the middleware strips the prefix
+    straight back off), but the *app* must not take ``__BIOPB_BASE__`` at face
+    value there: a router basename of ``<prefix>`` against a location of ``/``
+    renders an empty tree. ``web/packages/app/src/base.ts`` therefore honours the
+    prefix only when ``location.pathname`` is actually under it, which is what
+    keeps that root — the one ``biopb ui`` opens — working alongside the portal
+    route.
     """
     # Escape for each context the prefix lands in, even though
     # normalize_url_prefix has already confined it to path characters: json.dumps

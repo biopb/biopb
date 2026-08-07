@@ -39,10 +39,35 @@ function normalize(raw: unknown): string {
   return SAFE_BASE.test(candidate) ? candidate : "";
 }
 
+/**
+ * Whether this document actually *arrived* under `prefix`.
+ *
+ * The control rewrites the shell once at startup and serves that one document to
+ * every request, prefixed or not — it never sees the request path. So a direct
+ * `http://127.0.0.1:8813/` on a prefixed control is handed the prefixed shell
+ * too, and taking the injected value at face value there would set the router
+ * basename to `/node/h/p` while `location.pathname` is `/`. React Router does not
+ * fall back: `stripBasename` returns null, `<Router>` renders null, and the whole
+ * tree disappears — a blank page with only a console warning. That root is the URL
+ * `biopb ui` opens and the one the `ssh -L` hint points at, so it has to work.
+ *
+ * Reading the location rather than the injected value also keeps the case where a
+ * proxy *strips* the prefix before the control sees it: the browser is still at a
+ * prefixed URL, so the app still needs the prefix even though the request did not
+ * carry one by the time it landed.
+ */
+function servedUnder(prefix: string): boolean {
+  if (!prefix) return false;
+  const here =
+    typeof window === "undefined" ? "" : (window.location?.pathname ?? "");
+  return here === prefix || here.startsWith(prefix + "/");
+}
+
 /** The prefix this app is served under: "" at the origin root, else "/a/b". */
-export const BASE = normalize(
+const declared = normalize(
   typeof window === "undefined" ? "" : window.__BIOPB_BASE__,
 );
+export const BASE = servedUnder(declared) ? declared : "";
 
 /** A root-relative path (`/api/status`, `/biopb-logo.png`) placed under the
  *  prefix. Use for anything the browser resolves against the origin: `fetch`,

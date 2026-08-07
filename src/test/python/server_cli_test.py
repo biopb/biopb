@@ -10,6 +10,7 @@ biopb-tensor-server's own suite. OS calls are mocked so the tests are
 deterministic and fast on any platform; time.sleep is neutralized.
 """
 
+import inspect
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -522,6 +523,46 @@ class TestDashboardCommand:
             res = CliRunner().invoke(cli.app, ["dashboard", "--remote"])
         assert res.exit_code == 0, res.output
         assert start.call_args.kwargs["remote"] is True
+
+    def test_ui_passes_every_control_start_parameter(self, monkeypatch):
+        """`dashboard` calls `control_start` as a plain function, so typer applies
+        no defaults: a parameter it forgets arrives as the `OptionInfo` sentinel
+        rather than that option's value. `OptionInfo` defines no `__bool__`, so it
+        is truthy and slips past `if not value` guards to fail somewhere further
+        in — `url_prefix` did exactly that, crashing every `biopb ui` that had to
+        start a control. Hold the call site to the signature so the next option
+        added to `control_start` cannot repeat it."""
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        expected = set(
+            inspect.signature(cli.control_start).parameters
+        )  # before mocking
+        start = MagicMock(side_effect=typer.Exit(0))
+        monkeypatch.setattr(cli, "control_start", start)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(cli.app, ["dashboard", "--no-browser"])
+        assert res.exit_code == 0, res.output
+        assert expected - set(start.call_args.kwargs) == set()
+        assert start.call_args.args == ()  # all by keyword, so order cannot drift
+
+    def test_ui_starts_a_control_through_the_real_control_start(self, monkeypatch):
+        """The mocked tests above never exercise `control_start`'s real signature,
+        which is how the `url_prefix` crash reached a release-shaped path. Let the
+        real function run as far as `_resolve_url_prefix` (which raised
+        `AttributeError: 'OptionInfo' object has no attribute 'strip'`) and stop it
+        just after, before anything is spawned."""
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(cli, "_require_biopb_control", lambda: None)
+        reached = []
+
+        def _stop() -> None:  # first call site past the option resolution
+            reached.append(True)
+            raise typer.Exit(0)
+
+        monkeypatch.setattr(cli, "_ensure_dirs", _stop)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(cli.app, ["dashboard", "--no-browser"])
+        assert res.exit_code == 0, res.output + repr(res.exception)
+        assert reached, "control_start returned before resolving its options"
 
 
 class TestVersionCommand:

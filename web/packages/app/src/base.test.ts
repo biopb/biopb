@@ -2,9 +2,21 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 
 // base.ts reads window.__BIOPB_BASE__ once, at module load — the value is fixed
 // for the life of the page — so each case installs a window and re-imports.
-async function loadWith(value: unknown) {
+//
+// It also reads location.pathname, because the prefix only applies when the
+// document was served under it. `pathname` defaults to a path *inside* whatever
+// prefix is declared (the portal case); pass it explicitly to model a document
+// served somewhere else, as the unprefixed-root cases below do.
+async function loadWith(value: unknown, pathname?: string) {
   vi.resetModules();
-  (globalThis as { window?: unknown }).window = { __BIOPB_BASE__: value };
+  const declared =
+    typeof value === "string"
+      ? "/" + value.trim().replace(/^\/+/, "").replace(/\/+$/, "")
+      : "/";
+  (globalThis as { window?: unknown }).window = {
+    __BIOPB_BASE__: value,
+    location: { pathname: pathname ?? declared },
+  };
   return await import("./base.js");
 }
 
@@ -53,6 +65,39 @@ describe("BASE", () => {
       const { BASE } = await loadWith(hostile);
       expect(BASE, hostile).toBe("");
     }
+  });
+
+  it("ignores a prefix the document was not served under", async () => {
+    // A prefixed control serves its one rewritten shell to *every* request, so a
+    // direct http://127.0.0.1:8813/ gets __BIOPB_BASE__ too. Honouring it there
+    // would set the router basename to /node/h/29847 while location.pathname is
+    // "/", and react-router renders null — a blank page, not a broken-looking
+    // one. That root is what `biopb ui` opens and what the ssh -L hint targets.
+    for (const here of ["/", "/viewer", "/node/h/29847x/admin", "/node/h"]) {
+      const { BASE } = await loadWith("/node/h/29847", here);
+      expect(BASE, here).toBe("");
+    }
+  });
+
+  it("applies the prefix on the paths actually served under it", async () => {
+    for (const here of [
+      "/node/h/29847",
+      "/node/h/29847/",
+      "/node/h/29847/viewer",
+      "/node/h/29847/session/s1/observe",
+    ]) {
+      const { BASE } = await loadWith("/node/h/29847", here);
+      expect(BASE, here).toBe("/node/h/29847");
+    }
+  });
+
+  it("is inert at the unprefixed root, not merely un-routed", async () => {
+    // The whole module degrades together: a half-applied prefix would keep
+    // sending fetches and links into /node/h/29847 from a page at the root.
+    const { BASE, withBase, appPath } = await loadWith("/node/h/29847", "/");
+    expect(BASE).toBe("");
+    expect(withBase("/api/status")).toBe("/api/status");
+    expect(appPath("/admin")).toBe("/admin");
   });
 });
 

@@ -92,10 +92,13 @@ that: its lazy route chunks are relative module specifiers
 (`import("./DashboardPage-*.js")`), which resolve against the importing module's
 URL and so follow the prefix for free.
 
-Serving this same rewritten document to an *unprefixed* request still boots the
-app: the browser asks for `<prefix>/assets/…` on the same origin, and the
-middleware strips the prefix straight back off. A direct
-`http://127.0.0.1:8813/` therefore keeps working alongside the portal route.
+The shell is rewritten once, at startup, and served to *every* request — the
+handler never sees the request path — so an unprefixed `http://127.0.0.1:8813/`
+on a prefixed control is handed the prefixed document too. That direct root has
+to keep working: it is what `biopb ui` opens and what the `ssh -L` hint points
+at. The assets are fine either way (the browser asks for `<prefix>/assets/…` on
+the same origin and the middleware strips the prefix straight back off), but the
+*app* cannot take the injected prefix at face value there — see `BASE` below.
 
 ## The web side
 
@@ -104,7 +107,15 @@ no prefix is configured. `web/packages/app/src/base.ts` owns it:
 
 - `BASE` — the normalized prefix, `""` at the origin root. Re-validated against
   the same shape the control enforces, degrading to `""` rather than trusting a
-  value that could send the app off-origin.
+  value that could send the app off-origin. It also degrades to `""` when
+  `location.pathname` is **not** under the injected prefix, which is what makes
+  the shared-document behaviour above safe: honouring it at the unprefixed root
+  would set the router basename to `/node/h/p` against a location of `/`, and
+  React Router does not fall back — `stripBasename` returns null, `<Router>`
+  renders null, and the page goes *blank* with only a console warning. Gating on
+  the location rather than on the request also preserves the inverse topology, a
+  proxy that strips the prefix before the control sees it: the browser is still
+  at a prefixed URL, so the app still needs the prefix.
 - `withBase(path)` — a root-relative path placed under the prefix. **Every
   root-absolute URL the app builds goes through this**: API fetches, full-page
   navigations (`window.location`), `<a href>`, and asset `src`s. A bare
