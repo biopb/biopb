@@ -21,7 +21,7 @@ which cases to spend on, not the machinery.
 | `_bridge.py` | MCP tool schemas → the function-calling shape a chat model expects |
 | `_models.py` | The provider table: which model on each side, at which address, with which key |
 | `_agent.py` | `ChatAgent`; `ScriptedAgent`, `ReplayAgent`, and the live `ToolCallingAgent` |
-| `_respondent.py` | `Persona`, `Respondent`; `ScriptedRespondent`, `SilentRespondent`, and the live `ModelRespondent` |
+| `_respondent.py` | `Persona` (its prompt *and* its up-front `briefing`), `Respondent`; `ScriptedRespondent`, the two local controls `SilentRespondent`/`BriefedRespondent`, and the live `ModelRespondent` |
 | `_conversation.py` | The two-model loop, the caps, the `Trace` |
 | `_fixture.py` | What a run is given and what it recovers: `Fixture`, `Attempt`, `Metric`, `Outcome`, the fixture specs (`Procedural`/`OnDisk`) and the refs they hand out, artifact writing |
 | `_plane.py` | The run-scoped tensor server a `tensor`-presented case needs. Conditional: nothing starts unless a case asks |

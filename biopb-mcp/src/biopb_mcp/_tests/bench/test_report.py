@@ -61,6 +61,7 @@ from ._engine import (
     select,
     session_dir,
     session_id,
+    task_for,
     unavailable,
     write_session,
 )
@@ -208,6 +209,7 @@ def test_every_responder_the_options_offer_is_one_the_engine_can_build(monkeypat
     for value in RESPONDER.values:
         built.append(respondent_for(SKILL_CASE, Options(responder=value)))
     assert built[RESPONDER.values.index("silent")].name == "silent"
+    assert built[RESPONDER.values.index("briefed")].name == "briefed"
     assert built[RESPONDER.values.index("model")][0] == "model"
     assert len(built) == len(RESPONDER.values)
 
@@ -320,6 +322,7 @@ def test_the_skills_switch_is_a_bool_and_not_the_string_false(clean_env):
 def test_the_responder_switch_reaches_the_dispatch(monkeypatch):
     monkeypatch.setattr(_engine, "model_respondent", lambda persona: "a-model")
     assert respondent_for(SKILL_CASE, Options(responder="silent")).name == "silent"
+    assert respondent_for(SKILL_CASE, Options(responder="briefed")).name == "briefed"
     assert respondent_for(SKILL_CASE, Options(responder="model")) == "a-model"
 
 
@@ -329,7 +332,66 @@ def test_the_same_switches_apply_to_a_case_of_either_kind(monkeypatch):
     monkeypatch.setattr(_engine, "model_respondent", lambda persona: "a-model")
     for case in (SKILL_CASE, TASK_CASE):
         assert respondent_for(case, Options(responder="silent")).name == "silent"
+        assert respondent_for(case, Options(responder="briefed")).name == "briefed"
         assert respondent_for(case, Options(responder="model")) == "a-model"
+
+
+# --- what a briefed run is handed -------------------------------------------
+
+
+def test_only_a_briefed_run_is_handed_the_persona_s_facts():
+    """The half of `--bench-responder=briefed` the respondent cannot do.
+
+    Every other configuration makes the fact something to ask for or go
+    without, so the prompt has to be the case's own text and nothing else — a
+    briefing that leaked into a `model` run would hand over the answer to the
+    question that run exists to measure being asked.
+    """
+    spoken = task_for(SKILL_CASE, Options(responder="model"))
+    silent = task_for(SKILL_CASE, Options(responder="silent"))
+    briefed = task_for(SKILL_CASE, Options(responder="briefed"))
+
+    assert spoken == SKILL_CASE.task
+    assert silent == SKILL_CASE.task
+    assert briefed.startswith(SKILL_CASE.task.rstrip())
+    for value in SKILL_CASE.persona.facts.values():
+        assert value not in spoken
+        assert value in briefed
+
+
+def test_a_briefed_prompt_countermands_the_task_s_offer_of_a_person():
+    """Every case's task says the microscopist is there and how to reach them,
+    because that is the condition every other switch value runs. The brief has
+    to cancel it explicitly and *after* it — a prompt holding both would leave
+    a run reasonably spending turns waiting on somebody who is not coming."""
+    case = SKILL_CASE
+    # Whitespace-normalised: where the header happens to wrap is formatting,
+    # and a test that reads the prompt line by line fails on a reflow that
+    # changed nothing about what it says.
+    flowed = " ".join(task_for(case, Options(responder="briefed")).split())
+    assert "not available for this session" in flowed
+    assert flowed.index("not available") > flowed.index(
+        " ".join(case.task.split())[-40:]
+    )
+
+
+def test_a_brief_hands_over_the_facts_and_not_the_persona_s_own_instructions():
+    """`background` is written in the second person to whoever plays the part
+    — "you acquired these fields, you are happy to answer questions" — so
+    including it would tell the agent it ran the experiment and re-offer the
+    conversation this switch exists to remove."""
+    with_background = next(c for c in CASES if c.persona.background)
+    assert with_background.persona.background not in with_background.persona.briefing()
+
+
+def test_a_briefed_run_and_a_spoken_one_differ_by_nothing_but_the_asking():
+    """The pair only measures the cost of eliciting if the *information* is the
+    same on both sides. It is rendered from one fact table for that reason, and
+    this is the assertion that the rendering did not drop any of it."""
+    briefing = SKILL_CASE.persona.briefing()
+    for key, value in SKILL_CASE.persona.facts.items():
+        assert key in briefing, f"{key!r} is missing from the brief"
+        assert value in briefing
 
 
 # --- what the configuration needs to exist ----------------------------------
@@ -375,12 +437,15 @@ def only_the_models(monkeypatch):
     return probed
 
 
-def test_a_silent_session_needs_no_respondent_model(only_the_models, monkeypatch):
-    """`SilentRespondent` answers from a constant, so a silent run reaches for
-    no respondent at all.
+@pytest.mark.parametrize("local", ["silent", "briefed"])
+def test_a_session_with_a_local_respondent_needs_no_respondent_model(
+    only_the_models, monkeypatch, local
+):
+    """Both answer from a constant, so neither run reaches for a respondent at
+    all.
 
     Demanding one anyway skipped **every case** on a machine holding one key —
-    the ordinary way to run the control condition — and reported it as an
+    the ordinary way to run these conditions — and reported it as an
     environment problem with the cases.
     """
     monkeypatch.setattr(
@@ -388,21 +453,22 @@ def test_a_silent_session_needs_no_respondent_model(only_the_models, monkeypatch
     )
     case = RunnableAnywhere()
 
-    assert unavailable(case, Options(responder="silent")) == ""
+    assert unavailable(case, Options(responder=local)) == ""
     assert unavailable(case, Options(responder="model")) == "respondent: no key"
 
 
-def test_a_silent_session_spends_no_request_proving_a_model_it_will_not_call(
-    only_the_models, monkeypatch
+@pytest.mark.parametrize("local", ["silent", "briefed"])
+def test_a_local_respondent_spends_no_request_proving_a_model_it_will_not_call(
+    only_the_models, monkeypatch, local
 ):
     """The reachability probe is the one check here that costs money, and a
-    respondent endpoint is not on the path of a silent run."""
+    respondent endpoint is not on the path of either local condition."""
     monkeypatch.setattr(
         _engine, "respondent_choice", lambda: FakeChoice("the-respondent")
     )
     case = RunnableAnywhere()
 
-    assert unavailable(case, Options(responder="silent")) == ""
+    assert unavailable(case, Options(responder=local)) == ""
     assert [c.name for c in only_the_models] == ["the-agent"]
 
     only_the_models.clear()
@@ -418,8 +484,10 @@ def test_the_models_in_play_are_the_ones_the_switch_selects(monkeypatch):
         _engine, "respondent_choice", lambda: FakeChoice("the-respondent")
     )
     silent = [side for side, _ in models_in_play(Options(responder="silent"))]
+    briefed = [side for side, _ in models_in_play(Options(responder="briefed"))]
     spoken = [side for side, _ in models_in_play(Options(responder="model"))]
     assert silent == ["agent"]
+    assert briefed == ["agent"]
     assert spoken == ["agent", "respondent"]
 
 
@@ -496,6 +564,27 @@ def test_asking_too_much_and_never_asking_are_both_flagged():
 
     silent = result(trace=FakeTrace(asked=["let me look at this"]), outcome=scored(0.1))
     assert FLAG_NEVER_ASKED in silent.flags()
+
+
+def test_a_briefed_run_is_not_flagged_for_asking_nothing():
+    """It was handed everything and there is nobody to ask, so not asking is
+    the switch working rather than something to notice about the agent — and a
+    flag on every row of a session says nothing about any of them."""
+    briefed = result(
+        responder="briefed",
+        trace=FakeTrace(asked=["here is what I am doing"]),
+        outcome=scored(0.1),
+    )
+    assert FLAG_NEVER_ASKED not in briefed.flags()
+
+    # The other half: it is still worth seeing when a briefed run went asking
+    # anyway, which is the agent not using what it was given.
+    chatty = result(
+        responder="briefed",
+        trace=FakeTrace(asked=["a?", "b?", "c?", "d?"]),
+        outcome=scored(0.1),
+    )
+    assert f"{FLAG_OVER_BUDGET}(4)" in chatty.flags(budget=3)
 
 
 def test_a_scored_but_severed_run_says_so():
@@ -731,8 +820,9 @@ def test_the_report_states_the_configuration_it_ran_under(report):
     assert data["options"]["responder"] == "model"
 
 
-def test_a_silent_report_names_no_respondent_model_in_either_form(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("local", ["silent", "briefed"])
+def test_a_local_respondent_report_names_no_model_in_either_form(
+    tmp_path, monkeypatch, local
 ):
     """`summary.md` and `summary.json` are one report in two forms, and a
     reader who compares two sessions reads whichever is to hand.
@@ -749,14 +839,14 @@ def test_a_silent_report_names_no_respondent_model_in_either_form(
     run = Run(
         case=SKILL_CASE,
         fixture=FIXTURE,
-        options=Options(responder="silent"),
-        results=[result(outcome=scored(0.2))],
+        options=Options(responder=local),
+        results=[result(responder=local, outcome=scored(0.2))],
     )
     text = run.summary()
     data = json.loads((_engine.where_for(SKILL_CASE) / "summary.json").read_text())
 
-    assert "Respondent: **silent**" in text
-    assert data["respondent"] == "silent"
+    assert f"Respondent: **{local}**" in text
+    assert data["respondent"] == local
     assert "a-real-model" not in text
 
 
@@ -868,6 +958,30 @@ def test_the_session_file_records_the_configuration(tmp_path, monkeypatch):
     # The respondent is what actually answered, not what the provider table
     # would have supplied: a `silent` session never asked it for anything.
     assert data["respondent"] == "silent"
+
+
+def test_the_session_file_names_a_briefed_run_by_its_switch(tmp_path, monkeypatch):
+    """The same rule as the silent arm, on the corner that is easiest to
+    mistake for the shipped one: a briefed session has all the information a
+    spoken session ends up with, so the file has to be what says the agent
+    never had to ask for any of it."""
+    monkeypatch.setattr(_engine, "artifact_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        _engine, "respondent_choice", lambda: FakeChoice("a-real-model")
+    )
+    data = json.loads(
+        write_session(
+            Run(
+                case=SKILL_CASE,
+                fixture=FIXTURE,
+                options=Options(responder="briefed"),
+                results=[result(responder="briefed", outcome=scored(0.1))],
+            )
+        ).read_text()
+    )
+
+    assert data["respondent"] == "briefed"
+    assert data["configuration"] == "skills=on responder=briefed"
 
 
 def test_the_session_file_says_which_code_produced_it(tmp_path, monkeypatch):

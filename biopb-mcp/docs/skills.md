@@ -678,12 +678,19 @@ never reads as something the agent did.
 
 A skill's claim is a behavioural delta, so measuring it needs a baseline —
 which means **two runs**, not one. The configuration is two switches on the
-invocation, and the square is four commands:
+invocation, and each corner is one command:
 
-| | `--bench-responder=model` | `=silent` |
-|---|---|---|
-| `--bench-skills=true` | does the whole thing work | does *asking* matter |
-| `=false` | does the *skill* matter | the floor |
+| | `--bench-responder=model` | `=silent` | `=briefed` |
+|---|---|---|---|
+| `--bench-skills=true` | does the whole thing work | does *asking* matter | what the asking cost |
+| `=false` | does the *skill* matter | the floor | the fact without the skill |
+
+`briefed` puts every fact the persona holds into the **task prompt** at handover
+and answers nothing after. It is the third value because `model` and `silent`
+differ in the information *and* in the exchange that obtains it, so their delta
+cannot say which one it measured: against `model`, a briefed run holds the
+information fixed and removes only the asking, and against `silent` it is the
+worth of the fact with no conversation on either side.
 
 Withholding is `services.skills_enabled: false` — a real shipped configuration,
 so the kernel, napari, dask and every library stay as they are and only the
@@ -698,7 +705,7 @@ configuration the *engine* chose per case, which meant a case's kind decided
 what a run cost, and a report had to explain a table whose rows were configured
 differently from one another.
 
-**The bottom-right pair measures the fixture, not the skill.** Whether the
+**The `silent` column measures the fixture, not the skill.** Whether the
 withheld fact is obtainable from the pixels is a property of the construction in
 `cases/` — it does not change when a body is edited, and `test_cases.py` already
 asserts the cheap half of it hermetically. The delta the layer exists to produce
@@ -711,12 +718,13 @@ recovered its withheld fact anyway.
 **No run's outcome fails a test.** Each sample becomes a row with an outcome and a
 reason — `ok`, `wrong-answer`, `out-of-turns`, `out-of-tool-calls`, `gave-up`,
 `no-result`, `unscorable-result`, `harness-error` — plus flags that change how to
-read it: `cut-off-but-scored`, `over-ask-budget(n)`, `never-asked`,
-`asked-but-unanswered`, `stalled`, `catalog-mismatch`. Ordering matters: a cap
-beats a bad number, so a run severed mid-workflow is not reported as a wrong
-answer, and a *provider* failure beats everything, because it is not about the
-skill at all. Every sample runs inside its own `try`, so one that dies becomes a
-row instead of an exception that destroys the other three.
+read it: `cut-off-but-scored`, `over-ask-budget(n)`, `never-asked` (not on a
+`briefed` row — there is nobody to ask), `asked-but-unanswered`, `stalled`,
+`catalog-mismatch`. Ordering matters: a cap beats a bad number, so a run severed
+mid-workflow is not reported as a wrong answer, and a *provider* failure beats
+everything, because it is not about the skill at all. Every sample runs inside
+its own `try`, so one that dies becomes a row instead of an exception that
+destroys the other three.
 
 Five properties of the loop, each of which cost a wrong number to find:
 

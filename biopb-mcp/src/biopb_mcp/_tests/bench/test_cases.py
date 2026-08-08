@@ -465,6 +465,27 @@ def test_the_persona_knows_the_sample_and_not_the_procedure(case):
         )
 
 
+def test_the_briefing_carries_the_facts_and_keeps_the_same_fence(case):
+    """`--bench-responder=briefed` hands the persona's facts to the agent, and
+    both halves of that have to hold per case.
+
+    It must carry **every** fact, or a briefed session is a different fixture
+    from the spoken one and the pair measures nothing it claims to. And it must
+    fence off the same vocabulary `persona_must_not_know` does: the switch
+    exists to remove the *asking*, and a brief that also handed over the skill's
+    procedure would remove the subject as well.
+    """
+    briefing = case.persona.briefing()
+    for key, value in case.persona.facts.items():
+        assert value in briefing, f"{case.label}: {key!r} never reaches the brief"
+    folded = briefing.casefold()
+    for procedural in case.persona_must_not_know:
+        assert procedural.casefold() not in folded, (
+            f"{case.label}: the brief hands over {procedural!r}, "
+            "which is the skill's job"
+        )
+
+
 def test_a_skill_case_declares_what_its_persona_must_hold(skill_case):
     """Both lists non-empty, because either one empty makes the check above
     vacuous — and a vacuous version of it is indistinguishable from a passing

@@ -16,20 +16,26 @@ engine — which is then what happened, twice.
 who answers the agent are switches (`_options.py`), fixed for the whole session,
 so this module varies exactly one thing: how many times to run each case.
 
-That was a 2x2 the engine iterated per case, and it is four commands now:
+That was a 2x2 the engine iterated per case, and it is one command per corner
+now:
 
-===================  ==================================  ======================
-                     `--bench-responder=model`           `=silent`
-===================  ==================================  ======================
-`--bench-skills=true`   does the whole thing work        does *asking* matter
-`=false`                does the *skill* matter          the floor
-===================  ==================================  ======================
+=====================  =========================  ====================  =========================
+                       `--bench-responder=model`  `=silent`             `=briefed`
+=====================  =========================  ====================  =========================
+`--bench-skills=true`  does the whole thing work  does *asking* matter  what the asking cost
+`=false`               does the *skill* matter    the floor             the fact without the skill
+=====================  =========================  ====================  =========================
+
+The third column is the one that separates the information from the exchange:
+`briefed` hands the agent everything the persona holds in the task prompt and
+answers nothing after, so against `model` the only thing that differs is whether
+the fact had to be elicited. The `silent` column differs in the fact itself.
 
 What that buys is that a run costs what you asked for, every row in a report was
-configured identically, and the four corners are four directories a reader can
-diff. What it costs is that no single report contains a delta: the delta is two
-sessions, which is why `session.json` records the configuration and the report
-header repeats it.
+configured identically, and the corners are directories a reader can diff. What
+it costs is that no single report contains a delta: the delta is two sessions,
+which is why `session.json` records the configuration and the report header
+repeats it.
 
 Samples are the axis a single session still varies, and the only source of
 information a case with no ablation ever had: run the same thing again, and the
@@ -86,10 +92,14 @@ from ..agentbench._models import (
     respondent_choice,
     text_backend,
 )
-from ..agentbench._respondent import SilentRespondent, model_respondent
+from ..agentbench._respondent import (
+    BriefedRespondent,
+    SilentRespondent,
+    model_respondent,
+)
 from ..agentbench._session import SessionUnavailable, live_session
 from ._case import BLOCKING_BUDGET, LAYER_KINDS, TENSOR_HANDLE, Case
-from ._options import Options
+from ._options import RESPONDER, Options
 
 # How a run ended. **Nothing here fails a test** -- a run that ran out of turns,
 # gave up, or got the wrong answer is a *result*. One vocabulary for both kinds
@@ -173,7 +183,30 @@ def respondent_for(case: Case, options: Options):
     """
     if options.responder == "silent":
         return SilentRespondent()
+    if options.responder == "briefed":
+        return BriefedRespondent()
     return model_respondent(case.persona)
+
+
+def task_for(case: Case, options: Options) -> str:
+    """The prompt this run is handed, per `--bench-responder`.
+
+    Only `briefed` changes it, and this is the half of that switch the
+    respondent cannot do: the persona's facts are folded in at handover, so the
+    run starts holding what every other configuration makes it ask for (or go
+    without). The respondent side then only has to stop volunteering, which is
+    what `BriefedRespondent` does.
+
+    Rendered from the persona rather than written a second time in the case
+    module, so a briefed run and a spoken one cannot end up disagreeing about
+    what was knowable — the drift `Persona` keeps its facts as data to prevent.
+    That inheritance carries the fence too: `test_cases.py` asserts the briefing
+    names none of the skill's own vocabulary, so this discloses the *fact* and
+    never the procedure for using it.
+    """
+    if options.responder != "briefed":
+        return case.task
+    return f"{case.task.rstrip()}\n\n{case.persona.briefing()}\n"
 
 
 # --- one run's result -------------------------------------------------------
@@ -194,6 +227,11 @@ class Result:
     #: Whether this run's session offered the catalog — `--bench-skills`, copied
     #: onto the result so a row can be read without its session file.
     skills_offered: bool = True
+    #: Who answered this run — `--bench-responder`, copied onto the result for
+    #: the same reason, and read by :meth:`flags`: whether asking nothing is an
+    #: observation about the agent or the configuration working as asked depends
+    #: on whether there was anybody to ask.
+    responder: str = RESPONDER.default
     trace: object = None
     outcome: Outcome | None = None
     #: Which skills the catalog offered this run, read at bring-up. Ids rather
@@ -283,7 +321,11 @@ class Result:
         asked = len(self.trace.blocking_questions)
         if asked > budget:
             out.append(f"{FLAG_OVER_BUDGET}({asked})")
-        if asked == 0:
+        # Not under `briefed`: the facts arrived with the task and nobody is
+        # there to add to them, so asking nothing is the configuration doing
+        # what it was set to do. Flagging it would put the same mark on every
+        # row of such a session, which is how a flag stops meaning anything.
+        if asked == 0 and self.responder != "briefed":
             out.append(FLAG_NEVER_ASKED)
         if asked and not self.trace.answers:
             out.append(FLAG_UNANSWERED)
@@ -442,9 +484,12 @@ def write_session(run: Run) -> Path:
                 "options": run.options.as_json(),
                 "configuration": run.options.configuration,
                 "agent": agent_choice().name,
+                # The switch's own word for anything but `model`: those
+                # respondents are local, so there is no model name to give and
+                # naming one would say a provider answered when none was asked.
                 "respondent": respondent_choice().name
                 if run.options.responder == "model"
-                else "silent",
+                else run.options.responder,
                 "cases": known,
             },
             indent=2,
@@ -600,7 +645,9 @@ def run_one(
     """One sample, in a session of its own configured by *options*."""
     ids = {} if ids is None else ids
     plane = _plane.running_plane() if ids else None
-    result = Result(sample=sample, skills_offered=options.skills)
+    result = Result(
+        sample=sample, skills_offered=options.skills, responder=options.responder
+    )
     where = where_for(case) / result.name
     with live_session(
         skills_enabled=options.skills,
@@ -616,7 +663,7 @@ def run_one(
             session,
             ToolCallingAgent(),
             respondent_for(case, options),
-            with_protocol(case.task),
+            with_protocol(task_for(case, options)),
             max_turns=case.max_turns,
             max_tool_calls=case.max_tool_calls,
         )
@@ -705,12 +752,14 @@ def run_case(case: Case, options: Options | None = None) -> Run:
             result = Result(
                 sample=sample,
                 skills_offered=options.skills,
+                responder=options.responder,
                 error=f"{NO_SESSION}{exc}",
             )
         except Exception as exc:  # noqa: BLE001 - the row is the point
             result = Result(
                 sample=sample,
                 skills_offered=options.skills,
+                responder=options.responder,
                 error=f"{type(exc).__name__}: {exc}",
             )
         result.seconds = time.monotonic() - started
@@ -766,13 +815,15 @@ def write_summary(run: Run) -> str:
     rows = [r.row(case.blocking_budget) for r in results]
     agent = agent_choice()
     # Resolved only under `--bench-responder=model`. Two reasons it is not a
-    # plain `respondent_choice().name`: a silent run has no respondent model to
-    # name, and stamping one anyway made this file disagree with its own
-    # `summary.md`; and `respondent_choice()` raises on a malformed
+    # plain `respondent_choice().name`: a silent or briefed run has no
+    # respondent model to name, and stamping one anyway made this file disagree
+    # with its own `summary.md`; and `respondent_choice()` raises on a malformed
     # BIOPB_RESPONDENT, which would take out the report of a run already paid
     # for that never had a respondent model in it.
     respondent = (
-        respondent_choice().name if run.options.responder == "model" else "silent"
+        respondent_choice().name
+        if run.options.responder == "model"
+        else run.options.responder
     )
     many = run.options.samples > 1
     # `columns` is empty when no sample produced an outcome — every one died, or
@@ -915,10 +966,10 @@ def write_summary(run: Run) -> str:
 def models_in_play(options: Options) -> tuple[tuple[str, object], ...]:
     """The `(side, choice)` pairs this configuration will actually call.
 
-    The respondent is only one of them under `--bench-responder=model`.
-    `SilentRespondent` is local and answers from a constant, so a silent session
-    needs no respondent key, no respondent endpoint, and no request spent
-    proving either — see `respondent_for`.
+    The respondent is only one of them under `--bench-responder=model`. Both
+    other respondents are local and answer from a constant, so a `silent` or
+    `briefed` session needs no respondent key, no respondent endpoint, and no
+    request spent proving either — see `respondent_for`.
     """
     sides = [("agent", agent_choice())]
     if options.responder == "model":

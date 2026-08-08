@@ -41,7 +41,7 @@ ago should not be the answer to "why did this take two hours".
 | `--bench-cases` | `BIOPB_BENCH_CASES` | `all` (default), `skills`, `tasks` | which cases to pay for — `skills` is the ones with an ablation, `tasks` the complement |
 | `--bench-fixtures` | `BIOPB_BENCH_FIXTURES` | `all` (default), `synthetic`, `curated` | which kind of data |
 | `--bench-skills` | `BIOPB_BENCH_SKILLS` | `true` (default), `false` | whether the agent is offered the catalog |
-| `--bench-responder` | `BIOPB_BENCH_RESPONDER` | `model` (default), `silent` | who answers the agent |
+| `--bench-responder` | `BIOPB_BENCH_RESPONDER` | `model` (default), `silent`, `briefed` | who answers the agent — or, for `briefed`, whether there is anything left to ask |
 | `--bench-samples` | `BIOPB_BENCH_SAMPLES` | a positive integer, default 1 | how many times each case |
 
 **The target must be at or below `_tests/`.** `pytest .../_tests`,
@@ -86,11 +86,12 @@ happens in, fixed for the whole invocation. A run therefore has no arms and no
 grid: it runs the cases you selected, `--bench-samples` times each, in one
 configuration, and writes one session directory that says which.
 
-The 2x2 that used to be a table inside one report is four commands:
+The 2x2 that used to be a table inside one report is one command per corner:
 
 ```sh
 pytest ... --bench-skills=true  --bench-responder=model    # does the whole thing work
 pytest ... --bench-skills=true  --bench-responder=silent   # does *asking* matter
+pytest ... --bench-skills=true  --bench-responder=briefed  # what the asking cost
 pytest ... --bench-skills=false --bench-responder=model    # does the *skill* matter
 pytest ... --bench-skills=false --bench-responder=silent   # the floor
 ```
@@ -119,6 +120,37 @@ decorative. `drift-correction` is the standing reason to keep doing it: a capabl
 agent recovered its withheld channel anyway, by registering on both and keeping
 the self-consistent one — a fixture can be built so the heuristics its author
 thought of point the wrong way and still not make the fact unobtainable.
+
+### `--bench-responder=briefed`: the same facts, without the asking
+
+Every fact the persona holds goes into the **task prompt** at handover, rendered
+from the same fact table `silent` withholds, and the respondent adds nothing
+afterwards. Nothing else about the session changes.
+
+It is there because `model` and `silent` differ in two things at once — the
+information *and* the exchange that obtains it — so their delta cannot say which
+one it measured. `briefed` holds the information fixed and removes only the
+asking:
+
+| pair | what it isolates |
+|---|---|
+| `model` vs `silent` | whether the fact was obtainable from the pixels |
+| `model` vs `briefed` | what having to **elicit** it cost, the fact being equal |
+| `briefed` vs `silent` | what the fact itself is worth, no conversation either side |
+
+A briefed run that lands well inside tolerance where the spoken one does not is
+an agent that can use the fact but does not reliably get it — which is a finding
+about the interaction, and the one the other two arms report as the fixture's.
+Read a briefed session as an **upper bound**: it is the best the case can go
+when nothing has to be asked for.
+
+Two consequences worth knowing. `never-asked` is not flagged on a briefed row —
+there is nobody to ask, so the flag would be on every row of the session and
+mean nothing — while `over-ask-budget` still is, since a briefed run that goes
+asking anyway is one not using what it was handed. And the brief carries the
+persona's facts and nothing else: `test_cases.py` asserts it fences off the same
+`persona_must_not_know` vocabulary the persona does, so it discloses the fact and
+never the procedure for using it.
 
 ### `--bench-skills=false` on a case with no skill
 
@@ -200,11 +232,12 @@ every model is a legitimate subject for it.
 `ollama` needs no key, which makes it the cheap way to rehearse a run end to end
 before spending anything.
 
-**A `--bench-responder=silent` session needs only the agent's key.** The silent
-respondent is local and answers from a constant, so that arm reaches for no
-respondent model at all — no key read, no endpoint probed, nothing spent on one.
-The availability check follows the switch rather than the defaults
-(`_engine.models_in_play`), so one key is enough to run the control condition.
+**A `silent` or `briefed` session needs only the agent's key.** Both respondents
+are local and answer from a constant, so those arms reach for no respondent
+model at all — no key read, no endpoint probed, nothing spent on one. The
+availability check follows the switch rather than the defaults
+(`_engine.models_in_play`), so one key is enough to run either control
+condition.
 
 The provider SDKs are imported lazily and are **not** dependencies of this
 package — one `--with` line each. Keys are read from the environment at call
