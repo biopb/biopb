@@ -2,9 +2,10 @@
 
 **One invocation is one configuration.** `--bench-skills` decides whether the
 agent is offered the catalog at all and `--bench-responder` decides who answers
-it; both are settings on the session the run happens in, and neither varies
-within a run. What used to be a 2x2 the engine iterated is four commands, and
-each writes its own session directory that says which corner it was.
+it — or whether there is anything left to ask; both are settings on the session
+the run happens in, and neither varies within a run. What used to be a 2x2 the
+engine iterated is one command per corner, and each writes its own session
+directory that says which corner it was.
 
 That is the whole reason there is no `--bench-arms` here any more. An arm was a
 *harness configuration the engine chose per case*, which meant a case's kind
@@ -97,20 +98,34 @@ SKILLS = Setting(
     "it and nothing else, which is the ablation half of a skill's delta",
 )
 
-#: Who answers when the agent asks. Two, and the second is not a straw man:
-#: "I don't know" is what a real user says about half the metadata they are
-#: asked for, and `calibrated-measurements` specifies that branch explicitly.
-#: A run against `silent` **must fail** a case whose fixture withholds a fact —
-#: if it does not, that asymmetry is decorative and the case measures something
-#: else. That pair of runs is a claim about the *fixture*, not about a skill.
+#: Who answers when the agent asks — and, for one value, whether there is
+#: anything left to ask. Three, and none of them is a straw man.
+#:
+#: `silent` is the control condition: "I don't know" is what a real user says
+#: about half the metadata they are asked for, and `calibrated-measurements`
+#: specifies that branch explicitly. A run against it **must fail** a case whose
+#: fixture withholds a fact — if it does not, that asymmetry is decorative and
+#: the case measures something else. That pair of runs is a claim about the
+#: *fixture*, not about a skill.
+#:
+#: `briefed` varies the other thing. The persona's facts go into the task prompt
+#: at handover and the respondent adds nothing after, so the run has the whole
+#: of the information and none of the conversation. Against `model` that is the
+#: **cost of having to elicit** — a delta the other two cannot separate from the
+#: value of the fact itself, since they differ in the information as well as in
+#: the exchange. Read the three together: `silent` says whether the fact was
+#: obtainable from the pixels, `briefed` says what obtaining it *by asking* was
+#: worth over being handed it.
 RESPONDER = Setting(
     "--bench-responder",
     "BIOPB_BENCH_RESPONDER",
-    ("model", "silent"),
+    ("model", "silent", "briefed"),
     "model",
     "who answers the agent's questions: `model` plays the case's persona, "
     "`silent` answers nothing, which is what says whether the withheld fact "
-    "was obtainable from the pixels",
+    "was obtainable from the pixels, and `briefed` puts every fact the persona "
+    "holds into the task prompt up front and answers nothing after, which is "
+    "the same information with the asking taken out",
 )
 
 SETTINGS = (CASES, FIXTURES, SKILLS, RESPONDER)

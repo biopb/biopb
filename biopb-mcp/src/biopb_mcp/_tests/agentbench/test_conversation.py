@@ -36,7 +36,12 @@ from ._conversation import (
     with_protocol,
 )
 from ._models import EmptyCompletion
-from ._respondent import DONE, ScriptedRespondent, SilentRespondent
+from ._respondent import (
+    DONE,
+    BriefedRespondent,
+    ScriptedRespondent,
+    SilentRespondent,
+)
 from ._session import CLIENT_TOOLS, ToolResult, ToolSpec
 
 
@@ -444,6 +449,27 @@ def test_the_silent_respondent_answers_nothing_but_keeps_talking():
     assert trace.stopped != FINISHED
     answers = [e.text for e in trace.events if e.role == "user"]
     assert all("don't know" in a for a in answers)
+
+
+def test_the_briefed_respondent_adds_nothing_to_what_was_already_said():
+    """The other control, varying the other thing. It answers every question
+    the same way and with no content, so the only information a briefed run
+    has is what its prompt carried — but unlike the silent one it says the
+    agent already has everything, because under this switch that is true and
+    "I'd have to check" would send it waiting on a person who is not coming.
+    """
+    respondent = BriefedRespondent()
+    agent = ScriptedAgent(
+        [_says("Which channel is structural?"), _says("And the pixel size?")]
+    )
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert len(respondent.said) == 2
+    assert trace.stopped != FINISHED, "it must not end the run either"
+    answers = {e.text for e in trace.events if e.role == "user"}
+    assert len(answers) == 1, "one constant, so nothing can be leaked by it"
+    assert "nothing to add" in answers.pop()
 
 
 def test_an_unmatched_question_is_not_silently_answered():

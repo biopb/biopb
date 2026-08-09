@@ -445,7 +445,7 @@ def converse(
                     text=(
                         f"no tool call in {idle_turns} turns — the conversation "
                         "stopped progressing; the respondent may be unable to "
-                        "end it (SilentRespondent never returns DONE)"
+                        "end it (a local respondent never returns DONE)"
                     ),
                     is_error=True,
                 )
