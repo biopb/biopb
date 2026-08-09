@@ -552,7 +552,7 @@ CASE = Case(
     task=TASK,
     persona=OPERATOR,
     fixture=Procedural(AberratedStack()),
-    layers=(Layer("image", "image"), Layer("beads", "image")),
+    layers=(Layer("image", "image"), Layer("beads", "beads")),
     collect={
         "restored": "restored",
         "axial_fwhm_before_um": "axial_fwhm_before_um",
