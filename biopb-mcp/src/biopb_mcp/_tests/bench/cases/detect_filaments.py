@@ -412,7 +412,6 @@ CASE = Case(
     collect={"centrelines": "centrelines", "mean_width_um": "mean_width_um"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="filament",
     # It must be able to answer: the fixture strips the pixel size, and this
     # person knows it, along with what the filaments are and how wide.
     persona_must_know=("0.1 microns per pixel", "0.3 and 0.9", "phalloidin"),

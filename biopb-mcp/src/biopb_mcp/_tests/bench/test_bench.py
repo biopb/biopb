@@ -107,3 +107,18 @@ def test_the_catalog_matched_the_switch(run: Run):
         "the session's catalog did not match the switch it was run under, so "
         f"this report is not of the configuration it names: {wrong}"
     )
+    # And that it held the *right* thing. "Something came back" is a weaker
+    # claim than this test's name, and weak in the direction that matters: a
+    # probe that retrieved a different skill entirely passed it for as long as
+    # anyone had been running the suite.
+    if want and run.case.about_a_skill:
+        missing = [
+            f"{r.name}: asked {run.case.query!r} and got {list(r.catalog)}"
+            for r in run.results
+            if not r.error and run.case.skill not in r.catalog
+        ]
+        assert not missing, (
+            f"the catalog was offered but never held {run.case.skill!r}, so an "
+            f"ablation of it would change nothing and this row is not the "
+            f"comparison it claims: {missing}"
+        )

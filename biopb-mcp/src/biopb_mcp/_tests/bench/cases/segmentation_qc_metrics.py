@@ -301,7 +301,6 @@ CASE = Case(
     # path. Without this the session has no such plugin and the run would be
     # scoring an environment the skill declares it cannot work in.
     plugins=("segmentation_qc",),
-    catalog_query="segmentation quality",
     # It must be able to answer which layer is which.
     persona_must_know=("labels_run_a", "labels_run_b", "by hand"),
     # And it must not know the metric — only which layer it drew.

@@ -295,7 +295,6 @@ CASE = Case(
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="physical units",
     # It must be able to answer: the fixture strips the voxel size, and this
     # person knows both the lateral pixel size and the z-step.
     persona_must_know=("0.1 micron", "0.5 micron", "nuclei"),
