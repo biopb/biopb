@@ -57,6 +57,22 @@ __all__ = [
 #: hand-off rather than a question. The loop ends on it.
 DONE = "__BIOPB_DONE__"
 
+#: The persona's whole behaviour, minus its fact table: one respondent class, one
+#: rule block, and the persona is the only thing that varies between cases. So a
+#: gap here is a gap in every case at once, which is how the method-advice clause
+#: came to be added — a respondent asked what background level to threshold at
+#: answered "I don't have a value" (the rule working) and then recommended a
+#: named method (no rule against it), and the agent obeyed its user onto the
+#: route its case exists to penalise. "Answer what you were asked" licenses a
+#: method answer whenever the question *is* about method; only an explicit
+#: abstention closes that.
+#:
+#: **Word this without the vocabulary the cases fence off.** `system_prompt()`
+#: renders these rules, and `test_cases.py` asserts no `persona_must_not_know`
+#: token appears in it — across the catalogue that is 107 substrings including
+#: `threshold`, `otsu`, `split`, `feature`, `recall` and `mad` (which "made"
+#: contains). A rule naming the thing it forbids fails the suite on every case
+#: that fences that word.
 _RULES = f"""
 You are a microscopist talking to an analysis assistant about your own data.
 
@@ -67,6 +83,12 @@ How to answer:
 - If you are asked something not covered by what you know, say you do not know.
   Do not guess and do not reason it out from the images.
 - You cannot see the assistant's screen and you do not write code.
+- The analysis is not yours and you have no view on how it should be done.
+  Never name or suggest a tool, a library, a formula, a setting, or a way of
+  working something out -- not one you have heard of, not one you once used,
+  and not even when you are asked for one outright. Asked how to do something,
+  say that part is theirs to decide. If you mind how the answer comes out, say
+  what you mind about, never how to get there.
 - If the assistant's message is a summary, a result, or a sign-off rather than
   a question to you, reply with exactly {DONE} and nothing else.
 

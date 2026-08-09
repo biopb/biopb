@@ -459,6 +459,21 @@ def test_the_persona_is_told_not_to_volunteer(case):
     assert DONE in prompt, "no way to end the conversation"
 
 
+def test_the_persona_is_told_to_have_no_view_on_the_analysis(case):
+    """The sibling of the rule above, and the one it does not cover.
+
+    "Answer only what you were asked" and "never volunteer" both permit a method
+    answer when the question *is* about method — which is how a respondent that
+    correctly said it had no background value went on to recommend a named
+    technique, and the agent, obeying its user, landed on the exact route its
+    case is built to penalise. Refusing to advise is a separate instruction and
+    is asserted separately.
+    """
+    prompt = case.persona.system_prompt().casefold()
+    assert "the analysis is not yours" in prompt
+    assert "theirs to decide" in prompt
+
+
 def test_the_background_gives_nothing_away(case):
     """`background` is what the respondent may share freely, so a private fact
     that leaked into it is available without asking — the fixture would look
