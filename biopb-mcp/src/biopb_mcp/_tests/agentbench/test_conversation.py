@@ -729,6 +729,49 @@ def test_a_working_turn_cannot_declare_completion():
     assert trace.tool_names == ["execute_code", "server_status"]
 
 
+def test_a_turn_that_asks_cannot_declare_completion():
+    """The sibling of the tool-call rule, and it cost a real run.
+
+    An agent five turns into `skeleton-network-metrics` put three good
+    questions to the microscopist — voxel size per axis, the shortest real side
+    branch, whether fragmentation was expected — and ended that same message
+    with the sentinel. The loop took it at its word and scored a case that had
+    barely started, with nothing bound. Asking and signing off in one breath is
+    still working, whatever the last line says.
+    """
+    agent = ScriptedAgent(
+        [
+            _says(f"What is the voxel size?\n{TASK_COMPLETE}"),
+            _says(f"Now they are bound.\n{TASK_COMPLETE}"),
+        ]
+    )
+    respondent = ScriptedRespondent([("voxel", "0.1 by 0.1 by 0.5 microns")])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+    assert trace.turns_used == 2, "it ended on the declaration, not the question"
+    assert respondent.heard == ["What is the voxel size?\n" + TASK_COMPLETE], (
+        "the question went to the person who could answer it"
+    )
+
+
+def test_a_sign_off_a_model_respondent_reads_as_done_still_ends_the_run():
+    """The cost of routing is bounded, and usually zero.
+
+    A rhetorical question before the sentinel is now handed over rather than
+    ending the run directly — and a model respondent has a rule for exactly
+    that shape, so it comes straight back as `DONE` and the run ends one line
+    later with the same verdict.
+    """
+    agent = ScriptedAgent([_says(f"Anything else you need?\n{TASK_COMPLETE}")])
+    respondent = ScriptedRespondent([("anything else", DONE)])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+
+
 def test_every_run_is_told_the_protocol():
     """Appended by the harness rather than written into each case, so a new
     case cannot forget it and then livelock."""
