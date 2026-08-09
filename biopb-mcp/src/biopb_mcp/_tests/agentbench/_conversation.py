@@ -237,6 +237,18 @@ def declares_done(text: str) -> bool:
     return bool(lines) and lines[-1].strip() == TASK_COMPLETE
 
 
+def asks_something(text: str) -> bool:
+    """Whether *text* puts a question to the person on the other end.
+
+    A question mark, the same heuristic and for the same reasons as
+    :attr:`Trace.asked` — transparent and cheap, against paying a third model
+    to classify a turn in a layer built to avoid judged verifiers. One
+    definition, because a turn the ask budget counts as a question and the loop
+    treats as a hand-off would be two different readings of the same sentence.
+    """
+    return "?" in text
+
+
 def with_protocol(task: str) -> str:
     """*task* plus the completion protocol every run is held to."""
     return task.rstrip() + "\n" + COMPLETION_PROTOCOL
@@ -409,7 +421,16 @@ def converse(
         # Before the respondent sees it: the agent declaring itself done is not
         # a question, and routing it would only invite a judgement about
         # whether it was one.
-        if declares_done(step.text):
+        #
+        # Unless it *is* one. A turn that asks and signs off in the same breath
+        # is the same shape as a turn that calls a tool and signs off — still
+        # working, whatever it wrote — and it cost a real run: an agent five
+        # turns in put three good questions to the microscopist and closed the
+        # message with the sentinel, and the loop took it at its word and
+        # scored a case that had barely started. Routing it costs at most one
+        # turn and usually nothing: a model respondent already answers a
+        # sign-off with `DONE`, which ends the run on the next line.
+        if declares_done(step.text) and not asks_something(step.text):
             trace.stopped = FINISHED
             return trace
 

@@ -245,7 +245,25 @@ class ToolCallingAgent:
     #: reasoning alone in a first turn against an almost empty context — a
     #: margin thin enough that a harder turn truncates, and a truncated turn is
     #: an empty one. The cost of the larger budget is nothing until it is used.
-    max_tokens: int = 16384
+    #:
+    #: 16384 was that reasoning applied once and it was still short. Two full
+    #: sweeps truncated one case each — `strahler-ordering` at turn 54 of 90
+    #: while computing a fourth variant of a ratio it had already got right
+    #: (the bound answer would have passed both tolerances), and
+    #: `measure-smlm-resolution` at turn 29 mid-FRC-curve. Both were deep in a
+    #: long transcript, which is where the budget has to cover reasoning over
+    #: the most context. Doubled again rather than measured, on the same "costs
+    #: nothing until used" argument — but a *third* truncation should be
+    #: measured rather than doubled a third time, because at that point the
+    #: pattern is a turn shape this budget cannot hold, not a number set too
+    #: low.
+    #:
+    #: This is not the turn cap, which is a scored outcome (`out-of-turns`)
+    #: exactly like the ask budget: a run that will not converge is supposed to
+    #: fail. Truncation is the harness ending a run for a reason that is not
+    #: the agent's performance, which is why it scores `agent-truncated` and is
+    #: worth spending headroom to avoid.
+    max_tokens: int = 32768
 
     def __post_init__(self) -> None:
         self.choice = self.choice or agent_choice()
