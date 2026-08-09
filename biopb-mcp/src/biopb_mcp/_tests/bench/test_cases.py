@@ -371,6 +371,31 @@ def test_the_fixture_provides_every_layer_the_case_loads(case, built):
         )
 
 
+def test_every_array_the_fixture_builds_reaches_the_agent(case, built):
+    """The converse of the check above, and the one that catches a `Layer` whose
+    key is a typo for another layer's.
+
+    `Layer` is `(name, key)`, so `Layer("beads", "image")` is well-formed, passes
+    the check above, and presents `data["image"]` twice under two names while the
+    bead stack is never shown. What the agent sees is two layers, both plausible,
+    and a case that silently measures something else — `deconvolve-widefield`
+    shipped that way and deconvolved its image with a PSF measured from itself.
+    An array a fixture pays to build and nobody is shown is the symptom, so that
+    is what is asserted: every key presented, each exactly once.
+    """
+    keys = [layer.key for layer in case.layers]
+    duplicated = sorted({k for k in keys if keys.count(k) > 1})
+    assert not duplicated, (
+        f"{case.label}: {duplicated} is presented as more than one layer, so "
+        f"some other array of this fixture is presented as none"
+    )
+    unseen = sorted(set(built.data) - set(keys))
+    assert not unseen, (
+        f"{case.label}: the fixture builds {unseen}, which no layer presents — "
+        f"the agent is never shown it"
+    )
+
+
 def test_the_fixture_says_where_it_came_from(built):
     """Free text and required. A synthetic seed needs no review; an annotation
     is someone's claim about their own data and is only as good as the review it
