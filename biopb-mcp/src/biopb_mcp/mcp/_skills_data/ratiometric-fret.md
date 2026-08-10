@@ -37,7 +37,7 @@ between cells, fields or conditions.
   that changed between the two exposures is indistinguishable from a change in
   the ratio.
 - **One channel's intensity is the readout.** Then it is an intensity
-  measurement — [[calibrated-measurements]] — and dividing discards the signal.
+  measurement, and dividing discards the signal.
 
 ## Parameters
 
@@ -192,8 +192,7 @@ between cells, fields or conditions.
 
 ## Next steps
 
-- Per-object or per-cell ratios, in physical units, are
-  [[calibrated-measurements]] over a segmentation of the donor channel — segment
-  on a channel, never on the ratio.
+- Per-object or per-cell ratios are measured in physical units over a
+  segmentation of the donor channel — segment on a channel, never on the ratio.
 - A time series wants [[drift-correction]] applied to the channels before the
   ratio, and the same warp applied to both so the pair stays registered.

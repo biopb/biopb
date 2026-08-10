@@ -21,8 +21,8 @@ down.
 ## When NOT to use
 
 - **The objects are compact rather than thin.** Area, volume, eccentricity and
-  the rest are `regionprops`, and in physical units they are
-  [[calibrated-measurements]]. A skeleton of a blob is a meaningless star.
+  the rest are `regionprops`, reported in physical units. A skeleton of a blob
+  is a meaningless star.
 - **There is no segmentation yet.** This measures a mask; it does not make one,
   and every number below inherits the mask's mistakes directly — see the last
   guardrail.
@@ -235,5 +235,4 @@ on a 5:1 anisotropic stack of a 132 µm network with 11 branches and 5 junctions
 - Per-branch lengths are already in `branches`; a length histogram separates a
   network that lost total length from one that fragmented at the same length.
 - Counting anything *inside* the network — puncta on the filaments, say — needs
-  the mask as a parent, and lengths per parent in physical units is
-  [[calibrated-measurements]].
+  the mask as a parent, and lengths per parent are reported in physical units.

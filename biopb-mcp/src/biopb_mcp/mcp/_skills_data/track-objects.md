@@ -214,7 +214,6 @@ where it was missed, and keeps lineage where cells divide.
 ## Next steps
 
 - Per-object size, shape or intensity along each track: measure them per frame
-  with [[calibrated-measurements]] and join on `(frame, label)`, the same key
-  step 5 uses.
+  in physical units and join on `(frame, label)`, the same key step 5 uses.
 - `split_df` and `merge_df` carry `parent_track_id` / `child_track_id`, which is
   the lineage tree if the user wants generation times rather than counts.

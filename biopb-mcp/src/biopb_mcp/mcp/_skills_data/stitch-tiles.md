@@ -242,5 +242,5 @@ sweep found does not move the placement (step 3).
 ## Next steps
 
 - Segment the mosaic as one image, then score that with
-  [[segmentation-qc-metrics]] and report sizes from it with
-  [[calibrated-measurements]], carrying the spacing across (step 7).
+  [[segmentation-qc-metrics]] and report sizes from it in physical units,
+  carrying the spacing across (step 7).

@@ -227,5 +227,5 @@ what steps 2 and 5 are for.
   shading, but the correlation score it accepts pairs on loses most of its margin
   without this step. A seam that survives the correction is a registration
   problem, not an illumination one.
-- Report intensities and sizes from the corrected stack with
-  [[calibrated-measurements]], carrying the pixel spacing across (step 6).
+- Report intensities and sizes from the corrected stack in physical units,
+  carrying the pixel spacing across (step 6).

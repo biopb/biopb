@@ -69,6 +69,7 @@ _WORKSPACE = {"biopb", "biopb-mcp", "biopb-tensor-server", "biopb-control"}
 COVERED: dict[str, set[str]] = {
     "drift-correction": {"pystackreg"},
     "track-objects": {"laptrack"},
+    "skeleton-network-metrics": {"skan", "networkx"},
 }
 
 
@@ -724,3 +725,137 @@ def test_a_warped_channel_gets_exact_zeros_at_the_border():
         "excluding the zeros no longer helps the background estimate; "
         "ratiometric-fret's `warped=True` argument and its failure row are wrong"
     )
+
+
+# --- skan, for skeleton-network-metrics ------------------------------------
+#
+# Guarded per-package for the same reason as pystackreg above.
+
+
+@pytest.fixture(scope="module")
+def skan_api():
+    skan = pytest.importorskip("skan")
+    return skan.Skeleton, skan.summarize
+
+
+@pytest.fixture(scope="module")
+def z_line():
+    """A single filament running straight along z, one voxel wide.
+
+    Chosen so the anisotropic axis is the only one carrying length: every step
+    the skeleton takes is a z step, so a `spacing` that was ignored shows up as
+    the whole answer rather than as a few percent.
+    """
+    vol = np.zeros((20, 3, 3), bool)
+    vol[:, 1, 1] = True
+    return vol
+
+
+def test_spacing_is_honoured_by_the_constructor(skan_api, z_line):
+    """Step 4 passes `Skeleton(skeleton, spacing=SPACING)` and step 4's prose
+    says this is not the same as scaling the answer at the end.
+
+    If `spacing` were ever ignored, nothing downstream would raise -- the
+    lengths would simply come back in voxels, which on this skill's own failure
+    table is the 79.8%-of-truth row.
+    """
+    Skeleton, summarize = skan_api
+    voxels = float(summarize(Skeleton(z_line), separator="_").branch_distance.iloc[0])
+    microns = float(
+        summarize(
+            Skeleton(z_line, spacing=(0.5, 0.1, 0.1)), separator="_"
+        ).branch_distance.iloc[0]
+    )
+    assert voxels == pytest.approx(19.0)
+    assert microns == pytest.approx(9.5), "spacing did not reach branch_distance"
+
+
+def test_summarize_takes_separator_and_names_the_two_columns_step_5_reads(skan_api):
+    """Step 5 filters on `branch_type` and `branch_distance`, from
+    `summarize(sk, separator="_")`. The separator is explicit in the body
+    because it decides whether the columns are `branch_type` or `branch-type`;
+    a rename would surface as a KeyError mid-prune, after the skeleton has
+    already been built.
+    """
+    Skeleton, summarize = skan_api
+    img = np.zeros((21, 21), bool)
+    img[10, 2:19] = True
+    img[7:10, 10] = True
+    table = summarize(Skeleton(img), separator="_")
+    assert {"branch_type", "branch_distance"} <= set(table.columns)
+
+
+def test_branch_type_1_is_the_dead_end_step_5_prunes(skan_api):
+    """Step 5 prunes `branch_type == 1` and says why: junction-to-endpoint is a
+    dead end, and pruning on length alone would drop real short connections
+    between two junctions. That claim is about skan's encoding of the column,
+    not about this repo, so it is worth pinning.
+    """
+    Skeleton, summarize = skan_api
+    img = np.zeros((21, 21), bool)
+    img[10, 2:19] = True
+    img[7:10, 10] = True  # a 3-px spur off the middle
+    table = summarize(Skeleton(img), separator="_")
+    spurs = table[table.branch_type == 1]
+    assert len(spurs) == 3, "the T should read as three junction-to-endpoint arms"
+    assert float(spurs.branch_distance.min()) == pytest.approx(3.0)
+
+
+def test_prune_paths_returns_a_skeleton_to_loop_on(skan_api):
+    """Step 5 reassigns `sk = sk.prune_paths(...)` and loops up to ten times,
+    because pruning a spur can expose the one behind it. That only works if the
+    return value is another Skeleton rather than an array or an in-place None.
+    """
+    Skeleton, _ = skan_api
+    img = np.zeros((21, 21), bool)
+    img[10, 2:19] = True
+    img[7:10, 10] = True
+    sk = Skeleton(img)
+    assert isinstance(sk.prune_paths(np.array([0])), Skeleton)
+
+
+def test_path_coordinates_stays_in_voxels_even_with_spacing(skan_api, z_line):
+    """The load-bearing one for step 6.
+
+    `branch_length` does `sk.path_coordinates(path) * np.asarray(SPACING)` on a
+    Skeleton that was *already* constructed with that spacing. That is only
+    correct because `path_coordinates` returns raw voxel indices. If skan ever
+    applied the spacing here too, nothing would raise -- every length would be
+    scaled twice, and on this fixture that is a 5x error in the one number the
+    skill exists to report.
+    """
+    Skeleton, _ = skan_api
+    coords = Skeleton(z_line, spacing=(0.5, 0.1, 0.1)).path_coordinates(0)
+    assert coords[:3].tolist() == [[0, 1, 1], [1, 1, 1], [2, 1, 1]]
+
+
+# --- networkx, for skeleton-network-metrics --------------------------------
+
+
+def test_the_networkx_calls_step_7_makes_behave_as_written():
+    """Step 7 builds a `MultiGraph`, collapses each junction cluster with
+    `contracted_nodes(..., self_loops=False, copy=False)`, drops self-loops and
+    counts components.
+
+    `copy=False` is the argument that matters: the body mutates `g` in place and
+    never rebinds it, so a default that returned a copy instead would leave the
+    graph uncontracted and the junction count too high -- silently, since every
+    later call still works.
+    """
+    nx = pytest.importorskip("networkx")
+    import inspect
+
+    assert {"self_loops", "copy"} <= set(
+        inspect.signature(nx.contracted_nodes).parameters
+    )
+
+    g = nx.MultiGraph()
+    g.add_edge(0, 1, length=1.0)
+    g.add_edge(1, 2, length=2.0)
+    nx.contracted_nodes(g, 0, 1, self_loops=False, copy=False)
+    assert sorted(g.nodes()) == [0, 2], "contracted_nodes did not mutate in place"
+
+    g.add_edge(2, 2, length=0.1)
+    g.remove_edges_from(list(nx.selfloop_edges(g)))
+    assert list(g.edges()) == [(0, 2)]
+    assert nx.number_connected_components(g) == 1

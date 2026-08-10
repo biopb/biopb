@@ -52,7 +52,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "calibrated-measurements"
+NAMESPACE = "calibrated-measurements"
 
 #: (Z, Y, X) µm per voxel — the fact the fixture strips and the persona holds.
 #: Anisotropic on purpose: a run that assumes cubic voxels is wrong by the Z:XY
@@ -146,7 +146,7 @@ def _agrees_with_regionprops(labels, volumes_um3) -> None:
     measured = regionprops_table(labels, properties=("area",), spacing=SPACING_UM)
     if not np.allclose(measured["area"], volumes_um3, rtol=1e-9):
         raise AssertionError(
-            f"{SKILL} fixture: regionprops with spacing={SPACING_UM} does not "
+            f"{NAMESPACE} fixture: regionprops with spacing={SPACING_UM} does not "
             "agree with voxel count x voxel volume. The truth is wrong."
         )
 
@@ -283,7 +283,7 @@ MICROSCOPIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="twelve-nuclei-anisotropic",
     task=TASK,
     persona=MICROSCOPIST,
