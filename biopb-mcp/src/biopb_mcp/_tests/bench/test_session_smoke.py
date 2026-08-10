@@ -16,7 +16,8 @@ The last two tests are **per case**, and they are the ones that pay for
 themselves: a fixture that will not reach the viewer, or a deliverable name the
 harness cannot read back, wastes a paid conversation and looks exactly like a
 model failing the task. They run over the same case list the run itself will
-use, so `--bench-cases=tasks` does not smoke-test nine cases it is not going to run.
+use, so `--bench-fixtures=synthetic` does not smoke-test the curated cases it is
+not going to run.
 
 Marked `bench` and deselected by default. Slow (a kernel, napari and dask per
 session) but free — no key, no network beyond loopback.

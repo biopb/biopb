@@ -3,9 +3,10 @@
 Two jobs, and they are here rather than in a test module because both are about
 the *run* rather than about any one assertion.
 
-**Selection.** `--bench-cases`, `--bench-fixtures` and the rest are resolved once and the
-paid tests are parametrized over what survives, so `--bench-cases=skills` collects
-the skill cases and nothing else instead of printing a screen of skips. What
+**Selection.** `--bench-fixtures` and the rest are resolved once and the paid
+tests are parametrized over what survives, so `--bench-fixtures=synthetic`
+collects the synthetic cases and nothing else instead of printing a screen of
+skips. What
 was dropped is said out loud at the end of the run: a shorter table is
 otherwise indistinguishable from a shorter catalogue, and this layer's whole
 failure mode is a green summary that means something narrower than it looks.

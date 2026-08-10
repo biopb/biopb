@@ -4,20 +4,18 @@
 is well-formed, whether the API it quotes still exists, and whether anyone can
 retrieve it. This one runs the thing.
 
-It answers two questions, and they were two packages until it became clear they
-were one engine reading one field:
+It asks one question of every case — **can an agent do this work** — and two
+kinds of comparison answer it. Run the same cases again with the catalog
+withheld and the delta says what the catalog was worth; run them repeatedly and
+the spread says what a single number is worth. Both are properties of the
+invocation, and one invocation is one configuration for every case in it.
 
-* **does *this skill* change what an agent does** — the case names a skill, so
-  the same cases run again with the catalog withheld and the delta is the
-  finding;
-* **can an agent do *this work*** — the case names none, there is nothing to
-  withhold, and repetition rather than a control is where the information comes
-  from.
-
-The difference is a `skill=` on a :class:`~._case.Case` and which sessions are
-worth comparing afterwards. It is not a difference in what a run does: one
-invocation is one configuration, set by switch, for every case in it — a skill
-case and a task case in the same run are treated identically.
+**Nothing here names a skill.** A case used to carry `skill=`, and the two
+questions above read as two kinds of case. They are one kind now: this package
+does not import the skills layout, glob `_skills_data`, or know which entries
+ship, so promoting or banking a skill changes the catalog and no file in this
+tree. What a run measured is recorded in `session.json`, and which two sessions
+are worth comparing is a judgement a reader makes, not a field a case declares.
 
 Two properties make this the tier with teeth, and one makes it the hardest to
 read.

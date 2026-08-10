@@ -51,7 +51,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "drift-correction"
+NAMESPACE = "drift-correction"
 
 # Set from measurement, not from taste. Over six seeds of this construction, a
 # run told which channel is structural lands at 0.003-0.010 px RMS and a
@@ -508,7 +508,7 @@ MICROSCOPIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="two-channels-one-structural",
     task=TASK,
     persona=MICROSCOPIST,

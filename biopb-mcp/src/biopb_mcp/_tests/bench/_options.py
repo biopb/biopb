@@ -1,4 +1,4 @@
-"""The run options: which cases, in what configuration, how many times.
+"""The run options: which fixtures, in what configuration, how many times.
 
 **One invocation is one configuration.** `--bench-skills` decides whether the
 agent is offered the catalog at all and `--bench-responder` decides who answers
@@ -24,8 +24,8 @@ the values offered here are the ones the engine can actually honour.
 
 **A flag beats the environment, and there is no dotenv.** `agentbench` reads
 `.env` for credentials and model selection, which are facts about a machine. An
-option here decides what gets *spent* and what a number means — a case list, a
-catalog, a sample count — and a file somebody put in the repo root a month ago
+option here decides what gets *spent* and what a number means — a fixture kind,
+a catalog, a sample count — and a file somebody put in the repo root a month ago
 should not be what answers that. An explicit `--bench-skills=false` on the
 command line is why a report has no catalog in it; `BIOPB_BENCH_SKILLS` in a
 `.env` is not.
@@ -44,7 +44,7 @@ from dataclasses import dataclass
 
 #: One per option. Kept as data because three things read it — the argparse
 #: registration, the environment fallback, and the header line a run prints
-#: about itself — and a fourth copy of "the values `--bench-cases` accepts" is
+#: about itself — and a fourth copy of "the values `--bench-fixtures` accepts" is
 #: exactly the drift this package was merged to stop having.
 @dataclass(frozen=True)
 class Setting:
@@ -58,17 +58,6 @@ class Setting:
     def dest(self) -> str:
         return self.flag.lstrip("-").replace("-", "_")
 
-
-CASES = Setting(
-    "--bench-cases",
-    "BIOPB_BENCH_CASES",
-    ("all", "skills", "tasks"),
-    "all",
-    "which cases to run: `skills` are the ones making a claim about a served "
-    "skill, `tasks` is the complement — every case that asks only whether the "
-    "work gets done, including those written alongside a banked skill the "
-    "runtime does not serve. Use -k to pick out one case by name",
-)
 
 FIXTURES = Setting(
     "--bench-fixtures",
@@ -128,7 +117,7 @@ RESPONDER = Setting(
     "the same information with the asking taken out",
 )
 
-SETTINGS = (CASES, FIXTURES, SKILLS, RESPONDER)
+SETTINGS = (FIXTURES, SKILLS, RESPONDER)
 
 #: How many times to run the case. One unless asked for more.
 #:
@@ -155,7 +144,6 @@ class Options:
     and it is the only thing that makes two report directories comparable.
     """
 
-    cases: str = CASES.default
     fixtures: str = FIXTURES.default
     skills: bool = True
     responder: str = RESPONDER.default
@@ -165,11 +153,11 @@ class Options:
     def filtered(self) -> bool:
         """Whether the *case list* was narrowed. Decides if a run has to say so.
 
-        Only the two selection options count. `skills` and `responder` change
-        what a run measures rather than how much of the catalogue it covers,
-        and both are already in every report header and in `session.json`.
+        Only the selection option counts. `skills` and `responder` change what
+        a run measures rather than how much of the catalogue it covers, and both
+        are already in every report header and in `session.json`.
         """
-        return self.cases != CASES.default or self.fixtures != FIXTURES.default
+        return self.fixtures != FIXTURES.default
 
     @property
     def configuration(self) -> str:
@@ -181,7 +169,7 @@ class Options:
         the ones left alone — a header that lists only what was changed cannot
         be read as a record of what was run."""
         return (
-            f"cases={self.cases} fixtures={self.fixtures} "
+            f"fixtures={self.fixtures} "
             f"skills={str(self.skills).lower()} responder={self.responder} "
             f"samples={self.samples}"
         )
@@ -190,7 +178,6 @@ class Options:
         """What `session.json` carries. Keys are the option names, so a reader
         who has seen `pytest -h` needs nothing else to interpret them."""
         return {
-            "cases": self.cases,
             "fixtures": self.fixtures,
             "skills": self.skills,
             "responder": self.responder,
@@ -259,7 +246,6 @@ def _samples(config) -> int:
 def resolve(config=None) -> Options:
     """This run's options: the flag, else the environment, else the default."""
     return Options(
-        cases=_chosen(config, CASES),
         fixtures=_chosen(config, FIXTURES),
         skills=_chosen(config, SKILLS) == "true",
         responder=_chosen(config, RESPONDER),

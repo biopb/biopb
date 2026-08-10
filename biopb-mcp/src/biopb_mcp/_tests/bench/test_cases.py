@@ -18,7 +18,7 @@ this layer needs to survive a catalogue of thirty, and it is why there is no
 longer a tuple of cases that are checked here and run nowhere: a case worth
 checking is a case worth running.
 
-**The run options do not reach this file.** `--bench-cases=skills` narrows what an
+**The run options do not reach this file.** `--bench-fixtures` narrows what an
 invocation pays for; it does not narrow what has to be true. A case excluded
 from tonight's run is checked tonight anyway, because these cost nothing and
 the alternative is a filter that quietly turns off the tests as well.
@@ -30,40 +30,34 @@ that are true of every case.
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 from ..agentbench._fixture import Attempt, Fixture
-
-# Reaching into the authoring gate, on purpose: the coverage checks below are
-# claims about the shipped catalogue, and `SKILLS_DIR` and the strict validator
-# are spelled there once. A second spelling of where the skills live is exactly
-# what `mcp/_skills_layout.py` exists to stop.
-from ..skills._validate import validate
-from ..skills.conftest import SKILLS_DIR
 from ._case import LAYER_KINDS, PRESENTATIONS, TENSOR_HANDLE
-from .cases import CASES, NOT_BENCHMARKED
+from .cases import CASES
 
-#: Everything with data to check, which is now everything the layer runs. There
-#: used to be a second tuple of cases nothing ran — the ones whose skill is
-#: banked rather than served — checked here and benchmarked nowhere. They are
-#: ordinary cases now: no skill to withhold, and the same checks.
+#: Everything with data to check, which is every case the layer runs. There used
+#: to be tuples splitting these by whether they named a served skill; a case
+#: names none now, so there is one population and every check runs on all of it.
 ALL_CASES = CASES
-
-SKILL_CASES = tuple(c for c in ALL_CASES if c.about_a_skill)
-TASK_CASES = tuple(c for c in ALL_CASES if not c.about_a_skill)
 
 #: Cases whose prompt is **self-sufficient**: they name no fact the run has to
 #: elicit, so asking neither rescues nor penalises and the persona is there for
 #: realism alone.
 #:
-#: `persona_must_know` is the declaration, not `skill`. Those coincided while
-#: every case with no skill was a task written against real data — and then the
-#: banked skills' cases arrived, which have no skill *and* withhold a fact the
-#: verifier depends on. Reading the shape off `skill` would have applied the
-#: wrong half of this file to four of them.
+#: `persona_must_know` is the declaration. It used to be tempting to read this
+#: off a `skill` field instead, and the two coincided only while every case
+#: without a skill was written against real data — the banked skills' cases had
+#: no skill *and* withheld a fact the verifier depended on, so `skill` would
+#: have applied the wrong half of this file to four of them. That field is gone
+#: now and this is the only declaration there ever should have been.
 SELF_SUFFICIENT = tuple(c for c in ALL_CASES if not c.persona_must_know)
+
+#: The complement: every case that strips a fact out of its pixels and puts it
+#: in the persona. What used to be called a "skill case" — but the property that
+#: matters was never that a skill was served for it, only that the run has
+#: something to elicit.
+WITHHOLDING = tuple(c for c in ALL_CASES if c.persona_must_know)
 
 
 def _ids(case):
@@ -72,7 +66,7 @@ def _ids(case):
 
 #: Built once each: a fixture is megabytes of numpy and several tests share
 #: them. Keyed on the full label — a subject covered two ways is two cases, and
-#: keying on the skill alone would hand the second the first's data.
+#: keying on the namespace alone would hand the second the first's data.
 _FIXTURES: dict[str, Fixture] = {}
 
 
@@ -81,24 +75,17 @@ def case(request):
     return request.param
 
 
-@pytest.fixture(params=SKILL_CASES or [None], ids=_ids)
-def skill_case(request):
-    if request.param is None:
-        pytest.skip("no case in this tree makes a claim about a skill")
-    return request.param
-
-
-@pytest.fixture(params=TASK_CASES or [None], ids=_ids)
-def task_case(request):
-    if request.param is None:
-        pytest.skip("no case in this tree is about work rather than a skill")
-    return request.param
-
-
 @pytest.fixture(params=SELF_SUFFICIENT or [None], ids=_ids)
 def self_sufficient_case(request):
     if request.param is None:
         pytest.skip("every case in this tree withholds something")
+    return request.param
+
+
+@pytest.fixture(params=WITHHOLDING or [None], ids=_ids)
+def withholding_case(request):
+    if request.param is None:
+        pytest.skip("no case in this tree withholds anything")
     return request.param
 
 
@@ -122,91 +109,6 @@ def test_there_is_at_least_one_case():
     """The guard against this file going vacuously green, the same shape as
     `test_the_extractor_finds_pkg_tokens` in the contract layer."""
     assert CASES
-
-
-def test_both_kinds_of_case_are_represented():
-    """One `Case` covers a claim about a skill and a claim about nothing, and
-    the difference is one field. If either side of that emptied out, half the
-    checks below would pass by having nothing to run on — which reads exactly
-    like the other half passing."""
-    assert SKILL_CASES, "no case names a skill, so nothing here is ablated"
-    assert TASK_CASES, "no case is about the work alone"
-
-
-# --- the catalogue is covered ----------------------------------------------
-
-
-def _shipped() -> set[str]:
-    """Skills the runtime serves. `is_skill_file` is the one rule for that."""
-    from biopb_mcp.mcp._skills_layout import is_skill_file
-
-    return {p.stem for p in SKILLS_DIR.glob("*.md") if is_skill_file(p.name)}
-
-
-def test_every_shipped_skill_is_benchmarked_or_declared_unbenchmarkable():
-    """A skill outside this layer is a decision, and it has to be written down.
-
-    Without this the honest answer to "what does the benchmark cover" is
-    "whatever anyone got round to", which is indistinguishable from full
-    coverage when read off a green suite.
-    """
-    uncovered = _shipped() - {c.skill for c in CASES} - set(NOT_BENCHMARKED)
-    assert not uncovered, (
-        f"these shipped skills are neither benchmarked nor listed in "
-        f"cases.NOT_BENCHMARKED with a reason: {sorted(uncovered)}"
-    )
-
-
-def test_nothing_claims_to_cover_a_skill_that_does_not_ship():
-    """A case or an exemption left behind by a deleted skill. Cheap to check,
-    and it is how the contract layer's module came to be written entirely for a
-    skill that no longer existed."""
-    stale = ({c.skill for c in CASES if c.skill} | set(NOT_BENCHMARKED)) - _shipped()
-    assert not stale, (
-        f"these name skills that are not in the catalogue: {sorted(stale)}"
-    )
-
-
-def test_an_exemption_carries_a_reason():
-    for skill, why in NOT_BENCHMARKED.items():
-        assert len(why.split()) >= 5, f"{skill}: {why!r} does not say why"
-
-
-#: `checklist:` tokens that say a skill expects a data plane — to read lazily
-#: from one, to upload a result to one, or both. They map to the same
-#: presentation, because the tensor path is the only place either happens:
-#: `client.get_tensor` is what hands a session a dask array in production, and
-#: `client is None` is what an `array` case gives instead.
-LAZY_TOKENS = ("dask", "tensor")
-
-
-def test_a_skill_written_for_lazy_data_reports_whether_a_case_presents_it():
-    """A coverage ledger, and it **warns rather than fails**.
-
-    The unit is the skill, not the case: a case presenting `array` for a skill
-    that declares `dask` is not wrong, it tests the in-memory branch, which is
-    a real branch. What it is, is *incomplete* — and since a skill may have
-    several cases, the fix is another case rather than a correction to this
-    one. A gate here would demand cases nobody has written yet and would punish
-    an honest partial benchmark exactly as hard as a wrong one.
-
-    It belongs beside `NOT_BENCHMARKED`, which records "this skill is outside
-    the layer, and why". This records "this skill is *partly* inside it, and
-    which part".
-    """
-    entries, _ = validate(SKILLS_DIR)
-    benchmarked = {c.skill for c in CASES if c.skill}
-    lazy_cases = {c.skill for c in CASES if any(layer.lazy for layer in c.layers)}
-    for entry in entries:
-        declared = [t for t in LAZY_TOKENS if t in entry.checklist]
-        if not declared or entry.id in lazy_cases or entry.id not in benchmarked:
-            continue
-        warnings.warn(
-            f"{entry.id} declares {declared}, but every case presents `array`, "
-            "so every run has `client is None` — neither the lazy read "
-            "path nor any step that uploads a result has been benchmarked",
-            stacklevel=1,
-        )
 
 
 def test_no_two_cases_share_an_identity():
@@ -327,53 +229,6 @@ def test_nothing_asks_for_chunking_it_will_not_get(case):
             f"{case.label}: layer {layer.name!r} sets chunks/dim_labels but is "
             f"presented as {layer.presentation!r}, where neither reaches anything"
         )
-
-
-def test_a_skill_case_can_ask_the_catalog_about_itself(skill_case):
-    """`query` is what the run asks `find_skills` to prove the ablation took
-    effect. It falls back to the skill id, so this can only fail by someone
-    setting `catalog_query` to nothing on purpose."""
-    assert skill_case.query
-
-
-def test_a_skill_cases_catalog_probe_finds_its_own_skill(skill_case):
-    """The probe has to be able to succeed, and nothing else was checking.
-
-    `find_skills` is pure and reads the catalogue off disk, so this costs a
-    function call and runs with the ordinary suite — which is the whole point.
-    The live check (`test_bench.py`) can only speak after a paid run, and the
-    two broken queries it was supposed to catch survived four full sweeps: one
-    asked a whole sentence and matched nothing, the other asked
-    "segmentation quality" and retrieved `pixel-classifier-segmentation`.
-
-    An agent is not held to this because an agent can read the result and try
-    again — and does, in every transcript. A string in a case module is read
-    once by a machine that cannot.
-    """
-    from ...mcp._skills import find_skills
-
-    found = [entry["id"] for entry in find_skills(skill_case.query)]
-    assert skill_case.skill in found, (
-        f"{skill_case.label}: the catalog probe asks {skill_case.query!r}, "
-        f"which retrieves {found} — never its own skill, so the run cannot "
-        f"tell an offered catalog from a withheld one"
-    )
-
-
-def test_a_case_with_no_skill_asks_the_catalog_for_everything(task_case):
-    """Its catalog read is *provenance*, not a manipulation: the record of what
-    was on offer when this number was produced.
-
-    A `catalog_query` would narrow that record to a retrieval, and on the case
-    of a banked skill it narrows it to nothing — the entry is not served, the
-    session says the catalog was offered, and `test_the_catalog_matched_the_switch`
-    fails a run that was configured exactly as intended.
-    """
-    assert not task_case.catalog_query, (
-        f"{task_case.label}: names no skill but narrows the catalog read to "
-        f"{task_case.catalog_query!r}, which records a retrieval where the "
-        "report wants what was on offer"
-    )
 
 
 # --- the fixture -----------------------------------------------------------
@@ -546,17 +401,18 @@ def test_the_briefing_carries_the_facts_and_keeps_the_same_fence(case):
     for procedural in case.persona_must_not_know:
         assert procedural.casefold() not in folded, (
             f"{case.label}: the brief hands over {procedural!r}, "
-            "which is the skill's job"
+            "which is the run's job to work out"
         )
 
 
-def test_a_skill_case_declares_what_its_persona_must_hold(skill_case):
-    """Both lists non-empty, because either one empty makes the check above
-    vacuous — and a vacuous version of it is indistinguishable from a passing
-    one from the outside, which is the failure mode this whole file is about."""
-    assert skill_case.persona_must_know, f"{skill_case.label}: nothing declared askable"
-    assert skill_case.persona_must_not_know, (
-        f"{skill_case.label}: no procedural terms fenced off"
+def test_a_withholding_case_fences_off_its_own_procedure(withholding_case):
+    """A case that withholds a fact must also say which vocabulary the persona
+    may not use, because either list empty makes the check above vacuous — and a
+    vacuous version of it is indistinguishable from a passing one from the
+    outside, which is the failure mode this whole file is about."""
+    assert withholding_case.persona_must_not_know, (
+        f"{withholding_case.label}: withholds a fact but fences off no "
+        "procedural terms, so the persona may hand over the method"
     )
 
 
