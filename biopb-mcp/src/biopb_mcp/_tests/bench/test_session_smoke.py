@@ -98,7 +98,7 @@ def test_the_skill_body_comes_from_the_shipped_catalog(session):
     `drift-correction` through the same `_skills.py` the runtime uses, so
     deleting or editing the file changes what a run is scored against — which is
     exactly what a hand-transcribed procedure could never do."""
-    found = session.call("find_skills", query="stage drift in a time lapse")
+    found = session.call("find_skills", keywords=["stage drift"])
     assert "drift-correction" in found.text, found.text[:400]
 
     body = session.read_resource("skill://drift-correction")
@@ -126,7 +126,7 @@ def test_the_agent_can_reach_a_skill_body_and_not_only_the_harness(session):
         "agent_tools must extend the server's advertisement, not replace it"
     )
 
-    found = session.call("find_skills", query="stage drift in a time lapse")
+    found = session.call("find_skills", keywords=["stage drift"])
     uri = next(
         part.strip('", ')
         for part in found.text.split()
