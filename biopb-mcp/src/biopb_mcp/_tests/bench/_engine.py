@@ -121,6 +121,13 @@ FLAG_OVER_BUDGET = "over-ask-budget"
 FLAG_NEVER_ASKED = "never-asked"
 FLAG_CUT_OFF = "cut-off-but-scored"
 FLAG_CATALOG_MISMATCH = "catalog-mismatch"
+
+#: The catalog probe itself failed, so this run has *no* reading either way.
+#: Its own value rather than an empty tuple or a plausible-looking id: both of
+#: those are answers, and "we did not manage to ask" is not one. `flags()` and
+#: `test_the_catalog_matched_the_switch` both read it as a mismatch, because an
+#: unverified configuration label is the thing they exist to refuse.
+CATALOG_UNREAD = ("<catalog-unread>",)
 #: Asked, and was never once answered. Under `--bench-responder=model` that is
 #: not a result, it is the respondent being broken — the session measured the
 #: `silent` condition under the other label, and is comparable to nothing.
@@ -330,7 +337,7 @@ class Result:
             out.append(FLAG_CUT_OFF)
         if self.trace.stopped == STALLED:
             out.append(FLAG_STALLED)
-        if bool(self.catalog) != self.skills_offered:
+        if self.catalog == CATALOG_UNREAD or bool(self.catalog) != self.skills_offered:
             out.append(FLAG_CATALOG_MISMATCH)
         return out
 
@@ -561,12 +568,26 @@ def _json_values(text: str) -> list | None:
     return values
 
 
-def read_catalog(session, case: Case) -> tuple[str, ...]:
-    """What the catalog offered this run. Best-effort; never fails a run."""
+def read_catalog(session) -> tuple[str, ...]:
+    """What the catalog offered this run. Best-effort; never fails a run.
+
+    **Probed with no query, which asks for the whole catalog.** The question is
+    whether the catalog was there at all — `test_the_catalog_matched_the_switch`
+    never names an entry, because this package cannot know which skills ship —
+    and a *filtered* probe answers a narrower one it then has to get right. It
+    used to pass a per-case query, and when the case stopped naming a skill the
+    attribute went with it, leaving this raising `AttributeError` on every run.
+
+    A failure returns :data:`CATALOG_UNREAD`, which is neither a catalog nor an
+    empty one. The distinction is load-bearing: the sentinel used to be an
+    ordinary non-empty tuple, so a skills-*on* run whose probe had crashed
+    satisfied "the catalog was non-empty" and the switch check passed having
+    verified nothing — the exact hole #738 was written to close.
+    """
     try:
-        return catalog_ids(session.call("find_skills", query=case.query).text)
+        return catalog_ids(session.call("find_skills").text)
     except Exception:  # noqa: BLE001 -- provenance is best-effort, the run is not
-        return ("<unavailable>",)
+        return CATALOG_UNREAD
 
 
 # --- the fixture on the plane -----------------------------------------------
@@ -682,7 +703,7 @@ def run_one(
         # Read here rather than inferred from behaviour: the agent may well call
         # `find_skills` under `--bench-skills=false` and simply get nothing back,
         # and `load_catalog()` is what gates, not whether the tool was registered.
-        result.catalog = read_catalog(session, case)
+        result.catalog = read_catalog(session)
         load_fixture(session, case, fixture, ids)
         trace = converse(
             session,

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,7 @@ from ..agentbench._conversation import (
 from ..agentbench._fixture import Attempt, Fixture, Metric, Outcome
 from . import _engine, conftest
 from ._engine import (
+    CATALOG_UNREAD,
     FLAG_CATALOG_MISMATCH,
     FLAG_CUT_OFF,
     FLAG_NEVER_ASKED,
@@ -57,6 +59,7 @@ from ._engine import (
     Run,
     catalog_ids,
     models_in_play,
+    read_catalog,
     respondent_for,
     select,
     session_dir,
@@ -582,6 +585,53 @@ def test_the_catalog_flag_fires_in_both_directions():
 
     offered_but_absent = result(skills=True, outcome=scored(0.1), catalog=())
     assert FLAG_CATALOG_MISMATCH in offered_but_absent.flags()
+
+
+def test_a_failed_catalog_probe_is_a_mismatch_and_not_a_catalog():
+    """The sentinel must not read as "the catalog was there".
+
+    It did, once: a non-empty placeholder satisfied `bool(catalog)`, so a
+    skills-on run whose probe had crashed passed the switch check having
+    verified nothing. Both directions are asserted because the sentinel is
+    wrong under either switch — it is the absence of a reading, not a reading.
+    """
+    assert CATALOG_UNREAD, "the sentinel is deliberately truthy; test the identity"
+    offered = result(skills=True, outcome=scored(0.1), catalog=CATALOG_UNREAD)
+    assert FLAG_CATALOG_MISMATCH in offered.flags()
+
+    withheld = result(skills=False, outcome=scored(0.1), catalog=CATALOG_UNREAD)
+    assert FLAG_CATALOG_MISMATCH in withheld.flags()
+
+
+def test_the_catalog_probe_asks_for_the_whole_catalog(monkeypatch):
+    """The probe must not depend on anything a `Case` carries.
+
+    This is the regression that shipped: the probe passed a per-case query, the
+    case stopped naming a skill, and `read_catalog` raised `AttributeError` on
+    every run for a whole session — invisibly, because the sentinel it fell back
+    to was truthy and the switch check accepted it.
+    """
+    calls: list = []
+
+    class FakeSession:
+        def call(self, tool, **kwargs):
+            calls.append((tool, kwargs))
+            return SimpleNamespace(text=json.dumps([{"id": "flatfield"}]))
+
+    assert read_catalog(FakeSession()) == ("flatfield",)
+    assert calls == [("find_skills", {})], (
+        "the probe filtered the catalog; it asks whether one was offered at all"
+    )
+
+
+def test_a_probe_that_raises_reports_that_it_did_not_look():
+    """Best-effort, but never by inventing a reading."""
+
+    class Broken:
+        def call(self, tool, **kwargs):
+            raise RuntimeError("session is gone")
+
+    assert read_catalog(Broken()) == CATALOG_UNREAD
 
 
 def test_a_run_that_read_the_answer_key_says_so_on_its_own_row():
