@@ -1,15 +1,9 @@
 """Seed biopb-mcp's built-in example kernel plugins into the user's plugin dir (#92).
 
-The installer runs this (``biopb-mcp-seed-plugins``) so the bundled plugins —
-``rolling_ball.py``, ``segmentation_qc.py``, ``chunked_label.py``,
-``image_resolution.py``, plus the namespace ``__init__.py`` doc — land in
-``~/.config/biopb/kernel/``. Delivering
-them as **files there**, rather
-than only as an installed module, makes them visible/editable to the user and loads
-them from a path, which is robust to the kernel interpreter's entry-point metadata
-view (the ``python3`` kernelspec need not be the biopb-mcp tool env).
+The installer runs this (``biopb-mcp-seed-plugins``) so the bundled plugins land in
+``~/.config/biopb/kernel/``.
 
-Seeding is **idempotent and never clobbers**: an existing file is left untouched
+Seeding is **idempotent and never overwrites**: an existing file is left untouched
 (the user may have edited it), mirroring how the installer preserves an existing
 ``mcp-config.json``. Stdlib-only (``shutil`` + ``pathlib``) and independent of the
 heavy MCP/kernel stack, so it stays a cheap console entry.
