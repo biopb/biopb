@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 
-from ._engine import Run, run_case, unavailable, where_for
+from ._engine import CATALOG_UNREAD, Run, run_case, unavailable, where_for
 from .conftest import smoke_failures
 
 pytestmark = pytest.mark.bench
@@ -98,13 +98,22 @@ def test_the_catalog_matched_the_switch(run: Run):
     and then saw nothing came up misconfigured (or shipped no `.md` files at
     all, which imports and tests clean), and its number is not the
     configuration it claims to be.
+
+    A run whose probe *failed* is caught too, and by its own message: it has no
+    reading in either direction, and treating "we could not look" as evidence of
+    a catalog is how this check silently stopped checking once before.
     """
     want = run.options.skills
     wrong = [
-        f"{r.name}: --bench-skills={str(want).lower()} but the catalog held "
-        f"{len(r.catalog)} entries"
+        f"{r.name}: the catalog probe failed, so nothing here verifies "
+        f"--bench-skills={str(want).lower()}"
+        if r.catalog == CATALOG_UNREAD
+        else (
+            f"{r.name}: --bench-skills={str(want).lower()} but the catalog held "
+            f"{len(r.catalog)} entries"
+        )
         for r in run.results
-        if not r.error and bool(r.catalog) != want
+        if not r.error and (r.catalog == CATALOG_UNREAD or bool(r.catalog) != want)
     ]
     assert not wrong, (
         "the session's catalog did not match the switch it was run under, so "
