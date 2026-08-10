@@ -34,6 +34,7 @@ import pytest
 
 from ..agentbench._fixture import Attempt, Fixture
 from ._case import LAYER_KINDS, PRESENTATIONS, TENSOR_HANDLE
+from ._engine import load_fixture
 from .cases import CASES
 
 #: Everything with data to check, which is every case the layer runs. There used
@@ -190,6 +191,66 @@ def test_every_layer_kind_is_one_the_harness_can_add(case):
             f"{case.label}: layer {layer.name!r} wants a {layer.kind!r} layer, "
             f"and the harness can add {sorted(LAYER_KINDS)}"
         )
+
+
+#: What each kind must actually put on the viewer, written out rather than
+#: derived from :data:`LAYER_KINDS` — a check that reads the table it is
+#: checking passes whatever the table says. Adding a kind means adding a line
+#: here, which is the point: the next one will have keywords too.
+EMITTED_CALL = {
+    "image": "viewer.add_image(_fixture_array, name={name!r})",
+    "labels": "viewer.add_labels(_fixture_array, name={name!r})",
+    "points": "viewer.add_points(_fixture_array, name={name!r})",
+    "path": "viewer.add_shapes(_fixture_array, name={name!r}, shape_type='path')",
+}
+
+
+def test_every_layer_kind_says_what_it_emits():
+    assert set(EMITTED_CALL) == set(LAYER_KINDS), (
+        "a layer kind was added without saying what call it makes: "
+        f"{set(LAYER_KINDS) ^ set(EMITTED_CALL)}"
+    )
+
+
+def test_the_call_a_layer_kind_names_is_the_one_that_gets_made(case, built):
+    """`test_every_layer_kind_is_one_the_harness_can_add` checks the key is
+    known. This checks what the key buys.
+
+    A kind is an `add_*` call *plus* the keywords that call needs, and the
+    keywords are the half that fails quietly: `add_shapes` given a `path`
+    layer's vertices and no `shape_type` builds a rectangle out of them, puts
+    it on the viewer under the right name, and passes every check the smoke
+    test makes. The agent then reads four corners where it was promised a
+    traced line. Only a live session runs `load_fixture`, and only on a machine
+    that has one, so the splice is asserted here instead.
+    """
+    snippet = _engine_snippet(case, built)
+    for layer in case.layers:
+        if layer.lazy:
+            continue
+        emitted = EMITTED_CALL[layer.kind].format(name=layer.name)
+        assert emitted in snippet, (
+            f"{case.label}: layer {layer.name!r} is a {layer.kind!r}, and the "
+            f"call the harness makes for it is not {emitted!r}"
+        )
+
+
+def _engine_snippet(case, fixture):
+    """What `load_fixture` would send for this case, without a session."""
+
+    class Recorder:
+        def __init__(self):
+            self.sent = []
+
+        def put_array(self, *args):
+            pass
+
+        def setup(self, code):
+            self.sent.append(code)
+
+    recorder = Recorder()
+    load_fixture(recorder, case, fixture, dict.fromkeys(case.collect, "id"))
+    return "\n".join(recorder.sent)
 
 
 def test_every_layer_is_presented_in_a_way_the_harness_can_produce(case):

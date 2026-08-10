@@ -668,9 +668,11 @@ def load_fixture(session, case: Case, fixture: Fixture, ids: Mapping[str, str]) 
             handles[layer.name] = ids[layer.key]
             session.setup(f"viewer.add_tensor({ids[layer.key]!r}, name={layer.name!r})")
             continue
+        call, extra = LAYER_KINDS[layer.kind]
+        keywords = "".join(f", {k}={v!r}" for k, v in extra.items())
         session.put_array("_fixture_array", np.asarray(fixture.data[layer.key]))
         session.setup(
-            f"viewer.{LAYER_KINDS[layer.kind]}(_fixture_array, name={layer.name!r})"
+            f"viewer.{call}(_fixture_array, name={layer.name!r}{keywords})"
             "\ndel _fixture_array"
         )
     if handles:
