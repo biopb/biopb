@@ -4,7 +4,7 @@ title: Measure the length and branching of a segmented filament network
 description: Measure how long a filament network is and how branched, in physical units — mitochondria, vessels, neurites or cytoskeleton, from a mask you already have.
 tags: [morphology, quantification, network, skeleton, 3d]
 version: 1.0.0
-checklist: [viewer, pkg:biopb-mcp>=0.13.0, pkg:skan~=0.13.1, pkg:networkx~=3.6.1]
+checklist: [viewer, pkg:biopb-mcp>=0.13.0, pkg:skan~=0.13.1, pkg:networkx~=3.4]
 ---
 
 # Measure the length and branching of a segmented filament network

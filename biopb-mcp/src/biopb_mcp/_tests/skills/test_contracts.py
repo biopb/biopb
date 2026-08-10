@@ -30,7 +30,17 @@ The trigger follows the risk. A skill declares a *bounded* package range
 these assertions pin cannot move underneath a shipped skill: what a user
 resolves is inside the range the assertions were proved against. Upstream
 releasing a new minor is therefore not an event this layer needs to hear about,
-which rules out a cron. What remains is our own editing -- a body rewritten to
+which rules out a cron.
+
+**One range is bounded at the major instead, and it has to be.** `networkx`
+moves its own Python floor with its minors — 3.5 dropped 3.10, which
+`install.sh` still accepts — so a py3.10 session resolves 3.4.2 and a py3.12
+one resolves 3.6.1. No next-minor ceiling contains both, and either choice
+fails a real supported cell: `~=3.6.1` is unsatisfiable on 3.10, `~=3.4.2`
+excludes what every other interpreter actually installs. `~=3.4` is the
+narrowest range that is true everywhere, and the assertions below are proved
+against both ends of it. A package whose minor version tracks the interpreter
+cannot be pinned like one whose does not. What remains is our own editing -- a body rewritten to
 pass `tmats` positionally, a new skill written against an API nobody ran -- and
 that is change-triggered, so it belongs on the PR that does it.
 
