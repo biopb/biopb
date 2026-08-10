@@ -42,12 +42,15 @@ def shipped_only(monkeypatch, tmp_path):
 # idiom instead pushes synonyms into the description until it stops reading as a
 # request, which is its own rule (test_descriptions_are_one_sentence_...).
 RETRIEVES = [
-    ("measure", "calibrated-measurements"),
-    ("measure microns", "calibrated-measurements"),
-    ("physical units", "calibrated-measurements"),
-    ("voxel spacing", "calibrated-measurements"),
-    ("calibrated", "calibrated-measurements"),
-    ("volumes microns", "calibrated-measurements"),
+    ("foci", "count-foci-per-cell"),
+    ("spots", "count-foci-per-cell"),
+    ("puncta", "count-foci-per-cell"),
+    ("count foci", "count-foci-per-cell"),
+    ("per cell", "count-foci-per-cell"),
+    ("skeleton", "skeleton-network-metrics"),
+    ("branching", "skeleton-network-metrics"),
+    ("network length", "skeleton-network-metrics"),
+    ("physical units", "skeleton-network-metrics"),
     ("segmentation", "segmentation-qc-metrics"),
     ("f1 iou", "segmentation-qc-metrics"),
     ("ground truth", "segmentation-qc-metrics"),
@@ -109,9 +112,7 @@ RETRIEVES = [
 # agent is told to prefer a curated skill over improvising, so a false hit sends
 # it down a workflow written for someone else's problem.
 REJECTS = [
-    ("stitch", "calibrated-measurements"),
     ("measure", "segmentation-qc-metrics"),
-    ("segmentation", "calibrated-measurements"),
     ("tiles", "segmentation-qc-metrics"),
     # `flatfield` and `drift-correction` are both "fix the images before
     # measuring", and both bodies talk about correcting a collection of frames.
@@ -120,7 +121,6 @@ REJECTS = [
     ("drift", "flatfield"),
     ("registration", "flatfield"),
     ("illumination", "drift-correction"),
-    ("vignetting", "calibrated-measurements"),
     # `drift-correction` and `track-objects` are the pair an agent lands on
     # from a single word about a movie, and they are opposites: one cancels
     # motion, the other measures it. Each body says so in its *When NOT to
@@ -137,13 +137,13 @@ REJECTS = [
     ("illumination", "deconvolve-widefield"),
     ("drift", "deconvolve-widefield"),
     # `detect-filaments` produces a mask-like output and reports a size in
-    # microns, which puts it one word away from both of the skills that own
-    # those. Tracing filaments is not scoring a segmentation against a truth,
-    # and a filament width is not a calibrated object measurement.
+    # microns, which puts it one word away from the skills that own those.
+    # Tracing filaments is not scoring a segmentation against a truth, and
+    # tracing them is not measuring a network's length and branching either.
     ("filament", "segmentation-qc-metrics"),
-    ("filament", "calibrated-measurements"),
     ("centreline", "segmentation-qc-metrics"),
     ("segmentation", "detect-filaments"),
+    ("centreline", "skeleton-network-metrics"),
     # `ratiometric-fret` aligns two detectors and fixes channel intensities
     # before it divides, which puts it one word away from all three skills that
     # own those. Registering two cameras onto the same field is not correcting a
@@ -155,16 +155,18 @@ REJECTS = [
     ("measure", "ratiometric-fret"),
     ("fret", "flatfield"),
     ("fret", "drift-correction"),
-    # Counting foci per cell is served by no shipped skill -- the candidate is
-    # deferred -- so these must surface nothing rather than the nearest
-    # measurement skill. A spot count per parent is neither a calibrated object
-    # measurement nor a segmentation scored against a truth.
-    ("foci", "calibrated-measurements"),
+    # `count-foci-per-cell` takes a parent segmentation as input and reports a
+    # per-object table, which puts it one word away from the skill that scores a
+    # segmentation and the one that detects the parents. Counting what is inside
+    # objects is not judging the objects' outlines.
     ("spots", "segmentation-qc-metrics"),
-    # `skeleton-network-metrics` and `calibrated-measurements` both end in
-    # morphology numbers in microns, and the word that must not conflate them is
-    # the one each is about: a network has a length, an object has a size.
-    ("skeleton", "calibrated-measurements"),
+    ("foci", "segmentation-qc-metrics"),
+    ("segmentation", "count-foci-per-cell"),
+    # `skeleton-network-metrics` and `count-foci-per-cell` both consume a mask
+    # somebody else produced and both end in a per-structure number, so the
+    # words each owns must not cross: a network has a length, a cell has a count.
+    ("skeleton", "count-foci-per-cell"),
+    ("foci", "skeleton-network-metrics"),
     ("branching", "segmentation-qc-metrics"),
 ]
 

@@ -149,6 +149,6 @@ measurement made from it.
 
 ## Next steps
 
-- To report object sizes in physical units alongside the score, use
-  [[calibrated-measurements]] — the QC numbers say whether the labels are
-  trustworthy, the calibrated table is what gets quoted.
+- To report object sizes in physical units alongside the score, measure them
+  with the voxel spacing carried across — the QC numbers say whether the labels
+  are trustworthy, the calibrated table is what gets quoted.

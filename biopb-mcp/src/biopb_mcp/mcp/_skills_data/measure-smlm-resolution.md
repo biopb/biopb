@@ -165,5 +165,5 @@ may claim for it.
   stack, but an SMLM list is better corrected in the localization domain by
   cross-correlating temporal blocks and least-squares solving all pairs, which
   stops error accumulating along the acquisition.
-- Per-structure measurements on the render are [[calibrated-measurements]] — and
+- Per-structure measurements on the render are made in physical units — and
   the render's pixel size, not the camera's, is the spacing that applies.

@@ -53,7 +53,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-NAMESPACE = "count-foci-per-cell"
+SKILL = "count-foci-per-cell"
 
 #: From measurement, not from taste. The reference scores 0.02 and the two
 #: routes this case is built to separate score 1.11 and 2.02, so the limit sits
@@ -432,7 +432,7 @@ OPERATOR = Persona(
 )
 
 CASE = Case(
-    namespace=NAMESPACE,
+    skill=SKILL,
     case_id="aggregates-only-the-operator-can-name",
     task=TASK,
     persona=OPERATOR,

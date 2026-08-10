@@ -19,8 +19,8 @@ brightness but no useful shape — and the answer is a count, not an area.
 ## When NOT to use
 
 - **The objects are big enough to have a shape.** If you would describe them by
-  area or diameter rather than by number, label them and measure them:
-  [[calibrated-measurements]].
+  area or diameter rather than by number, label them and measure them in
+  physical units instead.
 - **You have no parent segmentation.** This procedure assigns spots to labels it
   is given; it does not produce them. Segment first.
 - **The question is intensity, not number.** Mean or integrated intensity per
@@ -216,8 +216,8 @@ Every row below was hit while measuring this; `scikit-image` 0.26, on fields of
 ## Next steps
 
 - Foci per unit nuclear area or volume needs the parents measured in physical
-  units, which is [[calibrated-measurements]] — and the spacing it asks for is
-  the same pixel size step 2 already obtained.
+  units — and the spacing that takes is the same pixel size step 2 already
+  obtained.
 - If the parent labels came from a segmentation nobody has checked, the counts
   inherit its splits and merges directly: one merged pair of nuclei reads as one
   cell with twice the foci. [[segmentation-qc-metrics]] is how that gets scored.

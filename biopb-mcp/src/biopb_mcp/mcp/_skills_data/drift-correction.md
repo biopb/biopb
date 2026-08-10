@@ -144,5 +144,5 @@ chromatic error that was not there.
 
 ## Next steps
 
-- Report sizes and positions from the corrected movie with
-  [[calibrated-measurements]], after carrying the pixel spacing across (step 7).
+- Report sizes and positions from the corrected movie in physical units, after
+  carrying the pixel spacing across (step 7).
