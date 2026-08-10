@@ -177,9 +177,18 @@ class Case:
     #: run is scoring an environment the skill declares it cannot work in.
     plugins: Sequence[str] = ()
     #: What to ask `find_skills`, to check `--bench-skills` actually took effect.
-    #: Defaults to the skill id, and is empty for a case with no skill — where
-    #: the catalog is recorded as provenance rather than manipulated, so the
-    #: honest query is the one that lists everything.
+    #: Empty for a case with no skill — where the catalog is recorded as
+    #: provenance rather than manipulated, so the honest query is the one that
+    #: lists everything — and otherwise defaults to the skill's own id, which
+    #: :attr:`query` spells the way the catalog spells it.
+    #:
+    #: **Leave it empty unless the case wants a different question.** A written
+    #: query is a second place the skill is named, and the two that existed for
+    #: no reason had both rotted: one asked a whole sentence and matched
+    #: nothing, the other retrieved a *different* skill. Neither could notice —
+    #: this string is read once by a machine, never by anything that could
+    #: retry, which is exactly the difference between it and the agent's own
+    #: search.
     catalog_query: str = ""
     #: Case-folded substrings that must appear in the persona's rendered
     #: prompt: the fact the fixture strips, so the run is answerable at all.
@@ -208,7 +217,15 @@ class Case:
 
     @property
     def query(self) -> str:
-        return self.catalog_query or self.skill
+        """What the harness asks `find_skills` to prove the catalog was there.
+
+        The id **with its hyphens opened out**, because that is how the catalog
+        stores it: `_search_text` spells an id as words so that naming a skill
+        finds it, and `find_skills` matches each whitespace-separated term as a
+        substring — so the id typed verbatim matches nothing at all, and the
+        obvious default was a query that could never succeed.
+        """
+        return self.catalog_query or self.skill.replace("-", " ")
 
     @property
     def label(self) -> str:

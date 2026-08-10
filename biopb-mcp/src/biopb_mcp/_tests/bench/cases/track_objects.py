@@ -493,7 +493,6 @@ CASE = Case(
     collect={"tracks": "tracks", "mean_speed_um_per_min": "mean_speed_um_per_min"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="track",
     # It must be able to answer: the fixture strips the scale, and this person
     # knows the pixel size, the interval, how fast the cells go and that they
     # divide.

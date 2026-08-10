@@ -694,6 +694,29 @@ def test_the_catalog_is_read_from_what_the_tool_returned():
     assert catalog_ids("1 skill: drift-correction") == ("<unparseable>",)
 
 
+def test_the_catalog_reads_the_two_shapes_the_tool_actually_returns():
+    """The shapes that reached it in practice, both of which it got wrong.
+
+    The tool answers with one content block per skill and the client joins
+    them, so the text is a *stream* of JSON values rather than one document —
+    `{...}{...}` for two matches, which `json.loads` rejects. Filed as
+    unreadable, it still counted as "something", so the switch check stayed
+    green while the provenance line said `<unparseable>` for most of the
+    catalogue.
+
+    A lone match is worse, because it parses. One skill is a dict whose only
+    list is `tags`, and hunting for the entries by type reported *those* as the
+    catalog — every "Skills the catalog offered" line ever written was a tag
+    list. The identifying keys are checked first for exactly that reason.
+    """
+    one = json.dumps({"id": "flatfield", "tags": ["illumination", "correction"]})
+    two = json.dumps({"id": "stitch-tiles", "tags": ["mosaic"]})
+
+    assert catalog_ids(one) == ("flatfield",)
+    assert catalog_ids(one + two) == ("flatfield", "stitch-tiles")
+    assert catalog_ids(f"{one}\n{two}") == ("flatfield", "stitch-tiles")
+
+
 # --- the report ------------------------------------------------------------
 
 

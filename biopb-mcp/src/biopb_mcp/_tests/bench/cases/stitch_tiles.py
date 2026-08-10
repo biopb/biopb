@@ -356,7 +356,6 @@ CASE = Case(
     collect={"pos": "pos", "mosaic": "mosaic"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="stitch",
     # It must be able to answer: the fixture withholds the grid shape and the
     # acquisition path, and this person knows both, plus the overlap.
     persona_must_know=("4", "6", "left to right", "18"),

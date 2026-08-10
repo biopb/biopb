@@ -517,7 +517,6 @@ CASE = Case(
     collect={"offsets": "offsets", "corrected": "corrected"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="drift",
     # It must be able to answer: the fixture withholds which channel is
     # structural, and this person knows both channels and that the stage moved.
     persona_must_know=("channel 0", "channel 1", "move", "drift"),

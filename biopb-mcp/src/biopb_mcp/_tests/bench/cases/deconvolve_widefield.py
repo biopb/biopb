@@ -560,7 +560,6 @@ CASE = Case(
     },
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="deconvolution",
     # It must be able to answer: the fixture strips the spacing, and this person
     # knows it, along with the optics and what the beads are.
     persona_must_know=("0.065", "0.20", "1.4", "520", "beads"),

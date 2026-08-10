@@ -520,20 +520,50 @@ def catalog_ids(text: str) -> tuple[str, ...]:
     evidence that the catalog was withheld, and reading it as one would turn a
     broken ablation into a clean-looking table.
     """
-    try:
-        parsed = json.loads(text)
-    except (ValueError, TypeError):
+    values = _json_values(text)
+    if values is None:
         return ("<unparseable>",) if text.strip() else ()
-    if isinstance(parsed, dict):
-        # A list return can reach a client wrapped in structured content; the
-        # entries are still the only list in it.
-        parsed = next((v for v in parsed.values() if isinstance(v, list)), parsed)
-    if not isinstance(parsed, list):
-        return ("<unparseable>",) if parsed else ()
+    entries: list = []
+    for parsed in values:
+        if isinstance(parsed, dict) and not (parsed.get("id") or parsed.get("name")):
+            # A wrapper: a list return can reach a client inside structured
+            # content, and the entries are the only list in it. Checked *after*
+            # the identifying keys, because a lone skill is itself a dict with
+            # a list in it — `tags` — and reading that as the entries reported
+            # a skill's tags as if they were the catalog.
+            parsed = next((v for v in parsed.values() if isinstance(v, list)), parsed)
+        entries.extend(parsed if isinstance(parsed, list) else [parsed])
+    if not entries:
+        return ()
     return tuple(
         str(e.get("id") or e.get("name") or "?") if isinstance(e, dict) else str(e)
-        for e in parsed
+        for e in entries
     )
+
+
+def _json_values(text: str) -> list | None:
+    """Every JSON value in *text*, or `None` if it is not JSON at all.
+
+    A stream, not one document. The tool answers with one content block per
+    skill and a client joins them, so two matches arrive as `{...}{...}` —
+    which `json.loads` rejects, and which the old parser therefore filed as
+    unreadable. It counted as *something*, so the check stayed green while the
+    provenance line said `<unparseable>` on more than half the catalogue.
+    """
+    decoder = json.JSONDecoder()
+    values: list = []
+    index, end = 0, len(text)
+    while index < end:
+        while index < end and text[index].isspace():
+            index += 1
+        if index >= end:
+            break
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except ValueError:
+            return None
+        values.append(value)
+    return values
 
 
 def read_catalog(session, case: Case) -> tuple[str, ...]:

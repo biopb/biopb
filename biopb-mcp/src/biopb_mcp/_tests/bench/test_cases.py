@@ -336,6 +336,30 @@ def test_a_skill_case_can_ask_the_catalog_about_itself(skill_case):
     assert skill_case.query
 
 
+def test_a_skill_cases_catalog_probe_finds_its_own_skill(skill_case):
+    """The probe has to be able to succeed, and nothing else was checking.
+
+    `find_skills` is pure and reads the catalogue off disk, so this costs a
+    function call and runs with the ordinary suite — which is the whole point.
+    The live check (`test_bench.py`) can only speak after a paid run, and the
+    two broken queries it was supposed to catch survived four full sweeps: one
+    asked a whole sentence and matched nothing, the other asked
+    "segmentation quality" and retrieved `pixel-classifier-segmentation`.
+
+    An agent is not held to this because an agent can read the result and try
+    again — and does, in every transcript. A string in a case module is read
+    once by a machine that cannot.
+    """
+    from ...mcp._skills import find_skills
+
+    found = [entry["id"] for entry in find_skills(skill_case.query)]
+    assert skill_case.skill in found, (
+        f"{skill_case.label}: the catalog probe asks {skill_case.query!r}, "
+        f"which retrieves {found} — never its own skill, so the run cannot "
+        f"tell an offered catalog from a withheld one"
+    )
+
+
 def test_a_case_with_no_skill_asks_the_catalog_for_everything(task_case):
     """Its catalog read is *provenance*, not a manipulation: the record of what
     was on offer when this number was produced.

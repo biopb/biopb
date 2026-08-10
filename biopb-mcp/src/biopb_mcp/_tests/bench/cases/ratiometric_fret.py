@@ -474,7 +474,6 @@ CASE = Case(
     collect={"fret_ratio": "fret_ratio", "bleedthrough": "bleedthrough"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="fret",
     # It must be able to answer: the fixture withholds both coefficients, and
     # this person ran the slides they were measured on.
     persona_must_know=("0.35", "0.12", "only the donor", "only the acceptor"),

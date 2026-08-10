@@ -381,7 +381,6 @@ CASE = Case(
     score=verify,
     save_artifacts=save_artifacts,
     plugins=("image_resolution",),
-    catalog_query="resolution of a super-resolution reconstruction",
     # It must be able to say the molecules repeat, which is what makes the split
     # a choice at all, and that the structure fills the field, which is what
     # makes the areal density floor the right one to compare against.

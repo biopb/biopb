@@ -382,7 +382,6 @@ CASE = Case(
     collect={"flat": "flat", "darkfield": "darkfield"},
     score=verify,
     save_artifacts=save_artifacts,
-    catalog_query="illumination",
     # It must be able to answer: the fixture withholds the camera offset, and
     # this person knows it, knows the data is raw, and knows the symptom.
     persona_must_know=("offset", "200", "camera", "raw"),
