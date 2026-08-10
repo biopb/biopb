@@ -2,16 +2,14 @@
 
 **This is the one place a case is defined.** There were two — one per suite,
 under two engines that had drifted — and "where is the benchmark data" had two
-answers a reader had to know to ask about separately. A case that names a skill
-and a case that names none differ by one field now, so they live together and
-the run options decide which of them a given invocation pays for.
+answers a reader had to know to ask about separately. There is one kind of case
+now, and one engine behind it.
 
 Adding one is:
 
 1. write ``cases/<name>.py`` exporting a module-level `CASE`: an id, the task
    prompt, the persona, the one `FixtureSpec` the case is written against, and
-   a verifier for what the run leaves in the kernel — plus ``skill=`` if it is
-   a claim about a skill rather than about the work;
+   a verifier for what the run leaves in the kernel;
 2. there is no step 2. The module is discovered by being here.
 
 One module is one `CASE`, so covering a subject two ways — a procedural fixture
@@ -24,31 +22,27 @@ and transcripts with it, and `test_cases.py` starts checking its persona and its
 fixture by its arriving.
 
 **Every module here is a case, and every case runs.** There used to be a second
-tuple, `DEFERRED_CASES`, holding the cases of skills the runtime does not serve:
-banked behind the `_` marker, checked hermetically, and never run, because a 2x2
-over an absent catalog entry is four copies of one arm. Decoupling the case from
-the skill dissolved that — such a case names no `skill`, keeps the skill's name
-as its :attr:`~.._case.Case.namespace`, and runs the shipped corner like any
-other case with no ablation. The work is real whether or not a skill for it is
-served, which is the whole reason it was worth banking.
+tuple, `DEFERRED_CASES`, holding the cases of skills the runtime does not serve,
+checked hermetically and never run. That distinction is gone along with the
+field that expressed it.
 
-**Every shipped skill has to appear somewhere.** A skill that cannot be
-benchmarked is a decision, not an oversight, so it goes in
-:data:`NOT_BENCHMARKED` with the reason. `test_cases.py` asserts the catalogue
-is covered by one or the other — the same shape as the contract layer's
-"a declared package this layer says nothing about fails the suite", and what
-keeps a 30-skill catalogue from quietly having 3 benchmarked skills.
+**This package knows nothing about the skills catalog.** A case used to carry
+``skill=``, and three things read it: a `--bench-cases=skills|tasks` filter, a
+coverage ledger asserting every shipped skill was benchmarked or exempted, and a
+rule about which agent could score it. All three are gone. Nothing here imports
+`mcp/_skills_layout.py`, globs `_skills_data`, or can tell a served skill from a
+banked one — so promoting or banking a skill is a change to the catalog and to
+no file in this tree, and a case's `namespace` is a subject on disk that stays
+put either way.
 
-That gate is also what catches a **promotion**: drop the `_` from a skill file
-and the skill is suddenly shipped and uncovered, and the fix is to add `skill=`
-to the case already sitting here under its name. Demote one and
-`test_nothing_claims_to_cover_a_skill_that_does_not_ship` fires from the other
-side. Both directions used to be pinned by two filename prefixes agreeing; they
-are pinned by the shipped catalogue now, which is the thing that actually
-changed.
+What is lost with the ledger is worth naming: nothing now notices a shipped
+skill that no case covers. That was the check keeping a 30-skill catalogue from
+quietly having 3 benchmarked skills, and the honest answer to "what does the
+benchmark cover" is again "whatever anyone got round to". It was removed
+deliberately — it was the coupling — and if it is wanted back it belongs on the
+skills side, asserting from the catalog outwards, not here.
 
-Nothing equivalent constrains a case with no skill: there is no catalogue of
-work to be complete against, and a case exists by someone having written it.
+A case exists by someone having written it, and that is the whole registration.
 """
 
 from __future__ import annotations
@@ -57,16 +51,6 @@ import importlib
 import pkgutil
 
 from .._case import Case
-
-#: Skills deliberately outside this layer, and why. A reason here should be
-#: about the skill's *output*, not about the effort: "no number to score" is a
-#: fact, "nobody has written it yet" is a TODO and belongs in an issue.
-NOT_BENCHMARKED: dict[str, str] = {
-    "write-a-skill": (
-        "it emits a markdown file. There is no number with a knowable right "
-        "answer, so there is nothing here for a programmatic verifier to score."
-    ),
-}
 
 
 def _discover() -> tuple[Case, ...]:
@@ -99,4 +83,4 @@ def _discover() -> tuple[Case, ...]:
 #: Every case this layer runs. There is no second tuple.
 CASES: tuple[Case, ...] = _discover()
 
-__all__ = ["CASES", "NOT_BENCHMARKED"]
+__all__ = ["CASES"]

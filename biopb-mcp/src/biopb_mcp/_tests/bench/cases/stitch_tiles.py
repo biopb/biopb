@@ -54,7 +54,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "stitch-tiles"
+NAMESPACE = "stitch-tiles"
 
 #: Set from measurement (see the module docstring), not from taste. A correct
 #: layout comes back at 1.0 px rms / 2.4 px worst; the failure this case exists
@@ -347,7 +347,7 @@ MICROSCOPIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="path-known-only-to-the-operator",
     task=TASK,
     persona=MICROSCOPIST,

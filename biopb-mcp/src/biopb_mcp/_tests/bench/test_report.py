@@ -13,7 +13,7 @@ curated fixture and a synthetic one for the same subject support different
 measurements and the table has to follow.
 
 The run options get the same treatment for the same reason: `--bench-skills`
-and `--bench-cases` decide what an invocation spends *and what its number
+and `--bench-fixtures` decide what an invocation spends *and what its number
 means*, and a switch that silently did not take effect is indistinguishable
 from one that did until two sessions are compared.
 
@@ -66,7 +66,6 @@ from ._engine import (
     write_session,
 )
 from ._options import (
-    CASES as CASES_OPTION,
     FIXTURES,
     RESPONDER,
     SAMPLES_DEST,
@@ -90,8 +89,11 @@ FIXTURE = Fixture(
     about="a stand-in, so nothing here depends on a real case",
 )
 
-SKILL_CASE = next(c for c in CASES if c.about_a_skill)
-TASK_CASE = next(c for c in CASES if not c.about_a_skill)
+#: A case that withholds a fact, and one that does not. The pair used to be
+#: split on `skill`; the property these tests actually need is whether there is
+#: anything for the respondent to be asked for.
+SKILL_CASE = next(c for c in CASES if c.persona_must_know)
+TASK_CASE = next(c for c in CASES if not c.persona_must_know)
 
 
 class FakeTrace:
@@ -142,7 +144,7 @@ def clean_env(monkeypatch):
     """No `BIOPB_BENCH_*` from the developer's shell. There is deliberately no
     dotenv behind these — a file somebody forgot about should not decide what a
     run spends — so clearing the environment is the whole isolation."""
-    for setting in (CASES_OPTION, FIXTURES, SKILLS, RESPONDER):
+    for setting in (FIXTURES, SKILLS, RESPONDER):
         monkeypatch.delenv(setting.env, raising=False)
     monkeypatch.delenv(SAMPLES_ENV, raising=False)
     return monkeypatch
@@ -150,7 +152,7 @@ def clean_env(monkeypatch):
 
 def test_the_defaults_run_everything_once_in_the_shipped_configuration(clean_env):
     chosen = resolve(FakeConfig())
-    assert (chosen.cases, chosen.fixtures) == ("all", "all")
+    assert chosen.fixtures == "all"
     assert chosen.skills is True and chosen.responder == "model"
     assert chosen.samples == 1
     assert not chosen.filtered
@@ -218,7 +220,6 @@ def test_a_filter_says_it_is_a_filter(clean_env):
     """`filtered` is what makes the terminal summary print. A narrowed run that
     does not say so reads afterwards exactly like a complete one."""
     assert not Options().filtered
-    assert Options(cases="skills").filtered
     assert Options(fixtures="curated").filtered
     # The switches and the sample count change what a run measures and how
     # deep it goes, not how much of the catalogue it covers, and all three are
@@ -229,10 +230,9 @@ def test_a_filter_says_it_is_a_filter(clean_env):
 def test_the_option_line_names_every_option(clean_env):
     """Including the ones left alone: a header listing only what was changed
     cannot be read as a record of what was run."""
-    line = Options(cases="skills", samples=2).describe()
+    line = Options(fixtures="curated", samples=2).describe()
     for token in (
-        "cases=skills",
-        "fixtures=all",
+        "fixtures=curated",
         "skills=true",
         "responder=model",
         "samples=2",
@@ -241,27 +241,10 @@ def test_the_option_line_names_every_option(clean_env):
 
 
 def test_a_setting_derives_its_own_argparse_destination():
-    assert Setting("--bench-cases", "X", (), "", "").dest == "bench_cases"
+    assert Setting("--bench-fixtures", "X", (), "", "").dest == "bench_fixtures"
 
 
 # --- which cases a run pays for --------------------------------------------
-
-
-def test_selecting_skills_drops_the_cases_that_have_none():
-    chosen = select(CASES, Options(cases="skills"))
-    assert chosen and all(c.about_a_skill for c in chosen)
-    assert len(chosen) < len(CASES), "this tree has no case without a skill"
-
-
-def test_selecting_tasks_is_the_complement():
-    # By label: a `Case` is frozen but not hashable — `collect` and the
-    # persona's fact table are mappings — so the set algebra goes through the
-    # thing that identifies a case anyway.
-    skills = {c.label for c in select(CASES, Options(cases="skills"))}
-    tasks = {c.label for c in select(CASES, Options(cases="tasks"))}
-    assert tasks
-    assert not (skills & tasks)
-    assert skills | tasks == {c.label for c in CASES}
 
 
 def test_selecting_a_fixture_kind_keeps_only_that_kind():
@@ -269,24 +252,6 @@ def test_selecting_a_fixture_kind_keeps_only_that_kind():
         chosen = select(CASES, Options(fixtures=kind))
         assert chosen, f"nothing in this tree is {kind}"
         assert all(c.fixture.kind == kind for c in chosen)
-
-
-def test_the_filters_compose():
-    chosen = select(CASES, Options(cases="skills", fixtures="synthetic"))
-    assert chosen, "this tree has no synthetic skill case, so this proves nothing"
-    assert all(c.about_a_skill and c.fixture.kind == "synthetic" for c in chosen)
-
-
-def test_composing_filters_may_legitimately_select_nothing():
-    """And must say so by being empty rather than by falling back.
-
-    Every curated case in the tree happens to name no skill, so this pair is
-    satisfied by nothing — which is a real answer to a real question, and the
-    terminal summary is what makes it legible. An `all()` over an empty tuple
-    is *also* how the test above would look if the filters had stopped working
-    entirely, which is why that one asserts it selected something first.
-    """
-    assert select(CASES, Options(cases="skills", fixtures="curated")) == ()
 
 
 def test_selection_keeps_the_order_it_was_given():
@@ -415,7 +380,6 @@ class RunnableAnywhere:
     """
 
     layers = ()
-    about_a_skill = False
 
     def available(self):
         return True, ""
@@ -903,25 +867,6 @@ def test_the_report_points_at_the_other_session_for_a_delta(report):
     assert "--bench-skills" in text
 
 
-def test_a_skill_case_names_the_comparison_worth_making(report):
-    text, _, _ = report
-    assert f"`{SKILL_CASE.skill}`" in text
-
-
-def test_a_case_with_no_skill_is_not_sent_looking_for_an_ablation(
-    tmp_path, monkeypatch
-):
-    """Withholding the catalog from it measures something, but not a delta of
-    its own — there is no entry of its to withhold."""
-    monkeypatch.setattr(_engine, "artifact_root", lambda: tmp_path)
-    text = Run(
-        case=TASK_CASE,
-        fixture=FIXTURE,
-        results=[result(outcome=scored(0.05))],
-    ).summary()
-    assert "claims something about" not in text
-
-
 def test_the_report_lands_under_its_own_case_inside_the_session(report):
     """`<session>/<namespace>/<case_id>`, so neither a second subject nor a
     second case for the same skill overwrites the first, and neither does the
@@ -971,7 +916,6 @@ def test_the_session_file_records_the_configuration(tmp_path, monkeypatch):
 
     assert data["session"] == session_id()
     assert data["options"] == {
-        "cases": "all",
         "fixtures": "all",
         "skills": False,
         "responder": "silent",
@@ -1053,8 +997,8 @@ def test_the_session_file_accumulates_a_roster(tmp_path, monkeypatch):
 
     assert set(data["cases"]) == {SKILL_CASE.label, TASK_CASE.label}
     assert data["cases"][SKILL_CASE.label]["samples"] == [OK]
-    assert data["cases"][SKILL_CASE.label]["skill"] == SKILL_CASE.skill
-    assert data["cases"][TASK_CASE.label]["skill"] == ""
+    assert data["cases"][SKILL_CASE.label]["namespace"] == SKILL_CASE.namespace
+    assert data["cases"][SKILL_CASE.label]["case_id"] == SKILL_CASE.case_id
 
 
 def test_a_half_written_session_file_does_not_fail_the_next_case(tmp_path, monkeypatch):

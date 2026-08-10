@@ -156,17 +156,13 @@ def select(cases: Sequence[Case], options: Options) -> tuple[Case, ...]:
     """The cases *options* asks for, in the order they were given.
 
     Filtered rather than skipped, because these are the paid runs: a
-    `--bench-cases=skills` invocation should collect the skill cases and nothing
-    else, not print a screen of skips. What was dropped is said out loud
-    instead (`conftest.pytest_terminal_summary`), since a shorter list is
+    `--bench-fixtures=synthetic` invocation should collect the synthetic cases
+    and nothing else, not print a screen of skips. What was dropped is said out
+    loud instead (`conftest.pytest_terminal_summary`), since a shorter list is
     otherwise indistinguishable from a shorter catalogue.
     """
     chosen = []
     for case in cases:
-        if options.cases == "skills" and not case.about_a_skill:
-            continue
-        if options.cases == "tasks" and case.about_a_skill:
-            continue
         if options.fixtures != "all" and case.fixture.kind != options.fixtures:
             continue
         chosen.append(case)
@@ -472,7 +468,6 @@ def write_session(run: Run) -> Path:
     known[run.case.label] = {
         "namespace": run.case.namespace,
         "case_id": run.case.case_id,
-        "skill": run.case.skill,
         "fixture": run.fixture.kind,
         "samples": [r.classify()[0] for r in run.results],
     }
@@ -939,17 +934,12 @@ def write_summary(run: Run) -> str:
         # Where the delta went. It used to be two rows of this table; it is two
         # sessions now, which is why the configuration is in the header and in
         # `session.json` rather than in a column.
-        "- **This report is one configuration.** A delta — a skill's, or the",
-        "  cost of the withheld fact — is this session against another one run",
-        f"  with a different `--bench-skills` or `--bench-responder`. `{session_id()}`",
-        "  and its `session.json` are what make the pair comparable.",
+        "- **This report is one configuration.** A delta — what the catalog was",
+        "  worth, or the cost of the withheld fact — is this session against",
+        "  another run with a different `--bench-skills` or `--bench-responder`.",
+        f"  `{session_id()}` and its `session.json` are what make the pair",
+        "  comparable.",
     ]
-    if case.about_a_skill:
-        lines += [
-            f"- This case claims something about `{case.skill}`, so the delta",
-            "  worth having is `--bench-skills=true` against `--bench-skills=false`,",
-            "  everything else held.",
-        ]
     lines += [
         f"- `asked` counts blocking questions; `write-a-skill` step 4 budgets"
         f" {case.blocking_budget}.",
@@ -968,7 +958,6 @@ def write_summary(run: Run) -> str:
             {
                 "session": session_id(),
                 "case": case.label,
-                "skill": case.skill,
                 "namespace": case.namespace,
                 "case_id": case.case_id,
                 "kind": fixture.kind,
@@ -1034,15 +1023,6 @@ def unavailable(case: Case, options: Options) -> str:
     for side, choice in sides:
         if why := choice.why_unavailable():
             return f"{side}: {why}"
-    # §5a, and it constrains a *skill* case only: an agent from the family that
-    # wrote these bodies could pass by recognising its own prose. A case with no
-    # skill has no authored prose to recognise — only an acquisition and a
-    # question — so every model is a legitimate subject for it.
-    if case.about_a_skill and agent_choice().from_authoring_family:
-        return (
-            f"the agent is {agent_choice().name}, from the family that wrote these "
-            "skills — it could pass by recognising its own prose (§5a)."
-        )
     # Last, because it is the only one that costs a request: a model the
     # endpoint does not serve fails every case identically, and a shell export
     # beating the dotenv is the ordinary way to arrive there.

@@ -51,7 +51,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "detect-filaments"
+NAMESPACE = "detect-filaments"
 
 #: The withheld number. Every width the run reports is a pixel count times this.
 PX_UM = 0.1
@@ -403,7 +403,7 @@ CYTOSKELETON = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="a-decade-of-brightness-no-scale-in-the-pixels",
     task=TASK,
     persona=CYTOSKELETON,

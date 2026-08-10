@@ -55,7 +55,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "flatfield"
+NAMESPACE = "flatfield"
 
 #: Set from measurement, not from taste -- see the module docstring for the two
 #: populations these separate. The field error is deterministic to ~0.05% across
@@ -373,7 +373,7 @@ MICROSCOPIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="offset-known-only-to-the-operator",
     task=TASK,
     persona=MICROSCOPIST,

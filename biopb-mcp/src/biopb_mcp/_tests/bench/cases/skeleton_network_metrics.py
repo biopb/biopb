@@ -68,7 +68,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "skeleton-network-metrics"
+NAMESPACE = "skeleton-network-metrics"
 CASE_ID = "mitochondria-on-anisotropic-voxels"
 
 #: From the table above, not from taste. The reference scores 4.2% / 0 / 0 and
@@ -507,7 +507,7 @@ CELL_BIOLOGIST = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id=CASE_ID,
     task=TASK,
     persona=CELL_BIOLOGIST,

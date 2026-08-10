@@ -568,11 +568,11 @@ is, because it changes what a green run means.
 
 The machinery is [`_tests/agentbench/`](../src/biopb_mcp/_tests/agentbench/),
 which knows nothing about skills, and the runner is
-[`_tests/bench/`](../src/biopb_mcp/_tests/bench/). A case there either names a
-skill — an ablation, and the delta below — or names none, and asks "can an agent
-do this work" against real data with nothing withheld. Same engine, same report,
-and `--bench-cases` is which of them an invocation pays for. What a run is given
-and how it is scored is [`fixtures.md`](fixtures.md).
+[`_tests/bench/`](../src/biopb_mcp/_tests/bench/), which knows nothing about
+them either. Every case there asks "can an agent do this work"; what a skill was
+worth is the delta between two sessions either side of `--bench-skills`, read
+afterwards from their `session.json`s rather than declared on the case. What a
+run is given and how it is scored is [`fixtures.md`](fixtures.md).
 
 ### 10a. The agent matrix
 
@@ -807,11 +807,12 @@ CASE = Case(
 Modules are discovered by being there — no registration line, no engine change,
 no test code. `test_bench.py` parametrizes over them.
 
-**Omitting `skill` is what makes a case a task** rather than a claim about a
-skill: nothing is ablated, and `--bench-samples` replaces the control as the
-source of information.
-Same dataclass, same engine, same report — the field is the whole difference,
-and `--bench-cases` is how an invocation picks one kind or the other.
+**A case does not name a skill at all.** It once did, and that field fed a
+`--bench-cases` filter, a coverage ledger over the shipped catalog and a rule
+about which agent could score it; all three are gone, and the bench package no
+longer reads `_skills_data`. Whether an invocation is an ablation is decided by
+`--bench-skills`, and whether repetition or a control carries the information is
+decided by `--bench-samples`.
 
 A **banked** skill's case is written that way too: the `_` marker keeps its
 skill out of the catalog, so there is no entry to withhold and a square would be
@@ -956,7 +957,7 @@ uv run --no-project --python .venv/bin/python --with openai --with anthropic \
 # One invocation is one configuration, so a delta is two of these (§10c)
 uv run --no-project --python .venv/bin/python --with openai --with anthropic \
   python -m pytest biopb-mcp/src/biopb_mcp/_tests/bench -m bench -s \
-  --bench-cases=skills --bench-skills=false
+  --bench-skills=false
 ```
 
 `-s` is not optional in practice: pytest discards a *passing* test's captured

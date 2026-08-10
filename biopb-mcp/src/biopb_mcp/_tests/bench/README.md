@@ -16,17 +16,21 @@ break in the machinery, or a case whose persona gives its own answer away,
 should surface as a normal red test rather than be found by someone
 mid-diagnosis with a paid run.
 
-A case either names a **skill** — a claim that following it changes what an
-agent does, measured as two sessions either side of `--bench-skills` — or it
-names none, and asks only whether the work gets done, with repetition rather
-than a control behind its number. That one field is the whole difference; the
-engine, the report and the switches are the same for both.
+Every case asks the same question — whether the work gets done — and two kinds
+of comparison answer it: two sessions either side of `--bench-skills` say what
+the catalog was worth, and repetition says what one number is worth. Both are
+properties of the invocation, not of the case.
 
-It says nothing about whether a case **withholds** something. The cases of
-*banked* skills live here too — a skill behind the `_` marker, which the runtime
-does not serve — and they withhold as hard as any skill case does; they simply
-have no catalog entry to ablate. What declares that a case withholds is
-`persona_must_know`, and that is what `test_cases.py` reads.
+**A case does not name a skill.** It used to, and three things read that field:
+a `--bench-cases=skills|tasks` filter, a coverage ledger over the shipped
+catalog, and a rule about which agent could score it. All three are gone, and
+this package no longer imports the skills layout or globs `_skills_data` —
+promoting or banking a skill is a change to the catalog and to nothing here.
+
+What declares that a case **withholds** something is `persona_must_know`, which
+is what `test_cases.py` reads. That was always the right declaration: it and
+`skill` coincided only until the banked skills' cases arrived, which withheld a
+fact and named no skill.
 
 ## Run options
 
@@ -38,7 +42,6 @@ ago should not be the answer to "why did this take two hours".
 
 | Flag | Environment | Values | Does |
 |---|---|---|---|
-| `--bench-cases` | `BIOPB_BENCH_CASES` | `all` (default), `skills`, `tasks` | which cases to pay for — `skills` is the ones with an ablation, `tasks` the complement |
 | `--bench-fixtures` | `BIOPB_BENCH_FIXTURES` | `all` (default), `synthetic`, `curated` | which kind of data |
 | `--bench-skills` | `BIOPB_BENCH_SKILLS` | `true` (default), `false` | whether the agent is offered the catalog |
 | `--bench-responder` | `BIOPB_BENCH_RESPONDER` | `model` (default), `silent`, `briefed` | who answers the agent — or, for `briefed`, whether there is anything left to ask |
@@ -68,8 +71,8 @@ pytest .../bench -m bench -s -k drift-correction --bench-responder=silent \
 
 Picking out a single case is pytest's own `-k`: the parametrization ids are case
 labels, so `-k drift-correction`, `-k "drift or flatfield"` and the full
-`-k drift-correction/two-channels-one-structural` all work. `--bench-cases` is
-for the two *categories*, which `-k` cannot express.
+`-k drift-correction/two-channels-one-structural` all work. `--bench-fixtures`
+is for the two *kinds of data*, which `-k` cannot express.
 
 A filter is a cap on coverage, so a filtered run **says what it did not run**,
 by name, in its own terminal summary. A shorter table is otherwise
@@ -259,7 +262,7 @@ or configurations. What stays here is what is about *scoring a subject*:
 | `test_bench.py` | The pytest surface: run every selected case, assert only that it reported |
 | `test_session_smoke.py` | That the stack works, with **no model in it** |
 | `test_report.py` | That the options resolve and the engine classifies, on hand-built outcomes |
-| `test_cases.py` | That every case's persona, fixture and verifier hold up — and that the catalogue is covered |
+| `test_cases.py` | That every case's persona, fixture and verifier hold up |
 | `test_verifiers.py` | The checks one case needs and no other does |
 | `conftest.py` | Which cases a run pays for; and smoke runs first, with a failed smoke *skipping* the run rather than merely preceding it |
 
@@ -272,7 +275,7 @@ module is discovered by being there.
 ```python
 CASE = Case(
     case_id="twelve-nuclei-anisotropic",   # names the run and its artifacts
-    skill="calibrated-measurements",  # omit for a case about the work alone
+    namespace="calibrated-measurements",   # the subject; defaults to "tasks"
     task=TASK,                        # the prompt, incl. where results land
     persona=MICROSCOPIST,             # who holds the fact the fixture withholds
     fixture=Procedural(Ellipsoids()), # data, truth, tolerances -- and only this
@@ -283,34 +286,25 @@ CASE = Case(
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},
     score=verify,                     # (fixture, attempt) -> Outcome
     save_artifacts=save_artifacts,
-    plugins=("segmentation_qc",),     # kernel plugins the skill's `checklist:` names
-    persona_must_know=(...), persona_must_not_know=(...),   # skill cases
+    plugins=("segmentation_qc",),     # kernel plugins this work needs
+    persona_must_know=(...), persona_must_not_know=(...),   # if it withholds
 )
 ```
 
-A skill that cannot be benchmarked goes in `cases.NOT_BENCHMARKED` with the
-reason instead; `test_cases.py` asserts the shipped catalogue is covered by one
-or the other, so "what does this cover" never has to be answered by reading the
-directory. Nothing equivalent constrains a case with no skill: there is no
-catalogue of work to be complete against.
+**A case never names a skill, and this layer cannot tell which skills ship.**
+`namespace` is a subject and a directory on disk (`$BIOPB_FIXTURES/<namespace>/
+<case_id>/`); it keeps its name whether a skill by that name is served, banked
+behind the `_` marker, or has never been written. So promoting or banking a
+skill is a change to the catalog and to no file here.
 
-A **banked** skill — written but not served by the runtime, the `_` prefix on
-its file — gets an ordinary case that leaves `skill` empty and sets
-`namespace=` to the skill's own name. It runs the shipped corner, because there
-is no catalog entry to withhold and a square over one would be four copies of a
-corner. Everything else about it is a case like any other.
-
-That is a relaxation, and what it replaced is worth knowing. The case module
-used to carry the `_` prefix too and land in a `DEFERRED_CASES` tuple that was
-checked hermetically and **run nowhere** — on the argument that a skill the
-runtime does not serve has nothing to measure. But the *work* is real whether or
-not a skill for it is served, and three of the four such cases had a complete
-fixture, verifier and persona sitting behind a prefix. Now they run.
-
-Promoting the skill is then a one-line edit: add `skill=` to the case that is
-already there. `namespace` already carries the name, so nothing on disk moves,
-and the coverage gate fires the moment the skill ships uncovered — which is a
-better pin than the two filename prefixes that used to have to agree.
+That is a deliberate loosening, and it cost something worth naming. A case used
+to carry `skill=`, which fed a coverage ledger asserting every shipped skill was
+either benchmarked or listed in `NOT_BENCHMARKED` with a reason. Nothing now
+notices a shipped skill that no case covers, so "what does the benchmark cover"
+is again answered by reading the directory. The ledger was removed because it
+*was* the coupling — it globbed `_skills_data` from inside this package — and if
+it is wanted back it belongs on the skills side, asserting outwards from the
+catalog.
 
 **A case may also exist for a candidate that was screened and *rejected*.**
 `local-thickness`, `fibre-orientation`, `strahler-ordering`,

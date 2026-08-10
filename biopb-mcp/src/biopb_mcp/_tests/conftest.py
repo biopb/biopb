@@ -8,7 +8,7 @@ from biopb_mcp._config import CONFIG
 
 
 def pytest_addoption(parser):
-    """Register the benchmark's run options (`--bench-cases`, `--bench-skills`, …).
+    """Register the benchmark's run options (`--bench-fixtures`, `--bench-skills`, …).
 
     Here rather than in `bench/conftest.py` because pytest calls this hook only
     on the conftests it loads at *startup* — the rootdir's and those on the way

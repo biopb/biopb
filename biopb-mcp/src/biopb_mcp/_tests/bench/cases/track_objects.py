@@ -47,7 +47,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "track-objects"
+NAMESPACE = "track-objects"
 
 #: The withheld pair. A 20x objective on a large sensor and a 90 s interval --
 #: ordinary numbers, deliberately not round ones, so a run cannot land on them
@@ -484,7 +484,7 @@ OPERATOR = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="colonies-no-scale-in-the-pixels",
     task=TASK,
     persona=OPERATOR,

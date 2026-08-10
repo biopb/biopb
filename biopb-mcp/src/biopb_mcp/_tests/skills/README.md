@@ -116,13 +116,13 @@ A **real** biopb-mcp session — shim-spawned child, real kernel, real napari,
 real dask, the nine real tools over real MCP — with the skill body arriving
 through the real `_skills.py`, and a model in front of it talking to a simulated
 user who holds a fact the fixture withheld. It lives in
-[`_tests/bench/`](../bench/) with the task benchmark, because the two are one
-engine and `--bench-cases` is what tells them apart.
+[`_tests/bench/`](../bench/), which knows nothing about this directory: a case
+names no skill, and what a skill was worth is read as the delta between two
+sessions either side of `--bench-skills`.
 `biopb-mcp/docs/skills.md` §10 and `bench/README.md`.
 
 ```sh
-uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/bench -m bench -s \
-  --bench-cases=skills
+uv run --no-sync pytest biopb-mcp/src/biopb_mcp/_tests/bench -m bench -s
 ```
 
 The trailing `-s` is what makes the per-run progress lines visible; pytest

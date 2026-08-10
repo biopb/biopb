@@ -71,7 +71,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "ratiometric-fret"
+NAMESPACE = "ratiometric-fret"
 
 #: Set from the route table in the module docstring, not from taste. Every
 #: failure route is 20x or more outside the level limit and 10x or more outside
@@ -461,7 +461,7 @@ BIOSENSOR_USER = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="controls-were-run-but-are-not-in-the-session",
     task=TASK,
     persona=BIOSENSOR_USER,

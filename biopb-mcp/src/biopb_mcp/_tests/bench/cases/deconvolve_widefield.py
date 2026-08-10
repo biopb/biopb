@@ -54,7 +54,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "deconvolve-widefield"
+NAMESPACE = "deconvolve-widefield"
 
 #: The withheld triple. Anisotropic on purpose -- a 0.20 µm z-step against
 #: 0.065 µm pixels is an ordinary high-NA acquisition, and the ratio is what a
@@ -547,7 +547,7 @@ OPERATOR = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="aberrated-no-spacing-in-the-pixels",
     task=TASK,
     persona=OPERATOR,

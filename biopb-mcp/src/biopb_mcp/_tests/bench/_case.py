@@ -1,12 +1,9 @@
 """What a case is, and what a run may vary about it. No engine, no pytest.
 
-One :class:`Case` covers both questions this layer asks, because they turned out
-to be the same object with one field set differently:
-
-* **does *this skill* change what an agent does** — ``skill`` names it, and two
-  runs either side of ``--bench-skills`` are its delta;
-* **can an agent do *this work*** — ``skill`` is empty, and repetition rather
-  than a control is where the information comes from.
+One :class:`Case` asks one question — **can an agent do this work** — and
+answers it with a number that has a knowable right value. Two runs either side
+of ``--bench-skills`` say what the catalog was worth to that work; repetition
+says what the spread is. Both are properties of the invocation, not of the case.
 
 They were two dataclasses in two packages for a while (`Case` and `TaskCase`),
 with two engines behind them that had drifted in the small: two outcome
@@ -17,13 +14,17 @@ is exactly the cost this file exists to stop paying a third time.
 
 **Nothing here decides how a run is configured.** Whether the catalog is offered
 and who answers the agent are switches on the invocation (`_options.py`), not
-properties of the case — so ``skill`` no longer changes what a run *does*, only
-what the case *is*. It labels, and labels are what filters and ledgers read.
+properties of the case.
 
-That was the last thing a case took from the skills tree. There was an arm set
-here that a skill case got four of and every other case got one of; it meant a
-case's kind decided what a run cost, and that a report had to explain a table
-whose rows were configured differently from one another.
+**And nothing here names a skill.** A case used to carry ``skill``, which fed a
+``--bench-cases=skills|tasks`` filter, a coverage ledger over the shipped
+catalog, and a rule about which agent could score it. All three are gone: this
+package no longer imports the skills layout, reads ``_skills_data``, or knows
+which entries ship. Promoting or banking a skill is a change to the catalog and
+to nothing here, and a case's namespace stays put whether or not a skill by that
+name exists. What remains is one assertion that the catalog matched the switch
+it was run under, which reads what ``find_skills`` returned at runtime and never
+names an entry.
 """
 
 from __future__ import annotations
@@ -48,8 +49,8 @@ MAX_TOOL_CALLS = 200
 #: not asserted: a handful of samples cannot support a verdict.
 BLOCKING_BUDGET = 3
 
-#: The namespace a case falls back to when it names neither a skill nor one of
-#: its own. A curated case is found at ``$BIOPB_FIXTURES/<namespace>/<case_id>/``
+#: The namespace a case falls back to when it declares none of its own. A
+#: curated case is found at ``$BIOPB_FIXTURES/<namespace>/<case_id>/``
 #: and every artifact path starts the same way (`docs/fixtures.md`), so this is
 #: a directory name on somebody's disk and not merely a label.
 TASK_NAMESPACE = "tasks"
@@ -114,8 +115,8 @@ class Case:
 
     Everything that is *about the subject* and nothing that is about running a
     benchmark. Adding one is writing a single module under `cases/` — see
-    `cases/drift_correction.py` for a skill and
-    `cases/align_channels_from_landmarks.py` for a task.
+    `cases/drift_correction.py` for a procedural fixture and
+    `cases/align_channels_from_landmarks.py` for a curated one.
 
     **A case is non-decomposable.** Task, persona, fixture, verifier and
     tolerances are one artifact, and where the pixels come from — a procedure
@@ -134,8 +135,8 @@ class Case:
     case_id: str
     #: What the agent is asked to do, including where its results should land.
     task: str
-    #: Who it is talking to. For a skill case, the holder of the fact the
-    #: fixture strips out; for a task, the experimental context and no answer.
+    #: Who it is talking to: the holder of the fact the fixture strips out, or
+    #: — where nothing is withheld — the experimental context and no answer.
     persona: Persona
     #: Where this case's data comes from. Exactly one, and no fallback:
     #: substituting it would make a different experiment with the same name.
@@ -148,56 +149,32 @@ class Case:
     #: cases emit numbers with knowable right answers.
     score: Callable[[Fixture, Attempt], Outcome]
 
-    #: The **served** skill this case is a claim about, as `find_skills` and
-    #: `skill://<id>` know it.
+    #: What this case is about, and where its data and artifacts live:
+    #: ``$BIOPB_FIXTURES/<namespace>/<case_id>/``. Defaults to `tasks`.
     #:
-    #: **It changes nothing about a run.** It says what the case *is*, and three
-    #: things read that: `--bench-cases=skills|tasks`, the coverage ledger that
-    #: keeps a growing catalogue honest, and §5a's refusal to score an agent
-    #: from the family that wrote these bodies. A run's configuration comes from
-    #: the switches, and is the same whatever this says.
-    #:
-    #: **Empty is meaningful**: there is no served entry to withhold, so
-    #: `--bench-skills=false` against such a case ablates nothing and its two
-    #: runs are the same run. A case written alongside a *banked* skill — one
-    #: behind the `_` marker, which the runtime does not serve — leaves this
-    #: empty and puts the skill's name in :attr:`namespace` instead.
-    skill: str = ""
-    #: Where this case's data and artifacts live, when it is not a skill's:
-    #: ``$BIOPB_FIXTURES/<namespace>/<case_id>/``. Defaults to the skill id, and
-    #: to `tasks` for a case that names neither. It is a directory somebody has
-    #: on disk, so a banked skill's case keeps the skill's own name here and
-    #: nothing moves when the skill is later promoted.
+    #: **This layer knows nothing about the skills catalog.** A namespace is a
+    #: subject, not a catalog entry — it is a directory somebody has on disk,
+    #: and it keeps its name whether or not a skill by that name is served,
+    #: banked, or has never been written. Promoting or banking a skill is
+    #: therefore not an edit to any case: what a run measures comes from the
+    #: switches, and `--bench-skills` withholds the catalog wholesale rather
+    #: than per entry.
     namespace: str = ""
 
     #: Optional ``(outcome, dir) -> None`` — the before/after images.
     save_artifacts: Callable[[Outcome, Path], None] | None = None
-    #: Kernel plugins the skill's `checklist:` names, seeded into the session's
-    #: own config tree. Without this a `plugin:` token is unresolvable and the
-    #: run is scoring an environment the skill declares it cannot work in.
+    #: Kernel plugins this case's work needs, seeded into the session's own
+    #: config tree. Without this a `plugin:` token is unresolvable and the run
+    #: is scoring an environment the work cannot be done in.
     plugins: Sequence[str] = ()
-    #: What to ask `find_skills`, to check `--bench-skills` actually took effect.
-    #: Empty for a case with no skill — where the catalog is recorded as
-    #: provenance rather than manipulated, so the honest query is the one that
-    #: lists everything — and otherwise defaults to the skill's own id, which
-    #: :attr:`query` spells the way the catalog spells it.
-    #:
-    #: **Leave it empty unless the case wants a different question.** A written
-    #: query is a second place the skill is named, and the two that existed for
-    #: no reason had both rotted: one asked a whole sentence and matched
-    #: nothing, the other retrieved a *different* skill. Neither could notice —
-    #: this string is read once by a machine, never by anything that could
-    #: retry, which is exactly the difference between it and the agent's own
-    #: search.
-    catalog_query: str = ""
     #: Case-folded substrings that must appear in the persona's rendered
     #: prompt: the fact the fixture strips, so the run is answerable at all.
-    #: Required of a skill case, and checked wherever it is declared — a case
-    #: with no skill may still withhold something, and several do.
+    #: Checked wherever it is declared; a case that withholds nothing leaves it
+    #: empty.
     persona_must_know: Sequence[str] = ()
     #: Case-folded substrings that must **not**. A persona that has absorbed the
     #: procedure can answer a question the agent never properly asked, and the
-    #: numeric result stops meaning what it appears to. Name the skill's own
+    #: numeric result stops meaning what it appears to. Name the procedure's own
     #: vocabulary here — `test_cases` asserts it, hermetically and free.
     persona_must_not_know: Sequence[str] = ()
     blocking_budget: int = BLOCKING_BUDGET
@@ -208,24 +185,7 @@ class Case:
         # Resolved once, into the field itself, so `case.namespace` is a plain
         # attribute everywhere and there is no second spelling of the fallback.
         if not self.namespace:
-            object.__setattr__(self, "namespace", self.skill or TASK_NAMESPACE)
-
-    @property
-    def about_a_skill(self) -> bool:
-        """Whether there is a claim here to isolate, and so an ablation to run."""
-        return bool(self.skill)
-
-    @property
-    def query(self) -> str:
-        """What the harness asks `find_skills` to prove the catalog was there.
-
-        The id **with its hyphens opened out**, because that is how the catalog
-        stores it: `_search_text` spells an id as words so that naming a skill
-        finds it, and `find_skills` matches each whitespace-separated term as a
-        substring — so the id typed verbatim matches nothing at all, and the
-        obvious default was a query that could never succeed.
-        """
-        return self.catalog_query or self.skill.replace("-", " ")
+            object.__setattr__(self, "namespace", TASK_NAMESPACE)
 
     @property
     def label(self) -> str:

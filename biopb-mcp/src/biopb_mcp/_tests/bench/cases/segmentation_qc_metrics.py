@@ -52,7 +52,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "segmentation-qc-metrics"
+NAMESPACE = "segmentation-qc-metrics"
 
 #: Absolute error on a 0-1 score. Every number here is exact by construction, so
 #: this is a "did you compute the same thing" limit, not a measurement band: it
@@ -168,13 +168,13 @@ def _agrees_with_the_plugin(gt, pred, truth) -> None:
     declared = (truth["tp"], truth["fp"], truth["fn"])
     if counted != declared:
         raise AssertionError(
-            f"{SKILL} fixture: segmentation_qc counts {counted} (tp, fp, fn) but "
+            f"{NAMESPACE} fixture: segmentation_qc counts {counted} (tp, fp, fn) but "
             f"the construction declares {declared}. The truth is wrong, not the "
             "plugin."
         )
     if got.splits or got.merges:
         raise AssertionError(
-            f"{SKILL} fixture: objects are meant to be isolated, but the plugin "
+            f"{NAMESPACE} fixture: objects are meant to be isolated, but the plugin "
             f"reports {got.splits} splits and {got.merges} merges"
         )
 
@@ -285,7 +285,7 @@ ANNOTATOR = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="hand-annotation-versus-model",
     task=TASK,
     persona=ANNOTATOR,

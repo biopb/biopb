@@ -72,7 +72,7 @@ from ...agentbench._fixture import (
 from ...agentbench._respondent import Persona
 from .._case import Case, Layer
 
-SKILL = "measure-smlm-resolution"
+NAMESPACE = "measure-smlm-resolution"
 
 FIELD_NM = 4000.0
 #: Molecules in the dense acquisition, and the factor the sparse one is thinned
@@ -223,20 +223,20 @@ def _the_case_can_be_passed_and_failed(dense, sparse, floors) -> None:
     ok = {s: _measure(t, "blocks") for s, t in (("dense", dense), ("sparse", sparse))}
     if ok["sparse"] < floors["floor_sparse_nm"] * (1 - TOLERANCE["floor_violation"]):
         raise AssertionError(
-            f"{SKILL} fixture: a correct blocks-split measures the sparse list at "
+            f"{NAMESPACE} fixture: a correct blocks-split measures the sparse list at "
             f"{ok['sparse']:.0f} nm, under its own {floors['floor_sparse_nm']:.0f} nm "
             "density floor. The fixture is unwinnable."
         )
     if ok["sparse"] / ok["dense"] < RANKING_MIN:
         raise AssertionError(
-            f"{SKILL} fixture: a correct blocks-split ranks the two only "
+            f"{NAMESPACE} fixture: a correct blocks-split ranks the two only "
             f"{ok['sparse'] / ok['dense']:.2f}x apart, under the {RANKING_MIN} the "
             "scorer demands. The fixture is unwinnable."
         )
     bad = _measure(sparse, "random")
     if bad >= floors["floor_sparse_nm"] * (1 - TOLERANCE["floor_violation"]):
         raise AssertionError(
-            f"{SKILL} fixture: a random split measures {bad:.0f} nm, which the "
+            f"{NAMESPACE} fixture: a random split measures {bad:.0f} nm, which the "
             "scorer would accept. The failure this case exists to catch is no "
             "longer detectable on this data."
         )
@@ -368,7 +368,7 @@ IMAGER = Persona(
 )
 
 CASE = Case(
-    skill=SKILL,
+    namespace=NAMESPACE,
     case_id="two-densities-blocks-split",
     task=TASK,
     persona=IMAGER,
