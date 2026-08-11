@@ -7,6 +7,7 @@ across dask workers, installed via biopb's worker-init plugin.
 from unittest.mock import MagicMock, patch
 
 import biopb.tensor.client as tclient
+import pytest
 
 from biopb_mcp.mcp import _bootstrap
 
@@ -193,6 +194,89 @@ class TestLoadPluginFiles:
         assert sys.modules["json"] is json  # the real module, untouched
         assert json.dumps({"a": 1}) == '{"a": 1}'
         sys.modules.pop("biopb_kernel_plugins.json", None)
+
+    def test_import_reaches_a_loaded_plugin(self, tmp_path):
+        # `import <stem>` is what anyone writes, so it has to work. A bound name
+        # that raises ModuleNotFoundError on import reads as broken, and telling
+        # people about the difference is a weaker fix than not having one: a
+        # benchmarked agent saw `files: image_resolution` in server_status,
+        # wrote the import, and went hunting the filesystem for the file.
+        import importlib
+        import sys
+
+        (tmp_path / "tool_for_import.py").write_text(
+            "def answer():\n    return 7\n", "utf-8"
+        )
+        ns = _seeded_ns()
+        try:
+            loaded = _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+            assert loaded == ["tool_for_import"]
+            imported = importlib.import_module("tool_for_import")
+            assert imported.answer() == 7
+            # The same object, not a second execution of the file.
+            assert imported is ns["tool_for_import"]
+        finally:
+            sys.modules.pop("tool_for_import", None)
+            sys.modules.pop("biopb_kernel_plugins.tool_for_import", None)
+            _bootstrap._PLUGIN_IMPORT_HOOK.unregister("tool_for_import")
+
+    def test_import_still_prefers_a_real_package_over_a_plugin(self, tmp_path):
+        # The guarantee the module prefix was introduced for, now that `import`
+        # can reach a plugin at all. The hook is *appended* to sys.meta_path, so
+        # every standard finder runs first and an installed package always wins;
+        # `sys.modules[stem] = mod` would not be equivalent, because imports
+        # short-circuit on sys.modules before any finder is consulted.
+        import colorsys
+        import importlib
+        import sys
+
+        (tmp_path / "colorsys.py").write_text(
+            "def rgb_to_hls(*a):\n    return 'HIJACKED'\n", "utf-8"
+        )
+        ns = _seeded_ns()
+        saved = sys.modules.pop("colorsys", None)
+        try:
+            _bootstrap._load_plugin_files(_FakeIP(ns), tmp_path)
+            assert ns["colorsys"].rgb_to_hls() == "HIJACKED"  # bound, under its name
+            # Nothing is in sys.modules for it, so this is a real resolution and
+            # not a cache hit: the stdlib module has to win on the meta_path.
+            assert "colorsys" not in sys.modules
+            assert importlib.import_module("colorsys").rgb_to_hls(0, 0, 0) == (0, 0, 0)
+        finally:
+            sys.modules.pop("biopb_kernel_plugins.colorsys", None)
+            _bootstrap._PLUGIN_IMPORT_HOOK.unregister("colorsys")
+            sys.modules["colorsys"] = saved if saved is not None else colorsys
+
+    def test_the_import_hook_is_installed_last(self, tmp_path):
+        """Position is the whole guarantee, so it is asserted rather than
+        assumed. Prepending would make every plugin able to shadow a package."""
+        import sys
+
+        (tmp_path / "positional.py").write_text("X = 1\n", "utf-8")
+        try:
+            _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path)
+            assert sys.meta_path[-1] is _bootstrap._PLUGIN_IMPORT_HOOK
+            # And installed once, however many plugins or reloads there are.
+            _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path)
+            assert sys.meta_path.count(_bootstrap._PLUGIN_IMPORT_HOOK) == 1
+        finally:
+            sys.modules.pop("biopb_kernel_plugins.positional", None)
+            _bootstrap._PLUGIN_IMPORT_HOOK.unregister("positional")
+
+    def test_a_plugin_that_lost_its_name_is_not_importable_either(self, tmp_path):
+        """A reserved-name collision contributes nothing, and that has to include
+        the import route — otherwise the name the namespace refused is still
+        reachable one `import` away."""
+        import importlib
+        import sys
+
+        (tmp_path / "viewer.py").write_text("def hijack():\n    return 1\n", "utf-8")
+        try:
+            assert _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path) == []
+            with pytest.raises(ModuleNotFoundError):
+                importlib.import_module("viewer")
+        finally:
+            sys.modules.pop("biopb_kernel_plugins.viewer", None)
 
     def test_plugin_functions_still_run_on_a_dask_worker(self, tmp_path):
         # A module's functions pickle *by reference* by default -- a few bytes
