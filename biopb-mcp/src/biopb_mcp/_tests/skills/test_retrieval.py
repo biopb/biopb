@@ -204,6 +204,73 @@ def test_every_shipped_skill_is_retrievable_by_its_own_name(shipped_only):
         assert got == [s["id"]], f"{query!r} -> {got}"
 
 
+#: What an agent actually typed, against what would have found the skill.
+#: Lifted verbatim from `.bench-outcomes/session-20260810-162211`, where the
+#: catalog was on, the skill was served, and eight of eleven eligible cases
+#: retrieved nothing — the agent described the task instead of naming it.
+#: Every table above this one is one to three words, which is the vocabulary
+#: the catalog was written for and not the one it was asked in.
+OVER_SPECIFIED = [
+    ("estimate illumination flatfield correction stack", "illumination", "flatfield"),
+    ("count foci per nucleus", "foci", "count-foci-per-cell"),
+    ("trace filament centrelines width FWHM", "filament", "detect-filaments"),
+    (
+        "axial resolution bead deconvolution 3D fluorescence",
+        "deconvolution",
+        "deconvolve-widefield",
+    ),
+    (
+        "track segmented cells time lapse labels speed lineage",
+        "tracking",
+        "track-objects",
+    ),
+]
+
+
+@pytest.mark.parametrize("typed,shorter,expected", OVER_SPECIFIED)
+def test_too_many_keywords_find_nothing_and_fewer_recover(
+    shipped_only, typed, shorter, expected
+):
+    """The trap the tool docstring now names, pinned to measured queries.
+
+    Asserted rather than fixed, because narrowing is what a keyword filter *is*:
+    every keyword can only remove results. What the docstring owes the caller is
+    that an empty result means "too many", and this is the check that the
+    recovery it prescribes actually works.
+    """
+    _require_shipped(expected)
+    assert _skills.find_skills([typed]) == [], (
+        f"{typed!r} now retrieves; the trap this documents is gone and the "
+        "docstring's advice should be revisited"
+    )
+    got = [s["id"] for s in _skills.find_skills([shorter])]
+    assert expected in got, f"{shorter!r} did not recover {expected}; got {got}"
+
+
+def test_a_phrase_inside_one_keyword_is_split(shipped_only):
+    """The list says "keywords", and a model will still pass a phrase in one.
+
+    Matching that element whole would fail against a skill whose title carries
+    one word and whose description carries the other, which is the failure the
+    list-shaped parameter is meant to make unlikely — not one it should
+    introduce.
+    """
+    assert [s["id"] for s in _skills.find_skills(["stitch tiles"])] == ["stitch-tiles"]
+    assert _skills.find_skills(["stitch tiles"]) == _skills.find_skills(
+        ["stitch", "tiles"]
+    )
+
+
+def test_no_keywords_returns_the_whole_catalog(shipped_only):
+    """The escape hatch the docstring points at when a search comes back empty.
+    Every spelling of "nothing" has to reach it, since that is the call an agent
+    makes after being told to widen."""
+    everything = _skills.find_skills(())
+    assert len(everything) > 1
+    for nothing in ([], "", (), [""]):
+        assert _skills.find_skills(nothing) == everything
+
+
 def test_every_shipped_skill_appears_in_the_phrasing_table(shipped_only):
     """A skill added without a phrasing entry is a skill nobody checked anyone
     can find. Cheap to satisfy, and the alternative is a table that quietly

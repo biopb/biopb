@@ -600,14 +600,23 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-def find_skills(query: str = "") -> list:
+def find_skills(keywords: list[str] | None = None) -> list:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
     Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
-    labels"). `query` filters by id/title/description/tags — every word must
-    appear, in any order — and an empty query returns all. Prefer a few content
-    words over a whole sentence: "stitch tiles" retrieves, "how do I stitch
-    these tiles together?" does not.
+    labels").
+
+    **`keywords` is a keyword filter, not a search engine.** Each keyword must
+    appear in a skill's id/title/description/tags, so every one you add can only
+    remove results. Pass **one or two** domain terms and widen from there:
+    `["drift"]`, `["fret"]`, `["illumination"]`, `["stitch", "tiles"]`. Omit it
+    to list the whole catalog — worth doing once, since it is small.
+
+    **An empty result usually means too many keywords, not no such skill.**
+    `["count", "foci", "per", "nucleus"]` returns nothing while `["foci"]`
+    returns the skill that counts them. If you get nothing back, drop keywords
+    and call again, or call with none and read the list.
+
     Each result includes a `uri` (`skill://<id>`) — read that resource for the
     full step-by-step workflow. Prefer an existing skill over improvising.
 
@@ -625,7 +634,7 @@ def find_skills(query: str = "") -> list:
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.
     """
-    return _skills.find_skills(query)
+    return _skills.find_skills(keywords or ())
 
 
 @mcp.tool()

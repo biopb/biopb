@@ -29,6 +29,7 @@ tool call or the bootstrap.
 
 import logging
 import re
+from collections.abc import Sequence
 from datetime import date
 from importlib import resources
 from pathlib import Path
@@ -379,26 +380,41 @@ def _search_text(s: dict) -> str:
     ).lower()
 
 
-def find_skills(query: str = "") -> list[dict]:
-    """Filter the catalog by *query* over id/title/description/tags (empty = all).
+def search_terms(keywords: Sequence[str] | str) -> list[str]:
+    """The terms *keywords* actually searches for. Each element is split.
 
-    Every whitespace-separated term must appear somewhere in that text; order and
-    adjacency do not matter. The tool docstring offers the agent multi-word
-    queries ("segment nuclei", "measure labels"), and matching the query as one
-    substring could not serve them — "stitch tiles" missed a skill whose title
-    says "stitch" and whose description says "tiles". Since a whole-query
-    substring hit implies every term hits, this only ever widens the result set.
+    **A caller that passes one string gets it split, not matched whole.** The
+    parameter is a list to say "keywords, not a sentence" in the signature
+    itself, but a model handed a list will still sometimes put a phrase in one
+    element — ``["stitch tiles"]``, or the whole task in ``["how do I stitch
+    these tiles"]`` — and matching that as a single substring would fail against
+    a skill whose title says "stitch" and whose description says "tiles". A bare
+    string is accepted for the same reason and split the same way, which is also
+    what keeps this module's callers (and their tests) working unchanged.
+    """
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    return [term for k in keywords for term in str(k).lower().split()]
+
+
+def find_skills(keywords: Sequence[str] | str = ()) -> list[dict]:
+    """Filter the catalog by *keywords* over id/title/description/tags.
+
+    Empty returns everything. **Every keyword must appear** somewhere in that
+    text; order and adjacency do not matter. That is a narrowing filter, so each
+    keyword added can only ever remove results — which is why the tool asks for
+    a few, and why a caller that gets nothing back should retry with fewer
+    rather than conclude the catalog is empty.
 
     Substring terms, not tokens: "measure" is meant to find "measurements". The
     cost is that a term also matches mid-word, which at catalog scale is a
-    trade worth making. Natural-language sentences are still out of scope --
-    "how do I stitch tiles?" carries terms no description contains.
+    trade worth making.
 
     Returns a list of metadata dicts, each with a ``uri`` (``skill://<id>``) the
     caller reads for the full workflow. Sorted by title.
     """
     skills = load_catalog()
-    terms = (query or "").lower().split()
+    terms = search_terms(keywords)
     if terms:
         skills = [s for s in skills if all(t in _search_text(s) for t in terms)]
     out = []
