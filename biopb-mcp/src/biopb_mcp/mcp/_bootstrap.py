@@ -274,6 +274,74 @@ _RESERVED_NAMES = frozenset(
 _PLUGIN_MODULE_PREFIX = "biopb_kernel_plugins"
 
 
+class _PluginLoader:
+    """Hands back a plugin module that is already loaded. Nothing re-executes."""
+
+    def __init__(self, module):
+        self._module = module
+
+    def create_module(self, spec):
+        return self._module
+
+    def exec_module(self, module):
+        """No-op: the file ran once, at bootstrap."""
+
+
+class _PluginImportHook:
+    """Make ``import <stem>`` reach a loaded kernel plugin.
+
+    **Because ``import`` is what anyone writes.** A plugin is bound as a *name*
+    in the namespace, which is the cheap part of #92 — but a name that exists
+    while ``import <stem>`` raises `ModuleNotFoundError` is a design that reads
+    as broken, and documenting the difference is a weaker fix than not having
+    one. A benchmarked agent read `server_status`, saw `files: image_resolution`,
+    wrote the import every Python programmer writes, got a traceback, and went
+    looking for the file on disk (session 20260810-172816).
+
+    **Appended to `sys.meta_path`, never prepended**, which is what keeps the
+    guarantee the module prefix exists for. The standard finders run first, so a
+    real installed package always wins and a user's `skimage.py` can never
+    answer for `skimage`; this hook is consulted only once nothing else can
+    resolve the name. `sys.modules[stem] = mod` would *not* be equivalent —
+    imports short-circuit on `sys.modules` before any finder runs, so it would
+    shadow a package imported later in the session, which is the exact hazard
+    `_PLUGIN_MODULE_PREFIX` was introduced to close.
+
+    Top-level names only (`path is None`): a plugin never answers for a
+    submodule of a real package.
+    """
+
+    def __init__(self):
+        self._modules: dict[str, object] = {}
+
+    def register(self, stem: str, module) -> None:
+        self._modules[stem] = module
+
+    def unregister(self, stem: str) -> None:
+        self._modules.pop(stem, None)
+
+    def find_spec(self, fullname, path=None, target=None):
+        if path is not None:
+            return None
+        module = self._modules.get(fullname)
+        if module is None:
+            return None
+        import importlib.util
+
+        return importlib.util.spec_from_loader(fullname, _PluginLoader(module))
+
+
+#: One hook per process, installed on first use and left in place.
+_PLUGIN_IMPORT_HOOK = _PluginImportHook()
+
+
+def _install_plugin_import_hook() -> None:
+    import sys
+
+    if _PLUGIN_IMPORT_HOOK not in sys.meta_path:
+        sys.meta_path.append(_PLUGIN_IMPORT_HOOK)
+
+
 def _public_names(mapping: dict) -> dict:
     """The names a mapping plugin contributes: ``__all__`` if declared, else every
     public (non-``_``) name that is not itself an imported module (so a plugin's
@@ -389,9 +457,13 @@ def _load_plugin_files(ip, plugin_dir) -> list[str]:
             continue
         if _bind_one(ip, path.stem, mod, source=path.name):
             _pickle_by_value(mod)
+            # So `import <stem>` finds it too, not only the bound name.
+            _install_plugin_import_hook()
+            _PLUGIN_IMPORT_HOOK.register(path.stem, mod)
             loaded.append(path.stem)
         else:
             sys.modules.pop(module_name, None)
+            _PLUGIN_IMPORT_HOOK.unregister(path.stem)
     return loaded
 
 
