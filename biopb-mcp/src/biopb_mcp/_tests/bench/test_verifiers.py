@@ -485,3 +485,195 @@ def test_multiview_half_an_answer_is_not_half_a_pass(bead_field, microns):
     assert not by_name["worst_view_median_um"].scored
     assert by_name["deliverables_unusable"].value == 1.0
     assert not outcome.passed
+
+
+# --- lumos-spectral-unmixing: accuracy must be over the field, not the keep --
+
+
+def _lumos_truth():
+    from .cases import lumos_spectral_unmixing as lumos
+
+    return np.asarray(built_fixture(lumos.CASE).truth["dye_map"])
+
+
+def _lumos_score(labels):
+    from .cases import lumos_spectral_unmixing as lumos
+
+    fixture = built_fixture(lumos.CASE)
+    arrays = {} if labels is None else {"dye_labels": np.asarray(labels)}
+    outcome = lumos.verify(fixture, Attempt(subject="test", arrays=arrays))
+    return {m.name: m for m in outcome.metrics}, outcome
+
+
+def test_lumos_a_perfect_run_passes():
+    truth = _lumos_truth()
+    by_name, outcome = _lumos_score(truth)
+    assert outcome.passed
+    assert by_name["dye_error"].value == 0.0
+    assert by_name["background_error"].value == 0.0
+
+
+def test_lumos_a_relabelled_run_passes():
+    """Which dye gets which number is a cluster id, not an answer. A run that
+    permuted 1-4 has done the task and must not be marked down for it."""
+    truth = _lumos_truth()
+    permuted = np.select(
+        [truth == 1, truth == 2, truth == 3, truth == 4],
+        [3, 4, 1, 2],
+        default=0,
+    )
+    by_name, outcome = _lumos_score(permuted)
+    assert outcome.passed
+    assert by_name["dye_error"].value == 0.0
+
+
+def test_lumos_a_run_that_did_nothing_fails():
+    """Everything called background: the degenerate answer, and the one an
+    over-cut converges to."""
+    truth = _lumos_truth()
+    by_name, outcome = _lumos_score(np.zeros_like(truth))
+    assert not outcome.passed
+    assert by_name["dye_error"].value > 0.5
+    assert by_name["background_error"].value == pytest.approx(0.6, abs=0.01)
+
+
+def test_lumos_perfect_clustering_over_a_bad_background_cut_fails():
+    """**The specific way of looking right for this case.**
+
+    The run's partition of the pixels it kept is *exactly* the truth -- every
+    check it can compute on retained pixels comes back clean, which is what the
+    prescreen's M2 arm did while discarding a seventh of the image. Scoring
+    accuracy over the retained pixels would call this perfect. Scoring it over
+    the field is what makes the discarded third visible, and it is the whole
+    reason `background_error` is a metric rather than a footnote.
+    """
+    truth = _lumos_truth()
+    rng = np.random.default_rng(0)
+    over_cut = truth.copy()
+    # Vacate a third of the labelled pixels -- perfect where it kept, silent
+    # about where it did not.
+    labelled = np.flatnonzero(truth.ravel() != 0)
+    drop = rng.choice(labelled, size=int(0.33 * labelled.size), replace=False)
+    flat = over_cut.ravel()
+    flat[drop] = 0
+    by_name, outcome = _lumos_score(over_cut)
+
+    kept = over_cut != 0
+    assert np.array_equal(over_cut[kept], truth[kept]), (
+        "the setup is not perfect-on-keep"
+    )
+    assert not outcome.passed
+    assert not by_name["background_error"].passed
+    assert not by_name["dye_error"].passed
+
+
+def test_lumos_a_missing_result_is_unscorable_not_a_pass():
+    by_name, outcome = _lumos_score(None)
+    assert not outcome.passed
+    assert not by_name["dye_error"].scored
+    assert "left no" in by_name["dye_error"].unavailable
+
+
+def test_lumos_a_foreign_labelling_convention_is_unscorable():
+    """Five clusters, or background numbered last, is a different task's answer.
+    Scoring it anyway would silently score something the case did not ask."""
+    truth = _lumos_truth()
+    by_name, outcome = _lumos_score(np.where(truth == 0, 5, truth))
+    assert not outcome.passed
+    assert not by_name["dye_error"].scored
+
+
+def test_lumos_intensity_alone_cannot_pass():
+    """§11's back door, asserted rather than remembered.
+
+    The within-dye brightness range is a decade and identical across dyes, so
+    total intensity carries no dye identity. Binning it -- with the bin edges
+    fitted against the answer key, which no run could do -- must land far
+    outside the tolerance, or the fixture is scoring brightness.
+    """
+    from .cases import lumos_spectral_unmixing as lumos
+
+    fixture = built_fixture(lumos.CASE)
+    truth = np.asarray(fixture.truth["dye_map"])
+    total = np.asarray(fixture.data["lambda_stack"], float).sum(axis=0)
+
+    keep = truth != 0  # oracle foreground: strictly better than any run's cut
+    edges = np.quantile(total[keep], np.linspace(0, 1, lumos.N_DYES + 1)[1:-1])
+    labels = np.zeros(truth.shape, int)
+    labels[keep] = np.digitize(total[keep], edges) + 1
+
+    by_name, _ = _lumos_score(labels)
+    assert by_name["dye_error"].value > 3 * lumos.TOLERANCE["dye_error"], (
+        "an intensity-only route scores near the tolerance, so this fixture "
+        "is measuring brightness rather than spectrum (§11 back door)"
+    )
+
+
+def test_lumos_the_operators_estimate_lands_inside_the_pass_band():
+    """The safeguard has to point at the answer, and it is easy to word so it
+    does not.
+
+    The persona's coverage estimate is what turns this case from a draw off the
+    unordered auto-threshold menu into something a run can check against. But
+    the pass band is asymmetric -- under-cutting background costs accuracy fast,
+    because background pixels forced into a dye cluster are wrong twice -- so an
+    estimate that reads high fails a run that believed it. A first draft said
+    "call it two thirds", which is 0.333 background against a band that starts
+    at 0.38, and a run following the operator exactly would have scored 0.791.
+
+    So: take the range a reader would take from the persona's own words, and
+    require both ends to pass. This is the test that fails when someone rounds
+    the operator's number for readability.
+    """
+    from .cases import lumos_spectral_unmixing as lumos
+
+    fixture = built_fixture(lumos.CASE)
+    cube = np.moveaxis(np.asarray(fixture.data["lambda_stack"], float), 0, -1)
+    total = cube.sum(axis=-1)
+
+    # "a bit more than half ... not much more" -> 0.55 to 0.62 covered.
+    for coverage in (0.55, 0.62):
+        keep = total > np.quantile(total, 1.0 - coverage)
+        vectors = cube[keep]
+        vectors = vectors / np.maximum(
+            np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9
+        )
+        from sklearn.cluster import KMeans
+
+        labels = np.zeros(total.shape, int)
+        labels[keep] = KMeans(4, n_init=10, random_state=1).fit_predict(vectors) + 1
+        _, outcome = _lumos_score(labels)
+        assert outcome.passed, (
+            f"a run that believed the operator ({coverage:.0%} covered) fails: "
+            f"{[str(m) for m in outcome.metrics]}"
+        )
+
+
+def test_lumos_the_operators_patch_count_catches_a_shattered_mask():
+    """The other half of the safeguard, and the one that answers 'would a bad
+    cut look obviously wrong'.
+
+    It does: a failing cut breaks the field into 119-1165 components against the
+    truth's 10. The operator says "ten or so big irregular areas", so a run that
+    asked has the number to compare against -- and this asserts the comparison
+    actually discriminates, rather than both masks being in the same ballpark.
+    """
+    from scipy import ndimage as ndi
+    from skimage import filters
+
+    from .cases import lumos_spectral_unmixing as lumos
+
+    fixture = built_fixture(lumos.CASE)
+    truth = np.asarray(fixture.truth["dye_map"])
+    total = np.asarray(fixture.data["lambda_stack"], float).sum(axis=0)
+
+    _, true_components = ndi.label(truth != 0)
+    _, bad_components = ndi.label(total > filters.threshold_otsu(total))
+    assert true_components <= 20, (
+        f"the truth is {true_components} components, which is not 'ten or so' "
+        "-- the persona's description has drifted from the fixture"
+    )
+    assert bad_components > 5 * true_components, (
+        f"an over-cut gives {bad_components} components against the truth's "
+        f"{true_components}, which is not a difference anyone would notice"
+    )
