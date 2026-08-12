@@ -33,7 +33,6 @@ from .cases import (
 )
 from .test_cases import built_fixture
 
-
 # --- drift-correction: the movie must not paint the answer on its own edges --
 
 #: Widest run of identical rows or columns tolerated at a frame border. A
