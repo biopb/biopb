@@ -85,6 +85,31 @@ jobs:
           git clone --depth 1 https://github.com/pyvista/gl-ci-helpers.git
           powershell gl-ci-helpers/appveyor/install_opengl.ps1
 
+      # The step above is what actually provides vispy's OpenGL. The Mesa
+      # install in `Setup headless display` does not: `systemwidedeploy.cmd 1`
+      # ("Install OpenGL drivers") leaves System32\opengl32.dll byte-identical
+      # -- same 999424 bytes, same mtime -- on every run inspected, passing and
+      # failing alike. Only gl-ci-helpers takes ownership of that file and
+      # replaces it, and nothing here observes whether it worked.
+      #
+      # When it does not, the job dies ~4 minutes later inside pytest's plugin
+      # loader, because napari's pytest11 entry point imports vispy, which does
+      # `ctypes.windll.opengl32` at import time:
+      #
+      #   FileNotFoundError: Could not find module 'opengl32' (or one of its
+      #   dependencies).
+      #
+      # That has cost several Windows jobs and reads as a test failure, which it
+      # is not. Load the library here instead, so a bad GL install fails at
+      # setup, next to the step that caused it, and says so.
+      - name: Check Windows OpenGL loads
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ls -l /C/Windows/System32/opengl32.dll || true
+          ls -l /C/Windows/System32/osmesa.dll || true
+          python -c "import ctypes; ctypes.WinDLL('opengl32'); print('opengl32 loads')"
+
       - name: Setup buf
         uses: bufbuild/buf-action@v1
         with:
