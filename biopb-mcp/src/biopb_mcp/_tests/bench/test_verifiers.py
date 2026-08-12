@@ -31,6 +31,7 @@ from .cases import (
 )
 from .test_cases import built_fixture
 
+
 # --- drift-correction: the movie must not paint the answer on its own edges --
 
 #: Widest run of identical rows or columns tolerated at a frame border. A
@@ -677,3 +678,391 @@ def test_lumos_the_operators_patch_count_catches_a_shattered_mask():
         f"an over-cut gives {bad_components} components against the truth's "
         f"{true_components}, which is not a difference anyone would notice"
     )
+
+
+# --- reconstruction-fidelity-qc: the ranking must survive its own shortcuts --
+
+
+def _squirrel():
+    from .cases import reconstruction_fidelity_qc as squirrel
+
+    return squirrel, built_fixture(squirrel.CASE)
+
+
+def _squirrel_parts():
+    """``(module, fixture, reconstructions, widefield, true order)``."""
+    squirrel, fixture = _squirrel()
+    widefield = np.asarray(fixture.data[squirrel.WIDEFIELD], float)
+    recons = {
+        name: np.asarray(array, float)
+        for name, array in fixture.data.items()
+        if name != squirrel.WIDEFIELD
+    }
+    order = [str(x) for x in np.asarray(fixture.truth["fidelity_order"]).tolist()]
+    return squirrel, fixture, recons, widefield, order
+
+
+def _squirrel_score(ranking):
+    squirrel, fixture = _squirrel()
+    arrays = {} if ranking is None else {"fidelity_ranking": np.asarray(ranking)}
+    outcome = squirrel.verify(fixture, Attempt(subject="test", arrays=arrays))
+    return {m.name: m.value for m in outcome.metrics}, outcome
+
+
+def _rank_by(scores):
+    """Best first. Alphabetical is the tie-break, so a statistic that cannot
+    separate two layers falls back to presentation order — which this case has
+    already measured as worth nothing (Spearman 0.036)."""
+    return sorted(sorted(scores), key=lambda name: -scores[name])
+
+
+def test_squirrel_a_perfect_run_passes():
+    _, _, _, _, order = _squirrel_parts()
+    by_name, outcome = _squirrel_score(order)
+    assert outcome.passed
+    assert by_name["ranking_error"] == 0.0
+
+
+def test_squirrel_the_mark_is_not_a_knife_edge():
+    """The prescreen's own threshold caveat: with seven items one adjacent swap
+    moves Spearman by 0.036, so a mark sitting one swap from a clean run is
+    measuring the draw rather than the work.
+
+    Each adjacent transposition costs ``sum d^2 = 2`` and the limit is at 8, so
+    every one of the three disjoint adjacent swaps that fit in seven items
+    passes. What must not pass is a wholesale reordering: moving one layer
+    three places costs 12.
+    """
+    squirrel, _, _, _, order = _squirrel_parts()
+    for pairs in range(4):
+        ranking = list(order)
+        for i in range(pairs):
+            lo = 2 * i
+            ranking[lo], ranking[lo + 1] = ranking[lo + 1], ranking[lo]
+        by_name, outcome = _squirrel_score(ranking)
+        assert outcome.passed, (
+            f"{pairs} disjoint adjacent swap(s) scores "
+            f"{by_name['ranking_error']:.4f} against a limit of "
+            f"{squirrel.TOLERANCE['ranking_error']}, and a case this coarse "
+            "must leave room for a near-miss"
+        )
+    displaced = order[1:4] + [order[0]] + order[4:]
+    by_name, outcome = _squirrel_score(displaced)
+    assert not outcome.passed, (
+        "moving the most faithful reconstruction three places down scores "
+        f"{by_name['ranking_error']:.4f} and passes"
+    )
+    _, outcome = _squirrel_score(list(reversed(order)))
+    assert not outcome.passed, "the reversed ranking is a pass"
+
+
+def test_squirrel_matching_resolution_passes_and_skipping_it_does_not():
+    """§11 triviality, computed rather than asserted from a table.
+
+    Correlating each reconstruction against the widefield is the whole idea and
+    every arm in the prescreen found it unaided. What separated the tiers was
+    blurring to the camera's resolution first. So the un-blurred one-liner must
+    not reach the mark, or this case measures nothing the prescreen did not
+    already give away.
+    """
+    squirrel, _, recons, widefield, _ = _squirrel_parts()
+    from scipy import ndimage as ndi
+
+    def rebin(a):
+        return a.reshape(squirrel.CAM, squirrel.BIN, squirrel.CAM, squirrel.BIN).mean(
+            (1, 3)
+        )
+
+    blurred = _rank_by(
+        {
+            name: squirrel._pearson(
+                rebin(ndi.gaussian_filter(a, squirrel.PSF_SIGMA_FINE)), widefield
+            )
+            for name, a in recons.items()
+        }
+    )
+    raw = _rank_by(
+        {name: squirrel._pearson(rebin(a), widefield) for name, a in recons.items()}
+    )
+
+    _, blurred_outcome = _squirrel_score(blurred)
+    raw_by_name, raw_outcome = _squirrel_score(raw)
+    assert blurred_outcome.passed, "the reference route does not pass its own case"
+    assert not raw_outcome.passed, (
+        "correlating without matching resolution scores "
+        f"{raw_by_name['ranking_error']:.4f}, inside the limit — the one step "
+        "this case exists to measure is not load-bearing"
+    )
+
+
+def test_squirrel_the_operators_psf_lands_well_inside_the_pass_band():
+    """The safeguard, and the reason handing the PSF over concedes nothing.
+
+    The prescreen found a *fitted* resolution-scaling function and the *known
+    optical PSF* rank all seven identically, so this case must not be a
+    PSF-guessing game. Both numbers the persona offers — the measured bead
+    width, and an Abbe estimate from the NA and wavelength it also states —
+    have to pass, and so does a wide band either side of them.
+    """
+    squirrel, _, recons, widefield, _ = _squirrel_parts()
+    from scipy import ndimage as ndi
+
+    def score(fwhm_nm):
+        sigma = fwhm_nm / 2.3548 / squirrel.FINE_NM
+        ranking = _rank_by(
+            {
+                name: squirrel._pearson(
+                    ndi.gaussian_filter(a, sigma)
+                    .reshape(squirrel.CAM, squirrel.BIN, squirrel.CAM, squirrel.BIN)
+                    .mean((1, 3)),
+                    widefield,
+                )
+                for name, a in recons.items()
+            }
+        )
+        return _squirrel_score(ranking)
+
+    # what the persona says beads measure
+    assert score(squirrel.PSF_FWHM_NM)[1].passed
+    # 0.51 * lambda / NA from the objective the persona names
+    assert score(0.51 * 600.0 / 1.35)[1].passed
+    for multiple in (0.6, 0.85, 1.25, 2.0, 3.0):
+        by_name, outcome = score(squirrel.PSF_FWHM_NM * multiple)
+        assert outcome.passed, (
+            f"a PSF {multiple}x the true one scores "
+            f"{by_name['ranking_error']:.4f} and fails, which makes this a "
+            "test of PSF estimation rather than of matching resolution at all"
+        )
+
+
+def test_squirrel_ranking_by_apparent_sharpness_fails():
+    """The prescreen's first keepsake: sharpness is *anti*-correlated with
+    fidelity, so "it looks more resolved" inverts the answer."""
+    squirrel, _, recons, _, _ = _squirrel_parts()
+    ranking = _rank_by(
+        {
+            name: float(
+                np.mean(np.gradient(a)[0] ** 2 + np.gradient(a)[1] ** 2)
+                / (a.var() + 1e-12)
+            )
+            for name, a in recons.items()
+        }
+    )
+    by_name, outcome = _squirrel_score(ranking)
+    assert not outcome.passed
+    assert by_name["ranking_error"] > 1.0, (
+        "ranking by sharpness scores "
+        f"{by_name['ranking_error']:.4f}; the prescreen measured this route as "
+        "worse than chance and the fixture should reproduce that"
+    )
+
+
+def test_squirrel_demoting_the_signed_reconstruction_is_fatal_on_its_own():
+    """The prescreen's second keepsake, and this case's specific way of being
+    wrong while looking careful.
+
+    Odd-order SOFI cumulants are legitimately signed. Two of six arms demoted
+    one reconstruction as "corrupted" for having 7.5% negative pixels, and that
+    single error was the whole of one arm's failure. Here it must be fatal on
+    its own — everything else ranked perfectly.
+    """
+    squirrel, fixture, recons, _, order = _squirrel_parts()
+    signed = squirrel.LAYER_NAMES["sofi3_signed"]
+    assert order.index(signed) == 1, "the signed reconstruction is no longer rank 2"
+
+    array = recons[signed]
+    negative = float((array < 0).mean())
+    assert 0.05 < negative < 0.12, (
+        f"the signed reconstruction is {negative:.1%} negative; the trap is "
+        "that this reads as corruption to a run that does not ask"
+    )
+    for name, other in recons.items():
+        if name != signed:
+            assert other.min() >= 0.0, f"{name} is also signed"
+
+    ranking = [n for n in order if n != signed] + [signed]
+    by_name, outcome = _squirrel_score(ranking)
+    assert not outcome.passed, (
+        "throwing away the signed reconstruction and ranking everything else "
+        "perfectly is a pass, so the case cannot see the error the prescreen "
+        "says decided a whole arm"
+    )
+    assert by_name["ranking_error"] > 0.5
+
+
+def test_squirrel_no_per_image_statistic_reproduces_the_key():
+    """§11's back door, at oracle strength: the statistic AND its sign chosen
+    against the answer key, which no run could do.
+
+    The first build of this fixture failed here. A residual background is
+    low-frequency power, and it had been made monotone in fidelity, so the
+    high-frequency power fraction — one number per image, no comparison with
+    anything — reproduced the key at |rho| 0.964 on two of six seeds.
+    """
+    squirrel, _, recons, _, _ = _squirrel_parts()
+
+    def statistics(a):
+        spectrum = np.abs(np.fft.fftshift(np.fft.fft2(a - a.mean())))
+        half = squirrel.FINE // 2
+        ky, kx = np.mgrid[-half:half, -half:half]
+        radius = np.hypot(ky, kx)
+        positive = np.clip(a - a.min(), 0, None)
+        positive = positive / (positive.sum() + 1e-12)
+        return {
+            "mean": float(a.mean()),
+            "std": float(a.std()),
+            "skew": float(((a - a.mean()) ** 3).mean() / (a.std() ** 3 + 1e-12)),
+            "kurtosis": float(((a - a.mean()) ** 4).mean() / (a.std() ** 4 + 1e-12)),
+            "negative_fraction": float((a < 0).mean()),
+            "negative_depth": float(a.min() / a.max()),
+            "max_over_std": float(a.max() / (a.std() + 1e-12)),
+            "gradient_energy": float(np.mean(np.gradient(a)[0] ** 2)),
+            "high_frequency_fraction": float(
+                spectrum[radius > squirrel.FINE * 0.18].sum() / (spectrum.sum() + 1e-12)
+            ),
+            "low_frequency_fraction": float(
+                spectrum[radius < squirrel.FINE * 0.02].sum() / (spectrum.sum() + 1e-12)
+            ),
+            "entropy": float(
+                -(positive[positive > 0] * np.log(positive[positive > 0])).sum()
+            ),
+        }
+
+    menu = {name: statistics(a) for name, a in recons.items()}
+    worst = ("", 0.0)
+    for statistic in next(iter(menu.values())):
+        values = {name: menu[name][statistic] for name in recons}
+        for sign in (1.0, -1.0):
+            by_name, outcome = _squirrel_score(
+                _rank_by({k: sign * v for k, v in values.items()})
+            )
+            assert not outcome.passed, (
+                f"ranking by {statistic} alone (sign {sign:+.0f}) scores "
+                f"{by_name['ranking_error']:.4f} and passes — one number per "
+                "image, computed without looking at the widefield at all"
+            )
+            if 1.0 - by_name["ranking_error"] > worst[1]:
+                worst = (statistic, 1.0 - by_name["ranking_error"])
+    assert worst[1] < 0.6, (
+        f"the best per-image statistic ({worst[0]}) reaches Spearman "
+        f"{worst[1]:.3f}; §11 wants a route that ignores the premise near chance"
+    )
+
+
+def test_squirrel_the_presentation_order_is_worth_nothing():
+    """The letters were permuted against the fidelity order on purpose."""
+    _, _, recons, _, _ = _squirrel_parts()
+    by_name, outcome = _squirrel_score(sorted(recons))
+    assert not outcome.passed
+    assert by_name["ranking_error"] > 0.5, (
+        "listing the layers in the order they are presented scores "
+        f"{by_name['ranking_error']:.4f}, so the anonymised names carry the answer"
+    )
+
+
+def test_squirrel_a_missing_result_is_unscorable_not_a_pass():
+    by_name, outcome = _squirrel_score(None)
+    assert not outcome.passed
+    assert by_name["ranking_error"] is None
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param(lambda o: o[:-1], id="one-short"),
+        pytest.param(lambda o: o + [o[0]], id="one-too-many"),
+        pytest.param(lambda o: [o[0]] + o[2:] + [o[0]], id="repeats-a-name"),
+        pytest.param(lambda o: o[:-1] + ["method_H"], id="names-a-missing-layer"),
+        pytest.param(lambda o: [[n] for n in o], id="not-a-flat-list"),
+    ],
+)
+def test_squirrel_a_ranking_that_is_not_a_ranking_is_unusable(damage):
+    """A ranking of six, or one that repeats a layer, has not answered the
+    question — and scoring it anyway would score a different task."""
+    _, _, _, _, order = _squirrel_parts()
+    by_name, outcome = _squirrel_score(damage(list(order)))
+    assert not outcome.passed
+    assert by_name["ranking_error"] is None
+
+
+def _squirrel_rebin(squirrel, a):
+    return a.reshape(squirrel.CAM, squirrel.BIN, squirrel.CAM, squirrel.BIN).mean(
+        (1, 3)
+    )
+
+
+def test_squirrel_the_case_does_not_require_squirrel():
+    """The scope note, pinned.
+
+    The prescreen's conclusion was that the whole candidate is "match
+    resolution before correlating" -- not a resolution-scaling function, not an
+    intensity fit, not even a Gaussian. If any of these cheaper routes failed,
+    the case would quietly be scoring something the prescreen said it was not.
+    """
+    squirrel, _, recons, widefield, _ = _squirrel_parts()
+    from scipy import ndimage as ndi
+
+    blurred = {
+        name: ndi.gaussian_filter(a, squirrel.PSF_SIGMA_FINE)
+        for name, a in recons.items()
+    }
+
+    def upsampled(w):
+        return np.repeat(np.repeat(w, squirrel.BIN, 0), squirrel.BIN, 1)
+
+    def by_rse(a):
+        binned = _squirrel_rebin(squirrel, a)
+        design = np.stack([binned.ravel(), np.ones(binned.size)], 1)
+        coefficients, *_ = np.linalg.lstsq(design, widefield.ravel(), rcond=None)
+        residual = design @ coefficients - widefield.ravel()
+        return -float(np.sqrt(np.mean(residual**2)))
+
+    routes = {
+        "blurred but not rebinned": {
+            name: squirrel._pearson(a, upsampled(widefield))
+            for name, a in blurred.items()
+        },
+        "a box blur of roughly the right width": {
+            name: squirrel._pearson(
+                _squirrel_rebin(
+                    squirrel, ndi.uniform_filter(a, int(2.5 * squirrel.PSF_SIGMA_FINE))
+                ),
+                widefield,
+            )
+            for name, a in recons.items()
+        },
+        "scored by RSE instead of RSP": {
+            name: by_rse(a) for name, a in blurred.items()
+        },
+    }
+    for label, scores in routes.items():
+        by_name, outcome = _squirrel_score(_rank_by(scores))
+        assert outcome.passed, (
+            f"{label} scores {by_name['ranking_error']:.4f} and fails, so this "
+            "case is measuring more than matching resolution"
+        )
+
+
+def test_squirrel_the_remaining_shortcuts_fail():
+    """The rest of the docstring's table, so no row of it is a number somebody
+    typed once: comparing against an upsampled widefield without blurring, and
+    ranking by agreement with the other six -- which never looks at the data."""
+    squirrel, _, recons, widefield, _ = _squirrel_parts()
+
+    upsampled = np.repeat(np.repeat(widefield, squirrel.BIN, 0), squirrel.BIN, 1)
+    shortcuts = {
+        "upsample the widefield, no blur": {
+            name: squirrel._pearson(a, upsampled) for name, a in recons.items()
+        },
+    }
+    standardised = [(a - a.mean()) / (a.std() + 1e-12) for a in recons.values()]
+    consensus = np.mean(standardised, axis=0)
+    shortcuts["consensus of the seven"] = {
+        name: squirrel._pearson(a, consensus) for name, a in recons.items()
+    }
+    for label, scores in shortcuts.items():
+        by_name, outcome = _squirrel_score(_rank_by(scores))
+        assert not outcome.passed, (
+            f"{label} scores {by_name['ranking_error']:.4f} and passes, and it "
+            "is not the work this case is for"
+        )
