@@ -71,11 +71,19 @@ PRESENTATIONS = ("array", "tensor")
 #: agent told nothing would have to guess at a source the catalog does not list.
 TENSOR_HANDLE = "fixture_tensors"
 
-#: Layer kinds the harness knows how to put on a viewer. `points` is not
-#: cosmetic: a Points layer is how a person's clicked correspondences actually
-#: reach napari, and a task about landmarks handed a raw (N, 2) array would be
-#: testing a different route.
-LAYER_KINDS = {"image": "add_image", "labels": "add_labels", "points": "add_points"}
+#: Layer kinds the harness knows how to put on a viewer, as ``add_*`` plus the
+#: keywords that call needs. `points` is not cosmetic: a Points layer is how a
+#: person's clicked correspondences actually reach napari, and a task about
+#: landmarks handed a raw (N, 2) array would be testing a different route. Nor
+#: is `path`, for the same reason one step further on — a traced neurite
+#: reaches napari as a Shapes layer, and reading its vertices back out of
+#: ``layer.data[0]`` is part of the route, not an obstacle in front of it.
+LAYER_KINDS = {
+    "image": ("add_image", {}),
+    "labels": ("add_labels", {}),
+    "points": ("add_points", {}),
+    "path": ("add_shapes", {"shape_type": "path"}),
+}
 
 
 @dataclass(frozen=True)

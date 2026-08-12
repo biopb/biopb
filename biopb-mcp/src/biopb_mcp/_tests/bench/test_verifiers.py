@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 
 from ..agentbench._fixture import Attempt, Fixture
 from .cases import (
     align_channels_from_landmarks as landmarks,
+    kymograph_velocity,
     multiview_reconstruction as multiview,
 )
 from .test_cases import built_fixture
@@ -1244,3 +1246,259 @@ def test_landmarks_an_empty_attempt_scores_nothing_on_both_fixtures():
         )
         for metric in outcome.metrics:
             assert metric.limit > 0, f"{case.label}: {metric.name} has no usable limit"
+
+
+# --- kymograph-velocity: the distance axis, and what hides a wrong one -------
+#
+# The estimator lives here rather than in the case module because it is not the
+# case's business how a run gets its answer -- only what it reports. It is here
+# at all because the docstring's route table is a claim, and a claim about what
+# a fixture separates has to be recomputed against the fixture that ships.
+
+
+def _kymograph(movie, path, linewidth=5):
+    """(T, S) intensities along *path*, averaged perpendicular to it."""
+    tangent = np.gradient(path, axis=0)
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    offsets = np.arange(linewidth) - (linewidth - 1) / 2
+    out = np.zeros((len(movie), len(path)))
+    for i, frame in enumerate(movie):
+        frame = np.asarray(frame, float)
+        out[i] = sum(
+            ndi.map_coordinates(frame, (path + off * normal).T, order=1, mode="nearest")
+            for off in offsets
+        ) / len(offsets)
+    return out
+
+
+def _equal_count(vertices, per_segment):
+    """The trap: `per_segment` samples between every pair of clicks, whatever
+    the distance between them."""
+    out = [
+        a + (b - a) * np.linspace(0, 1, per_segment, endpoint=False)[:, None]
+        for a, b in zip(vertices[:-1], vertices[1:], strict=True)
+    ]
+    return np.vstack(out + [vertices[-1][None, :]])
+
+
+def _speeds(kymo, step_um, vmax=9.0):
+    """One speed each way, by shearing the kymograph and summing over time: a
+    trace of slope v lines up with itself only at v, so the sum's variance
+    peaks there. Returns (forward, backward) in um/s, both positive."""
+    velocities = np.linspace(-vmax, vmax, 721)
+    columns = np.arange(kymo.shape[1])
+    power = np.array(
+        [
+            np.var(
+                sum(
+                    np.interp(columns + v * t, columns, row, left=0.0, right=0.0)
+                    for t, row in enumerate(kymo)
+                )
+            )
+            for v in velocities
+        ]
+    )
+    out = []
+    for side in (+1, -1):
+        keep = np.where(side * velocities > 0.4)[0]
+        best = keep[int(np.argmax(power[keep]))]
+        out.append(abs(velocities[best]) * step_um / kymograph_velocity.DT_S)
+    return tuple(out)
+
+
+def _reference_path(fixture, per_segment=None):
+    roi = np.asarray(fixture.data["roi"], float)
+    if per_segment is not None:
+        path = _equal_count(roi, per_segment)
+        # What the run believes one sample is worth when it never asked: the
+        # whole traced length divided by however many samples it took.
+        return path, kymograph_velocity._arclength(roi)[-1] / (len(path) - 1)
+    length = kymograph_velocity._arclength(roi)[-1]
+    return kymograph_velocity._resample(roi, int(round(length))), 1.0
+
+
+def _measure(fixture, per_segment=None, linewidth=5, destationary=True):
+    movie = np.asarray(fixture.data["transport"])
+    path, step_px = _reference_path(fixture, per_segment)
+    kymo = _kymograph(movie, path, linewidth)
+    if destationary:
+        kymo = kymo - np.median(kymo, axis=0, keepdims=True)
+    return _speeds(kymo, step_px * kymograph_velocity.PIXEL_UM)
+
+
+def _errors(fixture, **kwargs):
+    forward, backward = _measure(fixture, **kwargs)
+    return (
+        abs(forward - fixture.truth["forward_um_per_s"])
+        / fixture.truth["forward_um_per_s"],
+        abs(backward - fixture.truth["backward_um_per_s"])
+        / fixture.truth["backward_um_per_s"],
+    )
+
+
+@pytest.fixture(scope="module")
+def transport():
+    return built_fixture(kymograph_velocity.CASE)
+
+
+def test_kymograph_the_reference_route_reaches_both_speeds(transport):
+    """Winnability, recomputed rather than quoted. Resample the traced ROI by
+    arc length, take the stationary component out, find one slope each way."""
+    forward, backward = _errors(transport)
+    assert forward < 0.05, forward
+    assert backward < 0.05, backward
+    # And comfortably, not marginally -- a limit the reference only just clears
+    # is measuring the estimator rather than the run.
+    assert max(forward, backward) < kymograph_velocity.SPEED_LIMIT / 3
+
+
+def test_kymograph_equal_counts_per_segment_fail(transport):
+    """The trap the dropped candidate recorded on its way out. Same movie, same
+    ROI, same estimator -- only the meaning of one sample changes, and nothing
+    in the kymograph says so."""
+    for per_segment in (60, 100):
+        forward, backward = _errors(transport, per_segment=per_segment)
+        assert max(forward, backward) > kymograph_velocity.SPEED_LIMIT, (
+            f"{per_segment} samples per segment scored "
+            f"{forward:.1%}/{backward:.1%}, inside the limit"
+        )
+
+
+def test_kymograph_the_roi_earns_that_trap_rather_than_being_drawn_for_it(
+    transport,
+):
+    """`<L><1/L>` is the factor an equal-count route puts on a per-segment
+    average, and the prescreen measured 1.21x on its own polyline. This ROI
+    reaches the same figure from a rule about how far a chord may bow off the
+    filament -- so the trap is a property of tracing a curve, not of a vertex
+    list chosen to make the point."""
+    roi = np.asarray(transport.data["roi"], float)
+    segments = np.diff(kymograph_velocity._arclength(roi))
+    assert 1.15 < segments.mean() * np.mean(1 / segments) < 1.30
+    assert segments.max() / segments.min() > 4.0, "the segments are too even"
+
+
+def test_kymograph_the_roi_stays_on_the_filament(transport):
+    """A ROI that wandered off the ridge would fail every route for a reason
+    that is not the one being measured."""
+    roi = np.asarray(transport.data["roi"], float)
+    movie = np.asarray(transport.data["transport"], float)
+    bright = movie.mean(axis=0)
+    dense = kymograph_velocity._resample(roi, 3000)
+    along = ndi.map_coordinates(bright, dense.T, order=1, mode="nearest")
+    assert along.min() > np.percentile(bright, 97), (
+        "the traced path leaves the filament somewhere along it"
+    )
+
+
+def test_kymograph_leaving_the_stationary_component_in_fails(transport):
+    """The filament is labelled along its whole length and some cargo is
+    parked, so the brightest thing in the kymograph is a horizontal stripe. A
+    run that looks for slopes without taking it out is answering about the
+    stripe."""
+    forward, backward = _errors(transport, destationary=False)
+    assert max(forward, backward) > kymograph_velocity.SPEED_LIMIT
+
+
+def test_kymograph_perpendicular_averaging_is_not_what_this_separates(
+    transport,
+):
+    """Recorded because the docstring says so and a claim of no effect is as
+    falsifiable as any other. Sixty frames of coherent integration have already
+    bought what averaging five pixels across the filament would."""
+    wide = _errors(transport)
+    narrow = _errors(transport, linewidth=1)
+    assert max(narrow) < 0.05, narrow
+    assert abs(max(wide) - max(narrow)) < 0.01
+
+
+def test_kymograph_a_canonical_guess_fails(transport):
+    """The triviality screen. Fast anterograde transport is quoted at about
+    1 um/s and retrograde at about half that; a run that reports the numbers it
+    remembers instead of the ones in front of it must not pass, which is why
+    the fixture's speeds are 2.35 and 0.95."""
+    outcome = kymograph_velocity._verify(
+        transport,
+        Attempt(
+            subject="guess",
+            arrays={
+                "speed_forward_um_per_s": 1.0,
+                "speed_backward_um_per_s": 0.5,
+            },
+            notes="",
+        ),
+    )
+    assert not outcome.passed
+    failed = [m.name for m in outcome.metrics if m.scored and not m.passed]
+    assert failed == ["forward_speed_error", "backward_speed_error"]
+
+
+def test_kymograph_one_speed_for_both_directions_fails(transport):
+    """A run that finds the dominant population and reports it twice has
+    measured one thing and answered two questions with it."""
+    fast = transport.truth["forward_um_per_s"]
+    outcome = kymograph_velocity._verify(
+        transport,
+        Attempt(
+            subject="blend",
+            arrays={
+                "speed_forward_um_per_s": fast,
+                "speed_backward_um_per_s": fast,
+            },
+            notes="",
+        ),
+    )
+    assert not outcome.passed
+    by_name = {m.name: m for m in outcome.metrics}
+    assert by_name["forward_speed_error"].passed
+    assert not by_name["backward_speed_error"].passed
+
+
+def test_kymograph_half_an_answer_is_not_half_a_pass(transport):
+    """One direction reported perfectly and the other not at all. The scored
+    metric is green, so without `deliverables_unusable` the run would be."""
+    outcome = kymograph_velocity._verify(
+        transport,
+        Attempt(
+            subject="half",
+            arrays={"speed_forward_um_per_s": transport.truth["forward_um_per_s"]},
+            notes="",
+        ),
+    )
+    by_name = {m.name: m for m in outcome.metrics}
+    assert by_name["forward_speed_error"].passed
+    assert not by_name["backward_speed_error"].scored
+    assert by_name["deliverables_unusable"].value == 1.0
+    assert not outcome.passed
+
+
+def test_kymograph_an_empty_attempt_scores_nothing(transport):
+    """The shared contract, asserted here too because this verifier reports a
+    count and a count of nothing is 0, which reads as a pass."""
+    outcome = kymograph_velocity._verify(
+        transport, Attempt(subject="nothing", arrays={}, notes="")
+    )
+    assert not any(m.scored for m in outcome.metrics)
+    assert not outcome.passed
+
+
+def test_kymograph_a_negative_speed_is_not_a_speed(transport):
+    """The task asks for magnitudes and says so. A signed answer is not a near
+    miss to be scored generously -- it is a different quantity, and reading it
+    as a speed would score a run that got the direction backwards as perfect."""
+    truth = transport.truth
+    outcome = kymograph_velocity._verify(
+        transport,
+        Attempt(
+            subject="signed",
+            arrays={
+                "speed_forward_um_per_s": truth["forward_um_per_s"],
+                "speed_backward_um_per_s": -truth["backward_um_per_s"],
+            },
+            notes="",
+        ),
+    )
+    by_name = {m.name: m for m in outcome.metrics}
+    assert not by_name["backward_speed_error"].scored
+    assert not outcome.passed
