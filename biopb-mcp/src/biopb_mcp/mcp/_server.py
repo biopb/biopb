@@ -617,8 +617,20 @@ def find_skills(keywords: list[str] | None = None) -> list:
     returns the skill that counts them. If you get nothing back, drop keywords
     and call again, or call with none and read the list.
 
-    Each result includes a `uri` (`skill://<id>`) — read that resource for the
-    full step-by-step workflow. Prefer an existing skill over improvising.
+    **Results are of two `kind`s, and they are used differently.**
+
+    - `kind="skill"` — a curated workflow. It carries a `uri` (`skill://<id>`);
+      read that resource for the full step-by-step body. Prefer an existing
+      skill over improvising.
+    - `kind="plugin"` — a Python module already loaded into the kernel
+      namespace, listed with its docstring summary. There is no body to read.
+      It carries a `handle`, the name it is bound under: call
+      `inspect_object(handle)` for its callables and signatures, then use it in
+      `execute_code` as `handle.some_function(...)`. **Prefer it over writing
+      your own** — these exist because the from-scratch version is slow, subtly
+      wrong, or both, and the docstring says which.
+
+    Skills are listed before plugins.
 
     A result's `checklist` lists what the skill touches (`viewer`, `tensor`, `dask`,
     `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the

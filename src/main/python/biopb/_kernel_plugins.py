@@ -36,18 +36,38 @@ logger = logging.getLogger(__name__)
 NAMESPACE_ENTRY_POINT_GROUP = "biopb_mcp.namespace"
 
 
-def _summary_from_source(text: str) -> str:
-    """First line of a Python file's module docstring, or ``""``.
+def _doc_from_source(text: str) -> tuple[str, str]:
+    """``(summary, blurb)`` from a Python file's module docstring.
+
+    *summary* is the first line; *blurb* is the whole opening paragraph, which is
+    what a keyword index needs — a one-liner rarely carries the second term of a
+    two-word query ("background subtract" misses a plugin whose first line says
+    only "Rolling-ball background subtraction"). Both are ``""`` when there is no
+    docstring.
 
     Parsed with ``ast`` — never executed — so *listing* a plugin can't run it.
     """
     try:
         doc = ast.get_docstring(ast.parse(text))
     except (SyntaxError, ValueError):
-        return ""
+        return "", ""
     if not doc:
-        return ""
-    return doc.strip().splitlines()[0].strip()
+        return "", ""
+    lines = doc.strip().splitlines()
+    summary = lines[0].strip()
+    paragraph = []
+    for line in lines[1:]:
+        if not line.strip():
+            if paragraph:
+                break
+            continue
+        paragraph.append(line.strip())
+    return summary, " ".join([summary, *paragraph]).strip()
+
+
+def _summary_from_source(text: str) -> str:
+    """First line of a Python file's module docstring, or ``""``."""
+    return _doc_from_source(text)[0]
 
 
 def startup_files(plugin_dir: Optional[Path] = None) -> list[dict]:
@@ -70,10 +90,10 @@ def startup_files(plugin_dir: Optional[Path] = None) -> list[dict]:
         if path.name.startswith("_"):
             continue
         try:
-            summary = _summary_from_source(path.read_text(encoding="utf-8"))
+            summary, blurb = _doc_from_source(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            summary = ""
-        rows.append({"name": path.name, "summary": summary})
+            summary, blurb = "", ""
+        rows.append({"name": path.name, "summary": summary, "blurb": blurb})
     return rows
 
 

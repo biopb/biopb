@@ -1,4 +1,4 @@
-"""Image resolution in physical units: Fourier ring correlation and decorrelation.
+"""Image resolution in physical units: Fourier ring correlation (FRC) and decorrelation.
 
 Answers "how good is this image, in nanometres" — which is **not** the question a
 focus metric or a localization precision answers. Localization precision is

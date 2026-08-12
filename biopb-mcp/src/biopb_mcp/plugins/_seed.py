@@ -17,9 +17,9 @@ from pathlib import Path
 
 # Files bundled in this package that the installer seeds into the kernel dir.
 # __init__.py documents the dir (the loader skips it — leading underscore);
-# rolling_ball.py is the worked example plugin; segmentation_qc.py backs the
-# segmentation-qc-metrics skill, whose body carries the call signature only;
-# chunked_label.py is connected components across dask chunk boundaries;
+# rolling_ball.py is the worked example plugin; segmentation_qc.py is IoU
+# matching and F1 for instance segmentations; chunked_label.py is connected
+# components across dask chunk boundaries;
 # image_resolution.py is FRC and decorrelation analysis.
 SEED_FILES = (
     "__init__.py",

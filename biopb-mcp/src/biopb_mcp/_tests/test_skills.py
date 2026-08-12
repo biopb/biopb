@@ -40,6 +40,14 @@ def skills_cfg(monkeypatch, tmp_path):
     cfg = {
         "skills_enabled": True,
         "skills_local_dir": str(tmp_path / "local-skills"),
+        # Off by default here so these tests stay about the *skill* sources. It
+        # also keeps them hermetic: the plugin scan resolves
+        # ``~/.config/biopb/kernel``, and `mcp_plugin_dir` honours
+        # ``$XDG_CONFIG_HOME`` ahead of the patched home — which CI sets — so a
+        # default-on scan would read whatever the machine happens to have
+        # seeded. The `plugin_catalog` fixture turns it on against a tmp dir.
+        "skills_index_plugins": False,
+        "namespace_enabled": True,
     }
 
     def fake_setting(path, default=None):
@@ -547,3 +555,142 @@ def test_results_are_sorted_by_title(mock_home, skills_cfg, monkeypatch, tmp_pat
         "mango",
         "zebra",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Kernel plugins as catalog rows (#92 discovery)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def plugin_catalog(skills_cfg, monkeypatch, tmp_path):
+    """Turn plugin indexing on, pointed at a tmp plugin dir this test owns.
+
+    Returns the dir, so a test writes ``*.py`` into it and calls
+    ``find_skills``. ``mcp_plugin_dir`` is patched at its source rather than via
+    ``$HOME``, because it reads ``$XDG_CONFIG_HOME`` first.
+    """
+    import biopb._locations as locations
+
+    skills_cfg["skills_index_plugins"] = True
+    d = tmp_path / "kernel-plugins"
+    d.mkdir(exist_ok=True)
+    monkeypatch.setattr(locations, "mcp_plugin_dir", lambda: d)
+    return d
+
+
+def _plugin(d, name, doc):
+    (d / f"{name}.py").write_text(
+        f'"""{doc}"""\n\n\ndef go():\n    return 1\n', encoding="utf-8"
+    )
+
+
+def test_a_plugin_is_discoverable_by_its_docstring(mock_home, plugin_catalog):
+    _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
+    (row,) = _skills.find_skills(["rolling"])
+    assert row["id"] == "rolling_ball"
+    assert row["kind"] == "plugin"
+    assert row["description"] == "Rolling-ball background subtraction."
+
+
+def test_a_plugin_row_offers_a_handle_and_no_skill_uri(mock_home, plugin_catalog):
+    """The two are used differently, so they must not look alike: an agent that
+    reads `skill://rolling_ball` gets nothing, and one that calls a skill's id
+    as a namespace handle gets a NameError."""
+    _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
+    (row,) = _skills.find_skills(["rolling"])
+    assert row["handle"] == "rolling_ball"
+    assert "uri" not in row
+
+
+def test_a_skill_row_still_carries_its_uri_and_kind(
+    mock_home, skills_cfg, monkeypatch, tmp_path
+):
+    _ship(monkeypatch, tmp_path, [{"id": "flatfield", "description": "even out"}])
+    (row,) = _skills.find_skills(["flatfield"])
+    assert row["kind"] == "skill"
+    assert row["uri"] == "skill://flatfield"
+    assert "handle" not in row
+
+
+def test_the_opening_paragraph_is_searched_not_just_the_first_line(
+    mock_home, plugin_catalog
+):
+    """A module's first line names the subject and often not the verb, so a
+    two-word query would miss it on the second term."""
+    _plugin(
+        plugin_catalog,
+        "chunked_label",
+        "Connected components on a chunked dask array.\n\n"
+        "Labels are linked across every chunk seam.\n\n"
+        "Implementation notes nobody should retrieve on: pixiedust.",
+    )
+    assert [s["id"] for s in _skills.find_skills(["seam"])] == ["chunked_label"]
+    # ...and it stops at the *first* blank line after that, so the rest of a long
+    # docstring is not dumped into the haystack.
+    assert _skills.find_skills(["pixiedust"]) == []
+
+
+def test_an_undocumented_plugin_is_still_listed(mock_home, plugin_catalog):
+    """Excluding it would hide a working third-party tool entirely. The row says
+    plainly that it has to be inspected."""
+    (plugin_catalog / "mystery.py").write_text("def go():\n    return 1\n")
+    (row,) = _skills.find_skills(["mystery"])
+    assert row["kind"] == "plugin"
+    assert "inspect_object" in row["description"]
+
+
+def test_private_files_are_not_plugins(mock_home, plugin_catalog):
+    _plugin(plugin_catalog, "_helpers", "Not a plugin.")
+    assert _skills.find_skills([]) == []
+
+
+def test_plugins_are_off_when_the_catalog_is(mock_home, plugin_catalog, skills_cfg):
+    """`--bench-skills=false` sets `skills_enabled: false` and the run then
+    asserts the catalog came back empty. A plugin row surviving that would fail
+    the assertion *and* hand the ablated arm back a form of discovery."""
+    _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
+    skills_cfg["skills_enabled"] = False
+    assert _skills.find_skills([]) == []
+
+
+def test_plugins_are_off_when_they_will_not_be_loaded(
+    mock_home, plugin_catalog, skills_cfg
+):
+    """Nothing binds them into the namespace, so the handle would not resolve."""
+    _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
+    skills_cfg["namespace_enabled"] = False
+    assert _skills.find_skills([]) == []
+
+
+def test_a_skill_shadows_a_plugin_of_the_same_name(
+    mock_home, plugin_catalog, monkeypatch, tmp_path
+):
+    """One id, one row — otherwise `skill://<id>` is ambiguous. The reviewed
+    artifact wins."""
+    _plugin(plugin_catalog, "flatfield", "A plugin that happens to share the name.")
+    _ship(monkeypatch, tmp_path, [{"id": "flatfield", "description": "the skill"}])
+    (row,) = _skills.find_skills(["flatfield"])
+    assert row["kind"] == "skill"
+
+
+def test_skills_sort_before_plugins(mock_home, plugin_catalog, monkeypatch, tmp_path):
+    """A curated procedure is the better answer when both match, and that should
+    not depend on the alphabet."""
+    _plugin(plugin_catalog, "aaa_plugin", "shared term here.")
+    _ship(monkeypatch, tmp_path, [{"id": "zzz-skill", "description": "shared term"}])
+    assert [s["kind"] for s in _skills.find_skills(["shared"])] == ["skill", "plugin"]
+
+
+def test_reading_a_plugin_as_a_skill_body_explains_itself(mock_home, plugin_catalog):
+    """Reachable, because find_skills lists plugins beside skills and reading
+    `skill://<id>` is the habit that row sits next to."""
+    _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
+    body = _skills.get_skill_body("rolling_ball")
+    assert "not a skill" in body
+    assert "inspect_object('rolling_ball')" in body
+
+
+def test_an_unreadable_plugin_dir_is_not_fatal(mock_home, plugin_catalog, monkeypatch):
+    import biopb._kernel_plugins as kp
+
+    monkeypatch.setattr(kp, "startup_files", lambda *a, **k: 1 / 0)
+    assert _skills.find_skills([]) == []

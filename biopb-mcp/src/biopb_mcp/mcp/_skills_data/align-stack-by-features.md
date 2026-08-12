@@ -231,6 +231,6 @@ Every row below was hit while building this; `scikit-image` 0.26.
 
 ## Next steps
 
-- A stack aligned here is what [[calibrated-measurements]] should measure, and
-  the Z spacing to pass it is the **section thickness**, which alignment neither
-  knows nor changes.
+- A stack aligned here is what gets measured next, and the Z spacing to carry
+  into that is the **section thickness**, which alignment neither knows nor
+  changes.

@@ -389,6 +389,17 @@ class ServicesConfig:
         "machine out of band. Off with skills_enabled like the rest of the "
         "subsystem.",
     )
+    skills_index_plugins: bool = _h(
+        True,
+        "Also return kernel plugins from find_skills, described by their module "
+        "docstring (read with ast, never imported). Without this a plugin is "
+        "discoverable only as a bare name in server_status, which conveys nothing "
+        "about what it does -- measured: five benchmark arms were shown the name "
+        "and none followed it up. Rows carry kind='plugin' and a namespace handle "
+        "instead of a skill:// uri. Off with skills_enabled or namespace_enabled, "
+        "since there is nothing to advertise if the catalog is dormant or the "
+        "plugins will not load.",
+    )
     namespace_enabled: bool = _h(
         True,
         "Load user 'bring your own tool' plugins into the agent kernel namespace at "

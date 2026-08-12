@@ -2,7 +2,7 @@
 
 A faithful Python port of ImageJ/Fiji's ``BackgroundSubtracter`` rolling-ball
 algorithm. ``skimage.restoration.rolling_ball`` computes the same morphological
-result but rolls a full-radius ball over the full-resolution image
+result but rolls a full-radius ball over the image at its original size
 (``O(n·radius²)``); ImageJ — and this port — instead **shrink** the image, roll a
 proportionally small ball on it, and **bilinearly enlarge** the background back,
 cutting the work by the shrink factor to the fourth power (``~256×`` at radius 50).
