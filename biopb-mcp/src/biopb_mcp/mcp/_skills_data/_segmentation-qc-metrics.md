@@ -9,6 +9,20 @@ checklist: [viewer, tensor, plugin:segmentation_qc, pkg:biopb-mcp>=0.13.0]
 
 # Score an instance segmentation against ground truth
 
+> **Deferred (not served).** Eight benchmark arms have run this subject and all
+> eight passed — three that read this body and used `segmentation_qc`, five that
+> never saw it and hand-rolled a matcher, agreeing to machine epsilon
+> (`f1_err` 1.1e-16 against a 0.01 limit). The only function it was demonstrably
+> performing was making the plugin discoverable, and `find_skills` now indexes
+> kernel plugins directly, so `segmentation_qc` is reachable without it.
+>
+> **What that evidence does not cover**, and what would justify promoting this
+> again: the case builds isolated disks and asserts zero splits and merges at
+> build time, so greedy and optimal assignment provably agree on it — the
+> condition this body's "do not reimplement" rests on has never been tested. Nor
+> can a numeric verifier see step 7 (3 of 3 models asked cold invented a quality
+> band). A crowded-field fixture is the experiment that would settle it.
+
 ## When to use
 
 Two Labels layers of the same field need to be compared: a prediction against a

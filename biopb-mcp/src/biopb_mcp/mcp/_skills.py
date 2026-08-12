@@ -17,10 +17,16 @@ dir below is the escape hatch. See ``docs/skills.md`` §1.
 There is no catalog index. The frontmatter *is* the metadata, and this module
 parses it, so there is no generated file to disagree with the bodies.
 
-**Two sources.** User-authored skills in ``~/.config/biopb/skills/*.md`` **merge**
-with the shipped set (local wins a shared id, and every entry carries
+**Three sources.** User-authored skills in ``~/.config/biopb/skills/*.md``
+**merge** with the shipped set (local wins a shared id, and every entry carries
 ``origin``). Both are re-read on every call: a skill the user is editing must
 show up without a restart, and the shipped set is a handful of small files.
+
+The third is the **kernel plugins**, described by their own module docstrings
+and marked ``kind: "plugin"``. They are not skills and are not presented as
+some — no body, no ``skill://`` uri, just the handle they are bound under — but
+discovery is a catalog's job and this is where the agent looks. See
+:func:`_scan_plugins` for why a bare name in ``server_status`` was not enough.
 
 **Fail-open.** A malformed or unreadable file is skipped and debug-logged, never
 fatal — one bad skill must not sink discovery, and nothing here raises into a
@@ -48,6 +54,16 @@ _FRONTMATTER = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
 # reviewed one.
 _ORIGIN_LOCAL = "local"
 _ORIGIN_CATALOG = "catalog"
+_ORIGIN_PLUGIN_FILE = "plugin-file"
+_ORIGIN_PLUGIN_PACKAGE = "plugin-package"
+
+# What a row *is*. A skill is a procedure to follow and has a body to read; a
+# plugin is an object already in the namespace, and the only thing to "read" is
+# its signature. Conflating them sends an agent to `skill://rolling_ball`, which
+# does not exist, so the kind is on every row rather than inferred from which
+# other keys happen to be present.
+KIND_SKILL = "skill"
+KIND_PLUGIN = "plugin"
 
 # Frontmatter reader. Deliberately weak: scalars and inline `[a, b]` lists, no
 # YAML dependency in this stdlib-only module, and anything it can't parse is
@@ -150,6 +166,7 @@ def _entry(text: str, *, stem: str, origin: str, updated: str = "") -> dict | No
         "checklist": checklist,
         "updated": str(fm.get("updated") or updated or ""),
         "origin": origin,
+        "kind": KIND_SKILL,
     }
 
 
@@ -322,6 +339,135 @@ def _merge_local(shipped: list[dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Source 3: kernel plugins (#92's "bring your own tool" surface)
+# --------------------------------------------------------------------------- #
+#
+# A plugin is not a skill and this does not pretend otherwise -- rows carry
+# `kind: "plugin"` and a namespace `handle` instead of a `skill://` uri. What it
+# fixes is discovery. `server_status` already reports which plugins loaded, but
+# only as bare names, and a *name* says nothing about capability: across eight
+# benchmark arms, five were shown `## Kernel plugins  files: <name>` and not one
+# followed it up, while all three that reached the same plugin through a skill
+# body called it. So the thing that has to reach `find_skills` is the sentence
+# the module already carries.
+#
+# The docstring is that sentence, and reading it here keeps the rule the plugin
+# system was built on -- *the docstring is the doc, so code and doc cannot
+# drift*. Nothing is imported: `biopb._kernel_plugins` parses with `ast`, which
+# is also what lets this answer before the kernel exists, which is when the agent
+# actually asks.
+#
+# Discovery is static, verification stays dynamic. This lists what *will* load;
+# the loader is fail-open, so a `checklist: plugin:<name>` resolved against
+# `server_status` remains the only thing that says a plugin is really there.
+
+
+def _plugin_entry(
+    name: str,
+    *,
+    summary: str = "",
+    blurb: str = "",
+    origin: str,
+    version: str = "",
+) -> dict | None:
+    """One plugin row → a catalog-shaped entry, or ``None`` if unusable."""
+    handle = name[:-3] if name.endswith(".py") else name
+    handle = handle.strip()
+    if not handle:
+        return None
+    # An undocumented plugin is still listed. Excluding it would hide a working
+    # third-party tool completely, which is worse than a row that says "look at
+    # this yourself" -- and the placeholder is honest about which it is.
+    described = bool(summary)
+    return {
+        "id": handle,
+        "title": summary or f"Kernel plugin `{handle}`",
+        "description": (
+            summary
+            or f"Kernel plugin bound in the namespace as `{handle}`. It carries no "
+            "module docstring, so call inspect_object to see what it provides."
+        ),
+        "tags": [],
+        "version": version,
+        "checklist": [],
+        "updated": "",
+        "origin": origin,
+        "kind": KIND_PLUGIN,
+        # How to reach it: it is already in the namespace under this name.
+        "handle": handle,
+        # Search text only. The opening paragraph, so a two-word query can match
+        # a term the one-line summary had no room for.
+        "_blurb": blurb if described else "",
+    }
+
+
+def _scan_plugins() -> list[dict]:
+    """Kernel plugins as catalog entries. Fail-open, like every other source.
+
+    Gated by ``namespace_enabled`` as well as its own switch: if the plugins are
+    not going to be loaded into the namespace, advertising them would send the
+    agent after a handle that will not be bound.
+    """
+    if not _setting("services.skills_index_plugins", True):
+        return []
+    if not _setting("services.namespace_enabled", True):
+        return []
+    try:
+        from biopb import _kernel_plugins
+    except Exception:  # pragma: no cover - core SDK always present in practice
+        logger.debug("skills: no kernel-plugin reader available", exc_info=True)
+        return []
+
+    out: list[dict] = []
+    try:
+        for row in _kernel_plugins.startup_files():
+            entry = _plugin_entry(
+                str(row.get("name") or ""),
+                summary=str(row.get("summary") or ""),
+                blurb=str(row.get("blurb") or ""),
+                origin=_ORIGIN_PLUGIN_FILE,
+            )
+            if entry is not None:
+                out.append(entry)
+    except Exception:
+        logger.debug("skills: plugin-file scan failed (fail-open)", exc_info=True)
+
+    try:
+        for row in _kernel_plugins.entry_point_plugins():
+            # No docstring here by construction: reading one would mean importing
+            # the module, which this side does not do.
+            entry = _plugin_entry(
+                str(row.get("name") or ""),
+                origin=_ORIGIN_PLUGIN_PACKAGE,
+                version=str(row.get("dist") or ""),
+            )
+            if entry is not None:
+                out.append(entry)
+    except Exception:
+        logger.debug("skills: plugin entry-point scan failed", exc_info=True)
+    return out
+
+
+def _merge_plugins(skills: list[dict], plugins: list[dict]) -> list[dict]:
+    """Append the plugins whose handle no curated skill has already claimed.
+
+    A skill wins the id: it is the reviewed artifact, it has a body to read, and
+    two rows under one id would make `skill://<id>` ambiguous.
+    """
+    taken = {entry["id"] for entry in skills}
+    keep = []
+    for entry in plugins:
+        if entry["id"] in taken:
+            logger.debug(
+                "skills: skill %s shadows the plugin of that name", entry["id"]
+            )
+            continue
+        taken.add(entry["id"])
+        keep.append(entry)
+    return skills + keep
+
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 def _config():
@@ -348,15 +494,21 @@ def _setting(path: str, default=_UNSET):
 def load_catalog() -> list[dict]:
     """Return the resolved skills list (metadata only), fail-open.
 
-    The shipped set merged with the user's local dir, both read fresh. Returns
-    ``[]`` when the feature is disabled or every file is unusable. Not cached:
-    the reads are a handful of small local files, and re-reading is what makes a
-    local edit live immediately — the authoring loop would be unusable if a
-    draft needed a restart to appear.
+    The shipped set merged with the user's local dir, both read fresh, plus the
+    kernel plugins. Returns ``[]`` when the feature is disabled or every file is
+    unusable. Not cached: the reads are a handful of small local files, and
+    re-reading is what makes a local edit live immediately — the authoring loop
+    would be unusable if a draft needed a restart to appear.
+
+    **``skills_enabled`` gates the plugins too**, and that is deliberate rather
+    than incidental. It is the switch the benchmark's ablation flips
+    (``--bench-skills=false``), and the run then asserts the catalog came back
+    empty; a plugin row surviving it would both fail that assertion and quietly
+    give the ablated arm back a form of the discovery it is meant to be without.
     """
     if not _setting("services.skills_enabled"):
         return []
-    return _merge_local(_scan_shipped())
+    return _merge_plugins(_merge_local(_scan_shipped()), _scan_plugins())
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +521,14 @@ def _search_text(s: dict) -> str:
     names the skill ("flatfield") is making the most specific request there is;
     matching only prose would miss it. Everything else is what the ``find_skills``
     docstring advertises: title, description, tags.
+
+    A plugin row adds ``_blurb`` — its docstring's opening paragraph — and needs
+    it. A skill's ``description`` is written to be retrieved; a module's first
+    line is written for someone already reading the file, so it carries the
+    subject and rarely the verb: ``["background", "subtract"]`` misses
+    "Rolling-ball background subtraction (Sternberg 1983), the fast ImageJ port"
+    on the second term. ``_blurb`` is empty for skills, so their matching is
+    unchanged.
     """
     return " ".join(
         (
@@ -376,6 +536,7 @@ def _search_text(s: dict) -> str:
             s["title"],
             s["description"],
             " ".join(s["tags"]),
+            s.get("_blurb", ""),
         )
     ).lower()
 
@@ -410,30 +571,41 @@ def find_skills(keywords: Sequence[str] | str = ()) -> list[dict]:
     cost is that a term also matches mid-word, which at catalog scale is a
     trade worth making.
 
-    Returns a list of metadata dicts, each with a ``uri`` (``skill://<id>``) the
-    caller reads for the full workflow. Sorted by title.
+    Returns a list of metadata dicts. Every row carries ``kind``: a
+    ``"skill"`` has a ``uri`` (``skill://<id>``) to read for the full workflow,
+    a ``"plugin"`` has a ``handle`` — the name it is already bound under in the
+    kernel namespace — and is inspected with ``inspect_object`` instead.
+
+    Skills sort before plugins, each group by title: a curated procedure is the
+    better answer when both match, so it should not depend on where the
+    alphabet happens to put it.
     """
     skills = load_catalog()
     terms = search_terms(keywords)
     if terms:
         skills = [s for s in skills if all(t in _search_text(s) for t in terms)]
     out = []
-    for s in sorted(skills, key=lambda s: s["title"].lower()):
-        out.append(
-            {
-                "id": s["id"],
-                "title": s["title"],
-                "description": s["description"],
-                "tags": s["tags"],
-                "version": s["version"],
-                "updated": s["updated"],
-                "checklist": s["checklist"],
-                # "local" = the user's own file, unreviewed. The agent should be
-                # able to say so rather than let a draft pass as curated.
-                "origin": s.get("origin", _ORIGIN_CATALOG),
-                "uri": f"skill://{s['id']}",
-            }
-        )
+    for s in sorted(
+        skills, key=lambda s: (s.get("kind") != KIND_SKILL, s["title"].lower())
+    ):
+        row = {
+            "id": s["id"],
+            "title": s["title"],
+            "description": s["description"],
+            "tags": s["tags"],
+            "version": s["version"],
+            "updated": s["updated"],
+            "checklist": s["checklist"],
+            # "local" = the user's own file, unreviewed. The agent should be
+            # able to say so rather than let a draft pass as curated.
+            "origin": s.get("origin", _ORIGIN_CATALOG),
+            "kind": s.get("kind", KIND_SKILL),
+        }
+        if row["kind"] == KIND_PLUGIN:
+            row["handle"] = s["handle"]
+        else:
+            row["uri"] = f"skill://{s['id']}"
+        out.append(row)
     return out
 
 
@@ -449,6 +621,19 @@ def get_skill_body(skill_id: str) -> str:
         return (
             f"No skill '{skill_id}' in the catalog. "
             "Call find_skills to list available skills."
+        )
+
+    if entry.get("kind") == KIND_PLUGIN:
+        # Reachable: find_skills returns plugins too, and a `skill://<id>` read
+        # is the habit that row is sitting next to. Say what it is instead of
+        # reporting it missing -- it exists, it is just not a document.
+        handle = entry.get("handle", skill_id)
+        return (
+            f"'{skill_id}' is a kernel plugin, not a skill, so it has no workflow "
+            f"body. It is already bound in the kernel namespace as `{handle}`; "
+            f"call inspect_object('{handle}') for its callables and their "
+            "signatures — the docstring is the documentation. Confirm it actually "
+            "loaded in server_status under '## Kernel plugins' before relying on it."
         )
 
     local_path = entry.get("_path")

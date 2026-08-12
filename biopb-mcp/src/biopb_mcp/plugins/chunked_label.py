@@ -1,6 +1,6 @@
 """Connected components on a chunked dask array, linked across chunk boundaries.
 
-``scipy.ndimage.label`` applied per block is the obvious way to label a dask array
+``scipy.ndimage.label`` applied per block is the natural way to label a dask array
 and it is wrong at every seam: the two halves of an object that straddles a chunk
 boundary are numbered independently, and nothing reconciles them. The result is a
 plausible label image whose object count is too high by however many objects touch

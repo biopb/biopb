@@ -236,6 +236,6 @@ their width, rather than a foreground mask.
 
 - Widths and lengths per filament, rather than pooled, need the centrelines
   split at their crossings first — see the component caveat above.
-- Comparing a detection against a hand-traced ground truth is
-  [[segmentation-qc-metrics]]; dilate both centrelines to a few pixels first,
-  since one-pixel skeletons rarely overlap exactly.
+- Comparing a detection against a hand-traced ground truth is the
+  `segmentation_qc` kernel plugin's job; dilate both centrelines to a few pixels
+  first, since one-pixel skeletons rarely overlap exactly.

@@ -212,7 +212,7 @@ whole measurement rests on.
 - **Every number here inherits the segmentation.** A mask that bridges two
   filaments that only touch invents a junction and merges two branches into one;
   a mask that breaks a filament invents two free ends. If nobody has checked it,
-  [[segmentation-qc-metrics]] is how that gets scored, and the branch and
+  the `segmentation_qc` kernel plugin is how that gets scored, and the branch and
   junction counts are the first things to distrust — length is the most robust
   of the three.
 

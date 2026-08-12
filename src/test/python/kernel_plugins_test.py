@@ -44,11 +44,36 @@ class TestStartupFiles:
         d = _plugin_dir(home)
         # A side effect in module code proves the file is parsed, never run.
         (d / "tool.py").write_text(
-            '"""Blob helpers.\n\nlonger prose ignored\n"""\n'
+            '"""Blob helpers.\n\nthe opening paragraph\n\nlater prose ignored\n"""\n'
             'raise RuntimeError("must not run on inspect")\n',
             encoding="utf-8",
         )
-        assert kp.startup_files(d) == [{"name": "tool.py", "summary": "Blob helpers."}]
+        assert kp.startup_files(d) == [
+            {
+                "name": "tool.py",
+                "summary": "Blob helpers.",
+                "blurb": "Blob helpers. the opening paragraph",
+            }
+        ]
+
+    def test_blurb_is_the_opening_paragraph_because_a_first_line_is_thin(self, home):
+        """`blurb` is what a keyword index matches on (biopb-mcp's find_skills
+        lists plugins by it). A first line names the subject and often not the
+        verb, so a two-term query would miss on the second term; the paragraph
+        after it usually carries the rest, and stopping there keeps a long
+        docstring's implementation notes out of the haystack."""
+        d = _plugin_dir(home)
+        (d / "roll.py").write_text(
+            '"""Rolling-ball background subtraction.\n\n'
+            "A port of ImageJ's estimator.\n\n"
+            'Notes on the shrink factor.\n"""\n',
+            encoding="utf-8",
+        )
+        (row,) = kp.startup_files(d)
+        assert row["blurb"] == (
+            "Rolling-ball background subtraction. A port of ImageJ's estimator."
+        )
+        assert "shrink" not in row["blurb"]
 
     def test_sorted_skips_underscore_and_tolerates_syntax_error(self, home):
         d = _plugin_dir(home)
@@ -57,9 +82,9 @@ class TestStartupFiles:
         (d / "_priv.py").write_text('"""skip me"""\n', encoding="utf-8")
         (d / "bad.py").write_text("def (:\n", encoding="utf-8")  # syntax error -> ""
         assert kp.startup_files(d) == [
-            {"name": "a.py", "summary": ""},
-            {"name": "b.py", "summary": "B tool."},
-            {"name": "bad.py", "summary": ""},
+            {"name": "a.py", "summary": "", "blurb": ""},
+            {"name": "b.py", "summary": "B tool.", "blurb": "B tool."},
+            {"name": "bad.py", "summary": "", "blurb": ""},
         ]
 
 
@@ -69,7 +94,7 @@ class TestSummary:
         (d / "t.py").write_text('"""T."""\n', encoding="utf-8")
         out = kp.summary()
         assert out["dir"] == str(d)
-        assert out["files"] == [{"name": "t.py", "summary": "T."}]
+        assert out["files"] == [{"name": "t.py", "summary": "T.", "blurb": "T."}]
         # entry_points reflects whatever biopb_mcp.namespace packages the env has
         # installed (e.g. biopb-mcp's built-in rolling-ball in the workspace), so
         # assert the shape, not emptiness.

@@ -47,9 +47,9 @@ Plugin                What it is
                       fast ImageJ port. The worked "bring your own tool"
                       example — start here if you are writing one.
 ``segmentation_qc``   Instance-segmentation QC: IoU matching, F1 at threshold,
-                      splits and merges. Backs the ``segmentation-qc-metrics``
-                      skill, whose body carries the call signature while the
-                      matching stays here where it is unit-tested.
+                      splits and merges. Greedy nearest-IoU matching disagrees
+                      with the optimal assignment done here on exactly the
+                      crowded fields where the score matters.
 ``chunked_label``     Connected components on a chunked dask array, linked
                       across chunk boundaries — which per-block
                       ``scipy.ndimage.label`` silently does not do.

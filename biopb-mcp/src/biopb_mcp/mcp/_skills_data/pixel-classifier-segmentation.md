@@ -29,15 +29,15 @@ scribbles on one field. The output is a class per pixel.
   — and a forest over eleven features is a slower way to draw the same line.
 - **The user needs objects, not classes.** This labels pixels; touching cells
   come back as one component. Counting, per-object measurements and identity all
-  need an instance step afterwards — [[calibrated-measurements]] over a
-  segmentation, scored by [[segmentation-qc-metrics]].
+  need an instance step afterwards, measured in physical units and scored
+  against a hand-drawn truth with the `segmentation_qc` kernel plugin.
 - **The structures are what a published model was trained on** — nuclei, whole
   cells in a standard stain. A pretrained segmenter behind the algorithm plane
   will beat scribbles and needs no training data.
 - **The brightness varies because the *illumination* does.** Correct it first —
   [[flatfield]] — or the forest learns the shading as if it were a class.
-- **One class is the readout and it is an intensity.** Then it is
-  [[calibrated-measurements]], and a hard class boundary throws away the signal.
+- **One class is the readout and it is an intensity.** Then it is a calibrated
+  measurement, and a hard class boundary throws away the signal.
 
 ## Parameters
 
@@ -234,8 +234,8 @@ scribbles on one field. The output is a class per pixel.
 ## Next steps
 
 - Objects, counts and per-object measurements need an instance step on top of
-  the class map — [[calibrated-measurements]], and [[segmentation-qc-metrics]]
-  to score it against a hand-drawn truth.
+  the class map, reported in physical units and scored against a hand-drawn
+  truth with the `segmentation_qc` kernel plugin.
 - More scribbles are worth more than more trees. The ceiling here is the
   annotation: with every true pixel of the field as training data the same
   features reach macro IoU **1.000** on it, and **0.818** on the second
