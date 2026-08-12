@@ -1066,3 +1066,181 @@ def test_squirrel_the_remaining_shortcuts_fail():
             f"{label} scores {by_name['ranking_error']:.4f} and passes, and it "
             "is not the work this case is for"
         )
+
+
+# --- landmark-registration: the warp must actually need a spline -------------
+
+
+def _landmark_parts():
+    """``(module, fixture, clicked source, clicked target, probes, truth)``."""
+    from .cases import landmark_registration as synthetic
+
+    fixture = built_fixture(synthetic.CASE)
+    return (
+        synthetic,
+        fixture,
+        np.asarray(fixture.data["moving_pts"], float),
+        np.asarray(fixture.data["fixed_pts"], float),
+        np.asarray(fixture.data["probe_pts"], float),
+        np.asarray(fixture.truth["probe_truth"], float),
+    )
+
+
+def _landmark_score(mapped, quality):
+    synthetic, fixture, *_ = _landmark_parts()
+    arrays = {}
+    if mapped is not None:
+        arrays["probe_mapped"] = np.asarray(mapped, float)
+    if quality is not None:
+        arrays["quality_px"] = np.asarray(float(quality))
+    outcome = synthetic.CASE.score(fixture, Attempt(subject="test", arrays=arrays))
+    return {m.name: m for m in outcome.metrics}, outcome
+
+
+def _fit_affine(source, target, points):
+    design = np.hstack([source, np.ones((len(source), 1))])
+    coefficients, *_ = np.linalg.lstsq(design, target, rcond=None)
+    return np.hstack([points, np.ones((len(points), 1))]) @ coefficients
+
+
+def _fit_spline(source, target, points):
+    from scipy.interpolate import RBFInterpolator
+
+    return RBFInterpolator(source, target, kernel="thin_plate_spline")(points)
+
+
+def test_landmarks_synthetic_the_reference_route_passes():
+    """§4 winnability: a thin-plate spline through the shipped clicks must
+    clear the limit, or the case asks for something it does not supply."""
+    _, _, source, target, probes, truth = _landmark_parts()
+    mapped = _fit_spline(source, target, probes)
+    actual = float(np.median(np.linalg.norm(mapped - truth, axis=1)))
+    by_name, outcome = _landmark_score(mapped, actual)
+    assert outcome.passed, f"the reference route scores {actual:.2f} px and fails"
+    assert actual < 5.0
+
+
+def test_landmarks_synthetic_a_global_affine_fails():
+    """The tier gap the prescreen actually found, and the reason this fixture
+    exists at all.
+
+    Both Haiku arms fitted an affine at every landmark budget and paid 5.8x on
+    the set that supported a spline. The record also says the *first* synthetic
+    fixture could not show this -- affine and spline landed within ~1 px -- so
+    this assertion is the one that says the rebuild worked.
+    """
+    _, _, source, target, probes, truth = _landmark_parts()
+    affine = _fit_affine(source, target, probes)
+    spline = _fit_spline(source, target, probes)
+    affine_px = float(np.median(np.linalg.norm(affine - truth, axis=1)))
+    spline_px = float(np.median(np.linalg.norm(spline - truth, axis=1)))
+
+    by_name, outcome = _landmark_score(affine, affine_px)
+    assert not outcome.passed, (
+        f"a global affine scores {affine_px:.2f} px and passes, so this fixture "
+        "has the same defect the prescreen recorded in its synthetic first try"
+    )
+    assert affine_px / spline_px > 3.0, (
+        f"affine {affine_px:.2f} px against spline {spline_px:.2f} px is a "
+        f"ratio of {affine_px / spline_px:.2f}; the deformation is too nearly "
+        "affine for the choice of model to be what is measured"
+    )
+
+
+def test_landmarks_synthetic_a_second_order_polynomial_is_not_enough():
+    """More than affine and still global. It should land between the two and
+    still fail -- documented because it is the obvious middle route."""
+    _, _, source, target, probes, truth = _landmark_parts()
+
+    def features(points):
+        row, col = points[:, 0], points[:, 1]
+        return np.stack(
+            [np.ones_like(row), row, col, row * row, row * col, col * col], 1
+        )
+
+    coefficients, *_ = np.linalg.lstsq(features(source), target, rcond=None)
+    mapped = features(probes) @ coefficients
+    actual = float(np.median(np.linalg.norm(mapped - truth, axis=1)))
+    _, outcome = _landmark_score(mapped, actual)
+    assert not outcome.passed, f"a quadratic scores {actual:.2f} px and passes"
+
+
+def test_landmarks_synthetic_doing_nothing_fails():
+    _, _, _, _, probes, truth = _landmark_parts()
+    displacement = float(np.median(np.linalg.norm(probes - truth, axis=1)))
+    by_name, outcome = _landmark_score(probes, displacement)
+    assert not outcome.passed
+    assert by_name["median_error_px"].value == pytest.approx(displacement, rel=1e-6)
+
+
+def test_landmarks_synthetic_quoting_the_fitting_residual_fails_honesty():
+    """The trap the honesty metric exists for, on this fixture's own numbers.
+
+    A spline interpolates its control points exactly, so its residual at the
+    clicks is ~0 whatever the warp does in between. A run reporting that number
+    is not making a small reporting slip.
+    """
+    _, _, source, target, probes, truth = _landmark_parts()
+    residual = float(
+        np.median(np.linalg.norm(_fit_spline(source, target, source) - target, axis=1))
+    )
+    assert residual < 0.01, (
+        f"the spline's fitting residual is {residual:.4f} px, so the trap this "
+        "metric exists for is not present in this fixture"
+    )
+    affine = _fit_affine(source, target, probes)
+    by_name, outcome = _landmark_score(affine, residual)
+    assert not outcome.passed
+    assert by_name["quality_honesty"].scored
+    assert not by_name["quality_honesty"].passed
+
+
+def test_landmarks_synthetic_the_channels_are_not_one_image_twice():
+    """§11 back door: if `fixed` were `moving` pushed through the truth map,
+    intensity registration would be the answer and the clicked points would be
+    decoration. Both halves are checked -- how much the channels share, and
+    whether the cheapest intensity route gets anywhere."""
+    from skimage.registration import phase_cross_correlation
+
+    _, fixture, _, _, probes, truth = _landmark_parts()
+    moving = np.asarray(fixture.data["moving"], float)
+    fixed = np.asarray(fixture.data["fixed"], float)
+
+    a = moving.ravel() - moving.mean()
+    b = fixed.ravel() - fixed.mean()
+    correlation = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    assert abs(correlation) < 0.30, (
+        f"the channels correlate {correlation:.3f} -- close enough to one image "
+        "twice that intensity registration becomes the answer"
+    )
+
+    shift, _, _ = phase_cross_correlation(fixed, moving, upsample_factor=4)
+    by_name, outcome = _landmark_score(probes + shift, 5.0)
+    assert not outcome.passed, (
+        "phase correlation alone scores "
+        f"{by_name['median_error_px'].value:.2f} px and passes"
+    )
+
+
+def test_landmarks_an_empty_attempt_scores_nothing_on_both_fixtures():
+    """The shared contract this verifier used to violate.
+
+    `deliverables_unusable` carried a limit of 0.0 -- a silent always-fail --
+    and reported 2-of-2 on an empty attempt, which the case contract forbids.
+    It was never caught because `align-channels-from-landmarks` is `OnDisk` and
+    skips everywhere; its procedural sibling does not.
+    """
+    from .cases import landmark_registration as synthetic
+
+    for case, fixture in (
+        (synthetic.CASE, built_fixture(synthetic.CASE)),
+        (landmarks.CASE, _fixture_with(_truth())),
+    ):
+        outcome = case.score(fixture, Attempt(subject="left-nothing"))
+        assert not outcome.passed
+        assert outcome.metrics
+        assert all(not m.scored for m in outcome.metrics), (
+            f"{case.label}: an empty attempt produced a scored metric"
+        )
+        for metric in outcome.metrics:
+            assert metric.limit > 0, f"{case.label}: {metric.name} has no usable limit"

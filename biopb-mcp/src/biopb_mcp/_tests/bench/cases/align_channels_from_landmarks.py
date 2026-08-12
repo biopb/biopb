@@ -159,12 +159,23 @@ def _verify(fixture: Fixture, attempt: Attempt) -> Outcome:
     # to the wrong shape would report green on the strength of the other half.
     # Usably, not merely bound -- a name pointing at a (10, 2) array or at inf
     # has been delivered in no sense that matters.
+    # A limit of 0.0 would be a silent always-fail, and the shared contract
+    # rejects it (`test_every_metric_the_verifier_reports_has_a_tolerance`);
+    # 0.5 is the same predicate on an integer count. And a run that left
+    # *nothing* reports this as unscorable rather than as 2-of-2, because the
+    # other shared contract is that an empty attempt scores nothing at all
+    # (`test_a_run_that_left_nothing_scores_nothing`) -- a rule this case has
+    # never had to satisfy, being `OnDisk` and skipped everywhere. Its
+    # procedural sibling `landmark-registration` is not skipped, and shares
+    # this verifier.
     unusable = [w for w in (why_mapped, why_claimed) if w]
+    nothing_at_all = mapped is None and claimed is None and not attempt.arrays
     delivered = Metric(
         "deliverables_unusable",
-        float(len(unusable)),
-        0.0,
+        None if nothing_at_all else float(len(unusable)),
+        0.5,
         f" of 2 -- {'; '.join(unusable)}" if unusable else " of 2",
+        unavailable="the run left nothing to score" if nothing_at_all else "",
     )
 
     if mapped is None:
