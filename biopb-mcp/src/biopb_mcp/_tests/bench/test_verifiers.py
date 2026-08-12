@@ -22,9 +22,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
 from ..agentbench._fixture import Attempt, Fixture
-from .cases import align_channels_from_landmarks as landmarks
+from .cases import (
+    align_channels_from_landmarks as landmarks,
+    multiview_reconstruction as multiview,
+)
 from .test_cases import built_fixture
 
 # --- drift-correction: the movie must not paint the answer on its own edges --
@@ -202,3 +206,282 @@ def test_the_landmark_persona_does_not_describe_the_transform():
     facts = " ".join(landmarks.CASE.persona.facts.values()).casefold()
     for phrase in ("the transform is", "the warp is", "the shift is"):
         assert phrase not in facts, f"the persona describes the answer: {phrase!r}"
+
+
+# --- multiview-reconstruction: every view, in microns -----------------------
+#
+# The registration lives here and not in the case module for the same reason as
+# the kymograph estimator: how a run reaches an answer is not the case's
+# business. It exists because the docstring's route table is a claim.
+
+
+def _kabsch(src, dst):
+    """Rigid (R, t) with ``dst ~ src @ R.T + t``, by SVD."""
+    cs, cd = src.mean(0), dst.mean(0)
+    u, _, vt = np.linalg.svd((src - cs).T @ (dst - cd))
+    flip = np.diag([1.0, 1.0, np.sign(np.linalg.det(vt.T @ u.T))])
+    r = vt.T @ flip @ u.T
+    return r, cd - r @ cs
+
+
+#: Coarse to fine. The nominal transform is a few degrees and a few microns
+#: out, so the first pass has to pair points much further apart than the beads
+#: are spaced; a schedule that starts at the final tolerance never starts.
+CUTOFF_SCHEDULE_UM = (10.0, 6.0, 4.0, 2.5, 1.5, 1.0, 0.8, 0.8, 0.8)
+
+
+def _icp(moving, fixed, r, t):
+    tree = cKDTree(fixed)
+    for cutoff in CUTOFF_SCHEDULE_UM:
+        distance, nearest = tree.query(moving @ r.T + t)
+        keep = distance < cutoff
+        if keep.sum() < 8:
+            break
+        r, t = _kabsch(moving[keep], fixed[nearest[keep]])
+    return r, t
+
+
+def _register(fixture, scale, centroid=True, refine=True):
+    """Every view straight to view 0 -- no link graph and no composition, so
+    #690's spanning-tree-versus-least-squares question cannot arise here."""
+    clouds = [
+        np.asarray(fixture.data[f"view{k}"], float) * scale
+        for k in range(multiview.N_VIEWS)
+    ]
+    nominal = multiview._transforms(exact=False)
+    maps = [(np.eye(3), np.zeros(3))]
+    for k in range(1, multiview.N_VIEWS):
+        r_k, t_k = nominal[k]
+        r, t = r_k.T, -r_k.T @ t_k  # view k -> the reference, as the stage has it
+        if centroid:
+            t = t + clouds[0].mean(0) - (clouds[k] @ r.T + t).mean(0)
+        if refine:
+            r, t = _icp(clouds[k], clouds[0], r, t)
+        maps.append((r, t))
+    return maps
+
+
+def _principal_axes(fixture, scale):
+    """Correspondence-free: match centroids and principal axes, nothing else."""
+    clouds = [
+        np.asarray(fixture.data[f"view{k}"], float) * scale
+        for k in range(multiview.N_VIEWS)
+    ]
+    centre = clouds[0].mean(0)
+    _, _, axes = np.linalg.svd(clouds[0] - centre, full_matrices=False)
+    maps = [(np.eye(3), np.zeros(3))]
+    for cloud in clouds[1:]:
+        here = cloud.mean(0)
+        _, _, mine = np.linalg.svd(cloud - here, full_matrices=False)
+        flipped = axes.copy()
+        r = axes.T @ mine
+        if np.linalg.det(r) < 0:
+            flipped[2] *= -1
+            r = flipped.T @ mine
+        maps.append((r, centre - r @ here))
+    return maps
+
+
+def _probe_um(fixture, maps, scale):
+    probes = np.asarray(fixture.data["probes"], float)
+    out = np.empty_like(probes)
+    for i, k in enumerate((1, 2, 3)):
+        rows = slice(
+            i * multiview.N_PROBES_PER_VIEW, (i + 1) * multiview.N_PROBES_PER_VIEW
+        )
+        out[rows] = (probes[rows] * scale) @ maps[k][0].T + maps[k][1]
+    return out
+
+
+def _confirmed(fixture, maps, scale, gap_um=1.1):
+    """Clusters carrying detections from two or more views.
+
+    The only count that is well defined here: a spurious detection appears in
+    one list, and so does a real bead only one view was shallow enough to see,
+    and nothing in the data tells those two apart.
+    """
+    points, source = [], []
+    for k in range(multiview.N_VIEWS):
+        cloud = np.asarray(fixture.data[f"view{k}"], float) * scale
+        points.append(cloud @ maps[k][0].T + maps[k][1])
+        source.append(np.full(len(cloud), k))
+    points, source = np.vstack(points), np.concatenate(source)
+
+    tree = cKDTree(points)
+    taken = np.zeros(len(points), bool)
+    count = 0
+    for i in np.argsort(points[:, 0]):
+        if taken[i]:
+            continue
+        group = [j for j in tree.query_ball_point(points[i], gap_um) if not taken[j]]
+        taken[group] = True
+        count += len(set(source[group])) >= 2
+    return count
+
+
+def _score(fixture, maps, scale, count=None):
+    return multiview._verify(
+        fixture,
+        Attempt(
+            subject="route",
+            arrays={
+                "probe_um": _probe_um(fixture, maps, scale),
+                "n_beads_confirmed": (
+                    _confirmed(fixture, maps, scale) if count is None else count
+                ),
+            },
+            notes="",
+        ),
+    )
+
+
+def _named(outcome):
+    return {m.name: m for m in outcome.metrics}
+
+
+@pytest.fixture(scope="module")
+def bead_field():
+    return built_fixture(multiview.CASE)
+
+
+@pytest.fixture(scope="module")
+def microns():
+    return multiview.VOXEL_UM
+
+
+def test_multiview_the_reference_route_registers_every_view(bead_field, microns):
+    """Winnability, recomputed rather than quoted: convert to microns, start
+    from the stage angle, put the centroids together, refine."""
+    outcome = _score(bead_field, _register(bead_field, microns), microns)
+    assert outcome.passed
+    by_name = _named(outcome)
+    assert by_name["worst_view_median_um"].value < 0.1
+    assert by_name["bead_count_error"].value == 0.0
+
+
+def test_multiview_registering_in_voxel_indices_fails(bead_field, microns):
+    """The failure the modality has and a 2D tile grid cannot: z is 3.1x
+    coarser than xy, and the views differ by rotations about the axis that
+    trades z for x, so a rotation fitted to indices is fitted to a different
+    geometry."""
+    ones = np.ones(3)
+    outcome = _score(bead_field, _register(bead_field, ones), ones)
+    assert not outcome.passed
+    assert _named(outcome)["worst_view_median_um"].value > 100.0
+
+
+def test_multiview_the_nominal_stage_transform_is_not_the_answer(bead_field, microns):
+    """The stage records what it was told to do, not where the sample settled."""
+    outcome = _score(
+        bead_field,
+        _register(bead_field, microns, centroid=False, refine=False),
+        microns,
+    )
+    assert not outcome.passed
+    assert _named(outcome)["worst_view_median_um"].value > 4.0
+
+
+def test_multiview_icp_needs_the_centroid_start(bead_field, microns):
+    """The finding this fixture exists to keep: the nominal transform is a good
+    enough start for three views and not for the fourth, whose stage shift is
+    6.1 um. Outside its basin ICP does not diverge, it converges 8.7 degrees off
+    -- and the run has no way to tell from its own output."""
+    outcome = _score(
+        bead_field, _register(bead_field, microns, centroid=False), microns
+    )
+    assert not outcome.passed
+    assert _named(outcome)["worst_view_median_um"].value > 1.0
+
+
+def test_multiview_principal_axes_without_correspondence_fail(bead_field, microns):
+    """The back door: register the clouds by their moments and never match a
+    bead to a bead. It fails because the subsets differ -- each view's centroid
+    and inertia are computed over a different sample of the specimen."""
+    outcome = _score(bead_field, _principal_axes(bead_field, microns), microns)
+    assert not outcome.passed
+    assert _named(outcome)["worst_view_median_um"].value > 10.0
+
+
+def test_multiview_perfect_transforms_do_not_excuse_never_merging(bead_field, microns):
+    """Why there are two metrics. A run that registers exactly and keeps every
+    detection has done the hard half and not the task: it scores 0.03 um and
+    reports 3.1x too many beads."""
+    maps = _register(bead_field, microns)
+    total = sum(len(bead_field.data[f"view{k}"]) for k in range(multiview.N_VIEWS))
+    outcome = _score(bead_field, maps, microns, count=total)
+    by_name = _named(outcome)
+    assert by_name["worst_view_median_um"].passed
+    assert not by_name["bead_count_error"].passed
+    assert not outcome.passed
+
+
+def test_multiview_view_zeros_list_alone_fails_the_count(bead_field, microns):
+    """The other half of the same point, and the closer of the two: a run that
+    reports what one view saw is out by 23%, not by a factor."""
+    outcome = _score(
+        bead_field,
+        _register(bead_field, microns),
+        microns,
+        count=len(bead_field.data["view0"]),
+    )
+    assert not _named(outcome)["bead_count_error"].passed
+
+
+def test_multiview_the_worst_view_is_scored_not_the_pooled_median(bead_field, microns):
+    """The metric's own failure mode, asserted because the first version of
+    this verifier had it. Two views perfect and one 5 um out leaves the pooled
+    median at zero -- the failure sits in the top third and never reaches it."""
+    truth = np.asarray(bead_field.truth["probe_um"], float)
+    mapped = truth.copy()
+    mapped[2 * multiview.N_PROBES_PER_VIEW :] += 5.0
+
+    pooled = np.median(np.linalg.norm(mapped - truth, axis=1))
+    assert pooled == 0.0, "the premise of this test is gone"
+
+    outcome = multiview._verify(
+        bead_field,
+        Attempt(
+            subject="two of three",
+            arrays={
+                "probe_um": mapped,
+                "n_beads_confirmed": bead_field.truth["n_confirmed"],
+            },
+            notes="",
+        ),
+    )
+    assert not outcome.passed
+    assert _named(outcome)["worst_view_median_um"].value > 4.0
+
+
+def test_multiview_the_four_views_are_not_the_same_subset(bead_field):
+    """If every view saw every bead, correspondence would be sorting and the
+    count would be free. Detection falls off with depth so that it is not."""
+    sizes = [len(bead_field.data[f"view{k}"]) for k in range(multiview.N_VIEWS)]
+    assert len(set(sizes)) > 1, sizes
+    assert bead_field.truth["n_confirmed"] < sum(sizes) / 2
+
+
+def test_multiview_an_empty_attempt_scores_nothing(bead_field):
+    outcome = multiview._verify(
+        bead_field, Attempt(subject="nothing", arrays={}, notes="")
+    )
+    assert not any(m.scored for m in outcome.metrics)
+    assert not outcome.passed
+
+
+def test_multiview_half_an_answer_is_not_half_a_pass(bead_field, microns):
+    """The count reported and the transforms not. The scored metric is green,
+    so without `deliverables_unusable` the run would be."""
+    outcome = multiview._verify(
+        bead_field,
+        Attempt(
+            subject="half",
+            arrays={"n_beads_confirmed": bead_field.truth["n_confirmed"]},
+            notes="",
+        ),
+    )
+    by_name = _named(outcome)
+    assert by_name["bead_count_error"].passed
+    assert not by_name["worst_view_median_um"].scored
+    assert by_name["deliverables_unusable"].value == 1.0
+    assert not outcome.passed
