@@ -74,10 +74,18 @@ jobs:
           fetch-depth: 0  # setuptools_scm needs tags for versioning
 
       # vispy/napari need a GL context; provide a headless display + Qt libs.
+      # Windows OpenGL comes from the gl-ci-helpers step below, not from here:
+      # this action's Windows half downloads Mesa3D only to point VTK at an
+      # offscreen renderer (`VTK_DEFAULT_OPENGL_WINDOW`), and nothing in the
+      # suite imports VTK or vedo. That download is served from a third-party
+      # release mirror and has failed the whole Windows job three times in a
+      # week with `curl: (52) Empty reply from server`, instantly and past its
+      # own retries -- so it is turned off rather than retried harder.
       - name: Setup headless display
         uses: pyvista/setup-headless-display-action@v4
         with:
           qt: true
+          install-mesa3d-offscreen: false
 
       - name: Install Windows OpenGL
         if: runner.os == 'Windows'
