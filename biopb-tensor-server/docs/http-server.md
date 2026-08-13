@@ -54,9 +54,16 @@ is the local **default**, not a property of local mode.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/livez` | ✗ | Liveness probe — `{"status":"ok","timestamp":"…"}` |
-| `GET` | `/readyz` | ✗ | Readiness — adds `ready`, `dev_mode`, `service`, `version` |
+| `GET` | `/livez` | ✗ | Liveness probe — `{"status":"ok","timestamp":"…"}`. Never contacts the backend |
+| `GET` | `/readyz` | ✗ | Readiness — **200 when Flight reports `SERVING`, 503 otherwise**. Adds `ready`, `backend_health`, `backend_error`, `source_count`, `dev_mode`, `service`, `version` |
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
+
+`/readyz` opens the Flight connection if none exists yet, so it answers from the
+backend rather than from whatever traffic happened to arrive first, and it is
+safe for a supervisor to gate on. `backend_health` is `null` exactly when the
+backend was not reached, and `backend_error` then says why (`connect failed: …`
+vs `health check failed: …`) — the two used to be indistinguishable, and both
+looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
 | `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
 | `GET` | `/api/sources/{id}` | ✓ | Single descriptor |

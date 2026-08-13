@@ -3,8 +3,9 @@
 Exposes the TensorFlightClient over a browser-friendly HTTP/JSON + binary API.
 
 Endpoints (unauthenticated — probes):
-  GET  /livez                        — liveness probe
-  GET  /readyz                       — readiness probe
+  GET  /livez                        — liveness probe (never touches the backend)
+  GET  /readyz                       — readiness probe; asks Flight, connecting if
+                                       needed. 200 when SERVING, 503 otherwise
   GET  /healthz                      — alias for /readyz
 
 Endpoints (token required):
@@ -58,6 +59,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -393,6 +395,34 @@ class _SidecarContext:
         with self._client_lock:
             return self._client_holder["client"]
 
+    def backend_snapshot(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Flight's health, connecting first if nothing has yet. ``(health, error)``.
+
+        Readiness is a question about the backend, so it has to be answered by
+        asking the backend -- which means being willing to open the connection.
+        Peeking instead made readiness a function of *traffic*: nothing but the
+        token-protected data routes ever called ``get_client()``, so a probe
+        reported "not ready" against a perfectly healthy Flight server until an
+        unrelated request happened to connect (biopb/biopb#755).
+
+        Exactly one of the two returns is set, so a caller can tell "never
+        reached the backend" from "backend answered, but not SERVING" -- a null
+        health with no error used to also mean "nobody has asked yet."
+
+        BLOCKING: connect and the health action are both synchronous gRPC. Call
+        it off the event loop (the route uses ``run_in_threadpool``), or one
+        unreachable backend stalls every other request the sidecar is serving.
+        """
+        try:
+            client = self.get_client()
+        except Exception as exc:  # get_client already logged and marked the error
+            return None, f"connect failed: {exc}"
+        try:
+            return client.health_check(), None
+        except Exception as exc:
+            logger.warning(f"Backend health check failed: {exc}")
+            return None, f"health check failed: {exc}"
+
     def check_token(self, request: Request) -> None:
         """Raise 401 if the request does not carry a valid token.
 
@@ -520,18 +550,23 @@ async def livez() -> JSONResponse:
 
 @_router.get("/readyz")
 async def readyz(request: Request) -> JSONResponse:
-    ctx = _sidecar(request)
-    backend_health = None
-    client = ctx.peek_client()
-    if client is not None:
-        try:
-            backend_health = client.health_check()
-        except Exception as e:
-            logger.warning(f"Backend health check failed: {e}")
+    """Readiness: is the Flight backend serving *right now*?
 
-    ready = (
-        backend_health and backend_health.get("status") == "SERVING"
-    ) or ctx.diag.connection_state == "connected"
+    Answers only from what Flight just said. The old expression also accepted
+    ``diag.connection_state == "connected"``, which is a record of a past
+    successful connect and is never revised when the backend goes away -- so a
+    sidecar whose backend had died still reported ready, which is precisely the
+    window (a data-plane restart) the admin page polls this endpoint through.
+
+    503 when not ready, so probes that can only see status work: a Kubernetes
+    ``readinessProbe``, a ``curl -f`` wait loop, and the web bootstrap (which
+    already backs off and retries on 503) were all being told to proceed by the
+    unconditional 200 that accompanied ``"ready": false`` (biopb/biopb#755).
+    """
+    ctx = _sidecar(request)
+    # Off the event loop: connect + health are blocking gRPC (see backend_snapshot).
+    backend_health, backend_error = await run_in_threadpool(ctx.backend_snapshot)
+    ready = bool(backend_health) and backend_health.get("status") == "SERVING"
 
     return JSONResponse(
         {
@@ -542,10 +577,12 @@ async def readyz(request: Request) -> JSONResponse:
             "service": _SERVICE,
             "version": _VERSION,
             "backend_health": backend_health,
+            "backend_error": backend_error,
             "source_count": backend_health.get("source_count", 0)
             if backend_health
             else 0,
-        }
+        },
+        status_code=200 if ready else 503,
     )
 
 

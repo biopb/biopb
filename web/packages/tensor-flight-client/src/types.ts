@@ -93,6 +93,13 @@ export interface ReadyzSnapshot {
   source_count?: number;
   /** Full backend health dict, including the freshness fields above. */
   backend_health?: BackendHealth | null;
+  /**
+   * Why `backend_health` is null: `connect failed: …` (never reached Flight) or
+   * `health check failed: …` (connected, then the health action threw). Null
+   * when the backend answered. Absent on servers older than biopb#755, where a
+   * null `backend_health` could also mean "no request has connected yet."
+   */
+  backend_error?: string | null;
 }
 
 export interface QuerySourcesResult {
