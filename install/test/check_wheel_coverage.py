@@ -10,9 +10,10 @@ when ``cryptography`` 49 dropped its x86_64/universal2 wheel (see ``install.sh``
 and issue #45's sibling, #355).
 
 It resolves the SAME requirements install.sh does, *including* the dependency
-overrides install.sh applies (see ``INSTALLER_OVERRIDES``), so a clean run means
-"an installer-equivalent resolve is wheel-clean on this platform," not merely "the
-raw dependency graph is." Run from the repo root.
+overrides install.sh applies (read out of install.sh itself by
+``installer_overrides``), so a clean run means "an installer-equivalent resolve is
+wheel-clean on this platform," not merely "the raw dependency graph is." Run from
+the repo root.
 
 Why not a uv ``--only-binary`` diff: ``--only-binary=:all:`` also rejects
 pure-Python *sdist-only* packages (e.g. ``asciitree``), which build anywhere
@@ -70,15 +71,43 @@ def installer_requirements(target: str) -> list[str]:
     ]
 
 
-# Dependency overrides install.sh applies (on every platform). Mirror them here so
-# a green run reflects the *installer's* resolve, not the unconstrained graph.
-INSTALLER_OVERRIDES = [
-    # install.sh overrides the MCP SDK's unconditional `pyjwt[crypto]` back to plain
-    # `pyjwt`, dropping `cryptography` (arm64-only macOS wheels since 49) and its
-    # cffi/Rust/OpenSSL build surface from the closure entirely. See install.sh +
-    # issue #355 (supersedes the old Intel-mac `cryptography<49` pin).
-    "pyjwt>=2.10.1",
-]
+_INSTALL_SH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "install.sh"
+)
+
+# The single `printf ... > "$WHEELS_DIR/overrides.txt"` install.sh writes its
+# --overrides file with.
+_OVERRIDES_PRINTF = re.compile(
+    r"printf\s+'([^']*)'\s*>\s*\"\$WHEELS_DIR/overrides\.txt"
+)
+
+
+def installer_overrides(install_sh: str = _INSTALL_SH) -> list[str]:
+    """The override lines install.sh writes, read out of install.sh itself.
+
+    A green run has to reflect the *installer's* resolve, not the unconstrained
+    graph, so this file needs the same overrides. It reads them rather than
+    restating them: the hand-copied list silently went stale when install.sh
+    gained the `mcp<2` cap, and a workbench that resolves a closure the installer
+    no longer produces is worse than no workbench. Parsing keeps the two in step
+    by construction and works on any branch, whichever overrides that branch's
+    install.sh happens to apply.
+
+    Raises rather than degrading to an empty list: an unconstrained resolve looks
+    like a pass here, so a parse that stops matching must be loud.
+    """
+    with open(install_sh, encoding="utf-8") as fh:
+        text = fh.read()
+    m = _OVERRIDES_PRINTF.search(text)
+    if m is None:
+        raise SystemExit(
+            f"could not find the overrides printf in {install_sh}; "
+            "update _OVERRIDES_PRINTF to match how install.sh writes overrides.txt"
+        )
+    lines = [line.strip() for line in m.group(1).split("\\n") if line.strip()]
+    if not lines:
+        raise SystemExit(f"parsed an empty override set from {install_sh}")
+    return lines
 
 
 def _mac_x86(tag: str) -> bool:
@@ -126,7 +155,7 @@ def resolve(target: str, python_version: str) -> dict[str, str]:
     with tempfile.NamedTemporaryFile(
         "w", suffix=".txt", delete=False, encoding="utf-8"
     ) as ov:
-        ov.write("\n".join(INSTALLER_OVERRIDES) + "\n")
+        ov.write("\n".join(installer_overrides()) + "\n")
         override_path = ov.name
     try:
         proc = subprocess.run(

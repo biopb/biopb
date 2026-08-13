@@ -1,0 +1,130 @@
+# Runs the biopb-mcp suite against a FRESH resolve -- no uv.lock -- to find out
+# what users get before they do.
+#
+# Every other CI job here installs through `uv sync`, which reads uv.lock. That
+# makes the suite a statement about the locked versions, and only those. What
+# `install.sh` does is different in kind: it resolves from PyPI at run time, with
+# no lockfile, so a user's closure is whatever the declared ranges admit *today*.
+# Most declared ranges are floors with no upper bound, so the two closures drift
+# apart continuously and nothing was watching the gap.
+#
+# That gap shipped a dead product. mcp 2.0.0 satisfied biopb-mcp's `mcp>=1.20`,
+# every install after its release resolved it, and it fails at `import mcp` --
+# while CI stayed green on the locked 1.27.2 (biopb#756). This job is the thing
+# that would have gone red the week 2.0.0 landed.
+#
+# What it catches that other gates do not: an upstream release that resolves
+# cleanly but breaks an API the code actually calls. A per-platform *resolution*
+# check cannot see it (mcp 2.0.0 resolves fine on every platform), and neither
+# can a start-the-process smoke test (that only reaches import-time breakage).
+# Running the real suite against the real resolve is what covers signature and
+# behavior changes -- and only on the paths the suite exercises.
+#
+# Deliberately NOT on push/pull_request. It is red whenever upstream breaks,
+# which is the point, and a gate that fails for reasons a PR did not cause is a
+# gate people learn to ignore. It informs; it does not block.
+#
+# When it goes red, the fix is a decision, not a revert: cap the offending
+# dependency (see biopb-mcp's `[mcp]` extra for the `mcp<2` precedent) or port
+# the code to the new major. Either way the choice gets made deliberately,
+# before a release, instead of by a user's install.
+name: Unlocked Resolve
+
+on:
+  schedule:
+    # Daily, 07:00 UTC. Daily rather than weekly so the report names the one
+    # release that moved: an upstream break is then bracketed to a single day's
+    # `uv lock --upgrade --dry-run` diff, instead of arriving inside a week's
+    # worth of updates to bisect by hand.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unlocked-resolve
+  cancel-in-progress: true
+
+jobs:
+  unlocked:
+    name: ${{ matrix.os }} py${{ matrix.python-version }} (unlocked)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The SAME cells as mcp-ci's locked run. Identical matrix on purpose: a
+        # red here is then attributable to the resolve, the one variable that
+        # differs, rather than to a cell the locked run never covered.
+        include:
+          - os: ubuntu-latest
+            python-version: '3.10'
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          - os: macos-latest
+            python-version: '3.12'
+          - os: windows-latest
+            python-version: '3.12'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      # vispy/napari need a GL context; provide a headless display + Qt libs.
+      - name: Setup headless display
+        uses: pyvista/setup-headless-display-action@v4
+        with:
+          qt: true
+
+      - name: Install Windows OpenGL
+        if: runner.os == 'Windows'
+        run: |
+          git clone --depth 1 https://github.com/pyvista/gl-ci-helpers.git
+          powershell gl-ci-helpers/appveyor/install_opengl.ps1
+
+      # See mcp-ci.yaml: a failed GL install otherwise surfaces ~4 minutes later
+      # as a pytest collection error, which reads as a test failure and is not.
+      - name: Check Windows OpenGL loads
+        if: runner.os == 'Windows'
+        run: |
+          python -c "import ctypes; ctypes.WinDLL('opengl32'); print('opengl32 loads')"
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      # The drift report, before anything is installed: names every package the
+      # fresh resolve moves and where it moves it to. This is the artifact to
+      # read first when the run is red -- the failure is almost always one of
+      # these lines.
+      - name: Report drift vs uv.lock
+        run: uv lock --upgrade --dry-run
+
+      # `--upgrade` re-resolves from the declared ranges instead of replaying
+      # uv.lock, which is the single difference from mcp-ci's install step. It
+      # rewrites uv.lock in the runner's checkout; nothing commits it.
+      - name: Install (unlocked resolve)
+        run: >-
+          uv sync --package biopb-mcp --extra mcp --group testing
+          --upgrade --python ${{ matrix.python-version }}
+
+      - name: Record what was actually installed
+        run: uv pip list
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: >-
+          uv run --no-sync pytest -v --color=yes
+          biopb-mcp/src/biopb_mcp/_tests
