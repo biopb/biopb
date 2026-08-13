@@ -103,7 +103,19 @@ tables = [
 # install has to make that true. Neither is guaranteed otherwise: matplotlib
 # reaches an env only through *optional* extras of napari/tifffile/vedo, and
 # scikit-learn through nothing at all.
-mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn"]
+#
+# mcp <2: the 2.0 SDK is a breaking rewrite. It deleted `mcp.server.fastmcp`
+# outright -- `mcp/_server.py` builds the whole server on `FastMCP` -- and it
+# added a module-scope `cryptography` import (`mcp/server/request_state.py`, the
+# 2026-07-28 sealed-`requestState` codec) on the path `import mcp` itself walks,
+# while still declaring that dep only as `pyjwt[crypto]`. Our pyjwt override
+# (root pyproject / install.sh) un-requests that extra, so 2.x dies at
+# `from mcp import types` with ModuleNotFoundError: cryptography before it ever
+# reaches the FastMCP breakage. The floor alone let install.sh -- which resolves
+# fresh from PyPI, not from uv.lock -- swallow the new major, so every release
+# back to 0.8.0 installs a server that cannot start. Lift the cap only together
+# with the FastMCP port and a re-examined override.
+mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn"]
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a

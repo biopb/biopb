@@ -747,7 +747,7 @@ requires-dist = [
     { name = "jupyter-client", marker = "extra == 'mcp'" },
     { name = "magicgui" },
     { name = "matplotlib", marker = "extra == 'mcp'" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20,<2" },
     { name = "napari", extras = ["all"], marker = "extra == 'mcp'", specifier = "==0.7.0" },
     { name = "napari-skimage-regionprops", marker = "extra == 'tables'" },
     { name = "numpy" },
