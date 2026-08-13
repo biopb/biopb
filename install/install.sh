@@ -1276,9 +1276,20 @@ install_biopb() {
     # stock machine without OpenSSL dev headers. Supersedes the Intel-mac pin from
     # 024ca79 (biopb#355). Safe because pyjwt imports cryptography lazily, only for
     # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine.
-    printf 'pyjwt>=2.10.1\n' > "$WHEELS_DIR/overrides.txt"
+    #
+    # `mcp<2` for the same reason, one layer up: "`import mcp` is fine" holds on
+    # 1.x only. The 2.0 SDK imports cryptography at module scope
+    # (`mcp/server/request_state.py`) on that very path, so the override above
+    # strips a dep it hard-needs -- and 2.0 also deleted `mcp.server.fastmcp`,
+    # which biopb-mcp's server is built on. The cap lives here as well as in
+    # biopb-mcp's `[mcp]` extra because THIS file is what fixes an already-
+    # published release: it is fetched fresh from biopb.org on every run and
+    # overrides whatever the downloaded wheels declare, so it covers every
+    # version back to 0.8.0, all of which carry an uncapped `mcp>=1.20` and
+    # would otherwise resolve 2.x and install a server that cannot start.
+    printf 'pyjwt>=2.10.1\nmcp<2\n' > "$WHEELS_DIR/overrides.txt"
     install_args+=(--overrides "$WHEELS_DIR/overrides.txt")
-    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override)"
+    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override); capping mcp<2"
 
     # No MCP server to stop before the new wheels land: each AI client's stdio
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so

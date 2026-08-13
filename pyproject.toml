@@ -111,6 +111,11 @@ biopb-control = { workspace = true }
 # it back to plain `pyjwt` un-requests the `crypto` extra, so cryptography and its
 # cffi / Rust / OpenSSL build surface fall out of the resolved set. Keeps this
 # checkout's `uv sync` closure aligned with what install.sh ships via --overrides.
+#
+# Safe only because pyjwt imports cryptography lazily AND the SDK itself never
+# imports it -- true on mcp 1.x, false on 2.x, which imports it at module scope
+# from `mcp/server/request_state.py`. That is one of the reasons biopb-mcp's
+# `[mcp]` extra caps `mcp<2`; this override and that cap move together.
 override-dependencies = ["pyjwt>=2.10.1"]
 
 # Exclude anyio 4.13.0: it ships a `fail_after` typo (yields an undefined
