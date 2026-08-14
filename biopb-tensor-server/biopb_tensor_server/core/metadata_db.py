@@ -165,8 +165,23 @@ class MetadataDatabase:
                     # `SET enable_external_access=true` in a query is rejected.
                     # The server itself needs no external access: it only does
                     # parameterized INSERT/DELETE and JSON-operator SELECTs.
+                    #
+                    # `common_subplan` is off to dodge a DuckDB 1.5.5 planner
+                    # bug: sync_source_added's `INSERT OR REPLACE` compiles to a
+                    # MERGE_INTO whose projection repeats every value expression,
+                    # and folding those repeats into materialized CTEs can leave
+                    # a LogicalMaterializedCTE with a NULL child ("INTERNAL
+                    # Error: Attempted to dereference unique_ptr that is NULL").
+                    # Rare, but it costs the source its registration: the write
+                    # raises and the reconciler rolls the source back out of the
+                    # catalog. The pass earns nothing on a small in-memory
+                    # single-table catalog; drop this once duckdb fixes it.
                     self._conn = duckdb.connect(
-                        ":memory:", config={"enable_external_access": False}
+                        ":memory:",
+                        config={
+                            "enable_external_access": False,
+                            "disabled_optimizers": "common_subplan",
+                        },
                     )
                     self._create_schema()
                     self._initialized = True
@@ -318,7 +333,6 @@ class MetadataDatabase:
             )
 
         # Build schema metadata for truncation signaling
-        schema = arrow_table.schema
         metadata = {
             b"total_sources": str(total_sources).encode(),
             b"returned_sources": str(
@@ -326,7 +340,13 @@ class MetadataDatabase:
             ).encode(),
             b"query_elapsed_ms": str(int(elapsed_ms)).encode(),
         }
-        schema = schema.with_metadata(metadata)
+        # Tag the TABLE, not just the FlightInfo schema. DoGet streams this very
+        # table, and Flight carries a schema's custom metadata with it, so
+        # tagging here reaches both kinds of caller: the ones that read the keys
+        # off the FlightInfo, and the ones that read them off the result they
+        # got from the stream (the sidecar's /api/sources/query).
+        arrow_table = arrow_table.replace_schema_metadata(metadata)
+        schema = arrow_table.schema
 
         # Store result for DoGet retrieval
         ticket_id = f"metadata-query-{time.time_ns()}"

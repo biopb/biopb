@@ -661,11 +661,14 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         # Convert Arrow Table to JSON
         result = arrow_table.to_pylist()
 
-        # Truncation info from schema metadata
-        total = int(arrow_table.schema.metadata.get(b"total_sources", len(result)))
-        returned = int(
-            arrow_table.schema.metadata.get(b"returned_sources", len(result))
-        )
+        # Truncation info from schema metadata. An untagged Arrow table has
+        # `schema.metadata is None`, not an empty dict, so go through a fallback:
+        # a result carrying no truncation keys must degrade to "returned ==
+        # total" rather than raise an AttributeError that the handler below would
+        # then report as a 502 Flight error.
+        table_metadata = arrow_table.schema.metadata or {}
+        total = int(table_metadata.get(b"total_sources", len(result)))
+        returned = int(table_metadata.get(b"returned_sources", len(result)))
         truncated = total > returned
 
         elapsed = (time.monotonic() - t0) * 1000

@@ -624,6 +624,32 @@ class TestQueryHandling:
         result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
         assert result.num_rows == 2
 
+    def test_truncation_metadata_rides_on_the_doget_table(self):
+        """The truncation keys must be on the STORED table, not just the FlightInfo.
+
+        DoGet streams the pending table, so a client that reads its result from
+        the stream (rather than from the FlightInfo) sees exactly this schema.
+        Tagging only the FlightInfo left `schema.metadata is None` there, which
+        is what broke the sidecar's /api/sources/query.
+        """
+        db = MetadataDatabase(max_query_results=2)
+        for i in range(5):
+            db.sync_source_added(
+                f"test-{i}",
+                MockAdapter(
+                    f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
+                ),
+            )
+
+        info = db.handle_query("SELECT source_id FROM sources")
+        result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+
+        assert result.schema.metadata is not None
+        assert int(result.schema.metadata[b"total_sources"]) == 5
+        assert int(result.schema.metadata[b"returned_sources"]) == 2
+        # ... and the FlightInfo still agrees with it.
+        assert result.schema.metadata == info.schema.metadata
+
 
 class TestSQLValidation:
     """Test SQL query validation."""
@@ -745,6 +771,21 @@ class TestSQLValidation:
         )
         with pytest.raises(ValueError):
             db.handle_query("SET enable_external_access=true; SELECT * FROM sources")
+
+    def test_common_subplan_optimizer_is_disabled(self):
+        """DuckDB 1.5.5's common-subplan pass crashes planning the catalog upsert.
+
+        `INSERT OR REPLACE` compiles to a MERGE_INTO whose projection repeats
+        every value expression; folding those repeats into materialized CTEs can
+        leave a LogicalMaterializedCTE with a NULL child, and the upsert dies with
+        an INTERNAL Error that costs the source its registration. Cursors inherit
+        the setting, so reads are covered too.
+        """
+        db = MetadataDatabase()
+        conn = db._get_connection()
+        setting = "SELECT current_setting('disabled_optimizers')"
+        assert "common_subplan" in conn.execute(setting).fetchone()[0]
+        assert "common_subplan" in db._get_cursor().execute(setting).fetchone()[0]
 
 
 class TestFlightInfo:
