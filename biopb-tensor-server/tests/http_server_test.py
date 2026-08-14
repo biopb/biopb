@@ -842,7 +842,10 @@ class TestQuerySourcesEndpoint:
     def test_query_sources_valid_request(self, auth_client):
         tc, mock_fc = auth_client
 
-        # Mock query_sources to return an Arrow table
+        # Deliberately UNtagged. A mock that fabricates the truncation keys tests
+        # a contract nothing guarantees -- `schema.metadata` is None on any table
+        # nobody tagged -- and it hid a handler that dereferenced them blindly.
+        # Serving the rows must not depend on the tags being there.
         import pyarrow as pa
 
         mock_table = pa.table(
@@ -851,12 +854,7 @@ class TestQuerySourcesEndpoint:
                 "source_type": ["zarr", "zarr"],
             }
         )
-        mock_table = mock_table.replace_schema_metadata(
-            {
-                b"total_sources": "2",
-                b"returned_sources": "2",
-            }
-        )
+        assert mock_table.schema.metadata is None
         mock_fc.query_sources.return_value = mock_table
 
         r = tc.post(
@@ -869,6 +867,10 @@ class TestQuerySourcesEndpoint:
         assert isinstance(body, list)
         assert len(body) == 2
         assert body[0]["source_id"] == "src0"
+        # No tags -> report what was actually returned, not a failure.
+        assert r.headers["X-Total-Sources"] == "2"
+        assert r.headers["X-Returned-Sources"] == "2"
+        assert r.headers["X-Truncated"] == "false"
 
     def test_query_sources_truncation_headers(self, auth_client):
         tc, mock_fc = auth_client

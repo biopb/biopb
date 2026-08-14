@@ -318,7 +318,6 @@ class MetadataDatabase:
             )
 
         # Build schema metadata for truncation signaling
-        schema = arrow_table.schema
         metadata = {
             b"total_sources": str(total_sources).encode(),
             b"returned_sources": str(
@@ -326,7 +325,13 @@ class MetadataDatabase:
             ).encode(),
             b"query_elapsed_ms": str(int(elapsed_ms)).encode(),
         }
-        schema = schema.with_metadata(metadata)
+        # Tag the TABLE, not just the FlightInfo schema. DoGet streams this very
+        # table, and Flight carries a schema's custom metadata with it, so
+        # tagging here reaches both kinds of caller: the ones that read the keys
+        # off the FlightInfo, and the ones that read them off the result they
+        # got from the stream (the sidecar's /api/sources/query).
+        arrow_table = arrow_table.replace_schema_metadata(metadata)
+        schema = arrow_table.schema
 
         # Store result for DoGet retrieval
         ticket_id = f"metadata-query-{time.time_ns()}"
