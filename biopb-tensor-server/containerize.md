@@ -16,9 +16,18 @@ container's cert. See biopb/biopb#604.
 
 ## Docker Usage
 
-**The container is the standard way to run a remote data server.** The default
-below is a full remote deployment — public bind, TLS, access token — on a machine
-that only needs Docker and the data:
+**The container is the standard way to run a remote data server.** The published
+image lives on **Docker Hub**. The release workflow also mirrors it to `ghcr.io`,
+but that copy is not public — pull from Docker Hub:
+
+```bash
+docker pull jiyuuchc/biopb-tensor-server:latest
+# short tag, so the examples below (and a locally built image) read the same
+docker tag jiyuuchc/biopb-tensor-server:latest biopb-tensor-server:latest
+```
+
+The default below is a full remote deployment — public bind, TLS, access token —
+on a machine that only needs Docker and the data:
 
 ```bash
 docker run -d --restart unless-stopped \
@@ -228,7 +237,7 @@ docker run -d -p 8814:8814 -p 8815:8815 \
 ### Build from Docker Image
 
 ```bash
-singularity build biopb-tensor-server.sif docker://ghcr.io/jiyuuchc/biopb-tensor-server:latest
+singularity build biopb-tensor-server.sif docker://jiyuuchc/biopb-tensor-server:latest
 ```
 
 ### Basic Usage
