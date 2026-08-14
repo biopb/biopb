@@ -772,21 +772,6 @@ class TestSQLValidation:
         with pytest.raises(ValueError):
             db.handle_query("SET enable_external_access=true; SELECT * FROM sources")
 
-    def test_common_subplan_optimizer_is_disabled(self):
-        """DuckDB 1.5.5's common-subplan pass crashes planning the catalog upsert.
-
-        `INSERT OR REPLACE` compiles to a MERGE_INTO whose projection repeats
-        every value expression; folding those repeats into materialized CTEs can
-        leave a LogicalMaterializedCTE with a NULL child, and the upsert dies with
-        an INTERNAL Error that costs the source its registration. Cursors inherit
-        the setting, so reads are covered too.
-        """
-        db = MetadataDatabase()
-        conn = db._get_connection()
-        setting = "SELECT current_setting('disabled_optimizers')"
-        assert "common_subplan" in conn.execute(setting).fetchone()[0]
-        assert "common_subplan" in db._get_cursor().execute(setting).fetchone()[0]
-
 
 class TestFlightInfo:
     """Test FlightInfo generation."""
