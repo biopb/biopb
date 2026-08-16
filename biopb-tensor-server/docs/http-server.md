@@ -70,6 +70,8 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
+| `GET` | `/api/tile_info/{id}` | ✓ | Tile grid, pyramid levels and selectable axes for one tensor |
+| `GET` | `/api/tile/{id}` | ✓ | One tile, cacheable (`fmt=raw\|png\|jpeg`) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
 | `POST` | `/api/render` | ✓ | Server-rendered RGB image of a slice |
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
@@ -86,6 +88,65 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 **or a `token` query parameter**, since browsers cannot set custom headers on a
 WebSocket handshake; an unauthorized socket is closed with code `4001`. It holds
 no session state — each render is an independent request/response.
+
+## Tile endpoints
+
+Design rationale in `remote-viewer-tiles.md`; this is the contract.
+
+`GET /api/tile_info/{source_id}?tensor_id=…` reports everything needed to address
+the tensor as a tile grid — shaped to drop into a Viv `PixelSource[]`:
+
+```json
+{
+  "array_id": "src/Image:0", "dim_labels": ["T","C","Z","Y","X"],
+  "shape": [1,3,16,512,512], "chunk_shape": [1,1,1,512,512], "dtype": "<u2",
+  "tile_size": 512,
+  "plane": {"y": 3, "x": 4, "s": null},
+  "selectable": {"t": 0, "c": 1, "z": 2},
+  "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}]
+}
+```
+
+**`level` 0 is full resolution** (Viv's `PixelSource[]` index convention, not the
+map-tile one where z grows with detail); each level halves. `tile_size` is derived
+from `chunk_shape` so a tile *nests* inside a stored chunk rather than straddling
+one — clients must not assume a constant.
+
+`GET /api/tile/{source_id}` takes `level`, `col`, `row`, optional `tensor_id`,
+the selection `t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, plus
+`lo` / `hi` / `color` / `use_min_max` for the rendered formats).
+
+| | |
+|---|---|
+| `fmt=raw` | `application/octet-stream`, the tensor's own dtype, C-contiguous. `X-Shape` / `X-Dtype` / `X-Dim-Labels` as on `/api/slice` |
+| `fmt=png\|jpeg` | image bytes, plus `X-Image-Width` / `-Height` and `X-Percentile-Lo-Value` / `-Hi-Value` |
+| always | `ETag`, `Cache-Control: public, max-age=3600`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
+
+`If-None-Match` revalidates to **304 without touching the backend**. The ETag
+covers render settings only for the rendered formats, so adjusting contrast does
+not fragment the raw-tile cache (raw contrast is a client-side shader concern).
+
+A tile outside the level's grid is **404**; a selection index outside its axis is
+**422**.
+
+> Caching is `max-age`, not `immutable`, because a tile's bytes are only stable
+> while its `array_id` is, and re-indexing currently reuses the id. Tighten both
+> together once the version lives in the array_id namespace.
+
+## Cancellation
+
+The read routes (`/api/tile`, `/api/slice`, `/api/render`) check
+`request.is_disconnected()` before starting a read and return **499** when the
+caller has already hung up, counted as `cancelled_reads` in `/api/diagnostics`.
+This reclaims *queued* work only — neither the Flight read nor the dask graph is
+interruptible, so a client that leaves mid-compute is not noticed.
+
+`/api/tile` reads via `run_in_threadpool`. That is load-bearing for cancellation,
+not just for latency: a read blocking the event loop denies it the turn it needs
+to observe other callers' disconnects, which silently defeats the check for every
+request queued behind it (`remote-viewer-tiles.md` has the measurements).
+`/api/slice` and `/api/render` still compute on the loop, so their check only
+fires when something else has yielded.
 
 ## Slice endpoint
 
