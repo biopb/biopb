@@ -23,6 +23,10 @@ import type {
   RenderRequest,
   RenderResult,
   SliceRequest,
+  TileImageRequest,
+  TileInfo,
+  TileRequest,
+  TileResult,
   TypedNdArray,
 } from "./types.js";
 
@@ -44,6 +48,114 @@ export class TensorApiError extends Error {
     super(`TensorApi ${status}: ${fullMessage}`);
     this.name = "TensorApiError";
   }
+}
+
+/**
+ * The caller aborted this request through its own signal.
+ *
+ * Deliberately NOT a {@link TensorApiError}: a tile the user panned away from is
+ * a normal outcome, not a failure, and reporting it as the 408 timeout the
+ * helpers used to synthesise put self-inflicted cancellations into the error UI
+ * and the retry path. Callers discard these silently.
+ *
+ * `name` stays `"AbortError"` so the standard `err.name === "AbortError"` idiom
+ * -- what deck.gl/Viv tile layers use to drop a cancelled tile -- keeps working.
+ */
+export class TensorAbortError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly reason?: unknown,
+  ) {
+    super(`Request aborted by caller (${path})`);
+    this.name = "AbortError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/** Per-call options accepted by every read method. */
+export interface RequestOptions {
+  /**
+   * Caller's cancellation signal, composed with the method's own timeout.
+   *
+   * Aborting drops the connection, which is what lets the server skip a read it
+   * has not started yet (it answers 499 and counts `cancelled_reads`); without
+   * it a viewer that pans away still pays for every tile it asked for.
+   */
+  signal?: AbortSignal;
+}
+
+interface ComposedSignal {
+  signal: AbortSignal;
+  cleanup: () => void;
+}
+
+/**
+ * One signal that fires on either the timeout or the caller's abort.
+ *
+ * Hand-wired rather than `AbortSignal.any()`, which is too recent to rely on
+ * here (this package still works around Safari versions predating it).
+ * Listeners are removed on the way out so a long-lived caller signal -- one
+ * AbortController per viewport, reused across many tiles -- cannot accumulate
+ * them.
+ */
+function composeSignal(timeoutMs: number | undefined, caller?: AbortSignal): ComposedSignal {
+  const controller = new AbortController();
+  const cleanups: Array<() => void> = [];
+
+  if (timeoutMs != null) {
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    cleanups.push(() => clearTimeout(id));
+  }
+
+  if (caller) {
+    if (caller.aborted) {
+      controller.abort(caller.reason);
+    } else {
+      const onAbort = () => controller.abort(caller.reason);
+      caller.addEventListener("abort", onAbort);
+      cleanups.push(() => caller.removeEventListener("abort", onAbort));
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => { for (const fn of cleanups) fn(); },
+  };
+}
+
+/**
+ * Turn a fetch rejection into the right error.
+ *
+ * Order matters: an abort raised by the caller and one raised by the timeout are
+ * the same `AbortError` on the wire, and only the caller's signal distinguishes
+ * them.
+ */
+function abortAwareError(e: unknown, path: string, timeoutMs?: number, caller?: AbortSignal): unknown {
+  if (e instanceof Error && e.name === "AbortError") {
+    if (caller?.aborted) return new TensorAbortError(path, caller.reason);
+    return new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
+  }
+  return e;
+}
+
+/** Reject on a non-2xx response, unwrapping the server's JSON detail. */
+async function assertOk(res: Response): Promise<void> {
+  if (res.ok) return;
+  // An HTML body here is the reverse proxy's error page, not the sidecar's:
+  // the data plane is still starting and has nothing to say yet.
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("text/html")) {
+    throw new TensorApiError(
+      res.status,
+      "Server unavailable - may be starting up. Please wait and retry.",
+    );
+  }
+  let detail: unknown;
+  try { detail = await res.json(); } catch { /* ignore */ }
+  throw new TensorApiError(res.status, res.statusText, detail);
 }
 
 // ---------------------------------------------------------------------------
@@ -85,135 +197,76 @@ export class TensorHttpClient {
     path: string,
     options?: RequestInit,
     timeoutMs?: number,
+    opts?: RequestOptions,
   ): Promise<T> {
-    const url = `${this.base}${path}`;
-    const controller = new AbortController();
-    const timeoutId = timeoutMs != null
-      ? setTimeout(() => controller.abort(), timeoutMs)
-      : null;
-    try {
-      const res = await fetch(url, {
-        ...options,
-        headers: { ...this.headers(), ...(options?.headers as Record<string, string> ?? {}) },
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        // Check if response is HTML (nginx error page during startup)
-        const contentType = res.headers.get("content-type") ?? "";
-        if (contentType.includes("text/html")) {
-          throw new TensorApiError(
-            res.status,
-            "Server unavailable - may be starting up. Please wait and retry.",
-          );
-        }
-        let detail: unknown;
-        try { detail = await res.json(); } catch { /* ignore */ }
-        throw new TensorApiError(res.status, res.statusText, detail);
-      }
-      return res.json() as Promise<T>;
-    } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") {
-        throw new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
-      }
-      throw e;
-    } finally {
-      if (timeoutId !== null) clearTimeout(timeoutId);
-    }
+    const res = await this.send(path, {
+      ...options,
+      headers: { ...this.headers(), ...(options?.headers as Record<string, string> ?? {}) },
+    }, timeoutMs, opts);
+    return res.json() as Promise<T>;
   }
 
   private async fetchBinary(
     path: string,
     body: unknown,
     timeoutMs?: number,
+    opts?: RequestOptions,
   ): Promise<Response> {
-    const url = `${this.base}${path}`;
-    const controller = new AbortController();
-    const timeoutId = timeoutMs != null
-      ? setTimeout(() => controller.abort(), timeoutMs)
-      : null;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        // Check if response is HTML (nginx error page during startup)
-        const contentType = res.headers.get("content-type") ?? "";
-        if (contentType.includes("text/html")) {
-          throw new TensorApiError(
-            res.status,
-            "Server unavailable - may be starting up. Please wait and retry.",
-          );
-        }
-        let detail: unknown;
-        try { detail = await res.json(); } catch { /* ignore */ }
-        throw new TensorApiError(res.status, res.statusText, detail);
-      }
-      return res;
-    } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") {
-        throw new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
-      }
-      throw e;
-    } finally {
-      if (timeoutId !== null) clearTimeout(timeoutId);
-    }
+    return this.send(path, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    }, timeoutMs, opts);
   }
 
   private async fetchJsonWithHeaders<T>(
     path: string,
     body: unknown,
     timeoutMs?: number,
+    opts?: RequestOptions,
   ): Promise<{ data: T; headers: Headers }> {
-    const url = `${this.base}${path}`;
-    const controller = new AbortController();
-    const timeoutId = timeoutMs != null
-      ? setTimeout(() => controller.abort(), timeoutMs)
-      : null;
+    const res = await this.send(path, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    }, timeoutMs, opts);
+    return { data: await res.json() as T, headers: res.headers };
+  }
+
+  /**
+   * The one place a request is actually issued: composes the caller's signal
+   * with the timeout, checks the status, and maps an abort to the error that
+   * says which of the two fired.
+   */
+  private async send(
+    path: string,
+    init: RequestInit,
+    timeoutMs?: number,
+    opts?: RequestOptions,
+  ): Promise<Response> {
+    const composed = composeSignal(timeoutMs, opts?.signal);
     try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        // Check if response is HTML (nginx error page during startup)
-        const contentType = res.headers.get("content-type") ?? "";
-        if (contentType.includes("text/html")) {
-          throw new TensorApiError(
-            res.status,
-            "Server unavailable - may be starting up. Please wait and retry.",
-          );
-        }
-        let detail: unknown;
-        try { detail = await res.json(); } catch { /* ignore */ }
-        throw new TensorApiError(res.status, res.statusText, detail);
-      }
-      const data = await res.json() as T;
-      return { data, headers: res.headers };
+      const res = await fetch(`${this.base}${path}`, { ...init, signal: composed.signal });
+      await assertOk(res);
+      return res;
     } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") {
-        throw new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
-      }
-      throw e;
+      throw abortAwareError(e, path, timeoutMs, opts?.signal);
     } finally {
-      if (timeoutId != null) clearTimeout(timeoutId);
+      composed.cleanup();
     }
   }
+
 
   // -------------------------------------------------------------------------
   // Health (no auth required)
   // -------------------------------------------------------------------------
 
-  async livez(): Promise<{ status: string; timestamp: string }> {
-    return this.fetchJson("/livez", undefined, this.metadataTimeoutMs);
+  async livez(opts?: RequestOptions): Promise<{ status: string; timestamp: string }> {
+    return this.fetchJson("/livez", undefined, this.metadataTimeoutMs, opts);
   }
 
-  async readyz(): Promise<ReadyzSnapshot> {
-    return this.fetchJson("/readyz", undefined, this.metadataTimeoutMs);
+  async readyz(opts?: RequestOptions): Promise<ReadyzSnapshot> {
+    return this.fetchJson("/readyz", undefined, this.metadataTimeoutMs, opts);
   }
 
   // -------------------------------------------------------------------------
@@ -221,20 +274,22 @@ export class TensorHttpClient {
   // -------------------------------------------------------------------------
 
   /** List all data sources registered with the server. */
-  async listSources(): Promise<DataSourceDescriptor[]> {
+  async listSources(opts?: RequestOptions): Promise<DataSourceDescriptor[]> {
     return this.fetchJson<DataSourceDescriptor[]>(
       "/api/sources",
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
 
   /** Get a single DataSourceDescriptor by source_id. */
-  async getSource(sourceId: string): Promise<DataSourceDescriptor> {
+  async getSource(sourceId: string, opts?: RequestOptions): Promise<DataSourceDescriptor> {
     return this.fetchJson<DataSourceDescriptor>(
       `/api/sources/${encodeURIComponent(sourceId)}`,
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
 
@@ -242,11 +297,12 @@ export class TensorHttpClient {
    * Get the parsed OME-NGFF metadata for a source.
    * Returns an empty object if the source has no metadata.
    */
-  async getSourceMetadata(sourceId: string): Promise<Record<string, unknown>> {
+  async getSourceMetadata(sourceId: string, opts?: RequestOptions): Promise<Record<string, unknown>> {
     return this.fetchJson<Record<string, unknown>>(
       `/api/sources/${encodeURIComponent(sourceId)}/metadata`,
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
 
@@ -257,11 +313,12 @@ export class TensorHttpClient {
    * @returns Query result with rows and truncation metadata
    * @throws {TensorApiError} on validation error or timeout
    */
-  async querySources(sql: string): Promise<QuerySourcesResult> {
+  async querySources(sql: string, opts?: RequestOptions): Promise<QuerySourcesResult> {
     const { data, headers } = await this.fetchJsonWithHeaders<Record<string, unknown>[]>(
       "/api/sources/query",
       { sql },
       this.metadataTimeoutMs,
+      opts,
     );
 
     const totalSources = parseInt(headers.get("X-Total-Sources") ?? "0", 10);
@@ -276,11 +333,12 @@ export class TensorHttpClient {
   // -------------------------------------------------------------------------
 
   /** Read the on-disk config, its path, and the JSON Schema (`GET /api/config`). */
-  async getAdminConfig(): Promise<AdminConfigResponse> {
+  async getAdminConfig(opts?: RequestOptions): Promise<AdminConfigResponse> {
     return this.fetchJson<AdminConfigResponse>(
       "/api/config",
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
 
@@ -291,6 +349,10 @@ export class TensorHttpClient {
    * throws a {@link TensorApiError} whose `.detail` is the
    * {@link AdminConfigValidationBody} (`{detail, errors}`); callers render
    * `error.detail.errors` inline.
+   *
+   * Takes no cancellation signal, unlike the read methods: aborting a write
+   * leaves the caller unable to say whether the server applied it, which is a
+   * worse position than waiting.
    */
   async putAdminConfig(config: Record<string, unknown>): Promise<AdminConfigSaveResult> {
     return this.fetchJson<AdminConfigSaveResult>(
@@ -301,11 +363,12 @@ export class TensorHttpClient {
   }
 
   /** Backend health merged with process facts (`GET /api/admin/status`). */
-  async getAdminStatus(): Promise<AdminStatus> {
+  async getAdminStatus(opts?: RequestOptions): Promise<AdminStatus> {
     return this.fetchJson<AdminStatus>(
       "/api/admin/status",
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
 
@@ -317,12 +380,13 @@ export class TensorHttpClient {
    * {@link AdminStatus.local} so this is only invoked when available. A blank
    * `path` starts at the server user's home directory.
    */
-  async browse(path?: string): Promise<BrowseResponse> {
+  async browse(path?: string, opts?: RequestOptions): Promise<BrowseResponse> {
     const qs = path ? `?path=${encodeURIComponent(path)}` : "";
     return this.fetchJson<BrowseResponse>(
       `/api/admin/browse${qs}`,
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
 
@@ -337,20 +401,100 @@ export class TensorHttpClient {
    * are in response headers ``X-Shape``, ``X-Dtype``, ``X-Dim-Labels``.
    *
    * @throws {TensorApiError} on HTTP error or timeout.
+   * @throws {TensorAbortError} if `opts.signal` fired.
    */
-  async slice(req: SliceRequest): Promise<TypedNdArray> {
-    const res = await this.fetchBinary("/api/slice", req, this.chunkTimeoutMs);
+  async slice(req: SliceRequest, opts?: RequestOptions): Promise<TypedNdArray> {
+    const res = await this.fetchBinary("/api/slice", req, this.chunkTimeoutMs, opts);
+    return readNdArray(res);
+  }
 
-    const shapeHeader = res.headers.get("X-Shape") ?? "";
-    const dtype = res.headers.get("X-Dtype") ?? "";
-    const dimLabels = (res.headers.get("X-Dim-Labels") ?? "")
-      .split(",")
-      .filter(Boolean);
+  // -------------------------------------------------------------------------
+  // Tiles
+  // -------------------------------------------------------------------------
 
-    const shape = shapeHeader.split(",").filter(Boolean).map(Number);
-    const buffer = await res.arrayBuffer();
+  /**
+   * Grid, pyramid levels and selectable axes for a tensor
+   * (`GET /api/tile_info`).
+   *
+   * Fetch once per tensor and keep it: `tile_size` comes from the stored
+   * `chunk_shape`, so it varies per tensor and must not be assumed.
+   */
+  async tileInfo(sourceId: string, tensorId?: string, opts?: RequestOptions): Promise<TileInfo> {
+    const qs = tensorId ? `?tensor_id=${encodeURIComponent(tensorId)}` : "";
+    return this.fetchJson<TileInfo>(
+      `/api/tile_info/${encodeURIComponent(sourceId)}${qs}`,
+      undefined,
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
 
-    return { buffer, shape, dtype, dimLabels };
+  /**
+   * One tile as raw bytes (`GET /api/tile`, `fmt=raw`).
+   *
+   * A cacheable GET, so a tile already seen is served by the browser cache
+   * without reaching the network -- which is the point of addressing pixels this
+   * way rather than through `slice()`. Pass `opts.signal` for tiles that may
+   * leave the viewport before they land: aborting also lets the server skip the
+   * read if it has not started it.
+   *
+   * @throws {TensorAbortError} if `opts.signal` fired.
+   */
+  async tile(req: TileRequest, opts?: RequestOptions): Promise<TileResult> {
+    const res = await this.fetchGet(this.tilePath(req, {}), this.chunkTimeoutMs, opts);
+    return {
+      ...(await readNdArray(res)),
+      tileSize: parseInt(res.headers.get("X-Tile-Size") ?? "0", 10),
+      level: parseInt(res.headers.get("X-Tile-Level") ?? "0", 10),
+      col: parseInt(res.headers.get("X-Tile-Col") ?? "0", 10),
+      row: parseInt(res.headers.get("X-Tile-Row") ?? "0", 10),
+    };
+  }
+
+  /**
+   * One tile rendered server-side (`GET /api/tile`, `fmt=png|jpeg`).
+   *
+   * The same tile as {@link tile}, with appearance baked in: far fewer bytes,
+   * at the cost of making contrast part of the cache key. Intended for slow
+   * links and high channel counts, not as a separate rendering path.
+   */
+  async tileImage(req: TileImageRequest, opts?: RequestOptions): Promise<Blob> {
+    const { fmt = "jpeg", lo, hi, color, use_min_max } = req;
+    const res = await this.fetchGet(
+      this.tilePath(req, { fmt, lo, hi, color, use_min_max }),
+      this.chunkTimeoutMs * 2,
+      opts,
+    );
+    return res.blob();
+  }
+
+  /** Build a tile URL. Every parameter that decides the bytes is in it, by design. */
+  private tilePath(req: TileRequest, extra: Record<string, unknown>): string {
+    const qs = new URLSearchParams();
+    const params: Record<string, unknown> = {
+      tensor_id: req.tensor_id,
+      level: req.level,
+      col: req.col,
+      row: req.row,
+      t: req.t,
+      z: req.z,
+      c: req.c,
+      reduction_method: req.reduction_method,
+      ...extra,
+    };
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null) qs.set(k, String(v));
+    }
+    const query = qs.toString();
+    return `/api/tile/${encodeURIComponent(req.source_id)}${query ? `?${query}` : ""}`;
+  }
+
+  private async fetchGet(
+    path: string,
+    timeoutMs?: number,
+    opts?: RequestOptions,
+  ): Promise<Response> {
+    return this.send(path, { method: "GET", headers: this.headers() }, timeoutMs, opts);
   }
 
   // -------------------------------------------------------------------------
@@ -365,10 +509,11 @@ export class TensorHttpClient {
    * This is an alternative to slice() + frontend rendering.
    *
    * @throws {TensorApiError} on HTTP error, timeout, or if rendering not enabled.
+   * @throws {TensorAbortError} if `opts.signal` fired.
    */
-  async render(req: RenderRequest): Promise<RenderResult> {
+  async render(req: RenderRequest, opts?: RequestOptions): Promise<RenderResult> {
     // Use longer timeout for rendering (may be slower than raw slice)
-    const res = await this.fetchBinary("/api/render", req, this.chunkTimeoutMs * 2);
+    const res = await this.fetchBinary("/api/render", req, this.chunkTimeoutMs * 2, opts);
 
     const width = parseInt(res.headers.get("X-Image-Width") ?? "0", 10);
     const height = parseInt(res.headers.get("X-Image-Height") ?? "0", 10);
@@ -386,11 +531,20 @@ export class TensorHttpClient {
   // Diagnostics
   // -------------------------------------------------------------------------
 
-  async diagnostics(): Promise<DiagnosticsSnapshot> {
+  async diagnostics(opts?: RequestOptions): Promise<DiagnosticsSnapshot> {
     return this.fetchJson<DiagnosticsSnapshot>(
       "/api/diagnostics",
       undefined,
       this.metadataTimeoutMs,
+      opts,
     );
   }
+}
+
+/** Read the shape/dtype/label headers the binary routes share into an ndarray. */
+async function readNdArray(res: Response): Promise<TypedNdArray> {
+  const shape = (res.headers.get("X-Shape") ?? "").split(",").filter(Boolean).map(Number);
+  const dtype = res.headers.get("X-Dtype") ?? "";
+  const dimLabels = (res.headers.get("X-Dim-Labels") ?? "").split(",").filter(Boolean);
+  return { buffer: await res.arrayBuffer(), shape, dtype, dimLabels };
 }

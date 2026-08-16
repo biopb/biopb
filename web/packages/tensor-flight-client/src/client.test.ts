@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TensorHttpClient, TensorApiError } from "./client.js";
+import { TensorHttpClient, TensorApiError, TensorAbortError } from "./client.js";
 import type { DataSourceDescriptor, TypedNdArray } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -462,5 +462,244 @@ describe("TensorHttpClient.browse", () => {
     mockFetch.mockResolvedValueOnce(errorResponse(404, "File browsing is available only on a tokenless local server"));
     const c = new TensorHttpClient(BASE, TOKEN);
     await expect(c.browse("/data")).rejects.toThrow(TensorApiError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/** Reject the way fetch does when its signal fires. */
+function abortRejection(): Error {
+  const e = new Error("The operation was aborted.");
+  e.name = "AbortError";
+  return e;
+}
+
+describe("client-side cancellation", () => {
+  it("passes a signal to fetch", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+    const ctrl = new AbortController();
+    await c.listSources({ signal: ctrl.signal });
+    const init = mockFetch.mock.calls[0]![1] as RequestInit;
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("aborts the underlying fetch when the caller aborts", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    let seen: AbortSignal | undefined;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) => {
+      seen = init.signal as AbortSignal;
+      return new Promise((_res, rej) => {
+        seen!.addEventListener("abort", () => rej(abortRejection()));
+      });
+    });
+    const ctrl = new AbortController();
+    const p = c.listSources({ signal: ctrl.signal });
+    expect(seen!.aborted).toBe(false);
+    ctrl.abort();
+    await expect(p).rejects.toThrow();
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it("reports a caller abort as TensorAbortError, not a 408 timeout", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.slice({ source_id: "src0", tensor_id: "t0" }, { signal: ctrl.signal });
+    ctrl.abort();
+    // A tile the user panned away from must not surface as a server failure.
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorApiError);
+  });
+
+  it("keeps name 'AbortError' so the standard idiom still catches it", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.listSources({ signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("still reports a timeout as a 408 when the caller did not abort", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.metadataTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.listSources({ signal: new AbortController().signal });
+    await expect(p).rejects.toBeInstanceOf(TensorApiError);
+    await expect(p).rejects.toThrow(/Timeout after 5ms/);
+  });
+
+  it("aborts immediately when handed an already-aborted signal", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) => {
+      const s = init.signal as AbortSignal;
+      // A viewport controller aborted before this tile was even requested.
+      if (s.aborted) return Promise.reject(abortRejection());
+      return Promise.resolve(jsonResponse([SOURCE]));
+    });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await expect(c.listSources({ signal: ctrl.signal })).rejects.toBeInstanceOf(TensorAbortError);
+  });
+
+  it("removes its listener so one long-lived signal does not accumulate them", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const ctrl = new AbortController();
+    const added: string[] = [];
+    const realAdd = ctrl.signal.addEventListener.bind(ctrl.signal);
+    const realRemove = ctrl.signal.removeEventListener.bind(ctrl.signal);
+    ctrl.signal.addEventListener = ((t: string, f: EventListener, o?: unknown) => {
+      added.push(t); return realAdd(t, f, o as AddEventListenerOptions);
+    }) as typeof ctrl.signal.addEventListener;
+    ctrl.signal.removeEventListener = ((t: string, f: EventListener, o?: unknown) => {
+      added.splice(added.indexOf(t), 1); return realRemove(t, f, o as EventListenerOptions);
+    }) as typeof ctrl.signal.removeEventListener;
+
+    // One controller per viewport, reused across many tiles.
+    for (let i = 0; i < 20; i++) {
+      mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+      await c.listSources({ signal: ctrl.signal });
+    }
+    expect(added).toHaveLength(0);
+  });
+
+  it("works without a signal, as before", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+    await expect(c.listSources()).resolves.toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tiles
+// ---------------------------------------------------------------------------
+
+const TILE_INFO = {
+  array_id: "src0/Image:0",
+  dim_labels: ["T", "C", "Z", "Y", "X"],
+  shape: [1, 3, 16, 1024, 1024],
+  chunk_shape: [1, 1, 1, 512, 512],
+  dtype: "<u2",
+  tile_size: 512,
+  plane: { y: 3, x: 4, s: null },
+  selectable: { t: 0, c: 1, z: 2 },
+  levels: [
+    { level: 0, scale: 1, height: 1024, width: 1024, cols: 2, rows: 2 },
+    { level: 1, scale: 2, height: 512, width: 512, cols: 1, rows: 1 },
+  ],
+};
+
+function tileResponse(bytes: number, shape: number[]): Response {
+  return new Response(new ArrayBuffer(bytes), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Shape": shape.join(","),
+      "X-Dtype": "uint16",
+      "X-Dim-Labels": "T,C,Z,Y,X",
+      "X-Tile-Size": "512",
+      "X-Tile-Level": "1",
+      "X-Tile-Col": "3",
+      "X-Tile-Row": "4",
+    },
+  });
+}
+
+describe("TensorHttpClient.tileInfo", () => {
+  it("GETs /api/tile_info and returns the grid", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
+    const info = await c.tileInfo("src0");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/tile_info/src0`);
+    expect(info.tile_size).toBe(512);
+    expect(info.levels).toHaveLength(2);
+  });
+
+  it("passes tensor_id when given", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
+    await c.tileInfo("src0", "Image:0");
+    expect(mockFetch.mock.calls[0]![0]).toContain("tensor_id=Image%3A0");
+  });
+});
+
+describe("TensorHttpClient.tile", () => {
+  it("puts the whole address in the URL so the response is cacheable", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    await c.tile({ source_id: "src0", tensor_id: "Image:0", level: 1, col: 3, row: 4, c: 2, z: 7 });
+    const url = mockFetch.mock.calls[0]![0] as string;
+    expect(url).toContain("/api/tile/src0?");
+    for (const q of ["level=1", "col=3", "row=4", "c=2", "z=7", "tensor_id=Image%3A0"]) {
+      expect(url).toContain(q);
+    }
+    expect((mockFetch.mock.calls[0]![1] as RequestInit).method).toBe("GET");
+  });
+
+  it("omits parameters the caller left undefined", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    await c.tile({ source_id: "src0" });
+    const url = mockFetch.mock.calls[0]![0] as string;
+    // Server defaults must not be re-encoded here, or two spellings of the same
+    // tile would occupy two browser-cache entries.
+    expect(url).toBe(`${BASE}/api/tile/src0`);
+  });
+
+  it("returns the array plus the grid the server actually used", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    const t = await c.tile({ source_id: "src0" });
+    expect(t.shape).toEqual([1, 1, 1, 2, 2]);
+    expect(t.dtype).toBe("uint16");
+    expect(t.buffer.byteLength).toBe(8);
+    expect([t.tileSize, t.level, t.col, t.row]).toEqual([512, 1, 3, 4]);
+  });
+
+  it("is cancellable", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.tile({ source_id: "src0" }, { signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+  });
+});
+
+describe("TensorHttpClient.tileImage", () => {
+  it("sends the render settings that form the cache key", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(
+      new Response(new Blob(["x"]), { status: 200, headers: { "Content-Type": "image/png" } }),
+    );
+    await c.tileImage({ source_id: "src0", fmt: "png", lo: 1, hi: 99, color: "green" });
+    const url = mockFetch.mock.calls[0]![0] as string;
+    for (const q of ["fmt=png", "lo=1", "hi=99", "color=green"]) {
+      expect(url).toContain(q);
+    }
+  });
+
+  it("defaults to jpeg", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(
+      new Response(new Blob(["x"]), { status: 200, headers: { "Content-Type": "image/jpeg" } }),
+    );
+    await c.tileImage({ source_id: "src0" });
+    expect(mockFetch.mock.calls[0]![0]).toContain("fmt=jpeg");
   });
 });

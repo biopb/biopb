@@ -217,3 +217,79 @@ export interface RenderResult {
   /** Output format used (from X-Image-Format header). */
   format?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Tiles
+// ---------------------------------------------------------------------------
+
+/** One pyramid level of a tensor's tile grid. */
+export interface TileLevel {
+  /** 0 is FULL resolution (Viv `PixelSource[]` order, not map-tile z order). */
+  level: number;
+  /** Downsample factor applied to Y/X at this level, i.e. 2**level. */
+  scale: number;
+  height: number;
+  width: number;
+  /** Grid extent at this level; the last row/column may be a short tile. */
+  cols: number;
+  rows: number;
+}
+
+/** Everything needed to address a tensor as a tile grid (`GET /api/tile_info`). */
+export interface TileInfo {
+  array_id: string;
+  dim_labels: string[];
+  shape: number[];
+  chunk_shape: number[];
+  dtype: string;
+  /**
+   * Square tile edge in pixels. Derived server-side from `chunk_shape` so a tile
+   * nests inside a stored chunk -- do NOT assume a constant across tensors.
+   */
+  tile_size: number;
+  /** Wire indices of the display plane; `s` is set only for interleaved RGB(A). */
+  plane: { y: number; x: number; s: number | null };
+  /** Wire index of each slider axis, or null when the tensor has no such axis. */
+  selectable: { t: number | null; z: number | null; c: number | null };
+  /**
+   * Non-plane axes with extent > 1 that `t`/`z`/`c` cannot reach.
+   *
+   * Served at index 0, with the rest of the axis unreachable through the tile
+   * route — an unlabelled axis, or the second of two sharing a label. Empty for
+   * an ordinary TCZYX tensor. Worth surfacing rather than ignoring: the viewer
+   * is showing one position of several and nothing else says so.
+   */
+  pinned: Array<{ axis: number; label: string; extent: number }>;
+  levels: TileLevel[];
+}
+
+/** Address of one tile. Omitted selection axes default to index 0. */
+export interface TileRequest {
+  source_id: string;
+  tensor_id?: string;
+  level?: number;
+  col?: number;
+  row?: number;
+  t?: number;
+  z?: number;
+  c?: number;
+  reduction_method?: string;
+}
+
+/** A rendered tile: appearance is baked server-side, so contrast is part of the key. */
+export interface TileImageRequest extends TileRequest {
+  fmt?: "png" | "jpeg";
+  lo?: number;
+  hi?: number;
+  color?: string;
+  use_min_max?: boolean;
+}
+
+/** A raw tile plus the grid the server actually served it from. */
+export interface TileResult extends TypedNdArray {
+  /** Echoed from `X-Tile-*`, so a client can check the grid it assumed. */
+  tileSize: number;
+  level: number;
+  col: number;
+  row: number;
+}
