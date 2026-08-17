@@ -78,6 +78,9 @@ importers:
       '@bufbuild/protobuf':
         specifier: ^2.2.4
         version: 2.12.1
+      '@vivjs/types':
+        specifier: 0.22.1
+        version: 0.22.1
     devDependencies:
       '@vitest/coverage-v8':
         specifier: ^4.1.5
@@ -404,6 +407,15 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+
+  '@luma.gl/constants@9.3.6':
+    resolution: {integrity: sha512-EIZopGJbaHIpj1smMWfz8/Xok3SnMGGbPo72DXVLs3JzST/w3AMrPMX1YUmWIA/op3Vdt7CxN6ikJWgRkanSVg==}
+
+  '@math.gl/core@4.1.0':
+    resolution: {integrity: sha512-FrdHBCVG3QdrworwrUSzXIaK+/9OCRLscxI2OUy6sLOHyHgBMyfnEGs99/m3KNvs+95BsnQLWklVfpKfQzfwKA==}
+
+  '@math.gl/types@4.1.0':
+    resolution: {integrity: sha512-clYZdHcmRvMzVK5fjeDkQlHUzXQSNdZ7s4xOqC3nJPgz4C/TZkUecTo9YS4PruZqtDda/ag4erndP0MIn40dGA==}
 
   '@napi-rs/wasm-runtime@1.1.6':
     resolution: {integrity: sha512-ZLv/JdUfkvOy9eCnnBaGfiO+XimbjebAeO+MRQqD/B+FR1tnRN0tpKSJHRbE8sFfS6aqsXZ67TQjfwfsxULVbg==}
@@ -820,6 +832,12 @@ packages:
 
   '@vitest/utils@4.1.10':
     resolution: {integrity: sha512-fy9am/HWxbaGt/Sawrp90vt6Y6jQwf1RX77cz3uwoJwJVMli/e1IEwRPnMNJ7vKfPTwo0diXifkpPvwH9v7nGA==}
+
+  '@vivjs/constants@0.22.1':
+    resolution: {integrity: sha512-ELBgiDskTYmikKTKFf4CGtQHlso9b1JFf+1RVYCB1jZD30ffKkCwrFSxBvCxPLqLIFFeiSzgrsC9Ps4FWX9mpg==}
+
+  '@vivjs/types@0.22.1':
+    resolution: {integrity: sha512-k9nHL3e8wcF3KAl70RiZWNhQJiA/MAtgSHy72DxUiYsXgBgNOHE2OeMzw/A26KgWFlLYHc0+MVOb7Jfj+xL5HA==}
 
   acorn-jsx@5.3.2:
     resolution: {integrity: sha512-rq9s+JNhf0IChjtDXxllJ7g41oZk5SlXtp0LHwyA5cejwn7vKmKp4pPri6YEePv2PU65sAsegbXtIinmDFDXgQ==}
@@ -1260,6 +1278,9 @@ packages:
   make-dir@4.0.0:
     resolution: {integrity: sha512-hXdUTZYIVOt1Ex//jAQi+wTZZpUpwBj/0QsOzqegb3rGMMeJiSEu5xLHnYfBrRV4RH2+OCSOO95Is/7x1WJ4bw==}
     engines: {node: '>=10'}
+
+  math.gl@4.1.0:
+    resolution: {integrity: sha512-FtvCJuuAlvn4358e2SkepTv2gnV7VTvu0y/hwkkjS/urDk+nY9x/4Tsn19LmaJl1wqKaqn+QFZhbnjAsuMOkWA==}
 
   minimatch@10.2.5:
     resolution: {integrity: sha512-MULkVLfKGYDFYejP07QOurDLLQpcjk7Fw+7jXS2R2czRQzR56yHRveU5NDJEOviH+hETZKSkIk5c+T23GjFUMg==}
@@ -1964,6 +1985,14 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
+  '@luma.gl/constants@9.3.6': {}
+
+  '@math.gl/core@4.1.0':
+    dependencies:
+      '@math.gl/types': 4.1.0
+
+  '@math.gl/types@4.1.0': {}
+
   '@napi-rs/wasm-runtime@1.1.6(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)':
     dependencies:
       '@emnapi/core': 1.11.1
@@ -2362,6 +2391,15 @@ snapshots:
       '@vitest/pretty-format': 4.1.10
       convert-source-map: 2.0.0
       tinyrainbow: 3.1.0
+
+  '@vivjs/constants@0.22.1':
+    dependencies:
+      '@luma.gl/constants': 9.3.6
+
+  '@vivjs/types@0.22.1':
+    dependencies:
+      '@vivjs/constants': 0.22.1
+      math.gl: 4.1.0
 
   acorn-jsx@5.3.2(acorn@8.17.0):
     dependencies:
@@ -2764,6 +2802,10 @@ snapshots:
   make-dir@4.0.0:
     dependencies:
       semver: 7.8.5
+
+  math.gl@4.1.0:
+    dependencies:
+      '@math.gl/core': 4.1.0
 
   minimatch@10.2.5:
     dependencies:

@@ -4,3 +4,4 @@ export * from "./admin-errors.js";
 export * from "./config-schema.js";
 export * from "./tensor-array.js";
 export * from "./tensor-flight-client.js";
+export * from "./viv-source.js";
