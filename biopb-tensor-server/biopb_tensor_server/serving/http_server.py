@@ -577,11 +577,28 @@ async def _abort_if_client_gone(request: Request, ctx: _SidecarContext) -> None:
 # on proxy overhead rather than pixels. See docs/remote-viewer-tiles.md.
 _TILE_TARGET_EDGE = 512
 
-# Tiles are cached by URL. Kept at an hour rather than `immutable` because tile
-# content is only stable while the array_id is: re-indexing a source today reuses
-# the id, so a year-long cache would pin stale pixels in every browser that saw
-# them. Move to `public, max-age=31536000, immutable` once the version lives in
-# the array_id namespace (the policy compact-grid settled on).
+# Tiles are cached by URL, and the URL carries no token -- auth rides in the
+# Authorization header so a token rotation does not invalidate the whole cache.
+# That makes `private` load-bearing rather than conservative: RFC 9111 section
+# 3.5 lets a *shared* cache reuse a response to an authenticated request for
+# some other request when the response says `public` (or `s-maxage`, or
+# `must-revalidate`), and with no token in the cache key that other request can
+# be an unauthenticated stranger's. An nginx proxy_cache, CDN, or corporate
+# proxy in front of a `--remote` deployment would then serve tiles with the
+# token checked exactly once, for someone else. `private` keeps the win we
+# actually wanted -- a per-user browser cache across pan/zoom and reload -- and
+# withholds the one that cannot be made safe under bearer auth.
+#
+# `Vary: Authorization` is belt-and-braces for a cache that stores it anyway:
+# entries then key on the credential instead of colliding across users.
+#
+# An hour rather than `immutable` because tile content is only stable while the
+# array_id is: re-indexing a source today reuses the id, so a year-long cache
+# would pin stale pixels in every browser that saw them. Lengthening this needs
+# the version in the array_id namespace (the policy compact-grid settled on);
+# `public` needs a different auth model altogether, e.g. signed URLs that put
+# the grant in the cache key.
+_TILE_CACHE_CONTROL_TEMPLATE = "private, max-age={max_age}"
 _TILE_MAX_AGE = 3600
 
 
@@ -1154,6 +1171,10 @@ async def get_tile(
     Response headers mirror /api/slice (``X-Shape``/``X-Dtype``/``X-Dim-Labels``)
     plus ``X-Tile-Size``/``X-Tile-Level``/``X-Tile-Col``/``X-Tile-Row`` so a
     client can verify the grid it assumed against the one it got.
+
+    Cached ``private`` only, never ``public`` -- see ``_TILE_MAX_AGE``: the URL
+    holds no token, so `public` would authorise a shared cache to hand an
+    authenticated tile to whoever asks next.
     """
     ctx = _sidecar(request)
     ctx.check_token(request)
@@ -1213,7 +1234,8 @@ async def get_tile(
     )
     cache_headers = {
         "ETag": etag,
-        "Cache-Control": f"public, max-age={_TILE_MAX_AGE}",
+        "Cache-Control": _TILE_CACHE_CONTROL_TEMPLATE.format(max_age=_TILE_MAX_AGE),
+        "Vary": "Authorization",
         "X-Tile-Size": str(edge),
         "X-Tile-Level": str(level),
         "X-Tile-Col": str(col),

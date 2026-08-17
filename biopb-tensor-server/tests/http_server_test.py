@@ -1555,6 +1555,40 @@ class TestTileEndpoint:
         assert "max-age" in r.headers["Cache-Control"]
         assert r.headers["ETag"].startswith('"')
 
+    def test_cache_is_private_never_public(self, tile_client):
+        """`public` on a token-authenticated response is a shared-cache bypass.
+
+        The URL carries no token (auth is a header, so rotation does not bust the
+        cache), and RFC 9111 §3.5 lets a shared cache reuse a response to an
+        authenticated request for *another* request when the response says
+        `public` / `s-maxage` / `must-revalidate`. With no token in the cache key
+        that other request can be an unauthenticated one, so an nginx
+        proxy_cache or CDN in front of a `--remote` deployment would serve tiles
+        having checked the token once, for someone else.
+        """
+        tc, _ = tile_client
+        cc = tc.get("/api/tile/tiled").headers["Cache-Control"]
+        assert "private" in cc
+        for shared in ("public", "s-maxage", "must-revalidate"):
+            assert shared not in cc, f"{shared!r} re-opens the shared-cache bypass"
+
+    def test_varies_on_the_credential(self, tile_client):
+        tc, _ = tile_client
+        # Belt-and-braces: a cache that stores it anyway keys on the token
+        # rather than colliding entries across users.
+        assert "Authorization" in tc.get("/api/tile/tiled").headers["Vary"]
+
+    def test_a_304_is_no_more_shareable_than_a_200(self, tile_client):
+        # The revalidation path reuses the same header dict; if it ever stops
+        # doing so, the cheap response is the one that leaks.
+        tc, _ = tile_client
+        etag = tc.get("/api/tile/tiled").headers["ETag"]
+        r = tc.get("/api/tile/tiled", headers={"If-None-Match": etag})
+        assert r.status_code == 304
+        assert "private" in r.headers["Cache-Control"]
+        assert "public" not in r.headers["Cache-Control"]
+        assert "Authorization" in r.headers["Vary"]
+
     def test_matching_etag_revalidates_to_304_without_reading(self, tile_client):
         tc, mock_fc = tile_client
         etag = tc.get("/api/tile/tiled").headers["ETag"]

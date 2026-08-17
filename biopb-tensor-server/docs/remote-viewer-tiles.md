@@ -151,16 +151,33 @@ GET /data_plane/api/tile/{source}/{tensor}/{level}/{col}_{row}?fmt=jpeg&t=0&z=42
 `POST /api/slice` cannot be cached by any browser under any header. It stays for the
 3D slab and large-body requests; the tile read path needs its own GET.
 
-**Headers.** `Cache-Control: public, immutable, max-age=<long>` plus an `ETag`.
-`immutable` is genuinely correct — a tile at (source version, tensor, level, coords,
-selection) never changes content. Staleness is handled by versioning the `array_id`
-namespace, **not** by putting a version in the cache key (same conclusion as the
-compact-grid work: `chunk_id` stays an opaque server-side token).
+**Headers.** `Cache-Control: private, max-age=3600` plus `Vary: Authorization` and an
+`ETag`. Staleness is handled by versioning the `array_id` namespace, **not** by putting
+a version in the cache key (same conclusion as the compact-grid work: `chunk_id` stays
+an opaque server-side token) — so `immutable` and a long `max-age` wait on that
+versioning, since re-indexing currently reuses the id.
 
 **Auth stays out of the URL.** `ws/render` passes `?token=`; do not carry that over.
 A token in a tile URL means one cache entry per token and tokens in access logs. Use
 the `Authorization` header — the client is on `fetch` anyway, and the browser caches
 by URL, so tokens can rotate without invalidating anything.
+
+**Which is exactly why the cache must be `private`.** These two decisions interact,
+and the first draft of this document got it wrong by recommending `public`. RFC 9111
+§3.5 permits a **shared** cache to reuse a response to a request bearing
+`Authorization` for a *different* request when the response carries `public`,
+`s-maxage`, or `must-revalidate`. Since auth is a header, the cache key — the URL —
+contains no token at all, so that "different request" can be an unauthenticated
+stranger's. An nginx `proxy_cache`, CDN, or corporate proxy in front of a `--remote`
+deployment would then serve tiles having checked the token exactly once, for someone
+else. Local mode is unaffected (nothing shared is in the loopback path), but the
+directive is an instruction to intermediaries we do not control, so it must not be
+sent.
+
+`private` keeps everything the tiled design actually needs: a per-user browser cache
+across pan and zoom, and cheap `ETag` revalidation on reload. It gives up only CDN
+caching, which bearer auth cannot make safe in any case — that would need the grant in
+the cache key, i.e. signed URLs, not a header change.
 
 **`fmt` is the escape hatch, and it must exist from day one.** A `PixelSource`
 returning server-rendered 8-bit RGB tiles is still a valid `PixelSource` — Viv renders

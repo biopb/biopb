@@ -120,7 +120,7 @@ the selection `t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, pl
 |---|---|
 | `fmt=raw` | `application/octet-stream`, the tensor's own dtype, C-contiguous. `X-Shape` / `X-Dtype` / `X-Dim-Labels` as on `/api/slice` |
 | `fmt=png\|jpeg` | image bytes, plus `X-Image-Width` / `-Height` and `X-Percentile-Lo-Value` / `-Hi-Value` |
-| always | `ETag`, `Cache-Control: public, max-age=3600`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
+| always | `ETag`, `Cache-Control: private, max-age=3600`, `Vary: Authorization`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
 
 `If-None-Match` revalidates to **304 without touching the backend**. The ETag
 covers render settings only for the rendered formats, so adjusting contrast does
@@ -132,6 +132,18 @@ A tile outside the level's grid is **404**; a selection index outside its axis i
 > Caching is `max-age`, not `immutable`, because a tile's bytes are only stable
 > while its `array_id` is, and re-indexing currently reuses the id. Tighten both
 > together once the version lives in the array_id namespace.
+
+> **`private`, never `public`.** The URL carries no token — auth is a header, so
+> rotation does not bust the cache — and RFC 9111 §3.5 lets a *shared* cache reuse
+> a response to an authenticated request for a *different* request when the
+> response says `public` (or `s-maxage`, or `must-revalidate`). With no token in
+> the cache key that other request can be an unauthenticated one, so an nginx
+> `proxy_cache`, CDN, or corporate proxy in front of a `--remote` deployment would
+> serve tiles with the token checked exactly once, for someone else. `private`
+> keeps the per-user browser cache that the tiled design actually needs and
+> withholds the shared-cache reuse that bearer auth cannot make safe. CDN caching
+> would need a different grant in the cache key — signed URLs — not a header
+> change.
 
 ## Cancellation
 
