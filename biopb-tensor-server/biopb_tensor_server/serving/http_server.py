@@ -688,6 +688,43 @@ def _tile_levels(
         level += 1
 
 
+def _resolve_tile_level(
+    levels: List[Dict[str, int]], level: int, col: int, row: int
+) -> Dict[str, int]:
+    """The advertised grid entry a request addresses, or 404.
+
+    The single gate on ``(level, col, row)``, checked against exactly the list
+    ``/api/tile_info`` publishes so the two cannot disagree about what exists.
+
+    ``level`` needs this most and is the least obvious: an unadvertised level is
+    not a harmless over-zoom. ``scale_hint`` is honoured all the way down into
+    ``downsample_block``, which pads its input up to a multiple of the scale
+    factor before reducing -- so level 17 on a 512x512 plane asks the *data
+    plane* to allocate and edge-pad a 65536x65536 array. numpy refuses the
+    absurd sizes (a 502), but the band that merely exhausts memory succeeds and
+    writes it, in a process shared by every other caller. One query parameter
+    must not size an allocation in the backend.
+    """
+    if level >= len(levels):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"level {level} does not exist "
+                f"(this tensor has {len(levels)}: 0..{len(levels) - 1})"
+            ),
+        )
+    entry = levels[level]
+    if col >= entry["cols"] or row >= entry["rows"]:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"tile ({col},{row}) is outside level {level} "
+                f"({entry['cols']}x{entry['rows']} tiles)"
+            ),
+        )
+    return entry
+
+
 def _tile_slices(
     td: Any,
     y_idx: int,
@@ -704,6 +741,9 @@ def _tile_slices(
     Bounds are full-resolution world coordinates (the units ``slice_hint`` is
     applied in, before scaling); ``scale_hint`` then downsamples Y/X by
     ``2**level`` so the returned plane is at most ``edge x edge``.
+
+    Assumes ``(level, col, row)`` already passed :func:`_resolve_tile_level`;
+    this derives geometry and does not re-check it.
     """
     from biopb_tensor_server.core.axes import labeled_axis_index
 
@@ -713,11 +753,6 @@ def _tile_slices(
     step = edge * scale
 
     y0, x0 = row * step, col * step
-    if y0 >= shape[y_idx] or x0 >= shape[x_idx]:
-        raise HTTPException(
-            status_code=404,
-            detail=f"tile ({col},{row}) is outside level {level}",
-        )
 
     start = [0] * len(shape)
     stop = list(shape)
@@ -1211,6 +1246,11 @@ async def get_tile(
         )
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
+
+    # Before the ETag, not after: a revalidation must not be able to answer 304
+    # for a tile that does not exist, and an out-of-grid request should cost the
+    # same 404 whether or not the caller happens to hold a matching ETag.
+    _resolve_tile_level(_tile_levels(shape, y_idx, x_idx, edge), level, col, row)
 
     render_identity = (
         [("lo", lo), ("hi", hi), ("color", color), ("mm", use_min_max)]

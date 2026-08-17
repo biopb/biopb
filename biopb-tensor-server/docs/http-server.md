@@ -122,12 +122,26 @@ the selection `t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, pl
 | `fmt=png\|jpeg` | image bytes, plus `X-Image-Width` / `-Height` and `X-Percentile-Lo-Value` / `-Hi-Value` |
 | always | `ETag`, `Cache-Control: private, max-age=3600`, `Vary: Authorization`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
 
-`If-None-Match` revalidates to **304 without touching the backend**. The ETag
-covers render settings only for the rendered formats, so adjusting contrast does
-not fragment the raw-tile cache (raw contrast is a client-side shader concern).
+`If-None-Match` revalidates to **304 without reading tile data**. Revalidation
+still consults the catalog to resolve the tensor descriptor and compute the
+ETag, but it does not call `get_tensor()` or run a data read. The ETag covers
+render settings only for the rendered formats, so adjusting contrast does not
+fragment the raw-tile cache (raw contrast is a client-side shader concern).
 
-A tile outside the level's grid is **404**; a selection index outside its axis is
-**422**.
+`(level, col, row)` is validated against exactly the grid `/api/tile_info`
+publishes — a level the tensor does not have, or a tile outside that level's
+`cols`×`rows`, is **404**. A selection index outside its axis is **422**.
+
+Validation runs *before* the ETag check, so a nonexistent tile cannot be turned
+into a cheap 304 by a stale or forged `If-None-Match`.
+
+> **`level` is not a harmless over-zoom.** `scale_hint` is honoured down into
+> `downsample_block`, which edge-pads its input up to a multiple of the scale
+> factor: level 17 on a 512px plane would ask the *data plane* to allocate and
+> write a 65536×65536 array, in the Flight process shared by every other caller.
+> numpy refuses the absurd sizes (surfacing as 502), but the band that merely
+> exhausts memory succeeds. Hence the level gate, and hence it rejects before
+> `get_tensor()` rather than letting the read path discover it.
 
 > Caching is `max-age`, not `immutable`, because a tile's bytes are only stable
 > while its `array_id` is, and re-indexing currently reuses the id. Tighten both

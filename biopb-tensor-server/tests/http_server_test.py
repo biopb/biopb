@@ -1540,6 +1540,72 @@ class TestTileEndpoint:
         r = tc.get("/api/tile/tiled", params={"level": 0, "col": 99, "row": 0})
         assert r.status_code == 404
 
+    def test_row_outside_the_grid_is_404_too(self, tile_client):
+        tc, _ = tile_client
+        assert tc.get("/api/tile/tiled", params={"row": 99}).status_code == 404
+
+    def test_a_level_the_tensor_does_not_have_is_404(self, tile_client):
+        """An unadvertised level must not be served, at any grid position.
+
+        `col`/`row` cannot catch this: the old grid check was
+        `row * edge * 2**level >= height`, which at (0,0) is `0 >= height` --
+        false for every level. So tile (0,0) was reachable at any depth.
+        """
+        tc, mock_fc = tile_client
+        n_levels = len(tc.get("/api/tile_info/tiled").json()["levels"])
+        for level in (n_levels, n_levels + 3, 17, 24):
+            r = tc.get("/api/tile/tiled", params={"level": level})
+            assert r.status_code == 404, f"level {level} was served"
+            assert "does not exist" in r.json()["detail"]
+
+    def test_an_over_deep_level_never_reaches_the_backend(self, tile_client):
+        """The reason this is a 404 and not a curiosity.
+
+        `scale_hint` is honoured down into `downsample_block`, which edge-pads
+        its input up to a multiple of the scale factor. Level 17 on a 512px
+        plane therefore asks the data plane to allocate and write a 65536x65536
+        array -- measured: level 13 already pads to 8192x8192, and the cost
+        scales with the square. Rejecting before `get_tensor` is what keeps one
+        query parameter from sizing an allocation in a shared backend process.
+        """
+        tc, mock_fc = tile_client
+        before = mock_fc.get_tensor.call_count
+        assert tc.get("/api/tile/tiled", params={"level": 17}).status_code == 404
+        assert mock_fc.get_tensor.call_count == before
+
+    def test_the_advertised_grid_is_exactly_what_is_servable(self, tile_client):
+        """tile_info and /api/tile must agree; they used to derive it twice."""
+        tc, _ = tile_client
+        info = tc.get("/api/tile_info/tiled").json()
+        for lv in info["levels"]:
+            args = {"level": lv["level"], "col": lv["cols"] - 1, "row": lv["rows"] - 1}
+            assert tc.get("/api/tile/tiled", params=args).status_code == 200
+            # One past each edge of the advertised grid is gone.
+            assert (
+                tc.get(
+                    "/api/tile/tiled", params={**args, "col": lv["cols"]}
+                ).status_code
+                == 404
+            )
+            assert (
+                tc.get(
+                    "/api/tile/tiled", params={**args, "row": lv["rows"]}
+                ).status_code
+                == 404
+            )
+
+    def test_a_bad_tile_404s_even_holding_a_matching_etag(self, tile_client):
+        # Validation runs before the revalidation short-circuit, so a stale or
+        # forged ETag cannot turn a nonexistent tile into a cheap 304.
+        tc, _ = tile_client
+        etag = tc.get("/api/tile/tiled").headers["ETag"]
+        r = tc.get(
+            "/api/tile/tiled",
+            params={"level": 17},
+            headers={"If-None-Match": etag},
+        )
+        assert r.status_code == 404
+
     def test_selection_out_of_range_is_422(self, tile_client):
         tc, _ = tile_client
         r = tc.get("/api/tile/tiled", params={"c": 99})
