@@ -177,6 +177,8 @@ function makeSource(
   options: TensorPixelSourceOptions,
 ): PixelSource<string[]> {
   const { plane } = info;
+  // Values per pixel: >1 only for an interleaved RGB(A) samples axis.
+  const samples = plane.s === null ? 1 : Math.max(1, info.shape[plane.s] ?? 1);
   // Per-level shape: only the plane shrinks, the slider axes are unchanged.
   const shape = info.shape.map((extent, i) =>
     i === plane.y ? level.height : i === plane.x ? level.width : extent,
@@ -199,7 +201,7 @@ function makeSource(
       // Answering locally with zeros costs no round trip and keeps the layer
       // from treating a routine 404 as a load failure.
       if (x < 0 || y < 0 || x >= level.cols || y >= level.rows) {
-        return emptyTile(info.tile_size, dtype);
+        return emptyTile(info.tile_size, dtype, samples);
       }
       const result = await client.tile(
         {
@@ -262,13 +264,22 @@ function makeSource(
   };
 }
 
-/** A zero tile for an out-of-grid request, sized as Viv expects. */
-function emptyTile(tileSize: number, dtype: SupportedDtype): PixelData {
-  return {
-    data: new TYPED_ARRAY_BY_DTYPE[dtype](tileSize * tileSize) as SupportedTypedArray,
-    width: tileSize,
-    height: tileSize,
-  };
+/**
+ * A zero tile for an out-of-grid request, shaped like a real one.
+ *
+ * `samples` is load-bearing: an interleaved RGB(A) tensor carries that many
+ * values per pixel, so a plain `tileSize * tileSize` buffer is a third (or a
+ * quarter) of what the layer will upload. WebGL then rejects the texture or
+ * reads past the end -- and only when a viewport pans off the edge of an RGB
+ * image, which is ordinary interaction rather than an edge case.
+ */
+function emptyTile(
+  tileSize: number,
+  dtype: SupportedDtype,
+  samples: number,
+): PixelData {
+  const data = new TYPED_ARRAY_BY_DTYPE[dtype](tileSize * tileSize * samples);
+  return { data: data as SupportedTypedArray, width: tileSize, height: tileSize };
 }
 
 /**

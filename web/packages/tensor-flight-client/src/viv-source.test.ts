@@ -204,6 +204,28 @@ describe("PixelSource.getTile", () => {
     const px = await half!.getTile({ x: 5, y: 0, selection: { t: 0, c: 0, z: 0 } });
     expect(client.tile).not.toHaveBeenCalled();
     expect(px.data.every((v) => v === 0)).toBe(true);
+    // Zeros alone is a trivially-true assertion on an undersized buffer, so
+    // pin the length too.
+    expect(px.data.length).toBe(px.width * px.height);
+  });
+
+  it("sizes an out-of-grid RGB tile for its samples, not just its pixels", async () => {
+    // Interleaved RGB carries 3 values per pixel. A plain width*height buffer
+    // is a third of what the layer uploads, so WebGL rejects the texture or
+    // reads past the end -- and only when a viewport pans off the edge.
+    const client = stubClient({
+      tile: vi.fn(async (_req: TileRequest, _opts?: RequestOptions) => ({
+        buffer: new ArrayBuffer(512 * 512 * 3),
+        shape: [1, 1, 1, 512, 512, 3],
+        dtype: "uint8", dimLabels: [], tileSize: 512, level: 0, col: 0, row: 0,
+      })),
+    });
+    const [full] = pixelSourcesFromInfo(client, RGB_INFO);
+    const real = await full!.getTile({ x: 0, y: 0, selection: { t: 0, c: 0, z: 0 } });
+    const oob = await full!.getTile({ x: 99, y: 0, selection: { t: 0, c: 0, z: 0 } });
+    expect(oob.data.length).toBe(real.data.length);
+    expect(oob.data.length).toBe(512 * 512 * 3);
+    expect(oob.data).toBeInstanceOf(Uint8Array);
   });
 
   it("forwards Viv's abort signal to the request", async () => {
