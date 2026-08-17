@@ -58,6 +58,16 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   // Get current color - subscribe to channelColors directly so color changes trigger re-renders
   const color: ColorValue = channelColors[sourceId]?.[slice.c] ?? "auto";
 
+  // What the server is actually asked to draw with. The render request carries a
+  // resolved colour, not "auto" plus a name, so this is what decides whether a
+  // new render is needed: a name landing changes it only when the name means
+  // something (DAPI -> blue), and asking the server to redraw an unnamed channel
+  // grey-for-grey would be a round trip for nothing.
+  const resolvedColor = useMemo(
+    () => resolveAutoColor(color, currentChannelName),
+    [color, currentChannelName],
+  );
+
   // Get token for WebSocket auth
   const token = useMemo(() => {
     if (devMode) return null;
@@ -109,8 +119,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     reductionMethod: slice.reductionMethod,
     useMinMax: slice.useMinMax,
     percentileScale: slice.percentileScale,
-    color,
-    currentChannelName,
+    resolvedColor,
     percentileLo,
     percentileHi,
   });
@@ -273,8 +282,10 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       reductionMethod: s.slice.reductionMethod,
       useMinMax: s.slice.useMinMax,
       percentileScale: s.slice.percentileScale,
-      color: s.getChannelColor(sourceId, s.slice.c),
-      currentChannelName: s.channelNames[sourceId]?.[s.slice.c] ?? undefined,
+      resolvedColor: resolveAutoColor(
+        s.getChannelColor(sourceId, s.slice.c),
+        s.channelNames[sourceId]?.[s.slice.c] ?? undefined,
+      ),
       percentileLo: s.slice.useMinMax ? 0 : s.slice.percentileScale / 100,
       percentileHi: s.slice.useMinMax ? 1 : 1 - s.slice.percentileScale / 100,
     };
@@ -307,14 +318,6 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     requestRender({ y: [0, fullHeight], x: [0, fullWidth] }, scaleResult.factors);
   }, [descriptor, fullWidth, fullHeight, requestRender]);
 
-  // Keep prevSliceRef.currentChannelName in sync so the slice-change effect below doesn't
-  // misfire when channel names load asynchronously after the initial render. This effect
-  // runs first (effects run in declaration order), so by the time the slice-change effect
-  // evaluates, prev.currentChannelName already matches.
-  useEffect(() => {
-    prevSliceRef.current.currentChannelName = currentChannelName;
-  }, [currentChannelName]);
-
   // Detect slice changes and request render - compare with previous values
   useEffect(() => {
     const prev = prevSliceRef.current;
@@ -325,8 +328,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       prev.reductionMethod !== slice.reductionMethod ||
       prev.useMinMax !== slice.useMinMax ||
       prev.percentileScale !== slice.percentileScale ||
-      prev.color !== color ||
-      prev.currentChannelName !== currentChannelName ||
+      prev.resolvedColor !== resolvedColor ||
       prev.percentileLo !== percentileLo ||
       prev.percentileHi !== percentileHi;
 
@@ -367,8 +369,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       reductionMethod: slice.reductionMethod,
       useMinMax: slice.useMinMax,
       percentileScale: slice.percentileScale,
-      color,
-      currentChannelName,
+      resolvedColor,
       percentileLo,
       percentileHi,
     };
@@ -381,8 +382,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     slice.reductionMethod,
     slice.useMinMax,
     slice.percentileScale,
-    color,
-    currentChannelName,
+    resolvedColor,
     percentileLo,
     percentileHi,
     fullWidth,
