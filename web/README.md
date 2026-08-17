@@ -36,7 +36,7 @@ is a client route of the same bundle:
 | `/session/:id/observe`         | `ObservePage`    | `/session/:id/api/*` (proxied to child)|
 
 `main.tsx` wires the routes; the dashboard and observe pages are `React.lazy`
-chunks so the observe shell doesn't pull the heavy Pixi/Arrow viewer. Assets are
+chunks, and the tiled viewer is another, so no other route pulls deck.gl. Assets are
 requested from the absolute root (`/assets/*`), so they resolve no matter which
 prefix (`/`, `/viewer`, `/session/<id>/observe`) the shell was served under.
 
