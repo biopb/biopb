@@ -170,25 +170,14 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         }
       }
 
-      // Resolve color: if "auto", use channel name or fallback based on channel index
+      // Resolve color: if "auto", guess from the channel name, grey until it
+      // loads. The names arrive asynchronously and this render does not wait for
+      // them, so the pre-load answer has to be one the post-load answer can
+      // agree with.
       const rawColor = useAppStore.getState().getChannelColor(sourceId, currentSlice.c);
       const names = useAppStore.getState().channelNames[sourceId];
       const channelName = names?.[currentSlice.c] ?? undefined;
-
-      // Resolve "auto" to actual pseudo-color
-      let resolvedColor: ColorValue;
-      if (rawColor === "auto") {
-        if (channelName) {
-          resolvedColor = resolveAutoColor("auto", channelName);
-        } else {
-          // No channel name loaded yet - use default based on channel index
-          // Cycle through: green, red, blue, magenta, cyan
-          const defaultColors: ColorValue[] = ["green", "red", "blue", "magenta", "cyan"];
-          resolvedColor = defaultColors[currentSlice.c % defaultColors.length] ?? "green";
-        }
-      } else {
-        resolvedColor = rawColor;
-      }
+      const resolvedColor: ColorValue = resolveAutoColor(rawColor, channelName);
 
       const pLo = currentSlice.useMinMax ? 0 : currentSlice.percentileScale / 100;
       const pHi = currentSlice.useMinMax ? 1 : 1 - currentSlice.percentileScale / 100;

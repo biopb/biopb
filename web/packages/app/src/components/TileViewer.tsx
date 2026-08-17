@@ -25,7 +25,6 @@ import {
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
-import { resolveAutoColor } from "../utils/colorUtils";
 import {
   contrastLimitsFrom,
   contrastSamples,
@@ -152,14 +151,11 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // --- colour -------------------------------------------------------------
   const color = useMemo(() => {
     const stored = channelColors[sourceId]?.[slice.c] ?? "auto";
-    const name = channelNames[sourceId]?.[slice.c];
-    // Without a channel name "auto" has nothing to guess from; cycle by index
-    // so two loaded channels are at least distinguishable.
-    const resolved =
-      stored === "auto" && !name
-        ? (["green", "red", "blue", "magenta", "cyan"][slice.c % 5] ?? "green")
-        : resolveAutoColor(stored, name);
-    return vivColor(resolved, name);
+    // `channelNames` is filled asynchronously, so this runs at least once with
+    // the name still unknown. `resolveAutoColor` answers grey then and grey
+    // again once an unrecognised name lands, which is what keeps the first
+    // frames from being a different colour than the settled one.
+    return vivColor(stored, channelNames[sourceId]?.[slice.c]);
   }, [channelColors, channelNames, sourceId, slice.c]);
 
   const maxCacheSize = useMemo(
