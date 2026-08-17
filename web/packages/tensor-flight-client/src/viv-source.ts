@@ -195,6 +195,16 @@ function makeSource(
     shape,
     dtype,
     tileSize: info.tile_size,
+    // `meta` is optional in Viv's own type, but `ImageLayer.renderLayers` reads
+    // `loader.meta.photometricInterpretation` unguarded on the interleaved
+    // branch -- the destructuring default only covers a missing property, not a
+    // missing object. Without this an RGB(A) tensor throws inside deck.gl and
+    // renders nothing at all, silently: the tiles are fetched, the canvas stays
+    // empty, and the failure only shows up in the console.
+    //
+    // 2 is TIFF PhotometricInterpretation RGB, which is what the server sends
+    // for an interleaved samples axis and what Viv itself defaults to.
+    meta: { photometricInterpretation: 2 },
 
     async getTile({ x, y, selection, signal }: TileSelection<string[]>): Promise<PixelData> {
       // deck.gl can ask for a tile past the edge while the viewport settles.

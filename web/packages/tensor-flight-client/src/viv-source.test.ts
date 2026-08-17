@@ -184,6 +184,22 @@ describe("PixelSource.getTile", () => {
     expect([px.width, px.height]).toEqual([512, 512]);
   });
 
+  it("carries `meta`, which Viv dereferences unguarded for interleaved data", () => {
+    // ImageLayer.renderLayers does `const { photometricInterpretation = 2 } =
+    // loader.meta` on the interleaved branch. The destructuring default covers a
+    // missing property, not a missing object, so a source without `meta` throws
+    // inside deck.gl and renders nothing -- while the tiles fetch normally and
+    // the canvas just stays blank. `meta` is optional in Viv's own type, so
+    // nothing but this test holds the line.
+    const client = stubClient({});
+    for (const info of [RGB_INFO, INFO]) {
+      for (const source of pixelSourcesFromInfo(client, info)) {
+        expect(source.meta).toBeDefined();
+        expect(source.meta!.photometricInterpretation).toBe(2);
+      }
+    }
+  });
+
   it("reports the served size for a short edge tile", async () => {
     const client = stubClient({
       tile: vi.fn(async (_req: TileRequest, _opts?: RequestOptions) => ({
