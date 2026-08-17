@@ -70,8 +70,8 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
-| `GET` | `/api/tile_info/{id}` | ✓ | Tile grid, pyramid levels and selectable axes for one tensor |
-| `GET` | `/api/tile/{id}` | ✓ | One tile, cacheable (`fmt=raw\|png\|jpeg`) |
+| `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels and selectable axes for one tensor |
+| `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (`fmt=raw\|png\|jpeg`) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
 | `POST` | `/api/render` | ✓ | Server-rendered RGB image of a slice |
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
@@ -93,8 +93,19 @@ no session state — each render is an independent request/response.
 
 Design rationale in `remote-viewer-tiles.md`; this is the contract.
 
-`GET /api/tile_info/{source_id}?tensor_id=…` reports everything needed to address
-the tensor as a tile grid — shaped to drop into a Viv `PixelSource[]`:
+**Addressed by `array_id` alone**, per the identity policy at the top of
+`proto/biopb/tensor/descriptor.proto` — not the `(source_id, tensor_id)` pair the
+older routes here take. array_id is globally unique and authoritative; `source_id`
+is only the slash-free routing prefix. The path is `{array_id:path}`, so a field
+containing `/` (HCS `plate/A01/0`) is captured whole, percent-encoded or not.
+
+A bare source_id remains valid for a **single-tensor** source, which is what the
+policy says its array_id *is*. For a multi-tensor source it is **404**, listing the
+available array_ids, rather than silently resolving to the first tensor
+(biopb/biopb#75).
+
+`GET /api/tile_info/{array_id}` reports everything needed to address the tensor as
+a tile grid — shaped to drop into a Viv `PixelSource[]`:
 
 ```json
 {
@@ -120,8 +131,8 @@ map-tile one where z grows with detail); each level halves. `tile_size` is deriv
 from `chunk_shape` so a tile *nests* inside a stored chunk rather than straddling
 one — clients must not assume a constant.
 
-`GET /api/tile/{source_id}` takes `level`, `col`, `row`, optional `tensor_id`,
-the selection `t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, plus
+`GET /api/tile/{array_id}` takes `level`, `col`, `row`, the selection
+`t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, plus
 `lo` / `hi` / `color` / `use_min_max` for the rendered formats).
 
 | | |

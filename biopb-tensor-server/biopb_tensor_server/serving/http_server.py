@@ -602,23 +602,46 @@ _TILE_CACHE_CONTROL_TEMPLATE = "private, max-age={max_age}"
 _TILE_MAX_AGE = 3600
 
 
-def _tensor_desc_for(
-    client: TensorFlightClient, source_id: str, tensor_id: Optional[str]
-) -> Any:
-    """The catalog TensorDescriptor a request addresses, or ``None``.
+def _tensor_desc_by_array_id(client: TensorFlightClient, array_id: str) -> Any:
+    """The catalog TensorDescriptor named by *array_id*, or ``None``.
 
-    Unlike :func:`_dim_labels_for` (best-effort decoration) the tile routes read
-    geometry off this, so the caller turns a miss into a 404 rather than
-    falling back.
+    Addressed by array_id ALONE, per the identity policy at the top of
+    ``proto/biopb/tensor/descriptor.proto``: array_id is globally unique and
+    authoritative, ``source_id`` is only the slash-free routing prefix. The
+    older routes here take a ``(source_id, tensor_id)`` pair and rejoin it with
+    :func:`_request_array_id` before reading -- a split made only to be undone,
+    and one that let geometry and the read resolve differently (a bare
+    multi-tensor id gave tensor[0]'s shape while the read went to the source's
+    own default).
+
+    A bare source_id stays valid for a single-tensor source, which is what the
+    policy says its array_id *is*. For a multi-tensor source it is refused
+    rather than guessed (biopb/biopb#75); the caller turns ``None`` into a 404.
     """
     sources = client.list_sources()
-    desc = sources.get(source_id)
+    desc = sources.get(array_id.split("/", 1)[0])
     if desc is None:
         return None
     for td in desc.tensors:
-        if not tensor_id or _tensor_matches(td.array_id, tensor_id, source_id):
+        if td.array_id == array_id:
             return td
+    if array_id == desc.source_id and len(desc.tensors) == 1:
+        return desc.tensors[0]
     return None
+
+
+def _tensor_candidates(client: TensorFlightClient, array_id: str) -> List[str]:
+    """array_ids of the source *array_id* points at, for a 404 that helps."""
+    desc = client.list_sources().get(array_id.split("/", 1)[0])
+    return [td.array_id for td in desc.tensors] if desc else []
+
+
+def _no_such_tensor(array_id: str, candidates: List[str]) -> str:
+    """404 text. Naming the alternatives is most of the value when the caller
+    addressed a multi-tensor source by its bare source_id."""
+    if candidates:
+        return f"No tensor {array_id!r}; this source has: {', '.join(candidates)}"
+    return f"No tensor {array_id!r}"
 
 
 def _tile_edge(
@@ -1180,12 +1203,8 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
 # -- Tiles (cacheable GET reads) --------------------------------------------
 
 
-@_router.get("/api/tile_info/{source_id:path}")
-async def tile_info(
-    source_id: str,
-    request: Request,
-    tensor_id: Optional[str] = Query(None),
-) -> JSONResponse:
+@_router.get("/api/tile_info/{array_id:path}")
+async def tile_info(array_id: str, request: Request) -> JSONResponse:
     """Everything a tiled client needs to address this tensor.
 
     The browser must not derive the tile grid itself: the edge follows the
@@ -1197,7 +1216,8 @@ async def tile_info(
     ctx.check_token(request)
     try:
         client = ctx.get_client()
-        td = _tensor_desc_for(client, source_id, tensor_id)
+        td = _tensor_desc_by_array_id(client, array_id)
+        candidates = [] if td is not None else _tensor_candidates(client, array_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1207,7 +1227,7 @@ async def tile_info(
         )
     if td is None:
         raise HTTPException(
-            status_code=404, detail=f"Tensor not found: {source_id}/{tensor_id}"
+            status_code=404, detail=_no_such_tensor(array_id, candidates)
         )
 
     from biopb_tensor_server.core.axes import labeled_axis_index, plane_axes
@@ -1241,14 +1261,13 @@ async def tile_info(
     )
 
 
-@_router.get("/api/tile/{source_id:path}")
+@_router.get("/api/tile/{array_id:path}")
 async def get_tile(
-    source_id: str,
+    array_id: str,
     request: Request,
     level: int = Query(0, ge=0, le=24),
     col: int = Query(0, ge=0),
     row: int = Query(0, ge=0),
-    tensor_id: Optional[str] = Query(None),
     t: int = Query(0, ge=0),
     z: int = Query(0, ge=0),
     c: int = Query(0, ge=0),
@@ -1293,7 +1312,12 @@ async def get_tile(
 
     try:
         client = await run_in_threadpool(ctx.get_client)
-        td = await run_in_threadpool(_tensor_desc_for, client, source_id, tensor_id)
+        td = await run_in_threadpool(_tensor_desc_by_array_id, client, array_id)
+        candidates = (
+            []
+            if td is not None
+            else await run_in_threadpool(_tensor_candidates, client, array_id)
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -1303,7 +1327,7 @@ async def get_tile(
         )
     if td is None:
         raise HTTPException(
-            status_code=404, detail=f"Tensor not found: {source_id}/{tensor_id}"
+            status_code=404, detail=_no_such_tensor(array_id, candidates)
         )
 
     from biopb_tensor_server.core.axes import plane_axes
@@ -1370,7 +1394,9 @@ async def get_tile(
 
     def _read() -> np.ndarray:
         arr_lazy = client.get_tensor(
-            _request_array_id(source_id, tensor_id),
+            # The array_id the geometry above was read from, not a rebuilt one:
+            # the two used to be derived separately and could disagree.
+            td.array_id,
             slice_hint=_build_slice_hint(start, stop),
             scale_hint=scale_hint,
             reduction_method=reduction_method or None,

@@ -1864,3 +1864,112 @@ class TestTileInfoPinnedAxes:
             assert tc.get("/api/tile_info/s").json()["pinned"] == [
                 {"axis": 1, "label": "c", "extent": 3}
             ]
+
+
+# ===========================================================================
+# Unit tests — tiles are addressed by array_id alone
+# ===========================================================================
+
+
+@contextmanager
+def _multi_tensor_client():
+    """A source with two tensors, so a bare source_id is ambiguous."""
+    tensors = [
+        _make_tensor_desc(
+            array_id="multi/Image:0",
+            shape=[1, 1, 1, 512, 512],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        ),
+        _make_tensor_desc(
+            array_id="multi/Image:1",
+            shape=[1, 1, 1, 2048, 2048],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        ),
+    ]
+    src = _make_source_desc(source_id="multi", tensors=tensors)
+    mock_fc = _build_mock_client(src)
+    lazy = MagicMock()
+    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        with TestClient(create_app(token=None), raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+class TestTileArrayIdAddressing:
+    """array_id is the whole address (identity policy in descriptor.proto).
+
+    The pair form these routes used to take was split and immediately rejoined
+    before the read, and the two derivations could disagree.
+    """
+
+    def test_a_qualified_array_id_selects_its_tensor(self):
+        with _multi_tensor_client() as (tc, _):
+            info = tc.get("/api/tile_info/multi/Image:1").json()
+            assert info["array_id"] == "multi/Image:1"
+            assert info["shape"] == [1, 1, 1, 2048, 2048]
+
+    def test_a_field_containing_slashes_survives_the_route(self):
+        # The policy allows '/' inside the field (HCS "plate/A01/0"); only the
+        # source_id prefix is slash-free. {array_id:path} must capture it whole.
+        td = _make_tensor_desc(
+            array_id="plate/A01/0",
+            shape=[1, 1, 1, 512, 512],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        )
+        src = _make_source_desc(source_id="plate", tensors=[td])
+        mock_fc = _build_mock_client(src)
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            with TestClient(create_app(token=None)) as tc:
+                assert (
+                    tc.get("/api/tile_info/plate/A01/0").json()["array_id"]
+                    == "plate/A01/0"
+                )
+
+    def test_a_bare_id_is_refused_for_a_multi_tensor_source(self):
+        # biopb/biopb#75: refuse rather than guess. It used to return tensor[0].
+        with _multi_tensor_client() as (tc, _):
+            r = tc.get("/api/tile_info/multi")
+            assert r.status_code == 404
+            detail = r.json()["detail"]
+            assert "multi/Image:0" in detail and "multi/Image:1" in detail
+
+    def test_a_bare_id_still_works_for_a_single_tensor_source(self):
+        # For a single-tensor source the bare source_id *is* the array_id.
+        with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile_info/s").status_code == 200
+
+    def test_an_unknown_field_404s_and_names_the_alternatives(self):
+        with _multi_tensor_client() as (tc, _):
+            r = tc.get("/api/tile/multi/Nope")
+            assert r.status_code == 404
+            assert "multi/Image:0" in r.json()["detail"]
+
+    def test_the_read_addresses_the_tensor_the_geometry_came_from(self):
+        """The bug the split allowed: geometry from one tensor, read of another.
+
+        A bare multi-tensor id gave tensor[0]'s shape while the read was issued
+        for the bare source_id, whose resolution is caller-dependent.
+        """
+        with _multi_tensor_client() as (tc, mock_fc):
+            assert tc.get("/api/tile/multi/Image:1").status_code == 200
+            assert mock_fc.get_tensor.call_args.args[0] == "multi/Image:1"
+
+    def test_no_tensor_id_parameter_is_accepted_any_more(self):
+        # A stale caller passing the old pair must not silently address
+        # something else; the ignored query param cannot change the tensor.
+        with _multi_tensor_client() as (tc, _):
+            r = tc.get("/api/tile_info/multi", params={"tensor_id": "Image:1"})
+            assert r.status_code == 404
