@@ -416,13 +416,16 @@ export class TensorHttpClient {
    * Grid, pyramid levels and selectable axes for a tensor
    * (`GET /api/tile_info`).
    *
+   * Addressed by `array_id` alone (`source_id` for a single-tensor source,
+   * `source_id/field` otherwise) -- the tensor identity policy, not the
+   * deprecated `(source_id, tensor_id)` pair the slice/render routes still take.
+   *
    * Fetch once per tensor and keep it: `tile_size` comes from the stored
    * `chunk_shape`, so it varies per tensor and must not be assumed.
    */
-  async tileInfo(sourceId: string, tensorId?: string, opts?: RequestOptions): Promise<TileInfo> {
-    const qs = tensorId ? `?tensor_id=${encodeURIComponent(tensorId)}` : "";
+  async tileInfo(arrayId: string, opts?: RequestOptions): Promise<TileInfo> {
     return this.fetchJson<TileInfo>(
-      `/api/tile_info/${encodeURIComponent(sourceId)}${qs}`,
+      `/api/tile_info/${encodeArrayId(arrayId)}`,
       undefined,
       this.metadataTimeoutMs,
       opts,
@@ -472,7 +475,6 @@ export class TensorHttpClient {
   private tilePath(req: TileRequest, extra: Record<string, unknown>): string {
     const qs = new URLSearchParams();
     const params: Record<string, unknown> = {
-      tensor_id: req.tensor_id,
       level: req.level,
       col: req.col,
       row: req.row,
@@ -486,7 +488,7 @@ export class TensorHttpClient {
       if (v !== undefined && v !== null) qs.set(k, String(v));
     }
     const query = qs.toString();
-    return `/api/tile/${encodeURIComponent(req.source_id)}${query ? `?${query}` : ""}`;
+    return `/api/tile/${encodeArrayId(req.array_id)}${query ? `?${query}` : ""}`;
   }
 
   private async fetchGet(
@@ -539,6 +541,17 @@ export class TensorHttpClient {
       opts,
     );
   }
+}
+
+/**
+ * Percent-encode an array_id for a path, keeping its `/` separators.
+ *
+ * `encodeURIComponent` would turn the field separator into `%2F`. The server
+ * decodes that back, so it happens to work, but it makes two spellings of one
+ * tile -- and therefore two browser-cache entries. Encode per segment instead.
+ */
+function encodeArrayId(arrayId: string): string {
+  return arrayId.split("/").map(encodeURIComponent).join("/");
 }
 
 /** Read the shape/dtype/label headers the binary routes share into an ndarray. */

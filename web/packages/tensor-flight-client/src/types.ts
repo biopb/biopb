@@ -265,8 +265,12 @@ export interface TileInfo {
 
 /** Address of one tile. Omitted selection axes default to index 0. */
 export interface TileRequest {
-  source_id: string;
-  tensor_id?: string;
+  /**
+   * The tensor's globally-unique id: `source_id` for a single-tensor source,
+   * `source_id/field` otherwise. The whole address -- there is no separate
+   * tensor_id.
+   */
+  array_id: string;
   level?: number;
   col?: number;
   row?: number;

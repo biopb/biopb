@@ -627,11 +627,21 @@ describe("TensorHttpClient.tileInfo", () => {
     expect(info.levels).toHaveLength(2);
   });
 
-  it("passes tensor_id when given", async () => {
+  it("addresses a tensor by array_id, keeping the field separator", async () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
-    await c.tileInfo("src0", "Image:0");
-    expect(mockFetch.mock.calls[0]![0]).toContain("tensor_id=Image%3A0");
+    await c.tileInfo("src0/Image:0");
+    // The '/' separates source from field and must survive as a path
+    // separator; encoding it to %2F would give one tile two spellings, and so
+    // two browser-cache entries. The ':' is still escaped.
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/tile_info/src0/Image%3A0`);
+  });
+
+  it("keeps a field that itself contains slashes intact", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
+    await c.tileInfo("plate/A01/0");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/tile_info/plate/A01/0`);
   });
 });
 
@@ -639,10 +649,10 @@ describe("TensorHttpClient.tile", () => {
   it("puts the whole address in the URL so the response is cacheable", async () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
-    await c.tile({ source_id: "src0", tensor_id: "Image:0", level: 1, col: 3, row: 4, c: 2, z: 7 });
+    await c.tile({ array_id: "src0/Image:0", level: 1, col: 3, row: 4, c: 2, z: 7 });
     const url = mockFetch.mock.calls[0]![0] as string;
-    expect(url).toContain("/api/tile/src0?");
-    for (const q of ["level=1", "col=3", "row=4", "c=2", "z=7", "tensor_id=Image%3A0"]) {
+    expect(url).toContain("/api/tile/src0/Image%3A0?");
+    for (const q of ["level=1", "col=3", "row=4", "c=2", "z=7"]) {
       expect(url).toContain(q);
     }
     expect((mockFetch.mock.calls[0]![1] as RequestInit).method).toBe("GET");
@@ -651,7 +661,7 @@ describe("TensorHttpClient.tile", () => {
   it("omits parameters the caller left undefined", async () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
-    await c.tile({ source_id: "src0" });
+    await c.tile({ array_id: "src0" });
     const url = mockFetch.mock.calls[0]![0] as string;
     // Server defaults must not be re-encoded here, or two spellings of the same
     // tile would occupy two browser-cache entries.
@@ -661,7 +671,7 @@ describe("TensorHttpClient.tile", () => {
   it("returns the array plus the grid the server actually used", async () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
-    const t = await c.tile({ source_id: "src0" });
+    const t = await c.tile({ array_id: "src0" });
     expect(t.shape).toEqual([1, 1, 1, 2, 2]);
     expect(t.dtype).toBe("uint16");
     expect(t.buffer.byteLength).toBe(8);
@@ -675,7 +685,7 @@ describe("TensorHttpClient.tile", () => {
         (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
       }));
     const ctrl = new AbortController();
-    const p = c.tile({ source_id: "src0" }, { signal: ctrl.signal });
+    const p = c.tile({ array_id: "src0" }, { signal: ctrl.signal });
     ctrl.abort();
     await expect(p).rejects.toBeInstanceOf(TensorAbortError);
   });
@@ -687,7 +697,7 @@ describe("TensorHttpClient.tileImage", () => {
     mockFetch.mockResolvedValueOnce(
       new Response(new Blob(["x"]), { status: 200, headers: { "Content-Type": "image/png" } }),
     );
-    await c.tileImage({ source_id: "src0", fmt: "png", lo: 1, hi: 99, color: "green" });
+    await c.tileImage({ array_id: "src0", fmt: "png", lo: 1, hi: 99, color: "green" });
     const url = mockFetch.mock.calls[0]![0] as string;
     for (const q of ["fmt=png", "lo=1", "hi=99", "color=green"]) {
       expect(url).toContain(q);
@@ -699,7 +709,7 @@ describe("TensorHttpClient.tileImage", () => {
     mockFetch.mockResolvedValueOnce(
       new Response(new Blob(["x"]), { status: 200, headers: { "Content-Type": "image/jpeg" } }),
     );
-    await c.tileImage({ source_id: "src0" });
+    await c.tileImage({ array_id: "src0" });
     expect(mockFetch.mock.calls[0]![0]).toContain("fmt=jpeg");
   });
 });
