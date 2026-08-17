@@ -1,9 +1,9 @@
 # Remote data viewer — client-side rendering over a tile API
 
-**Status:** partially implemented. The tile API (`GET /api/tile_info`, `GET /api/tile`)
-and server-side cancellation have landed; the client adapter, `AbortSignal`
-plumbing and the framework choice (Viv — a recommendation, not yet committed) have
-not.
+**Status:** partially implemented. The tile API (`GET /api/tile_info`, `GET /api/tile`),
+server-side cancellation, client `AbortSignal` plumbing and the Viv `PixelSource`
+adapter have landed. **Viv is now the committed framework** (0.22.1, deck.gl/luma.gl
+`~9.3.3`). The viewer component itself has not been built.
 **Component:** `biopb-tensor-server` (HTTP sidecar, tile route); `web/` (viewer SPA);
 `biopb-control` (proxy hop — see `biopb/biopb#762`).
 **Related:** `http-server.md`, `remote-tensor-cache.md`, `../../docs/url-prefix.md`.
@@ -82,7 +82,7 @@ The same viewport as server-rendered JPEG is ~300–500 KB — 10–40× less. T
 real and is widest in topology 2, which is why the tile route keeps a rendered mode
 (below) rather than committing to raw only.
 
-## Rendering framework — Viv (recommended)
+## Rendering framework — Viv (committed)
 
 [Viv](https://github.com/hms-dbmi/viv) (`@hms-dbmi/viv`), deck.gl layers for
 bioimaging. The decisive argument is that its data seam already matches ours. A
@@ -119,13 +119,16 @@ What it provides that is otherwise expensive to build:
 
 - **Bundle size.** deck.gl + luma.gl will be the largest dependency by a wide margin
   in an app that is currently React + zustand + a router. Lazy-load the viewer route.
-- **Version pinning.** The Viv↔deck.gl↔luma.gl peer-dependency relationship is the
-  fragile part, particularly across the deck.gl v8→v9 (luma.gl v9) boundary. Pin all
-  three; verify the compatibility matrix before committing.
+- **Version pinning.** Resolved: **Viv 0.22.1** declares `@deck.gl/*` and `@luma.gl/*`
+  peers at **`~9.3.3`** — a tilde, so it will not follow a deck.gl minor. Pin all three
+  together and re-check the peer range on any Viv bump.
 - **Maintenance cadence.** Academic-lab project (HMS DBMI). Widely deployed and it
   works, but expect to vendor a patch occasionally rather than wait on a release.
-- **Channel cap.** The default shader handles ~6 channels. Fine for most microscopy,
-  a hard wall for highly multiplexed data.
+- **Channel cap.** `MAX_CHANNELS = 10` in `@vivjs/constants` — a hard wall for highly
+  multiplexed data, comfortable for ordinary microscopy.
+- **`@vivjs/loaders` is not used.** It pulls geotiff, zarrita and zod to read formats
+  we do not serve. The adapter depends on `@vivjs/types` only, which is types plus
+  math.gl.
 
 ### Alternatives
 
@@ -433,9 +436,45 @@ a 512×512 slice is exactly 524288 B).
    abort raises `TensorAbortError` (`name: "AbortError"`) rather than the 408 the
    helpers used to synthesise, so a tile the viewport moved past is not reported
    as a server failure.
-5. **Viv `PixelSource` adapter** over the tile API; coarsest level resident;
-   byte-bounded L1.
-6. **Measure against a real link**, then decide on zstd and on the `fmt=jpeg` policy.
+5. ~~**Viv `PixelSource` adapter**~~ — done:
+   `web/packages/tensor-flight-client/src/viv-source.ts`. Types come from
+   `@vivjs/types` rather than being restated, so the build fails if Viv changes the
+   contract. Verified against a live server: the level-0 grid of a 1411×1411 RGB
+   source tiles the plane **exactly** (1990921 px covered, no gaps or overlap,
+   including the four ragged edge shapes).
+6. **Viewer component** in `web/packages/app` — installs `@hms-dbmi/viv` +
+   deck.gl/luma.gl `~9.3.3`, mounts a viewer over these sources, keeps the coarsest
+   level resident, sets `maxCacheByteSize`.
+7. **Measure against a real link**, then decide on zstd and on the `fmt=jpeg` policy.
+
+### What the adapter had to reconcile
+
+- **`onTileError` is required** by `PixelSource` and is where a cancelled tile must
+  be swallowed — an aborted tile is a normal outcome, not a load failure.
+- **`labels` must end `y`, `x`** (`"_c"` after them for interleaved RGB(A)). The
+  canonical `[..., Z, Y, X, S]` order satisfies this after lowercasing; a tensor that
+  does not is rejected rather than rendered transposed.
+- **`data` is a `TypedArray`,** not an `ArrayBuffer`, and `dtype` is Viv's spelling
+  (`Uint16`), not numpy's. Both numpy spellings the server emits (`<u2` from
+  `tile_info`, `uint16` from the tile header) map to it.
+- **`getRaster` reads a whole level**, which is right for the overview and would be
+  the entire image on level 0. It is served by one `/api/slice` at that level's
+  `scale_hint` and refuses beyond `maxRasterPixels` (default 4096²).
+- **Only `t`/`z`/`c` are selectable** through the tile API. Any other slider axis is
+  served at index 0 — correct as a default, wrong for anything else — so a non-zero
+  request on one is refused instead of quietly returning the wrong plane. Extending
+  the endpoint is the fix if a dataset needs it.
+- **Out-of-grid tiles are answered locally** with zeros. deck.gl can ask past the edge
+  while a viewport settles, and a round trip for a routine 404 is waste.
+
+### Threadpool size bounds what cancellation can reclaim
+
+`run_in_threadpool` uses anyio's default 40-thread limiter, so a burst of ≤40 tiles
+starts immediately and **none of it queues** — a 40-tile abort through the adapter
+skipped 0 server-side reads, where a 60-tile burst skipped 34. That is the documented
+queued-vs-in-flight boundary, not a defect, but it means the pool size sets the
+reclaim ceiling. 40 concurrent Flight reads on a 12-core box is also oversubscribed;
+worth tuning alongside biopb/biopb#762.
 
 End-to-end, one `AbortController` per viewport abandoned mid-burst: 60 tiles → 11
 completed, 49 aborted client-side, **34 reads skipped server-side**. The gap
