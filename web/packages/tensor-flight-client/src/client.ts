@@ -199,24 +199,24 @@ export class TensorHttpClient {
     timeoutMs?: number,
     opts?: RequestOptions,
   ): Promise<T> {
-    const res = await this.send(path, {
+    return this.send(path, {
       ...options,
       headers: { ...this.headers(), ...(options?.headers as Record<string, string> ?? {}) },
-    }, timeoutMs, opts);
-    return res.json() as Promise<T>;
+    }, timeoutMs, opts, (res) => res.json() as Promise<T>);
   }
 
-  private async fetchBinary(
+  private async fetchBinary<T>(
     path: string,
     body: unknown,
-    timeoutMs?: number,
-    opts?: RequestOptions,
-  ): Promise<Response> {
+    timeoutMs: number | undefined,
+    opts: RequestOptions | undefined,
+    consume: (res: Response) => Promise<T>,
+  ): Promise<T> {
     return this.send(path, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
-    }, timeoutMs, opts);
+    }, timeoutMs, opts, consume);
   }
 
   private async fetchJsonWithHeaders<T>(
@@ -225,30 +225,38 @@ export class TensorHttpClient {
     timeoutMs?: number,
     opts?: RequestOptions,
   ): Promise<{ data: T; headers: Headers }> {
-    const res = await this.send(path, {
+    return this.send(path, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
-    }, timeoutMs, opts);
-    return { data: await res.json() as T, headers: res.headers };
+    }, timeoutMs, opts, async (res) => ({ data: await res.json() as T, headers: res.headers }));
   }
 
   /**
    * The one place a request is actually issued: composes the caller's signal
-   * with the timeout, checks the status, and maps an abort to the error that
-   * says which of the two fired.
+   * with the timeout, checks the status, reads the body, and maps an abort to
+   * the error that says which of the two fired.
+   *
+   * `consume` reads the body HERE, inside the guard, rather than the caller
+   * doing it afterwards. That is the whole point of the callback: `fetch`
+   * resolves on the response *headers* and the body streams after, so cleaning
+   * up once the Response object exists would clear the timeout and detach the
+   * caller's abort for the entire body phase -- the expensive part. A 512 KB
+   * tile whose headers arrive in a millisecond was, measurably, uncancellable
+   * and un-timeout-able while its bytes were in flight.
    */
-  private async send(
+  private async send<T>(
     path: string,
     init: RequestInit,
-    timeoutMs?: number,
-    opts?: RequestOptions,
-  ): Promise<Response> {
+    timeoutMs: number | undefined,
+    opts: RequestOptions | undefined,
+    consume: (res: Response) => Promise<T>,
+  ): Promise<T> {
     const composed = composeSignal(timeoutMs, opts?.signal);
     try {
       const res = await fetch(`${this.base}${path}`, { ...init, signal: composed.signal });
       await assertOk(res);
-      return res;
+      return await consume(res);
     } catch (e) {
       throw abortAwareError(e, path, timeoutMs, opts?.signal);
     } finally {
@@ -404,8 +412,7 @@ export class TensorHttpClient {
    * @throws {TensorAbortError} if `opts.signal` fired.
    */
   async slice(req: SliceRequest, opts?: RequestOptions): Promise<TypedNdArray> {
-    const res = await this.fetchBinary("/api/slice", req, this.chunkTimeoutMs, opts);
-    return readNdArray(res);
+    return this.fetchBinary("/api/slice", req, this.chunkTimeoutMs, opts, readNdArray);
   }
 
   // -------------------------------------------------------------------------
@@ -444,14 +451,13 @@ export class TensorHttpClient {
    * @throws {TensorAbortError} if `opts.signal` fired.
    */
   async tile(req: TileRequest, opts?: RequestOptions): Promise<TileResult> {
-    const res = await this.fetchGet(this.tilePath(req, {}), this.chunkTimeoutMs, opts);
-    return {
+    return this.fetchGet(this.tilePath(req, {}), this.chunkTimeoutMs, opts, async (res) => ({
       ...(await readNdArray(res)),
       tileSize: parseInt(res.headers.get("X-Tile-Size") ?? "0", 10),
       level: parseInt(res.headers.get("X-Tile-Level") ?? "0", 10),
       col: parseInt(res.headers.get("X-Tile-Col") ?? "0", 10),
       row: parseInt(res.headers.get("X-Tile-Row") ?? "0", 10),
-    };
+    }));
   }
 
   /**
@@ -463,12 +469,12 @@ export class TensorHttpClient {
    */
   async tileImage(req: TileImageRequest, opts?: RequestOptions): Promise<Blob> {
     const { fmt = "jpeg", lo, hi, color, use_min_max } = req;
-    const res = await this.fetchGet(
+    return this.fetchGet(
       this.tilePath(req, { fmt, lo, hi, color, use_min_max }),
       this.chunkTimeoutMs * 2,
       opts,
+      (res) => res.blob(),
     );
-    return res.blob();
   }
 
   /** Build a tile URL. Every parameter that decides the bytes is in it, by design. */
@@ -491,12 +497,13 @@ export class TensorHttpClient {
     return `/api/tile/${encodeArrayId(req.array_id)}${query ? `?${query}` : ""}`;
   }
 
-  private async fetchGet(
+  private async fetchGet<T>(
     path: string,
-    timeoutMs?: number,
-    opts?: RequestOptions,
-  ): Promise<Response> {
-    return this.send(path, { method: "GET", headers: this.headers() }, timeoutMs, opts);
+    timeoutMs: number | undefined,
+    opts: RequestOptions | undefined,
+    consume: (res: Response) => Promise<T>,
+  ): Promise<T> {
+    return this.send(path, { method: "GET", headers: this.headers() }, timeoutMs, opts, consume);
   }
 
   // -------------------------------------------------------------------------
@@ -515,18 +522,18 @@ export class TensorHttpClient {
    */
   async render(req: RenderRequest, opts?: RequestOptions): Promise<RenderResult> {
     // Use longer timeout for rendering (may be slower than raw slice)
-    const res = await this.fetchBinary("/api/render", req, this.chunkTimeoutMs * 2, opts);
+    return this.fetchBinary("/api/render", req, this.chunkTimeoutMs * 2, opts, async (res) => {
+      const width = parseInt(res.headers.get("X-Image-Width") ?? "0", 10);
+      const height = parseInt(res.headers.get("X-Image-Height") ?? "0", 10);
+      const percentileLoValue = parseFloat(res.headers.get("X-Percentile-Lo-Value") ?? "0");
+      const percentileHiValue = parseFloat(res.headers.get("X-Percentile-Hi-Value") ?? "1");
+      const format = res.headers.get("X-Image-Format") ?? req.output_format ?? "jpeg";
 
-    const width = parseInt(res.headers.get("X-Image-Width") ?? "0", 10);
-    const height = parseInt(res.headers.get("X-Image-Height") ?? "0", 10);
-    const percentileLoValue = parseFloat(res.headers.get("X-Percentile-Lo-Value") ?? "0");
-    const percentileHiValue = parseFloat(res.headers.get("X-Percentile-Hi-Value") ?? "1");
-    const format = res.headers.get("X-Image-Format") ?? req.output_format ?? "jpeg";
+      // For raw format, use arrayBuffer; for png/jpeg, use blob
+      const blob = format === "raw" ? await res.arrayBuffer() : await res.blob();
 
-    // For raw format, use arrayBuffer; for png/jpeg, use blob
-    const blob = format === "raw" ? await res.arrayBuffer() : await res.blob();
-
-    return { blob, width, height, percentileLoValue, percentileHiValue, format };
+      return { blob, width, height, percentileLoValue, percentileHiValue, format };
+    });
   }
 
   // -------------------------------------------------------------------------

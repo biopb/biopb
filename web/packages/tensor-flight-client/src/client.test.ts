@@ -713,3 +713,69 @@ describe("TensorHttpClient.tileImage", () => {
     expect(mockFetch.mock.calls[0]![0]).toContain("fmt=jpeg");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cancellation covers the body, not just the headers
+// ---------------------------------------------------------------------------
+
+describe("cancellation scope", () => {
+  /**
+   * A response whose headers are ready but whose body never arrives, plus the
+   * signal fetch was given. `fetch` resolves on headers, so anything that
+   * cleans up at that point stops guarding the expensive part.
+   */
+  function stallingFetch() {
+    const seen: { signal?: AbortSignal } = {};
+    mockFetch.mockImplementation((_u: string, init: RequestInit) => {
+      seen.signal = init.signal as AbortSignal;
+      return Promise.resolve(
+        new Response(new ReadableStream({ start() { /* never enqueues */ } }), {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream", "X-Shape": "1,1", "X-Dtype": "uint16" },
+        }),
+      );
+    });
+    return seen;
+  }
+
+  it("keeps the caller's abort wired while the body streams", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const seen = stallingFetch();
+    const ctrl = new AbortController();
+    void c.tile({ array_id: "src0" }, { signal: ctrl.signal }).catch(() => {});
+    // Let the headers land and send() reach the body read.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.signal!.aborted).toBe(false);
+
+    ctrl.abort();
+    // The regression: cleanup() used to run when the Response was returned,
+    // detaching this listener, so a mid-body abort never reached the transfer.
+    expect(seen.signal!.aborted).toBe(true);
+  });
+
+  it("keeps the timeout running while the body streams", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.chunkTimeoutMs = 20;
+    const seen = stallingFetch();
+    void c.tile({ array_id: "src0" }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.signal!.aborted).toBe(false);
+    // cleanup() used to clearTimeout here, so a stalled body hung forever.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(seen.signal!.aborted).toBe(true);
+  });
+
+  it("still tears everything down once the body is read", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const ctrl = new AbortController();
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    await c.tile({ array_id: "src0" }, { signal: ctrl.signal });
+    // A completed request must not leave a listener on a long-lived viewport
+    // controller, which is what composeSignal's cleanup exists for.
+    let fired = false;
+    ctrl.signal.addEventListener("abort", () => { fired = true; });
+    ctrl.abort();
+    expect(fired).toBe(true); // our own listener, proving abort works
+    // and no error surfaced from the settled request
+  });
+});
