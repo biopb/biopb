@@ -79,30 +79,31 @@ Higher-level facade over `TensorHttpClient`: caches the source list and returns
 `validateConfig()`, the client-side mirror of the server's `PUT /api/config`
 validation used by the admin page.
 
-## Rendering a slice — the data flow
+## Rendering a slice — two paths
+
+`ViewerPane` picks one per tensor.
+
+**Tiled, client-side (`TileViewer`, the default).** Raw tiles reach the GPU and
+contrast is a shader uniform, so a pan refetches only what came into view and a
+contrast drag costs no request at all.
 
 ```
-User moves Z slider
-  → setSlice({ z: 5 }) [Zustand]
-  → SliceControls re-renders (controlled input)
-  → viewer effect fires (deps: activeSourceId, activeTensorId, slice)
-      → TensorArray.compute({ z: 5, scaleHint, reductionMethod })
-          → TensorHttpClient.slice(SliceRequest)
-              POST /api/slice → control /data_plane proxy → FastAPI sidecar → Flight server
-              ← octet-stream + X-Shape / X-Dtype / X-Dim-Labels
-          ← TypedNdArray { buffer, shape, dtype, dimLabels }
-      → toGrayscaleRgba(buffer, shape, dtype)   [e.g. uint16 → Uint8ClampedArray RGBA]
-      → ImageData → canvas → Pixi.js Texture → Sprite → stage
+GET /api/tile_info/{array_id} → PixelSource[] (viv-source.ts, one per level)
+  → Viv / deck.gl TileLayer → GET /api/tile/{array_id}?level&col&row&t&z&c
 ```
 
-A **request counter** guards against races: if a newer request starts before the
-previous one resolves, the stale response is discarded.
+**Server-rendered (`ImageViewer`, the fallback).** The server renders a whole
+region and pushes it over `/ws/render` per repaint. Reached when the tiled path
+cannot be: no WebGL2, a dtype with no GPU equivalent, a non-canonical axis order,
+or a server without the tile routes.
+
+Design and measurements: `../biopb-tensor-server/docs/remote-viewer-tiles.md`.
 
 ## `@biopb/web` — SPA internals
 
-Vite + React + React Router v6, Zustand state, Pixi.js v8 (WebGL). The routes, the
-surfaces table, and the build/serve model are in `README.md`; the architectural
-notes that aren't there:
+Vite + React + React Router v6, Zustand state, and Viv/deck.gl (WebGL2) in a
+lazily-loaded viewer chunk. The routes, the surfaces table, and the build/serve
+model are in `README.md`; the architectural notes that aren't there:
 
 - **Token / auth flow.** The token lives in `sessionStorage` under `biopb_token`
   (clears on tab close, never persisted to disk). On load `ClientBootstrap` reads

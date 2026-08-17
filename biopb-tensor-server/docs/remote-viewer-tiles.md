@@ -442,9 +442,11 @@ a 512×512 slice is exactly 524288 B).
    contract. Verified against a live server: the level-0 grid of a 1411×1411 RGB
    source tiles the plane **exactly** (1990921 px covered, no gaps or overlap,
    including the four ragged edge shapes).
-6. **Viewer component** in `web/packages/app` — installs `@hms-dbmi/viv` +
-   deck.gl/luma.gl `~9.3.3`, mounts a viewer over these sources, keeps the coarsest
-   level resident, sets `maxCacheByteSize`.
+6. ~~**Viewer component**~~ — done: `web/packages/app/src/components/TileViewer.tsx`,
+   chosen per tensor by `ViewerPane.tsx`. Viv 0.22.1 with deck.gl/luma.gl `~9.3.3`,
+   lazy-loaded so the 1.06 MB chunk (299 kB gzip) stays off every other route — the
+   eager entry chunk is unchanged at 248 kB. Verified in headless chromium against a
+   live server (below).
 7. **Measure against a real link**, then decide on zstd and on the `fmt=jpeg` policy.
 
 ### What the adapter had to reconcile
@@ -466,6 +468,76 @@ a 512×512 slice is exactly 524288 B).
   the endpoint is the fix if a dataset needs it.
 - **Out-of-grid tiles are answered locally** with zeros. deck.gl can ask past the edge
   while a viewport settles, and a round trip for a routine 404 is waste.
+
+### What the viewer component had to reconcile
+
+Three things that the design above got wrong or left implicit, each found by
+measurement rather than reading.
+
+**`maxCacheByteSize` is unusable with Viv, and setting it is worse than not.**
+The cache-hierarchy note above says to bound L1 by bytes. deck.gl reads
+`tile.content.byteLength`, and Viv's `getTileData` returns a plain
+`{ data, width, height }` object which has no such property: it logs
+`byteLength not defined in tile data` **once per tile** and counts zero — measured,
+6 errors in one probe run. Worse, passing `maxCacheByteSize` at all switches
+`maxCacheSize` to `Infinity`, so the bound that *was* working is removed and the
+cache grows without limit.
+
+`maxCacheSize` (a count) is the control that works, and it loses nothing here:
+tile edge, dtype and sample count are all known from `tile_info`, so a count **is**
+a byte budget for this data. `tileCacheSize()` derives it from 128 MiB — ~256 tiles
+of 512×512 `uint16`, which budgets ~256 MiB across RAM and VRAM once the GPU texture
+is counted. Re-check on a Viv bump: if Viv starts reporting `byteLength`,
+`maxCacheByteSize` becomes the better prop.
+
+**Viv's `ImageLayer` diffs `selections` by reference, and zustand defeats that.**
+`updateState` refetches when `props.selections !== oldProps.selections`, so any new
+array identity re-reads the whole background raster. zustand hands out a fresh
+`slice` object on *every* `setSlice`, so a selection derived straight from it changed
+identity when only the contrast slider moved — and the "contrast costs no round trip"
+claim quietly failed: **2 requests per contrast change**, measured. Deriving the
+selection from its own content (and memoising the `selections` array separately)
+takes it to **0**. This is the kind of thing the four-layer cache table cannot warn
+about, because the refetch happens above all four.
+
+**The coarsest level is kept resident for free.** `MultiscaleImageLayer` already
+renders a background `ImageLayer` from `loader[loader.length - 1]` via `getRaster`,
+so no extra work was needed. It also means a **single-level** tensor never uses the
+tile grid at all — Viv picks `ImageLayer` when `loader.length === 1`. That is safe
+only because `_tile_levels` stops halving once the plane fits one tile, so one level
+implies an image no larger than `tile_size`; a single-level pyramid over a large
+image would make Viv read the whole thing in one request.
+
+**`@vivjs/loaders` cannot be avoided by import choice.** The framework note above
+says it is not used. In the app it is: `@vivjs/views` imports `getImageSize` from it
+and `@vivjs/layers` imports `isInterleaved`/`SIGNAL_ABORTED`, and the package ships
+without `sideEffects: false`, so Rollup keeps geotiff's core in the graph. Importing
+the subpackages directly instead of the `@hms-dbmi/viv` umbrella makes **no**
+difference — measured byte-identical at 1,057.63 kB. Aliasing `@vivjs/loaders` to a
+three-function stub removes 108 kB (38 kB gzip) from the lazy chunk plus ~120 kB of
+decoder chunks that are never fetched. Not taken: it means vendoring three semantic
+definitions that can drift silently, for 38 kB off a chunk that is already lazy.
+
+### Verified in a browser, not just in node
+
+`viv_browser_probe.mjs` drives the real `ViewerPane` in headless chromium over CDP
+against a live sidecar, and reads the composited frame back (CDP screenshots, so it
+does not need `preserveDrawingBuffer`). Against three real OME-TIFFs — a
+single-level `uint16` stack, a 3-level interleaved RGB, and a 2-level 4-channel
+`uint16`:
+
+| claim | result |
+|---|---|
+| tiles reach the GPU | 86–100% of the canvas lit on all three |
+| contrast is a shader uniform | repaints 14.2% of pixels, **0 requests** |
+| a channel change is real data | repaints 12.7%, **3 requests** |
+| the tile grid is used when it exists | 4 tile requests for the RGB pyramid |
+| single-level takes the `ImageLayer` path | 0 tile requests, still renders |
+| cache bound is live | no `byteLength not defined` in the console |
+
+Pixel checks, not smoke tests: "no round trip" is asserted from
+`performance.getEntriesByType("resource")` and "repaints" from a per-pixel luminance
+diff of two screenshots.
 
 ### Threadpool size bounds what cancellation can reclaim
 

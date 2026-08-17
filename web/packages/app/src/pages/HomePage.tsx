@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import { useAppStore } from "../store";
-import { ImageViewer } from "../components/ImageViewer";
+import { ViewerPane } from "../components/ViewerPane";
 import { MetaPanel } from "../components/MetaPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
@@ -48,7 +48,7 @@ export function HomePage() {
           <>
             <div className="viewer-column">
               <div className="viewer-canvas-wrap">
-                <ImageViewer
+                <ViewerPane
                   sourceId={activeSourceId}
                   tensorId={activeTensorId}
                 />
