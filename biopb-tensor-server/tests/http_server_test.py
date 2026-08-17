@@ -7,6 +7,7 @@ Integration tests spin up a real TensorFlightServer + ZarrAdapter.
 import json
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1743,3 +1744,123 @@ class TestCancellation:
         before = mock_fc.get_tensor.call_count
         assert tc.get("/api/tile/tiled").status_code == 200
         assert mock_fc.get_tensor.call_count == before + 1
+
+
+# ===========================================================================
+# Unit tests — tile selection is checked against the axes that exist
+# ===========================================================================
+
+
+@contextmanager
+def _tile_client_for(dim_labels, shape):
+    """A tile client over a tensor with the given axis labels."""
+    td = _make_tensor_desc(
+        array_id="s/Image:0", shape=shape, dtype="uint16", dim_labels=dim_labels
+    )
+    src = _make_source_desc(source_id="s", tensors=[td])
+    mock_fc = _build_mock_client(src)
+    plane = np.zeros([1] * (len(shape) - 2) + [8, 8], dtype=np.uint16)
+    lazy = MagicMock()
+    lazy.compute.return_value = plane
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        with TestClient(create_app(token=None), raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+class TestTileSelectionValidation:
+    """`t`/`z`/`c` must be checked against the axis they name, not just `ge=0`.
+
+    The loop that built the slices iterated *axes*, so a parameter naming an
+    axis the tensor does not have was never visited and never validated.
+    """
+
+    def test_nonexistent_axis_with_a_nonzero_index_is_422(self):
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, _):
+            for params in ({"t": 7}, {"z": 99}, {"c": 12345}):
+                r = tc.get("/api/tile/s", params=params)
+                assert r.status_code == 422, f"{params} was served"
+                assert "no" in r.json()["detail"]
+
+    def test_nonexistent_axis_at_index_zero_is_fine(self):
+        # Every client sends a full selection; index 0 is the correct default
+        # and must not become an error.
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, _):
+            assert (
+                tc.get("/api/tile/s", params={"t": 0, "z": 0, "c": 0}).status_code
+                == 200
+            )
+
+    def test_an_ignored_parameter_cannot_fragment_the_cache(self):
+        """Identical bytes must not sit under unbounded distinct ETags.
+
+        `t` is an unbounded non-negative int, so when it was silently dropped
+        every value minted a fresh cache entry for the very same tile.
+        """
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, _):
+            base = tc.get("/api/tile/s").headers["ETag"]
+            assert tc.get("/api/tile/s", params={"t": 0}).headers["ETag"] == base
+            assert tc.get("/api/tile/s", params={"t": 9}).status_code == 422
+
+    def test_axes_are_validated_independently(self):
+        # The nastiest shape: one selection half-checked, because `c` exists
+        # and `t` does not.
+        with _tile_client_for(["c", "y", "x"], [3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile/s", params={"c": 2}).status_code == 200
+            assert tc.get("/api/tile/s", params={"c": 3}).status_code == 422
+            assert tc.get("/api/tile/s", params={"t": 5}).status_code == 422
+            assert tc.get("/api/tile/s", params={"z": 5}).status_code == 422
+
+    def test_existing_axes_keep_their_extent_check(self):
+        with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile/s", params={"z": 15}).status_code == 200
+            assert tc.get("/api/tile/s", params={"z": 16}).status_code == 422
+            # Extents are full-resolution, which holds at every level because
+            # scale_hint is 1 on non-plane axes.
+            assert (
+                tc.get("/api/tile/s", params={"z": 15, "level": 1}).status_code == 200
+            )
+
+    def test_a_rejected_selection_never_reaches_the_backend(self):
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, mock_fc):
+            before = mock_fc.get_tensor.call_count
+            assert tc.get("/api/tile/s", params={"c": 4}).status_code == 422
+            assert mock_fc.get_tensor.call_count == before
+
+
+class TestTileInfoPinnedAxes:
+    """Axes the tile API serves at index 0 and cannot address are published."""
+
+    def test_no_pinned_axes_on_a_fully_addressable_tensor(self):
+        with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == []
+
+    def test_an_unlabelled_axis_is_reported(self):
+        # 4 of 5 positions are unreachable through this route; say so rather
+        # than leaving a client to diff dim_labels against selectable.
+        with _tile_client_for(["pos", "c", "y", "x"], [5, 3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == [
+                {"axis": 0, "label": "pos", "extent": 5}
+            ]
+
+    def test_a_singleton_axis_is_not_reported(self):
+        # Extent 1 hides nothing: index 0 is the only index.
+        with _tile_client_for(["pos", "c", "y", "x"], [1, 3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == []
+
+    def test_a_duplicate_label_is_reported(self):
+        # labeled_axis_index takes the first match, so the second C is
+        # unreachable even though it is labelled.
+        with _tile_client_for(["c", "c", "y", "x"], [2, 3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == [
+                {"axis": 1, "label": "c", "extent": 3}
+            ]

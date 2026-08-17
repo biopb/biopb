@@ -725,6 +725,95 @@ def _resolve_tile_level(
     return entry
 
 
+def _plane_axes_set(y_idx: int, x_idx: int, s_idx: Optional[int]) -> set:
+    """The axes the tile *is*, as opposed to the ones that select which tile."""
+    return {y_idx, x_idx} | ({s_idx} if s_idx is not None else set())
+
+
+def _unaddressable_axes(
+    dim_labels: List[str], shape: List[int], plane: set
+) -> List[Dict[str, Any]]:
+    """Non-plane axes with extent > 1 that ``t``/``z``/``c`` cannot reach.
+
+    Such an axis is served at index 0 and the rest of it is unreachable through
+    this route -- true of an unlabelled axis (``POS``), and of the second of two
+    axes sharing a label, since ``labeled_axis_index`` takes the first. That is
+    a real limit on what the tile API can address, so publish it instead of
+    leaving a client to infer it by diffing ``dim_labels`` against
+    ``selectable``.
+    """
+    from biopb_tensor_server.core.axes import labeled_axis_index
+
+    named = {labeled_axis_index(dim_labels, a) for a in ("t", "z", "c")}
+    return [
+        {
+            "axis": idx,
+            "label": dim_labels[idx] if idx < len(dim_labels) else "?",
+            "extent": int(shape[idx]),
+        }
+        for idx in range(len(shape))
+        if idx not in plane and idx not in named and int(shape[idx]) > 1
+    ]
+
+
+def _resolve_tile_selection(
+    dim_labels: List[str], shape: List[int], plane: set, selection: Dict[str, int]
+) -> Dict[int, int]:
+    """``{axis index: chosen index}`` for every non-plane axis, or 422.
+
+    Validation has to iterate the *parameters* as well as the axes. Checking
+    only axes -- which is what the loop building the slices did -- silently
+    drops a selection naming an axis the tensor does not have: the loop never
+    visits it, so ``t=7`` on a plain 2-D tensor returned index 0's pixels with a
+    200 and no hint, under an ETag that varied with the ignored number. One
+    tile, unbounded distinct cache entries, and a client told it got a plane it
+    did not get.
+
+    Index 0 is exempt because it is the default every client sends; only a
+    non-zero request for an axis that does not exist is a mistake worth
+    refusing. That is the same rule the Viv adapter applies client-side, so the
+    two agree on what is addressable.
+
+    Extents are the full-resolution ones, which is correct at every level:
+    ``scale_hint`` is 1 on non-plane axes, so pyramid depth never changes them.
+    """
+    from biopb_tensor_server.core.axes import labeled_axis_index
+
+    named = {axis: labeled_axis_index(dim_labels, axis) for axis in ("t", "z", "c")}
+
+    for axis, want in selection.items():
+        axis_idx = named.get(axis)
+        if axis_idx is None and want:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"tensor has no '{axis}' axis to select "
+                    f"(dim_labels {dim_labels}); only index 0 is meaningful"
+                ),
+            )
+
+    resolved: Dict[int, int] = {}
+    for idx in range(len(shape)):
+        if idx in plane:
+            continue
+        want = 0
+        for axis, axis_idx in named.items():
+            if axis_idx == idx:
+                want = int(selection.get(axis, 0))
+                break
+        if not 0 <= want < int(shape[idx]):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"index {want} out of range for axis {idx} "
+                    f"('{dim_labels[idx] if idx < len(dim_labels) else '?'}', "
+                    f"extent {shape[idx]})"
+                ),
+            )
+        resolved[idx] = want
+    return resolved
+
+
 def _tile_slices(
     td: Any,
     y_idx: int,
@@ -734,7 +823,7 @@ def _tile_slices(
     level: int,
     col: int,
     row: int,
-    selection: Dict[str, int],
+    resolved: Dict[int, int],
 ) -> Tuple[List[int], List[int], List[int]]:
     """``(slice_start, slice_stop, scale_hint)`` for one tile.
 
@@ -742,13 +831,11 @@ def _tile_slices(
     applied in, before scaling); ``scale_hint`` then downsamples Y/X by
     ``2**level`` so the returned plane is at most ``edge x edge``.
 
-    Assumes ``(level, col, row)`` already passed :func:`_resolve_tile_level`;
-    this derives geometry and does not re-check it.
+    Assumes ``(level, col, row)`` already passed :func:`_resolve_tile_level` and
+    the selection :func:`_resolve_tile_selection`; this derives geometry and does
+    not re-check either.
     """
-    from biopb_tensor_server.core.axes import labeled_axis_index
-
     shape = [int(d) for d in td.shape]
-    dim_labels = list(td.dim_labels)
     scale = 1 << level
     step = edge * scale
 
@@ -763,28 +850,8 @@ def _tile_slices(
     scale_hint[y_idx] = scale_hint[x_idx] = scale
 
     # Every leading axis collapses to one index so the response is a single
-    # plane. T/C/Z are resolved by label (the canonical order does not position
-    # them); anything else unrecognised takes index 0 rather than the whole axis,
-    # which would silently multiply the payload.
-    plane = {y_idx, x_idx} | ({s_idx} if s_idx is not None else set())
-    named = {axis: labeled_axis_index(dim_labels, axis) for axis in ("t", "z", "c")}
-    for idx in range(len(shape)):
-        if idx in plane:
-            continue
-        want = 0
-        for axis, axis_idx in named.items():
-            if axis_idx == idx:
-                want = int(selection.get(axis, 0))
-                break
-        if not 0 <= want < shape[idx]:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"index {want} out of range for axis {idx} "
-                    f"('{dim_labels[idx] if idx < len(dim_labels) else '?'}', "
-                    f"extent {shape[idx]})"
-                ),
-            )
+    # plane; an axis left whole would silently multiply the payload.
+    for idx, want in resolved.items():
         start[idx], stop[idx] = want, want + 1
 
     return start, stop, scale_hint
@@ -1166,6 +1233,9 @@ async def tile_info(
             "selectable": {
                 axis: labeled_axis_index(dim_labels, axis) for axis in ("t", "z", "c")
             },
+            "pinned": _unaddressable_axes(
+                dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
+            ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
         }
     )
@@ -1251,6 +1321,12 @@ async def get_tile(
     # for a tile that does not exist, and an out-of-grid request should cost the
     # same 404 whether or not the caller happens to hold a matching ETag.
     _resolve_tile_level(_tile_levels(shape, y_idx, x_idx, edge), level, col, row)
+    resolved = _resolve_tile_selection(
+        dim_labels,
+        shape,
+        _plane_axes_set(y_idx, x_idx, s_idx),
+        {"t": t, "z": z, "c": c},
+    )
 
     render_identity = (
         [("lo", lo), ("hi", hi), ("color", color), ("mm", use_min_max)]
@@ -1285,7 +1361,7 @@ async def get_tile(
         return Response(status_code=304, headers=cache_headers)
 
     start, stop, scale_hint = _tile_slices(
-        td, y_idx, x_idx, s_idx, edge, level, col, row, {"t": t, "z": z, "c": c}
+        td, y_idx, x_idx, s_idx, edge, level, col, row, resolved
     )
 
     # Last chance to skip the read: on a saturated loop this request may have sat

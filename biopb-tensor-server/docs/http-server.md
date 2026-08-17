@@ -103,9 +103,17 @@ the tensor as a tile grid — shaped to drop into a Viv `PixelSource[]`:
   "tile_size": 512,
   "plane": {"y": 3, "x": 4, "s": null},
   "selectable": {"t": 0, "c": 1, "z": 2},
+  "pinned": [],
   "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}]
 }
 ```
+
+`selectable` gives the wire index of each addressable slider axis, or `null`.
+`pinned` is the converse and is the one worth reading: non-plane axes with
+extent > 1 that `t`/`z`/`c` **cannot** reach, served at index 0 with the rest
+unreachable through this route — an unlabelled axis (`[{"axis":0,"label":"POS",
+"extent":5}]`), or the second of two axes sharing a label, since only the first
+occurrence resolves. Empty for an ordinary TCZYX tensor.
 
 **`level` 0 is full resolution** (Viv's `PixelSource[]` index convention, not the
 map-tile one where z grows with detail); each level halves. `tile_size` is derived
@@ -131,6 +139,12 @@ fragment the raw-tile cache (raw contrast is a client-side shader concern).
 `(level, col, row)` is validated against exactly the grid `/api/tile_info`
 publishes — a level the tensor does not have, or a tile outside that level's
 `cols`×`rows`, is **404**. A selection index outside its axis is **422**.
+
+`t`/`z`/`c` are checked against the axis they name, not merely against `ge=0`: an
+index past the axis extent is **422**, and so is a *non-zero* index on an axis the
+tensor does not have. Index 0 there stays valid — it is the default every client
+sends. Extents are the full-resolution ones, correct at every level because
+`scale_hint` is 1 on non-plane axes.
 
 Validation runs *before* the ETag check, so a nonexistent tile cannot be turned
 into a cheap 304 by a stale or forged `If-None-Match`.
