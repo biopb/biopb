@@ -243,6 +243,60 @@ describe("TensorHttpClient.getSourceMetadata", () => {
     const [url] = mockFetch.mock.calls[0] as [string];
     expect(url).toContain("/metadata");
   });
+
+  it("serves simultaneous callers for one source from a single request", async () => {
+    // Selecting a source asks twice in the same tick (metadata panel plus the
+    // channel-name loader). For a per-frame MicroManager blob that was 2 x 13.8 MB.
+    mockFetch.mockResolvedValueOnce(jsonResponse({ Summary: { ChNames: ["STORM"] } }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    const [a, b] = await Promise.all([c.getSourceMetadata("src0"), c.getSourceMetadata("src0")]);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(a).toBe(b);
+  });
+
+  it("keeps different sources apart", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: 0 }));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: 1 }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    const [a, b] = await Promise.all([c.getSourceMetadata("src0"), c.getSourceMetadata("src1")]);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(a["id"]).not.toBe(b["id"]);
+  });
+
+  it("asks again once the shared request has settled", async () => {
+    // No cache: a re-indexed source must be able to report something new.
+    mockFetch.mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    await c.getSourceMetadata("src0");
+    await c.getSourceMetadata("src0");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not leave a failed request wedged in the in-flight slot", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(500, "boom"));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    await expect(c.getSourceMetadata("src0")).rejects.toBeInstanceOf(TensorApiError);
+    await expect(c.getSourceMetadata("src0")).resolves.toEqual({ ok: true });
+  });
+
+  it("gives a caller with its own signal a request it alone can abort", async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    const shared = c.getSourceMetadata("src0");
+    const owned = c.getSourceMetadata("src0", { signal: new AbortController().signal });
+
+    await Promise.all([shared, owned]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 // ---------------------------------------------------------------------------

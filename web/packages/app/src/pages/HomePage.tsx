@@ -56,7 +56,14 @@ export function HomePage() {
             </div>
             <div className="control-column">
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
-              <MetaPanel sourceId={activeSourceId} />
+              {/*
+                Remount per source. Without the key, a switch re-renders the
+                whole tree against the *previous* source's metadata — the new
+                fetch has not resolved yet — and then reconciles it away once it
+                does. It also carries every node's expanded/collapsed state over
+                to a tree that has nothing to do with it.
+              */}
+              <MetaPanel key={activeSourceId} sourceId={activeSourceId} />
             </div>
           </>
         ) : (
