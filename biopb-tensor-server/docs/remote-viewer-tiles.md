@@ -427,12 +427,20 @@ a 512×512 slice is exactly 524288 B).
 2. ~~**GET tile endpoint**~~ — done: `/api/tile_info` + `/api/tile`, ETag +
    `max-age`, `fmt` parameter, tile size derived from `chunk_shape`.
 3. ~~**Server-side cancellation**~~ — done, with the threadpool change it depends on.
-4. **Caller-supplied `AbortSignal`** through `web/packages/tensor-flight-client/src/client.ts`
-   (currently only an internal timeout controller). Without it the server-side
-   cancellation above has nothing to react to.
+4. ~~**Caller-supplied `AbortSignal`**~~ — done: every read method on
+   `TensorHttpClient` takes `{ signal }`, composed with its own timeout, plus
+   `tileInfo()` / `tile()` / `tileImage()` so the tile API is reachable. A caller
+   abort raises `TensorAbortError` (`name: "AbortError"`) rather than the 408 the
+   helpers used to synthesise, so a tile the viewport moved past is not reported
+   as a server failure.
 5. **Viv `PixelSource` adapter** over the tile API; coarsest level resident;
    byte-bounded L1.
 6. **Measure against a real link**, then decide on zstd and on the `fmt=jpeg` policy.
+
+End-to-end, one `AbortController` per viewport abandoned mid-burst: 60 tiles → 11
+completed, 49 aborted client-side, **34 reads skipped server-side**. The gap
+between 49 and 34 is requests already running when the abort landed — the
+queued/in-flight boundary, visible in practice.
 
 Steps 2–4 are plumbing that is useful regardless and do not depend on the framework
 choice — worth landing before committing to Viv, since they are also where the
