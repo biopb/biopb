@@ -166,6 +166,9 @@ export class TensorHttpClient {
   private readonly base: string;
   private readonly token: string | null;
 
+  /** In-flight {@link getSourceMetadata} calls, so simultaneous callers share one. */
+  private readonly metadataInFlight = new Map<string, Promise<Record<string, unknown>>>();
+
   /** Timeout for metadata / listing requests (ms). */
   metadataTimeoutMs = 3_000;
   /** Timeout for binary chunk/slice requests (ms). */
@@ -304,14 +307,39 @@ export class TensorHttpClient {
   /**
    * Get the parsed OME-NGFF metadata for a source.
    * Returns an empty object if the source has no metadata.
+   *
+   * Concurrent callers for the same source share one request. Selecting a
+   * source asks twice in the same tick -- the metadata panel and the channel-name
+   * loader are independent components -- and a MicroManager per-frame blob is
+   * 13.8 MB, so the second ask is a duplicate download and a duplicate parse.
+   * Nothing is retained past the response: a re-indexed source still reports
+   * whatever it reports now.
    */
   async getSourceMetadata(sourceId: string, opts?: RequestOptions): Promise<Record<string, unknown>> {
-    return this.fetchJson<Record<string, unknown>>(
-      `/api/sources/${encodeURIComponent(sourceId)}/metadata`,
+    const path = `/api/sources/${encodeURIComponent(sourceId)}/metadata`;
+    // A caller with its own signal gets its own request: aborting a shared one
+    // would cancel it out from under whoever else is waiting on it.
+    if (opts?.signal) {
+      return this.fetchJson<Record<string, unknown>>(path, undefined, this.metadataTimeoutMs, opts);
+    }
+
+    const pending = this.metadataInFlight.get(sourceId);
+    if (pending) return pending;
+
+    const request = this.fetchJson<Record<string, unknown>>(
+      path,
       undefined,
       this.metadataTimeoutMs,
       opts,
     );
+    this.metadataInFlight.set(sourceId, request);
+    const release = () => {
+      if (this.metadataInFlight.get(sourceId) === request) this.metadataInFlight.delete(sourceId);
+    };
+    // Both arms, so a failure clears the slot and a rejection is never left
+    // unhandled on this branch of the chain.
+    request.then(release, release);
+    return request;
   }
 
   /**
