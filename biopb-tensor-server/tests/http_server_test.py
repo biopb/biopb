@@ -7,12 +7,18 @@ Integration tests spin up a real TensorFlightServer + ZarrAdapter.
 import json
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from biopb_tensor_server.serving.http_server import _request_array_id, create_app
+from biopb_tensor_server.serving.http_server import (
+    _request_array_id,
+    _tile_edge,
+    _tile_levels,
+    create_app,
+)
 from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
@@ -1368,3 +1374,602 @@ class TestWebSocketRender:
             msg = ws.receive_json()
         assert msg["action"] == "error"
         assert msg["message"] == "Unknown action: nope"
+
+
+# ===========================================================================
+# Unit tests — tile addressing (GET /api/tile_info, GET /api/tile)
+# ===========================================================================
+
+
+def _tile_source_desc() -> SimpleNamespace:
+    """A realistic tiled tensor: TCZYX uint16, 1024x1024 plane, 512x512 chunks."""
+    td = SimpleNamespace(
+        array_id="tiled/Image:0",
+        shape=[1, 3, 16, 1024, 1024],
+        chunk_shape=[1, 1, 1, 512, 512],
+        dtype="uint16",
+        dim_labels=["t", "c", "z", "y", "x"],
+    )
+    return SimpleNamespace(
+        source_id="tiled",
+        source_url="/data/tiled.zarr",
+        source_type="zarr",
+        metadata_json=None,
+        tensors=[td],
+    )
+
+
+@pytest.fixture()
+def tile_client():
+    """TestClient over a tiled tensor; compute() yields one 512x512 plane."""
+    src = _tile_source_desc()
+    mock_fc = _build_mock_client(src)
+    lazy = MagicMock()
+    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(token=None)
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+class TestTileGeometry:
+    """The grid maths, independent of any request."""
+
+    def test_edge_equals_chunk_when_chunk_is_at_target(self):
+        edge = _tile_edge([1, 1024, 1024], [1, 512, 512], 1, 2)
+        assert edge == 512
+
+    def test_edge_halves_a_large_chunk_until_it_nests(self):
+        # 2048 chunk -> 512 tile, i.e. chunk / 2**2: still nests, never straddles.
+        edge = _tile_edge([1, 4096, 4096], [1, 2048, 2048], 1, 2)
+        assert edge == 512
+        assert 2048 % edge == 0
+
+    def test_edge_keeps_a_small_chunk_whole(self):
+        assert _tile_edge([1, 256, 256], [1, 256, 256], 1, 2) == 256
+
+    def test_edge_never_exceeds_the_plane(self):
+        # An unchunked adapter advertises zeros; the tile must still fit.
+        assert _tile_edge([1, 180, 183], [0, 0, 0], 1, 2) == 183
+
+    def test_edge_stops_halving_on_an_odd_chunk(self):
+        # 183 has no power-of-two factor; halving would break nesting.
+        assert _tile_edge([1, 4000, 4000], [1, 183, 183], 1, 2) == 183
+
+    def test_single_chunk_plane_still_gets_tiled(self):
+        # A whole-plane chunk with an odd extent has no interior boundary to
+        # straddle, so the transport target wins instead of yielding one 1411px
+        # tile (which is tiling switched off for the largest images).
+        assert _tile_edge([1, 1411, 1411, 3], [1, 1411, 1411, 3], 1, 2) == 512
+
+    def test_levels_index_zero_is_full_resolution(self):
+        levels = _tile_levels([1, 1024, 1024], 1, 2, 512)
+        assert levels[0]["scale"] == 1
+        assert (levels[0]["width"], levels[0]["height"]) == (1024, 1024)
+
+    def test_levels_stop_once_the_plane_fits_one_tile(self):
+        levels = _tile_levels([1, 1024, 1024], 1, 2, 512)
+        assert len(levels) == 2
+        assert levels[-1]["cols"] == 1 and levels[-1]["rows"] == 1
+
+    def test_level_grid_covers_a_non_multiple_plane(self):
+        # 1000 / 512 -> 2 tiles, the second one short. Must not drop the remainder.
+        levels = _tile_levels([1, 1000, 1000], 1, 2, 512)
+        assert levels[0]["cols"] == 2 and levels[0]["rows"] == 2
+
+
+class TestTileInfoEndpoint:
+    def test_reports_grid_and_levels(self, tile_client):
+        tc, _ = tile_client
+        r = tc.get("/api/tile_info/tiled")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["array_id"] == "tiled/Image:0"
+        assert body["tile_size"] == 512
+        assert body["dtype"] == "uint16"
+        assert body["plane"] == {"y": 3, "x": 4, "s": None}
+        assert [lv["level"] for lv in body["levels"]] == [0, 1]
+
+    def test_reports_selectable_axes_by_label(self, tile_client):
+        tc, _ = tile_client
+        body = tc.get("/api/tile_info/tiled").json()
+        assert body["selectable"] == {"t": 0, "c": 1, "z": 2}
+
+    def test_tile_size_nests_in_chunk_shape(self, tile_client):
+        tc, _ = tile_client
+        body = tc.get("/api/tile_info/tiled").json()
+        chunk_x = body["chunk_shape"][body["plane"]["x"]]
+        assert chunk_x % body["tile_size"] == 0
+
+    def test_unknown_source_is_404(self, tile_client):
+        tc, _ = tile_client
+        assert tc.get("/api/tile_info/nope").status_code == 404
+
+    def test_requires_token_when_one_is_set(self, auth_client):
+        tc, _ = auth_client
+        assert tc.get("/api/tile_info/src0").status_code == 401
+
+
+class TestTileEndpoint:
+    def test_raw_tile_returns_bytes_and_shape_headers(self, tile_client):
+        tc, _ = tile_client
+        r = tc.get("/api/tile/tiled", params={"level": 0, "col": 0, "row": 0})
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/octet-stream"
+        assert r.headers["X-Dtype"] == "uint16"
+        assert r.headers["X-Tile-Size"] == "512"
+        assert len(r.content) == 512 * 512 * 2
+
+    def test_neighbouring_tiles_ask_for_adjacent_world_bounds(self, tile_client):
+        tc, mock_fc = tile_client
+        tc.get("/api/tile/tiled", params={"level": 0, "col": 1, "row": 0})
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        # Bounds are full-resolution world coords: col 1 starts one tile in.
+        assert kwargs["slice_hint"][4] == slice(512, 1024)
+        assert kwargs["slice_hint"][3] == slice(0, 512)
+        assert kwargs["scale_hint"][3] == 1 and kwargs["scale_hint"][4] == 1
+        # Leading axes collapse to a single index so the payload is one plane.
+        assert kwargs["slice_hint"][0] == slice(0, 1)
+
+    def test_a_coarser_level_covers_more_world_at_a_higher_scale(self, tile_client):
+        tc, mock_fc = tile_client
+        tc.get("/api/tile/tiled", params={"level": 1, "col": 0, "row": 0})
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        # One level-1 tile spans 2x the world and downsamples it back to 512px.
+        assert kwargs["slice_hint"][4] == slice(0, 1024)
+        assert kwargs["scale_hint"][3] == 2 and kwargs["scale_hint"][4] == 2
+
+    def test_edge_tile_is_clipped_to_the_plane(self, tile_client):
+        tc, mock_fc = tile_client
+        tc.get("/api/tile/tiled", params={"level": 0, "col": 1, "row": 1})
+        hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+        assert hint[3].stop == 1024 and hint[4].stop == 1024
+
+    def test_selection_indexes_the_labelled_axis(self, tile_client):
+        tc, mock_fc = tile_client
+        tc.get("/api/tile/tiled", params={"c": 2, "z": 7})
+        hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+        assert hint[1] == slice(2, 3)  # c
+        assert hint[2] == slice(7, 8)  # z
+
+    def test_tile_outside_the_level_grid_is_404(self, tile_client):
+        tc, _ = tile_client
+        r = tc.get("/api/tile/tiled", params={"level": 0, "col": 99, "row": 0})
+        assert r.status_code == 404
+
+    def test_row_outside_the_grid_is_404_too(self, tile_client):
+        tc, _ = tile_client
+        assert tc.get("/api/tile/tiled", params={"row": 99}).status_code == 404
+
+    def test_a_level_the_tensor_does_not_have_is_404(self, tile_client):
+        """An unadvertised level must not be served, at any grid position.
+
+        `col`/`row` cannot catch this: the old grid check was
+        `row * edge * 2**level >= height`, which at (0,0) is `0 >= height` --
+        false for every level. So tile (0,0) was reachable at any depth.
+        """
+        tc, mock_fc = tile_client
+        n_levels = len(tc.get("/api/tile_info/tiled").json()["levels"])
+        for level in (n_levels, n_levels + 3, 17, 24):
+            r = tc.get("/api/tile/tiled", params={"level": level})
+            assert r.status_code == 404, f"level {level} was served"
+            assert "does not exist" in r.json()["detail"]
+
+    def test_an_over_deep_level_never_reaches_the_backend(self, tile_client):
+        """The reason this is a 404 and not a curiosity.
+
+        `scale_hint` is honoured down into `downsample_block`, which edge-pads
+        its input up to a multiple of the scale factor. Level 17 on a 512px
+        plane therefore asks the data plane to allocate and write a 65536x65536
+        array -- measured: level 13 already pads to 8192x8192, and the cost
+        scales with the square. Rejecting before `get_tensor` is what keeps one
+        query parameter from sizing an allocation in a shared backend process.
+        """
+        tc, mock_fc = tile_client
+        before = mock_fc.get_tensor.call_count
+        assert tc.get("/api/tile/tiled", params={"level": 17}).status_code == 404
+        assert mock_fc.get_tensor.call_count == before
+
+    def test_the_advertised_grid_is_exactly_what_is_servable(self, tile_client):
+        """tile_info and /api/tile must agree; they used to derive it twice."""
+        tc, _ = tile_client
+        info = tc.get("/api/tile_info/tiled").json()
+        for lv in info["levels"]:
+            args = {"level": lv["level"], "col": lv["cols"] - 1, "row": lv["rows"] - 1}
+            assert tc.get("/api/tile/tiled", params=args).status_code == 200
+            # One past each edge of the advertised grid is gone.
+            assert (
+                tc.get(
+                    "/api/tile/tiled", params={**args, "col": lv["cols"]}
+                ).status_code
+                == 404
+            )
+            assert (
+                tc.get(
+                    "/api/tile/tiled", params={**args, "row": lv["rows"]}
+                ).status_code
+                == 404
+            )
+
+    def test_a_bad_tile_404s_even_holding_a_matching_etag(self, tile_client):
+        # Validation runs before the revalidation short-circuit, so a stale or
+        # forged ETag cannot turn a nonexistent tile into a cheap 304.
+        tc, _ = tile_client
+        etag = tc.get("/api/tile/tiled").headers["ETag"]
+        r = tc.get(
+            "/api/tile/tiled",
+            params={"level": 17},
+            headers={"If-None-Match": etag},
+        )
+        assert r.status_code == 404
+
+    def test_selection_out_of_range_is_422(self, tile_client):
+        tc, _ = tile_client
+        r = tc.get("/api/tile/tiled", params={"c": 99})
+        assert r.status_code == 422
+
+    def test_bad_format_is_rejected(self, tile_client):
+        tc, _ = tile_client
+        assert tc.get("/api/tile/tiled", params={"fmt": "gif"}).status_code == 422
+
+    def test_response_is_cacheable(self, tile_client):
+        tc, _ = tile_client
+        r = tc.get("/api/tile/tiled")
+        assert "max-age" in r.headers["Cache-Control"]
+        assert r.headers["ETag"].startswith('"')
+
+    def test_cache_is_private_never_public(self, tile_client):
+        """`public` on a token-authenticated response is a shared-cache bypass.
+
+        The URL carries no token (auth is a header, so rotation does not bust the
+        cache), and RFC 9111 §3.5 lets a shared cache reuse a response to an
+        authenticated request for *another* request when the response says
+        `public` / `s-maxage` / `must-revalidate`. With no token in the cache key
+        that other request can be an unauthenticated one, so an nginx
+        proxy_cache or CDN in front of a `--remote` deployment would serve tiles
+        having checked the token once, for someone else.
+        """
+        tc, _ = tile_client
+        cc = tc.get("/api/tile/tiled").headers["Cache-Control"]
+        assert "private" in cc
+        for shared in ("public", "s-maxage", "must-revalidate"):
+            assert shared not in cc, f"{shared!r} re-opens the shared-cache bypass"
+
+    def test_varies_on_the_credential(self, tile_client):
+        tc, _ = tile_client
+        # Belt-and-braces: a cache that stores it anyway keys on the token
+        # rather than colliding entries across users.
+        assert "Authorization" in tc.get("/api/tile/tiled").headers["Vary"]
+
+    def test_a_304_is_no_more_shareable_than_a_200(self, tile_client):
+        # The revalidation path reuses the same header dict; if it ever stops
+        # doing so, the cheap response is the one that leaks.
+        tc, _ = tile_client
+        etag = tc.get("/api/tile/tiled").headers["ETag"]
+        r = tc.get("/api/tile/tiled", headers={"If-None-Match": etag})
+        assert r.status_code == 304
+        assert "private" in r.headers["Cache-Control"]
+        assert "public" not in r.headers["Cache-Control"]
+        assert "Authorization" in r.headers["Vary"]
+
+    def test_matching_etag_revalidates_to_304_without_reading(self, tile_client):
+        tc, mock_fc = tile_client
+        etag = tc.get("/api/tile/tiled").headers["ETag"]
+        before = mock_fc.get_tensor.call_count
+        r = tc.get("/api/tile/tiled", headers={"If-None-Match": etag})
+        assert r.status_code == 304
+        assert r.content == b""
+        assert mock_fc.get_tensor.call_count == before  # no backend read
+
+    def test_etag_distinguishes_tiles(self, tile_client):
+        tc, _ = tile_client
+        a = tc.get("/api/tile/tiled", params={"col": 0}).headers["ETag"]
+        b = tc.get("/api/tile/tiled", params={"col": 1}).headers["ETag"]
+        assert a != b
+
+    def test_etag_distinguishes_render_settings(self, tile_client):
+        tc, _ = tile_client
+        a = tc.get("/api/tile/tiled", params={"fmt": "png", "lo": 1}).headers["ETag"]
+        b = tc.get("/api/tile/tiled", params={"fmt": "png", "lo": 5}).headers["ETag"]
+        assert a != b
+
+    def test_raw_etag_ignores_render_settings(self, tile_client):
+        # Contrast is applied client-side for raw, so it must not fragment the cache.
+        tc, _ = tile_client
+        a = tc.get("/api/tile/tiled", params={"lo": 1}).headers["ETag"]
+        b = tc.get("/api/tile/tiled", params={"lo": 5}).headers["ETag"]
+        assert a == b
+
+    def test_rendered_tile_returns_an_image(self, tile_client):
+        tc, _ = tile_client
+        r = tc.get("/api/tile/tiled", params={"fmt": "png"})
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "image/png"
+        assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ===========================================================================
+# Unit tests — cancellation (client hung up before the read ran)
+# ===========================================================================
+
+
+async def _disconnected(self) -> bool:
+    return True
+
+
+class TestCancellation:
+    """A disconnected caller must cost no backend read."""
+
+    def test_tile_skips_the_read_and_answers_499(self, tile_client):
+        tc, mock_fc = tile_client
+        before = mock_fc.get_tensor.call_count
+        with patch("starlette.requests.Request.is_disconnected", _disconnected):
+            r = tc.get("/api/tile/tiled")
+        assert r.status_code == 499
+        assert mock_fc.get_tensor.call_count == before
+
+    def test_slice_skips_the_read_and_answers_499(self, dev_client):
+        tc, mock_fc = dev_client
+        before = mock_fc.get_tensor.call_count
+        with patch("starlette.requests.Request.is_disconnected", _disconnected):
+            r = tc.post("/api/slice", json={"source_id": "src0", "tensor_id": "t0"})
+        assert r.status_code == 499
+        assert mock_fc.get_tensor.call_count == before
+
+    def test_render_skips_the_read_and_answers_499(self, dev_client):
+        tc, mock_fc = dev_client
+        before = mock_fc.get_tensor.call_count
+        with patch("starlette.requests.Request.is_disconnected", _disconnected):
+            r = tc.post("/api/render", json={"source_id": "src0", "tensor_id": "t0"})
+        assert r.status_code == 499
+        assert mock_fc.get_tensor.call_count == before
+
+    def test_cancellations_are_counted_in_diagnostics(self, tile_client):
+        tc, _ = tile_client
+        # Read the counter off the context, not /api/diagnostics: that route is
+        # rate limited to 1 req/s per session, so a before/after pair 429s.
+        diag = tc.app.state.sidecar.diag
+        before = diag.cancelled
+        with patch("starlette.requests.Request.is_disconnected", _disconnected):
+            tc.get("/api/tile/tiled")
+        assert diag.cancelled == before + 1
+        assert diag.snapshot(dev_mode=True)["cancelled_reads"] == before + 1
+
+    def test_a_connected_client_is_unaffected(self, tile_client):
+        tc, mock_fc = tile_client
+        before = mock_fc.get_tensor.call_count
+        assert tc.get("/api/tile/tiled").status_code == 200
+        assert mock_fc.get_tensor.call_count == before + 1
+
+
+# ===========================================================================
+# Unit tests — tile selection is checked against the axes that exist
+# ===========================================================================
+
+
+@contextmanager
+def _tile_client_for(dim_labels, shape):
+    """A tile client over a tensor with the given axis labels."""
+    td = _make_tensor_desc(
+        array_id="s/Image:0", shape=shape, dtype="uint16", dim_labels=dim_labels
+    )
+    src = _make_source_desc(source_id="s", tensors=[td])
+    mock_fc = _build_mock_client(src)
+    plane = np.zeros([1] * (len(shape) - 2) + [8, 8], dtype=np.uint16)
+    lazy = MagicMock()
+    lazy.compute.return_value = plane
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        with TestClient(create_app(token=None), raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+class TestTileSelectionValidation:
+    """`t`/`z`/`c` must be checked against the axis they name, not just `ge=0`.
+
+    The loop that built the slices iterated *axes*, so a parameter naming an
+    axis the tensor does not have was never visited and never validated.
+    """
+
+    def test_nonexistent_axis_with_a_nonzero_index_is_422(self):
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, _):
+            for params in ({"t": 7}, {"z": 99}, {"c": 12345}):
+                r = tc.get("/api/tile/s", params=params)
+                assert r.status_code == 422, f"{params} was served"
+                assert "no" in r.json()["detail"]
+
+    def test_nonexistent_axis_at_index_zero_is_fine(self):
+        # Every client sends a full selection; index 0 is the correct default
+        # and must not become an error.
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, _):
+            assert (
+                tc.get("/api/tile/s", params={"t": 0, "z": 0, "c": 0}).status_code
+                == 200
+            )
+
+    def test_an_ignored_parameter_cannot_fragment_the_cache(self):
+        """Identical bytes must not sit under unbounded distinct ETags.
+
+        `t` is an unbounded non-negative int, so when it was silently dropped
+        every value minted a fresh cache entry for the very same tile.
+        """
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, _):
+            base = tc.get("/api/tile/s").headers["ETag"]
+            assert tc.get("/api/tile/s", params={"t": 0}).headers["ETag"] == base
+            assert tc.get("/api/tile/s", params={"t": 9}).status_code == 422
+
+    def test_axes_are_validated_independently(self):
+        # The nastiest shape: one selection half-checked, because `c` exists
+        # and `t` does not.
+        with _tile_client_for(["c", "y", "x"], [3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile/s", params={"c": 2}).status_code == 200
+            assert tc.get("/api/tile/s", params={"c": 3}).status_code == 422
+            assert tc.get("/api/tile/s", params={"t": 5}).status_code == 422
+            assert tc.get("/api/tile/s", params={"z": 5}).status_code == 422
+
+    def test_existing_axes_keep_their_extent_check(self):
+        with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile/s", params={"z": 15}).status_code == 200
+            assert tc.get("/api/tile/s", params={"z": 16}).status_code == 422
+            # Extents are full-resolution, which holds at every level because
+            # scale_hint is 1 on non-plane axes.
+            assert (
+                tc.get("/api/tile/s", params={"z": 15, "level": 1}).status_code == 200
+            )
+
+    def test_a_rejected_selection_never_reaches_the_backend(self):
+        with _tile_client_for(["y", "x"], [512, 512]) as (tc, mock_fc):
+            before = mock_fc.get_tensor.call_count
+            assert tc.get("/api/tile/s", params={"c": 4}).status_code == 422
+            assert mock_fc.get_tensor.call_count == before
+
+
+class TestTileInfoPinnedAxes:
+    """Axes the tile API serves at index 0 and cannot address are published."""
+
+    def test_no_pinned_axes_on_a_fully_addressable_tensor(self):
+        with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == []
+
+    def test_an_unlabelled_axis_is_reported(self):
+        # 4 of 5 positions are unreachable through this route; say so rather
+        # than leaving a client to diff dim_labels against selectable.
+        with _tile_client_for(["pos", "c", "y", "x"], [5, 3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == [
+                {"axis": 0, "label": "pos", "extent": 5}
+            ]
+
+    def test_a_singleton_axis_is_not_reported(self):
+        # Extent 1 hides nothing: index 0 is the only index.
+        with _tile_client_for(["pos", "c", "y", "x"], [1, 3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == []
+
+    def test_a_duplicate_label_is_reported(self):
+        # labeled_axis_index takes the first match, so the second C is
+        # unreachable even though it is labelled.
+        with _tile_client_for(["c", "c", "y", "x"], [2, 3, 512, 512]) as (tc, _):
+            assert tc.get("/api/tile_info/s").json()["pinned"] == [
+                {"axis": 1, "label": "c", "extent": 3}
+            ]
+
+
+# ===========================================================================
+# Unit tests — tiles are addressed by array_id alone
+# ===========================================================================
+
+
+@contextmanager
+def _multi_tensor_client():
+    """A source with two tensors, so a bare source_id is ambiguous."""
+    tensors = [
+        _make_tensor_desc(
+            array_id="multi/Image:0",
+            shape=[1, 1, 1, 512, 512],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        ),
+        _make_tensor_desc(
+            array_id="multi/Image:1",
+            shape=[1, 1, 1, 2048, 2048],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        ),
+    ]
+    src = _make_source_desc(source_id="multi", tensors=tensors)
+    mock_fc = _build_mock_client(src)
+    lazy = MagicMock()
+    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        with TestClient(create_app(token=None), raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+class TestTileArrayIdAddressing:
+    """array_id is the whole address (identity policy in descriptor.proto).
+
+    The pair form these routes used to take was split and immediately rejoined
+    before the read, and the two derivations could disagree.
+    """
+
+    def test_a_qualified_array_id_selects_its_tensor(self):
+        with _multi_tensor_client() as (tc, _):
+            info = tc.get("/api/tile_info/multi/Image:1").json()
+            assert info["array_id"] == "multi/Image:1"
+            assert info["shape"] == [1, 1, 1, 2048, 2048]
+
+    def test_a_field_containing_slashes_survives_the_route(self):
+        # The policy allows '/' inside the field (HCS "plate/A01/0"); only the
+        # source_id prefix is slash-free. {array_id:path} must capture it whole.
+        td = _make_tensor_desc(
+            array_id="plate/A01/0",
+            shape=[1, 1, 1, 512, 512],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        )
+        src = _make_source_desc(source_id="plate", tensors=[td])
+        mock_fc = _build_mock_client(src)
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            with TestClient(create_app(token=None)) as tc:
+                assert (
+                    tc.get("/api/tile_info/plate/A01/0").json()["array_id"]
+                    == "plate/A01/0"
+                )
+
+    def test_a_bare_id_is_refused_for_a_multi_tensor_source(self):
+        # biopb/biopb#75: refuse rather than guess. It used to return tensor[0].
+        with _multi_tensor_client() as (tc, _):
+            r = tc.get("/api/tile_info/multi")
+            assert r.status_code == 404
+            detail = r.json()["detail"]
+            assert "multi/Image:0" in detail and "multi/Image:1" in detail
+
+    def test_a_bare_id_still_works_for_a_single_tensor_source(self):
+        # For a single-tensor source the bare source_id *is* the array_id.
+        with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile_info/s").status_code == 200
+
+    def test_an_unknown_field_404s_and_names_the_alternatives(self):
+        with _multi_tensor_client() as (tc, _):
+            r = tc.get("/api/tile/multi/Nope")
+            assert r.status_code == 404
+            assert "multi/Image:0" in r.json()["detail"]
+
+    def test_the_read_addresses_the_tensor_the_geometry_came_from(self):
+        """The bug the split allowed: geometry from one tensor, read of another.
+
+        A bare multi-tensor id gave tensor[0]'s shape while the read was issued
+        for the bare source_id, whose resolution is caller-dependent.
+        """
+        with _multi_tensor_client() as (tc, mock_fc):
+            assert tc.get("/api/tile/multi/Image:1").status_code == 200
+            assert mock_fc.get_tensor.call_args.args[0] == "multi/Image:1"
+
+    def test_no_tensor_id_parameter_is_accepted_any_more(self):
+        # A stale caller passing the old pair must not silently address
+        # something else; the ignored query param cannot change the tensor.
+        with _multi_tensor_client() as (tc, _):
+            r = tc.get("/api/tile_info/multi", params={"tensor_id": "Image:1"})
+            assert r.status_code == 404
