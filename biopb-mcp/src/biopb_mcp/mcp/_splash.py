@@ -9,9 +9,6 @@ a ``QSplashScreen`` can give the watching scientist an immediate
 built. It is purely cosmetic feedback — a workaround for the startup latency,
 not a fix — so it is **fully best-effort**: every entry point fails open to a
 no-op handle and can never break or delay the bootstrap.
-
-Only the GUI (non-headless) branch uses it; a headless kernel has no Qt loop
-and nothing to look at.
 """
 
 import logging

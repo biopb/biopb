@@ -1,0 +1,158 @@
+{
+  "about": [
+    "The contract for ~/.config/biopb/extra-packages.txt: file content in, the",
+    "requirement list the installer passes to `uv tool install --with` out.",
+    "",
+    "There are TWO implementations of this parser -- install.sh's",
+    "_read_extra_packages and biopb-engine.ps1's Read-ExtraPackages -- written",
+    "independently for bash and PowerShell. Both had the same bug (biopb/biopb#648:",
+    "a `#` anywhere ended the line, so a PEP 508 direct reference lost its URL",
+    "fragment and silently installed something else). Nothing made them agree.",
+    "",
+    "This file is what makes them agree. test_extras_contract.py runs EVERY case",
+    "below through BOTH parsers, so the two cannot drift without a test failing.",
+    "Add a case here, not to one suite -- a case added to only one parser's tests",
+    "is exactly the hole this exists to close.",
+    "",
+    "The comment rule is pip's, from requirements.txt: `#` starts a comment only at",
+    "line start or after whitespace. Everywhere else it is data."
+  ],
+  "cases": [
+    {
+      "id": "plain-name",
+      "why": "The ordinary case: one bare requirement.",
+      "input": "basicpy\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "version-pin",
+      "why": "A pinned requirement passes through with its specifier intact.",
+      "input": "m2stitch==0.9.0\n",
+      "expected": ["m2stitch==0.9.0"]
+    },
+    {
+      "id": "several-lines",
+      "why": "One requirement per line, order preserved.",
+      "input": "basicpy\nm2stitch==0.9.0\nscikit-image>=0.22\n",
+      "expected": ["basicpy", "m2stitch==0.9.0", "scikit-image>=0.22"]
+    },
+    {
+      "id": "empty-file",
+      "why": "An empty file means no extras, not an empty requirement.",
+      "input": "",
+      "expected": []
+    },
+    {
+      "id": "blank-lines-dropped",
+      "why": "Blank and whitespace-only lines are skipped, not passed to uv as ''.",
+      "input": "\nbasicpy\n\n   \n\t\nm2stitch\n\n",
+      "expected": ["basicpy", "m2stitch"]
+    },
+    {
+      "id": "full-line-comment",
+      "why": "A `#` at line start comments out the whole line.",
+      "input": "# needed for flat-field correction\nbasicpy\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "indented-full-line-comment",
+      "why": "Leading whitespace before the `#` still makes it a full-line comment.",
+      "input": "    # temporarily disabled\n        # and this one\nbasicpy\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "comment-with-no-space-after-hash",
+      "why": "`#basicpy` is a commented-out line, not a package named '#basicpy'. The rule is about what precedes the `#`, not what follows it.",
+      "input": "#basicpy\nm2stitch\n",
+      "expected": ["m2stitch"]
+    },
+    {
+      "id": "trailing-comment",
+      "why": "A `#` after whitespace ends the requirement; the note is not part of it.",
+      "input": "basicpy  # why I need this\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "trailing-comment-after-tab",
+      "why": "Any whitespace counts, not just a space.",
+      "input": "basicpy\t# tab-separated note\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "bare-trailing-hash",
+      "why": "An empty comment leaves the requirement and takes the separating space with it.",
+      "input": "basicpy #\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "git-subdirectory-fragment",
+      "why": "THE MOTIVATING BUG (#648). `#subdirectory=` is a PEP 508 URL fragment with no whitespace before it, so it is data. Truncating here does not fail -- uv installs the repo ROOT under the right name, and the user gets a different package with nothing to warn about.",
+      "input": "zoo @ git+https://github.com/o/r@main#subdirectory=sub\n",
+      "expected": ["zoo @ git+https://github.com/o/r@main#subdirectory=sub"]
+    },
+    {
+      "id": "wheel-sha256-fragment",
+      "why": "Same shape, worse consequence: dropping `#sha256=` silently disables the hash check on a directly-referenced wheel.",
+      "input": "foo @ https://h.example/foo-1.0-py3-none-any.whl#sha256=deadbeef\n",
+      "expected": ["foo @ https://h.example/foo-1.0-py3-none-any.whl#sha256=deadbeef"]
+    },
+    {
+      "id": "egg-fragment",
+      "why": "The legacy `#egg=` fragment names the package a VCS URL provides; without it the requirement can fail to resolve at all.",
+      "input": "git+https://h.example/r.git#egg=pkg\n",
+      "expected": ["git+https://h.example/r.git#egg=pkg"]
+    },
+    {
+      "id": "fragment-plus-real-comment",
+      "why": "Both rules on one line at once: the fragment is kept (no whitespace before its `#`) and the trailing comment is stripped (whitespace before its `#`). A parser that decides per LINE which `#` to honour, rather than per occurrence, has to pick one and gets the other wrong.",
+      "input": "zoo @ git+https://github.com/o/r@main#subdirectory=sub  # the stitcher\n",
+      "expected": ["zoo @ git+https://github.com/o/r@main#subdirectory=sub"]
+    },
+    {
+      "id": "surrounding-whitespace-trimmed",
+      "why": "Indentation and trailing spaces are not part of the requirement.",
+      "input": "   basicpy   \n\tm2stitch==0.9.0\t\n",
+      "expected": ["basicpy", "m2stitch==0.9.0"]
+    },
+    {
+      "id": "crlf-line-endings",
+      "why": "The file is the user's, and on Windows -- where the GUI installer runs -- their editor writes CRLF. A retained \\r rides along into the requirement string and makes uv reject it.",
+      "input": "basicpy\r\nm2stitch==0.9.0\r\n",
+      "expected": ["basicpy", "m2stitch==0.9.0"]
+    },
+    {
+      "id": "crlf-with-trailing-comment",
+      "why": "The \\r must go even when the comment strip already ran.",
+      "input": "basicpy  # note\r\n",
+      "expected": ["basicpy"]
+    },
+    {
+      "id": "no-trailing-newline",
+      "why": "A file whose last line lacks a newline -- what an editor that does not add one leaves behind. The last requirement must not be dropped.",
+      "input": "basicpy\nm2stitch",
+      "expected": ["basicpy", "m2stitch"]
+    },
+    {
+      "id": "extras-and-markers",
+      "why": "Full PEP 508 syntax -- extras in brackets, an environment marker after a semicolon -- survives intact, including the spaces inside it.",
+      "input": "pkg[extra]>=1.0 ; python_version < \"3.12\"\n",
+      "expected": ["pkg[extra]>=1.0 ; python_version < \"3.12\""]
+    },
+    {
+      "id": "local-version-plus",
+      "why": "A local version segment carries a '+'. Nothing in the comment strip may touch it.",
+      "input": "torch==2.3.0+cpu\n",
+      "expected": ["torch==2.3.0+cpu"]
+    },
+    {
+      "id": "everything-at-once",
+      "why": "The realistic file: a header comment, real requirements, a disabled line, a fragment, and a note.",
+      "input": "# packages I add to the biopb env by hand\n# (the installer replays this on every upgrade)\n\nbasicpy\nm2stitch==0.9.0   # stitching\n\n# scikit-image>=0.22\nzoo @ git+https://github.com/o/r@main#subdirectory=sub\n",
+      "expected": [
+        "basicpy",
+        "m2stitch==0.9.0",
+        "zoo @ git+https://github.com/o/r@main#subdirectory=sub"
+      ]
+    }
+  ]
+}

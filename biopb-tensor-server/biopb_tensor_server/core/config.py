@@ -6,12 +6,11 @@ Reads JSON config files (``biopb.json``) carrying:
 - Credential profiles for remote storage (S3, GCS, etc.)
 
 JSON is the only supported format; a pre-#34 ``biopb.toml`` is converted with
-``biopb server migrate-config`` (see biopb/biopb#34).
+``biopb-tensor-server migrate-config`` (see biopb/biopb#34).
 
 Example config (explicit):
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "sources": [
     {
       "type": "zarr",
@@ -28,7 +27,6 @@ Example config (explicit):
 Example config (relaxed auto-discovery):
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "sources": [
     { "url": "/data/" },
     { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images" }
@@ -41,7 +39,6 @@ needs an explicit ``type`` + ``dataset`` (it is not auto-detected).
 Example config (remote storage):
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8815 },
   "credentials": {
     "default_profile": "aws-prod",
     "profiles": [
@@ -111,7 +108,6 @@ from biopb._locations import (
     find_config as find_config,
 )
 
-from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
@@ -121,6 +117,7 @@ from biopb_tensor_server.core.discovery import (
     generate_source_id,
     get_file_identity,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import (
     CredentialProfile,
     CredentialsConfig,
@@ -238,11 +235,6 @@ _CONSTRAINTS = {
         "query_timeout_ms": _Range(min=1),
     },
     "ServerConfig": {
-        # 0 is not a typo-shaped value here: it is the "let the OS assign an
-        # ephemeral port" sentinel the flight server binds on (used by the test
-        # harness and by anyone running two planes on one box), so the floor is
-        # 0, not 1. Above 65535 there is no such reading -- that is a typo.
-        "port": _Range(min=0, max=65535),
         "log_level": _Enum(
             {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
         ),
@@ -386,7 +378,14 @@ class SourceConfig:
     )
     dim_labels: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Dimension labels applied to all tensors in the source."},
+        metadata={
+            "help": "Dimension labels applied to all tensors in the source. This "
+            "is how a store that carries no axis semantics of its own (plain "
+            "zarr, HDF5 -- which otherwise report dim0, dim1, ...) gets them: "
+            "the server reorders labelled axes into canonical [..., z, y, x, s] "
+            "order, but never invents a label it was not given "
+            "(biopb/biopb#596)."
+        },
     )
     dataset: Optional[str] = field(
         default=None,
@@ -647,19 +646,23 @@ class ServerConfig:
     source the config JSON Schema reads (see ``config_schema.py``). The nested
     section objects (``cache``/``pyramid``/``precache``/``credentials``/
     ``metadata_db``) and ``sources`` document themselves.
+
+    **The network bind is deliberately not here** (biopb/biopb#604). ``host``,
+    ``port``, ``tls``, ``tls_cert`` and ``tls_key`` used to live in this section
+    and now come only from the CLI (``serve``/``launch`` flags, which the control
+    passes explicitly when it spawns the plane). This file answers *what to
+    serve* -- sources, cache, pyramid, credentials -- while *where and how to
+    expose it* is a deployment decision owned by whoever starts the process. The
+    sidecar's own bind (``--web-host``/``--web-port``) was always CLI-only; this
+    just makes the flight plane consistent with it.
+
+    Two things fall out. The control cannot hold a stale view of a bind it
+    dictated, so a port edited underneath it can no longer wedge its liveness
+    probe. And "public + tokenless" stops being a config state that has to be
+    *validated* against and becomes unrepresentable: the flag that binds publicly
+    (``--remote``) is the same one that requires a token.
     """
 
-    host: str = field(
-        default="0.0.0.0",
-        metadata={
-            "help": "Address the Flight gRPC server binds. Loopback (127.0.0.1) "
-            "is local mode; a public address requires a token (remote mode)."
-        },
-    )
-    port: int = field(
-        default=8815,
-        metadata={"help": "TCP port for the Flight gRPC data-plane server."},
-    )
     log_level: str = field(
         default="INFO",
         metadata={"help": "Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL)."},
@@ -911,7 +914,7 @@ def restore_redacted_secrets(
 # learn the format changed (biopb/biopb#34).
 _MIGRATE_HINT = (
     "JSON is the only supported config format; convert a legacy "
-    f"{LEGACY_CONFIG_NAME} with `biopb server migrate-config`. See biopb/biopb#34."
+    f"{LEGACY_CONFIG_NAME} with `biopb-tensor-server migrate-config`. See biopb/biopb#34."
 )
 
 
@@ -921,7 +924,7 @@ def _read_config_file(path: Path) -> Dict[str, Any]:
     JSON only. A ``.toml`` path is rejected without parsing (the read path was
     dropped once the deprecation window closed); every other extension --
     including none -- is read as JSON, so an unconventionally-named config still
-    loads. Both failures name ``biopb server migrate-config``.
+    loads. Both failures name ``biopb-tensor-server migrate-config``.
     """
     if path.suffix.lower() == ".toml":
         raise ValueError(
@@ -944,7 +947,7 @@ def read_legacy_toml(path: Path) -> Dict[str, Any]:
     """Read a pre-#34 ``biopb.toml`` into a plain dict.
 
     The **only** remaining TOML reader, and deliberately not reachable from
-    :func:`load_config`: it exists for `biopb server migrate-config`, which
+    :func:`load_config`: it exists for `biopb-tensor-server migrate-config`, which
     converts the old file to canonical JSON. ``tomllib`` is imported lazily so
     the server's own read path carries no TOML dependency.
     """
@@ -1040,11 +1043,54 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
             continue
         if not isinstance(value, dict):
             continue
-        _warn_extra_keys(value, section_keys.get(section, set()), section)
+        known = section_keys.get(section, set())
+        if section == "server":
+            # The retired bind keys get their own, far more actionable message
+            # from _warn_retired_bind_keys; suppress the generic "unknown key"
+            # line so it does not bury that one.
+            known = known | set(_RETIRED_BIND_KEYS)
+        _warn_extra_keys(value, known, section)
         if section == "credentials":
             for prof in value.get("profiles", []) or []:
                 if isinstance(prof, dict):
                     _warn_extra_keys(prof, profile_keys, "credentials.profiles")
+
+
+# Bind/TLS keys that used to live in [server] and are now CLI-only
+# (biopb/biopb#604). Mapped to the flag that replaced each one.
+_RETIRED_BIND_KEYS = {
+    "host": "--host",
+    "port": "--port",
+    "tls": "--tls",
+    "tls_cert": "--tls-cert",
+    "tls_key": "--tls-key",
+}
+
+
+def _warn_retired_bind_keys(server_data: Dict[str, Any]) -> None:
+    """Warn — loudly — for a ``[server]`` bind key that is no longer read.
+
+    Ignoring these silently would be the worst possible break: a config saying
+    ``"host": "0.0.0.0"`` was someone's *remote* deployment, and quietly moving it
+    to the loopback default would take their server off the network with no
+    signal. So the message names the exact flag that replaces the key, and it is
+    a warning rather than a hard error because a config is often shared across
+    hosts that have already migrated their launch command.
+    """
+    if not isinstance(server_data, dict):
+        return
+    for key in _RETIRED_BIND_KEYS:
+        if server_data.get(key) is None:
+            continue
+        logger.warning(
+            "Config key `server.%s` is no longer read and is IGNORED: the "
+            "network bind moved to the command line (biopb/biopb#604). Pass "
+            "`%s` to `biopb-tensor-server serve/launch`, or -- under the control "
+            "plane -- use `biopb control start [--remote] [--tls]`, which passes "
+            "it down. Remove the key to silence this.",
+            key,
+            _RETIRED_BIND_KEYS[key],
+        )
 
 
 def _carry(
@@ -1114,8 +1160,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     # every default.
     server_data = data.get("server", {})
     server_kwargs: Dict[str, Any] = {}
-    _carry(server_kwargs, "host", server_data)
-    _carry(server_kwargs, "port", server_data)
+    _warn_retired_bind_keys(server_data)
     _carry(server_kwargs, "log_level", server_data)
     _carry(server_kwargs, "log_scope_to_biopb", server_data)
 
@@ -1224,6 +1269,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             region=profile_data.get("region", None),
             token=profile_data.get("token", None),
             endpoint_url=profile_data.get("endpoint_url", None),
+            # Per-upstream TLS trust (biopb/biopb#604 item 4). Both were added to
+            # CredentialProfile and read by resolve_upstream_credentials, but
+            # never parsed here -- so a configured anchor was dropped on load and
+            # every `grpcs://` upstream silently fell back to TOFU pinning, which
+            # is precisely the silent degradation that design set out to prevent.
+            # They are *known* keys (config_schema derives them from the
+            # dataclass), so nothing warned either.
+            tls_ca_file=profile_data.get("tls_ca_file", None),
+            tls_fingerprint=profile_data.get("tls_fingerprint", None),
         )
         if profile.name:
             credentials_profiles.append(profile)
@@ -1416,9 +1470,9 @@ def _discover_tensor_server(
         source.url,
     )
     from biopb_tensor_server.adapters.remote_tensor import (
-        _resolve_upstream_token,
         _split_grpc_url,
         list_upstream_source_ids,
+        resolve_upstream_credentials,
     )
 
     endpoint, upstream_source_id = _split_grpc_url(source.url)
@@ -1434,8 +1488,14 @@ def _discover_tensor_server(
     # it can.
     from biopb.tensor import TensorFlightClient
 
-    token = _resolve_upstream_token(source, credentials_config)
-    client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+    credentials = resolve_upstream_credentials(source, credentials_config)
+    client = TensorFlightClient(
+        endpoint,
+        cache_bytes=0,
+        token=credentials.token,
+        tls_ca_pem=credentials.tls_ca_pem,
+        tls_fingerprint=credentials.tls_fingerprint,
+    )
     try:
         ids, _complete = list_upstream_source_ids(client, endpoint)
         upstream_ids = sorted(ids)
@@ -1577,6 +1637,16 @@ def discover_sources(
         ValueError: If remote URL lacks explicit 'type'
     """
     if registry is None:
+        # Deferred on layering grounds: core should not import adapters. At
+        # directory granularity adapters -> cache -> config -> adapters is a
+        # cycle; at module granularity it is not one *yet*, because
+        # adapters/__init__ does not import cached_source (the module that
+        # reaches the cache) -- only serving/upload_manager does. Re-exporting
+        # cached_source from adapters/__init__, the one adapter module it omits,
+        # would close it for real. So undeferring this import will appear to
+        # work: that is the trap, not a sign the comment is stale.
+        from biopb_tensor_server.adapters import get_default_registry
+
         registry = get_default_registry()
 
     # Case 0: Remote URLs require an explicit (or auto-detectable) type.
@@ -1728,6 +1798,9 @@ def resolve_all_sources(
         List of all concrete SourceConfig objects (one per data source)
     """
     if registry is None:
+        # Deferred for the same layering reason as in discover_sources.
+        from biopb_tensor_server.adapters import get_default_registry
+
         registry = get_default_registry()
 
     source_list = sources if sources is not None else config.sources
@@ -1739,6 +1812,22 @@ def resolve_all_sources(
     for source in source_list:
         try:
             discovered = discover_sources(source, registry, credentials_config)
+        except UpstreamConfigError as e:
+            if not tolerant:
+                raise
+            # Still skip rather than abort the boot -- one bad entry must not take
+            # the server down -- but not at the volume of a missing static path.
+            # The operator asked for a stronger trust anchor and the server is
+            # coming up without the source that needed it; that is a broken
+            # deployment, not a transient upstream (biopb/biopb#608).
+            logger.error(
+                "NOT SERVING %s: its credentials configuration is broken (%s). "
+                "This is a configuration error, not an unreachable upstream -- "
+                "it will not resolve until the config is corrected.",
+                source.url,
+                e,
+            )
+            continue
         except Exception as e:
             if not tolerant:
                 raise

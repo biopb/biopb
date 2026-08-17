@@ -27,15 +27,11 @@ _kernel_host: KernelHost | None = None
 # instead of an inline result (set from config by the launcher).
 _promote_after: float = 10.0
 
-# Compute-only mode: no display, so the kernel has no napari viewer. Set by the
-# launcher (set_headless) before serving. Viewer-dependent tools return a clear
-# message and the agent is told via the initialize `instructions` field.
-_headless: bool = False
-
 # Whether the curated-skills catalog is advertised to the agent (mirrors
-# `services.skills_enabled`, off by default). Set by the launcher
+# `services.skills_enabled`, on by default). Set by the launcher
 # (set_skills_enabled); gates the _SKILLS_INSTRUCTIONS fragment in the handshake.
-_skills_enabled: bool = False
+# test_mcp_server pins this literal to the config default so the two can't drift.
+_skills_enabled: bool = True
 
 # This process's logfile path (set by the launcher), surfaced by server_status so
 # an agent can find its own log. None when output goes to a terminal (foreground
@@ -50,10 +46,12 @@ _session_log_path: str | None = None
 _BASE_INSTRUCTIONS = (
     "This biopb-mcp session drives a live napari viewer through a child IPython "
     "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
-    "for detail before non-trivial work: guide://kernel (namespace, examples, "
-    "long-running jobs & cancellation), guide://tensor (data access/upload), "
-    "guide://viewer (layers/camera/dims), guide://annotations "
-    "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
+    "for detail before non-trivial work: guide://kernel (namespace, skill "
+    "requirements, long-running jobs & cancellation), guide://data (how arrays are "
+    "represented here -- pyramids, laziness, axis order and rank -- and the traps), "
+    "guide://client (the `client` handle: catalog, load, upload), "
+    "guide://viewer (layers/camera/dims, annotation layers), "
+    "guide://ops (server-side image-processing ops).\n"
     "\n"
     "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
     "start of the session (and again to recover after a failure or after the "
@@ -82,28 +80,28 @@ _BASE_INSTRUCTIONS = (
 )
 
 # Appended to _BASE_INSTRUCTIONS only when the skills catalog is enabled
-# (`services.skills_enabled`, off by default). Kept out of the base so a default
-# install neither points the agent at `find_skills` (which would return nothing)
-# nor prompts it to author skills — set_skills_enabled owns the field.
+# (`services.skills_enabled`, on by default). Kept out of the base so an install
+# that switches skills off neither points the agent at `find_skills` (which would
+# return nothing) nor prompts it to author skills — set_skills_enabled owns the
+# field.
 _SKILLS_INSTRUCTIONS = (
     "At the start of a task, call `find_skills` to check for a curated workflow "
     "before improvising; read the matching `skill://<id>` resource for the "
-    "steps. After accomplishing a task, ask the user whether a new skill should "
-    "be generated and added to the agent's toolbox for future use."
-)
-
-# Appended to _BASE_INSTRUCTIONS when the session is headless. Phrased to fire
-# only when the user actually reaches for the viewer (compliance is up to the
-# client/agent).
-_HEADLESS_INSTRUCTIONS = (
-    "This biopb-mcp session is running HEADLESS: it was started without a "
-    "display, so there is NO napari viewer window and screenshots are not "
-    "available. If the user asks to access, open, view, or look at the biopb "
-    "viewer/napari (or asks for a screenshot), alert them plainly that no "
-    "viewer is available in this session because it started without a display. "
-    "You can still load data, run image-processing ops, and compute results "
-    "via execute_code (using client and ops); offer results as values/arrays. "
-    "Do not call take_screenshot or use viewer.* methods."
+    "steps. Results marked `origin: local` are the user's own unreviewed skills "
+    "from ~/.config/biopb/skills; prefer a curated one when both fit. After "
+    "accomplishing a task, ask the user whether a new skill should be generated "
+    "and added to the agent's toolbox for future use.\n"
+    "\n"
+    "Skills name three checkpoint types in their steps; honor them:\n"
+    "- confirm-input: ask before computing, but only for facts the data cannot "
+    "give you (voxel spacing, which channel is which, expected object size).\n"
+    "- visual checklist: put the intermediate on the viewer and report two or three "
+    "numbers with it -- never a screenshot alone, and report the numbers alone "
+    "when the data is too large to show usefully.\n"
+    "- validate-and-gate: stop and get the user's agreement before anything "
+    "expensive or hard to walk back.\n"
+    "Destructive steps always ask first, whatever a skill says: restarting the "
+    "kernel, interrupting a running job, overwriting a layer, or writing files."
 )
 
 # DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
@@ -140,8 +138,8 @@ def build_transport_security(
 mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
 
 # FastMCP built the low-level server with instructions=None at import; seed the
-# always-on base guidance now so it is present even if set_headless is never
-# called (e.g. tests, or a standalone import). set_headless recomposes from this
+# always-on base guidance now so it is present even if set_skills_enabled is
+# never called (e.g. tests, or a standalone import), which recomposes from this
 # base.
 mcp._mcp_server.instructions = _BASE_INSTRUCTIONS
 
@@ -237,6 +235,21 @@ else:
 """
 
 _STATUS_SNIPPET = """
+# This kernel's interpreter -- the one a skill's `pkg:` requirement is about, and
+# not necessarily the server process's env (the kernelspec need not be it). The
+# common such token is `pkg:biopb-mcp>=X`, how a skill says it needs a release
+# that carries some plugin, so report that one instead of making the agent import.
+# The interpreter, and how to install into it, come from _requires (which decides
+# the command from the env's shape) rather than being composed here.
+print("## Versions")
+try:
+    from biopb_mcp.mcp import _requires as _req
+    for _line in _req.versions_status_lines():
+        print(_line)
+except Exception as _e:
+    print("  error: " + str(_e))
+
+print("")
 print("## Dask")
 try:
     import dask as _dask
@@ -279,9 +292,11 @@ else:
 
 print("")
 print("## Viewer")
-if not viewer:
-    print("  headless: no viewer (no display)")
-elif not _viewer_window_alive():
+import os as _os
+if _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+    # Launcher-owned Xvfb (#90): screenshots work, but no human sees the window.
+    print("  display: virtual (Xvfb) — the viewer window is not visible to the user")
+if not _viewer_window_alive():
     print("  window: CLOSED — the napari window was closed; layer mutations")
     print("    won't display. Data/compute still work; restart_kernel to restore.")
     print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
@@ -291,6 +306,28 @@ else:
     for _layer in list(viewer.layers)[:10]:
         _shape = getattr(_layer.data, "shape", "?")
         print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+
+print("")
+print("## Ops")
+_ops = globals().get("ops")
+if _ops:
+    print("  " + ", ".join(sorted(_ops)))
+else:
+    print("  (none configured -- services.process_image_servers -- or unreachable)")
+
+print("")
+# What the plugin loader actually loaded, which neither the kernel dir (fail-open:
+# a file that raised is on disk and not loaded) nor dir() (a file contributes its
+# function names, not its own name) can tell the agent. It reads this to resolve a
+# skill's `plugin:<name>` requirement.
+print("## Kernel plugins")
+try:
+    from biopb_mcp.mcp import _requires as _req
+
+    for _line in _req.plugin_status_lines():
+        print(_line)
+except Exception as _e:
+    print("  error: " + str(_e))
 
 print("")
 print("## Jobs")
@@ -330,8 +367,7 @@ def set_session_log_path(path: str | None):
 
 def _recompose_instructions():
     """Rebuild the handshake ``instructions`` from ``_BASE_INSTRUCTIONS`` plus
-    whichever optional fragments the current mode enables (skills, then
-    headless).
+    whichever optional fragments the current mode enables (skills).
 
     Recomposing from the base in both directions is idempotent, so flipping any
     dimension back off can't leave a stale fragment in the handshake while
@@ -341,24 +377,14 @@ def _recompose_instructions():
     parts = [_BASE_INSTRUCTIONS]
     if _skills_enabled:
         parts.append(_SKILLS_INSTRUCTIONS)
-    if _headless:
-        parts.append(_HEADLESS_INSTRUCTIONS)
     mcp._mcp_server.instructions = "\n\n".join(parts)
-
-
-def set_headless(headless: bool):
-    """Mark the session compute-only (no viewer) and advertise it to the agent
-    via the initialize ``instructions`` field (append the headless directive
-    when headless, drop it otherwise)."""
-    global _headless
-    _headless = bool(headless)
-    _recompose_instructions()
 
 
 def set_skills_enabled(enabled: bool):
     """Advertise (or hide) the curated-skills catalog in the agent's initialize
-    ``instructions``. Off by default, so a default install never points the
-    agent at ``find_skills`` (which would return nothing)."""
+    ``instructions``. On by default; switching skills off also drops the
+    directive, so the agent is never pointed at ``find_skills`` when it would
+    return nothing."""
     global _skills_enabled
     _skills_enabled = bool(enabled)
     _recompose_instructions()
@@ -422,12 +448,84 @@ def _run_job_call(host, call: str):
 def _window_note(window_alive) -> str:
     """Closed-window warning to append when a result returns with no viewer.
 
-    Gated on non-headless (headless has no window and carries its own
-    messaging). ``window_alive`` is None when liveness is unknown -> no note.
+    ``window_alive`` is None when liveness is unknown -> no note.
     """
-    if not _headless and window_alive is False:
+    if window_alive is False:
         return _WINDOW_CLOSED_NOTE
     return ""
+
+
+def _user_digest(host) -> list:
+    """The user-run cells the agent has not been told about, or ``[]``.
+
+    A pure read — see :func:`_ack_user_digest` for why the ack is a second call.
+    Auxiliary, like the window-liveness probe: a kernel that answers with
+    anything but the expected list yields no digest rather than breaking the
+    result the agent actually asked for.
+    """
+    digest, _res, _w = _run_job_call(host, "user_digest()")
+    if not digest or not isinstance(digest, list):
+        return []
+    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
+        return []
+    return digest
+
+
+def _ack_user_digest(host, digest) -> None:
+    """Retire the *terminal* entries of *digest*, once the note carrying them is
+    on its way back to the agent.
+
+    Split from the read because acking inside it consumed notices that were
+    never delivered: ``execute_interactive`` sends the request before it starts
+    its timeout clock, so a probe that times out is still queued at the kernel
+    and runs when the main thread frees up — setting the flag for a note nobody
+    received. Acking only after this process has parsed a reply keeps the
+    guarantee that a notice is deferred, never dropped.
+
+    Running entries are excluded here rather than in the kernel: they were
+    reported as ``running``, which is not the final status the agent is promised,
+    so they must stay pending even if they have finished since.
+    """
+    ids = [d["job_id"] for d in digest if d.get("status") != "running"]
+    if ids:
+        _run_job_call(host, "ack_user_digest(" + repr(ids) + ")")
+
+
+def _render_user_note(digest) -> str:
+    """The digest as a line appended to an agent-facing result, or ``""``.
+
+    The agent is not the only writer of this namespace: a person can run code
+    from the observe page, through the same job runner (``docs/user-console.md``).
+    That leaves the agent's picture of the namespace stale with nothing in its
+    own results to say so — hence this note, appended at the same seam as
+    ``_window_note``, which is how every other user-attributed fact already
+    reaches the agent (``cancel_reason``, ``teardown_reason``).
+
+    Deliberately says *that* something changed, not *what*: the agent is told to
+    re-verify, which is cheap and cannot go stale itself. It names **no** job id
+    in the instruction either — pointing at one of several invites an agent to
+    read that one, call the notice discharged, and never see the rest, which it
+    will not be offered again.
+    """
+    if not digest:
+        return ""
+    listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    return (
+        "\n\nⓘ The user ran code in this kernel: "
+        f"{listed}. A finished cell is reported once; a running one repeats "
+        "until it ends, so a repeat is not a new cell. Read them with poll_job. "
+        "Variables and layers may have changed — re-check with dir() / "
+        "viewer.layers rather than trusting what you last saw."
+    )
+
+
+def _user_activity_note(host) -> str:
+    """Read, render, and retire the user-activity notice, in that order."""
+    digest = _user_digest(host)
+    note = _render_user_note(digest)
+    if note:
+        _ack_user_digest(host, digest)
+    return note
 
 
 def _format_job_status(snap: dict) -> str:
@@ -448,8 +546,22 @@ def _format_job_status(snap: dict) -> str:
 
 @mcp.resource("guide://kernel")
 def get_kernel_guide() -> str:
-    """Overview: available namespaces, helper functions, resource URIs."""
+    """Overview: available namespaces, helper functions, resource URIs.
+
+    The skill-requirements section is appended only when the catalog is enabled
+    (``services.skills_enabled``): with it off there is no ``find_skills`` to
+    return a ``checklist:``, so the section would document an unreachable
+    tool -- the same gate the handshake instructions use.
+    """
+    if _skills_enabled:
+        return _resources.GUIDE + _resources.SKILL_REQUIREMENTS
     return _resources.GUIDE
+
+
+@mcp.resource("guide://data")
+def get_data_guide() -> str:
+    """How array data is represented here: the three sources, and their traps."""
+    return _resources.DATA
 
 
 @mcp.resource("guide://viewer")
@@ -458,16 +570,10 @@ def get_viewer_guide() -> str:
     return _resources.VIEWER
 
 
-@mcp.resource("guide://tensor")
-def get_tensor_guide() -> str:
-    """Tensor data: listing sources, loading, uploading."""
-    return _resources.TENSOR
-
-
-@mcp.resource("guide://annotations")
-def get_annotations_guide() -> str:
-    """Annotation: points, shapes, labels creation/editing."""
-    return _resources.ANNOTATIONS
+@mcp.resource("guide://client")
+def get_client_guide() -> str:
+    """The `client` handle: listing sources, loading, uploading."""
+    return _resources.CLIENT
 
 
 @mcp.resource("guide://ops")
@@ -494,18 +600,53 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-def find_skills(query: str = "") -> list:
+def find_skills(keywords: list[str] | None = None) -> list:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
     Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
-    labels"). `query` filters by title/description/tags; empty returns all.
-    Each result includes a `uri` (`skill://<id>`) — read that resource for the
-    full step-by-step workflow. Prefer an existing skill over improvising.
+    labels").
+
+    **`keywords` is a keyword filter, not a search engine.** Each keyword must
+    appear in a skill's id/title/description/tags, so every one you add can only
+    remove results. Pass **one or two** domain terms and widen from there:
+    `["drift"]`, `["fret"]`, `["illumination"]`, `["stitch", "tiles"]`. Omit it
+    to list the whole catalog — worth doing once, since it is small.
+
+    **An empty result usually means too many keywords, not no such skill.**
+    `["count", "foci", "per", "nucleus"]` returns nothing while `["foci"]`
+    returns the skill that counts them. If you get nothing back, drop keywords
+    and call again, or call with none and read the list.
+
+    **Results are of two `kind`s, and they are used differently.**
+
+    - `kind="skill"` — a curated workflow. It carries a `uri` (`skill://<id>`);
+      read that resource for the full step-by-step body. Prefer an existing
+      skill over improvising.
+    - `kind="plugin"` — a Python module already loaded into the kernel
+      namespace, listed with its docstring summary. There is no body to read.
+      It carries a `handle`, the name it is bound under: call
+      `inspect_object(handle)` for its callables and signatures, then use it in
+      `execute_code` as `handle.some_function(...)`. **Prefer it over writing
+      your own** — these exist because the from-scratch version is slow, subtly
+      wrong, or both, and the docstring says which.
+
+    Skills are listed before plugins.
+
+    A result's `checklist` lists what the skill touches (`viewer`, `tensor`, `dask`,
+    `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
+    skill — it informs rather than blocks, so a gap is something to name and
+    work around, not a reason to abandon the skill: `server_status` answers every token except a third-party `pkg:` — it
+    does carry biopb-mcp's own version — and for those, `execute_code` an
+    `import <name>` and read the version with
+    `importlib.metadata.version("<name>")`, not the module's `__version__`
+    (packages forget to bump it). A gap is the user's call —
+    installing, seeding a plugin, restarting the kernel all need their consent —
+    but naming it up front beats failing halfway through.
 
     Fail-open: returns an empty list (never errors) when the catalog is
     unreachable and nothing is cached or bundled.
     """
-    return _skills.find_skills(query)
+    return _skills.find_skills(keywords or ())
 
 
 @mcp.tool()
@@ -518,19 +659,6 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     Returns a PNG screenshot as an image content block.
     """
-    if _headless:
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    "No screenshot available: this session is running headless "
-                    "(started without a display), so there is no viewer window "
-                    "to capture. Data loading and compute via execute_code/ops "
-                    "still work — tell the user the viewer is unavailable here."
-                ),
-            )
-        ]
-
     host = _kernel_host
     if host is None:
         return [TextContent(type="text", text="Kernel host not initialized")]
@@ -580,7 +708,7 @@ def execute_code(python_code: str) -> str:
     use it to batch many mutations into one main-thread hop, or to touch raw Qt
     (viewer.window), which still requires the main thread.
 
-    * data access (see guide://tensor for more details):
+    * data access (see guide://client for more details):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
@@ -589,25 +717,54 @@ def execute_code(python_code: str) -> str:
       (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
       predicate hides them; use `data_resident` to filter on residency on
       purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
-    - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
-      (auto-handles the multiscale pyramid). client.get_tensor(array_id)
-      returns a lazy dask array without adding a layer.
+    - viewer.add_tensor(array_id) loads a tensor as a layer (auto-handles the
+      multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
+      array without adding a layer. Both take the same id: "source_id/t1"
+      within a multi-tensor source, a bare "source_id" for a single-tensor one.
+    - reading pixels back off a layer is not plain napari: layer.data is a
+      *list* of pyramid levels when layer.multiscale, in display axis order
+      ([..., Z, Y, X], at the source's own rank), and lazy. Use
+      `layer.data[0] if layer.multiscale else layer.data`, and read
+      guide://data before measuring or computing from a layer.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
 
+    # Read once at entry, append to whichever path returns below.
+    digest = _user_digest(host)
+    user_note = _render_user_note(digest)
+    if user_note:
+        _ack_user_digest(host, digest)
+
     submitted, res, window_alive = _run_job_call(
         host, "submit(" + repr(python_code) + ")"
     )
     if submitted is None:
-        return _format_execute_result(res)
+        return _format_execute_result(res) + user_note
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
+        # Whose job is running decides the advice. Telling the agent to
+        # "stop it with interrupt_kernel" while a *person* is running a cell
+        # would have it kill their work; interrupt_kernel refuses that anyway
+        # (_jobs.interrupt_current), so the wording must not send it there.
+        if submitted.get("running_job_origin") == "user":
+            # A running user job stays in the digest by design, so the note is
+            # about to report the very job this branch is reporting. Drop it
+            # when that is *all* it says; keep it when the user also finished
+            # other cells, since those were acked above and will not be offered
+            # again.
+            if [d.get("job_id") for d in digest] == [running]:
+                user_note = ""
+            return (
+                f"The user is running a cell ({running}) in this kernel. Only one "
+                f"job runs at a time — wait for it and poll_job('{running}'); do "
+                "not interrupt it." + user_note
+            )
         return (
             f"A job ({running}) is already running. Poll it with "
             f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another."
+            "restart_kernel before starting another." + user_note
         )
 
     job_id = submitted["job_id"]
@@ -617,10 +774,10 @@ def execute_code(python_code: str) -> str:
         time.sleep(0.4)
         snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
-            return _format_execute_result(res)
+            return _format_execute_result(res) + user_note
         if snap.get("status") != "running":
             # terminal: inline result
-            return _format_execute_result(snap) + _window_note(window_alive)
+            return _format_execute_result(snap) + _window_note(window_alive) + user_note
 
     # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
@@ -628,7 +785,10 @@ def execute_code(python_code: str) -> str:
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with interrupt_kernel or restart_kernel.\n"
-        "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
+        "Partial output:\n"
+        + (partial or "(none yet)")
+        + _window_note(window_alive)
+        + user_note
     )
 
 
@@ -644,13 +804,14 @@ def poll_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
+    user_note = _user_activity_note(host)
     snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
     if snap is None:
-        return _format_execute_result(res)
+        return _format_execute_result(res) + user_note
     if snap.get("status") == "unknown":
-        return f"No such job '{job_id}'."
+        return f"No such job '{job_id}'." + user_note
     note = _window_note(window_alive) if snap.get("status") != "running" else ""
-    return _format_job_status(snap) + note
+    return _format_job_status(snap) + note + user_note
 
 
 @mcp.tool()
@@ -680,15 +841,29 @@ def interrupt_kernel() -> str:
     thread) can't reach it — this raises the exception directly into the worker.
     Best-effort: it lands at the next bytecode, so a
     blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
-    it returns to Python; if the kernel stays stuck, use restart_kernel — the
+    it returns to Python; if YOUR job stays stuck, use restart_kernel — the
     guaranteed stop.
+
+    Stops YOUR job only. A cell the user ran from the observe page shares this
+    kernel and this one-job-at-a-time runner, but is not yours to stop: this
+    refuses it, and you should wait for it instead. A refusal is not a stuck
+    kernel and restart_kernel is not the way around it — restarting would destroy
+    the user's running cell, variables and layers along with yours. Wait, or ask
+    them.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
-    data, res, _w = _run_job_call(host, "interrupt_current()")
+    data, res, _w = _run_job_call(host, "interrupt_current(requester='agent')")
     if data is None:
         return _format_execute_result(res)
+    if data.get("refused") == "user_job":
+        running = data.get("job_id")
+        return (
+            f"Refused: {running} was started by the user, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{running}'). (The user can "
+            "stop their own cell from the observe page.)"
+        )
     if data.get("interrupted"):
         return (
             f"Interrupted job {data.get('job_id')} (KeyboardInterrupt raised in "
@@ -702,12 +877,10 @@ def start_kernel() -> str:
     """Start the napari kernel on demand (it does not auto-start).
 
     The MCP server stays cheap and idle until you call this; it then brings up
-    the child IPython kernel, dask, the tensor client, and -- unless the session
-    is headless -- the napari viewer window. This BLOCKS until the kernel is
-    ready (or the bring-up fails), so on return you can use execute_code /
-    inspect_object directly, plus take_screenshot when a viewer is present (no
-    polling needed). A ready kernel is a no-op. The return message reports
-    whether the session is headless.
+    the child IPython kernel, dask, the tensor client, and the napari viewer
+    window. This BLOCKS until the kernel is ready (or the bring-up fails), so
+    on return you can use execute_code / take_screenshot / inspect_object
+    directly (no polling needed). A ready kernel is a no-op.
 
     Call this once at the start of a session. It is also the recovery path:
     after a failed start, a dead kernel, or the user closing the viewer window
@@ -719,14 +892,6 @@ def start_kernel() -> str:
         return "Error: kernel host not initialized"
     result = host.ensure_started()
     if result.get("state") == "ready":
-        if _headless:
-            # No napari window in a headless session, so take_screenshot is
-            # unavailable -- say so rather than claiming a viewer that isn't there.
-            return (
-                "Kernel ready (headless -- no napari viewer; screenshots "
-                "unavailable). dask and the tensor client are up; use "
-                "execute_code / inspect_object now."
-            )
         return (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
             "use execute_code / take_screenshot now."
@@ -743,10 +908,15 @@ def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the tensor client and -- unless the
-    session is headless -- the napari viewer. All variables defined in previous
-    execute_code calls are lost; when a viewer is present, a new desktop window
-    replaces the old one.
+    respawns a fresh kernel, rebuilding the tensor client and the napari
+    viewer. All variables defined in previous execute_code calls are lost; a
+    new viewer window replaces the old one.
+
+    This destroys the USER's work too, not only yours — their running cell,
+    their variables, their layers — and it is not undoable or announced to them
+    beforehand. So it is not the way past a refused interrupt_kernel or a kernel
+    busy with a user cell: neither is a runaway. Use it when the kernel is truly
+    wedged, and prefer asking first when someone is working in it.
     """
     host = _kernel_host
     if host is None:
@@ -755,12 +925,6 @@ def restart_kernel() -> str:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
-    if _headless:
-        # No napari window in a headless session -- don't claim a rebuilt viewer.
-        return (
-            "Kernel restarted (headless -- no napari viewer). dask and the "
-            "tensor client are up; previous variables are gone."
-        )
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
@@ -769,8 +933,10 @@ def server_status() -> str:
     """Report server health, system load, and resource usage.
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
-    queried from the kernel — dask scheduler info, tensor server
-    connectivity, and viewer layer count. Use before heavy computation.
+    queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
+    tensor server connectivity, viewer layer count, the available `ops`, and which
+    kernel plugins loaded. Use before heavy computation, and to resolve a skill's
+    `checklist:` list.
     """
     import psutil
 
@@ -811,7 +977,6 @@ def server_status() -> str:
         lines.append("  state: not initialized")
         return "\n".join(lines)
 
-    lines.append(f"  display: {'headless (no viewer)' if _headless else 'visible'}")
     health = host.health()
     lines.append(f"  alive: {health['alive']}")
     lines.append(f"  ready: {health['ready']}")
@@ -865,7 +1030,9 @@ def server_status() -> str:
             "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
-    return "\n".join(lines)
+    # Only on this path: the early returns above are all "kernel not usable",
+    # where the digest round-trip cannot land anyway.
+    return "\n".join(lines) + _user_activity_note(host)
 
 
 # ---------------------------------------------------------------------------

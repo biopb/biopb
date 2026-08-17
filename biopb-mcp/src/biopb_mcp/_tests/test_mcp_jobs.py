@@ -2,9 +2,10 @@
 
 Three layers:
 
-* ``TestJobRunnerUnit`` — the in-kernel job runner driven directly with a fake
-  InteractiveShell (no kernel, fast): submit/poll/interrupt, output capture,
-  distributed future-cancel.
+* ``TestJobRunnerUnit`` / ``TestJobOrigin`` — the in-kernel job runner driven
+  directly with a fake InteractiveShell (no kernel, fast): submit/poll/interrupt,
+  output capture, distributed future-cancel, and the agent/user ``origin`` split
+  (``docs/user-console.md``).
 * ``TestJobConcurrency`` — a real *bare* kernel (no napari/display): proves the
   kernel main thread stays free while a background job runs (the agent is no
   longer blind).
@@ -33,31 +34,40 @@ def _job_result(stdout):
     return payload["r"] if payload else None
 
 
+@pytest.fixture
+def runner():
+    """The in-kernel job runner wired to a fake InteractiveShell (no kernel).
+
+    Defined at module level so the runner classes below share one definition;
+    each test still gets a fresh namespace and a cleared job table.
+    """
+    ns = {
+        "_dask_client": None,
+        "_conn": types.SimpleNamespace(client=None),
+    }
+    _jobs.install(types.SimpleNamespace(user_ns=ns))
+    yield ns
+    _jobs.reset()
+
+
+def _wait_job(job_id, timeout=5.0):
+    """Block until *job_id* leaves ``running``, and return its snapshot."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snap = _jobs.poll(job_id)
+        if snap["status"] != "running":
+            return snap
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish")
+
+
 # ---------------------------------------------------------------------------
 # Unit: in-kernel job runner with a fake shell (no real kernel)
 # ---------------------------------------------------------------------------
 
 
 class TestJobRunnerUnit:
-    @pytest.fixture
-    def runner(self):
-        ns = {
-            "_dask_client": None,
-            "_conn": types.SimpleNamespace(client=None),
-        }
-        fake_ip = types.SimpleNamespace(user_ns=ns)
-        _jobs.install(fake_ip)
-        yield ns
-        _jobs.reset()
-
-    def _wait(self, job_id, timeout=5.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            snap = _jobs.poll(job_id)
-            if snap["status"] != "running":
-                return snap
-            time.sleep(0.02)
-        raise AssertionError(f"job {job_id} did not finish")
+    _wait = staticmethod(_wait_job)
 
     def test_quick_job_captures_stdout_and_result(self, runner):
         jid = _jobs.submit("print('hello'); 1 + 2")["job_id"]
@@ -168,6 +178,37 @@ class TestJobRunnerUnit:
     def test_raise_in_thread_no_ident(self):
         assert _jobs._raise_in_thread(None, KeyboardInterrupt) == 0
 
+    def test_external_interrupt_is_labeled_not_reported_as_an_error(self, runner):
+        # A KeyboardInterrupt this runner did not raise -- an external SIGINT
+        # relayed through a run_on_main slot. Unlabeled it renders as the
+        # submitted code failing, which for a user's cell reads as their own
+        # code breaking rather than as a stop someone else caused.
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        while _jobs.poll(jid)["status"] != "running":
+            time.sleep(0.02)
+        job = _jobs._jobs[jid]
+        assert _jobs._raise_in_thread(job.thread.ident, KeyboardInterrupt) == 1
+        snap = self._wait(jid)
+
+        assert snap["status"] == "interrupted"  # not "error"
+        assert snap["cancel_reason"] == _jobs._EXTERNAL_INTERRUPT_MSG
+        # The reason is prefixed onto the traceback, so poll_job / execute_code
+        # render the attribution rather than a bare KeyboardInterrupt.
+        assert snap["error_text"].startswith(_jobs._EXTERNAL_INTERRUPT_MSG)
+        assert "KeyboardInterrupt" in snap["error_text"]
+
+    def test_an_owned_interrupt_keeps_its_own_reason(self, runner):
+        # interrupt_current still owns the attribution when it is the cause --
+        # the external path must not overwrite a reason someone else set.
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        while _jobs.poll(jid)["status"] != "running":
+            time.sleep(0.02)
+        _jobs.interrupt_current(reason="forced by Bob")
+        snap = self._wait(jid)
+        assert snap["status"] == "interrupted"
+        assert snap["cancel_reason"] == "forced by Bob"
+        assert _jobs._EXTERNAL_INTERRUPT_MSG not in snap["error_text"]
+
     # -- submitted code is recorded (observe UI) ----------------------------
 
     def test_job_stores_submitted_code(self, runner):
@@ -187,6 +228,124 @@ class TestJobRunnerUnit:
         assert _jobs._code_preview("\n\n  hello  \nworld") == "hello"
         capped = _jobs._code_preview("x" * 100)
         assert len(capped) == 80 and capped.endswith("…")
+
+
+# ---------------------------------------------------------------------------
+# Two writers: the agent and a human sharing one kernel (docs/user-console.md)
+# ---------------------------------------------------------------------------
+
+
+class TestJobOrigin:
+    """The `origin` field and everything that reads it."""
+
+    _wait = staticmethod(_wait_job)
+
+    def test_origin_defaults_to_agent_and_rides_the_snapshot(self, runner):
+        jid = _jobs.submit("x = 1")["job_id"]
+        snap = self._wait(jid)
+        assert snap["origin"] == "agent"
+        summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
+        assert summ["origin"] == "agent"
+        # export() feeds the notebook writer -- provenance must survive there too.
+        assert {e["job_id"]: e for e in _jobs.export()}[jid]["origin"] == "agent"
+
+    def test_busy_reports_who_is_running(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
+        )["job_id"]
+        try:
+            busy = _jobs.submit("1 + 1")
+            assert busy["error"] == "busy"
+            assert busy["running_job_id"] == jid
+            # Without this the agent cannot tell whose job it collided with, and
+            # the advice it gets ("stop it") would be wrong.
+            assert busy["running_job_origin"] == "user"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
+
+    def test_agent_is_refused_a_user_job(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
+        )["job_id"]
+        try:
+            res = _jobs.interrupt_current(requester="agent")
+            assert res == {
+                "job_id": jid,
+                "interrupted": False,
+                "status": "running",
+                "refused": "user_job",
+            }
+            # Refused means untouched, not merely unreported.
+            assert _jobs.poll(jid)["status"] == "running"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
+
+    def test_user_may_stop_an_agent_job(self, runner):
+        # The converse of the rule above: a person can stop anything in their
+        # own session, which is what the observe UI's Interrupt does.
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        res = _jobs.interrupt_current(reason="stopped by the user")
+        assert res["interrupted"] is True
+        snap = self._wait(jid)
+        assert snap["status"] == "interrupted"
+        assert "stopped by the user" in snap["error_text"]
+
+    def test_agent_may_stop_its_own_job(self, runner):
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        assert _jobs.interrupt_current(requester="agent")["interrupted"] is True
+        assert self._wait(jid)["status"] == "interrupted"
+
+    def test_digest_reports_only_unseen_user_jobs(self, runner):
+        self._wait(_jobs.submit("a = 1", origin="agent")["job_id"])
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+
+        digest = _jobs.user_digest()
+        assert [d["job_id"] for d in digest] == [user_jid]
+        assert digest[0]["status"] == "ok"
+
+        # Reading never consumes; only an explicit ack does, so a finished
+        # user job is reported exactly once.
+        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
+        assert _jobs.ack_user_digest([user_jid]) == 1
+        assert _jobs.user_digest() == []
+
+    def test_running_user_job_stays_in_the_digest_until_it_ends(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
+        )["job_id"]
+        try:
+            # Reading never consumes, so a running cell stays reported:
+            # otherwise the agent would hear that a cell started and never
+            # learn how it ended. (Excluding it from the ack is the *caller's*
+            # job -- _server._ack_user_digest filters on the reported status,
+            # because re-reading it here is the race this split closes.)
+            assert _jobs.user_digest()[0]["status"] == "running"
+            assert _jobs.user_digest()[0]["status"] == "running"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
+        final = _jobs.user_digest()
+        assert [d["status"] for d in final] == ["interrupted"]
+        _jobs.ack_user_digest([jid])
+        assert _jobs.user_digest() == []
+
+    def test_prune_never_evicts_an_unreported_user_job(self, runner):
+        # The digest entry is the agent's only notice that its namespace changed
+        # under it; evicting the record would silently drop the notice.
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1")["job_id"])
+
+        assert user_jid in _jobs._jobs
+        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
+        _jobs.ack_user_digest([user_jid])
+
+        # Once reported it is an ordinary record again, and prunes normally.
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1")["job_id"])
+        assert user_jid not in _jobs._jobs
 
 
 # ---------------------------------------------------------------------------

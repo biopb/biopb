@@ -51,6 +51,8 @@ from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
     resolve_local_path,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
@@ -470,18 +472,28 @@ class Reconciler:
         from biopb.tensor import TensorFlightClient
 
         from biopb_tensor_server.adapters.remote_tensor import (
-            _resolve_upstream_token,
             _split_grpc_url,
             fetch_upstream_catalog,
             list_upstream_source_ids,
+            resolve_upstream_credentials,
         )
         from biopb_tensor_server.core.config import _namespaced_source_id
 
         endpoint, _ = _split_grpc_url(upstream.url)
         alias = upstream.alias
-        token = _resolve_upstream_token(upstream, self._credentials_config)
+        # The catalog fetch dials the upstream directly (not through the adapter
+        # pool), so it needs the same per-upstream token AND trust anchor the
+        # mirrored adapters will use (biopb/biopb#604 item 4) -- otherwise a
+        # grpcs:// upstream with a configured CA would still be TOFU-pinned here.
+        credentials = resolve_upstream_credentials(upstream, self._credentials_config)
 
-        client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+        client = TensorFlightClient(
+            endpoint,
+            cache_bytes=0,
+            token=credentials.token,
+            tls_ca_pem=credentials.tls_ca_pem,
+            tls_fingerprint=credentials.tls_fingerprint,
+        )
         try:
             # ONE bulk query_sources fetches every upstream source's id AND its
             # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs
@@ -844,6 +856,19 @@ class Reconciler:
                     adapter.seed_catalog(
                         tensors, metadata, data_resident, source_url, indexed_at
                     )
+        except UpstreamConfigError as e:
+            # Same skip, different diagnosis: "failed to create adapter" reads as
+            # a transient upstream problem, and this one is an operator edit away
+            # from fixed and will fail identically until then (biopb/biopb#608).
+            self._log_source_failure(
+                claim.source_id,
+                "Source %s (%s) is MISCONFIGURED and cannot be registered: %s. "
+                "Correct the configuration; retrying will not help.",
+                claim.source_id,
+                claim.primary_path,
+                e,
+            )
+            return False
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
@@ -862,6 +887,12 @@ class Reconciler:
 
         registered = False
         try:
+            # Normalize the axis order here rather than leaning on what
+            # register_source hands back (biopb/biopb#596): the catalog row
+            # below must describe the same tensors the serve path will hand
+            # out, and the wrap is idempotent, so the registry re-applying it
+            # is a no-op.
+            adapter = normalize_adapter(adapter)
             self._server.register_source(claim.source_id, adapter)
             registered = True
 

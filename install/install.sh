@@ -165,8 +165,10 @@ if not isinstance(data, dict):
 # startup. `enabled = false` is a deliberate user choice (read-only mount, disk
 # constraints, etc.) -- preserve it; the deprecation warning on startup is the
 # intended informational signal, and Phase 4 is the single hard cutover.
-data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
-                           "aggressive_dir_pruning": True})
+# No host/port here: the flight bind moved onto the command line
+# (biopb/biopb#604), and `biopb control start` passes it down. Writing it would
+# only earn a "no longer read" warning on every startup.
+data.setdefault("server", {"aggressive_dir_pruning": True})
 data.setdefault("cache", {"backend": "file", "file_max_total_gb": 32})
 md = data.pop("metadata_db", None)
 if isinstance(md, dict):
@@ -251,7 +253,7 @@ _install_opencode() {
     echo ""
     _info "opencode needs an API key to talk to an LLM (free with opencode zen):"
     _info "  1. Open ${BOLD}https://opencode.ai/auth${RESET}, sign in, create a new API key, and copy it."
-    printf "  ${DIM}Paste the API key (or press Enter to skip): ${RESET}" >/dev/tty
+    printf '  %sPaste the API key (or press Enter to skip): %s' "$DIM" "$RESET" >/dev/tty
     # Read silently but echo a "*" per character so the user gets visual
     # confirmation their paste registered (plain `read -s` shows nothing, which
     # makes it hard to tell whether a paste worked).
@@ -284,6 +286,46 @@ _install_opencode() {
     else
         _info "No key entered — authenticate later with: opencode auth login"
     fi
+}
+
+# Read the user's extra packages for the shared environment into EXTRA_PACKAGES.
+#
+# The one environment this installer builds is a uv tool env, and every upgrade
+# rebuilds it with `uv tool install --force` from the requirement list assembled
+# below. So a package the user added by hand -- into the very interpreter the
+# napari kernel runs, which is where an optional dependency like basicpy has to
+# live -- is silently dropped at the next upgrade, and the loss shows up later as
+# an import that used to work. Replaying a user-owned list makes those packages
+# part of the requirement set, so they are reinstalled along with everything else.
+#
+# One PEP 508 requirement per line ("basicpy", "m2stitch==0.9.0"); blank lines and
+# `#` comments ignored. The file is the user's, never written by the installer.
+#
+# EXTRA_PACKAGES_COUNT, not ${#EXTRA_PACKAGES[@]}, gates every expansion of the
+# array: macOS still ships bash 3.2, where expanding an *empty* array under
+# `set -u` is an unbound-variable error.
+_read_extra_packages() {
+    EXTRA_PACKAGES=()
+    EXTRA_PACKAGES_COUNT=0
+    EXTRA_PACKAGES_FILE="$CONFIG_DIR/extra-packages.txt"
+    [ -f "$EXTRA_PACKAGES_FILE" ] || return 0
+    local line
+    # `|| [ -n "$line" ]` so a final line without a trailing newline is not lost.
+    while IFS= read -r line || [ -n "$line" ]; do
+        # A `#` is a comment only at line start or after whitespace -- pip's
+        # requirements.txt rule, and the reason it has that rule: a PEP 508 direct
+        # reference carries load-bearing data in the URL fragment
+        # ("git+https://host/r@main#subdirectory=sub", "...whl#sha256=..."), so
+        # stripping from the first `#` anywhere truncates the requirement into one
+        # that still resolves -- to the repo root instead of the subdirectory, with
+        # no hash checked and nothing to warn about.
+        line=$(printf '%s' "$line" | tr -d '\r' \
+            | sed -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' \
+                  -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ -n "$line" ] || continue
+        EXTRA_PACKAGES+=("$line")
+        EXTRA_PACKAGES_COUNT=$((EXTRA_PACKAGES_COUNT + 1))
+    done < "$EXTRA_PACKAGES_FILE"
 }
 
 # Detect installed agent systems and register the biopb MCP server with each.
@@ -917,8 +959,10 @@ install_biopb() {
     # config tree, portable assets (webapp/samples) in the data tree, and logs /
     # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
     # conventional dirs, so writer (installer) and reader (code) never disagree.
+    # The state tree is derived at each point of use rather than here: the two
+    # readers are functions that run outside this one, and uninstall_biopb never
+    # executes it at all.
     CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/biopb"
-    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
     local data_base="${XDG_DATA_HOME:-$HOME/.local/share}/biopb"
     WEBAPP_DIR="$data_base/webapp"
     SAMPLES_DIR="$data_base/samples"
@@ -1203,10 +1247,14 @@ install_biopb() {
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
     trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
-    local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
-    local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
-    local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
-    local control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
+    # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
+    # status, so a failing _urldecode/basename would sail past `set -e` and leave
+    # a truncated path to curl into.
+    local mcp_whl sdk_whl tensor_whl control_whl
+    mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
+    sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
+    tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+    control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
@@ -1305,8 +1353,44 @@ install_biopb() {
     _info "Stopping any running biopb services before upgrade..."
     _stop_all_biopb_services
 
+    # User-added packages, replayed as part of the requirement set (see
+    # _read_extra_packages). Held in their own array so the install can be retried
+    # without them.
+    _read_extra_packages
+    local with_extras=()
+    if [ "$EXTRA_PACKAGES_COUNT" -gt 0 ]; then
+        local pkg
+        for pkg in "${EXTRA_PACKAGES[@]}"; do
+            with_extras+=(--with "$pkg")
+        done
+        _info "  including your extra packages: ${EXTRA_PACKAGES[*]}"
+    fi
+
     _info "Installing biopb into one shared environment..."
-    uv tool install "${install_args[@]}"
+    if [ "$EXTRA_PACKAGES_COUNT" -gt 0 ]; then
+        # Fail-soft. A user requirement joins the same resolve as the release's own
+        # pins (napari is pinned exactly), so one bad line could otherwise block the
+        # whole upgrade over a package the deployment does not need. Retry without
+        # them and name what was dropped: the deployment lands, and the user is told
+        # which line to fix rather than finding out at the next import.
+        #
+        # The retry is what *identifies* the cause, so the extras are only accused
+        # after it succeeds. A failure this install has nothing to do with them --
+        # no network, a full disk, a bad release pin -- fails the retry too, and
+        # `set -e` ends the run on uv's own error with no wrong diagnosis printed
+        # above it. Hence the hedge in the first warning and the verdict in the
+        # second.
+        if ! uv tool install "${install_args[@]}" "${with_extras[@]}"; then
+            _warn "Install failed; retrying without your extra packages to see whether"
+            _warn "  they are the cause: ${EXTRA_PACKAGES[*]}"
+            uv tool install "${install_args[@]}"
+            EXTRAS_DROPPED="${EXTRA_PACKAGES[*]}"
+            _warn "Could not resolve your extra packages: $EXTRAS_DROPPED"
+            _warn "  fix or remove the offending line in $EXTRA_PACKAGES_FILE"
+        fi
+    else
+        uv tool install "${install_args[@]}"
+    fi
     # The wheel download dir (if any) is removed by the EXIT trap set above.
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
@@ -1432,13 +1516,14 @@ install_biopb() {
     local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
         # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb server
+        # convert it in place to the canonical JSON via `biopb-tensor-server
         # migrate-config` (settings preserved verbatim, old file backed up to
         # biopb.toml.bak) so an upgraded install stops warning about the
         # deprecated format. A JSON config is already canonical -- nothing to do.
-        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && command -v biopb >/dev/null 2>&1; then
+        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] &&
+            command -v biopb-tensor-server >/dev/null 2>&1; then
             _info "Migrating legacy TOML config to canonical JSON..."
-            if biopb server migrate-config >/dev/null 2>&1; then
+            if biopb-tensor-server migrate-config >/dev/null 2>&1; then
                 ACTIVE_CONFIG="$CONFIG_FILE"
                 _ok "Migrated config: $LEGACY_CONFIG -> $CONFIG_FILE (old file backed up)"
             else
@@ -1545,6 +1630,16 @@ install_biopb() {
     if [ "$WEBAPP_OK" = "0" ]; then
         _warn "Web interface not installed (download failed)"
         _info "  the dashboard won't work until you rerun this script to fetch it"
+        echo ""
+    fi
+
+    # A dropped extra is the one failure a user would otherwise meet as a missing
+    # import weeks later, so it is repeated here rather than only at the (long)
+    # install step it happened in.
+    if [ -n "${EXTRAS_DROPPED:-}" ]; then
+        _warn "Your extra packages were NOT installed: $EXTRAS_DROPPED"
+        _info "  they could not be resolved with this release's own pins"
+        _info "  fix or remove the line, then rerun: ${CYAN}$EXTRA_PACKAGES_FILE${RESET}"
         echo ""
     fi
 
@@ -1778,8 +1873,14 @@ PY
         local c
         for c in "${cache_dirs[@]}"; do
             if [ -e "$c" ]; then
-                rm -rf "$c" 2>/dev/null && _ok "Removed cache $c" \
-                    || _info "Could not remove cache $c (left in place)"
+                # if/else, not `A && B || C`: with the latter a failing _ok (a
+                # closed stdout is enough) runs C, reporting a removal that
+                # actually succeeded as one that could not be done.
+                if rm -rf "$c" 2>/dev/null; then
+                    _ok "Removed cache $c"
+                else
+                    _info "Could not remove cache $c (left in place)"
+                fi
             fi
         done
 
@@ -1829,5 +1930,14 @@ main() {
     fi
 }
 
-# Only run if the script was fully downloaded (every function defined completely).
-main "$@"
+# Only run if the script was fully downloaded (every function defined completely):
+# a `curl | bash` cut off mid-transfer never reaches this line, so a half-written
+# installer defines some functions and then does nothing, rather than running with
+# the rest of itself missing. That property is why the call has to stay LAST --
+# keep it there.
+#
+# BIOPB_INSTALL_LIB=1 suppresses it so the test suite can source this file for its
+# helpers alone (install/test/test_install_sh.py). Deliberately checked with
+# `[ -n ... ]` rather than a value comparison: any non-empty value means "library",
+# and an unset variable -- the only state a real install is ever in -- installs.
+[ -n "${BIOPB_INSTALL_LIB:-}" ] || main "$@"

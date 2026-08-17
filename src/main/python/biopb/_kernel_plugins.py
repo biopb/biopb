@@ -3,14 +3,14 @@
 Two plugin sources feed the biopb-mcp agent kernel's namespace at bootstrap:
 
 - ``*.py`` files in ``~/.config/biopb/kernel/`` (the low-friction path: drop a
-  file; its top-level defs land in the namespace), and
+  file; it is imported and bound in the namespace under its stem), and
 - installed ``biopb_mcp.namespace`` entry-point packages (the distribution path).
 
 This module is a **read-only inspector** for the control dashboard, mirroring
 :mod:`biopb._algorithms`: it lists what is present **without ever importing or
-executing it**. That static "what will load" view is deliberate — the *live* set
-of names a running kernel actually bound depends on each file's top-level code and
-each package's ``register()`` hook, which only executing it reveals, and the lean
+executing it**. That static "what will load" view is deliberate — whether a file
+actually loads depends on its top-level code, and what a package's ``register()``
+hook binds is known only by running it, which only executing reveals, and the lean
 control must not run user Python (invariant I2, and it would be a robustness /
 security hole). A file's one-line summary comes from its module docstring parsed
 with :mod:`ast` (parse, not exec); an entry point reports the distribution that
@@ -36,18 +36,38 @@ logger = logging.getLogger(__name__)
 NAMESPACE_ENTRY_POINT_GROUP = "biopb_mcp.namespace"
 
 
-def _summary_from_source(text: str) -> str:
-    """First line of a Python file's module docstring, or ``""``.
+def _doc_from_source(text: str) -> tuple[str, str]:
+    """``(summary, blurb)`` from a Python file's module docstring.
+
+    *summary* is the first line; *blurb* is the whole opening paragraph, which is
+    what a keyword index needs — a one-liner rarely carries the second term of a
+    two-word query ("background subtract" misses a plugin whose first line says
+    only "Rolling-ball background subtraction"). Both are ``""`` when there is no
+    docstring.
 
     Parsed with ``ast`` — never executed — so *listing* a plugin can't run it.
     """
     try:
         doc = ast.get_docstring(ast.parse(text))
     except (SyntaxError, ValueError):
-        return ""
+        return "", ""
     if not doc:
-        return ""
-    return doc.strip().splitlines()[0].strip()
+        return "", ""
+    lines = doc.strip().splitlines()
+    summary = lines[0].strip()
+    paragraph = []
+    for line in lines[1:]:
+        if not line.strip():
+            if paragraph:
+                break
+            continue
+        paragraph.append(line.strip())
+    return summary, " ".join([summary, *paragraph]).strip()
+
+
+def _summary_from_source(text: str) -> str:
+    """First line of a Python file's module docstring, or ``""``."""
+    return _doc_from_source(text)[0]
 
 
 def startup_files(plugin_dir: Optional[Path] = None) -> list[dict]:
@@ -70,10 +90,10 @@ def startup_files(plugin_dir: Optional[Path] = None) -> list[dict]:
         if path.name.startswith("_"):
             continue
         try:
-            summary = _summary_from_source(path.read_text(encoding="utf-8"))
+            summary, blurb = _doc_from_source(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            summary = ""
-        rows.append({"name": path.name, "summary": summary})
+            summary, blurb = "", ""
+        rows.append({"name": path.name, "summary": summary, "blurb": blurb})
     return rows
 
 

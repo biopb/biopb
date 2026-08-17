@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { authHeaders, captureUrlToken, redirectToUnlock } from "../auth";
+import { withBase } from "../base";
 
 // A dedicated data-plane log monitor for the control dashboard. Polls the
 // control's own `GET /api/data_plane/logs` (the tail of the tensor server's
@@ -50,7 +51,7 @@ export default function LogsPage() {
   const load = useCallback(async (n: number) => {
     setLoading(true);
     try {
-      const r = await fetch(`/api/data_plane/logs?lines=${n}`, {
+      const r = await fetch(withBase(`/api/data_plane/logs?lines=${n}`), {
         headers: authHeaders(),
         cache: "no-store",
       });
@@ -104,7 +105,7 @@ export default function LogsPage() {
       <header>
         <img
           className="topbar-logo"
-          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          src={withBase("/biopb-logo.png")}
           alt=""
           aria-hidden="true"
         />

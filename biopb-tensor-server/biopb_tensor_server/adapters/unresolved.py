@@ -42,6 +42,7 @@ from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
 )
+from biopb_tensor_server.core.normalize import normalize_adapter
 
 if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -292,7 +293,14 @@ class UnresolvedSourceAdapter(SourceAdapter):
             credentials_profile=self._config.credentials_profile,
         )
         try:
-            return adapter_cls.create_from_config(config, self._credentials_config)
+            # Normalize here rather than at registration: this proxy is what the
+            # registry holds, and it advertises no tensors (so no labels to
+            # classify) until this moment. The canonical-order guarantee attaches
+            # to the real adapter the instant it exists (biopb/biopb#596), which
+            # is also before ``on_resolved`` backfills the catalog row from it.
+            return normalize_adapter(
+                adapter_cls.create_from_config(config, self._credentials_config)
+            )
         except SourceUnresolvedError:
             raise
         except OSError as e:

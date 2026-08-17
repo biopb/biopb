@@ -67,6 +67,7 @@ def stub_fetch(monkeypatch):
         bounds_stop,
         cache_bytes,
         schema_metadata=None,
+        tls_trust=None,
     ):
         calls.append(chunk_id)
         shape = tuple(

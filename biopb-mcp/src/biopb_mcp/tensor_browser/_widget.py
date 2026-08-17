@@ -927,29 +927,15 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._status_summary)
 
         # Advanced connection panel — hidden until the summary line is clicked.
-        # Holds the token and Connect/Refresh controls. The data-plane URL is NOT
-        # user-editable: the control (control plane) owns the data plane and is the
-        # single source of truth for its endpoint (#413), so the URL is resolved at
-        # connect time, not typed here. The summary line shows the resolved URL.
+        # Holds the Connect/Refresh controls. Neither the data-plane URL nor its
+        # token is user-editable: the control (control plane) owns the data plane,
+        # is the single source of truth for its endpoint (#413), and hands off the
+        # credential for it on disk (#470) — so both are resolved at connect time,
+        # not typed here (#628). The summary line shows the resolved URL.
         self._advanced_panel = QWidget()
         adv_layout = QVBoxLayout(self._advanced_panel)
         adv_layout.setContentsMargins(0, 0, 0, 0)
         adv_layout.setSpacing(4)
-
-        # Token input (label, input, and toggle on same row)
-        token_layout = QHBoxLayout()
-        token_layout.addWidget(QLabel("Token:"))
-        self._token_input = QLineEdit()
-        if self._conn.token:
-            self._token_input.setText(self._conn.token)
-        self._token_input.setPlaceholderText("optional")
-        self._token_input.setEchoMode(QLineEdit.Password)
-        self._show_token_btn = QPushButton("Show")
-        self._show_token_btn.setFixedWidth(50)
-        self._show_token_btn.clicked.connect(self._toggle_token_visibility)
-        token_layout.addWidget(self._token_input)
-        token_layout.addWidget(self._show_token_btn)
-        adv_layout.addLayout(token_layout)
 
         # Connect and Refresh buttons
         btn_layout = QHBoxLayout()
@@ -1050,12 +1036,12 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._message_label)
 
     def _on_connect_clicked(self, *args):
-        """Connect button handler: (re)connect, picking up the typed token.
+        """Connect button handler: re-run the connect policy.
 
-        The data-plane URL is not typed here (#413) -- ``auto_connect`` resolves
-        it from the control -- so this only refreshes the token and reconnects.
+        Nothing about the endpoint is typed here (#413/#628) — ``auto_connect``
+        resolves both address and credential — so this is a plain retry, which is
+        exactly what a user needs after starting the control.
         """
-        self._conn.token = self._token_input.text().strip() or None
         self._start_connect()
 
     def _auto_connect(self):
@@ -1065,8 +1051,8 @@ class TensorBrowserWidget(QWidget):
     def _start_connect(self):
         """Run the shared auto-connect policy on a worker thread.
 
-        Delegates to :meth:`TensorConnection.auto_connect` — the same
-        non-blocking policy the headless kernel uses (try the URL, wait through a
+        Delegates to :meth:`TensorConnection.auto_connect` — the shared
+        non-blocking policy (try the URL, wait through a
         ``STARTING`` data-folder scan, and auto-start a local biopb server as a
         last resort when the URL is local and the CLI is installed) — run off the
         Qt main thread. Two reasons it must not run inline: the viewer stays
@@ -1088,7 +1074,10 @@ class TensorBrowserWidget(QWidget):
         self._connecting = True
         self._connect_button.setEnabled(False)
         self._update_status_summary()
-        self._show_status(f"Connecting to {self._conn.url}…", sticky=True)
+        # The endpoint is unknown until the control names it, so on a first
+        # connect there is no address to show yet.
+        target = self._conn.url or "the data plane"
+        self._show_status(f"Connecting to {target}…", sticky=True)
 
         def _worker():
             # auto_connect is best-effort: it swallows its own failures and
@@ -1121,10 +1110,11 @@ class TensorBrowserWidget(QWidget):
         self._update_drop_hint()
 
         if not self._conn.is_connected:
-            # auto_connect recorded the friendly reason (down / still starting).
+            # auto_connect recorded the friendly reason (no control / down / still
+            # starting); the fallback covers only a connection that failed without
+            # one, which cannot name an endpoint either.
             self._show_error(
-                self._conn.last_message
-                or f"Cannot reach tensor server at {self._conn.url} — is it running?"
+                self._conn.last_message or "Could not reach the biopb data plane."
             )
             self._tree_widget.clear()
             self._refresh_button.setEnabled(False)
@@ -1181,15 +1171,6 @@ class TensorBrowserWidget(QWidget):
             f"<b>{url}</b> — <span style='color:{color}'>{state}</span> "
             f"<span style='color:#888'>{caret}</span>"
         )
-
-    def _toggle_token_visibility(self):
-        """Toggle token field visibility between password and normal mode."""
-        if self._token_input.echoMode() == QLineEdit.Password:
-            self._token_input.setEchoMode(QLineEdit.Normal)
-            self._show_token_btn.setText("Hide")
-        else:
-            self._token_input.setEchoMode(QLineEdit.Password)
-            self._show_token_btn.setText("Show")
 
     def _show_empty_state(self) -> bool:
         """Render the no-sources state, distinguishing indexing from empty.

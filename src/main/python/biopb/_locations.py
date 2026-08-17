@@ -42,7 +42,7 @@ has a stdlib writer on both ends, unifies the format with biopb-mcp's
 ``mcp-config.json``, and pairs with JSON Schema for validation. The TOML read
 path was dropped once the deprecation window closed (biopb/biopb#34); a leftover
 ``biopb.toml`` is still *recognized* — by the installers, which convert it, and
-by :func:`find_config`, which names ``biopb server migrate-config`` — so an old
+by :func:`find_config`, which names ``biopb-tensor-server migrate-config`` — so an old
 install fails with the fix rather than with a phantom missing file.
 """
 
@@ -131,6 +131,20 @@ def mcp_plugin_dir() -> Path:
     return config_dir() / "kernel"
 
 
+def mcp_skill_dir() -> Path:
+    """User skills dir (``~/.config/biopb/skills``).
+
+    ``*.md`` files here are merged into the agent's skills catalog beside the
+    curated ones, which ship inside biopb-mcp -- the personal tier of the same
+    "drop a file in a config dir" path as :func:`mcp_plugin_dir`, and the only
+    way a skill reaches a machine outside a release. Config-tree
+    (user-authored), resolved at call time for test isolation and **not created
+    on access**: absence is the normal no-local-skills case, and a bare read
+    must not materialize an empty dir.
+    """
+    return config_dir() / "skills"
+
+
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     """Resolve the config file in *config_dir*: ``biopb.json``, else a legacy
     ``biopb.toml`` that must be migrated.
@@ -142,7 +156,7 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
 
     A legacy TOML is **no longer readable** (biopb/biopb#34) but is still
     returned when it is the only config present, and both cases log a warning
-    naming ``biopb server migrate-config``. Handing the real file back — rather
+    naming ``biopb-tensor-server migrate-config``. Handing the real file back — rather
     than the canonical name that does not exist — is what lets the caller fail
     with "this config needs migrating" instead of "no config at all", which
     every downstream default (a defaulted bind address, a seeded fresh config)
@@ -154,7 +168,7 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
         if toml_path.exists():
             logger.warning(
                 "Both %s and %s exist in %s; using %s and ignoring the legacy "
-                "%s. Run `biopb server migrate-config` to retire it. "
+                "%s. Run `biopb-tensor-server migrate-config` to retire it. "
                 "See biopb/biopb#34.",
                 CANONICAL_CONFIG_NAME,
                 LEGACY_CONFIG_NAME,
@@ -167,7 +181,7 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
         logger.warning(
             "%s in %s is the legacy TOML config format, which is no longer "
             "read; %s is the only supported format. Run "
-            "`biopb server migrate-config` to convert it. See biopb/biopb#34.",
+            "`biopb-tensor-server migrate-config` to convert it. See biopb/biopb#34.",
             LEGACY_CONFIG_NAME,
             config_dir,
             CANONICAL_CONFIG_NAME,
@@ -229,9 +243,61 @@ def sessions_dir() -> Path:
     return d
 
 
+def tls_known_hosts() -> Path:
+    """TOFU pin store for the tensor Flight client (``state/biopb/tls-known-hosts.json``).
+
+    Maps a ``host:port`` to the server certificate pinned on first connect (the
+    SSH ``known_hosts`` model, biopb/biopb#604). Machine-local, regenerable trust
+    state — hence the state tree, beside the pids/sentinels — not user-authored
+    config. Resolved at call time for test isolation; not created on access (an
+    absent file is the normal "nothing pinned yet" case).
+    """
+    return state_dir() / "tls-known-hosts.json"
+
+
+def tls_server_cert() -> Path:
+    """The tensor server's TLS certificate (``state/biopb/tls/server-cert.pem``).
+
+    Auto-generated self-signed cert served when the flight plane runs with
+    ``--tls`` (biopb/biopb#604). Public material — world-readable is fine — kept
+    in the state tree beside its key. Resolved at call time for test isolation.
+    """
+    return state_dir() / "tls" / "server-cert.pem"
+
+
+def tls_server_key() -> Path:
+    """The tensor server's TLS private key (``state/biopb/tls/server-key.pem``).
+
+    The secret half of :func:`tls_server_cert`; written owner-only (``0600`` on
+    POSIX). Resolved at call time for test isolation.
+    """
+    return state_dir() / "tls" / "server-key.pem"
+
+
 def control_pid_file() -> Path:
     """The control plane's pid file."""
     return state_dir() / "control.pid"
+
+
+def control_runtime_file() -> Path:
+    """Where a *serving* control publishes its endpoint (``state/biopb/control.json``).
+
+    The discovery half of what the pid file used to imply. ``control.pid`` is a
+    **lifecycle** record -- ``control start`` writes it about the daemon it
+    spawned so ``control stop`` can signal it later -- and a foreground
+    ``control run`` deliberately has none (its terminal or service manager owns
+    the process). But once the control's port became derivable from
+    ``--base-port`` rather than fixed at 8813, *both* forms need to publish
+    **where** they listen, or a client has no way to find a control that moved.
+
+    So the endpoint is written by whoever actually bound the socket
+    (``biopb_control._run``), on the path both commands share, beside the
+    ``tensor-server.token`` credential and on the same publish-on-serve /
+    retract-on-clean-stop lifetime. Not a secret -- the port is not a
+    credential -- so unlike the credential file it carries no owner-only perms
+    and is written unconditionally, including for a tokenless local plane.
+    """
+    return state_dir() / "control.json"
 
 
 def control_stop_sentinel() -> Path:

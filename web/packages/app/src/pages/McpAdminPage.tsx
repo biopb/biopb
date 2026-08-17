@@ -16,6 +16,7 @@ import {
   mcpNavItemById,
 } from "../components/admin/mcpSections";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { withBase } from "../base";
 
 /**
  * The biopb-mcp settings page — sibling of the tensor AdminPage, but for the
@@ -43,7 +44,7 @@ async function loadMcpConfig(): Promise<McpConfigResponse> {
   // response (e.g. an empty {} cached before the file was populated) would show
   // the wrong config and clobber it on save. The server also sends
   // Cache-Control: no-store, but this makes the client independent of that.
-  const r = await fetch("/api/mcp_config", {
+  const r = await fetch(withBase("/api/mcp_config"), {
     headers: authHeaders(),
     cache: "no-store",
   });
@@ -152,7 +153,7 @@ export default function McpAdminPage() {
     setSaveError(null);
     setServerErrors([]);
     try {
-      const r = await fetch("/api/mcp_config", {
+      const r = await fetch(withBase("/api/mcp_config"), {
         method: "PUT",
         headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(config),
@@ -190,7 +191,7 @@ export default function McpAdminPage() {
       <header className="app-topbar">
         <img
           className="topbar-logo"
-          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          src={withBase("/biopb-logo.png")}
           alt=""
           aria-hidden="true"
         />

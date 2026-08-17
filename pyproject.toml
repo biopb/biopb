@@ -144,6 +144,13 @@ exclude = [
     "_build", "buck-out", "build", "dist", "node_modules", "venv",
     "*vendored*", "*_vendor*",
     "_version.py",  # setuptools_scm-generated, per package
+    # Skill bodies are authored prose, not source. ruff 0.16 began formatting
+    # Python code blocks inside markdown, which reaches these files -- and the
+    # contract layer asserts that a fence quotes a third-party call *exactly* as
+    # the body claims, so a cosmetic reformat can silently rewrite the thing
+    # under test. Excluded by path so the answer does not depend on the ruff
+    # version (the pin is 0.15.15, which does not do this).
+    "biopb-mcp/src/biopb_mcp/mcp/_skills_data",
 ]
 
 [tool.ruff.lint]

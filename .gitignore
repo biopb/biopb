@@ -156,3 +156,11 @@ web/packages/*/coverage/
 
 # Generated SDK API-reference site (docs-api/, see api-docs.yaml)
 docs-api/site/
+
+# Benchmark artifacts (biopb-mcp/docs/skills.md §10): reports and transcripts,
+# one directory per case, meant to be paged through locally. The first two names
+# are what the skill and task suites wrote before they merged, kept so a machine
+# with an old run on it does not report it as untracked.
+.bench-outcomes/
+.skill-outcomes/
+.task-outcomes/

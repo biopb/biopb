@@ -24,20 +24,17 @@ export interface McpNavItem {
 
 /**
  * Flat, ordered nav, grouped by concern in reading order: the data-plane knobs
- * the headless kernel uses, the compute-plane knobs, then the MCP server runtime.
+ * the MCP kernel uses, the compute-plane knobs, then the MCP server runtime.
  * The `id` equals the config section key. The demo-widget sections
  * (`widget` / `detection` / `grid`, the experimental image_processing/ widgets)
  * are deliberately omitted from the nav — they stay in the config and remain
  * editable via the Raw JSON panel, just not surfaced as first-class settings.
+ *
+ * There is no data-plane *endpoint* section: biopb-mcp asks the control where the
+ * plane is at connect time rather than reading a configured URL (biopb#628), so
+ * the address is shown on the Data Plane page, not edited here.
  */
 export const MCP_NAV: McpNavItem[] = [
-  {
-    id: "tensor_browser",
-    label: "Data Plane",
-    description: "The Arrow Flight tensor-server the kernel and browser widget read image data from.",
-    kind: "fields",
-    section: "tensor_browser",
-  },
   {
     id: "pyramid",
     label: "Pyramid",

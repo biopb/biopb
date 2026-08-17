@@ -8,12 +8,12 @@ the service module itself imports no Qt/napari.)
 
 import contextlib
 import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from biopb_mcp import _connection
-from biopb_mcp._config import DEFAULT_CONFIG
 from biopb_mcp._connection import (
     SERVER_QUERY_THRESHOLD,
     TensorConnection,
@@ -25,18 +25,16 @@ from biopb_mcp._connection import (
 def _clear_env(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
-    # resolve_from_config now also reads the control's local credential file
-    # (biopb/biopb#470). Default it to absent so a unit test never picks up a real
-    # credential from the dev machine's state dir; tests that exercise the handoff
-    # override this.
+    # The control's local credential file (biopb/biopb#470) is a real file on a
+    # dev machine. Default it to absent so a unit test never picks one up; tests
+    # that exercise the handoff -- or prove it is NOT used -- override this.
     monkeypatch.setattr("biopb._credentials.read_credential", lambda: None)
 
 
 @pytest.fixture(autouse=True)
 def _no_control(monkeypatch):
-    """Default: no control plane answers, so ``auto_connect`` falls back to the
-    config/env URL and makes no real ``ensure`` POST from unit tests. Tests that
-    exercise a live control override this with their own monkeypatch."""
+    """Default: no control plane answers, so no unit test makes a real ``ensure``
+    POST. Tests that exercise a live control override this."""
     monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
 
 
@@ -47,91 +45,106 @@ def _fake_client(sources):
     return client
 
 
+def _record_dials(monkeypatch, sources=None):
+    """Patch the Flight client and return the list of ``(url, token)`` dialed."""
+    dials = []
+
+    def _factory(url, token=None, **_):
+        dials.append((url, token))
+        return _fake_client({} if sources is None else sources)
+
+    monkeypatch.setattr(_connection, "TensorFlightClient", _factory)
+    return dials
+
+
 # ---------------------------------------------------------------------------
-# resolve_from_config
+# Where the endpoint and its credential come from (biopb/biopb#626, #628)
+#
+# The single rule: the credential file travels only to an endpoint the control
+# itself named. These tests keep a credential ON DISK for both branches, so the
+# two cannot silently drift back together.
 # ---------------------------------------------------------------------------
 
 
-class TestResolveFromConfig:
-    def test_env_overrides_config(self, monkeypatch):
-        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://env:1")
-        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "tok")
-        cfg = {"tensor_browser": {"server_url": "grpc://cfg:2"}}
-        url, token = TensorConnection.resolve_from_config(cfg)
-        assert url == "grpc://env:1"
-        assert token == "tok"
-
-    def test_config_when_no_env(self):
-        cfg = {"tensor_browser": {"server_url": "grpc://cfg:2"}}
-        url, token = TensorConnection.resolve_from_config(cfg)
-        assert url == "grpc://cfg:2"
-        assert token is None
-
-    def test_default_when_nothing(self):
-        url, token = TensorConnection.resolve_from_config({})
-        assert url == DEFAULT_CONFIG["tensor_browser"]["server_url"]
-        assert token is None
-
-    def test_token_from_credential_file(self, monkeypatch):
-        # No env token, but the control wrote a local credential (#470): it is the
-        # token, which is exactly the agent-spawned-over-stdio case where
-        # BIOPB_TENSOR_TOKEN never reached this process.
+class TestEndpointAndCredentialPolicy:
+    def test_control_endpoint_uses_credential_file(self, monkeypatch):
+        # The control named this endpoint, so its credential file is exactly the
+        # right token for it -- the #470 handoff an agent-spawned biopb-mcp needs,
+        # having inherited none of the control's environment.
         monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
-        _url, token = TensorConnection.resolve_from_config({})
-        assert token == "cred-tok"
-
-    def test_env_token_overrides_credential_file(self, monkeypatch):
-        # An explicit BIOPB_TENSOR_TOKEN wins over the credential file (the escape
-        # hatch for a remote plane whose token the user supplies out of band).
-        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-tok")
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
-        _url, token = TensorConnection.resolve_from_config({})
-        assert token == "env-tok"
-
-
-# ---------------------------------------------------------------------------
-# auto_connect URL resolution (control first via ensure, config fallback -- #413)
-# ---------------------------------------------------------------------------
-
-
-class TestAutoConnectResolution:
-    def test_targets_control_url(self, monkeypatch):
-        # Control answers: ensure both brings the plane up and reports its
-        # endpoint, so we connect straight there -- ignoring the (different)
-        # config fallback.
-        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
         monkeypatch.setattr(
             _connection,
             "ensure_data_plane",
             lambda *a, **k: {"grpc_url": "grpc://control:9", "state": "serving"},
         )
-        seen = []
-        monkeypatch.setattr(
-            _connection,
-            "TensorFlightClient",
-            lambda url, token=None: seen.append(url) or _fake_client({}),
-        )
+        dials = _record_dials(monkeypatch)
+
+        conn = TensorConnection()
         conn.auto_connect()
+
         assert conn.is_connected
         assert conn.url == "grpc://control:9"
-        assert seen == ["grpc://control:9"]
+        assert dials == [("grpc://control:9", "cred-tok")]
 
-    def test_falls_back_to_config_when_no_control(self, monkeypatch):
-        # No control answers: connect to the config/env URL directly.
-        conn = TensorConnection({"tensor_browser": {"server_url": "grpc://cfg:2"}})
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
-        monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
-        seen = []
-        monkeypatch.setattr(
-            _connection,
-            "TensorFlightClient",
-            lambda url, token=None: seen.append(url) or _fake_client({}),
-        )
+    def test_no_control_dials_nothing(self, monkeypatch):
+        # With a credential on disk and no control, there is no endpoint the
+        # control named -- so nothing is dialed at all and the file is never sent.
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        dials = _record_dials(monkeypatch)
+
+        conn = TensorConnection()
         conn.auto_connect()
-        assert conn.is_connected
-        assert conn.url == "grpc://cfg:2"
-        assert seen == ["grpc://cfg:2"]
+
+        assert dials == []
+        assert conn.url is None
+        assert not conn.is_connected
+        assert conn.last_status == "error"
+        assert "biopb control start" in conn.last_message
+
+    def test_env_url_bypasses_control_and_credential_file(self, monkeypatch):
+        # $BIOPB_TENSOR_URL names a plane the control does not own: the control is
+        # never asked (no side-effect plane spawn), and the file stays home.
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:7")
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        ensure = MagicMock(return_value={"grpc_url": "grpc://control:9"})
+        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
+        dials = _record_dials(monkeypatch)
+
+        conn = TensorConnection()
+        conn.auto_connect()
+
+        ensure.assert_not_called()
+        assert dials == [("grpc://elsewhere:7", None)]
+        assert conn.url == "grpc://elsewhere:7"
+
+    def test_env_url_carries_env_token(self, monkeypatch):
+        # The user who names a server may also name its token; that one travels.
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:7")
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-tok")
+        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+        dials = _record_dials(monkeypatch)
+
+        TensorConnection().auto_connect()
+
+        assert dials == [("grpc://elsewhere:7", "env-tok")]
+
+    def test_legacy_config_url_is_ignored(self, monkeypatch):
+        # A tensor_browser.server_url left in an existing mcp-config.json is inert
+        # (the section is gone, #628) -- it must not become an endpoint again.
+        from biopb_mcp._config import CONFIG
+
+        monkeypatch.setattr(
+            CONFIG,
+            "as_dict",
+            lambda: {"tensor_browser": {"server_url": "grpc://old:1"}},
+        )
+        dials = _record_dials(monkeypatch)
+
+        conn = TensorConnection()
+        conn.auto_connect()
+
+        assert dials == []
+        assert conn.url is None
 
 
 # ---------------------------------------------------------------------------
@@ -299,20 +312,14 @@ class TestBiopbExecutable:
 
 
 class TestConnect:
-    def test_sets_state_and_persists(self, monkeypatch):
+    def test_sets_state(self, monkeypatch):
         sources = {"a": MagicMock(), "b": MagicMock()}
         client = _fake_client(sources)
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
-        )
-        persisted = {}
-        monkeypatch.setattr(
-            TensorConnection,
-            "persist_url",
-            lambda self: persisted.update(url=self.url),
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         result = conn.connect("grpc://host:9", token="t")
 
         assert result is sources
@@ -322,17 +329,32 @@ class TestConnect:
         assert conn.token == "t"
         assert conn.use_server_query is False
         assert conn.is_connected is True
-        assert persisted == {"url": "grpc://host:9"}
+
+    def test_connect_writes_nothing_to_config(self, monkeypatch):
+        # Nothing is persisted (#628): the endpoint is re-resolved on every
+        # connect, so a written-back URL could only become a stale second answer
+        # -- and, once written, a sticky endpoint the control never named (#626).
+        from biopb_mcp._config import CONFIG
+
+        client = _fake_client({"a": MagicMock()})
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
+        )
+        writes = []
+        monkeypatch.setattr(CONFIG, "set", lambda *a, **k: writes.append(a) or None)
+
+        TensorConnection().connect("grpc://host:9", token="t")
+
+        assert writes == []
 
     def test_on_connect_hook_fires_with_final_url_token(self, monkeypatch):
         client = _fake_client({"a": MagicMock()})
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
         seen = []
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.on_connect = lambda url, token: seen.append((url, token))
         conn.connect("grpc://host:9", token="t")
 
@@ -343,14 +365,13 @@ class TestConnect:
         sources = {"a": MagicMock()}
         client = _fake_client(sources)
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        def boom(url, token):
+        def boom(url, token, **_):
             raise RuntimeError("hook boom")
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.on_connect = boom
         # connect must still succeed despite a failing hook
         result = conn.connect("grpc://host:9", token="t")
@@ -361,21 +382,20 @@ class TestConnect:
         big = {str(i): MagicMock() for i in range(SERVER_QUERY_THRESHOLD + 1)}
         client = _fake_client(big)
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         assert conn.use_server_query is True
 
     def test_failure_resets_and_raises(self, monkeypatch):
-        def boom(url, token=None):
+        def boom(url, token=None, **_):
             raise RuntimeError("nope")
 
         monkeypatch.setattr(_connection, "TensorFlightClient", boom)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(RuntimeError, match="nope"):
             conn.connect("grpc://host:9")
         assert conn.client is None
@@ -389,18 +409,17 @@ class TestConnect:
         assert "grpc://host:9" in conn.last_message
 
     def test_refresh_requires_connection(self):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(RuntimeError, match="Not connected"):
             conn.refresh()
 
     def test_refresh_relists(self, monkeypatch):
         client = _fake_client({"a": MagicMock()})
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         client.list_sources.return_value = {"a": MagicMock(), "b": MagicMock()}
         result = conn.refresh()
@@ -410,11 +429,10 @@ class TestConnect:
     def test_mark_disconnected_resets_state(self, monkeypatch):
         client = _fake_client({"a": MagicMock()})
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         assert conn.is_connected
 
@@ -428,7 +446,7 @@ class TestConnect:
         assert conn.last_message == "Lost connection to server"
 
     def test_resolve_source_requires_connection(self):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(RuntimeError, match="Not connected"):
             conn.resolve_source("cloud_x")
 
@@ -439,11 +457,10 @@ class TestConnect:
         client = _fake_client({"cloud_x": MagicMock()})
         client.resolve.return_value = resolved
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         full = {"cloud_x": MagicMock(), "other": MagicMock()}
         client.list_sources.return_value = full
@@ -451,7 +468,7 @@ class TestConnect:
         out = conn.resolve_source("cloud_x")
 
         # progress/cancel hooks are forwarded verbatim (None when the caller,
-        # e.g. the headless agent, supplies neither).
+        # e.g. the agent's kernel, supplies neither).
         client.resolve.assert_called_once_with(
             "cloud_x", on_progress=None, should_cancel=None
         )
@@ -459,7 +476,7 @@ class TestConnect:
         assert conn.sources == full  # snapshot refreshed via list_sources()
 
     def test_warm_source_requires_connection(self):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(RuntimeError, match="Not connected"):
             conn.warm_source("cloud_x")
 
@@ -471,11 +488,10 @@ class TestConnect:
         client = _fake_client({"cloud_x": MagicMock()})
         client.warm.return_value = terminal
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
 
         out = conn.warm_source("cloud_x")
@@ -486,7 +502,7 @@ class TestConnect:
         assert out is terminal
 
     def test_add_source_requires_connection(self):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(RuntimeError, match="Not connected"):
             conn.add_source("/data/x.zarr")
 
@@ -497,11 +513,10 @@ class TestConnect:
         client = _fake_client({})
         client.add_source.return_value = result
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         after = {"x": MagicMock()}
         client.list_sources.return_value = after
@@ -517,7 +532,7 @@ class TestConnect:
         assert conn.sources == after  # snapshot refreshed via list_sources()
 
     def test_remove_source_requires_connection(self):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(RuntimeError, match="Not connected"):
             conn.remove_source("dnd://exp.zarr")
 
@@ -528,11 +543,10 @@ class TestConnect:
         client = _fake_client({"x": MagicMock()})
         client.remove_source.return_value = result
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         after = {}
         client.list_sources.return_value = after
@@ -558,7 +572,7 @@ class TestIsLocalhost:
         ],
     )
     def test_is_localhost(self, url, expected):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.url = url
         assert conn.is_localhost() is expected
 
@@ -576,11 +590,10 @@ class TestConnectReadiness:
             "source_count": 3,
         }
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         with pytest.raises(_connection.ServerStarting):
             conn.connect("grpc://host:9")
 
@@ -597,11 +610,10 @@ class TestConnectReadiness:
         client = _fake_client(sources)
         client.health_check.side_effect = RuntimeError("no health action")
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         result = conn.connect("grpc://host:9")
 
         assert result is sources
@@ -612,10 +624,10 @@ class TestConnectReadiness:
         client = _fake_client({})
         client.list_sources.side_effect = RuntimeError("unavailable")
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
 
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         # A stale STARTING message from a prior attempt must not linger.
         conn.last_status = "starting"
         conn.last_message = "scanning…"
@@ -645,10 +657,9 @@ class TestScanFreshness:
         client = _fake_client({})
         client.health_check.return_value = health
         monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None: client
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
-        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         conn.connect("grpc://host:9")
         return conn
 
@@ -676,7 +687,7 @@ class TestScanFreshness:
         assert conn.scan_source_count() == 2
 
     def test_defaults_before_any_health(self):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         assert conn.last_health is None
         assert conn.scan_in_progress() is False
         assert conn.scan_source_count() == 0
@@ -698,7 +709,7 @@ class TestScanFreshness:
 
 class TestConnectWhenBooted:
     def test_waits_through_refused_and_starting(self, monkeypatch):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         sources = {"a": MagicMock()}
         outcomes = [
             RuntimeError("connection refused"),  # pre-bind window
@@ -706,7 +717,7 @@ class TestConnectWhenBooted:
             sources,  # ready
         ]
 
-        def fake_connect(url, token=None):
+        def fake_connect(url, token=None, **_):
             outcome = outcomes.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
@@ -720,9 +731,9 @@ class TestConnectWhenBooted:
         assert outcomes == []  # all three attempts consumed
 
     def test_timeout_raises(self, monkeypatch):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
 
-        def always_starting(url, token=None):
+        def always_starting(url, token=None, **_):
             raise _connection.ServerStarting("STARTING")
 
         monkeypatch.setattr(conn, "connect", always_starting)
@@ -784,10 +795,9 @@ def _connected_conn(monkeypatch, sources, health_results):
     """
     client = _fake_client(sources)
     monkeypatch.setattr(
-        _connection, "TensorFlightClient", lambda url, token=None: client
+        _connection, "TensorFlightClient", lambda url, token=None, **_: client
     )
-    monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
-    conn = TensorConnection(config={})
+    conn = TensorConnection()
     conn.connect("grpc://host:9")
     client.health_check.reset_mock()
     client.list_sources.reset_mock()
@@ -882,7 +892,7 @@ class TestSourceWatch:
         assert client.health_check.call_count == 2
 
     def test_start_is_idempotent(self, monkeypatch):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         started = []
         monkeypatch.setattr(
             _connection.threading,
@@ -895,7 +905,7 @@ class TestSourceWatch:
         assert started == ["biopb-source-watch"]
 
     def test_disabled_when_min_interval_zero(self, monkeypatch):
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         monkeypatch.setattr(
             _connection.threading,
             "Thread",
@@ -903,39 +913,6 @@ class TestSourceWatch:
         )
         conn.start_source_watch(min_interval=0, max_interval=10.0)
         assert conn._watch_thread is None
-
-
-# ---------------------------------------------------------------------------
-# persist_url
-# ---------------------------------------------------------------------------
-
-
-class TestPersistUrl:
-    def test_preserves_unowned_keys(self):
-        # persist_url() writes via CONFIG.set, which preserves keys the service
-        # does not own (here services.process_image_servers) -- both in the
-        # cache and on disk.
-        import json
-
-        from biopb_mcp._config import CONFIG, get_config_path
-
-        CONFIG.set(
-            "services.process_image_servers",
-            ["grpc://ops:5"],
-            persist=False,
-        )
-        CONFIG.set("tensor_browser.server_url", "grpc://old:1", persist=False)
-
-        conn = TensorConnection(config={})
-        conn.url = "grpc://new:2"
-        conn.persist_url()
-
-        assert CONFIG.get("tensor_browser.server_url") == "grpc://new:2"
-        assert CONFIG.get("services.process_image_servers") == ["grpc://ops:5"]
-        with get_config_path().open() as f:
-            saved = json.load(f)
-        assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
-        assert saved["services"]["process_image_servers"] == ["grpc://ops:5"]
 
 
 # ---------------------------------------------------------------------------
@@ -947,11 +924,10 @@ def test_health_delegates(monkeypatch):
     client = _fake_client({})
     client.health_check.return_value = "SERVING"
     monkeypatch.setattr(
-        _connection, "TensorFlightClient", lambda url, token=None: client
+        _connection, "TensorFlightClient", lambda url, token=None, **_: client
     )
-    monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
 
-    conn = TensorConnection(config={})
+    conn = TensorConnection()
     assert conn.health() is None  # not connected yet
     conn.connect("grpc://host:9")
     assert conn.health() == "SERVING"
@@ -988,26 +964,25 @@ class TestServerStartTimeout:
         from biopb_mcp._config import CONFIG
 
         CONFIG.set("transport.server_start_timeout", 12.5, persist=False)
-        conn = TensorConnection(config={})
+        conn = TensorConnection()
         assert conn.server_start_timeout() == 12.5
 
 
 class TestAutoConnect:
     """The shared connect policy used by both the kernel and the widget.
 
-    Since the de-daemonization, ``_connection`` is a pure
-    client: it asks the control plane **first** to ensure the data plane (single
-    source of truth, #413) and never spawns a server itself; only when no control
-    answers does it fall back to the config/env URL. Both callers drive this off
-    their own worker thread; here we call it directly with ``connect`` and friends
-    mocked.
+    The control is the only source of a data plane (biopb/biopb#628), so this is
+    two branches, not a fallback chain: the control's endpoint, or the explicit
+    ``$BIOPB_TENSOR_URL`` escape hatch. Neither caller reimplements it; both drive
+    it off their own worker thread. Here we call it directly with ``connect`` and
+    friends mocked. Credential-vs-endpoint rules live in
+    :class:`TestEndpointAndCredentialPolicy`.
     """
 
     # --- control answers (the normal path) --------------------------------- #
 
     def test_control_ensures_then_connects(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url, conn.token = "grpc://cfg:2", "tok"
+        conn = TensorConnection()
         ensure = MagicMock(
             return_value={"grpc_url": "grpc://control:9", "state": "serving"}
         )
@@ -1021,32 +996,32 @@ class TestAutoConnect:
         conn.auto_connect()
 
         # One control call brings the plane up AND resolves the endpoint; we wait
-        # that endpoint through boot and never take the standalone connect path.
+        # that endpoint through boot and never dial anything else.
         ensure.assert_called_once_with(timeout=30.0)
-        booted.assert_called_once_with("grpc://control:9", "tok", timeout=30.0)
+        booted.assert_called_once_with("grpc://control:9", None, timeout=30.0)
         assert conn.url == "grpc://control:9"
         connect.assert_not_called()
 
-    def test_control_snapshot_without_url_uses_current(self, monkeypatch):
-        # A real supervisor snapshot always carries grpc_url; if one omits it, the
-        # control still answered, so we wait our current url through boot rather
-        # than falling to the no-control error path.
-        conn = TensorConnection(config={})
-        conn.url = "grpc://localhost:8815"
+    def test_control_snapshot_without_url_is_an_error(self, monkeypatch):
+        # A real supervisor snapshot always carries grpc_url. If one omits it there
+        # is no endpoint the control named -- and nothing else is allowed to stand
+        # in for it -- so this reports rather than guessing an address.
+        conn = TensorConnection()
         monkeypatch.setattr(
             _connection, "ensure_data_plane", lambda timeout: {"state": "serving"}
         )
-        monkeypatch.setattr(conn, "server_start_timeout", lambda: 30.0)
-        booted = MagicMock(return_value={"a": MagicMock()})
+        booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
 
         conn.auto_connect()
 
-        booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
+        booted.assert_not_called()
+        assert conn.url is None
+        assert conn.last_status == "error"
+        assert "did not report a data-plane endpoint" in conn.last_message
 
     def test_control_boot_failure_is_swallowed(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url = "grpc://localhost:8815"
+        conn = TensorConnection()
         monkeypatch.setattr(
             _connection,
             "ensure_data_plane",
@@ -1060,27 +1035,48 @@ class TestAutoConnect:
         # A post-ensure boot failure must not propagate out of the policy.
         conn.auto_connect()
 
-    # --- no control answers (standalone / pre-control fallback) ------------ #
+    # --- no control answers (the terminal state) --------------------------- #
 
-    def test_no_control_connects_to_config(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url, conn.token = "grpc://host:9", "tok"
+    def test_no_control_records_actionable_status(self, monkeypatch):
+        conn = TensorConnection()
+        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
+        connect = MagicMock()
+        monkeypatch.setattr(conn, "connect", connect)
+        booted = MagicMock()
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+
+        conn.auto_connect()  # must not raise
+
+        # Nothing to dial: no control means no data plane, full stop.
+        connect.assert_not_called()
+        booted.assert_not_called()
+        assert conn.last_status == "error"
+        assert conn.last_message == _connection.NO_CONTROL_MESSAGE
+
+    # --- $BIOPB_TENSOR_URL escape hatch ------------------------------------ #
+
+    def test_env_url_connects_directly(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://host:9")
+        conn = TensorConnection()
+        ensure = MagicMock()
+        monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
         connect = MagicMock(return_value={"a": MagicMock()})
         monkeypatch.setattr(conn, "connect", connect)
         booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
-        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         conn.auto_connect()
 
-        # No control -> connect straight to the config/env URL; a clean connect
-        # needs no boot wait.
-        connect.assert_called_once_with("grpc://host:9", "tok")
+        # Straight to the named endpoint; a clean connect needs no boot wait, and
+        # the control is never consulted (nor spawned as a side effect).
+        ensure.assert_not_called()
+        connect.assert_called_once_with("grpc://host:9", None, from_env=True)
         booted.assert_not_called()
 
-    def test_no_control_starting_waits_through_boot(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url, conn.token = "grpc://host:9", None
+    def test_env_url_starting_waits_through_boot(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://host:9")
+        monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "tok")
+        conn = TensorConnection()
         monkeypatch.setattr(
             conn,
             "connect",
@@ -1089,15 +1085,17 @@ class TestAutoConnect:
         booted = MagicMock(return_value={"a": MagicMock()})
         monkeypatch.setattr(conn, "connect_when_booted", booted)
         monkeypatch.setattr(conn, "server_start_timeout", lambda: 42.0)
-        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         conn.auto_connect()
 
         # A STARTING server is waited through, not handed back as an error.
-        booted.assert_called_once_with("grpc://host:9", None, timeout=42.0)
+        booted.assert_called_once_with(
+            "grpc://host:9", "tok", timeout=42.0, from_env=True
+        )
 
-    def test_no_control_starting_boot_timeout_swallowed(self, monkeypatch):
-        conn = TensorConnection(config={})
+    def test_env_url_starting_boot_timeout_swallowed(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://host:9")
+        conn = TensorConnection()
         monkeypatch.setattr(
             conn,
             "connect",
@@ -1109,28 +1107,29 @@ class TestAutoConnect:
             MagicMock(side_effect=RuntimeError("did not become ready")),
         )
         monkeypatch.setattr(conn, "server_start_timeout", lambda: 1.0)
-        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
 
         # Best-effort: a boot timeout must not raise out of auto_connect.
         conn.auto_connect()
 
-    def test_no_control_unreachable_records_status(self, monkeypatch):
-        conn = TensorConnection(config={})
-        conn.url = "grpc://localhost:8815"
-        monkeypatch.setattr(
-            conn,
-            "connect",
-            MagicMock(side_effect=RuntimeError("connection refused")),
-        )
-        monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
+    def test_env_url_unreachable_keeps_connect_reason(self, monkeypatch):
+        # Nobody promised to start this server, so an unreachable address is
+        # terminal -- and connect() already recorded why.
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://host:9")
+        conn = TensorConnection()
+
+        def _boom(url, token=None, **_):
+            conn.last_status = "error"
+            conn.last_message = "recorded by connect"
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(conn, "connect", _boom)
         booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
 
         conn.auto_connect()  # must not raise
 
         booted.assert_not_called()
-        assert conn.last_status == "error"
-        assert "biopb control start" in conn.last_message
+        assert conn.last_message == "recorded by connect"
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1147,23 @@ class TestConnectErrorMessage:
         assert self.URL in msg
         # Names the fix so the user knows what to do.
         assert "token" in msg.lower()
+
+    def test_auth_required_on_control_endpoint_points_at_the_control(self):
+        # The control named this endpoint, so the token should have come from the
+        # credential file it writes -- that, not the env var, is the anomaly.
+        exc = RuntimeError("FlightUnauthenticatedError: token required")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "credential file held none" in msg
+        assert "biopb control start" in msg
+
+    def test_auth_required_on_env_endpoint_says_file_was_not_used(self):
+        # A user who knows a credential exists on this machine must not be sent
+        # to debug it: it is deliberately not read for an env-named server (#628).
+        exc = RuntimeError("FlightUnauthenticatedError: token required")
+        msg = connect_error_message(exc, self.URL, token=None, from_env=True)
+        assert "BIOPB_TENSOR_TOKEN" in msg
+        assert "credential file was not used" in msg
+        assert "BIOPB_TENSOR_URL" in msg
 
     def test_auth_failed_when_token_present(self):
         exc = RuntimeError("PermissionDenied: invalid token")
@@ -1171,3 +1187,107 @@ class TestConnectErrorMessage:
         # Even an exception with an empty str() yields an actionable message.
         msg = connect_error_message(RuntimeError(), self.URL, token=None)
         assert msg.strip()
+
+
+# --- local TLS plane: explicit anchor, never TOFU (biopb/biopb#604) ---------
+# A loopback grpcs:// plane is this machine's own and its cert is already on this
+# machine's disk, so it is trusted directly rather than pinned from the wire --
+# same cert and same reasoning as the tensor server's own HTTP sidecar.
+
+
+def _seed_cert(monkeypatch, tmp_path, body: bytes = b"-----BEGIN CERTIFICATE-----\n"):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from biopb._locations import tls_server_cert
+
+    path = tls_server_cert()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+def test_plaintext_and_remote_planes_get_no_anchor(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path)
+    # Plaintext: nothing to anchor.
+    assert _connection._local_ca("grpc://localhost:8815") is None
+    # Remote TLS: its cert is not on this disk and cannot be -- TOFU stays.
+    assert _connection._local_ca("grpcs://data.mylab.example:8815") is None
+
+
+def test_a_local_tls_plane_is_anchored_on_the_on_disk_cert(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path, b"PEMBYTES")
+    for url in ("grpcs://localhost:8815", "grpcs://127.0.0.1:8815"):
+        assert _connection._local_ca(url) == b"PEMBYTES"
+
+
+def test_an_unreadable_local_cert_errors_rather_than_falling_back_to_tofu(
+    monkeypatch, tmp_path
+):
+    """Degrading here would trade a verified anchor for an unverified one exactly
+    where the strong option was meant to apply."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    with pytest.raises(RuntimeError, match="could not be read"):
+        _connection._local_ca("grpcs://localhost:8815")
+
+
+def test_an_empty_local_cert_errors(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path, b"   \n")
+    with pytest.raises(RuntimeError, match="empty"):
+        _connection._local_ca("grpcs://localhost:8815")
+
+
+def test_connect_passes_the_anchor_to_the_client(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path, b"PEMBYTES")
+    captured = {}
+
+    def _fake_client(url, token=None, tls_ca_pem=None):
+        captured.update(url=url, tls_ca_pem=tls_ca_pem)
+        client = MagicMock()
+        client.health_check.return_value = {"status": "SERVING"}
+        client.list_sources.return_value = {}
+        return client
+
+    monkeypatch.setattr(_connection, "TensorFlightClient", _fake_client)
+    TensorConnection().connect("grpcs://127.0.0.1:8815", token=None)
+    assert captured["tls_ca_pem"] == b"PEMBYTES"
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="chmod 000 blocks neither root nor Windows, so the read would succeed",
+)
+def test_an_unreadable_cert_is_not_reported_as_an_auth_problem(monkeypatch, tmp_path):
+    """Regression: `[Errno 13] Permission denied` matched the auth markers.
+
+    `connect_error_message` classifies by substring, and a cert the process
+    cannot read stringifies as "Permission denied" — which the auth markers
+    claimed, so a file-permission problem was reported as "the tensor server
+    needs a token" and sent the reader after a credential that had nothing to do
+    with it.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from biopb._locations import tls_server_cert
+
+    cert = tls_server_cert()
+    cert.parent.mkdir(parents=True, exist_ok=True)
+    cert.write_bytes(b"PEM")
+    cert.chmod(0o000)
+    try:
+        with pytest.raises(_connection.LocalTrustError) as exc:
+            _connection._local_ca("grpcs://127.0.0.1:8815")
+    finally:
+        cert.chmod(0o600)
+
+    message = connect_error_message(exc.value, "grpcs://127.0.0.1:8815", None)
+    assert "needs a token" not in message
+    assert "Authentication" not in message
+    assert str(cert) in message  # names the actual file to fix
+
+
+def test_a_real_auth_failure_is_still_reported_as_one():
+    """The type check must not shadow the substring path it runs ahead of."""
+    message = connect_error_message(
+        RuntimeError("Flight returned unauthenticated error"),
+        "grpc://127.0.0.1:8815",
+        None,
+    )
+    assert "needs a token" in message

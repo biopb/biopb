@@ -21,8 +21,9 @@ const SPATIAL_X = new Set(["x", "width", "col", "cols", "column", "columns"]);
 const SPATIAL_Z = new Set(["z", "depth", "plane", "planes", "slice"]);
 const TEMPORAL = new Set(["t", "time", "frame", "frames"]);
 const CHANNEL = new Set(["c", "channel", "channels", "band", "bands"]);
+const SAMPLES = new Set(["s", "samples"]);
 const ALL_KNOWN_LABELS = new Set<string>([
-  ...TEMPORAL, ...SPATIAL_Z, ...CHANNEL, ...SPATIAL_Y, ...SPATIAL_X,
+  ...TEMPORAL, ...SPATIAL_Z, ...CHANNEL, ...SPATIAL_Y, ...SPATIAL_X, ...SAMPLES,
 ]);
 
 export interface AxisMap {
@@ -31,45 +32,73 @@ export interface AxisMap {
   c: number | null;
   y: number | null;
   x: number | null;
+  /** Interleaved RGB(A) samples axis, composited server-side. Always trailing. */
+  s: number | null;
 }
 
-/** Derive axis→dimension-index mapping from dim_labels. */
+/**
+ * Derive axis→dimension-index mapping from a descriptor's dim_labels.
+ *
+ * The data plane guarantees the axis order it serves (biopb/biopb#596): Z, Y, X
+ * and S appear last, in that relative order, with T, C and any unrecognized
+ * label keeping their relative order ahead of them. So the display plane is a
+ * *position* — X last, Y before it, behind an interleaved samples axis when one
+ * is there — and must be read the same way the server's own `plane_axes` reads
+ * it, since this side picks the crop and the scale_hint while that side renders
+ * the block those describe.
+ *
+ * T, C and Z stay label lookups. The canonical order does not position them (T
+ * and C ride in the leading group), and the slider UI needs to tell them apart.
+ */
 export function buildAxisMap(dimLabels: string[]): AxisMap {
-  const map: AxisMap = { t: null, z: null, c: null, y: null, x: null };
+  const map: AxisMap = { t: null, z: null, c: null, y: null, x: null, s: null };
   const labels = dimLabels.map((l) => l.toLowerCase().trim());
+  const ndim = labels.length;
+  if (ndim === 0) return map;
 
-  for (let i = 0; i < labels.length; i++) {
+  // Samples is honored only where the canonical order puts it — last, and 3 or
+  // 4 wide is the server's gate, but shapes are not known here, so the label
+  // alone decides. An S anywhere else is not an order the server serves.
+  const hasTrailingSamples = ndim >= 3 && SAMPLES.has(labels[ndim - 1] as string);
+  if (hasTrailingSamples) map.s = ndim - 1;
+
+  const xIdx = hasTrailingSamples ? ndim - 2 : ndim - 1;
+  const yIdx = xIdx - 1;
+  if (xIdx >= 0) map.x = xIdx;
+  if (yIdx >= 0) map.y = yIdx;
+
+  // T/C/Z by label, and only among the axes ahead of the plane — a label
+  // sitting on Y, X or S is describing the plane, not a slider axis.
+  for (let i = 0; i < yIdx; i++) {
     const l = labels[i] as string;
     if (TEMPORAL.has(l) && map.t === null) map.t = i;
     else if (SPATIAL_Z.has(l) && map.z === null) map.z = i;
     else if (CHANNEL.has(l) && map.c === null) map.c = i;
-    else if (SPATIAL_Y.has(l) && map.y === null) map.y = i;
-    else if (SPATIAL_X.has(l) && map.x === null) map.x = i;
   }
 
-  // Positional heuristic fallback for unlabelled / unknown axes using only
-  // dimensions that were not explicitly assigned above.
-  const unassigned: number[] = [];
-  for (let i = labels.length - 1; i >= 0; i--) {
-    if (i !== map.t && i !== map.z && i !== map.c && i !== map.y && i !== map.x) {
-      unassigned.push(i);
-    }
+  // Positional fallback for leading axes no label claimed, nearest the plane
+  // first (z, then c, then t). An unlabelled store still gets usable sliders;
+  // it is only a name for something already navigable, never a claim about the
+  // plane — which is why this is confined to the leading group and can no
+  // longer swallow the samples axis the way the old whole-array fallback did.
+  const unclaimed: number[] = [];
+  for (let i = yIdx - 1; i >= 0; i--) {
+    if (i !== map.t && i !== map.z && i !== map.c) unclaimed.push(i);
   }
-  const takeFallback = (): number | null => {
-    const idx = unassigned.shift();
-    return idx === undefined ? null : idx;
-  };
-
-  if (map.x === null) map.x = takeFallback();
-  if (map.y === null) map.y = takeFallback();
-  if (map.z === null) map.z = takeFallback();
-  if (map.c === null) map.c = takeFallback();
-  if (map.t === null) map.t = takeFallback();
+  if (map.z === null) map.z = unclaimed.shift() ?? null;
+  if (map.c === null) map.c = unclaimed.shift() ?? null;
+  if (map.t === null) map.t = unclaimed.shift() ?? null;
 
   return map;
 }
 
-/** Return true when any axis was inferred by heuristic (not explicit label). */
+/**
+ * True when the labels do not name every axis, so the plane came from position.
+ *
+ * Position is the contract, not a guess, so this no longer means "the plane may
+ * be wrong" — it means the source did not say what its leading axes are, and
+ * the slider UI has nothing to title them with.
+ */
 export function isAxisMapAmbiguous(dimLabels: string[]): boolean {
   return dimLabels.some((l) => !ALL_KNOWN_LABELS.has(l.toLowerCase().trim()));
 }

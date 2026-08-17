@@ -3,8 +3,9 @@
 Exposes the TensorFlightClient over a browser-friendly HTTP/JSON + binary API.
 
 Endpoints (unauthenticated — probes):
-  GET  /livez                        — liveness probe
-  GET  /readyz                       — readiness probe
+  GET  /livez                        — liveness probe (never touches the backend)
+  GET  /readyz                       — readiness probe; asks Flight, connecting if
+                                       needed. 200 when SERVING, 503 otherwise
   GET  /healthz                      — alias for /readyz
 
 Endpoints (token required):
@@ -58,6 +59,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -343,10 +345,15 @@ class _SidecarContext:
         cache_bytes: int,
         config_path: Optional[str] = None,
         supervised: bool = False,
+        tls_ca_pem: Optional[bytes] = None,
     ) -> None:
         self.flight_location = flight_location
         self.token = token
         self.cache_bytes = cache_bytes
+        # PEM the flight plane serves, when it serves TLS. We are co-located with
+        # that plane and read this off local disk, so it is an explicit trust
+        # anchor -- not a trust-on-first-use pin. None for a plaintext plane.
+        self.tls_ca_pem = tls_ca_pem
         # The config file this daemon was launched with (read/written by the
         # /api/config endpoints).
         self.config_path = config_path
@@ -373,6 +380,7 @@ class _SidecarContext:
                         location=self.flight_location,
                         cache_bytes=self.cache_bytes,
                         token=self.token,
+                        tls_ca_pem=self.tls_ca_pem,
                     )
                     self.diag.mark_connected()
                     logger.info(f"Connected to Flight server at {self.flight_location}")
@@ -386,6 +394,34 @@ class _SidecarContext:
         """Return the client only if already connected (never forces a connect)."""
         with self._client_lock:
             return self._client_holder["client"]
+
+    def backend_snapshot(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Flight's health, connecting first if nothing has yet. ``(health, error)``.
+
+        Readiness is a question about the backend, so it has to be answered by
+        asking the backend -- which means being willing to open the connection.
+        Peeking instead made readiness a function of *traffic*: nothing but the
+        token-protected data routes ever called ``get_client()``, so a probe
+        reported "not ready" against a perfectly healthy Flight server until an
+        unrelated request happened to connect (biopb/biopb#755).
+
+        Exactly one of the two returns is set, so a caller can tell "never
+        reached the backend" from "backend answered, but not SERVING" -- a null
+        health with no error used to also mean "nobody has asked yet."
+
+        BLOCKING: connect and the health action are both synchronous gRPC. Call
+        it off the event loop (the route uses ``run_in_threadpool``), or one
+        unreachable backend stalls every other request the sidecar is serving.
+        """
+        try:
+            client = self.get_client()
+        except Exception as exc:  # get_client already logged and marked the error
+            return None, f"connect failed: {exc}"
+        try:
+            return client.health_check(), None
+        except Exception as exc:
+            logger.warning(f"Backend health check failed: {exc}")
+            return None, f"health check failed: {exc}"
 
     def check_token(self, request: Request) -> None:
         """Raise 401 if the request does not carry a valid token.
@@ -514,18 +550,23 @@ async def livez() -> JSONResponse:
 
 @_router.get("/readyz")
 async def readyz(request: Request) -> JSONResponse:
-    ctx = _sidecar(request)
-    backend_health = None
-    client = ctx.peek_client()
-    if client is not None:
-        try:
-            backend_health = client.health_check()
-        except Exception as e:
-            logger.warning(f"Backend health check failed: {e}")
+    """Readiness: is the Flight backend serving *right now*?
 
-    ready = (
-        backend_health and backend_health.get("status") == "SERVING"
-    ) or ctx.diag.connection_state == "connected"
+    Answers only from what Flight just said. The old expression also accepted
+    ``diag.connection_state == "connected"``, which is a record of a past
+    successful connect and is never revised when the backend goes away -- so a
+    sidecar whose backend had died still reported ready, which is precisely the
+    window (a data-plane restart) the admin page polls this endpoint through.
+
+    503 when not ready, so probes that can only see status work: a Kubernetes
+    ``readinessProbe``, a ``curl -f`` wait loop, and the web bootstrap (which
+    already backs off and retries on 503) were all being told to proceed by the
+    unconditional 200 that accompanied ``"ready": false`` (biopb/biopb#755).
+    """
+    ctx = _sidecar(request)
+    # Off the event loop: connect + health are blocking gRPC (see backend_snapshot).
+    backend_health, backend_error = await run_in_threadpool(ctx.backend_snapshot)
+    ready = bool(backend_health) and backend_health.get("status") == "SERVING"
 
     return JSONResponse(
         {
@@ -536,10 +577,12 @@ async def readyz(request: Request) -> JSONResponse:
             "service": _SERVICE,
             "version": _VERSION,
             "backend_health": backend_health,
+            "backend_error": backend_error,
             "source_count": backend_health.get("source_count", 0)
             if backend_health
             else 0,
-        }
+        },
+        status_code=200 if ready else 503,
     )
 
 
@@ -618,11 +661,14 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         # Convert Arrow Table to JSON
         result = arrow_table.to_pylist()
 
-        # Truncation info from schema metadata
-        total = int(arrow_table.schema.metadata.get(b"total_sources", len(result)))
-        returned = int(
-            arrow_table.schema.metadata.get(b"returned_sources", len(result))
-        )
+        # Truncation info from schema metadata. An untagged Arrow table has
+        # `schema.metadata is None`, not an empty dict, so go through a fallback:
+        # a result carrying no truncation keys must degrade to "returned ==
+        # total" rather than raise an AttributeError that the handler below would
+        # then report as a 502 Flight error.
+        table_metadata = arrow_table.schema.metadata or {}
+        total = int(table_metadata.get(b"total_sources", len(result)))
+        returned = int(table_metadata.get(b"returned_sources", len(result)))
         truncated = total > returned
 
         elapsed = (time.monotonic() - t0) * 1000
@@ -1060,14 +1106,15 @@ async def _ws_render_one(
         if not dim_labels:
             dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
 
-        # Case-insensitive Y/X lookup (descriptor labels are uppercase "TCZYXS").
-        # A raw dim_labels.index("y") misses "Y" and, for a 6-D RGB TCZYXS
-        # layout, its positional fallback would pick X/S as Y/X.
-        from .renderer import build_axis_map
+        # The same plane the renderer will reduce to, resolved the same way --
+        # this crop and that reduction must agree on which axis is Y, or the
+        # request and the picture disagree silently. Sharing plane_axes is what
+        # makes that structural; it also covers the samples axis, which the
+        # hand-rolled fallback here did not (a 6-D RGB TCZYXS with unrecognized
+        # labels picked X/S as Y/X).
+        from biopb_tensor_server.core.axes import plane_axes
 
-        _axis_map = build_axis_map(dim_labels)
-        y_idx = _axis_map["y"] if _axis_map["y"] is not None else len(dim_labels) - 2
-        x_idx = _axis_map["x"] if _axis_map["x"] is not None else len(dim_labels) - 1
+        y_idx, x_idx, _ = plane_axes(dim_labels, dask_arr.shape)
 
         # Slice to the originally requested bounds (except y/x) before computing.
         dask_arr = _ws_crop_to_request(dask_arr, cctx, y_idx, x_idx)
@@ -1438,6 +1485,7 @@ def create_app(
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
     supervised: Optional[bool] = None,
+    tls_ca_pem: Optional[bytes] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -1462,6 +1510,10 @@ def create_app(
             restarted from the browser (biopb/biopb#418). Defaults to reading
             ``BIOPB_DATA_PLANE_SUPERVISED`` from the env the control set, so a
             directly-launched ``biopb-tensor-server launch`` is not supervised.
+        tls_ca_pem: PEM certificate the flight plane serves, when TLS is on. The
+            sidecar is co-located with that plane and reads this off local disk,
+            so it trusts it explicitly instead of pinning it on first use.
+            ``flight_location`` must then be a ``grpcs://`` URL.
 
     Returns:
         Configured FastAPI application.
@@ -1482,6 +1534,7 @@ def create_app(
         cache_bytes=cache_bytes,
         config_path=config_path,
         supervised=supervised,
+        tls_ca_pem=tls_ca_pem,
     )
 
     app.add_middleware(
@@ -1614,6 +1667,7 @@ def run(
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
+    tls_ca_pem: Optional[bytes] = None,
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
     import uvicorn
@@ -1624,6 +1678,7 @@ def run(
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
         config_path=config_path,
+        tls_ca_pem=tls_ca_pem,
     )
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher

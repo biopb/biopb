@@ -9,7 +9,7 @@ the SPA's token/store model.
 
 ESM output (`dist/index.js` + `.d.ts`). The browser's HTTP client + lazy array API
 for the tensor server's FastAPI data API — reached **same-origin** through the
-control plane at `/data_plane/*` (`VITE_TENSOR_API=/data_plane`).
+control plane at `/data_plane/*`, which the app resolves at runtime (`base.ts`).
 
 ### TensorHttpClient
 

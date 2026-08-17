@@ -69,6 +69,15 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     mc.list_sources.return_value = {src.source_id: src}
     mc.get_source_metadata.return_value = {"ome_ngff": {"version": "0.4"}}
     mc.cache_info.return_value = {"hits": 3, "misses": 1}
+    # /readyz reports whatever Flight says, so the mock has to say something a
+    # dict-shaped reader can parse -- a bare MagicMock's .get() returns another
+    # MagicMock, which is neither SERVING nor a number.
+    mc.health_check.return_value = {
+        "status": "SERVING",
+        "source_count": 1,
+        "metadata_db_enabled": True,
+        "full_scan_in_progress": False,
+    }
 
     # get_tensor → lazy array whose .compute() returns a numpy array
     arr = np.zeros(src.tensors[0].shape, dtype=src.tensors[0].dtype)
@@ -162,6 +171,81 @@ class TestHealthEndpoints:
         tc, _ = dev_client
         r = tc.get("/readyz")
         assert r.json()["dev_mode"] is True
+
+
+class TestReadyzTracksBackend:
+    """Readiness must follow the backend, not the traffic (biopb/biopb#755).
+
+    Every case here failed before the fix: readiness peeked at a client only the
+    token-protected data routes ever created, and the response was 200 whatever
+    the verdict.
+    """
+
+    def test_readyz_connects_instead_of_waiting_for_traffic(self, auth_client):
+        """A probe alone -- no prior data request -- must reach the backend."""
+        tc, mock_fc = auth_client
+        r = tc.get("/readyz")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ready"] is True
+        assert body["backend_health"]["status"] == "SERVING"
+        assert body["backend_error"] is None
+        # It asked Flight rather than reporting from a cached connection state.
+        assert mock_fc.health_check.called
+
+    def test_readyz_503_when_backend_not_serving(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.health_check.return_value = {"status": "NOT_SERVING"}
+        r = tc.get("/readyz")
+        assert r.status_code == 503
+        body = r.json()
+        assert body["ready"] is False
+        assert body["status"] == "degraded"
+
+    def test_readyz_503_and_names_the_reason_when_connect_fails(self):
+        """``backend_health: null`` must no longer be ambiguous."""
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            side_effect=OSError("connection refused"),
+        ):
+            app = create_app(token=_TOKEN)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.get("/readyz")
+        assert r.status_code == 503
+        body = r.json()
+        assert body["ready"] is False
+        assert body["backend_health"] is None
+        assert "connect failed" in body["backend_error"]
+        assert "connection refused" in body["backend_error"]
+
+    def test_readyz_goes_unready_when_a_live_backend_dies(self, auth_client):
+        """The stale-``connected`` case: a past connect must not vouch for now.
+
+        This is the false *positive* -- the one that hits during a data-plane
+        restart, which is exactly when the admin page polls this endpoint.
+        """
+        tc, mock_fc = auth_client
+        assert tc.get("/readyz").status_code == 200  # connected, healthy
+
+        mock_fc.health_check.side_effect = OSError("backend went away")
+        r = tc.get("/readyz")
+        assert r.status_code == 503
+        body = r.json()
+        assert body["ready"] is False
+        assert body["backend_health"] is None
+        assert "health check failed" in body["backend_error"]
+
+    def test_livez_stays_traffic_free(self):
+        """Liveness answers for the sidecar process alone -- no backend contact."""
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            side_effect=AssertionError("/livez must not touch the backend"),
+        ):
+            app = create_app(token=_TOKEN)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.get("/livez")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
 
 
 # ===========================================================================
@@ -758,7 +842,10 @@ class TestQuerySourcesEndpoint:
     def test_query_sources_valid_request(self, auth_client):
         tc, mock_fc = auth_client
 
-        # Mock query_sources to return an Arrow table
+        # Deliberately UNtagged. A mock that fabricates the truncation keys tests
+        # a contract nothing guarantees -- `schema.metadata` is None on any table
+        # nobody tagged -- and it hid a handler that dereferenced them blindly.
+        # Serving the rows must not depend on the tags being there.
         import pyarrow as pa
 
         mock_table = pa.table(
@@ -767,12 +854,7 @@ class TestQuerySourcesEndpoint:
                 "source_type": ["zarr", "zarr"],
             }
         )
-        mock_table = mock_table.replace_schema_metadata(
-            {
-                b"total_sources": "2",
-                b"returned_sources": "2",
-            }
-        )
+        assert mock_table.schema.metadata is None
         mock_fc.query_sources.return_value = mock_table
 
         r = tc.post(
@@ -785,6 +867,10 @@ class TestQuerySourcesEndpoint:
         assert isinstance(body, list)
         assert len(body) == 2
         assert body[0]["source_id"] == "src0"
+        # No tags -> report what was actually returned, not a failure.
+        assert r.headers["X-Total-Sources"] == "2"
+        assert r.headers["X-Returned-Sources"] == "2"
+        assert r.headers["X-Truncated"] == "false"
 
     def test_query_sources_truncation_headers(self, auth_client):
         tc, mock_fc = auth_client

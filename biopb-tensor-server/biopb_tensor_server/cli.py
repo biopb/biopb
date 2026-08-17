@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import typer
 from biopb import _web_auth
 from biopb._lifecycle import deathwatch as _deathwatch
+from biopb._locations import tls_server_cert
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
@@ -58,11 +59,48 @@ logger = logging.getLogger(__name__)
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
 
+cert_app = typer.Typer(help="Manage the server's self-signed TLS certificate")
+app.add_typer(cert_app, name="cert")
+
 # The bind address is the mode: a loopback bind is reachable same-machine only
 # (local mode); anything else is network-reachable. The wildcard binds
 # (``0.0.0.0`` / ``::`` / ``""``) and any real IP/hostname are public, so they are
 # *not* in this set and are treated as public — fail-closed.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# The flight plane's bind, owned by the CLI alone (biopb/biopb#604 -- it used to
+# be `server.host`/`server.port` in biopb.json). Loopback by default: the bind is
+# the mode switch, so the safe default is the one that exposes nothing, and going
+# public is an explicit act (`--host 0.0.0.0`, or `biopb control start --remote`).
+# The old config default was `0.0.0.0`, which made "local mode" public unless a
+# config said otherwise.
+DEFAULT_FLIGHT_HOST = "127.0.0.1"
+DEFAULT_FLIGHT_PORT = 8815
+
+
+def _print_verbatim(*rows: Tuple[str, object]) -> None:
+    """Print a ``label: value`` block the operator will copy byte-for-byte.
+
+    Cert paths and fingerprints get pasted into a mount, an ``scp``, or a
+    client's trust config, so Rich's two conveniences become corruption:
+
+    * it hard-wraps at the terminal width, splitting a long path mid-component
+      into something unusable that still *looks* like a path;
+    * it eats square brackets as style tags, so a state dir named
+      ``st[ate]dir`` prints as ``stdir`` -- a **wrong** path rendered as
+      confidently as a right one -- and rewrites the fingerprint's
+      colon-delimited hex pairs (``:cd:`` -> a CD emoji).
+
+    So: ``soft_wrap`` on, and markup/emoji/highlight off.
+    """
+    for label, value in rows:
+        console.print(
+            f"  {label:<12} {value}",
+            soft_wrap=True,
+            markup=False,
+            emoji=False,
+            highlight=False,
+        )
 
 
 def _host_is_public(host: str) -> bool:
@@ -95,8 +133,8 @@ def _resolve_flight_token(
     """Resolve the token the Flight (gRPC) server enforces, fail-closed on a
     public bind.
 
-    The flight bind (config ``server.host``, or a ``--host`` override) is the mode
-    switch: a loopback bind is **local mode** (tokenless, same-machine only); any
+    The flight bind (``--host``, loopback by default) is the mode switch: a
+    loopback bind is **local mode** (tokenless, same-machine only); any
     public bind is **remote mode** and MUST carry a token, so a public bind with
     none supplied auto-generates one rather than serving the data API open.
 
@@ -121,14 +159,14 @@ def _resolve_flight_token(
             console.print(
                 "[bold red]WARNING: token enforcement disabled "
                 "(BIOPB_TENSOR_ALLOW_NO_TOKEN) on a public flight bind "
-                f"(server.host={server_host}). The data API is served OPEN — "
+                f"(--host {server_host}). The data API is served OPEN — "
                 "only do this on a trusted network.[/bold red]"
             )
             return None
         generated = secrets.token_urlsafe(32)
         console.print(
             "[yellow]Auto-generated secure access token "
-            f"(server.host={server_host} is a public bind).[/yellow]"
+            f"(--host {server_host} is a public bind).[/yellow]"
         )
         return generated
     # Loopback flight bind, no token supplied: local mode.
@@ -149,7 +187,7 @@ def _resolve_launch_token(
     (``--web-host``). Because it re-exposes the whole data API, a **public sidecar
     with no enforced token** is exactly the "public + unauthenticated" combination
     the model makes unrepresentable — so it is refused rather than served open.
-    (This is the ``--web-host 0.0.0.0`` + loopback ``server.host`` footgun: the
+    (This is the ``--web-host 0.0.0.0`` + loopback ``--host`` footgun: the
     token would otherwise resolve to ``None`` and the data API would bind public
     and open.)
 
@@ -181,7 +219,7 @@ def _resolve_launch_token(
             "The sidecar re-exposes the data API, so this would serve it "
             "unauthenticated to the network. Either bind it to loopback "
             "(--web-host 127.0.0.1), make the flight server public "
-            "(server.host) so a token is enforced across both listeners, or "
+            "(--host 0.0.0.0) so a token is enforced across both listeners, or "
             "set BIOPB_TENSOR_ALLOW_NO_TOKEN=1 to serve it open deliberately."
         )
         raise typer.Exit(1)
@@ -466,12 +504,140 @@ def _grpc_location(host: str, port: int) -> str:
     return f"grpc://{authority}:{port}"
 
 
+def _resolve_tls_material(
+    tls: bool,
+    tls_cert: Optional[Path],
+    tls_key: Optional[Path],
+    san: Optional[List[str]] = None,
+) -> Tuple[Optional[bytes], Optional[bytes]]:
+    """Resolve the TLS cert + key (PEM bytes) the flight server should serve.
+
+    Three modes: no TLS (``(None, None)``); an explicit BYO cert (both
+    ``--tls-cert`` and ``--tls-key`` given, read from disk); or ``--tls`` alone,
+    which reuses — auto-generating on first use — the self-signed cert in the
+    state tree (biopb/biopb#604), printing its path + fingerprint so an operator
+    can eyeball-verify the value a client will TOFU-pin. Supplying only one of
+    ``--tls-cert`` / ``--tls-key`` is an error.
+
+    ``--san`` adds names/IPs to a cert generated *here*; an already-generated cert
+    is reused as-is, so widening its SANs means ``cert init --force --san ...``.
+    """
+    if (tls_cert is None) != (tls_key is None):
+        console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
+        raise typer.Exit(code=2)
+
+    # A BYO cert (both files given) is read straight off disk -- no `cryptography`
+    # needed, so this is the escape hatch when the [tls] extra isn't installed.
+    # Existence is re-checked here rather than left to typer's `exists=True`: the
+    # pair can also arrive from the config file, which never passed through it.
+    if tls_cert is not None:
+        for label, path in (("tls_cert", tls_cert), ("tls_key", tls_key)):
+            if not path.is_file():
+                console.print(
+                    f"[red]{label} not found: {_rich_escape(str(path))}[/red]"
+                )
+                raise typer.Exit(code=2)
+        return tls_cert.read_bytes(), tls_key.read_bytes()
+
+    if not tls:
+        return None, None
+
+    from biopb_tensor_server.core.tls import (
+        cert_fingerprint,
+        ensure_server_cert,
+        format_fingerprint,
+    )
+
+    existed = tls_server_cert().exists()
+    try:
+        cert_pem, key_pem = ensure_server_cert(extra_sans=san)
+    except RuntimeError as e:
+        # cryptography (the [tls] extra) is absent -- surface the actionable
+        # message cleanly and exit, rather than dumping a traceback.
+        console.print(f"[red]{_rich_escape(str(e))}[/red]")
+        raise typer.Exit(code=2) from None
+    if san and existed:
+        console.print(
+            "[yellow]--san ignored: reusing the existing certificate. Run "
+            "`cert init --force --san ...` to re-mint it with those names.[/yellow]"
+        )
+    console.print("[green]TLS enabled[/green] (self-signed)")
+    _print_verbatim(
+        ("cert:", tls_server_cert()),
+        ("fingerprint:", format_fingerprint(cert_fingerprint(cert_pem))),
+    )
+    return cert_pem, key_pem
+
+
+@cert_app.command("init")
+def cert_init(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Regenerate even if a cert already exists (rotates it; connected "
+        "clients that pinned the old cert must clear their pin to reconnect).",
+    ),
+    san: Optional[List[str]] = typer.Option(
+        None,
+        "--san",
+        help="Extra hostname or IP to put in the certificate (repeatable). Needed "
+        "when clients dial a name this host cannot discover itself (a NAT/VPN "
+        "address, a CNAME) -- gRPC verifies the dialed name against the SANs even "
+        "though trust comes from the client's pin. Only applies when the cert is "
+        "generated, so pair it with --force to widen an existing one.",
+    ),
+):
+    """Generate the server's self-signed TLS cert (if absent) and show its details.
+
+    Mints a self-signed certificate for this host's names/IPs into the state dir
+    and prints its path + SHA-256 fingerprint. `serve --tls` generates the same
+    cert on first use, so this is mainly for pre-seeding or rotating it, and for
+    reading off the fingerprint a client will pin on first connect (TOFU,
+    biopb/biopb#604).
+    """
+    from biopb._locations import tls_server_key
+
+    from biopb_tensor_server.core.tls import (
+        cert_fingerprint,
+        ensure_server_cert,
+        format_fingerprint,
+    )
+
+    existed = tls_server_cert().exists() and tls_server_key().exists()
+    try:
+        cert_pem, _ = ensure_server_cert(regenerate=force, extra_sans=san)
+    except RuntimeError as e:
+        # The [tls] extra (cryptography) is not installed -- advise, don't crash.
+        console.print(f"[red]{_rich_escape(str(e))}[/red]")
+        raise typer.Exit(code=2) from None
+
+    if existed and not force:
+        console.print(
+            "[green]TLS cert already present[/green] (use --force to regenerate)."
+        )
+        if san:
+            console.print(
+                "[yellow]--san ignored: the existing cert was reused. Re-run with "
+                "--force to mint one carrying those names.[/yellow]"
+            )
+    else:
+        verb = "Regenerated" if existed else "Generated"
+        console.print(f"[green]{verb} self-signed TLS cert[/green]")
+    _print_verbatim(
+        ("cert:", tls_server_cert()),
+        ("key:", tls_server_key()),
+        ("fingerprint:", format_fingerprint(cert_fingerprint(cert_pem))),
+    )
+
+
 def _setup_flight_server(
     server_config: ServerConfig,
-    host: Optional[str] = None,
-    port: Optional[int] = None,
+    host: str = DEFAULT_FLIGHT_HOST,
+    port: int = DEFAULT_FLIGHT_PORT,
     writable: Optional[bool] = None,
     token: Optional[str] = None,
+    tls_cert_chain: Optional[bytes] = None,
+    tls_private_key: Optional[bytes] = None,
 ) -> Tuple[
     TensorFlightServer, Optional[object], Optional[object], Optional[PrecacheWorker]
 ]:
@@ -482,6 +648,9 @@ def _setup_flight_server(
         host: Override host
         port: Override port
         token: Access token for Flight server authentication
+        tls_cert_chain: PEM cert chain -- serves TLS (grpc+tls://) when supplied
+            together with ``tls_private_key`` (see ``TensorFlightServer``).
+        tls_private_key: PEM private key paired with ``tls_cert_chain``.
 
     Returns:
         Tuple of (flight_server, source_manager, watcher, precache_worker)
@@ -490,8 +659,6 @@ def _setup_flight_server(
         typer.Exit: If no sources configured or no sources loaded successfully
     """
     # Apply overrides
-    host = host or server_config.host
-    port = port or server_config.port
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
 
@@ -632,6 +799,8 @@ def _setup_flight_server(
         max_list_flights_results=server_config.metadata_db.max_list_flights_results,
         grpc_max_message_size=80 * 1024 * 1024,
         pyramid_config=server_config.pyramid,
+        tls_cert_chain=tls_cert_chain,
+        tls_private_key=tls_private_key,
     )
 
     # Set up watcher for monitored sources (None for static-only configs)
@@ -836,17 +1005,18 @@ def serve(
         "--log-scope-biopb/--log-scope-all",
         help="Scope logging to biopb_tensor_server only (default) or affect all packages",
     ),
-    host: Optional[str] = typer.Option(
-        None,
+    host: str = typer.Option(
+        DEFAULT_FLIGHT_HOST,
         "--host",
         "-h",
-        help="Server host (overrides config)",
+        help="Address the Flight gRPC server binds. Loopback (the default) is "
+        "local mode; a public address is remote mode and requires a token.",
     ),
-    port: Optional[int] = typer.Option(
-        None,
+    port: int = typer.Option(
+        DEFAULT_FLIGHT_PORT,
         "--port",
         "-p",
-        help="Server port (overrides config)",
+        help="TCP port for the Flight gRPC server.",
     ),
     writable: bool = typer.Option(
         False,
@@ -860,6 +1030,34 @@ def serve(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
+    tls: bool = typer.Option(
+        False,
+        "--tls",
+        help="Serve the flight plane over TLS. Uses the self-signed cert in the "
+        "state dir (auto-generated on first use); clients connect with grpcs:// "
+        "and pin it on first connect (TOFU). Implied by --tls-cert/--tls-key. "
+        "See also `cert init`.",
+    ),
+    tls_cert: Optional[Path] = typer.Option(
+        None,
+        "--tls-cert",
+        exists=True,
+        help="PEM certificate chain to serve instead of the auto self-signed cert "
+        "(requires --tls-key).",
+    ),
+    tls_key: Optional[Path] = typer.Option(
+        None,
+        "--tls-key",
+        exists=True,
+        help="PEM private key paired with --tls-cert.",
+    ),
+    san: Optional[List[str]] = typer.Option(
+        None,
+        "--san",
+        help="Extra hostname/IP for the auto-generated cert (repeatable). Use it "
+        "when clients dial a name this host cannot discover itself; ignored if a "
+        "cert already exists (re-mint with `cert init --force --san ...`).",
+    ),
     log_file: Optional[str] = typer.Option(
         None,
         "--log-file",
@@ -871,7 +1069,7 @@ def serve(
     Example:
         biopb-tensor-server serve --config biopb.json
         biopb-tensor-server serve -c config.json --port 9000
-        biopb-tensor-server serve -c config.json --log-level DEBUG
+        biopb-tensor-server serve -c config.json --tls --host 0.0.0.0
     """
     server_config = _load_config_or_exit(config)
 
@@ -883,10 +1081,10 @@ def serve(
         effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
     )
 
-    # The flight bind is the mode switch; --host overrides config, so resolve the
-    # token against the effective host. A public bind with no token auto-generates
-    # one (fail-closed) rather than serving the data API open.
-    effective_host = host or server_config.host
+    # The flight bind is the mode switch, so resolve the token against it. A
+    # public bind with no token auto-generates one (fail-closed) rather than
+    # serving the data API open.
+    effective_host = host
     effective_token = _resolve_flight_token(
         effective_host,
         token,
@@ -914,6 +1112,8 @@ def serve(
     # _setup_flight_server acquires the lock during cache init and can still raise
     # afterwards (e.g. a bad static source); keeping it inside the try means such
     # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
+
     server = source_manager = watcher = precache_worker = None
     try:
         server, source_manager, watcher, precache_worker = _setup_flight_server(
@@ -922,9 +1122,14 @@ def serve(
             port=port,
             writable=writable,
             token=effective_token,
+            tls_cert_chain=tls_cert_chain,
+            tls_private_key=tls_private_key,
         )
 
-        location = _grpc_location(effective_host, port or server_config.port)
+        location = _grpc_location(effective_host, port)
+        if tls_cert_chain is not None:
+            # Advertise the scheme clients actually dial for a TLS server.
+            location = location.replace("grpc://", "grpcs://", 1)
         console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
         console.print("Press Ctrl+C to stop\n")
 
@@ -940,6 +1145,38 @@ def serve(
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
         _graceful_shutdown(source_manager, watcher, server, precache_worker)
+
+
+def _unreadable_trust_anchors(server_config) -> List[str]:
+    """Every credentials profile whose ``tls_ca_file`` cannot be read, described.
+
+    ``resolve_all_sources`` resolves an upstream's credentials only when it has
+    to expand a bare-host ``grpc://host:port`` entry; the single-source form
+    ``grpc://host:port/<id>`` returns before that, and a profile no source
+    references yet is never touched at all. So a typo'd trust anchor could pass
+    ``validate`` and then fail at serve -- which is the wrong end of the run to
+    find out that the anchor you asked for is not the one being used
+    (biopb/biopb#608).
+
+    Checked with the reader the serve path itself uses, so "readable" has one
+    definition rather than two that can drift apart. This is a deliberate
+    filesystem probe and therefore answers for *this* machine and user: it
+    belongs to ``validate`` (which already walks source paths), not to the pure
+    ``validate_config_dict`` that backs the admin config form.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import _read_upstream_ca
+    from biopb_tensor_server.core.errors import UpstreamConfigError
+
+    credentials = getattr(server_config, "credentials", None)
+    problems: List[str] = []
+    for profile in getattr(credentials, "profiles", None) or []:
+        if not getattr(profile, "tls_ca_file", None):
+            continue
+        try:
+            _read_upstream_ca(profile, getattr(profile, "name", None))
+        except UpstreamConfigError as exc:
+            problems.append(str(exc))
+    return problems
 
 
 @app.command()
@@ -975,31 +1212,36 @@ def validate(
     try:
         server_config = load_config(config)
         sources = resolve_all_sources(server_config)
-
-        console.print("[green]✓ Config valid[/green]")
-        console.print(f"  Server: {server_config.host}:{server_config.port}")
-        console.print(f"  Cache: backend={server_config.cache.backend}, ")
-        if server_config.cache.backend == "memory":
-            console.print(
-                f"    max_entries={server_config.cache.memory_max_entries}, "
-                f"max_bytes={server_config.cache.memory_max_bytes // (1024 * 1024)}MB"
-            )
-        elif server_config.cache.backend == "file":
-            console.print(
-                f"    cache_dir={server_config.cache.file_cache_dir}, "
-                f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
-                f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
-            )
-        console.print(f"  Sources: {len(sources)} data source(s)")
-
-        for source in sources:
-            console.print(f"    - {source.source_id} ({source.type}: {source.url})")
-
+        trust_problems = _unreadable_trust_anchors(server_config)
     except Exception as e:
         # Escaped: a validation message names its section as "[pyramid]", which
         # rich would otherwise eat as a style tag and print as nothing.
         console.print(f"[red]✗ Config invalid: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
+
+    if trust_problems:
+        console.print("[red]✗ Config invalid[/red]")
+        for message in trust_problems:
+            console.print(f"  credentials.profiles: {_rich_escape(message)}")
+        raise typer.Exit(1)
+
+    console.print("[green]✓ Config valid[/green]")
+    console.print(f"  Cache: backend={server_config.cache.backend}, ")
+    if server_config.cache.backend == "memory":
+        console.print(
+            f"    max_entries={server_config.cache.memory_max_entries}, "
+            f"max_bytes={server_config.cache.memory_max_bytes // (1024 * 1024)}MB"
+        )
+    elif server_config.cache.backend == "file":
+        console.print(
+            f"    cache_dir={server_config.cache.file_cache_dir}, "
+            f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
+            f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
+        )
+    console.print(f"  Sources: {len(sources)} data source(s)")
+
+    for source in sources:
+        console.print(f"    - {source.source_id} ({source.type}: {source.url})")
 
 
 @app.command()
@@ -1113,6 +1355,108 @@ def config_schema(
         typer.echo(text, nl=False)
 
 
+@app.command(name="migrate-config")
+def migrate_config(
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Config file (or dir) to migrate; defaults to ~/.config/biopb",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n", help="Report what would happen; write nothing"
+    ),
+):
+    """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
+
+    JSON is the only format the server reads (biopb/biopb#34), so this command is
+    the upgrade path for a pre-#34 install. It converts a legacy TOML config in
+    place -- reading the raw table (so advanced/unknown keys survive) and writing
+    the sibling ``biopb.json`` (plus its schema sidecar), then backing the old TOML
+    up to ``biopb.toml.bak``. Settings are preserved verbatim, so a running server
+    need not be restarted.
+
+    Lives here, not in the core SDK's `biopb` CLI, since biopb/biopb#615: it can do
+    nothing without this package's config reader/writer, so `biopb server
+    migrate-config` was a command the SDK could offer but not honor.
+    """
+    from biopb._locations import (
+        CANONICAL_CONFIG_NAME,
+        DEFAULT_CONFIG_DIR,
+        LEGACY_CONFIG_NAME,
+    )
+
+    from biopb_tensor_server.core.config import read_legacy_toml, save_config
+
+    # Resolve the config directory. --config may point at a file (use its parent)
+    # or a directory; with nothing given, use the standard location.
+    if config is None:
+        config_dir = DEFAULT_CONFIG_DIR
+    elif config.is_dir():
+        config_dir = config
+    else:
+        config_dir = config.parent
+
+    toml_path = config_dir / LEGACY_CONFIG_NAME
+    json_path = config_dir / CANONICAL_CONFIG_NAME
+
+    if not toml_path.exists():
+        if json_path.exists():
+            console.print(
+                f"[green]Already canonical:[/green] {json_path} is JSON; "
+                "nothing to migrate."
+            )
+        else:
+            console.print(
+                f"[yellow]No legacy config found[/yellow] at {toml_path} "
+                "(and no JSON either); nothing to migrate."
+            )
+        raise typer.Exit(0)
+
+    # A legacy TOML exists. If a JSON also exists it already shadows the TOML
+    # (find_config prefers JSON), so we must NOT overwrite it from the TOML --
+    # just retire the stale TOML to clear the both-files shadow warning.
+    if json_path.exists():
+        backup = toml_path.with_name(toml_path.name + ".bak")
+        console.print(
+            f"[yellow]Both configs present:[/yellow] {json_path} is already "
+            f"canonical and in use; the legacy {toml_path.name} is ignored."
+        )
+        if dry_run:
+            console.print(f"  [dim](dry run)[/dim] would back it up to {backup.name}")
+            raise typer.Exit(0)
+        toml_path.replace(backup)
+        console.print(f"  Retired the legacy TOML -> {backup.name}")
+        raise typer.Exit(0)
+
+    # The migration case: TOML only. Read the raw table and write canonical JSON.
+    # `read_legacy_toml` is the last TOML reader in the tree -- the server's own
+    # load path no longer parses TOML at all (biopb/biopb#34).
+    try:
+        data = read_legacy_toml(toml_path)
+    except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
+        console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
+        raise typer.Exit(1)
+
+    if dry_run:
+        backup = toml_path.with_name(toml_path.name + ".bak")
+        console.print(f"[cyan](dry run)[/cyan] would migrate {toml_path}")
+        console.print(f"  write  {json_path} (+ schema sidecar)")
+        console.print(f"  backup {toml_path.name} -> {backup.name}")
+        raise typer.Exit(0)
+
+    try:
+        written = save_config(data, toml_path)
+    except Exception as exc:  # noqa: BLE001 - write must surface, not crash
+        console.print(f"[red]Failed to write {json_path}:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Migrated[/green] {toml_path} -> {written} "
+        f"(old file backed up to {toml_path.name}.bak)."
+    )
+
+
 @app.command()
 def launch(
     config: Path = typer.Option(
@@ -1133,17 +1477,18 @@ def launch(
         "--log-scope-biopb/--log-scope-all",
         help="Scope logging to biopb_tensor_server only (default) or affect all packages",
     ),
-    host: Optional[str] = typer.Option(
-        None,
+    host: str = typer.Option(
+        DEFAULT_FLIGHT_HOST,
         "--host",
         "-h",
-        help="Flight server host (overrides config)",
+        help="Address the Flight gRPC server binds. Loopback (the default) is "
+        "local mode; a public address is remote mode and requires a token.",
     ),
-    port: Optional[int] = typer.Option(
-        None,
+    port: int = typer.Option(
+        DEFAULT_FLIGHT_PORT,
         "--port",
         "-p",
-        help="Flight server port (overrides config)",
+        help="TCP port for the Flight gRPC server.",
     ),
     writable: bool = typer.Option(
         False,
@@ -1163,9 +1508,39 @@ def launch(
     token: Optional[str] = typer.Option(
         None,
         "--token",
-        help="Access token (required when server.host is non-loopback; "
+        help="Access token (required when --host is non-loopback; "
         "auto-generated if blank on a public bind)",
         hide_input=True,
+    ),
+    tls: bool = typer.Option(
+        False,
+        "--tls",
+        help="Serve the flight plane over TLS. Uses the self-signed cert in the "
+        "state dir (auto-generated on first use); clients connect with grpcs:// "
+        "and pin it on first connect (TOFU). The HTTP sidecar reaches the flight "
+        "plane over loopback and trusts the same cert directly. Implied by "
+        "--tls-cert/--tls-key. See also `cert init`.",
+    ),
+    tls_cert: Optional[Path] = typer.Option(
+        None,
+        "--tls-cert",
+        exists=True,
+        help="PEM certificate chain to serve instead of the auto self-signed cert "
+        "(requires --tls-key). Must carry a loopback SAN (localhost / 127.0.0.1) "
+        "or the co-located sidecar cannot reach the flight plane.",
+    ),
+    tls_key: Optional[Path] = typer.Option(
+        None,
+        "--tls-key",
+        exists=True,
+        help="PEM private key paired with --tls-cert.",
+    ),
+    san: Optional[List[str]] = typer.Option(
+        None,
+        "--san",
+        help="Extra hostname/IP for the auto-generated cert (repeatable). Use it "
+        "when clients dial a name this host cannot discover itself; ignored if a "
+        "cert already exists (re-mint with `cert init --force --san ...`).",
     ),
     cors_origins: Optional[List[str]] = typer.Option(
         None,
@@ -1223,11 +1598,11 @@ def launch(
     _deathwatch.install()
 
     # --- Token management ---
-    # The flight bind (server.host, or a --host override) is the mode switch; the
+    # The flight bind (--host) is the mode switch; the
     # sidecar's own bind (--web-host) must never be public-and-unauthenticated.
     # _resolve_launch_token decides the enforced token fail-closed (and refuses a
     # public sidecar with no token). There is no separate dev flag.
-    effective_host = host or server_config.host
+    effective_host = host
     effective_token = _resolve_launch_token(
         effective_host,
         web_host,
@@ -1274,6 +1649,8 @@ def launch(
     # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
     # returns normally on shutdown (it does not re-raise), so cleanup must run in
     # `finally` rather than an except block regardless.
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
+
     flight_server = source_manager = watcher = precache_worker = None
     try:
         flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
@@ -1282,6 +1659,8 @@ def launch(
             port=port,
             writable=writable,
             token=effective_token,
+            tls_cert_chain=tls_cert_chain,
+            tls_private_key=tls_private_key,
         )
 
         # The HTTP sidecar is co-located with the Flight server and reaches it over
@@ -1295,9 +1674,20 @@ def launch(
             _flight_connect_host = "127.0.0.1"
         elif _flight_connect_host == "::":
             _flight_connect_host = "::1"
-        flight_location = _grpc_location(
-            _flight_connect_host, port or server_config.port
-        )
+        flight_location = _grpc_location(_flight_connect_host, port)
+        if tls_cert_chain is not None:
+            # The sidecar is on the same host as the flight plane and holds the
+            # very cert that plane serves, so it trusts it directly (passed below
+            # as the client's root) rather than trust-on-first-use: an anchor read
+            # off local disk is strictly stronger than a pin learned from the
+            # wire, and it keeps the sidecar off the pin store entirely.
+            #
+            # The auto-generated cert always carries localhost/127.0.0.1/::1 (see
+            # core.tls._host_identity), so the loopback dial matches its SANs. A
+            # BYO cert minted only for a public name does not, and gRPC still
+            # checks the dialed name against the SANs even when trust comes from
+            # this explicit root -- hence the --tls-cert help text.
+            flight_location = flight_location.replace("grpc://", "grpcs://", 1)
         flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
         flight_thread.start()
 
@@ -1344,6 +1734,7 @@ def launch(
             port=web_port,
             cors_origins=effective_cors,
             config_path=str(config),
+            tls_ca_pem=tls_cert_chain,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")

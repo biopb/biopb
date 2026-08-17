@@ -66,7 +66,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
   // Axis map
   const axisMap: AxisMap = useMemo(() => {
-    if (!descriptor) return { t: null, z: null, c: null, y: null, x: null };
+    if (!descriptor) return { t: null, z: null, c: null, y: null, x: null, s: null };
     return buildAxisMap(descriptor.dim_labels);
   }, [descriptor]);
 

@@ -18,9 +18,15 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
 the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
-widgets (``image_processing/``); ``tensor_browser`` / ``pyramid`` are
-GUI-independent data-plane knobs read by the headless kernel too; ``timeout`` /
-``grpc`` / ``memory`` are compute-plane knobs shared by the widgets and ``ops``.
+widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
+MCP kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
+shared by the widgets and ``ops``.
+
+There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
+control plane owns the data plane and is asked for its address at connect time,
+so a configured URL could only be a second, staler answer -- and was how this
+machine's credential reached endpoints the control never named (#626). A legacy
+``tensor_browser`` section in an existing file is simply ignored by the merge.
 
 Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` so
 call sites never duplicate a default literal.
@@ -128,25 +134,14 @@ class GridConfig:
 
 
 @dataclass
-class TensorBrowserConfig:
-    """Data-plane connection, read by the GUI-independent TensorConnection.
-
-    Not under ``widget`` on purpose: the headless MCP kernel uses it too.
-    """
-
-    server_url: str = _h(
-        "grpc://localhost:8815", "Arrow Flight tensor-server URL for the data plane."
-    )
-
-
-@dataclass
 class PyramidConfig:
     """Multiscale pyramid construction for large tensors.
 
     Shared by the Tensor Browser widget and MCP ``add_tensor`` (both call
-    ``_tensor_utils.build_pyramid_levels``). GUI-independent, like
-    ``tensor_browser``. The numeric bounds are the identical rows the tensor
-    server enforces (PYRAMID_CONSTRAINTS), so the two cannot drift.
+    ``_tensor_utils.build_pyramid_levels``), so it is GUI-independent and lives at
+    the top level rather than under ``widget``. The numeric bounds are the
+    identical rows the tensor server enforces (PYRAMID_CONSTRAINTS), so the two
+    cannot drift.
     """
 
     threshold: int = _h(
@@ -214,12 +209,6 @@ class TransportConfig:
         "launched `--transport http` server (the stdio shim and `biopb mcp view` "
         "use dynamic ports).",
     )
-    display_mode: str = _h(
-        "auto",
-        'Whether the kernel opens a visible napari viewer: "auto" (visible if a '
-        'display is present, else headless), "visible" (require a display; fail '
-        'fast if none), "headless" (never open a viewer -- compute-only).',
-    )
     kernel_log: str = _h(
         "",
         "Force the stdio bridge's session child to log to ONE fixed file instead "
@@ -242,9 +231,10 @@ class TransportConfig:
     )
     server_start_timeout: float = _h(
         60.0,
-        "Give-up budget (seconds) applied twice by auto_connect's down-plane "
-        "fallback (control-ensure, then boot wait), so the worst-case wall wait is "
-        "~2x this. The normal path (plane already up) has no timeout.",
+        "Give-up budget (seconds) applied twice on auto_connect's control path "
+        "(control-ensure, then boot wait), so the worst-case wall wait is ~2x "
+        "this. The $BIOPB_TENSOR_URL path spends it once, on a STARTING server. "
+        "The normal path (plane already up) has no timeout.",
     )
 
 
@@ -382,21 +372,33 @@ class ServicesConfig:
         "queried via GetOpNames and exposed as callables in the kernel's `ops` dict.",
     )
     skills_enabled: bool = _h(
-        False,
-        "Master switch for skills discovery/retrieval. Off by default (opt-in): "
-        "find_skills returns nothing, no catalog fetch is attempted, and the agent "
-        "is not told to consult skills. Set true to enable the curated-workflow "
-        "catalog.",
+        True,
+        "Master switch for skills discovery/retrieval. On by default: the agent is "
+        "told to consult find_skills, which resolves the curated workflows shipped "
+        "with this package plus the user's own (skills_local_dir). Set false to keep "
+        "the subsystem dormant -- find_skills returns nothing and the agent is not "
+        "told about skills.",
     )
-    skills_catalog_url: str = _h(
-        "https://biopb.org/skills/catalog.json",
-        "Published skills metadata catalog. Point at a self-hosted catalog to serve "
-        "a lab's own curated set.",
+    skills_local_dir: str = _h(
+        "",
+        "Directory of user-authored skill files (*.md) merged into the catalog "
+        "beside the shipped ones; empty -> ~/.config/biopb/skills. Personal and "
+        "unreviewed (find_skills reports them as origin=local), re-read on every "
+        "discovery so an edit is live without a restart. Since the curated set now "
+        "arrives only with a release, this is also the only way a skill reaches a "
+        "machine out of band. Off with skills_enabled like the rest of the "
+        "subsystem.",
     )
-    skills_cache_ttl: int = _h(
-        3600,
-        "Seconds a fetched skills catalog is reused before re-fetching. A stale "
-        "on-disk cache is still used past this if the network is down.",
+    skills_index_plugins: bool = _h(
+        True,
+        "Also return kernel plugins from find_skills, described by their module "
+        "docstring (read with ast, never imported). Without this a plugin is "
+        "discoverable only as a bare name in server_status, which conveys nothing "
+        "about what it does -- measured: five benchmark arms were shown the name "
+        "and none followed it up. Rows carry kind='plugin' and a namespace handle "
+        "instead of a skill:// uri. Off with skills_enabled or namespace_enabled, "
+        "since there is nothing to advertise if the catalog is dormant or the "
+        "plugins will not load.",
     )
     namespace_enabled: bool = _h(
         True,
@@ -425,6 +427,14 @@ class ObserveConfig:
         3000,
         "How often (ms) the observe page polls the job list/status. Deliberately "
         "slow: each poll is a kernel round-trip competing with agent calls.",
+    )
+    console_enabled: bool = _h(
+        True,
+        "Offer the user console: a code cell on the observe page that runs in "
+        "this session's kernel, serialized against the agent by the same "
+        "one-job-at-a-time rule. Off drops the route entirely. This can only "
+        "narrow the surface -- the control refuses to proxy the console at all "
+        "unless it is loopback-bound, whatever this says.",
     )
 
 
@@ -462,7 +472,6 @@ class McpConfig:
     widget: WidgetConfig = field(default_factory=WidgetConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     grid: GridConfig = field(default_factory=GridConfig)
-    tensor_browser: TensorBrowserConfig = field(default_factory=TensorBrowserConfig)
     pyramid: PyramidConfig = field(default_factory=PyramidConfig)
     timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
     grpc: GrpcConfig = field(default_factory=GrpcConfig)
@@ -507,7 +516,6 @@ _CONSTRAINTS = {
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),
-        "display_mode": Enum({"auto", "visible", "headless"}),
         "session_log_keep": Range(min=1),  # keep at least the current
         "server_start_timeout": Range(exclusive_min=0),
     },
@@ -528,9 +536,6 @@ _CONSTRAINTS = {
     "TensorRuntimeConfig": {
         "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
         "health_poll_max_interval": Range(min=0),
-    },
-    "ServicesConfig": {
-        "skills_cache_ttl": Range(min=0),
     },
 }
 

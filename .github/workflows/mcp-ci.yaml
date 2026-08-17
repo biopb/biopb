@@ -85,6 +85,31 @@ jobs:
           git clone --depth 1 https://github.com/pyvista/gl-ci-helpers.git
           powershell gl-ci-helpers/appveyor/install_opengl.ps1
 
+      # The step above is what actually provides vispy's OpenGL. The Mesa
+      # install in `Setup headless display` does not: `systemwidedeploy.cmd 1`
+      # ("Install OpenGL drivers") leaves System32\opengl32.dll byte-identical
+      # -- same 999424 bytes, same mtime -- on every run inspected, passing and
+      # failing alike. Only gl-ci-helpers takes ownership of that file and
+      # replaces it, and nothing here observes whether it worked.
+      #
+      # When it does not, the job dies ~4 minutes later inside pytest's plugin
+      # loader, because napari's pytest11 entry point imports vispy, which does
+      # `ctypes.windll.opengl32` at import time:
+      #
+      #   FileNotFoundError: Could not find module 'opengl32' (or one of its
+      #   dependencies).
+      #
+      # That has cost several Windows jobs and reads as a test failure, which it
+      # is not. Load the library here instead, so a bad GL install fails at
+      # setup, next to the step that caused it, and says so.
+      - name: Check Windows OpenGL loads
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ls -l /C/Windows/System32/opengl32.dll || true
+          ls -l /C/Windows/System32/osmesa.dll || true
+          python -c "import ctypes; ctypes.WinDLL('opengl32'); print('opengl32 loads')"
+
       - name: Setup buf
         uses: bufbuild/buf-action@v1
         with:
@@ -107,8 +132,73 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: uv run --no-sync pytest -v --color=yes --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
 
+      # Deselected from the run above (pyproject addopts) because each token is a
+      # real resolver run. Resolves every `pkg:` a shipped skill's `checklist:` declares against
+      # the environment just built, so a skill whose package installs only by
+      # downgrading biopb's own deps fails here rather than on a user's machine.
+      # Metadata only -- nothing is downloaded or installed.
+      #
+      # This step owns ONE question: does installing it move something already
+      # here. That is fatal wherever it happens -- a live kernel has the old
+      # versions imported -- so one red cell rejects the skill, and required and
+      # optional packages are judged the same way.
+      #
+      # Whether the package can be installed on a platform at all is a different
+      # question with a different verdict, and it is the skill-availability job
+      # below rather than another per-cell step (#680).
+      - name: Skill package satisfiability
+        run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/skills
+
       - name: Coverage
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: ${{ matrix.os }}-py${{ matrix.python-version }}
+
+  # Wheel availability for every interpreter x platform biopb supports, from one
+  # Linux job: `uv pip compile` resolves for a platform that is not present, so
+  # this covers all nine cells where the matrix above covers five -- and, more to
+  # the point, it is a single place that can render a per-cell verdict. Split out
+  # from the matrix in #680, where the old shape's "one red cell rejects" was
+  # shown to be not a policy choice but the only rule five independent pytest
+  # runs could express.
+  #
+  # A platform hole is reported, not rejected: `checklist:` informs the agent and
+  # gates nothing, so a session without the package says so and works around it.
+  # Installing on NO cell still fails -- that is a token nobody can ever satisfy
+  # rather than a platform gap.
+  skill-availability:
+    name: skill package availability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # `biopb`'s build generates the protobuf stubs, and it is installed below
+      # because biopb_mcp._config imports biopb._locations.
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # No dependency tree: the grid resolves metadata for interpreters that are
+      # not here, so napari and the rest are never imported. The workspace still
+      # goes in `--no-deps` -- `biopb_mcp/__init__.py` reads its own installed
+      # metadata, and pytest reaches it through the package conftest, which
+      # imports the shared config out of `biopb`. The checkout is the point: the
+      # co-resolve uses this branch's biopb-mcp, not the last release.
+      - name: Install (metadata only)
+        run: |
+          uv venv
+          uv pip install pytest pyyaml packaging
+          uv pip install --no-deps -e biopb-mcp -e .
+
+      - name: Skill package availability
+        run: >-
+          uv run --no-sync pytest -v --color=yes -m availability
+          biopb-mcp/src/biopb_mcp/_tests/skills/test_availability.py

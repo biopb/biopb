@@ -1,7 +1,7 @@
 """Helper functions injected into the execute_code namespace.
 
 ``add_tensor`` is monkey-patched onto the viewer instance so the agent
-calls ``viewer.add_tensor("source_id")``.
+calls ``viewer.add_tensor("array_id")``.
 """
 
 import logging
@@ -47,10 +47,10 @@ def viewer_window_alive(viewer) -> bool:
     half-dead viewer as healthy: after the user closes the window the Python
     ``viewer`` survives (the kernel namespace holds it), but its Qt window and
     vispy canvas are destroyed, so mutations silently no-op and ``screenshot``
-    raises.  Covers all three teardown shapes: a user X-close (``_qt_window``
-    wraps a deleted C++ object, so ``isVisible()`` raises ``RuntimeError``), a
-    programmatic ``Window.close()`` (``del self._qt_window`` -> attribute gone),
-    and the headless sentinel (``__getattr__`` raises).  An alive-but-minimized
+    raises.  Covers both teardown shapes: a user X-close (``_qt_window``
+    wraps a deleted C++ object, so ``isVisible()`` raises ``RuntimeError``) and a
+    programmatic ``Window.close()`` (``del self._qt_window`` -> attribute
+    gone).  An alive-but-minimized
     or hidden window is still "alive" (``isVisible()`` returns a bool rather than
     raising)."""
     try:
@@ -136,22 +136,42 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
     across the distributed cluster (issue #8)."""
 
     def add_tensor(
-        source_id: str,
+        array_id: str | None = None,
         tensor_id: str | None = None,
         name: str | None = None,
+        *,
+        source_id: str | None = None,
     ) -> str:
         """Add a tensor dataset to the viewer as an image layer.
 
         Args:
-            source_id: Source identifier on the tensor server.
-            tensor_id: Tensor array_id within the source.  If *None* and the
-                source has exactly one tensor, it is selected automatically.
+            array_id: The tensor's ``array_id``, addressed exactly as
+                ``client.get_tensor`` addresses it.  A bare source_id is also
+                accepted and resolves to the source's sole tensor.
+            tensor_id: The older split form -- ``array_id`` is then read as a
+                routing source_id and this is the tensor within it.  Still
+                accepted; passing a single ``array_id`` is preferred.
             name: Layer name.  Auto-generated from source URL if *None*.
 
         Returns:
             The name of the created viewer layer.
         """
+        from biopb.tensor.client import _split_array_id
+
         from .._tensor_utils import add_tensor_layer
+
+        if array_id is None:  # legacy keyword form: add_tensor(source_id="...")
+            array_id = source_id
+        if not array_id:
+            raise TypeError("add_tensor() requires an array_id")
+
+        # A tensor is identified by its array_id ALONE; the slash-free prefix is
+        # a routing convenience (descriptor.proto's identity policy). Splitting
+        # it here is what lets this call address like every other tensor call --
+        # a bare source_id still lands on `tensor_id=None` below.
+        source_id, qualified_id = _split_array_id(array_id)
+        if tensor_id is None:
+            tensor_id = qualified_id
 
         client = connection.client
         if client is None:

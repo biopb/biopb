@@ -1,0 +1,882 @@
+"""The loop, driven by a scripted agent — no model, no session, no key.
+
+These are machinery tests and they run with the **ordinary suite**, like
+`outcomes/test_outcome_protocol.py`: a break in the conversation loop should
+surface as a normal red test, not be discovered by someone mid-diagnosis with
+a paid run.
+
+The session here is a stand-in, and that is the one place in this package where
+that is the right answer. What is under test is the loop's own contract — route
+plain text to the respondent, route tool calls to the session, record both, stop
+for a stated reason — and none of that is a claim about the runtime. The real
+session is covered next door by `test_session_smoke.py`, against the real thing.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import pytest
+
+from ._agent import AgentTurn, ReplayAgent, ScriptedAgent, ToolCall
+from ._conversation import (
+    AGENT_TRUNCATED,
+    FINISHED,
+    RESPONDENT_FAILED,
+    SILENT,
+    STALLED,
+    TASK_COMPLETE,
+    TOOL_CAP,
+    TURN_CAP,
+    Trace,
+    converse,
+    scrape,
+    with_protocol,
+)
+from ._models import EmptyCompletion
+from ._respondent import (
+    DONE,
+    BriefedRespondent,
+    ScriptedRespondent,
+    SilentRespondent,
+)
+from ._session import CLIENT_TOOLS, ToolResult, ToolSpec
+
+
+@dataclass
+class FakeSession:
+    """Just enough session to exercise the loop. Not a model of the runtime."""
+
+    tools: list[ToolSpec] = field(
+        default_factory=lambda: [
+            ToolSpec("execute_code", "run python", {"type": "object"}),
+            ToolSpec("server_status", "status", {"type": "object"}),
+        ]
+    )
+    results: dict[str, ToolResult] = field(default_factory=dict)
+    arrays: dict[str, object] = field(default_factory=dict)
+    calls: list[tuple[int, str, dict]] = field(default_factory=list)
+    _turn: int = 0
+
+    @property
+    def agent_tools(self) -> list[ToolSpec]:
+        return [*self.tools, *CLIENT_TOOLS]
+
+    def call(self, name, /, **arguments):
+        self.calls.append((self._turn, name, dict(arguments)))
+        return self.results.get(name, ToolResult(name, f"{name} ok"))
+
+    def get_array(self, expression):
+        return self.arrays.get(expression)
+
+
+def _says(text):
+    return AgentTurn(text=text)
+
+
+def _calls(name, **arguments):
+    return AgentTurn(tool_calls=(ToolCall(f"c-{name}", name, arguments),))
+
+
+# --- routing ---------------------------------------------------------------
+
+
+def test_plain_text_goes_to_the_respondent_and_the_answer_comes_back():
+    """The mechanism the whole tier rests on: the agent's only route to a fact
+    it was not given is to say something to the user."""
+    agent = ScriptedAgent([_says("Which channel is structural?"), _says("Done.")])
+    respondent = ScriptedRespondent([("structural", "Channel 1, the membrane.")])
+    session = FakeSession()
+
+    trace = converse(session, agent, respondent, task="correct the drift")
+
+    assert respondent.heard == ["Which channel is structural?", "Done."]
+    assert "Channel 1, the membrane." in [
+        e.text for e in trace.events if e.role == "user"
+    ]
+    # The answer must be in what the agent sees next, or asking bought nothing.
+    assert agent.seen[-1][0] > agent.seen[0][0]
+
+
+def test_tool_calls_go_to_the_session_and_never_to_the_respondent():
+    """A turn that acted is not waiting on an answer, so the user is not
+    disturbed by it. A respondent that heard tool output would be a very
+    different fixture."""
+    agent = ScriptedAgent([_calls("server_status"), _says("All set.")])
+    respondent = ScriptedRespondent([])
+    session = FakeSession()
+
+    trace = converse(session, agent, respondent, task="t")
+
+    assert trace.tool_names == ["server_status"]
+    assert respondent.heard == ["All set."]
+
+
+def test_the_model_is_offered_the_resource_verbs():
+    """What the agent is *given* is the whole surface, not just the server's.
+
+    The loop translates one list onto the wire, so if it reads `tools` instead
+    of `agent_tools` the resource verbs never reach the model — which is the
+    original bug, and it is invisible from the session object alone.
+    """
+    agent = ScriptedAgent([_says("done")])
+    session = FakeSession()
+
+    converse(session, agent, ScriptedRespondent([]), task="t")
+
+    offered = {t["function"]["name"] for t in agent.seen_tools}
+    assert {"read_resource", "list_resources"} <= offered, sorted(offered)
+    assert {t.name for t in session.tools} <= offered
+
+
+def test_narration_alongside_a_tool_call_does_not_reach_the_user():
+    """Models narrate while acting, and a status update is not a question.
+    Only a turn that actually asks something is routed."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Let me look.", tool_calls=(ToolCall("i", "server_status", {}),)
+            )
+        ]
+    )
+    respondent = ScriptedRespondent([])
+
+    converse(FakeSession(), agent, respondent, task="t")
+
+    assert respondent.heard == [], "narration was mistaken for a question"
+
+
+def test_a_question_asked_while_acting_still_reaches_the_user():
+    """The swallowed question. Routing used to key on "did this turn call a
+    tool", so a model that asked *and* kept working was never asked on the
+    user's behalf — it then said "I have asked, I will wait", and the run
+    ended on that sign-off with the question never delivered."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Which channel is structural?",
+                tool_calls=(ToolCall("i", "server_status", {}),),
+            ),
+            _says("Thanks, done."),
+        ]
+    )
+    respondent = ScriptedRespondent(
+        [("structural", "Channel 1, the membrane."), ("done", DONE)]
+    )
+    session = FakeSession()
+
+    trace = converse(session, agent, respondent, task="t")
+
+    assert "Which channel is structural?" in respondent.heard
+    assert "Channel 1, the membrane." in [
+        e.text for e in trace.events if e.role == "user"
+    ]
+    assert trace.tool_names == ["server_status"], "the tool still ran"
+
+
+def test_a_working_turn_is_never_ended_by_the_sentinel():
+    """The mirrored bug. `DONE` on a turn that also called tools means "not a
+    question to me", not "we are finished" — the agent was working. Ending
+    there would make every rhetorical question inside a working turn a
+    terminated arm."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Is that the structural one? Let me check.",
+                tool_calls=(ToolCall("i", "server_status", {}),),
+            ),
+            _calls("execute_code", code="offsets = ..."),
+        ]
+    )
+    respondent = ScriptedRespondent([], fallback=DONE)
+
+    trace = converse(FakeSession(), agent, respondent, task="t", max_turns=4)
+
+    assert trace.stopped != FINISHED, "a working turn was read as a hand-off"
+    assert trace.tool_names == ["server_status", "execute_code"]
+
+
+# --- stopping --------------------------------------------------------------
+
+
+def test_the_respondent_ends_the_run_with_the_sentinel():
+    agent = ScriptedAgent([_says("Here is the corrected movie.")])
+    respondent = ScriptedRespondent([("corrected", DONE)])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+
+
+@dataclass
+class BrokenRespondent:
+    """A respondent whose provider returns nothing. The measured failure."""
+
+    name: str = "broken"
+
+    def reply(self, message: str) -> str:
+        raise EmptyCompletion("some:model", "length", 300)
+
+
+def test_a_respondent_that_never_answers_is_not_the_agent_signing_off():
+    """`DONE` ends the run and scores as the agent having handed off, which is
+    both the nearest reading of this failure and the most expensive to
+    believe: it ends the arm at the first question and reports the loss
+    against the skill."""
+    agent = ScriptedAgent([_says("Which channel is structural?")])
+
+    trace = converse(FakeSession(), agent, BrokenRespondent(), task="t")
+
+    assert trace.stopped == RESPONDENT_FAILED
+    assert trace.stopped != FINISHED
+    failure = [e for e in trace.events if e.role == "harness" and e.is_error]
+    assert failure, "the provider's own reason has to reach the trace"
+    assert "max_tokens" in failure[0].text
+
+
+def test_a_question_with_no_answer_behind_it_is_visible_in_the_trace():
+    """The shape a broken respondent leaves: questions asked, none answered.
+    The report flags on exactly this."""
+    agent = ScriptedAgent([_says("Which channel is structural?")])
+
+    trace = converse(FakeSession(), agent, BrokenRespondent(), task="t")
+
+    assert trace.blocking_questions
+    assert trace.answers == []
+
+
+def test_a_silent_agent_stops_the_run():
+    """Nothing said and nothing called: there is no next move to make, and
+    spinning to the turn cap would only hide it."""
+    trace = converse(FakeSession(), ScriptedAgent([]), ScriptedRespondent([]), task="t")
+    assert trace.stopped == SILENT
+
+
+def test_an_agent_cut_off_at_its_budget_is_not_an_agent_that_gave_up():
+    """The identical empty turn, and opposite meanings. A reasoning model
+    bills its reasoning against `max_tokens`, so it can spend the whole budget
+    before writing anything — which arrives as a turn with no text and no tool
+    calls, exactly like a model with nothing left to say."""
+    agent = ScriptedAgent([AgentTurn(text="", finish_reason="length")])
+
+    trace = converse(FakeSession(), agent, ScriptedRespondent([]), task="t")
+
+    assert trace.stopped == AGENT_TRUNCATED
+    assert any(e.role == "harness" and e.is_error for e in trace.events), (
+        "the reason has to reach the trace, not just the stop code"
+    )
+
+
+def test_a_truncated_turn_that_still_said_something_is_an_ordinary_turn():
+    """Only the *empty* truncated turn is unreadable. One that got a question
+    out before the budget ran down is still a question."""
+    agent = ScriptedAgent([AgentTurn(text="Which channel?", finish_reason="length")])
+    respondent = ScriptedRespondent([("channel", DONE)])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+    assert respondent.heard == ["Which channel?"]
+
+
+def test_the_finish_reason_survives_into_the_trace():
+    """Recorded rather than inferred: after the fact, nothing else in the
+    record distinguishes a cut-off turn from a finished one."""
+    agent = ScriptedAgent([AgentTurn(text="Hello?", finish_reason="length")])
+
+    trace = converse(FakeSession(), agent, ScriptedRespondent([]), task="t")
+
+    spoken = next(e for e in trace.events if e.role == "agent")
+    assert spoken.finish_reason == "length"
+    assert "cut off at the token budget" in trace._markdown()
+
+
+def test_the_turn_cap_is_recorded_as_the_outcome_it_is():
+    """ "Finished" and "was cut off" score the same numerically and mean
+    completely different things about a skill, so the reason is recorded rather
+    than inferred."""
+    agent = ScriptedAgent([_says("Are you there?")] * 50)
+    respondent = ScriptedRespondent([("there", "Yes.")])
+
+    trace = converse(FakeSession(), agent, respondent, task="t", max_turns=4)
+
+    assert trace.stopped == TURN_CAP and trace.turns_used == 4
+
+
+def test_the_tool_cap_bounds_a_model_stuck_in_a_loop():
+    agent = ScriptedAgent([_calls("server_status")] * 50)
+
+    trace = converse(
+        FakeSession(),
+        agent,
+        ScriptedRespondent([]),
+        task="t",
+        max_tool_calls=3,
+    )
+
+    assert trace.stopped == TOOL_CAP and len(trace.tool_names) == 3
+
+
+# --- the trace -------------------------------------------------------------
+
+
+def test_the_trace_answers_the_gate_spy_question():
+    """Structural assertion (§5): did a blocking question precede the expensive
+    call, or follow it? That is an ordering question about the record."""
+    asked_first = converse(
+        FakeSession(),
+        ScriptedAgent(
+            [_says("Field or objects?"), _calls("execute_code", python_code="x")]
+        ),
+        ScriptedRespondent([("field", "The stage drifted.")]),
+        task="t",
+    )
+    assert asked_first.first_question() < asked_first.first_call_of("execute_code")
+
+    acted_first = converse(
+        FakeSession(),
+        ScriptedAgent(
+            [_calls("execute_code", python_code="x"), _says("Field or objects?")]
+        ),
+        ScriptedRespondent([("field", "The stage drifted.")]),
+        task="t",
+    )
+    assert acted_first.first_question() > acted_first.first_call_of("execute_code")
+
+
+def test_questions_counts_only_what_was_said_to_the_user():
+    agent = ScriptedAgent(
+        [_says("One?"), _calls("server_status"), _says("Two?"), _says("Done.")]
+    )
+    trace = converse(
+        FakeSession(),
+        agent,
+        ScriptedRespondent([("done", DONE)]),
+        task="t",
+    )
+    assert trace.questions == ["One?", "Two?", "Done."]
+
+
+def test_narration_is_not_a_blocking_question():
+    """Models narrate their plan in a turn of their own and act in the next.
+    The loop routes that to the respondent like any plain text -- but it is a
+    status update, not a checkpoint, and counting it put a well-behaved run six
+    over a budget of four on the first real measurement of this layer."""
+    agent = ScriptedAgent(
+        [
+            _says("I found a drift-correction skill. Let me read it."),
+            _calls("server_status"),
+            _says("Which channel is structural?"),
+            _says("The correction is complete."),
+        ]
+    )
+    trace = converse(
+        FakeSession(),
+        agent,
+        ScriptedRespondent([("channel", "Channel 1."), ("complete", DONE)]),
+        task="t",
+    )
+
+    assert len(trace.questions) == 3
+    assert trace.blocking_questions == ["Which channel is structural?"]
+
+
+def test_the_trace_is_written_in_both_forms(tmp_path):
+    """One to replay from, one to read. Written whatever the verdict, because
+    an assertion message cannot tell a bad skill from a bad kernel."""
+    trace = converse(
+        FakeSession(),
+        ScriptedAgent([_calls("server_status"), _says("Done.")]),
+        ScriptedRespondent([("done", DONE)]),
+        task="correct the drift",
+    )
+    where = trace.write(tmp_path / "run")
+
+    lines = (where / "trace.jsonl").read_text().splitlines()
+    header = json.loads(lines[0])
+    assert header["stopped"] == FINISHED and header["task"] == "correct the drift"
+    assert all(json.loads(line) for line in lines[1:])
+
+    markdown = (where / "transcript.md").read_text()
+    assert "server_status" in markdown and "Done." in markdown
+
+
+def test_a_written_trace_replays(tmp_path):
+    """A finding travels as a file: someone with the trace and no key can
+    re-check every structural assertion made about it."""
+    original = converse(
+        FakeSession(),
+        ScriptedAgent(
+            [_says("Which channel?"), _calls("server_status"), _says("Bye.")]
+        ),
+        ScriptedRespondent([("channel", "Channel 1."), ("bye", DONE)]),
+        task="t",
+    )
+    where = original.write(tmp_path / "run")
+    records = [
+        json.loads(line)
+        for line in (where / "trace.jsonl").read_text().splitlines()[1:]
+    ]
+
+    replayed = converse(
+        FakeSession(),
+        ReplayAgent.from_trace(records),
+        ScriptedRespondent([("channel", "Channel 1."), ("bye", DONE)]),
+        task="t",
+    )
+
+    assert replayed.questions == original.questions
+    assert replayed.tool_names == original.tool_names
+
+
+# --- the control condition -------------------------------------------------
+
+
+def test_the_silent_respondent_answers_nothing_but_keeps_talking():
+    """The calibration for every interaction case. It must not end the run --
+    a user who says "I don't know" has not left the room -- so the agent gets
+    to proceed on a guess, and the numeric verifier is what fails it."""
+    respondent = SilentRespondent()
+    agent = ScriptedAgent(
+        [_says("Which channel is structural?"), _says("OK, guessing.")]
+    )
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert len(respondent.said) == 2
+    assert trace.stopped != FINISHED
+    answers = [e.text for e in trace.events if e.role == "user"]
+    assert all("don't know" in a for a in answers)
+
+
+def test_the_briefed_respondent_adds_nothing_to_what_was_already_said():
+    """The other control, varying the other thing. It answers every question
+    the same way and with no content, so the only information a briefed run
+    has is what its prompt carried — but unlike the silent one it says the
+    agent already has everything, because under this switch that is true and
+    "I'd have to check" would send it waiting on a person who is not coming.
+    """
+    respondent = BriefedRespondent()
+    agent = ScriptedAgent(
+        [_says("Which channel is structural?"), _says("And the pixel size?")]
+    )
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert len(respondent.said) == 2
+    assert trace.stopped != FINISHED, "it must not end the run either"
+    answers = {e.text for e in trace.events if e.role == "user"}
+    assert len(answers) == 1, "one constant, so nothing can be leaked by it"
+    assert "nothing to add" in answers.pop()
+
+
+def test_an_unmatched_question_is_not_silently_answered():
+    """A scripted respondent that answered everything would make the loop look
+    better than it is, so anything unmatched falls through to "I don't know"."""
+    respondent = ScriptedRespondent([("spacing", "0.325 µm")])
+    assert "don't know" in respondent.reply("Which channel is structural?")
+
+
+# --- scraping --------------------------------------------------------------
+
+
+def test_scrape_takes_what_is_there_and_records_what_is_not():
+    """A run that left nothing behind is an ordinary outcome. It has to arrive
+    as absence, which `Outcome.passed` already refuses to read as a pass."""
+    session = FakeSession(arrays={"offsets": [1, 2, 3]})
+    trace = Trace(agent="a", respondent="r", task="t")
+
+    found = scrape(session, trace, {"offsets": "offsets", "corrected": "corrected"})
+
+    assert set(found) == {"offsets"}
+    note = [e for e in trace.events if e.role == "harness"][-1].text
+    assert "['offsets']" in note and "'corrected'" in note
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"python_code": "x = 1"}', {"python_code": "x = 1"}),
+        ({"already": "a dict"}, {"already": "a dict"}),
+        ("", {}),
+        (None, {}),
+    ],
+)
+def test_tool_arguments_arrive_however_the_provider_sent_them(raw, expected):
+    from ._bridge import parse_arguments
+
+    assert parse_arguments(raw) == expected
+
+
+def test_malformed_tool_arguments_are_a_finding_not_a_crash():
+    """A model that cannot form a tool call is a fact about the model, and the
+    trace is where it belongs -- not a traceback out of the harness."""
+    from ._bridge import parse_arguments
+
+    assert parse_arguments("{not json") == {"__malformed__": "{not json"}
+
+
+# --- what the provider needs back ------------------------------------------
+
+
+def test_provider_fields_are_echoed_on_the_assistant_turn():
+    """A reasoning model's turn is not just text and tool calls.
+
+    Several providers return the reasoning alongside them and reject the
+    *next* request if it does not come back — the failure lands a turn later
+    than its cause, which is what made it read as intermittent. Rebuilding the
+    assistant message from the parts this harness cares about drops them.
+    """
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                tool_calls=(ToolCall("c1", "server_status", {}),),
+                provider_fields={"reasoning_content": "thinking about it"},
+            ),
+            AgentTurn(
+                text="Which channel?",
+                provider_fields={"reasoning_content": "still thinking"},
+            ),
+        ]
+    )
+    respondent = ScriptedRespondent([("channel", "Channel 1."), ("x", DONE)])
+    session = FakeSession()
+
+    class Recorder(ScriptedAgent):
+        sent: list = []
+
+        def respond(self, messages, tools):
+            Recorder.sent = list(messages)
+            return super().respond(messages, tools)
+
+    recorder = Recorder(turns=agent.turns)
+    converse(session, recorder, respondent, task="t")
+
+    assistants = [m for m in Recorder.sent if m.get("role") == "assistant"]
+    assert assistants, "no assistant turn was ever replayed back"
+    assert all("reasoning_content" in m for m in assistants), (
+        "a provider field was dropped when the assistant turn was rebuilt; "
+        "the next request fails, not this one"
+    )
+
+
+def test_an_agent_without_provider_fields_sends_no_extra_keys():
+    """The echo has to stay opt-in: a provider that never asked for one must
+    not start receiving an empty key it does not know."""
+    agent = ScriptedAgent([_calls("server_status"), _says("Done.")])
+    respondent = ScriptedRespondent([("done", DONE)])
+
+    class Recorder(ScriptedAgent):
+        sent: list = []
+
+        def respond(self, messages, tools):
+            Recorder.sent = list(messages)
+            return super().respond(messages, tools)
+
+    recorder = Recorder(turns=agent.turns)
+    converse(FakeSession(), recorder, respondent, task="t")
+
+    assistants = [m for m in Recorder.sent if m.get("role") == "assistant"]
+    assert assistants
+    assert all(set(m) <= {"role", "content", "tool_calls"} for m in assistants)
+
+
+def test_a_conversation_that_stops_progressing_is_ended():
+    """`SilentRespondent` answers "I don't know" to everything, including a
+    sign-off, so an agent that finishes and says so is answered with a
+    non-answer and says so again — to the turn cap. Measured: both silent arms
+    trailed 42 and 55 tool-free turns past their last real action, and scored
+    `turn-cap` with `cut-off-but-scored` on work that was complete."""
+    agent = ScriptedAgent([_calls("server_status")] + [_says("All done.")] * 40)
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=60)
+
+    assert trace.stopped == STALLED
+    assert trace.turns_used < 60, "it should end well before the cap"
+    assert any(e.role == "harness" and e.is_error for e in trace.events)
+
+
+def test_a_tool_call_clears_the_stall_counter():
+    """Only *consecutive* tool-free turns count. An agent that talks, acts,
+    talks again is working, not circling — and the ask budget alone allows
+    several questions in a row."""
+    agent = ScriptedAgent(
+        [_says("Q1?"), _says("Q2?"), _calls("server_status"), _says("Q3?")] * 4
+    )
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=16)
+
+    assert trace.stopped == TURN_CAP, "a working conversation was called stalled"
+
+
+def test_a_rejected_request_reports_what_it_sent():
+    """`reasoning_content must be passed back` names a missing field, not
+    which turn or what surrounded it — and reproducing that costs a paid run,
+    because it depends on what the real tools returned. So the shape travels
+    with the error."""
+    from ._agent import RequestRejected
+
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "a"}, {"id": "b"}],
+            "reasoning_content": "...",
+        },
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+    ]
+
+    text = str(RequestRejected("openai:m", messages, RuntimeError("400 nope")))
+
+    assert "400 nope" in text
+    assert "tool_calls=2" in text
+    assert "reasoning_content" in text, "the key that matters has to be visible"
+    assert "go" not in text, "content must not be dumped into the reason column"
+
+
+# --- what a tool result looks like to the agent -----------------------------
+
+
+def test_an_image_result_is_reported_not_dropped():
+    """`take_screenshot` returns an `ImageContent` — no `.text` — and the old
+    filter kept only blocks that had one, so a captured screenshot reached the
+    agent as an empty string. Measured cost: an agent built a montage to look
+    at, got nothing twice, concluded the tool was broken, and worked around a
+    tool that was working."""
+    from ._session import describe_block
+
+    image = SimpleNamespace(type="image", data="A" * 4096, mimeType="image/png")
+    rendered = describe_block(image)
+
+    assert rendered.strip(), "an image must not render as nothing"
+    assert "image/png" in rendered
+    assert "KB" in rendered, "the agent should be able to tell it is non-trivial"
+
+
+def test_a_text_result_is_unchanged():
+    from ._session import describe_block
+
+    assert describe_block(SimpleNamespace(type="text", text="shape (24, 2)")) == (
+        "shape (24, 2)"
+    )
+
+
+def test_an_unknown_block_still_says_something():
+    from ._session import describe_block
+
+    assert describe_block(SimpleNamespace(type="resource")).strip()
+
+
+# --- declaring completion ---------------------------------------------------
+
+
+def test_the_agent_can_declare_itself_done():
+    """Termination used to rest on somebody's judgement: `SilentRespondent`
+    could not end a run at all, and `ModelRespondent` ended one wrongly."""
+    agent = ScriptedAgent([_says(f"Both names are bound.\n{TASK_COMPLETE}")])
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t")
+
+    assert trace.stopped == FINISHED
+
+
+def test_the_sentinel_is_not_routed_to_the_respondent():
+    """A declaration is not a question, and handing it over would only invite
+    a judgement about whether it was one."""
+    agent = ScriptedAgent([_says(f"Done.\n{TASK_COMPLETE}")])
+    respondent = ScriptedRespondent([])
+
+    converse(FakeSession(), agent, respondent, task="t")
+
+    assert respondent.heard == []
+
+
+def test_quoting_the_protocol_does_not_end_the_run():
+    """Last line, exact match — not "contains". An agent describing what it
+    will do later must not finish the run by mentioning the word."""
+    agent = ScriptedAgent(
+        [
+            _says(f"I'll write {TASK_COMPLETE} when the arrays are bound."),
+            _says(f"Now they are.\n{TASK_COMPLETE}"),
+        ]
+    )
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t")
+
+    assert trace.stopped == FINISHED
+    assert trace.turns_used == 2, "it ended on the declaration, not the mention"
+
+
+def test_a_working_turn_cannot_declare_completion():
+    """The sentinel is honoured on a turn that stopped to say so. A turn that
+    also called a tool is still working, whatever it wrote."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text=f"Binding them now.\n{TASK_COMPLETE}",
+                tool_calls=(ToolCall("i", "execute_code", {"code": "x=1"}),),
+            ),
+            _calls("server_status"),
+        ]
+    )
+
+    trace = converse(FakeSession(), agent, SilentRespondent(), task="t", max_turns=3)
+
+    assert trace.stopped != FINISHED
+    assert trace.tool_names == ["execute_code", "server_status"]
+
+
+def test_a_turn_that_asks_cannot_declare_completion():
+    """The sibling of the tool-call rule, and it cost a real run.
+
+    An agent five turns into `skeleton-network-metrics` put three good
+    questions to the microscopist — voxel size per axis, the shortest real side
+    branch, whether fragmentation was expected — and ended that same message
+    with the sentinel. The loop took it at its word and scored a case that had
+    barely started, with nothing bound. Asking and signing off in one breath is
+    still working, whatever the last line says.
+    """
+    agent = ScriptedAgent(
+        [
+            _says(f"What is the voxel size?\n{TASK_COMPLETE}"),
+            _says(f"Now they are bound.\n{TASK_COMPLETE}"),
+        ]
+    )
+    respondent = ScriptedRespondent([("voxel", "0.1 by 0.1 by 0.5 microns")])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+    assert trace.turns_used == 2, "it ended on the declaration, not the question"
+    assert respondent.heard == ["What is the voxel size?\n" + TASK_COMPLETE], (
+        "the question went to the person who could answer it"
+    )
+
+
+def test_a_sign_off_a_model_respondent_reads_as_done_still_ends_the_run():
+    """The cost of routing is bounded, and usually zero.
+
+    A rhetorical question before the sentinel is now handed over rather than
+    ending the run directly — and a model respondent has a rule for exactly
+    that shape, so it comes straight back as `DONE` and the run ends one line
+    later with the same verdict.
+    """
+    agent = ScriptedAgent([_says(f"Anything else you need?\n{TASK_COMPLETE}")])
+    respondent = ScriptedRespondent([("anything else", DONE)])
+
+    trace = converse(FakeSession(), agent, respondent, task="t")
+
+    assert trace.stopped == FINISHED
+
+
+def test_every_run_is_told_the_protocol():
+    """Appended by the harness rather than written into each case, so a new
+    case cannot forget it and then livelock."""
+    assembled = with_protocol("Correct the drift. Leave `offsets` bound.")
+
+    assert "Correct the drift." in assembled
+    assert TASK_COMPLETE in assembled
+
+
+# --- keeping the history consistent for a reasoning provider ---------------
+
+
+def _sent_assistants(recorder):
+    return [m for m in recorder.sent if m.get("role") == "assistant"]
+
+
+class _Recorder(ScriptedAgent):
+    """A scripted agent that keeps the last message list it was handed."""
+
+    sent: list = []
+
+    def respond(self, messages, tools):
+        type(self).sent = [dict(m) for m in messages]
+        return super().respond(messages, tools)
+
+
+def test_a_turn_the_model_did_not_think_on_still_carries_the_key():
+    """The model does not reason on every turn, so "echo what arrived" leaves
+    holes — and a history where some assistant messages have the key and some
+    do not is rejected. Measured over five trials each: omitted 3/5 accepted,
+    empty string 5/5."""
+    agent = _Recorder(
+        turns=[
+            AgentTurn(
+                tool_calls=(ToolCall("a", "server_status", {}),),
+                provider_fields={"reasoning_content": "thinking"},
+            ),
+            AgentTurn(tool_calls=(ToolCall("b", "server_status", {}),)),
+            _calls("server_status"),
+        ]
+    )
+
+    converse(FakeSession(), agent, ScriptedRespondent([]), task="t", max_turns=3)
+
+    assistants = _sent_assistants(agent)
+    assert len(assistants) >= 2
+    assert all("reasoning_content" in m for m in assistants), (
+        "a turn without reasoning left a hole in the history"
+    )
+    assert assistants[-1]["reasoning_content"] == ""
+
+
+def test_turns_before_the_key_appeared_are_brought_up_to_it():
+    """The first turn may carry nothing and a later one may reason. That
+    leaves the history mixed in the other direction, which is rejected too."""
+    agent = _Recorder(
+        turns=[
+            AgentTurn(tool_calls=(ToolCall("a", "server_status", {}),)),
+            AgentTurn(
+                tool_calls=(ToolCall("b", "server_status", {}),),
+                provider_fields={"reasoning_content": "thinking"},
+            ),
+            _calls("server_status"),
+        ]
+    )
+
+    converse(FakeSession(), agent, ScriptedRespondent([]), task="t", max_turns=3)
+
+    assistants = _sent_assistants(agent)
+    assert all("reasoning_content" in m for m in assistants), (
+        "the turn that predated the key was left behind"
+    )
+
+
+def test_a_provider_that_never_reasons_is_left_alone():
+    """The backfill is keyed on the provider having shown the field. A plain
+    chat model must not start receiving one it never sent."""
+    agent = _Recorder(turns=[_calls("server_status"), _calls("server_status")])
+
+    converse(FakeSession(), agent, ScriptedRespondent([]), task="t", max_turns=2)
+
+    assistants = _sent_assistants(agent)
+    assert assistants
+    assert all(set(m) <= {"role", "content", "tool_calls"} for m in assistants)
+
+
+def test_a_declined_working_question_is_recorded_as_a_reply():
+    """A rhetorical "?" inside a working turn reaches the respondent, which
+    correctly answers DONE — "not a question to me". That is the respondent
+    replying, so it belongs in the trace: without it a run whose respondent
+    behaved perfectly reports `asked-but-unanswered`, which reads as broken.
+
+    The agent still never sees the sentinel — it was working, not waiting."""
+    agent = ScriptedAgent(
+        [
+            AgentTurn(
+                text="Is that the structural one? Let me check.",
+                tool_calls=(ToolCall("i", "server_status", {}),),
+            ),
+            _calls("execute_code", code="x=1"),
+        ]
+    )
+    respondent = ScriptedRespondent([], fallback=DONE)
+
+    trace = converse(FakeSession(), agent, respondent, task="t", max_turns=3)
+
+    assert trace.answers, "the respondent replied; the trace said it did not"
+    assert trace.stopped != FINISHED, "a working turn must not be ended by DONE"

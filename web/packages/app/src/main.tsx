@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BASE } from "./base";
 import { ViewerLayout } from "./ViewerLayout";
 import { HomePage } from "./pages/HomePage";
 import { UnlockPage } from "./pages/UnlockPage";
@@ -22,10 +23,12 @@ const LogsPage = lazy(() => import("./pages/LogsPage"));
 
 const root = document.getElementById("root")!;
 
-// The control front serves this bundle at its root (base "/"), so the router
-// basename is "/". import.meta.env.BASE_URL still drives it in case the bundle is
-// ever served under a prefix.
-const basename = import.meta.env.BASE_URL.replace(/\/$/, "") || "/";
+// The control front serves this bundle at its root, so the basename is "/" —
+// unless the control was published below the root (`--url-prefix`), which it
+// tells the app at runtime via BASE. Not import.meta.env.BASE_URL: the build is
+// always base "/" because the prefix is a per-job value with no build-time
+// answer (see base.ts).
+const basename = BASE || "/";
 
 createRoot(root).render(
   <StrictMode>

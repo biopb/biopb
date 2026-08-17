@@ -1,9 +1,9 @@
 """Launcher for the biopb-mcp MCP server.
 
 Under the http transport this process *is* the MCP server: it owns a child
-Jupyter kernel that hosts a visible napari viewer when a display is available,
-or a compute-only headless kernel when none is (see
-``transport.display_mode``).  Under the (deprecated) stdio transport it is
+Jupyter kernel that hosts the napari viewer — on the user's display when one
+is present, else on a launcher-owned Xvfb virtual display (see ``_xvfb``; the
+viewer and screenshots always exist).  Under the (deprecated) stdio transport it is
 instead a thin bridge: it spawns its own http session child on a dynamic port
 and pumps stdio JSON-RPC to it, reaping it on disconnect (see ``_shim``).  Run
 it with::
@@ -47,10 +47,10 @@ def _report_port(path, port):
     that file for the real port to build its bridge URL. Written atomically
     (temp + ``os.replace``) so the shim never reads a half-written value.
 
-    A cross-platform file rather than the inherited-pipe handshake used for the
-    kernel token (``BIOPB_TOKEN_REPORT_FD``): that pipe pattern is POSIX-only
-    here (``_kernel`` gates it on ``os.name == 'posix'`` — fd inheritance across
-    a Windows spawn is fragile), whereas a file is uniform. Best-effort: a write
+    A cross-platform file rather than the inherited-pipe handshake ``_kernel``
+    uses for its death/window signals: that pipe pattern is POSIX-only there (fd
+    inheritance across a Windows spawn is fragile), whereas a file is uniform.
+    Best-effort: a write
     failure only costs the shim its port (it times out; the client sees EOF),
     never the server.
     """
@@ -107,39 +107,6 @@ def _has_display():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _resolve_headless(display_mode, has_display):
-    """Map ``transport.display_mode`` + display availability to headless.
-
-    ``"headless"`` -> always; ``"visible"`` -> never (the caller fails fast if
-    no display); ``"auto"`` / anything else -> headless only when no display.
-    """
-    if display_mode == "headless":
-        return True
-    if display_mode == "visible":
-        return False
-    return not has_display
-
-
-def _resolve_headless_logged(display_mode, has_display):
-    """:func:`_resolve_headless`, but warn on a silent ``auto`` -> headless.
-
-    When ``display_mode='auto'`` degrades to headless purely because no display
-    was found, the viewer and screenshots silently go away -- the exact silent
-    path #98 named. Surface it once so the operator knows why. An explicit
-    ``'headless'`` choice is intentional and needs no warning; the ``'visible'``
-    + no-display case is handled (fatally) by the caller.
-    """
-    headless = _resolve_headless(display_mode, has_display)
-    if headless and display_mode != "headless" and not has_display:
-        logger.warning(
-            "display_mode='auto' resolved to headless: no display detected "
-            "($DISPLAY/$WAYLAND_DISPLAY are unset), so the kernel runs "
-            "compute-only (no napari viewer; screenshots unavailable). Set "
-            "transport.display_mode to 'visible' once a display is available."
-        )
-    return headless
-
-
 def _setup_observe(config):
     """Wire up the web observe UI.
 
@@ -158,6 +125,7 @@ def _setup_observe(config):
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
+            console_enabled=get_setting(config, "observe.console_enabled"),
             allowed_origins=get_setting(config, "transport.allowed_origins"),
             allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         )
@@ -242,7 +210,7 @@ def _serve_http(config, port, view=False):
     first ``start_kernel`` tool call.
     """
     from .._config import get_setting
-    from . import _server
+    from . import _server, _xvfb
     from ._cluster import DaskClusterHost
     from ._kernel import KernelHost
 
@@ -263,25 +231,35 @@ def _serve_http(config, port, view=False):
 
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Decide whether the kernel opens a visible viewer. With no display, a Qt
-    # viewer hard-aborts the kernel (SIGABRT, not a catchable error), so unless
-    # the user demands "visible" we degrade to a compute-only headless kernel.
-    # `--view` demands visible by definition (the human wants the window).
-    display_mode = "visible" if view else get_setting(config, "transport.display_mode")
-    has_display = _has_display()
-    if display_mode == "visible" and not has_display:
-        kernel_log_path = (
-            get_setting(config, "transport.kernel_log") or "the kernel log"
+    # Decide where the kernel's viewer renders. With no display a Qt viewer
+    # hard-aborts the kernel (SIGABRT, not a catchable error): a display-less
+    # Linux host gets a launcher-owned Xvfb virtual display — a real viewer,
+    # working screenshots, no human-visible window (#90) — or, when the binary
+    # is missing, a fail-fast with the install hint. There is no compute-only
+    # fallback. `--view` opens a window *for a human*, so a virtual display is
+    # useless there and it fails fast instead.
+    xvfb_proc = None
+    virtual_display = None
+    if not _has_display():
+        if view:
+            logger.error(
+                "No display detected ($DISPLAY/$WAYLAND_DISPLAY are unset); "
+                "`biopb mcp view` opens a viewer window for a human, so it "
+                "needs a real X/Wayland session."
+            )
+            return 2
+        try:
+            xvfb_proc, virtual_display = _xvfb.start()
+        except RuntimeError as exc:
+            logger.error("Cannot start the napari viewer: %s", exc)
+            return 2
+        # Backstop for exits that skip _shutdown; _xvfb.stop is idempotent.
+        atexit.register(_xvfb.stop, xvfb_proc)
+        logger.info(
+            "No display detected; the napari viewer will render on virtual "
+            "display %s (screenshots work; no visible window).",
+            virtual_display,
         )
-        logger.error(
-            "display_mode='visible' but no display detected "
-            "($DISPLAY/$WAYLAND_DISPLAY are unset). Start an X/Wayland session, "
-            "or set transport.display_mode to 'auto' or 'headless'. "
-            "(Kernel output: %s)",
-            kernel_log_path,
-        )
-        return 2
-    headless = _resolve_headless_logged(display_mode, has_display)
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
@@ -298,11 +276,12 @@ def _serve_http(config, port, view=False):
     kernel_env.setdefault("OPENBLAS_NUM_THREADS", "1")
     kernel_env.setdefault("OMP_NUM_THREADS", "1")
 
-    # Tell the kernel bootstrap to skip Qt/napari and bind `viewer` to a
-    # headless sentinel (compute-only). Resolved here so the launcher owns the
-    # display decision (and can fail fast for display_mode='visible').
-    if headless:
-        kernel_env["BIOPB_HEADLESS"] = "1"
+    # Point the kernel's Qt at the launcher-owned Xvfb. BIOPB_VIRTUAL_DISPLAY
+    # lets the in-kernel server_status report that the window, while real, is
+    # not visible to the user.
+    if virtual_display:
+        kernel_env["DISPLAY"] = virtual_display
+        kernel_env["BIOPB_VIRTUAL_DISPLAY"] = "1"
 
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
@@ -345,9 +324,6 @@ def _serve_http(config, port, view=False):
         watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(config, "kernel.watchdog_respawn_window"),
         parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-        # The window-close pipe only matters with a viewer; a headless kernel
-        # has no window to close, so don't wire it up.
-        window_close_pipe=not headless,
         # Session-child-owned dask cluster; _launch calls ensure() and injects
         # its scheduler address so the kernel attaches instead of spinning its own.
         cluster_host=cluster_host,
@@ -358,9 +334,6 @@ def _serve_http(config, port, view=False):
     cluster_host.start_reaper()
     _server.set_kernel_host(host)
     _server.set_promote_after(get_setting(config, "kernel.promote_after"))
-    # Surfaces headless state to the agent (initialize `instructions`) and the
-    # viewer-dependent tools (take_screenshot / server_status).
-    _server.set_headless(headless)
     # Advertise the curated-skills catalog only when it is enabled (off by
     # default) — mirrors what find_skills / the skill:// resource actually serve.
     _server.set_skills_enabled(get_setting(config, "services.skills_enabled"))
@@ -388,16 +361,10 @@ def _serve_http(config, port, view=False):
     # host.ensure_started() — a synchronous bring-up that blocks that one tool
     # call until the kernel is ready. Other tool calls landing before then get a
     # structured "not started" status (see KernelHost.execute).
-    if headless:
-        logger.info(
-            "Headless mode (no viewer; no display). Kernel starts on the first "
-            "start_kernel call."
-        )
-    else:
-        logger.info(
-            "Ready. The napari kernel (and viewer window) starts on the first "
-            "start_kernel call."
-        )
+    logger.info(
+        "Ready. The napari kernel (and viewer window) starts on the first "
+        "start_kernel call."
+    )
 
     # Reap the kernel on exit even if it is still mid-bringup when we stop
     # (a no-op safe on an idle, never-started host).
@@ -446,9 +413,11 @@ def _serve_http(config, port, view=False):
         # After the kernel is reaped (no clients left attached): stop the
         # session-child-owned cluster, then rmtree its now-idle spill dir. This
         # is the only path that closes the cluster — kernel restart/reap leaves
-        # it warm.
+        # it warm. The Xvfb display outlives kernel restarts the same way, so
+        # it too goes down only here (its X clients died with the kernel).
         cluster_host.close()
         _cleanup_dask_dir()
+        _xvfb.stop(xvfb_proc)
         os._exit(0)
 
     def _handle_signal(signum, frame):

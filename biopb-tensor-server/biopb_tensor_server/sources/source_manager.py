@@ -24,6 +24,7 @@ from biopb_tensor_server.core.discovery import (
     generate_source_id,
     resolve_local_path,
 )
+from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
@@ -46,6 +47,13 @@ logger = logging.getLogger(__name__)
 # fully-stable upstream settles to re-listing about once an hour at the default
 # 30s rescan tick (instead of querying it every 30s forever).
 _UPSTREAM_RELIST_MAX_TICKS = 120
+
+# How often a still-unreachable upstream re-reports itself. The re-list stays on
+# the fast cadence -- an upstream that is merely down recovers on its own, so
+# retrying every tick is right -- but repeating the same traceback at that rate
+# buries every other line in the log: an overnight outage at the default 30s tick
+# is ~1200 of them. Rate-limit the report, not the retry.
+_UPSTREAM_FAILURE_LOG_INTERVAL = 300.0
 
 # While add_local_source waits for the catalog lock (a rescan is mid-flight), it
 # emits a heartbeat this often so the streamed action does not sit silent long
@@ -154,6 +162,12 @@ class SourceManager:
         # Upstreams (by url) whose last re-list failed -- a status signal (the fast
         # retry itself is driven by the period reset above).
         self._failed_upstreams: Set[str] = set()
+        # Last reported config error per upstream url, so a permanent
+        # misconfiguration is reported once rather than every re-list (#608).
+        self._upstream_config_errors: Dict[str, str] = {}
+        # Last reported unreachable failure per upstream url, as (when, message),
+        # so a sustained outage reports on a window instead of on every tick.
+        self._upstream_failures: Dict[str, Tuple[float, str]] = {}
         self._dim_labels = dim_labels
         self._stability_window = stability_window
         self._probe_open_files = probe_open_files
@@ -870,25 +884,124 @@ class SourceManager:
                     self._initial_scan_done = True
                     self._fire_initial_scan_complete()
 
+    def _log_upstream_config_error(self, url: str, exc: Exception) -> None:
+        """Report a broken upstream config once, until it changes or clears.
+
+        A config error repeats identically on every re-list, so logging it each
+        pass would bury the (actionable) first report under noise -- but staying
+        silent forever hides a *different* breakage introduced by the next edit.
+        Keying the suppression on the message re-reports whenever the operator
+        changes something without fixing it (biopb/biopb#608).
+        """
+        message = str(exc)
+        if self._upstream_config_errors.get(url) == message:
+            logger.debug("upstream %s still misconfigured: %s", url, message)
+            return
+        self._upstream_config_errors[url] = message
+        logger.error(
+            "Upstream %s is MISCONFIGURED, not unreachable: %s. Its catalog is "
+            "kept as-is; correct the configuration and the next re-list picks it "
+            "up -- but that is now up to %d rescan ticks away, not the next one, "
+            "because a config error cannot fix itself between ticks.",
+            url,
+            message,
+            self._upstream_max_period,
+        )
+
+    def _clear_upstream_config_error(self, url: str) -> bool:
+        """Note that a previously misconfigured upstream now resolves.
+
+        Returns whether one was cleared, so the caller can restore the fast
+        cadence with it. The recovery is logged because the failure was: an
+        operator who fixed the config saw an error telling them it could be up to
+        an hour before anything happens, and needs the other half of that
+        sentence -- that the edit took, and when (biopb/biopb#608).
+        """
+        message = self._upstream_config_errors.pop(url, None)
+        if message is None:
+            return False
+        logger.warning(
+            "Upstream %s is configured correctly again (was: %s); re-listed and "
+            "back on the fast cadence.",
+            url,
+            message,
+        )
+        return True
+
+    def _log_upstream_unreachable(self, url: str, exc: Exception) -> None:
+        """Report an unreachable upstream, at most once per log window.
+
+        Keyed on the message as well as the window so a *changed* failure is never
+        held back: "connection refused" becoming "certificate verify failed" is
+        the operator's cue that something moved, and it would be worse than
+        useless to sit on it for the rest of the window.
+        """
+        message = f"{type(exc).__name__}: {exc}"
+        now = time.time()
+        last = self._upstream_failures.get(url)
+        if (
+            last is not None
+            and last[1] == message
+            and now - last[0] < _UPSTREAM_FAILURE_LOG_INTERVAL
+        ):
+            logger.debug("upstream %s still unreachable: %s", url, message)
+            return
+        self._upstream_failures[url] = (now, message)
+        logger.warning(
+            "Upstream re-list failed for %s; keeping its current catalog "
+            "(retrying on the next rescan; reporting again in at most %.0fs if "
+            "this persists)",
+            url,
+            _UPSTREAM_FAILURE_LOG_INTERVAL,
+            exc_info=True,
+        )
+
+    def _clear_upstream_failure(self, url: str) -> None:
+        """Announce that a previously unreachable upstream answers again.
+
+        Necessary *because* the failures are rate-limited: without it recovery
+        reads as the absence of a line that was already mostly absent, so an
+        operator watching the log cannot tell a fixed upstream from a suppressed
+        one.
+        """
+        if self._upstream_failures.pop(url, None) is None:
+            return
+        logger.info("Upstream %s is reachable again; catalog re-listed.", url)
+
     def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
         """Re-list one upstream and set its next-due period from the outcome."""
         state = self._upstream_relist[upstream.url]
         try:
             changed = self._reconciler._reconcile_one_upstream(upstream)
-        except Exception:
+        except UpstreamConfigError as exc:
+            # Config, not connectivity: the fast cadence exists so a *recovering*
+            # upstream is picked up within a tick, and nothing about an unreadable
+            # trust anchor recovers on its own. Back all the way off instead of
+            # re-reading the same broken file every tick (biopb/biopb#608); a
+            # fixed config is still picked up, one slow tick later.
+            self._failed_upstreams.add(upstream.url)
+            state["period"] = self._upstream_max_period
+            state["countdown"] = state["period"]
+            # We never dialed, so any pending unreachable report is stale -- drop
+            # it silently rather than let the config fix also announce a recovery
+            # of reachability nothing just observed.
+            self._upstream_failures.pop(upstream.url, None)
+            self._log_upstream_config_error(upstream.url, exc)
+            return
+        except Exception as exc:
             # Failure (unreachable): retry on the fast cadence next tick.
             self._failed_upstreams.add(upstream.url)
             state["period"] = 1
             state["countdown"] = state["period"]
-            logger.warning(
-                "Upstream re-list failed for %s; keeping its current catalog "
-                "(retrying on the next rescan)",
-                upstream.url,
-                exc_info=True,
-            )
+            self._log_upstream_unreachable(upstream.url, exc)
             return
         self._failed_upstreams.discard(upstream.url)
-        if changed:
+        self._clear_upstream_failure(upstream.url)
+        recovered = self._clear_upstream_config_error(upstream.url)
+        if changed or recovered:
+            # Recovery is a state change like any other: this upstream was parked
+            # at the slow cadence *because* it was broken, so leaving it there
+            # once it works would make the next real change up to an hour late.
             state["period"] = 1  # the catalog moved -> stay fast
         else:
             # Stable -> back off (double, capped at full_rescan_interval).
@@ -909,6 +1022,9 @@ class SourceManager:
         for upstream in upstreams:
             try:
                 self._reconciler._reconcile_one_upstream(upstream)
+            except UpstreamConfigError as exc:
+                self._failed_upstreams.add(upstream.url)
+                self._log_upstream_config_error(upstream.url, exc)
             except Exception:
                 self._failed_upstreams.add(upstream.url)
                 logger.warning(
@@ -919,6 +1035,7 @@ class SourceManager:
                 )
             else:
                 self._failed_upstreams.discard(upstream.url)
+                self._clear_upstream_config_error(upstream.url)
 
     def add_local_source(
         self,

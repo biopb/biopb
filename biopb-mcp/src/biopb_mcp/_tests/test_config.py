@@ -94,7 +94,7 @@ class TestLoadConfig:
         config = load_config()
 
         # Should have all expected keys
-        for key in ("widget", "tensor_browser", "timeout", "grpc", "transport"):
+        for key in ("widget", "pyramid", "timeout", "grpc", "transport"):
             assert key in config
 
     def test_has_server_start_timeout(self):
@@ -200,7 +200,6 @@ class TestDefaultConfig:
             "widget",
             "detection",
             "grid",
-            "tensor_browser",
             "pyramid",
             "timeout",
             "grpc",
@@ -233,11 +232,13 @@ class TestDefaultConfig:
     def test_skills_are_flat_scalars(self):
         """The former services.skills object is flattened to scalar leaves."""
         services = DEFAULT_CONFIG["services"]
-        # Skills are opt-in: off by default (biopb/biopb-mcp), but the catalog
-        # URL/TTL leaves are still present for anyone who flips the switch on.
-        assert services["skills_enabled"] is False
-        assert services["skills_catalog_url"].startswith("https://")
-        assert services["skills_cache_ttl"] == 3600
+        # Skills ship on: they are package data, so the default install always
+        # has something to answer with and there is nothing to fetch.
+        assert services["skills_enabled"] is True
+        assert services["skills_local_dir"] == ""
+        # Skills are package data, not a fetch (biopb-mcp/docs/skills.md §1).
+        assert "skills_catalog_url" not in services
+        assert "skills_cache_ttl" not in services
         # No nested object survives.
         assert "skills" not in services
 
@@ -355,12 +356,12 @@ class TestConfigSingleton:
 
     def test_set_persist_updates_cache_and_file(self):
         """set() with persist=True updates the cache AND the file."""
-        CONFIG.set("tensor_browser.server_url", "grpc://set:1")
+        CONFIG.set("widget.server_url", "grpc://set:1")
 
-        assert CONFIG.get("tensor_browser.server_url") == "grpc://set:1"
+        assert CONFIG.get("widget.server_url") == "grpc://set:1"
         with get_config_path().open() as f:
             on_disk = json.load(f)
-        assert on_disk["tensor_browser"]["server_url"] == "grpc://set:1"
+        assert on_disk["widget"]["server_url"] == "grpc://set:1"
 
     def test_set_no_persist_then_save_writes_once(self):
         """persist=False defers the write; save() flushes the batch."""
@@ -379,16 +380,16 @@ class TestConfigSingleton:
         assert CONFIG.get("brandnew.section.leaf") == 5
 
     def test_reload_picks_up_external_edit(self):
-        assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
+        assert CONFIG.get("widget.server_url") == "localhost:50051"
 
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
-            json.dump({"tensor_browser": {"server_url": "grpc://ext:9"}}, f)
-        assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
+            json.dump({"widget": {"server_url": "ext:9"}}, f)
+        assert CONFIG.get("widget.server_url") == "localhost:50051"
 
         CONFIG.reload()
-        assert CONFIG.get("tensor_browser.server_url") == "grpc://ext:9"
+        assert CONFIG.get("widget.server_url") == "ext:9"
 
     def test_load_config_returns_live_singleton(self):
         assert load_config() is CONFIG.as_dict()
@@ -412,7 +413,7 @@ class TestConfigSingleton:
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
-            json.dump({"tensor_browser": {"server_url": "grpc://disk:1"}}, f)
+            json.dump({"widget": {"server_url": "disk:1"}}, f)
         CONFIG.reload()
 
         real_ensure = CONFIG._ensure_loaded
@@ -429,7 +430,7 @@ class TestConfigSingleton:
         result = {}
 
         def getter():
-            result["v"] = CONFIG.get("tensor_browser.server_url")
+            result["v"] = CONFIG.get("widget.server_url")
 
         g = threading.Thread(target=getter)
         g.start()
@@ -442,7 +443,7 @@ class TestConfigSingleton:
         g.join(2)
         r.join(2)
 
-        assert result["v"] == "grpc://disk:1"
+        assert result["v"] == "disk:1"
 
 
 def _write_and_load(mock_config_dir, raw: dict) -> dict:

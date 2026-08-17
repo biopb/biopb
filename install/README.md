@@ -88,14 +88,50 @@ are produced.
 
 - Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
   legacy `biopb.toml` is no longer read and must be migrated to JSON — via
-  `biopb server migrate-config`, or automatically when you pick a new data
+  `biopb-tensor-server migrate-config`, or automatically when you pick a new data
   folder)
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools
   to the agent's namespace; the installer seeds a `rolling_ball.py` example there,
   never clobbering your edits)
+- Extra Python packages: `~/.config/biopb/extra-packages.txt` (see below)
 - Webapp: `~/.local/share/biopb/webapp`
+
+### Extra Python packages
+
+Everything installs into **one** `uv` tool environment, and that environment is
+what the agent's napari kernel runs in — so an optional dependency a workflow
+needs (`basicpy`, `m2stitch`, a newer `scikit-image`) has to live there too.
+
+Every rerun of the installer rebuilds that environment from the release's own
+requirement list, which means a package you add by hand is **dropped at the next
+upgrade** — usually noticed much later, as an import that used to work. To keep
+one, name it in `~/.config/biopb/extra-packages.txt`, one
+[PEP 508](https://peps.python.org/pep-0508/) requirement per line:
+
+```
+basicpy
+m2stitch==0.9.0
+# a direct reference works too; its URL fragment is left intact
+segmentation-zoo @ git+https://github.com/example/zoo@main#subdirectory=pkg
+```
+
+Blank lines are ignored, and so is a `#` comment — but only one that starts a line
+or follows whitespace, the same rule `pip` applies to a `requirements.txt`. A `#`
+elsewhere belongs to the requirement (a `#subdirectory=` or `#sha256=` URL
+fragment) and is kept.
+
+The installer replays that list on every run, so the packages are reinstalled
+with everything else. If one of them can't be resolved alongside the release's
+own pins, the install **does not fail**: it retries without your extras, says
+which were dropped, and points back at this file — biopb still upgrades, and you
+fix the offending line at your leisure.
+
+To install one for the current session only, use the exact command
+`server_status` prints under `## Versions` (it names this environment's
+interpreter); a bare `pip install` targets whatever environment your shell has
+active, which is usually not this one.
 
 ### Unattended / unmanned upgrades
 
@@ -132,6 +168,40 @@ curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
 registry, pids), and `~/.local/share/biopb` (webapp, samples). `uv` and any AI
 agent (e.g. opencode) are left installed.
 On Windows, uninstall through Add/Remove Programs instead.
+
+## Testing the installers
+
+Three layers, cheapest first. The first two run on every PR that touches
+`install/` (`.github/workflows/install-scripts.yaml`); the third is manual.
+
+```sh
+# 1. Static -- does it load?
+bash -n install/install.sh
+shellcheck install/install.sh install/test/run.sh install/test/assert.sh
+#    plus, in CI, a PowerShell [Parser]::ParseFile over both .ps1 files and an
+#    ISCC compile of the Inno wizard.
+
+# 2. Unit -- do its parsers return the right answer?
+pytest install/test          # needs bash; pwsh optional, and used when present
+
+# 3. End-to-end -- does the whole thing work?
+install/test/run.sh --assert clean     # one scenario, in Docker; minutes
+install/test/run.sh --assert all       # all five
+install/test/run.sh clean              # or drop into a shell and drive it by hand
+```
+
+The unit layer drives the installers by subprocess: `install.sh` sourced under
+`BIOPB_INSTALL_LIB=1` (which suppresses its trailing `main "$@"`), and
+`biopb-engine.ps1` dot-sourced. Both extras parsers — one per language,
+implemented independently — are held to the single table in
+`install/test/extras-contract.json`, so they cannot drift apart. **Add a case
+there, not to one language's tests.**
+
+The end-to-end layer is the only one that installs for real, and the only one
+that can check what `uv tool install --force` does to a package the user added by
+hand. It is also available as the `Installer Scenarios` workflow on
+`workflow_dispatch`. See `install/test/assert.sh` for the checks and
+biopb/biopb#653 for the reasoning.
 
 ## Notes
 

@@ -84,8 +84,7 @@ def _default_of(section, field):
             "max_query_results",
         ),
         ({"metadata_db": {"query_timeout_ms": 0}}, "metadata_db", "query_timeout_ms"),
-        ({"server": {"port": -1}}, "server", "port"),
-        ({"server": {"port": 99999}}, "server", "port"),
+        ({"server": {"rescan_interval": -1}}, "server", "rescan_interval"),
         ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
 )
@@ -129,8 +128,7 @@ def test_valid_defaults_do_not_warn(caplog):
             0.0,
         ),
         # port 0 = bind an OS-assigned ephemeral port (a sentinel, not a typo).
-        ({"server": {"port": 0}}, "server", "port", 0),
-        ({"server": {"port": 65535}}, "server", "port", 65535),
+        ({"server": {"rescan_interval": 0}}, "server", "rescan_interval", 0.0),
         ({"server": {"log_level": "debug"}}, "server", "log_level", "debug"),
         # reduction_method aliases + case-insensitivity (the computable subset;
         # "precompute" is protocol-only, tested above).
@@ -181,17 +179,21 @@ def test_every_bad_section_is_reported_not_just_the_first(caplog):
     with caplog.at_level(logging.WARNING):
         config = parse_config(
             {
-                "server": {"port": 70000},
+                "server": {"rescan_interval": -5},
                 "pyramid": {"downscale_factor": 0},
                 "cache": {"backend": "nope"},
             }
         )
     joined = "\n".join(_violations(caplog))
-    assert "server.port" in joined
+    assert "server.rescan_interval" in joined
     assert "pyramid.downscale_factor" in joined
     assert "cache.backend" in joined
-    assert (config.port, config.pyramid.downscale_factor, config.cache.backend) == (
-        ServerConfig().port,
+    assert (
+        config.rescan_interval,
+        config.pyramid.downscale_factor,
+        config.cache.backend,
+    ) == (
+        ServerConfig().rescan_interval,
         PyramidConfig().downscale_factor,
         CacheConfig().backend,
     )
@@ -204,7 +206,7 @@ def test_every_bad_section_is_reported_not_just_the_first(caplog):
 
 
 def test_validate_config_dict_valid_is_empty():
-    assert validate_config_dict({"server": {"port": 8815, "log_level": "info"}}) == []
+    assert validate_config_dict({"server": {"log_level": "info"}}) == []
 
 
 def test_validate_config_dict_flags_case_insensitive_enum():
@@ -242,7 +244,7 @@ def test_validate_config_dict_ignores_removed_compute_section():
 def test_validate_config_dict_reports_instead_of_raising():
     # The endpoint's surface returns problems where the load path raises, so a
     # bad form submission is a 422 listing them, not a 500.
-    assert validate_config_dict({"server": {"port": 70000}})
+    assert validate_config_dict({"server": {"rescan_interval": -1}})
 
 
 def test_validate_config_dict_structural_error_is_reported():
@@ -313,8 +315,6 @@ def test_valid_config_does_not_warn_unknown(caplog):
         parse_config(
             {
                 "server": {
-                    "host": "127.0.0.1",
-                    "port": 8815,
                     "watcher_type": "off",  # legacy alias
                     "poll_interval": 15.0,  # legacy alias
                     "aggressive_dir_pruning": True,
@@ -373,11 +373,41 @@ def test_present_keys_override_defaults_only_where_set():
     default_cache = CacheConfig()
     cfgobj = parse_config(
         {
-            "server": {"port": 9000},
+            "server": {"log_level": "DEBUG"},
             "cache": {"file_max_segment_mb": 32},
         }
     )
-    assert cfgobj.port == 9000
-    assert cfgobj.host == ServerConfig().host  # untouched -> default
+    assert cfgobj.log_level == "DEBUG"
+    assert cfgobj.writable == ServerConfig().writable  # untouched -> default
     assert cfgobj.cache.file_max_segment_bytes == 32 * 1024 * 1024
     assert cfgobj.cache.memory_max_bytes == default_cache.memory_max_bytes
+
+
+def test_per_upstream_tls_trust_survives_the_parse():
+    """`tls_ca_file` / `tls_fingerprint` reach the profile they were written on.
+
+    They were declared on CredentialProfile and read by
+    resolve_upstream_credentials (biopb/biopb#604 item 4), but the profile parser
+    never copied them across -- so a config file that pinned an upstream's trust
+    was loaded with both unset and the `grpcs://` dial silently fell back to
+    trust-on-first-use. Nothing warned, either: they are known keys, so the
+    unknown-key check waved them through.
+    """
+    cfg = parse_config(
+        {
+            "credentials": {
+                "profiles": [
+                    {
+                        "name": "lab-store",
+                        "storage_type": "biopb-tensor",
+                        "tls_ca_file": "/etc/biopb/lab-ca.pem",
+                        "tls_fingerprint": "AB:CD:EF",
+                    }
+                ]
+            }
+        }
+    )
+
+    profile = cfg.credentials.profiles[0]
+    assert profile.tls_ca_file == "/etc/biopb/lab-ca.pem"
+    assert profile.tls_fingerprint == "AB:CD:EF"

@@ -47,117 +47,95 @@ def _origin_initial_view(viewer):
         dims_cls._go_to_center_step = orig
 
 
-def get_xy_dim_indices(
-    shape: Sequence[int], dim_labels: Sequence[str] | None = None
-) -> Tuple[int, int]:
-    """Indices of the y and x dimensions for a tensor of *shape*.
-
-    Uses *dim_labels* as the primary source (looks for 'x', 'y'), falling back
-    to the last two dimensions under the standard ``[..., Y, X]`` convention
-    (X last, Y second-to-last) when labels are unavailable.
-
-    Returns:
-        Tuple of (y_index, x_index) -- y first, matching the row/col convention.
-
-    Raises:
-        ValueError: the tensor has fewer than 2 dimensions (not a displayable
-            image).
-    """
-    ndim = len(shape)
-
-    if dim_labels:
-        labels_lower = [str(label).lower() for label in dim_labels]
-        try:
-            return (labels_lower.index("y"), labels_lower.index("x"))
-        except ValueError:
-            pass
-
-    if ndim < 2:
-        raise ValueError(
-            f"Cannot identify x/y dimensions: tensor is {ndim}-D; napari needs "
-            "at least 2 dimensions to display an image."
-        )
-    # Standard [..., Y, X]: X is the last axis, Y the second-to-last.
-    return (ndim - 2, ndim - 1)
-
-
-def get_z_dim_index(
-    shape: Sequence[int], dim_labels: Sequence[str] | None = None
-) -> int | None:
-    """Index of the z (depth) axis, or ``None`` when the tensor has none.
-
-    Respects *dim_labels* ('z') first: when labels are present but carry no
-    'z', the tensor is taken to have no depth axis (``None``) -- not every 3-D+
-    tensor is volumetric (``[T, Y, X]``, ``[C, Y, X]`` have no z). With no
-    labels, assume the positional ``[..., Z, Y, X]`` convention -- the
-    third-from-last axis -- for 3-D+ tensors, and ``None`` for <3-D.
-
-    Mis-identifying a small channel/time axis as z is low-risk: such axes stay
-    below the pyramid floor and are never downsampled.
-    """
-    ndim = len(shape)
-    if dim_labels:
-        labels_lower = [str(label).lower() for label in dim_labels]
-        return labels_lower.index("z") if "z" in labels_lower else None
-    return ndim - 3 if ndim >= 3 else None
-
-
-# Interleaved RGB(A) samples axis. Mirrors ``AXIS_S_LABELS`` / ``samples_axis``
-# in biopb-tensor-server ``core.axes``: biopb-mcp does not depend on the tensor
-# server at runtime, so the rule is duplicated rather than imported -- the same
-# reason ``core.axes`` itself mirrors the frontend ``buildAxisMap``. Keep the
-# two in sync; biopb/biopb#596 tracks collapsing them onto a server-guaranteed
-# axis order.
+# The two axis questions position cannot answer. The data plane guarantees the
+# wire order (biopb/biopb#596): Z, Y, X and S appear last, in that relative
+# order, so "which axis is X" is a position rather than a lookup. What position
+# cannot say is whether those trailing slots are *occupied* -- so labels are
+# still read for two presence checks, and for nothing else. Mirrors
+# ``AXIS_Z_LABELS`` / ``AXIS_S_LABELS`` in biopb-tensor-server ``core.axes``;
+# biopb-mcp does not depend on the tensor server at runtime, so the vocabulary
+# is duplicated rather than imported.
+AXIS_Z_LABELS = frozenset({"z", "depth", "plane", "planes", "slice"})
 AXIS_S_LABELS = frozenset({"s", "samples"})
-
-
-def get_samples_dim_index(
-    shape: Sequence[int], dim_labels: Sequence[str] | None = None
-) -> int | None:
-    """Index of an interleaved RGB(A) samples axis, or ``None``.
-
-    Detected by *label* (``S`` / ``samples``) gated on a size of 3 or 4. This
-    axis holds the colour components of one pixel, so napari must composite it
-    (``rgb=True``) rather than slide over it one plane at a time like T/Z/C.
-
-    Label-only by design -- no positional fallback. Guessing "a trailing size-3
-    axis means colour" would render a 3-channel ``[C, Y, X]`` stack as a false
-    RGB image, which is worse than the slider it would replace.
-    """
-    if not dim_labels:
-        return None
-    for i, label in enumerate(dim_labels):
-        if (
-            str(label).lower() in AXIS_S_LABELS
-            and i < len(shape)
-            and shape[i] in (3, 4)
-        ):
-            return i
-    return None
 
 
 def _resolve_axes(
     shape: Sequence[int], dim_labels: Sequence[str] | None
 ) -> Tuple[int, int, int | None, int | None]:
-    """``(y_idx, x_idx, z_idx, s_idx)`` for a source tensor, degenerate axes dropped.
+    """``(y_idx, x_idx, z_idx, s_idx)`` for a tensor in canonical wire order.
 
-    The one place the canonicalization consumers (:func:`build_pyramid_levels`,
-    :func:`build_layer_scale`, :func:`add_tensor_layer`) resolve axes, so their
-    notion of "which axis is what" cannot drift apart.
+    The one place the consumers below (:func:`build_pyramid_levels`,
+    :func:`build_layer_scale`, :func:`canonical_dim_labels`,
+    :func:`add_tensor_layer`) decide which axis is what.
 
-    A z or samples axis that collides with an already-resolved axis is dropped
-    rather than trusted: a degenerate label set (``"CYS"``, ``"YS"``, a source
-    labelling two axes ``y``) then renders as a plain plane instead of raising
-    or transposing one axis into two slots.
+    The server advertises ``[..., Z, Y, X, S]``, so X and Y are read off the
+    tail and the labels answer only the two presence questions: is the last axis
+    interleaved colour (label ``S``/``samples`` gated on a size of 3 or 4, so a
+    3-channel ``[C, Y, X]`` stack is never rendered as false colour), and is the
+    axis ahead of Y a depth axis rather than a channel or time one (``[C, Y, X]``
+    and ``[T, Y, X]`` are 3-D but not volumetric).
+
+    A descriptor whose labels contradict the guarantee is served as ordered, not
+    second-guessed -- re-deriving an order here is exactly what the wire contract
+    exists to delete, and a server that predates it is one to upgrade.
+
+    Unlabeled ``dimN`` stores (plain zarr, HDF5) are the case the contract
+    deliberately leaves alone: nothing is placed, so a tensor with no labels at
+    all falls back to the positional ``[..., Z, Y, X]`` reading the server's own
+    ``plane_axes`` uses.
+
+    Raises:
+        ValueError: fewer than two non-samples axes -- not a displayable image.
     """
-    y_idx, x_idx = get_xy_dim_indices(shape, dim_labels)
-    z_idx = get_z_dim_index(shape, dim_labels)
-    if z_idx is not None and z_idx in (x_idx, y_idx):
+    ndim = len(shape)
+    labels = (
+        [str(label).lower() for label in dim_labels]
+        if dim_labels and len(dim_labels) == ndim
+        else None
+    )
+
+    s_idx = (
+        ndim - 1
+        if labels and ndim >= 3 and labels[-1] in AXIS_S_LABELS and shape[-1] in (3, 4)
+        else None
+    )
+    x_idx = ndim - 1 if s_idx is None else ndim - 2
+    y_idx = x_idx - 1
+    if y_idx < 0:
+        raise ValueError(
+            f"Cannot identify x/y dimensions: tensor is {ndim}-D; napari needs "
+            "at least 2 dimensions to display an image."
+        )
+    if y_idx == 0:
         z_idx = None
-    s_idx = get_samples_dim_index(shape, dim_labels)
-    if s_idx is not None and s_idx in (x_idx, y_idx, z_idx):
-        s_idx = None
+    elif labels is None:
+        z_idx = y_idx - 1
+    else:
+        z_idx = y_idx - 1 if labels[y_idx - 1] in AXIS_Z_LABELS else None
     return y_idx, x_idx, z_idx, s_idx
+
+
+def canonical_dim_labels(tensor_desc, source_desc=None) -> List[str] | None:
+    """Per-axis labels for the array :func:`build_pyramid_levels` returns.
+
+    The source's own labels, lowercased -- which is the whole job now that the
+    layer array *is* the source array: the server guarantees the order and the
+    client no longer changes the rank, so the source's names describe the
+    layer's axes one for one. Lowercased because that is the NGFF axis-name
+    convention this feeds (``_writers._axis_dict``).
+
+    The length matches the array's rank, not napari's ``layer.ndim``: an
+    interleaved samples axis is a real array axis (napari just doesn't count it),
+    and the OME-Zarr writer sees the raw array.
+
+    Returns ``None`` when the source declares no usable labels -- there is then
+    nothing to name the axes with, and the caller keeps its own fallback.
+    """
+    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
+    shape = list(tensor_desc.shape)
+    if not dim_labels or len(dim_labels) != len(shape):
+        return None
+    return [str(label).lower() for label in dim_labels]
 
 
 def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
@@ -242,23 +220,20 @@ def build_pyramid_levels(
     budget check correct either way.
 
     **Output axis order.** napari displays the *last* ndisplay axes by position
-    and ignores ``dim_labels`` for layout, so a source advertising an
-    out-of-order layout (``[Y, X, C]``, a buried Z, swapped X/Y) would render
-    the wrong plane silently. Using the labels (per-tensor, falling back to
-    *source_desc*), each level is transposed so X is last, Y second-to-last, and
-    Z third-to-last -- with a singleton Z *inserted* when the tensor has none.
+    and ignores ``dim_labels`` for layout, so a mis-ordered source (``[Y, X, C]``,
+    a buried Z, swapped X/Y) would render the wrong plane silently. The order is
+    the data plane's guarantee, not this function's job: it advertises
+    ``[..., Z, Y, X, S]`` (biopb/biopb#596), so the levels arrive in display
+    order and **no axis work happens here at all** -- nothing is transposed, and
+    the rank is the source's.
 
-    An interleaved RGB(A) **samples** axis (see :func:`get_samples_dim_index`)
-    is kept *after* X instead, giving ``[..., Z, Y, X, S]``. Without this the
-    samples axis is unrecognized, falls into the leading "everything else"
-    bucket, and a ``[T, C, Z, Y, X, S]`` RGB source loads as a 3-plane stack
-    behind a slider rather than a colour image (biopb/biopb#596).
-
-    The result is therefore **always** canonical ``[..., Z, Y, X]`` (rank >= 3),
-    or ``[..., Z, Y, X, S]`` (rank >= 4) for interleaved colour -- which lets
-    ``build_layer_scale`` map physical sizes onto fixed trailing positions
-    without re-deriving the labels. The transpose is a lazy dask graph relabel;
-    the real server emits ordered axes, so it is normally a no-op guard.
+    In particular a tensor with no Z does *not* get a singleton one inserted.
+    That used to happen so ``build_layer_scale`` could write physical sizes to
+    fixed trailing slots, but it made every layer disagree in rank with its
+    source -- so ``layer.ndim`` had to be reasoned about separately from the
+    descriptor, a 2-D image round-tripped through the OME-Zarr writer gained a
+    phantom Z, and the agent guide needed a trap for the offset. The scale is
+    placed by axis index instead, and the layer is now exactly the source array.
 
     Returns:
         List of dask arrays at canonical ``[..., Z, Y, X]`` resolution levels,
@@ -276,7 +251,7 @@ def build_pyramid_levels(
 
     # Per-tensor labels win; fall back to the source descriptor's labels.
     dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
-    y_idx, x_idx, z_idx, s_idx = _resolve_axes(shape, dim_labels)
+    y_idx, x_idx, z_idx, _ = _resolve_axes(shape, dim_labels)
 
     # Stop shrinking an axis once it reaches this floor; see the docstring for
     # why the cube-root-capped-at-threshold value guarantees termination.
@@ -331,25 +306,6 @@ def build_pyramid_levels(
                 break  # nothing left to shrink; avoid an infinite loop
             sx, sy, sz = nsx, nsy, nsz
 
-    # Canonicalize to [..., Z, Y, X], reusing the indices computed above (no
-    # second pass over the labels). Transpose moves X/Y/Z into place; a missing
-    # Z is inserted as a singleton so the output rank and trailing axes are
-    # uniform for every tensor. Both ops are lazy on dask arrays.
-    trailing = ([z_idx] if z_idx is not None else []) + [y_idx, x_idx]
-    if s_idx is not None:
-        trailing.append(s_idx)
-    perm = tuple([i for i in range(ndim) if i not in trailing] + trailing)
-    if perm != tuple(range(ndim)):
-        levels = [level.transpose(perm) for level in levels]
-    if z_idx is None:
-        # Singleton Z goes ahead of Y/X -- and ahead of the samples axis too when
-        # there is one, so Z stays third-from-last among the spatial axes and S
-        # stays strictly last.
-        expand = (Ellipsis, None, slice(None), slice(None))
-        if s_idx is not None:
-            expand += (slice(None),)
-        levels = [level[expand] for level in levels]
-
     return levels
 
 
@@ -369,15 +325,15 @@ def build_layer_scale(
     server folds onto the descriptor ``get_tensor`` already fetches (biopb issue
     #31) -- so areas/volumes the agent computes come out in physical units (e.g.
     µm²) instead of pixels, without the heavy ``get_source_metadata`` (full OME)
-    round trip. The summary is in *source* axis order; the source's
-    ``dim_labels`` (per-tensor, falling back to *source_desc*) map each physical
-    size onto x/y/z via :func:`get_xy_dim_indices` / :func:`get_z_dim_index`.
+    round trip. The summary is in *source* axis order -- which the server
+    guarantees is canonical -- so :func:`_resolve_axes` reads x/y/z off it
+    positionally, using the source's ``dim_labels`` (per-tensor, falling back to
+    *source_desc*) only to tell whether a z axis is there at all.
 
-    *ndim* is the rank of the layer **array**, which ``build_pyramid_levels``
-    guarantees is in canonical ``[..., Z, Y, X]`` order (rank >= 3, with an
-    explicit -- possibly singleton -- Z). So the resolved x/y/z sizes land on
-    fixed trailing positions: X last, Y second-to-last, Z third-to-last; leading
-    axes (channel, time) get 1.0.
+    *ndim* is the rank of the layer **array**, which is the source's own rank:
+    ``build_pyramid_levels`` neither transposes nor pads. So each resolved size
+    is written to the axis it describes, and an axis the source does not have
+    (no Z) is simply not written; every other axis (channel, time) gets 1.0.
 
     Pass *rgb* when the array is ``[..., Z, Y, X, S]`` interleaved colour. napari
     does not count the samples axis as a layer dimension (``layer.ndim ==
@@ -433,13 +389,18 @@ def build_layer_scale(
         if not any((psx, psy, psz)):
             return None, None
 
-        # Canonical [..., Z, Y, X(, S)]: physical sizes land on the trailing
-        # spatial axes. For rgb the samples axis is not a napari layer dimension,
-        # so it is excluded here and X is last in the scale vector either way.
+        # The layer array is the source array, so a size goes to the axis it
+        # describes -- no fixed trailing slot, and nothing written for an axis
+        # the source does not have. (A blind ``scale[-3] = psz`` was safe only
+        # while every layer was rank-evened with a singleton Z; it would now put
+        # depth on the channel axis of a [C, Y, X], and IndexError on a 2-D one.)
+        # For rgb the samples axis is not a napari layer dimension, so the vector
+        # is one shorter -- S is last, so the x/y/z indices stay in range.
         scale = [1.0] * (ndim - 1 if rgb else ndim)
-        scale[-1] = psx or 1.0
-        scale[-2] = psy or 1.0
-        scale[-3] = psz or 1.0
+        scale[x_idx] = psx or 1.0
+        scale[y_idx] = psy or 1.0
+        if z_idx is not None:
+            scale[z_idx] = psz or 1.0
 
         info = {
             "physical_size_x": psx,
@@ -488,13 +449,16 @@ def add_tensor_layer(
     """Build a tensor's pyramid and add it to *viewer* as an image layer.
 
     The shared "load a tensor into the viewer" pipeline used by both the Tensor
-    Browser widget and the MCP ``add_tensor``: build pyramid levels (already
-    canonicalized to napari's ``[..., Z, Y, X]`` display order, or
-    ``[..., Z, Y, X, S]`` plus ``rgb=True`` for interleaved colour), pin their slice
+    Browser widget and the MCP ``add_tensor``: build pyramid levels (in napari's
+    ``[..., Z, Y, X]`` display order, or ``[..., Z, Y, X, S]`` plus ``rgb=True``
+    for interleaved colour), pin their slice
     reads to a single-process scheduler so the serial viewer shares the
     main-process chunk cache (issue #8; no-op standalone), attach the source's
     OME physical pixel size as ``scale`` + ``metadata['ome_physical_size']`` so
-    the agent's areas/volumes come out in physical units, then ``add_image``
+    the agent's areas/volumes come out in physical units, attach the
+    canonicalized axis names as ``metadata['dim_labels']`` (the only way a
+    writer, which sees just ``(path, data, meta)``, can name the axes) and the
+    originating ``metadata['array_id']``, then ``add_image``
     (``multiscale=True`` when there is more than one level).
 
     Source resolution, layer *name*, and any cursor/logging/error handling stay
@@ -521,16 +485,16 @@ def add_tensor_layer(
     # affects what napari sees; the wire/source bytes stay faithful. Remove once
     # napari handles non-native byte order (tracked upstream from #296).
     levels = _to_native_byteorder(levels)
-    # An interleaved samples axis is now trailing (build_pyramid_levels put it
-    # there). napari composites a trailing size-3/4 axis into colour only when
+    # An interleaved samples axis is trailing (the server's guarantee). napari
+    # composites a trailing size-3/4 axis into colour only when
     # told to: rgb is left unset otherwise so napari's own auto-detection still
     # applies to unlabelled data exactly as before.
     dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
     _, _, _, s_idx = _resolve_axes(tensor_desc.shape, dim_labels)
     rgb = s_idx is not None
 
-    # Levels are in canonical [..., Z, Y, X(, S)] order, so the scale maps onto
-    # the output rank directly -- no reordering to keep in sync.
+    # Levels are the source arrays, in canonical order, at the source's rank,
+    # so the scale maps onto them by axis index -- nothing to keep in sync.
     out_ndim = levels[0].ndim
     levels = wrap_levels(levels, compute_scheduler)
 
@@ -548,8 +512,21 @@ def add_tensor_layer(
     )
     if scale is not None:
         add_kwargs["scale"] = scale
+    # Where this layer came from. Nothing else on the layer records it -- the
+    # name is a display stem that the user can rename -- so without this a layer
+    # cannot be traced back to its tensor, and re-reading the full-resolution
+    # source-order array means guessing at the catalog.
+    metadata = {"array_id": tensor_id}
     if phys is not None:
-        add_kwargs["metadata"] = {"ome_physical_size": phys}
+        metadata["ome_physical_size"] = phys
+    # Name the layer's axes for the OME-Zarr writer (biopb/biopb#651): it is
+    # handed only napari's (path, data, meta), so with no labels there it falls
+    # back to a positional guess that mislabels every leading pair that isn't
+    # (C, T) -- writing a TCZYX source with T and C swapped.
+    labels = canonical_dim_labels(tensor_desc, source_desc=source_desc)
+    if labels:
+        metadata["dim_labels"] = labels
+    add_kwargs["metadata"] = metadata
 
     with _origin_initial_view(viewer):
         if len(levels) > 1:

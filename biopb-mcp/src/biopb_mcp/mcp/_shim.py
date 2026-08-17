@@ -575,7 +575,7 @@ def replay_init_options(init):
     """Map the child's InitializeResult onto the options the bridge serves.
 
     Verbatim replay — most importantly ``instructions``, the handshake-time
-    carrier for the operation guardrails and the headless notice (the field
+    carrier for the operation guardrails (the field
     mcp-proxy drops), and the remote's capability
     set rather than one recomputed from the bridge's own handlers.
     """

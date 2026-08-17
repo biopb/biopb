@@ -36,7 +36,22 @@ dependencies = [
     # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
     # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
     # requirement explicit.
-    "scipy",
+    #
+    # !=1.15.*: the whole 1.15 series raises `AttributeError: 'coo_matrix'
+    # object has no attribute 'indices'` from
+    # `scipy.sparse.csgraph.min_weight_full_bipartite_matching` for coo input
+    # (scipy#22501, fixed in 1.16.0; csr is unaffected on every version).
+    # Reproduced here on 1.15.3, clean on 1.14.1 and 1.16.0. This kernel is an
+    # environment an *agent* runs arbitrary scientific code in, so a documented
+    # call that raises is worth excluding rather than debugging once per user.
+    # It also happens to be what upstream tracking libraries pin against, which
+    # is what lets a `pkg:` skill declare one without the resolver moving scipy
+    # backwards under a live kernel (`docs/skills.md` §9a).
+    #
+    # Costs nothing on 3.11+, which already resolve past 1.15 to 1.16+. On 3.10
+    # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
+    # 1.14.1. Retire this with the 3.10 floor, not before.
+    "scipy != 1.15.*",
     # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
     # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
     # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
@@ -81,6 +96,13 @@ tables = [
 # the `reconnect` era ended (>=2023.9). Pin a floor so orphan-hardening (issue #13)
 # can't silently regress on an older distributed. See biopb._lifecycle.deathwatch
 # and mcp/_cluster.
+# packaging: imported by mcp/_update.py (version compare for the update check).
+# It always arrives transitively, but the import is direct, so declare it.
+# matplotlib / scikit-learn: nothing in this package imports them. They are for
+# the agent's kernel namespace — guide://kernel names them as importable, so the
+# install has to make that true. Neither is guaranteed otherwise: matplotlib
+# reaches an env only through *optional* extras of napari/tifffile/vedo, and
+# scikit-learn through nothing at all.
 #
 # mcp <2: the 2.0 SDK is a breaking rewrite. It deleted `mcp.server.fastmcp`
 # outright -- `mcp/_server.py` builds the whole server on `FastMCP` -- and it
@@ -93,7 +115,7 @@ tables = [
 # fresh from PyPI, not from uv.lock -- swallow the new major, so every release
 # back to 0.8.0 installs a server that cannot start. Lift the cap only together
 # with the FastMCP port and a re-examined override.
-mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6"]
+mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn"]
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
@@ -132,6 +154,17 @@ testing = [
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
     "pytest-env",  # https://github.com/qwertyquerty/pytest-env
+    # The skills authoring gate (_tests/skills/) parses frontmatter with a real
+    # YAML parser. The runtime reader in mcp/_skills.py deliberately does not --
+    # it is stdlib-only and tolerant -- but the gate must reject what that one
+    # forgives, which takes a strict parser.
+    "pyyaml",
+    # NOT the place for the packages skills declare. Layer 1's signature
+    # contracts (_tests/skills/test_contracts.py) need them importable, but one
+    # shared resolution means every skill's package must co-exist with every
+    # other's -- so the first pair that cannot would break this whole env and
+    # the reflex fix would be to drop a skill. skill-contracts.yaml installs
+    # each one into its own ephemeral env instead. The module skips here.
 ]
 
 [project.scripts]
@@ -160,12 +193,27 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# The suite lives under src/ (biopb_mcp/_tests/), so without this it is packaged
+# like any other subpackage — it was 42% of the wheel by size. Nothing outside
+# the suite imports it; excluding it changes only what ships, not how tests run
+# (both local and CI collect from the checkout, never from an installed wheel).
+exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
-# Bundled skills snapshot (mcp/_skills_bundle/): last-resort offline fallback for
-# the curated catalog + bodies (see mcp/_skills.py).
-"biopb_mcp.mcp" = ["_skills_bundle/*.json", "_skills_bundle/*.md"]
+# The curated skills (mcp/_skills_data/). These ship with the package and are the
+# only source the runtime reads — a skill is documentation about a specific
+# runtime version, so it rides that version's upgrade cycle rather than being
+# fetched. There is no catalog index: the frontmatter is the metadata and
+# mcp/_skills.py parses it. See biopb-mcp/docs/skills.md §1.
+"biopb_mcp.mcp" = ["_skills_data/*.md"]
+
+# Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
+# is no longer a package, setuptools reclassifies its files as *data* of the
+# parent biopb_mcp, and include-package-data = true (fed every git-tracked file
+# by setuptools_scm's file finder) ships them anyway. Both halves are required.
+[tool.setuptools.exclude-package-data]
+"biopb_mcp" = ["_tests/*", "_tests/**/*"]
 
 # Versioned off the shared monorepo git history. Product component: keyed to the
 # single product tag `release-v*` (not a per-package prefix), so mcp, the tensor
@@ -188,7 +236,40 @@ describe_command = "git describe --tags --match 'release-v*'"
 
 [tool.pytest.ini_options]
 qt_api = "pyqt6"
-addopts = "--ignore-glob='*_vendor*'"
+# -m: the satisfiability layer runs a real resolver per skill package (tens of
+# seconds each over a torch-sized graph), so it is deselected by default and run
+# as its own CI step. A command-line -m overrides this one, which is how
+# `-m satisfiability` and `-m contract` still work.
+#
+# --strict-markers because deselection is what keeps the expensive layers out of
+# the ordinary run, and a marker that stops existing does not deselect anything:
+# renaming `interaction` to `bench` left four real-server tests in `agentbench`
+# carrying a name nothing matched, so they ran with the default suite and hung
+# it. A warning was the only sign. Now an unregistered marker is an error.
+addopts = "--ignore-glob='*_vendor*' --strict-markers -m 'not satisfiability and not availability and not bench and not fixtures'"
+markers = [
+    # Resolves each skill's pkg: tokens against the installed environment to
+    # reject a package that installs only by moving biopb's own deps. Metadata
+    # only -- nothing is downloaded or installed. See _tests/skills/README.md.
+    "satisfiability: resolves a skill's declared packages against this environment",
+    # Resolves each skill's pkg: tokens for all nine supported interpreter x
+    # platform cells, from one job, so a per-cell verdict is knowable in one
+    # place: unavailable rejects a required token and is recorded for an
+    # optional one. See _tests/skills/README.md.
+    "availability: resolves a skill's declared packages for every supported platform",
+    # Puts a model in front of a REAL session -- kernel, napari, dask, the nine
+    # real tools -- and scores what comes out, either against a shipped skill
+    # body or against a named piece of work. Slow, needs a GL-capable display,
+    # and the model rows need an API key; never in CI. One marker, because it
+    # is one runner: which cases an invocation pays for is `--cases`, not a
+    # second marker. biopb-mcp/docs/skills.md §10 and _tests/bench/README.md.
+    "bench: drives a real biopb-mcp session, and sometimes a model",
+    # Hashes a curated fixture tree against its manifest. Out-of-band on
+    # purpose: hashing multi-gigabyte volumes on a mount would cost more than
+    # the run it guards, and would do it once per arm. Run after syncing a
+    # tree, or when a result looks wrong. biopb-mcp/docs/fixtures.md.
+    "fixtures: checks an on-disk fixture tree against its manifest",
+]
 
 [tool.pytest_env]
 QT_QPA_PLATFORM = "offscreen"

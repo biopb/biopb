@@ -6,6 +6,7 @@ whose CI installs it. They were silently skipped here because the client-only CI
 job installs no server (biopb/biopb#579).
 """
 
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -99,6 +100,82 @@ class TestTensorFlightClient:
                 )
         finally:
             client.close()
+
+    def test_wait_for_upload_ready_pb_fails_fast_on_unknown(self):
+        """An UNKNOWN state is not an upload in progress -- don't poll to timeout.
+
+        Regression for biopb/biopb#109: a non-upload source (e.g. a catalog or
+        cloud source) reports UNKNOWN forever, so the old loop blocked for the
+        full timeout before raising a misleading TimeoutError.
+        """
+        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
+        client._upload.get_upload_status = Mock(
+            return_value={
+                "source_id": "ome-tiff_abc123",
+                "state": "UNKNOWN",
+                "expected_chunks": 0,
+                "uploaded_chunks": 0,
+            }
+        )
+
+        pb = SerializedTensor(
+            tensor_descriptor=TensorDescriptor(array_id="ome-tiff_abc123")
+        )
+
+        try:
+            started = time.monotonic()
+            with pytest.raises(ValueError, match="tracks no upload"):
+                client.wait_for_upload_ready_pb(
+                    pb,
+                    # Generous timeout: the point is that we return long before it.
+                    timeout_seconds=30.0,
+                    poll_interval_seconds=0.5,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            client.close()
+
+        assert elapsed < 1.0
+        assert client._upload.get_upload_status.call_count == 1
+
+    def test_wait_for_upload_ready_pb_stops_if_the_record_disappears(self):
+        """A tracked upload whose record vanishes mid-poll also fails fast.
+
+        The server forgets upload state when a source is unregistered (and loses
+        it entirely on restart), so PENDING -> UNKNOWN is just as terminal as
+        UNKNOWN on the first poll.
+        """
+        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
+        client._upload.get_upload_status = Mock(
+            side_effect=[
+                {
+                    "source_id": "cache_test",
+                    "state": "PENDING",
+                    "expected_chunks": 4,
+                    "uploaded_chunks": 1,
+                },
+                {
+                    "source_id": "cache_test",
+                    "state": "UNKNOWN",
+                    "expected_chunks": 0,
+                    "uploaded_chunks": 0,
+                },
+            ]
+        )
+
+        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
+
+        try:
+            with pytest.raises(ValueError, match="tracks no upload"):
+                client.wait_for_upload_ready_pb(
+                    pb,
+                    timeout_seconds=30.0,
+                    poll_interval_seconds=0.0,
+                )
+        finally:
+            client.close()
+
+        assert client._upload.get_upload_status.call_count == 2
 
     def test_get_upload_status_pb_requires_array_id(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)

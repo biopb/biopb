@@ -25,7 +25,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CredentialProfile:
-    """Named credential profile for remote storage.
+    """Named credential profile for a remote source.
+
+    Mostly object storage (the fsspec ``storage_options`` below), plus one
+    non-fsspec backend: ``storage_type="biopb-tensor"`` carries the bearer token
+    and TLS trust for an upstream **tensor server** mounted as a ``tensor-server``
+    source. That lives here rather than in a parallel mechanism because a
+    downstream server may mount several upstreams with different credentials, so
+    the binding has to be per source registration -- which is exactly what a named
+    profile already is (biopb/biopb#604 item 4).
 
     Per-field help lives in each field's ``metadata["help"]`` (read by the config
     JSON Schema).
@@ -35,7 +43,10 @@ class CredentialProfile:
         metadata={"help": "Profile name a source references via credentials_profile."}
     )
     storage_type: str = field(
-        metadata={"help": "Remote storage backend (s3, gs, http, azure)."}
+        metadata={
+            "help": "Backend this profile authenticates to (s3, gs, http, azure, "
+            "or biopb-tensor for an upstream tensor server)."
+        }
     )
     key: Optional[str] = field(
         default=None, metadata={"help": "Access key (AWS: access_key_id)."}
@@ -56,6 +67,22 @@ class CredentialProfile:
     endpoint_url: Optional[str] = field(
         default=None,
         metadata={"help": "Custom endpoint for S3-compatible storage (e.g. MinIO)."},
+    )
+    tls_ca_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "(biopb-tensor) Path to a PEM file to trust for a grpcs:// "
+            "upstream -- a private CA, or the upstream's own certificate. "
+            "Replaces trust-on-first-use pinning."
+        },
+    )
+    tls_fingerprint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "(biopb-tensor) Expected SHA-256 of the upstream's certificate "
+            "for a grpcs:// upstream (colon-grouped or bare hex). Checked on every "
+            "connect, so it also rejects a first-connect impostor."
+        },
     )
 
     def to_storage_options(self) -> Dict[str, Any]:

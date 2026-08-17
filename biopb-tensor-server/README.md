@@ -109,44 +109,35 @@ curl -fsSL https://biopb.org/install.sh | bash
 biopb control start
 ```
 
-### Docker
-```bash
-docker run -d --rm \
-    --name biopb-tensor \
-    -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 \
-    -v ${YOUR_DATA_LOCATION}:/data \
-    -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
-    jiyuuchc/biopb-tensor-server:latest
-```
+### Docker — remote data server
 
-The ports are published to host loopback only (`127.0.0.1`), so
-`BIOPB_TENSOR_ALLOW_NO_TOKEN=1` runs it without an access token for a
-single-machine setup. Drop that env var to have the container auto-generate a
-token (printed in `docker logs biopb-tensor`); do so whenever the ports are
-reachable from other hosts.
-
-Or use a custom config file:
+Docker is the standard way to run a **remote, headless data server**: the image
+is a Flight-only data plane (one gRPC port, no HTTP sidecar).
 
 ```bash
-docker run -d --rm \
+docker run -d --restart unless-stopped \
     --name biopb-tensor \
-    -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 \
-    -v ~/biopb.json:/biopb.json \
+    -p 8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
-    -e CONFIG_FILE=/biopb.json \
-    -e BIOPB_TENSOR_ALLOW_NO_TOKEN=1 \
+    -v biopb-state:/root/.local/state \
+    -e BIOPB_TENSOR_TLS=1 \
     jiyuuchc/biopb-tensor-server:latest
+
+docker logs biopb-tensor    # copy the access token, printed once
 ```
+
+`BIOPB_TENSOR_TLS=1` enables encryption. The server writes the TLS cert to
+`/root/.local/state` so it can be reused across restarts.
 
 See [containerize.md](containerize.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
 ## Configuration
 
-You can create a custom config file to fine-tune server behavior, e.g. specifying multiple data sources.
+You can create a custom config file to fine-tune server behavior, e.g. specifying multiple data sources. The config covers *what* to serve; *where and how* to expose it (`--host`/`--port`/`--tls`) is set on the command line, not here.
 
 ```json
 {
-  "server": { "host": "127.0.0.1", "port": 8815, "log_level": "INFO" },
+  "server": { "log_level": "INFO" },
   "cache": {
     "backend": "file",
     "file_max_segment_mb": 256,
@@ -192,11 +183,14 @@ biopb-tensor-server diagnose ...  Diagnostic commands for a running server
 #### Launch
 
 ```bash
-# Local mode (loopback server.host — no token required)
+# Local mode (the default loopback bind — no token required)
 biopb-tensor-server launch --config biopb.json
 
-# Remote mode (public server.host — token required, auto-generated if omitted)
-biopb-tensor-server launch --config biopb.json --token mytoken...
+# Remote mode (a public bind — token required, auto-generated if omitted)
+biopb-tensor-server launch --config biopb.json --host 0.0.0.0 --token mytoken...
+
+# Over TLS (clients dial grpcs:// and pin the cert on first connect)
+biopb-tensor-server launch --config biopb.json --tls
 
 # gRPC only (no web sidecar)
 biopb-tensor-server serve --config biopb.json

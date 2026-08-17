@@ -30,6 +30,25 @@ def _cache_lock_is_free(lock_path: Path) -> bool:
 _VALID_TOKEN = "a" * 32  # 32 URL-safe chars: passes _web_auth.valid_token
 
 
+def _fake_server_config(**overrides):
+    """Stand-in ServerConfig for tests that monkeypatch `load_config`.
+
+    Carries every field the CLI commands read off the config, so adding one to
+    ServerConfig surfaces here as a deliberate edit rather than an AttributeError
+    scattered across half the module.
+    """
+    base = {
+        "host": "127.0.0.1",
+        "port": 8815,
+        "log_level": "INFO",
+        "tls": False,
+        "tls_cert": None,
+        "tls_key": None,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 def _run_serve(config, **overrides):
     """Invoke `serve` as a plain function with explicit option defaults.
 
@@ -46,10 +65,41 @@ def _run_serve(config, **overrides):
         "port": None,
         "writable": False,
         "token": None,
+        "tls": None,
+        "tls_cert": None,
+        "tls_key": None,
+        "san": None,
         "log_file": None,
     }
     kwargs.update(overrides)
     return cli.serve(**kwargs)
+
+
+def _run_launch(config, **overrides):
+    """Invoke `launch` as a plain function with explicit option defaults.
+
+    Same reason as :func:`_run_serve`: calling a typer command directly bypasses
+    typer's default resolution, so every Option would arrive as an OptionInfo.
+    """
+    kwargs = {
+        "config": config,
+        "log_level": None,
+        "log_scope_biopb": True,
+        "host": None,
+        "port": None,
+        "writable": False,
+        "web_port": 8816,
+        "web_host": "127.0.0.1",
+        "token": None,
+        "tls": None,
+        "tls_cert": None,
+        "tls_key": None,
+        "san": None,
+        "cors_origins": None,
+        "log_file": None,
+    }
+    kwargs.update(overrides)
+    return cli.launch(**kwargs)
 
 
 class _FakeServer:
@@ -77,7 +127,7 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     server = _FakeServer()
     source_manager = _FakeStoppable()
     watcher = _FakeStoppable()
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
@@ -113,7 +163,7 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     flight_server = SimpleNamespace(serve=lambda: None)
     source_manager = _FakeStoppable()
     watcher = _FakeStoppable()
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
@@ -140,21 +190,7 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
         lambda *args, **kwargs: order.append("graceful_shutdown"),
     )
 
-    # Pass explicit values rather than typer OptionInfo defaults (calling the
-    # command as a plain function bypasses typer's default resolution).
-    cli.launch(
-        config=Path("unused.json"),
-        log_level=None,
-        log_scope_biopb=True,
-        host=None,
-        port=None,
-        writable=False,
-        web_port=8816,
-        web_host="127.0.0.1",
-        token=None,
-        cors_origins=None,
-        log_file=None,
-    )
+    _run_launch(Path("unused.json"))
 
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
 
@@ -168,7 +204,7 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     """
     captured: dict = {}
     # Config binds loopback; the override makes the flight plane public.
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
@@ -191,19 +227,7 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     )
     monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
 
-    cli.launch(
-        config=Path("unused.json"),
-        log_level=None,
-        log_scope_biopb=True,
-        host="0.0.0.0",
-        port=9001,
-        writable=True,
-        web_port=8816,
-        web_host="127.0.0.1",
-        token=None,
-        cors_origins=None,
-        log_file=None,
-    )
+    _run_launch(Path("unused.json"), host="0.0.0.0", port=9001, writable=True)
 
     # Overrides reached the flight server...
     assert captured["host"] == "0.0.0.0"
@@ -338,7 +362,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     assert not _cache_lock_is_free(lock_path)
 
     server = _FakeServer()
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
@@ -368,7 +392,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)  # held once cache init ran
 
-    server_config = SimpleNamespace(host="127.0.0.1", port=8815, log_level="INFO")
+    server_config = _fake_server_config()
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
@@ -771,3 +795,315 @@ def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys
         _run_serve(config_path)
     assert exc.value.exit_code == 1
     assert "migrate-config" in capsys.readouterr().out
+
+
+# --- TLS material resolution ------------------------------------------------
+# There is no config side to merge against any more (biopb/biopb#604): the flags
+# are the whole story, and a bare --tls-cert/--tls-key still implies TLS.
+
+
+def test_a_missing_cert_path_is_refused(tmp_path):
+    """A cert path that vanished between typer's `exists=True` and the read.
+
+    Without this the pair would reach `read_bytes()` and surface as a traceback
+    instead of an actionable message.
+    """
+    missing = tmp_path / "nope.pem"
+    key = tmp_path / "k.pem"
+    key.write_text("key")
+    with pytest.raises(typer.Exit) as exc:
+        cli._resolve_tls_material(True, missing, key, None)
+    assert exc.value.exit_code == 2
+
+
+def _launch_capturing_tls(monkeypatch, server_config, **launch_kwargs):
+    """Run `launch` with the plumbing stubbed, returning what TLS reached where."""
+    captured: dict = {}
+    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+    monkeypatch.setattr(cli, "_resolve_launch_token", lambda *a, **k: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured["flight_cert"] = kwargs.get("tls_cert_chain")
+        return (
+            SimpleNamespace(serve=lambda: None),
+            _FakeStoppable(),
+            _FakeStoppable(),
+            None,
+        )
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    monkeypatch.setattr(cli, "run_http_server", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+    _run_launch(Path("unused.json"), **launch_kwargs)
+    return captured
+
+
+def test_launch_points_the_sidecar_at_grpcs_and_hands_it_the_cert(
+    monkeypatch, tmp_path
+):
+    """The whole point of #604 case 1: `launch` can serve TLS *and* keep its sidecar.
+
+    The sidecar is co-located, so it gets the served cert as an explicit trust
+    anchor rather than pinning it off the wire.
+    """
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(b"CERTPEM")
+    key.write_bytes(b"KEYPEM")
+
+    captured = _launch_capturing_tls(
+        monkeypatch, _fake_server_config(), tls_cert=cert, tls_key=key
+    )
+
+    assert captured["flight_cert"] == b"CERTPEM"  # the plane serves it...
+    assert captured["tls_ca_pem"] == b"CERTPEM"  # ...and the sidecar trusts it
+    assert captured["flight_location"].startswith("grpcs://")
+
+
+def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
+    captured = _launch_capturing_tls(monkeypatch, _fake_server_config())
+    assert captured["flight_cert"] is None
+    assert captured["tls_ca_pem"] is None
+    assert captured["flight_location"].startswith("grpc://")
+
+
+# --- the bind is the CLI's, not the config's (biopb/biopb#604) ---------------
+
+
+def test_retired_bind_keys_warn_loudly_instead_of_being_ignored(caplog):
+    """Silently dropping these would be the worst possible break.
+
+    `"host": "0.0.0.0"` was someone's *remote* deployment; quietly falling back
+    to the loopback default would take their server off the network with no
+    signal at all. The message has to name the flag that replaced the key.
+    """
+    import logging
+
+    from biopb_tensor_server.core.config import parse_config
+
+    with caplog.at_level(logging.WARNING):
+        parse_config({"server": {"host": "0.0.0.0", "port": 9000, "tls": True}})
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    for key, flag in (("host", "--host"), ("port", "--port"), ("tls", "--tls")):
+        assert f"server.{key}" in joined
+        assert flag in joined
+
+
+def test_a_config_bind_cannot_move_the_plane(caplog):
+    """The warning is not cosmetic: the value really is gone."""
+    from biopb_tensor_server.core.config import ServerConfig, parse_config
+
+    cfg = parse_config({"server": {"host": "0.0.0.0", "port": 9000}})
+    assert not hasattr(cfg, "host")
+    assert not hasattr(cfg, "port")
+    assert set(vars(cfg)) == set(vars(ServerConfig()))
+
+
+def test_the_default_bind_is_loopback():
+    """Fail-safe. The old config default was 0.0.0.0, which made a plane public
+    unless something said otherwise -- the wrong direction for a default."""
+    assert cli.DEFAULT_FLIGHT_HOST == "127.0.0.1"
+
+
+class TestMigrateConfig:
+    """`biopb-tensor-server migrate-config`: legacy biopb.toml -> canonical biopb.json.
+
+    Moved here from the core SDK's suite with biopb/biopb#615, along with the
+    command: the migration is done by *this* package's `read_legacy_toml` /
+    `save_config`, so `biopb server migrate-config` was a command the SDK could
+    advertise but not perform on its own.
+    """
+
+    _TOML = (
+        "[server]\n"
+        'host = "127.0.0.1"\n'
+        "port = 8815\n\n"
+        "[cache]\n"
+        "max_bytes = 3000000000\n\n"
+        "[[sources]]\n"
+        'url = "/data/microscopy"\n'
+        "monitor = true\n\n"
+        "# advanced/unknown key that must survive the migration\n"
+        "[experimental]\n"
+        'foo = "bar"\n'
+    )
+
+    def _run(self, config_dir, *extra):
+        from typer.testing import CliRunner
+
+        return CliRunner().invoke(
+            cli.app, ["migrate-config", "--config", str(config_dir), *extra]
+        )
+
+    def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
+        import json
+
+        (tmp_path / "biopb.toml").write_text(self._TOML)
+        res = self._run(tmp_path)
+        assert res.exit_code == 0, res.output
+
+        json_path = tmp_path / "biopb.json"
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert data["server"]["port"] == 8815
+        assert data["cache"]["max_bytes"] == 3000000000
+        assert data["sources"][0]["url"] == "/data/microscopy"
+        # The unknown table survives (raw-dict round-trip, not dataclass).
+        assert data["experimental"] == {"foo": "bar"}
+        # Legacy file retired to .bak; schema sidecar written.
+        assert (tmp_path / "biopb.toml.bak").exists()
+        assert not (tmp_path / "biopb.toml").exists()
+        assert (tmp_path / "biopb.schema.json").exists()
+
+    def test_dry_run_writes_nothing(self, tmp_path):
+        (tmp_path / "biopb.toml").write_text(self._TOML)
+        res = self._run(tmp_path, "--dry-run")
+        assert res.exit_code == 0, res.output
+        assert (tmp_path / "biopb.toml").exists()  # untouched
+        assert not (tmp_path / "biopb.json").exists()
+        assert not (tmp_path / "biopb.toml.bak").exists()
+
+    def test_already_json_is_noop(self, tmp_path):
+        (tmp_path / "biopb.json").write_text('{"server": {"port": 8815}}')
+        res = self._run(tmp_path)
+        assert res.exit_code == 0
+        assert "Already canonical" in res.output
+        assert not (tmp_path / "biopb.toml.bak").exists()
+
+    def test_both_present_retires_toml_without_touching_json(self, tmp_path):
+        (tmp_path / "biopb.toml").write_text("[server]\nport = 8815\n")
+        # A JSON that must be left byte-for-byte untouched (it already wins).
+        original = '{"server": {"port": 9999}}'
+        (tmp_path / "biopb.json").write_text(original)
+        res = self._run(tmp_path)
+        assert res.exit_code == 0, res.output
+        assert (tmp_path / "biopb.json").read_text() == original  # untouched
+        assert (tmp_path / "biopb.toml.bak").exists()
+        assert not (tmp_path / "biopb.toml").exists()
+
+    def test_no_config_present(self, tmp_path):
+        res = self._run(tmp_path)
+        assert res.exit_code == 0
+        assert "No legacy config found" in res.output
+
+    def test_config_pointing_at_file_uses_its_dir(self, tmp_path):
+        # --config may name the file itself, not just the directory.
+        toml = tmp_path / "biopb.toml"
+        toml.write_text(self._TOML)
+        res = self._run(toml)
+        assert res.exit_code == 0, res.output
+        assert (tmp_path / "biopb.json").exists()
+
+    def test_the_sdk_no_longer_offers_the_command(self):
+        """The move is one-way: `biopb server migrate-config` is gone, not aliased.
+
+        Two spellings of one migration is how a user runs the one that is not
+        wired to this package's writer (biopb/biopb#615).
+        """
+        import biopb.cli as core_cli
+        from typer.testing import CliRunner
+
+        res = CliRunner().invoke(core_cli.app, ["server", "migrate-config"])
+        assert res.exit_code != 0
+
+
+# --- validate checks the trust anchors it will actually use (biopb/biopb#608) -
+
+
+def _config_with_ca(tmp_path, ca_path, source_url="grpc://lab-store:8815/img"):
+    """A config naming one credentials profile with `tls_ca_file`.
+
+    The default source url is the SINGLE-source form on purpose: expansion
+    returns before resolving credentials for that shape, so nothing else in
+    `validate` would ever read the profile.
+    """
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {"url": source_url, "credentials_profile": "lab-store"},
+                ],
+                "credentials": {
+                    "profiles": [
+                        {
+                            "name": "lab-store",
+                            "storage_type": "biopb-tensor",
+                            "tls_ca_file": str(ca_path),
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    return config_path
+
+
+def test_validate_rejects_a_trust_anchor_it_cannot_read(tmp_path, capsys):
+    """Serve-time is the wrong moment to learn the anchor you asked for is absent."""
+    config_path = _config_with_ca(tmp_path, tmp_path / "typo.pem")
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+
+    assert exc.value.exit_code == 1
+    out = capsys.readouterr().out
+    assert "tls_ca_file" in out
+    assert "credentials.profiles" in out
+    assert "✓ Config valid" not in out
+
+
+def test_validate_rejects_an_empty_trust_anchor(tmp_path, capsys):
+    ca = tmp_path / "empty.pem"
+    ca.write_bytes(b"   \n")
+    config_path = _config_with_ca(tmp_path, ca)
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+
+    assert exc.value.exit_code == 1
+    assert "empty" in capsys.readouterr().out
+
+
+def test_validate_accepts_a_readable_trust_anchor(tmp_path, capsys):
+    ca = tmp_path / "lab-ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n")
+    config_path = _config_with_ca(tmp_path, ca)
+
+    cli.validate(config=config_path)  # no Exit
+
+    assert "✓ Config valid" in capsys.readouterr().out
+
+
+def test_validate_checks_a_profile_no_source_references(tmp_path, capsys):
+    """An unused profile is still config the server will read the moment a source
+    names it -- and a typo found now costs nothing to fix."""
+    import json
+
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "sources": [],
+                "credentials": {
+                    "profiles": [
+                        {
+                            "name": "lab-store",
+                            "storage_type": "biopb-tensor",
+                            "tls_ca_file": str(tmp_path / "typo.pem"),
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.validate(config=config_path)
+
+    assert exc.value.exit_code == 1
+    assert "tls_ca_file" in capsys.readouterr().out

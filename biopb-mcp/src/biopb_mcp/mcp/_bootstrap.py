@@ -17,32 +17,6 @@ import traceback
 logger = logging.getLogger(__name__)
 
 
-class _HeadlessViewer:
-    """Stand-in bound to ``viewer`` when the kernel runs without a display.
-
-    Any attribute access raises a clear, quotable error so agent code that
-    reaches for the viewer (``viewer.add_image(...)``, ``viewer.layers`` …)
-    surfaces a self-describing message — relayed to the user by the model —
-    instead of a cryptic ``AttributeError`` on ``None``.  Falsy so kernel
-    snippets can guard with ``if viewer:``.
-    """
-
-    _MSG = (
-        "napari viewer unavailable: this biopb-mcp kernel started headless "
-        "(no display). Data access (client), compute (ops), and execute_code "
-        "still work — there is just no viewer window or screenshot."
-    )
-
-    def __getattr__(self, name):
-        raise RuntimeError(self._MSG)
-
-    def __repr__(self):
-        return "<headless: no napari viewer (no display)>"
-
-    def __bool__(self):
-        return False
-
-
 def _configure_dask(config: dict):
     """Set up dask in the kernel process.
 
@@ -231,37 +205,6 @@ def _install_window_close_hook(viewer):
         logger.exception("Failed to install napari window-close hook")
 
 
-def _make_token_report_hook():
-    """Return a ``(url, token) -> None`` callback that reports the connection to
-    the launcher, or ``None`` when no report pipe is configured.
-
-    The launcher inherits the *write* end of a pipe via ``BIOPB_TOKEN_REPORT_FD``
-    (set by ``KernelHost._launch``, name = ``_kernel.ENV_TOKEN_REPORT_FD``) and
-    caches the latest token in the MCP-server process so it can re-inject it into
-    the next kernel's env — persisting a token the user entered in the Tensor
-    Browser across ``restart_kernel`` without it ever touching disk (issue #86).
-    Wired into ``TensorConnection.on_connect`` so it fires on every successful
-    connect. One ``url\\ttoken`` line per connect (a single small write, atomic
-    under PIPE_BUF). Fully best-effort: a missing fd or any IO error is swallowed.
-    """
-    fd_str = os.environ.get("BIOPB_TOKEN_REPORT_FD")
-    if not fd_str:
-        return None
-    try:
-        fd = int(fd_str)
-    except ValueError:
-        return None
-
-    def _report(url, token):
-        line = f"{url or ''}\t{token or ''}\n".encode()
-        try:
-            os.write(fd, line)
-        except OSError:
-            pass
-
-    return _report
-
-
 def _start_update_check(viewer, config):
     """Kick off the kernel-start update reminder (issue #87), GUI branch only.
 
@@ -271,7 +214,7 @@ def _start_update_check(viewer, config):
     ``.show()``s rather than ``.exec()``s). Fully best-effort and fail-open: the
     check itself swallows every error, and this wrapper swallows the rest, so it
     never disturbs a working session. The caller invokes this only when a real
-    napari window exists (never headless — "only when a napari window exists").
+    napari window exists.
 
     This is a *notify-only* reminder: it tells the user to run the install/
     upgrade script. biopb does not self-update (a graceful cross-platform apply
@@ -304,9 +247,9 @@ def _start_update_check(viewer, config):
     threading.Thread(target=_worker, name="biopb-update-check", daemon=True).start()
 
 
-# Load-bearing namespace names a user plugin (#92) must not shadow. The merge
-# guard skips any of these; the startup-file save/restore protects all except the
-# two owned by the background dask-attach thread (below), which it must not race.
+# Load-bearing namespace names a user plugin (#92) must not shadow. A plugin now
+# contributes exactly one binding -- its module -- so this is a single check per
+# plugin rather than a sweep over everything it happened to define (#664).
 _RESERVED_NAMES = frozenset(
     {
         "viewer",
@@ -323,16 +266,86 @@ _RESERVED_NAMES = frozenset(
         "_resync_view",
     }
 )
-# Written only by the daemon attach thread (its sole-writer invariant, step 3), so
-# a plugin exec must NOT snapshot+restore them — that would race the attach and
-# could revert a just-attached Client.
-_ATTACH_OWNED = frozenset({"_dask_client", "_dask_attach_done"})
+# Plugin modules live under this prefix in ``sys.modules``, never under their bare
+# stem: a user file named ``skimage.py`` must not be able to claim
+# ``sys.modules["skimage"]`` for everything imported after it. The prefix is a key,
+# not an importable package — nothing imports it, and by-value pickling (see
+# _bind_by_value) means no unpickler ever resolves the name either.
+_PLUGIN_MODULE_PREFIX = "biopb_kernel_plugins"
+
+
+class _PluginLoader:
+    """Hands back a plugin module that is already loaded. Nothing re-executes."""
+
+    def __init__(self, module):
+        self._module = module
+
+    def create_module(self, spec):
+        return self._module
+
+    def exec_module(self, module):
+        """No-op: the file ran once, at bootstrap."""
+
+
+class _PluginImportHook:
+    """Make ``import <stem>`` reach a loaded kernel plugin.
+
+    **Because ``import`` is what anyone writes.** A plugin is bound as a *name*
+    in the namespace, which is the cheap part of #92 — but a name that exists
+    while ``import <stem>`` raises `ModuleNotFoundError` is a design that reads
+    as broken, and documenting the difference is a weaker fix than not having
+    one. A benchmarked agent read `server_status`, saw `files: image_resolution`,
+    wrote the import every Python programmer writes, got a traceback, and went
+    looking for the file on disk (session 20260810-172816).
+
+    **Appended to `sys.meta_path`, never prepended**, which is what keeps the
+    guarantee the module prefix exists for. The standard finders run first, so a
+    real installed package always wins and a user's `skimage.py` can never
+    answer for `skimage`; this hook is consulted only once nothing else can
+    resolve the name. `sys.modules[stem] = mod` would *not* be equivalent —
+    imports short-circuit on `sys.modules` before any finder runs, so it would
+    shadow a package imported later in the session, which is the exact hazard
+    `_PLUGIN_MODULE_PREFIX` was introduced to close.
+
+    Top-level names only (`path is None`): a plugin never answers for a
+    submodule of a real package.
+    """
+
+    def __init__(self):
+        self._modules: dict[str, object] = {}
+
+    def register(self, stem: str, module) -> None:
+        self._modules[stem] = module
+
+    def unregister(self, stem: str) -> None:
+        self._modules.pop(stem, None)
+
+    def find_spec(self, fullname, path=None, target=None):
+        if path is not None:
+            return None
+        module = self._modules.get(fullname)
+        if module is None:
+            return None
+        import importlib.util
+
+        return importlib.util.spec_from_loader(fullname, _PluginLoader(module))
+
+
+#: One hook per process, installed on first use and left in place.
+_PLUGIN_IMPORT_HOOK = _PluginImportHook()
+
+
+def _install_plugin_import_hook() -> None:
+    import sys
+
+    if _PLUGIN_IMPORT_HOOK not in sys.meta_path:
+        sys.meta_path.append(_PLUGIN_IMPORT_HOOK)
 
 
 def _public_names(mapping: dict) -> dict:
-    """The names a module/mapping plugin contributes: ``__all__`` if declared, else
-    every public (non-``_``) name that is not itself an imported module (so a
-    plugin's ``import numpy as np`` doesn't leak ``np`` into the namespace)."""
+    """The names a mapping plugin contributes: ``__all__`` if declared, else every
+    public (non-``_``) name that is not itself an imported module (so a plugin's
+    ``import numpy as np`` doesn't leak ``np`` into the namespace)."""
     import types
 
     declared = mapping.get("__all__")
@@ -360,66 +373,131 @@ def _merge_names(ip, names: dict, *, source: str) -> None:
         ns[key] = value
 
 
-def _load_startup_files(ip, plugin_dir) -> None:
-    """Exec each ``*.py`` in *plugin_dir* directly in the kernel namespace.
+def _bind_one(ip, name: str, value, *, source: str) -> bool:
+    """Bind a plugin's single contributed *name*, refusing a reserved one."""
+    if name in _RESERVED_NAMES:
+        logger.warning(
+            "kernel plugin %s would shadow reserved name %r; skipped", source, name
+        )
+        return False
+    ip.user_ns[name] = value
+    logger.info("Loaded kernel plugin: %s (from %s)", name, source)
+    return True
 
-    IPython ``startup/`` semantics: a file's top-level defs land beside ``viewer``/
-    ``client``/``ops``, and its functions resolve those live handles as globals at
-    call time -- exactly like agent ``execute_code`` (which also runs in this
-    namespace), so ``client`` refreshed per-job is seen. Fail-open per file. Any
-    load-bearing name the file overwrites is restored (warned); the two
-    attach-thread-owned names are left untouched to avoid racing that thread.
+
+def _pickle_by_value(mod) -> None:
+    """Make *mod*'s functions pickle by value, so they survive the trip to a dask
+    worker.
+
+    The old exec-into-the-namespace loader got this for free: a function defined in
+    ``user_ns`` reports ``__module__ == "__main__"``, which cloudpickle always
+    serializes by value. A function reached through an imported module pickles by
+    *reference* instead -- a few bytes naming a module no worker can import, since
+    the plugin dir is on no ``sys.path`` but this kernel's. ``dask.scheduler``
+    defaults to distributed and the guides steer the agent toward dask, so without
+    this a plugin function inside a ``da.map_blocks`` would fail at compute time,
+    far from the load that caused it. Fail-open: in-process use still works.
+    """
+    try:
+        import cloudpickle
+    except ImportError:  # no distributed stack → nothing ships to a worker
+        return
+    try:
+        cloudpickle.register_pickle_by_value(mod)
+    except Exception:
+        logger.warning(
+            "kernel plugin %s: could not register for by-value pickling; its "
+            "functions will not run on a dask worker",
+            getattr(mod, "__name__", mod),
+            exc_info=True,
+        )
+
+
+def _load_plugin_files(ip, plugin_dir) -> list[str]:
+    """Import each ``*.py`` in *plugin_dir* as a module, bound under its stem.
+
+    A plugin contributes exactly **one** name -- its module -- so its helpers and
+    imports stay on the module instead of landing in the agent's namespace (#664).
+    ``dir()`` then names the plugin rather than its parts, and
+    ``inspect_object("<stem>")`` prints the module docstring plus every public
+    callable with its signature.
+
+    Loaded from the path, not by import: the kernel's interpreter need not be the
+    tool env, so the plugin dir is reachable where installed-package metadata is
+    not. Fail-open per file.
+
+    Returns the stems that bound, for ``_requires.record_loaded_plugins`` -- the
+    file being on disk is not the same fact, precisely because this is fail-open.
     """
     try:
         paths = sorted(plugin_dir.glob("*.py"))
     except OSError:
-        return
-    ns = ip.user_ns
-    protect = _RESERVED_NAMES - _ATTACH_OWNED
+        return []
+    import importlib.util
+    import sys
+
+    loaded = []
     for path in paths:
         if path.name.startswith("_"):
             continue
-        saved = {k: ns[k] for k in protect if k in ns}
+        module_name = f"{_PLUGIN_MODULE_PREFIX}.{path.stem}"
         try:
-            code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
-            exec(code, ns)  # noqa: S102 - user plugin; this kernel is RCE by design
-            logger.info("Loaded kernel plugin file: %s", path.name)
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"no import machinery for {path}")
+            mod = importlib.util.module_from_spec(spec)
+            # Registered before exec so a plugin that re-imports itself (directly
+            # or via pickle/dataclass machinery) resolves this same object rather
+            # than executing the file a second time.
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
         except Exception:
+            sys.modules.pop(module_name, None)
             logger.exception("kernel plugin file %s failed to load", path.name)
-        finally:
-            for key, value in saved.items():
-                if ns.get(key) is not value:
-                    logger.warning(
-                        "kernel plugin %s overwrote reserved name %r; restored",
-                        path.name,
-                        key,
-                    )
-                    ns[key] = value
+            continue
+        if _bind_one(ip, path.stem, mod, source=path.name):
+            _pickle_by_value(mod)
+            # So `import <stem>` finds it too, not only the bound name.
+            _install_plugin_import_hook()
+            _PLUGIN_IMPORT_HOOK.register(path.stem, mod)
+            loaded.append(path.stem)
+        else:
+            sys.modules.pop(module_name, None)
+            _PLUGIN_IMPORT_HOOK.unregister(path.stem)
+    return loaded
 
 
-def _load_entry_point_plugins(ip) -> None:
+def _load_entry_point_plugins(ip) -> list[str]:
     """Load ``biopb_mcp.namespace`` entry-point packages into the namespace.
 
-    An entry point resolving to a ``register(namespace)`` callable is called with a
-    read-through snapshot of the live namespace (it can inspect the handles and add
-    names); one resolving to a module or mapping has its public names merged. All
-    merges pass the reserved-name guard; fail-open per entry point.
+    A module or mapping entry point binds **one** name -- the entry-point name --
+    like a plugin file does (#664); a mapping is wrapped in a namespace object so
+    its members are reached the same way. A ``register(namespace)`` callable stays
+    the escape hatch for a plugin that must bind several names itself: it is called
+    with a read-through snapshot of the namespace and only its new bindings are
+    merged, each past the reserved-name guard. That snapshot is taken at load time,
+    when ``client`` is still the ``None`` seeded at step 7 -- a hook wanting the
+    live client must read it per call (see ``plugins/__init__.py``).
+
+    Fail-open per entry point. Returns the names that loaded (see
+    :func:`_load_plugin_files`).
     """
     from biopb._kernel_plugins import NAMESPACE_ENTRY_POINT_GROUP
 
     try:
         from importlib.metadata import entry_points
     except ImportError:  # pragma: no cover - stdlib since 3.8
-        return
+        return []
     try:
         eps = list(entry_points(group=NAMESPACE_ENTRY_POINT_GROUP))
     except Exception:
         logger.debug("kernel plugin: entry-point discovery failed", exc_info=True)
-        return
+        return []
 
     import types
     from collections.abc import Mapping
 
+    loaded = []
     for ep in eps:
         try:
             obj = ep.load()
@@ -428,12 +506,17 @@ def _load_entry_point_plugins(ip) -> None:
             continue
         try:
             if isinstance(obj, types.ModuleType):
-                _merge_names(ip, _public_names(vars(obj)), source=ep.name)
+                if not _bind_one(ip, ep.name, obj, source=ep.name):
+                    continue
+                _pickle_by_value(obj)
             elif isinstance(obj, Mapping):
-                # A returned mapping is a namespace-like source (like a module), so
-                # filter it the same way: public names / honor __all__, drop the
-                # odd dunder. (A register() hook, by contrast, writes literally.)
-                _merge_names(ip, _public_names(dict(obj)), source=ep.name)
+                # Wrapped, not merged: a mapping is a namespace-like source, so it
+                # binds one name like a module does. Filtered the same way too —
+                # public names / honor __all__, drop the odd dunder. (A register()
+                # hook, by contrast, writes literally.)
+                holder = types.SimpleNamespace(**_public_names(dict(obj)))
+                if not _bind_one(ip, ep.name, holder, source=ep.name):
+                    continue
             elif callable(obj):
                 # A read-through snapshot: register() sees the live handles, and we
                 # merge only what it newly bound (guarded) rather than let it write
@@ -446,6 +529,11 @@ def _load_entry_point_plugins(ip) -> None:
                     if ip.user_ns.get(k, _MISSING) is not v
                 }
                 _merge_names(ip, writes, source=ep.name)
+                logger.info(
+                    "Loaded kernel plugin entry point: %s (register hook, %d name(s))",
+                    ep.name,
+                    len(writes),
+                )
             else:
                 logger.warning(
                     "kernel plugin entry point %r is not a register()/module/mapping;"
@@ -453,9 +541,10 @@ def _load_entry_point_plugins(ip) -> None:
                     ep.name,
                 )
                 continue
-            logger.info("Loaded kernel plugin entry point: %s", ep.name)
+            loaded.append(ep.name)
         except Exception:
             logger.exception("kernel plugin entry point %r failed to load", ep.name)
+    return loaded
 
 
 def _load_namespace_plugins(ip, config) -> None:
@@ -466,22 +555,30 @@ def _load_namespace_plugins(ip, config) -> None:
     ``~/.config/biopb/kernel/`` and installed ``biopb_mcp.namespace`` entry points.
     Called after the built-in handles exist (step 7) so plugins can reference them.
     Gated by ``services.namespace_enabled``.
+
+    What loaded is reported to :mod:`._requires` and printed by ``server_status``,
+    so a skill's ``plugin:<name>`` is answered from the load's actual outcome
+    instead of from the presence of a file this fail-open loader may have skipped.
     """
     from .._config import get_setting
+    from . import _requires
 
     if not get_setting(config, "services.namespace_enabled", True):
         logger.info("kernel plugins disabled (services.namespace_enabled=false)")
+        _requires.record_loaded_plugins(enabled=False)
         return
     from biopb._locations import mcp_plugin_dir
 
+    files, entry_points = [], []
     try:
-        _load_startup_files(ip, mcp_plugin_dir())
+        files = _load_plugin_files(ip, mcp_plugin_dir())
     except Exception:
-        logger.exception("kernel plugin: startup-file load failed")
+        logger.exception("kernel plugin: plugin-file load failed")
     try:
-        _load_entry_point_plugins(ip)
+        entry_points = _load_entry_point_plugins(ip)
     except Exception:
         logger.exception("kernel plugin: entry-point load failed")
+    _requires.record_loaded_plugins(files, entry_points)
 
 
 # Sentinel for "key absent" in the entry-point snapshot diff (a plugin may bind a
@@ -516,12 +613,6 @@ def _bootstrap_impl():
     ip = get_ipython()
     config = load_config()
 
-    # Headless (compute-only) mode: the launcher sets BIOPB_HEADLESS when no
-    # display is available (or display_mode forces it), so we skip Qt/napari
-    # entirely rather than crash on a missing display.  client/ops/execute_code
-    # still work; `viewer` is a self-describing sentinel.
-    headless = bool(os.environ.get("BIOPB_HEADLESS"))
-
     # 1. Qt integration must be enabled before the viewer is created so napari
     #    shares the kernel's integrated Qt event loop (programmatic %gui qt).
     #    Do it FIRST — before the heavy core imports below (dask.array, and on
@@ -530,14 +621,11 @@ def _bootstrap_impl():
     #    those deps, so popping the splash here covers the *whole* slow stretch;
     #    showing it after the imports (as before) left several seconds of blank
     #    screen the splash was meant to hide (issue #386). Best-effort: show_splash
-    #    fails open to _NullSplash when Qt is unavailable, and the headless branch
-    #    (no Qt loop) keeps the _NullSplash default below.
-    from ._splash import _NullSplash, show_splash
+    #    fails open to _NullSplash when Qt is unavailable.
+    from ._splash import show_splash
 
-    splash = _NullSplash()  # replaced below when a real one can be shown
-    if not headless:
-        ip.enable_gui("qt")
-        splash = show_splash()
+    ip.enable_gui("qt")
+    splash = show_splash()
 
     # Heavy core imports, now covered by the splash. dask.array is the slow one
     # here; napari is pulled in transitively on some platforms, so this is the
@@ -554,7 +642,7 @@ def _bootstrap_impl():
     # 2. Data-access service (dask-free), shared by the widget and the agent
     #    namespace. Created before dask so the viewer can come up without waiting
     #    on the distributed Client attach below.
-    conn = TensorConnection(config)
+    conn = TensorConnection()
 
     # 3. Attach dask on a background thread so the viewer opens immediately. The
     #    cluster is session-child-owned and may still be registering workers, and
@@ -596,18 +684,12 @@ def _bootstrap_impl():
         _register_cache_plugin(client, _dask_state["url"], _dask_state["token"], config)
 
     # on_connect fires (in the kernel) after every successful connect with the
-    # final (url, token): it bounds the dask chunk cache (token only known
-    # post-connect) and reports the token up to the launcher so it survives a
-    # kernel restart (issue #86). The report hook is None when no report pipe is
-    # configured (Windows, or a bare unit test).
-    _report_token = _make_token_report_hook()
-
+    # final (url, token), which is what bounds the dask chunk cache -- the token is
+    # only known post-connect.
     def _on_connect(url, token):
         with _dask_lock:
             _dask_state.update(url=url, token=token, connected=True)
             _register_cache_if_ready()
-        if _report_token is not None:
-            _report_token(url, token)
 
     conn.on_connect = _on_connect
 
@@ -621,76 +703,59 @@ def _bootstrap_impl():
 
     threading.Thread(target=_attach_dask, name="biopb-dask-attach", daemon=True).start()
 
-    # 4. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
+    # 4. napari viewer + Tensor Browser (auto-connects on its own tick).
     #    compute_scheduler pins the viewer's serial slice reads to a
     #    single-process scheduler so they share the main-process chunk cache
     #    instead of scattering across the distributed cluster (issue #8).
-    #    Headless: no viewer — `viewer` is a self-describing sentinel instead.
     compute_scheduler = get_setting(config, "viewer.compute_scheduler")
-    if headless:
-        viewer = _HeadlessViewer()
-        logger.info("Headless mode: no napari viewer (no display).")
-        # No widget exists to drive the initial connect (the GUI branch's
-        # TensorBrowserWidget runs the same conn.auto_connect policy off a
-        # worker thread), so drive it here. On a daemon thread: connect() blocks
-        # on network I/O and we must not stall kernel bring-up (this runs in
-        # exec_lines, ahead of start_kernel returning). execute_code refreshes
-        # `client` from `_conn.client` per job, so a connect that lands after the
-        # kernel is ready is still seen. (threading imported at step 3.)
-        threading.Thread(
-            target=conn.auto_connect,
-            name="biopb-headless-connect",
-            daemon=True,
-        ).start()
-    else:
-        # Enable napari async slicing via its NAPARI_ASYNC env override, set
-        # BEFORE importing napari. The settings singleton reads the env at load,
-        # and the viewer's _LayerSlicer captures the flag once at construction
-        # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
-        # var is the only reliable hook; assigning the settings object after
-        # import is too late (the settings load resets it). Async slicing
-        # fetches slices off the Qt main thread so a zoom into a not-yet-cached
-        # level doesn't freeze the viewer (vispy keeps the current coarse
-        # texture until the finer slice resolves); take_screenshot force-syncs a
-        # slice before capturing so the agent still sees the requested frame
-        # (resync_view_for_capture).
-        os.environ["NAPARI_ASYNC"] = (
-            "1" if get_setting(config, "viewer.async_slicing") else "0"
+    # Enable napari async slicing via its NAPARI_ASYNC env override, set
+    # BEFORE importing napari. The settings singleton reads the env at load,
+    # and the viewer's _LayerSlicer captures the flag once at construction
+    # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
+    # var is the only reliable hook; assigning the settings object after
+    # import is too late (the settings load resets it). Async slicing
+    # fetches slices off the Qt main thread so a zoom into a not-yet-cached
+    # level doesn't freeze the viewer (vispy keeps the current coarse
+    # texture until the finer slice resolves); take_screenshot force-syncs a
+    # slice before capturing so the agent still sees the requested frame
+    # (resync_view_for_capture).
+    os.environ["NAPARI_ASYNC"] = (
+        "1" if get_setting(config, "viewer.async_slicing") else "0"
+    )
+
+    try:
+        # napari was already pulled in by the core imports above (splash is
+        # showing "Loading napari…" for that phase), so this import just
+        # binds the name — the real cost is napari.Viewer() below.
+        import napari
+
+        from ..tensor_browser import TensorBrowserWidget
+
+        splash.message("Opening viewer…")  # the slow step
+        viewer = napari.Viewer()
+        tbw = TensorBrowserWidget(
+            viewer, connection=conn, compute_scheduler=compute_scheduler
         )
+        viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+        # Hand the splash off to the viewer window (closes once it's shown).
+        splash.finish(viewer)
+        # Tear the kernel down to idle when the user closes the window: signal
+        # the launcher's reader thread over the inherited window-close pipe.
+        _install_window_close_hook(viewer)
 
-        try:
-            # napari was already pulled in by the core imports above (splash is
-            # showing "Loading napari…" for that phase), so this import just
-            # binds the name — the real cost is napari.Viewer() below.
-            import napari
+        # Kernel-start update reminder (issue #87): once a window exists, check
+        # in the background whether a newer release-v* deployment is available
+        # and, if so, remind the user to run the upgrade script. Never blocks
+        # window paint.
+        _start_update_check(viewer, config)
 
-            from ..tensor_browser import TensorBrowserWidget
-
-            splash.message("Opening viewer…")  # the slow step
-            viewer = napari.Viewer()
-            tbw = TensorBrowserWidget(
-                viewer, connection=conn, compute_scheduler=compute_scheduler
-            )
-            viewer.window.add_dock_widget(tbw, name="Tensor Browser")
-            # Hand the splash off to the viewer window (closes once it's shown).
-            splash.finish(viewer)
-            # Tear the kernel down to idle when the user closes the window: signal
-            # the launcher's reader thread over the inherited window-close pipe.
-            _install_window_close_hook(viewer)
-
-            # Kernel-start update reminder (issue #87): once a window exists, check
-            # in the background whether a newer release-v* deployment is available
-            # and, if so, remind the user to run the upgrade script. GUI branch only;
-            # never blocks window paint.
-            _start_update_check(viewer, config)
-
-        except Exception:
-            # Happy path: finish() hands the splash off to the viewer window (it
-            # closes once the window shows). If a step above fails first, close it
-            # so it can't linger before the kernel is torn down, then re-raise for
-            # bootstrap()'s BOOTSTRAP_ERROR handler.
-            splash.close()
-            raise
+    except Exception:
+        # Happy path: finish() hands the splash off to the viewer window (it
+        # closes once the window shows). If a step above fails first, close it
+        # so it can't linger before the kernel is torn down, then re-raise for
+        # bootstrap()'s BOOTSTRAP_ERROR handler.
+        splash.close()
+        raise
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
@@ -721,14 +786,12 @@ def _bootstrap_impl():
     # job-thread code (viewer/layers/dims/camera mutations) can't segfault Qt --
     # the real viewer is touched only on the Qt main thread. Internal subsystems
     # (helpers, tools, the Tensor Browser widget) keep the real viewer. See
-    # docs/viewer-thread-safety.md. Headless has no Qt loop, so no proxy.
-    viewer_handle = viewer
-    if not headless:
-        from ._helpers import patch_viewer_add_tensor
-        from ._viewer_proxy import make_viewer_proxy
+    # docs/viewer-thread-safety.md.
+    from ._helpers import patch_viewer_add_tensor
+    from ._viewer_proxy import make_viewer_proxy
 
-        patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
-        viewer_handle = make_viewer_proxy(viewer)
+    patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
+    viewer_handle = make_viewer_proxy(viewer)
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
@@ -766,8 +829,8 @@ def _bootstrap_impl():
     #    changes, so a catalog cached while the server was still indexing
     #    self-heals — for the agent (reads `_conn.sources` live) and, in a GUI
     #    session, the widget (which wires its own tree rebuild and also starts
-    #    the watch; the call is idempotent). Thread-based, not a QTimer, so it
-    #    runs even headless where there is no Qt loop.
+    #    the watch; the call is idempotent). Thread-based, not a QTimer, so a
+    #    busy Qt loop never starves the poll.
     try:
         conn.start_source_watch(
             min_interval=get_setting(config, "tensor.health_poll_min_interval"),

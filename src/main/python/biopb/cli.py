@@ -8,13 +8,17 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _locations, _web_auth
+from . import _agents, _endpoints, _locations, _web_auth
+from ._endpoints import (
+    flight_port_for as _flight_port,
+    sidecar_port_for as _sidecar_port,
+)
 from ._lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
@@ -71,19 +75,21 @@ def _add_optional_typer(name: str, import_path: str, help: str) -> None:
 
 
 # TensorFlight client diagnostics
-_add_optional_typer("tensor", "biopb.tensor.cli", "TensorFlight client diagnostics")
+_add_optional_typer(
+    "tensor",
+    "biopb.tensor.cli",
+    "Query a TensorFlight data plane (sources, tensors, stats, cache).",
+)
 
 # ProcessImage client operations
-_add_optional_typer("image", "biopb.image.cli", "ProcessImage client operations")
+_add_optional_typer("image", "biopb.image.cli", "Call ProcessImage algorithm servers.")
 
-# Tensor server daemon management
-server_app = typer.Typer(
-    name="server",
-    help="Biopb tensor-server diagnostics (cache-stats, migrate-config). The "
-    "control plane (`biopb control`) owns the data-plane process lifecycle; the "
-    "former standalone-daemon commands (start/stop/restart/status/logs) are gone.",
-)
-app.add_typer(server_app, name="server")
+# The `biopb server` group is gone (biopb/biopb#615). Its lifecycle commands went
+# first, when the control plane took over the data-plane process; the two that
+# outlived them were not a group: `cache-stats` is a Flight query, so it moved to
+# `biopb tensor cache-stats` beside the other queries, and `migrate-config` needs
+# biopb-tensor-server to do anything at all, so it moved to
+# `biopb-tensor-server migrate-config` and left the SDK.
 
 # Daemon management constants. On-disk locations come from the shared
 # `_locations` module (XDG-aware): the installed webapp bundle is a portable
@@ -153,7 +159,7 @@ def _package_version(dist_name: str) -> str:
         return "unknown"
 
 
-@app.command()
+@app.command(help="Show the product deployment and biopb SDK versions.")
 def version():
     """Show the two version lines: the product deployment and the biopb SDK."""
     rows = [
@@ -344,85 +350,40 @@ def _reject_legacy_toml(config: Path) -> None:
     """Refuse to start on a pre-#34 ``biopb.toml``, naming the migration command.
 
     The server no longer reads TOML (biopb/biopb#34), and every config probe on
-    the start path is best-effort (an unreadable config silently falls back to
-    defaults -- ``_read_flight_host`` even fails *closed* to a public bind). So a
-    legacy config would otherwise surface as an unrelated "public bind needs a
-    token" refusal, or as a plane that starts on defaults and serves none of the
-    user's data. Check it once, up front, where the user can act on it.
+    the start path is best-effort, so a legacy config would otherwise surface as
+    a plane that starts on defaults and serves none of the user's data. Check it
+    once, up front, where the user can act on it.
     """
     if config and config.suffix.lower() == ".toml" and config.exists():
         console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
         console.print(
             "JSON is the only supported format. Convert it with "
-            "[bold]biopb server migrate-config[/bold] (settings are preserved "
-            "and the old file is backed up), then retry."
+            "[bold]biopb-tensor-server migrate-config[/bold] (settings are "
+            "preserved and the old file is backed up), then retry."
         )
         raise typer.Exit(1)
 
 
-def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
-    """Loopback-reachable gRPC host/port from the config (default
-    127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
-    the returned host is always something connect()-able locally."""
-    host, port = "127.0.0.1", 8815
-    if config and config.exists():
-        try:
-            from biopb_tensor_server.core.config import (
-                load_config as _load_server_config,
-            )
+def _plane_bind(grpc_bind: str, base_port: int) -> Tuple[str, int]:
+    """The flight plane's bind: the address from ``--grpc-bind``, port from the base.
 
-            cfg = _load_server_config(config)
-            host = cfg.host or host
-            port = int(cfg.port or port)
-        except Exception:
-            pass
+    The address used to be read out of ``biopb.json`` (``server.host``), which
+    made the deployment's exposure a *property of a file* the control snapshotted
+    at startup -- so a config edit could silently disagree with the running plane
+    (biopb/biopb#604). It is now the CLI's, and named for what it does: the flag
+    that exposes the plane is the one you type an address into, and everything
+    downstream (token required? TLS by default?) derives from that one address
+    through :func:`biopb._web_auth.host_is_public_bind`.
+    """
+    return (grpc_bind, _flight_port(base_port))
+
+
+def _probe_hostport(grpc_bind: str, base_port: int) -> Tuple[str, int]:
+    """Loopback-reachable form of :func:`_plane_bind`, for health probes."""
+    host, port = _plane_bind(grpc_bind, base_port)
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
     return host, port
-
-
-def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
-    """Best-effort gRPC endpoint + token for a running server's health query.
-
-    Reads host/port from the config (defaults 127.0.0.1:8815); a server
-    bound to 0.0.0.0/:: is reached over loopback. The token comes from
-    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
-    """
-    host, port = _resolve_grpc_hostport(config)
-    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
-    return f"grpc://{host}:{port}", token
-
-
-def _query_server(
-    location: str, token: Optional[str], call: Callable[[Any], dict]
-) -> Optional[dict]:
-    """Open a short-lived TensorFlightClient to *location*, return ``call(client)``.
-
-    Returns None if the client import fails or the server is unreachable; the
-    client is always closed. The shared body behind the status/cache-stats probes.
-    """
-    try:
-        from biopb.tensor.client import TensorFlightClient
-    except Exception:
-        return None
-    client = None
-    try:
-        client = TensorFlightClient(location, cache_bytes=0, token=token)
-        return call(client)
-    except Exception:
-        return None
-    finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-
-
-def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
-    """Return the server's cache-stats dict, or None if unreachable / no cache."""
-    return _query_server(location, token, lambda c: c.cache_stats())
 
 
 @dataclass
@@ -512,202 +473,6 @@ def _emit_daemon_status(
     console.print(table)
 
 
-def _fmt_mb(n_bytes: int) -> str:
-    """Format a byte count as MB."""
-    return f"{n_bytes / (1024 * 1024):.1f} MB"
-
-
-def _hit_rate(hits: int, misses: int) -> str:
-    """Hit rate as a percentage string (guards divide-by-zero)."""
-    total = hits + misses
-    return f"{(hits / total * 100):.1f}%" if total else "n/a"
-
-
-def _render_cache_stats(stats: dict) -> None:
-    """Render a CacheStats dict (from TensorFlightClient.cache_stats) as tables."""
-    g = stats.get
-    table = Table(title="Cache Statistics")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green", justify="right")
-
-    hits, misses = g("hits", 0), g("misses", 0)
-    table.add_row("Hits", str(hits))
-    table.add_row("Misses", str(misses))
-    table.add_row("Hit rate", _hit_rate(hits, misses))
-    table.add_row("Evictions", str(g("evictions", 0)))
-    table.add_row("Pending waits", str(g("pending_waits", 0)))
-    table.add_row("Oversized skips", str(g("oversized_skips", 0)))
-    table.add_row("Ref-held evictions skipped", str(g("ref_held_evictions_skipped", 0)))
-    table.add_row("Entries", str(g("total_entries", 0)))
-    table.add_row("Size", _fmt_mb(g("total_bytes", 0)))
-    if g("max_entries", 0):
-        table.add_row("Max entries", str(g("max_entries")))
-    if g("max_bytes", 0):
-        table.add_row("Max size", _fmt_mb(g("max_bytes")))
-    console.print(table)
-
-    pool_stats = stats.get("pool_stats") or {}
-    if pool_stats:
-        ptable = Table(title="Per-pool Statistics")
-        for col in ("Pool", "Hits", "Misses", "Hit rate", "Segments", "Size"):
-            ptable.add_column(
-                col,
-                style="cyan" if col == "Pool" else "green",
-                justify="left" if col == "Pool" else "right",
-            )
-        for name, p in sorted(pool_stats.items()):
-            ptable.add_row(
-                name,
-                str(p.get("hits", 0)),
-                str(p.get("misses", 0)),
-                _hit_rate(p.get("hits", 0), p.get("misses", 0)),
-                str(p.get("segments", 0)),
-                _fmt_mb(p.get("bytes", 0)),
-            )
-        console.print(ptable)
-
-
-@server_app.command("cache-stats")
-def cache_stats(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (biopb.json)"
-    ),
-    token: Optional[str] = typer.Option(
-        None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"
-    ),
-    json_output: bool = typer.Option(
-        False, "--json", help="Emit machine-readable JSON instead of a table"
-    ),
-):
-    """Show cache hit/miss diagnostics from the running server.
-
-    Liveness is the Flight query itself: an unreachable server yields no stats
-    (handled below), so there is no separate PID-file gate -- the control plane
-    now owns the data-plane process and writes no ``tensor-server.pid``.
-    """
-    location, env_token = _resolve_grpc_endpoint(config)
-    stats = _query_cache_stats(location, token or env_token)
-
-    if stats is None:
-        console.print(
-            "[red]Could not retrieve cache stats[/red] "
-            "(server unreachable or cache not initialized)."
-        )
-        raise typer.Exit(1)
-
-    if json_output:
-        print(json.dumps(stats))
-        raise typer.Exit(0)
-
-    _render_cache_stats(stats)
-
-
-@server_app.command("migrate-config")
-def migrate_config(
-    config: Path = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Config file (or dir) to migrate; defaults to ~/.config/biopb",
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", "-n", help="Report what would happen; write nothing"
-    ),
-):
-    """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
-
-    JSON is the only format the server reads (biopb/biopb#34), so this command
-    is the upgrade path for a pre-#34 install. It converts a legacy TOML config
-    in place -- reading the raw table (so advanced/unknown keys survive) and
-    writing the sibling ``biopb.json`` (plus its schema sidecar), then backing
-    the old TOML up to ``biopb.toml.bak``. Settings are preserved verbatim, so a
-    running server need not be restarted.
-    """
-    from ._locations import (
-        CANONICAL_CONFIG_NAME,
-        DEFAULT_CONFIG_DIR,
-        LEGACY_CONFIG_NAME,
-    )
-
-    # Resolve the config directory. --config may point at a file (use its parent)
-    # or a directory; with nothing given, use the standard location.
-    if config is None:
-        config_dir = DEFAULT_CONFIG_DIR
-    elif config.is_dir():
-        config_dir = config
-    else:
-        config_dir = config.parent
-
-    toml_path = config_dir / LEGACY_CONFIG_NAME
-    json_path = config_dir / CANONICAL_CONFIG_NAME
-
-    if not toml_path.exists():
-        if json_path.exists():
-            console.print(
-                f"[green]Already canonical:[/green] {json_path} is JSON; "
-                "nothing to migrate."
-            )
-        else:
-            console.print(
-                f"[yellow]No legacy config found[/yellow] at {toml_path} "
-                "(and no JSON either); nothing to migrate."
-            )
-        raise typer.Exit(0)
-
-    # A legacy TOML exists. If a JSON also exists it already shadows the TOML
-    # (find_config prefers JSON), so we must NOT overwrite it from the TOML --
-    # just retire the stale TOML to clear the both-files shadow warning.
-    if json_path.exists():
-        backup = toml_path.with_name(toml_path.name + ".bak")
-        console.print(
-            f"[yellow]Both configs present:[/yellow] {json_path} is already "
-            f"canonical and in use; the legacy {toml_path.name} is ignored."
-        )
-        if dry_run:
-            console.print(f"  [dim](dry run)[/dim] would back it up to {backup.name}")
-            raise typer.Exit(0)
-        toml_path.replace(backup)
-        console.print(f"  Retired the legacy TOML -> {backup.name}")
-        raise typer.Exit(0)
-
-    # The migration case: TOML only. Read the raw table and write canonical JSON.
-    # `read_legacy_toml` is the last TOML reader in the tree -- the server's own
-    # load path no longer parses TOML at all (biopb/biopb#34).
-    try:
-        from biopb_tensor_server.core.config import read_legacy_toml, save_config
-    except Exception as exc:  # noqa: BLE001 - optional dependency
-        console.print(
-            "[red]Config migration is unavailable:[/red] "
-            f"{exc}\n"
-            "[yellow]Re-run the BioPB installer to fix.[/yellow]"
-        )
-        raise typer.Exit(1)
-
-    try:
-        data = read_legacy_toml(toml_path)
-    except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
-        console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
-        raise typer.Exit(1)
-
-    if dry_run:
-        backup = toml_path.with_name(toml_path.name + ".bak")
-        console.print(f"[cyan](dry run)[/cyan] would migrate {toml_path}")
-        console.print(f"  write  {json_path} (+ schema sidecar)")
-        console.print(f"  backup {toml_path.name} -> {backup.name}")
-        raise typer.Exit(0)
-
-    try:
-        written = save_config(data, toml_path)
-    except Exception as exc:  # noqa: BLE001 - write must surface, not crash
-        console.print(f"[red]Failed to write {json_path}:[/red] {exc}")
-        raise typer.Exit(1)
-
-    console.print(
-        f"[green]Migrated[/green] {toml_path} -> {written} "
-        f"(old file backed up to {toml_path.name}.bak)."
-    )
-
-
 # ---------------------------------------------------------------------------
 # biopb-mcp (`biopb mcp view`)
 #
@@ -721,9 +486,13 @@ def migrate_config(
 # surfaces a clear install hint (rather than a raw ImportError) when it is absent.
 # ---------------------------------------------------------------------------
 
+# Every command below passes an explicit one-line `help=`. Typer prefers it over
+# the docstring, which keeps `--help` to a single sentence per command while the
+# docstring stays where the rationale belongs -- read by maintainers, not printed
+# at a user who asked what a command does.
 mcp_app = typer.Typer(
     name="mcp",
-    help="biopb-mcp MCP server: `view` opens the foreground napari viewer.",
+    help="Run a foreground napari viewer session (biopb-mcp).",
 )
 
 
@@ -742,6 +511,36 @@ def _require_biopb_mcp() -> None:
             r"[yellow]Install it with: pip install 'biopb-mcp\[mcp]'[/yellow]"
         )
         raise typer.Exit(1)
+
+
+def _require_control_for_view() -> None:
+    """Exit(1) unless a control plane answers — or ``$BIOPB_TENSOR_URL`` is set.
+
+    The viewer's data comes from the plane the control owns (biopb/biopb#628), so
+    without one there is nothing to browse; failing here keeps the user from
+    watching napari load only to meet an empty Tensor Browser. The env override
+    names a plane directly and deliberately bypasses the control, so it must also
+    bypass this check — otherwise the escape hatch would not reach `view` at all.
+
+    "Answered" is :func:`_query_control_health`, the module's one definition of a
+    responding control API (``control status`` reports the same probe), so the two
+    can never disagree about whether a control is up. Its 2s budget is deliberate:
+    ``/health`` takes the supervisor lock and does a blocking TCP liveness probe,
+    so a control busy in an ``ensure`` answers late — and here a false negative is
+    a hard exit, not a degraded reading.
+    """
+    from . import _data_plane
+
+    if os.environ.get(_data_plane.ENV_URL, "").strip():
+        return
+    if _query_control_health(*_control_endpoint()) is not None:
+        return
+    console.print(
+        "[red]No biopb control plane is running,[/red] so there is no data plane "
+        "for the viewer to read.\n"
+        "[yellow]Start it first: biopb control start[/yellow]"
+    )
+    raise typer.Exit(1)
 
 
 def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
@@ -773,7 +572,9 @@ def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
         time.sleep(0.25)
 
 
-@mcp_app.command("view")
+@mcp_app.command(
+    "view", help="Open the napari viewer in this terminal (Ctrl-C to stop)."
+)
 def mcp_view(
     port: Optional[int] = typer.Option(
         None,
@@ -794,8 +595,14 @@ def mcp_view(
     this terminal's stdio and process group, so Ctrl-C reaches it directly (its
     own SIGINT handler reaps the kernel/viewer). This CLI stays free of the heavy
     napari/Qt import — it only launches and waits.
+
+    Requires a running control plane (biopb/biopb#628), checked here rather than
+    after the child's multi-second napari import: the control is the only source
+    of a data plane, so a viewer started without one could open nothing. Unlike
+    the stdio shim we do not start it — a person is at this terminal and can.
     """
     _require_biopb_mcp()
+    _require_control_for_view()
     resolved_port = 0 if port is None else port
     cmd = [
         sys.executable,
@@ -838,7 +645,7 @@ app.add_typer(mcp_app, name="mcp")
 # shells out `biopb server start` -- it asks the control plane to ensure the data plane.
 control_app = typer.Typer(
     name="control",
-    help="Biopb control plane: supervise the data plane (start/stop/status/run)",
+    help="Manage the control plane, which supervises the data plane.",
 )
 
 
@@ -859,11 +666,116 @@ def _require_biopb_control() -> None:
         raise typer.Exit(1)
 
 
+def _require_tls_extra() -> None:
+    """Exit(2) with an install hint if ``--tls`` cannot possibly work.
+
+    ``cryptography`` is an opt-in extra (biopb/biopb#355 -- it drags a
+    Rust/OpenSSL build surface that breaks ``curl install.sh | bash`` on some
+    platforms), so a default install cannot mint the self-signed certificate
+    ``--tls`` needs.
+
+    Without this check the failure lands in the *wrong place entirely*: the
+    control starts fine and reports success, then its supervised plane exits 2
+    on every spawn and crash-loops on backoff, with the one useful sentence
+    buried in ``tensor-server.log``. The user sees a control that started and a
+    data plane that never serves. Checking here fails the command the user
+    actually typed, before anything is spawned.
+
+    Same-interpreter check: the control is spawned as ``sys.executable -m
+    biopb_control`` and spawns the plane the same way, so this process's import
+    spec is the plane's (and ``sys.executable`` names the exact environment to
+    install into -- which a generic ``pip install`` hint would not, under the
+    ``uv tool`` layout the installer uses).
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cryptography") is not None:
+        return
+    console.print(
+        "[red]--tls needs the 'cryptography' package, which is not installed."
+        "[/red]\nIt is an opt-in extra: it needs a Rust/OpenSSL build that the "
+        "default install deliberately avoids (biopb/biopb#355).\n"
+    )
+    console.print(
+        "[yellow]Install it into the environment that runs the data plane:[/yellow]"
+    )
+    # The one line the reader must copy verbatim, so it gets the same treatment
+    # as a printed fingerprint: soft_wrap so a narrow terminal cannot break it
+    # across lines, and markup off because Rich reads a bare `[tls]` as a style
+    # tag and silently eats it.
+    console.print(
+        f"    {sys.executable} -m pip install 'biopb-tensor-server[tls]'",
+        soft_wrap=True,
+        markup=False,
+        highlight=False,
+    )
+    console.print(
+        "\nThen retry. Or start without [bold]--tls[/bold] — the data plane still "
+        "serves, clients just dial grpc:// instead of grpcs://."
+    )
+    raise typer.Exit(2)
+
+
 def _control_endpoint() -> Tuple[str, int]:
-    """The control-API (host, port) from the shared core-SDK location."""
+    """Where to *find* a control: env override -> published record -> 8813.
+
+    The discovery form, for commands that talk to a control someone else started
+    (``status`` / ``stop`` / ``logs`` / ``dashboard``). A control started with a
+    non-default ``--base-port`` publishes its endpoint on serve, which is what
+    lets these follow it (see ``biopb._locations.control_runtime_file``).
+
+    Never used to decide a *bind* -- that is :func:`_control_bind_endpoint`.
+    Binding to a discovered value would mean a crashed control's stale record
+    dictates where the next one listens.
+    """
     from ._endpoints import control_host, control_port
 
     return control_host(), control_port()
+
+
+def _control_bind_endpoint(base_port: int) -> Tuple[str, int]:
+    """Where a control we are *starting* should listen: base+3, env still wins.
+
+    ``BIOPB_CONTROL_HOST`` / ``BIOPB_CONTROL_PORT`` keep top precedence so the
+    pre-base-port escape hatch still works and a reader and a writer that both
+    honor the env can never disagree; otherwise the port comes from the base and
+    nowhere else -- notably *not* from the published record, which describes some
+    other (possibly dead) control.
+    """
+    from ._endpoints import CONTROL_DEFAULT_HOST, control_port_for
+
+    host = os.environ.get("BIOPB_CONTROL_HOST") or CONTROL_DEFAULT_HOST
+    raw = os.environ.get("BIOPB_CONTROL_PORT")
+    if raw:
+        try:
+            return host, int(raw)
+        except ValueError:
+            pass
+    return host, control_port_for(base_port)
+
+
+def _print_ui_tunnel_hint(control_port: int) -> None:
+    """Print the SSH-tunnel recipe for reaching the browser UI off-box.
+
+    ``--remote`` publishes the flight plane and nothing else: the control serves
+    plaintext HTTP and has no TLS support, so a public bind would carry the
+    data-plane token — which unlocks the data *and* admin API — in the clear
+    (biopb/biopb#614). A tunnel gets encryption and authentication for free, adds
+    no listener, and is the pattern Jupyter users already know. Print it here so
+    it is discoverable at the moment the user needs it, rather than folklore.
+    """
+    import socket
+
+    host = socket.gethostname() or "<host>"
+    console.print("  Browser UI: loopback only. From another machine, tunnel it:")
+    # soft_wrap so a narrow terminal cannot break the one line the reader has to
+    # copy verbatim (same treatment as the pip hint in _require_tls_extra).
+    console.print(
+        f"    [bold]ssh -L {control_port}:localhost:{control_port} {host}[/bold]",
+        soft_wrap=True,
+        highlight=False,
+    )
+    console.print(f"    then open http://localhost:{control_port}")
 
 
 def _control_log_file() -> Path:
@@ -900,52 +812,86 @@ def _control_start_lock() -> Path:
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
 
-_LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
+def _resolve_grpc_bind(grpc_bind: Optional[str], remote: bool) -> str:
+    """The flight bind from ``--grpc-bind``, honoring the deprecated ``--remote``.
 
-
-def _read_flight_host(config: Path) -> str:
-    """The flight (gRPC) server's configured bind address (``server.host``).
-
-    Defaults to ``0.0.0.0`` when the config can't be read, so an unreadable
-    config is treated as a *public* bind — the fail-closed direction.
+    ``--remote`` named a *mode* back when it also published the browser UI. Since
+    biopb/biopb#614 it sets one thing — the flight address — so the flag is now
+    named for that. It survives as an alias because it is in install scripts,
+    service units, and every doc; an explicit ``--grpc-bind`` wins over it, since
+    naming an address is more specific than asking for "public".
     """
-    grpc_host = "0.0.0.0"
-    if config.exists():
-        try:
-            from biopb_tensor_server.core.config import (
-                load_config as _load_server_config,
+    if grpc_bind is None:
+        if remote:
+            console.print(
+                "[yellow]--remote is deprecated[/yellow]; it now means exactly "
+                "[bold]--grpc-bind 0.0.0.0[/bold]. Prefer the explicit form."
             )
+            return "0.0.0.0"
+        return "127.0.0.1"
+    if remote:
+        console.print(
+            f"[yellow]--remote ignored[/yellow]: --grpc-bind {grpc_bind} is explicit."
+        )
+    return grpc_bind
 
-            grpc_host = _load_server_config(config).host
-        except Exception:
-            pass
-    return grpc_host
+
+def _resolve_tls(tls: Optional[bool], grpc_bind: str) -> bool:
+    """Whether to serve the flight plane over TLS. **The bind decides the default.**
+
+    A public flight bind defaults TLS *on*; loopback defaults it off. Tying it
+    this way round — bind drives TLS, not TLS drives bind — keeps each flag's
+    name matching its own effect, and makes the dangerous combination the one you
+    have to ask for by name: ``--grpc-bind 0.0.0.0 --no-tls`` puts the access
+    token on the wire in cleartext on every gRPC call, which is precisely the
+    objection biopb/biopb#614 raised about the control, transplanted onto the
+    data plane. It stays *possible* — a trusted intranet is a real deployment —
+    but it is spelled out rather than defaulted into.
+
+    ``--tls`` alone therefore still means "encrypted, loopback only", which is
+    what exercising the TOFU pinning and SAN-verification paths (#606) needs.
+    """
+    if tls is not None:
+        return tls
+    return _web_auth.host_is_public_bind(grpc_bind)
 
 
-def _resolve_mode(config: Path, remote: bool, token: Optional[str]) -> Optional[str]:
-    """Resolve the data-plane token for the chosen deployment mode.
+def _warn_public_plaintext(grpc_bind: str, tls: bool) -> None:
+    """Warn when the data plane is published without TLS (an explicit --no-tls)."""
+    if not tls and _web_auth.host_is_public_bind(grpc_bind):
+        console.print(
+            f"[yellow]Warning:[/yellow] the data plane is bound publicly "
+            f"({grpc_bind}) without TLS. The access token and every pixel cross "
+            "the network in cleartext — keep this to a trusted intranet, or drop "
+            "[bold]--no-tls[/bold] to serve grpcs://."
+        )
+
+
+def _resolve_mode(grpc_bind: str, token: Optional[str]) -> Optional[str]:
+    """Resolve the data-plane token for the chosen flight bind.
 
     Token enforcement is **independent** of the network mode: a token may be
-    supplied — via ``--token`` or ``BIOPB_TENSOR_TOKEN`` — in *either* mode, so a
-    single-machine deployment can still gate its listeners for defense-in-depth
-    on a shared host. What ``--remote`` controls is the *bind address*: local
-    binds every listener to loopback, remote binds the control UI + flight server
-    publicly.
+    supplied — via ``--token`` or ``BIOPB_TENSOR_TOKEN`` — with *either* bind, so
+    a single-machine deployment can still gate its listeners for defense-in-depth
+    on a shared host. What ``--grpc-bind`` controls is who can reach the plane.
 
-    - **Local** (default): every listener binds loopback. A token is *optional*;
-      when one is supplied it is enforced (the browser then gates behind the
-      unlock page, same as remote). Fail-closed: a config that binds the flight
-      server publicly (``server.host`` non-loopback) with **no** token is refused,
-      because that would expose data on the network without auth.
-    - **Remote** (``--remote``): the flight server + control bind publicly, so a
-      token is **required** — supplied, or else generated and printed.
+    - **Loopback** (the default): a token is *optional*; when one is supplied it
+      is enforced (the browser then gates behind the unlock page just the same).
+    - **Public**: the flight server is reachable off-box, so a token is
+      **required** — supplied, or else generated and printed.
 
-    Returns the token to enforce (``None`` only when none is supplied in local
-    mode).
+    The control (the browser UI) stays on loopback with *either* bind; it is
+    plaintext HTTP with no TLS support, so publishing it would put this very
+    token on the wire in the clear (biopb/biopb#614). Reach it over an SSH tunnel.
+
+    "Public but unauthenticated" is therefore unrepresentable through this
+    command: the one address that decides exposure is the one this reads, through
+    the same :func:`biopb._web_auth.host_is_public_bind` the tensor ``launch`` and
+    the control's own bind guard use, so the three cannot drift.
+
+    Returns the token to enforce (``None`` only when none is supplied on a
+    loopback bind).
     """
-    grpc_host = _read_flight_host(config)
-    flight_public = grpc_host not in _LOCALHOST_ADDRS
-
     token = token or os.environ.get("BIOPB_TENSOR_TOKEN")
     if token:
         # Validate here with the shared rule the tensor `launch` applies, so the
@@ -956,30 +902,18 @@ def _resolve_mode(config: Path, remote: bool, token: Optional[str]) -> Optional[
         if not _web_auth.valid_token(token):
             console.print(
                 "[red]Invalid access token[/red]: must be 16-128 URL-safe "
-                "characters ([A-Za-z0-9_-]). Fix --token / BIOPB_TENSOR_TOKEN, "
-                "or omit it to run tokenless (local) / auto-generate one (--remote)."
+                "characters ([A-Za-z0-9_-]). Fix --token / BIOPB_TENSOR_TOKEN, or "
+                "omit it to run tokenless (loopback) / auto-generate one (public)."
             )
             raise typer.Exit(1)
         return token
 
-    # No token supplied.
-    if remote:
+    if _web_auth.host_is_public_bind(grpc_bind):
         import secrets as _secrets
 
         token = _secrets.token_urlsafe(32)
         console.print(f"[bold green]Generated access token:[/bold green] {token}")
         return token
-
-    # Local mode, tokenless — must not expose data on the network without auth.
-    if flight_public:
-        console.print(
-            f"[red]The flight server config binds publicly (server.host="
-            f"{grpc_host}), but no token would be enforced.[/red] "
-            "Pass [bold]--token[/bold] (or set BIOPB_TENSOR_TOKEN) to enforce one, "
-            "start with [bold]--remote[/bold], or set server.host to a loopback "
-            "address (127.0.0.1)."
-        )
-        raise typer.Exit(1)
     return None
 
 
@@ -997,39 +931,100 @@ def _query_control_health(host: str, port: int, timeout: float = 2.0) -> Optiona
         return None
 
 
+def _flight_location(grpc_bind: str, base_port: int, tls: bool) -> str:
+    """The flight plane's dial string, e.g. ``grpcs://0.0.0.0:8815``.
+
+    Printed at startup because ``--base-port`` makes the port a computation: an
+    operator who firewalled "8815" by habit needs to see where it actually landed,
+    and whether it is plaintext or TLS.
+    """
+    host, port = _plane_bind(grpc_bind, base_port)
+    scheme = "grpcs" if tls else "grpc"
+    authority = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{authority}:{port}"
+
+
+def _guard_ports_free(base_port: int, grpc_bind: str, data_plane: bool) -> None:
+    """Refuse to start into a port something already holds, naming which one.
+
+    Shared by ``control start`` and ``control run`` -- the foreground command used
+    to skip this entirely and crash-land in uvicorn's bind error instead, which is
+    the same deployment failing with a worse message.
+
+    All three listeners are checked. The sidecar was previously unguarded, which
+    was survivable while it was pinned to 8814 but is not now that ``--base-port``
+    can land it on anything: an unguarded collision surfaces as a control that
+    starts clean and then crash-loops its plane in the background.
+    """
+    checks = [("Control-plane", *_control_bind_endpoint(base_port))]
+    if data_plane:
+        checks.append(("Data-plane gRPC", *_probe_hostport(grpc_bind, base_port)))
+        checks.append(("Tensor HTTP sidecar", "127.0.0.1", _sidecar_port(base_port)))
+    for label, host, port in checks:
+        if not _port_listening(host, port):
+            continue
+        console.print(f"[red]{label} port {host}:{port} is already in use.[/red]")
+        console.print(
+            "It is held by a process biopb is not tracking (an orphaned plane, or "
+            "another login session), so [bold]biopb control stop[/bold] cannot "
+            f"reach it. Identify and stop the owner (`lsof -i :{port}` / "
+            f"`netstat -ano | findstr {port}`), then retry -- or move the whole "
+            "deployment with [bold]--base-port[/bold]."
+        )
+        raise typer.Exit(1)
+
+
+def _resolve_url_prefix(url_prefix: Optional[str]) -> Optional[str]:
+    """Normalize ``--url-prefix`` / ``$BIOPB_URL_PREFIX``, or exit naming the fault.
+
+    Rejected here, before anything is spawned or bound, because the prefix ends
+    up in the served ``<base href>``: a value that is not a plain same-origin
+    path would repoint every relative URL in the SPA (biopb/biopb#728). The rule
+    itself lives in biopb_control, next to the code that consumes it.
+    """
+    from biopb_control._control import normalize_url_prefix
+
+    try:
+        return normalize_url_prefix(url_prefix)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2)
+
+
 def _control_run_argv(
     *,
     config: Path,
     static_dir: Optional[Path],
     web_host: str,
-    web_port: int,
+    base_port: int,
     log_level: str,
     data_plane: bool,
-    remote: bool,
+    grpc_bind: str,
+    tls: bool = False,
+    url_prefix: Optional[str] = None,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
-    The core CLI resolves everything (grpc endpoint, mode, endpoint, log paths)
-    and passes it explicitly, so biopb_control imports no server config
-    (invariant I2). The supervised tensor server logs to tensor-server.log; the
-    control plane's own output is redirected by the caller to control.log.
+    The core CLI resolves everything (binds, ports, token, log paths) and passes
+    it explicitly, so biopb_control imports no server config (invariant I2) and
+    knows nothing of the base-port convention -- it receives three already-derived
+    ports. The supervised tensor server logs to tensor-server.log; the control
+    plane's own output is redirected by the caller to control.log.
 
     The access token is **not** on this argv: a command line is world-readable
     (`ps aux`, Task Manager) on exactly the multi-user hosts a token is meant to
     protect (biopb/biopb#414). It travels only via ``BIOPB_TENSOR_TOKEN`` in the
-    child env (set by the caller). ``--remote`` — not a secret — is the explicit
-    public-deployment signal; it also binds the control's own listener publicly
-    (0.0.0.0) so the browser UI is reachable off-box, while the local (default)
-    mode keeps every listener on loopback.
+    child env (set by the caller).
+
+    No ``--remote`` either, and not because it is secret: ``--grpc-host`` below
+    already carries the one fact it used to signal. The child re-derives "is this
+    deployment public?" from that address with the shared predicate, so the two
+    layers cannot disagree about it (biopb/biopb#614). The control's own listener
+    stays on loopback regardless.
     """
-    grpc_host, grpc_port = _resolve_grpc_hostport(config)
-    control_host, control_port = _control_endpoint()
-    # Remote mode: bind the control's HTTP listener on all interfaces so the
-    # dashboard/dataviewer is reachable off-box (the token gates it). The starter
-    # still probes readiness over loopback, so _control_endpoint()'s host is kept
-    # only for that probe, not passed through here.
-    if remote:
-        control_host = "0.0.0.0"
+    grpc_host, grpc_port = _plane_bind(grpc_bind, base_port)
+    control_host, control_port = _control_bind_endpoint(base_port)
+    web_port = _sidecar_port(base_port)
     argv = [
         sys.executable,
         "-m",
@@ -1058,50 +1053,112 @@ def _control_run_argv(
     ]
     if static_dir and static_dir.exists():
         argv += ["--static-dir", str(static_dir)]
+    if url_prefix:
+        # Not secret (it is a hostname and a port), unlike the token above.
+        argv += ["--url-prefix", url_prefix]
     if not data_plane:
         argv.append("--no-data-plane")
-    if remote:
-        argv.append("--remote")
+    if tls:
+        argv.append("--tls")
     return argv
 
 
-@control_app.command("start")
+# --- shared `control start` / `control run` options ----------------------- #
+#
+# The two commands stand up the *same* deployment; only process ownership
+# differs (daemon vs foreground). Their flags therefore have to agree, and they
+# had drifted -- same option set, three different help texts, so `--help` told
+# you different things depending on which you asked. One `typer.Option` object
+# per flag, referenced by both, makes that unrepresentable instead of a review
+# item. Anything genuinely command-specific stays declared inline.
+
+_OPT_CONFIG = typer.Option(
+    DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
+)
+_OPT_STATIC_DIR = typer.Option(
+    DEFAULT_WEBAPP,
+    "--static-dir",
+    help="Web UI bundle the control serves at its root (the built web/ dist)",
+)
+_OPT_BASE_PORT = typer.Option(
+    _endpoints.BASE_DEFAULT_PORT,
+    "--base-port",
+    help="Base port for the whole deployment. The three listeners are derived "
+    "from it: control/browser UI = base+3, tensor HTTP sidecar = base+4, flight "
+    "gRPC = base+5 (so the 8810 default gives 8813/8814/8815). Same convention "
+    "as the container's BIOPB_BASE_PORT. Move it to run a second deployment "
+    "alongside another user's — give that one its own XDG_STATE_HOME too.",
+)
+_OPT_LOG_LEVEL = typer.Option("INFO", "--log-level", "-l", help="Control log level")
+_OPT_GRPC_BIND = typer.Option(
+    None,
+    "--grpc-bind",
+    help="Address the flight (data-plane) server binds. Loopback (the default, "
+    "127.0.0.1) keeps the deployment on this machine. A public address "
+    "(0.0.0.0, or one interface's IP) serves it to other machines, and then an "
+    "access token is REQUIRED — supplied via --token, else generated and "
+    "printed — and TLS is on by default. This is the only listener that is ever "
+    "published: the sidecar and the browser UI stay on loopback, reachable "
+    "off-box through the ssh -L tunnel printed on start.",
+)
+_OPT_TLS = typer.Option(
+    None,
+    "--tls/--no-tls",
+    help="Serve the flight port over TLS with a self-signed certificate "
+    "(generated on first use); clients dial grpcs:// and pin it on first connect. "
+    "Defaults to ON for a public --grpc-bind and off for loopback, so the "
+    "default follows the exposure. --tls needs the 'tls' extra; read the "
+    "fingerprint with `biopb-tensor-server cert init`. --no-tls on a public bind "
+    "sends the token in cleartext — trusted networks only.",
+)
+_OPT_TOKEN = typer.Option(
+    None,
+    "--token",
+    help="Access token (or set BIOPB_TENSOR_TOKEN). Enforced with either bind: "
+    "required for a public --grpc-bind (auto-generated if omitted), optional on "
+    "loopback as defense-in-depth on a shared machine. A loopback token gates "
+    "the browser too; local clients read it from the credential file the control "
+    "writes, so biopb-mcp needs no environment of its own (biopb/biopb#470).",
+)
+_OPT_URL_PREFIX = typer.Option(
+    None,
+    "--url-prefix",
+    envvar="BIOPB_URL_PREFIX",
+    help="Path prefix a reverse proxy publishes the browser UI under, instead of "
+    "the origin root — e.g. --url-prefix /node/$host/$port for an Open OnDemand "
+    "interactive app, whose route passes the full path through and rewrites "
+    "nothing. Requests under the prefix are stripped before routing and the SPA "
+    "shell is rewritten to point back at it; unprefixed requests keep working. "
+    "Explicit configuration only: the prefix is never read off a request header "
+    "such as X-Forwarded-Prefix.",
+)
+_OPT_DATA_PLANE = typer.Option(
+    True,
+    "--data-plane/--no-data-plane",
+    help="Bring the data plane up on start (default). With --no-data-plane the "
+    "control plane starts without it; a client brings it up on demand via the "
+    "control API.",
+)
+
+
+@control_app.command(
+    "start", help="Start the control plane (and its data plane) as a daemon."
+)
 def control_start(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
-    ),
-    static_dir: Optional[Path] = typer.Option(
-        DEFAULT_WEBAPP,
-        "--static-dir",
-        help="Web UI bundle the control serves at its root (the built web/ dist)",
-    ),
-    web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
-    log_level: str = typer.Option(
-        "INFO", "--log-level", "-l", help="Control log level"
-    ),
+    config: Path = _OPT_CONFIG,
+    static_dir: Optional[Path] = _OPT_STATIC_DIR,
+    base_port: int = _OPT_BASE_PORT,
+    log_level: str = _OPT_LOG_LEVEL,
+    grpc_bind: Optional[str] = _OPT_GRPC_BIND,
+    tls: Optional[bool] = _OPT_TLS,
+    token: Optional[str] = _OPT_TOKEN,
+    data_plane: bool = _OPT_DATA_PLANE,
+    url_prefix: Optional[str] = _OPT_URL_PREFIX,
     remote: bool = typer.Option(
         False,
         "--remote",
-        help="Serve on the network behind a token: bind the control (browser UI) "
-        "and the flight server publicly, and require an access token. Without it "
-        "(the default) every listener binds loopback; a token is optional (pass "
-        "--token to enforce one).",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        help="Access token (or set BIOPB_TENSOR_TOKEN). Enforced in either mode: "
-        "required for --remote (auto-generated if omitted), optional in local "
-        "mode (loopback bind either way). A local token gates the browser too, "
-        "and biopb-mcp then needs BIOPB_TENSOR_TOKEN in its own environment to "
-        "reach the data plane (biopb/biopb#470).",
-    ),
-    data_plane: bool = typer.Option(
-        True,
-        "--data-plane/--no-data-plane",
-        help="Bring the data plane up on start (default). With --no-data-plane "
-        "the control plane starts without it; a client brings it up on demand via the "
-        "control API.",
+        hidden=True,
+        help="Deprecated alias for --grpc-bind 0.0.0.0.",
     ),
 ):
     """Start the biopb control plane as a background daemon.
@@ -1114,16 +1171,34 @@ def control_start(
     the gRPC port is already in use, `control start` refuses (stop the stray server
     first), so `biopb control stop` is always a complete data-plane teardown.
 
-    Two deployment modes: **local** (default) binds every listener to loopback —
-    the single-machine 90% case, tokenless unless you pass ``--token`` (an
-    optional defense-in-depth gate on a shared machine); and **remote**
-    (``--remote``) binds the control's browser UI and the flight server publicly
-    behind a *required* token, for serving a tensor deployment to other machines.
-    The tensor HTTP sidecar always stays on loopback (the control proxies it),
-    and the flight server's bind comes from the config's ``server.host`` — local
-    mode refuses to start if that is non-loopback and no token is enforced.
+    **Ports** come from one number, ``--base-port`` (default 8810): control =
+    base+3, sidecar = base+4, flight = base+5 — the container's convention. A
+    control that moved off 8813 publishes where it landed, so `stop` / `status` /
+    `logs` and biopb-mcp follow it without being told.
+
+    **Exposure** comes from one address, ``--grpc-bind`` (default 127.0.0.1).
+    Loopback is the single-machine 90% case, tokenless unless you pass ``--token``
+    (defense-in-depth on a shared machine). A public address serves the data plane
+    to other machines, and then a token is *required* and TLS is on by default —
+    the bind is read once, through the predicate the tensor `launch` and the
+    control's own guard share, so "public but unauthenticated" is unrepresentable
+    rather than something to validate against (biopb/biopb#604).
+
+    Only the flight plane is ever published. The tensor HTTP sidecar stays on
+    loopback (the control proxies it), and so does the control itself — the
+    browser UI is plaintext HTTP with no TLS support, so publishing it would send
+    the token that unlocks the whole data and admin API in the clear, which is
+    exactly the client class the TLS work set out to remove (biopb/biopb#614). To
+    open the UI from another machine, tunnel it: ``ssh -L 8813:localhost:8813
+    <host>``, then browse http://localhost:8813.
     """
     _require_biopb_control()
+    grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
+    url_prefix = _resolve_url_prefix(url_prefix)
+    tls = _resolve_tls(tls, grpc_bind)
+    if tls:
+        _require_tls_extra()
+    _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
     _reject_legacy_toml(config)
 
@@ -1147,48 +1222,22 @@ def control_start(
                 )
                 _remove_control_pid()
 
-            control_host, control_port = _control_endpoint()
-            if _port_listening(control_host, control_port):
-                console.print(
-                    f"[red]Control-plane port {control_host}:{control_port} is already in use.[/red]"
-                )
-                console.print(
-                    "It is held by a process biopb is not tracking (an orphaned control plane, or "
-                    "another login session), so [bold]biopb control stop[/bold] cannot reach "
-                    "it. Identify and stop the owner, then retry."
-                )
-                raise typer.Exit(1)
+            control_host, control_port = _control_bind_endpoint(base_port)
+            _guard_ports_free(base_port, grpc_bind, data_plane)
 
-            # The control plane owns the data plane exclusively, so refuse to start into a gRPC
-            # port a stray server already holds -- otherwise the supervised child would
-            # crash-loop on EADDRINUSE. Skipped for --no-data-plane (the plane comes
-            # up on demand, guarded there too).
-            if data_plane:
-                grpc_host, grpc_port = _resolve_grpc_hostport(config)
-                if _port_listening(grpc_host, grpc_port):
-                    console.print(
-                        f"[red]Data-plane gRPC port {grpc_host}:{grpc_port} is already "
-                        "in use.[/red]"
-                    )
-                    console.print(
-                        "The control plane owns the data plane exclusively and will not adopt a "
-                        "server it did not start. Stop the process holding that port "
-                        f"(`lsof -i :{grpc_port}` / `netstat -ano | findstr {grpc_port}`), "
-                        "then retry -- or start with [bold]--no-data-plane[/bold]."
-                    )
-                    raise typer.Exit(1)
-
-            resolved_token = _resolve_mode(config, remote, token)
+            resolved_token = _resolve_mode(grpc_bind, token)
             argv = _control_run_argv(
                 config=config,
                 static_dir=static_dir,
-                # The sidecar always binds loopback; the control proxies it. Only
-                # the control (browser UI) and flight server go public in --remote.
+                # The sidecar always binds loopback; the control proxies it. The
+                # flight server is the only listener --grpc-bind can publish.
                 web_host="127.0.0.1",
-                web_port=web_port,
+                base_port=base_port,
                 log_level=log_level,
                 data_plane=data_plane,
-                remote=remote,
+                grpc_bind=grpc_bind,
+                tls=tls,
+                url_prefix=url_prefix,
             )
 
             log_file = _control_log_file()
@@ -1229,10 +1278,14 @@ def control_start(
             )
             console.print(f"  Control: http://{control_host}:{control_port}")
             if data_plane:
-                console.print("  Data plane: starting (see 'biopb control status')")
+                console.print(
+                    f"  Data plane: starting on {_flight_location(grpc_bind, base_port, tls)}"
+                )
             else:
                 console.print("  Data plane: not started (--no-data-plane; on-demand)")
             console.print(f"  Logs: {log_file}")
+            if _web_auth.host_is_public_bind(grpc_bind):
+                _print_ui_tunnel_hint(control_port)
     except LockTimeout:
         console.print(
             "[red]Another 'biopb control start' is already in progress and did not "
@@ -1241,7 +1294,31 @@ def control_start(
         raise typer.Exit(1)
 
 
-@control_app.command("stop")
+def _live_foreground_control() -> Optional[Tuple[dict, int]]:
+    """The published record of a live foreground control, as ``(record, pid)``.
+
+    A foreground `biopb control run` writes no pid file -- its terminal or
+    service manager owns it -- so this endpoint record is the only trace of it.
+    Verified for *identity*, not merely liveness: a clean stop retracts the
+    record, so the way to strand one is a crash, and a pid recycled since then
+    would otherwise read as a control still serving. `_is_our_daemon` compares
+    the recorded create-time token and refuses to vouch for a different process.
+
+    Falls back to liveness when the record carries no usable token (written
+    before the field existed, or a platform with no cheap create-time), matching
+    the pid file's own degradation -- never a false "not running".
+    """
+    record = _endpoints.read_runtime_record()
+    pid = record.get("pid")
+    if not isinstance(pid, int):
+        return None
+    token = record.get("create_time")
+    if not _is_our_daemon(pid, token if isinstance(token, int) else None):
+        return None
+    return record, pid
+
+
+@control_app.command("stop", help="Stop the control plane and the data plane it owns.")
 def control_stop(
     timeout: int = typer.Option(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
@@ -1253,10 +1330,29 @@ def control_stop(
     teardown: the supervised tensor server is shut down too. This is the single
     command an installer/upgrade uses to free the control-managed processes before
     replacing files.
+
+    Only reaches a *daemonized* control (`biopb control start`). A foreground
+    `biopb control run` belongs to its terminal or service manager, so this
+    reports it and declines rather than signalling a process it does not own.
     """
     _require_biopb_control()
     pid, token = _read_pid_record(CONTROL_PID_FILE)
     if not pid:
+        # `status` reports a foreground control as Running, so "nothing running"
+        # here would flatly contradict it. Say which one is up and who owns it.
+        live = _live_foreground_control()
+        if live:
+            record, record_pid = live
+            console.print(
+                f"[yellow]A foreground control plane is running (PID {record_pid}, "
+                f"http://{record.get('host')}:{record.get('port')}).[/yellow]"
+            )
+            console.print(
+                "It was started with [bold]biopb control run[/bold], so it has no "
+                "PID file and this command does not own it. Stop it with Ctrl-C in "
+                "its terminal, or through your service manager."
+            )
+            raise typer.Exit(1)
         console.print("[yellow]No biopb control plane running[/yellow]")
         raise typer.Exit(0)
     if not _is_our_daemon(pid, token):
@@ -1283,7 +1379,9 @@ def control_stop(
     raise typer.Exit(0)
 
 
-@control_app.command("status")
+@control_app.command(
+    "status", help="Show the control plane's status and the data plane it supervises."
+)
 def control_status(
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -1294,6 +1392,16 @@ def control_status(
     pid, token = _read_pid_record(CONTROL_PID_FILE)
     running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
+
+    # A foreground `control run` writes no pid file -- the terminal or service
+    # manager owns it -- so it used to report "not running" however healthy it
+    # was. It does publish its endpoint, though, so fall back to that record and
+    # report it honestly rather than denying it exists.
+    foreground = False
+    if not running:
+        live = _live_foreground_control()
+        if live:
+            pid, running, stale, foreground = live[1], True, False, True
 
     control_host, control_port = _control_endpoint()
     health = _query_control_health(control_host, control_port) if running else None
@@ -1311,11 +1419,19 @@ def control_status(
         json_fields={
             "control_url": f"http://{control_host}:{control_port}" if running else None,
             "control_api": bool(health) if running else False,
+            "foreground": foreground,
             "data_plane": (data_plane or None) if running else None,
         },
         table_rows=[
             ("Control", f"http://{control_host}:{control_port}"),
             ("Control API", "responding" if health else "not responding"),
+            (
+                "Ownership",
+                "foreground (Ctrl-C or your service manager stops it; "
+                "'biopb control stop' does not)"
+                if foreground
+                else "daemon ('biopb control stop')",
+            ),
             ("Data plane", dp_state),
             ("Data plane URL", data_plane.get("grpc_url", "-")),
             ("Restarts", str(data_plane.get("restarts", 0))),
@@ -1323,7 +1439,9 @@ def control_status(
     )
 
 
-@control_app.command("logs")
+@control_app.command(
+    "logs", help="Show the control plane's log, or the data plane's with --data-plane."
+)
 def control_logs(
     data_plane: bool = typer.Option(
         False,
@@ -1363,72 +1481,77 @@ def control_logs(
     _tail_and_follow(log_file, follow, lines, _validate_level(level), level_of)
 
 
-@control_app.command("run")
+@control_app.command(
+    "run", help="Run the control plane in the foreground (Ctrl-C to stop)."
+)
 def control_run(
-    config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
-    ),
-    static_dir: Optional[Path] = typer.Option(
-        DEFAULT_WEBAPP,
-        "--static-dir",
-        help="Web UI bundle the control serves at its root (the built web/ dist)",
-    ),
-    web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
-    log_level: str = typer.Option(
-        "INFO", "--log-level", "-l", help="Control log level"
-    ),
+    config: Path = _OPT_CONFIG,
+    static_dir: Optional[Path] = _OPT_STATIC_DIR,
+    base_port: int = _OPT_BASE_PORT,
+    log_level: str = _OPT_LOG_LEVEL,
+    grpc_bind: Optional[str] = _OPT_GRPC_BIND,
+    tls: Optional[bool] = _OPT_TLS,
+    token: Optional[str] = _OPT_TOKEN,
+    data_plane: bool = _OPT_DATA_PLANE,
+    url_prefix: Optional[str] = _OPT_URL_PREFIX,
     remote: bool = typer.Option(
         False,
         "--remote",
-        help="Serve on the network behind a token (bind control + flight server "
-        "publicly). Without it every listener binds loopback; a token is optional "
-        "(pass --token to enforce one).",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        help="Access token (or set BIOPB_TENSOR_TOKEN). Enforced in either mode: "
-        "required for --remote (auto-generated if omitted), optional in local "
-        "mode (loopback bind either way). A local token gates the browser too, "
-        "and biopb-mcp then needs BIOPB_TENSOR_TOKEN in its own environment to "
-        "reach the data plane (biopb/biopb#470).",
-    ),
-    data_plane: bool = typer.Option(
-        True,
-        "--data-plane/--no-data-plane",
-        help="Bring the data plane up (default), or start without it (on-demand).",
+        hidden=True,
+        help="Deprecated alias for --grpc-bind 0.0.0.0.",
     ),
 ):
     """Run the control plane in the foreground (Ctrl-C to stop).
 
-    The foreground counterpart of `biopb control start`: no PID file, blocks this
+    The foreground counterpart of `biopb control start`, and the *same*
+    deployment: identical flags, identical binds, identical port derivation from
+    ``--base-port``. Only process ownership differs — no PID file, blocks this
     terminal, tears everything down on Ctrl-C. Useful for a systemd/launchd unit
-    (let the service manager own the process) or for debugging supervision. See
-    `biopb control start` for the local/remote mode model.
+    (let the service manager own the process) or for debugging supervision.
+
+    It still publishes where it listens, so `status` / `logs` and biopb-mcp find
+    a foreground control exactly as they find a daemonized one. `biopb control
+    stop` does not reach it, by design: the pid file is the daemon's lifecycle
+    record and this process belongs to your terminal or your service manager.
+    See `biopb control start` for the bind / token / TLS model.
     """
     _require_biopb_control()
+    grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
+    url_prefix = _resolve_url_prefix(url_prefix)
+    tls = _resolve_tls(tls, grpc_bind)
+    if tls:
+        _require_tls_extra()
+    _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
     _reject_legacy_toml(config)
     from biopb_control import run_control
     from biopb_control._supervisor import DataPlaneSpec
 
-    grpc_host, grpc_port = _resolve_grpc_hostport(config)
-    control_host, control_port = _control_endpoint()
-    resolved_token = _resolve_mode(config, remote, token)
-    # Remote mode binds the control's own listener publicly so the browser UI is
-    # reachable off-box; the token gates it. The sidecar always stays on loopback.
-    if remote:
-        control_host = "0.0.0.0"
+    grpc_host, grpc_port = _plane_bind(grpc_bind, base_port)
+    control_host, control_port = _control_bind_endpoint(base_port)
+    # The same pre-flight `start` does. It used to be missing here, so a busy port
+    # surfaced as uvicorn's bind traceback instead of a message naming the port.
+    _guard_ports_free(base_port, grpc_bind, data_plane)
+    resolved_token = _resolve_mode(grpc_bind, token)
+    console.print(f"  Control: http://{control_host}:{control_port}")
+    if data_plane:
+        console.print(f"  Data plane: {_flight_location(grpc_bind, base_port, tls)}")
+    # Only the flight plane is ever published; the control and the sidecar stay on
+    # loopback either way (biopb/biopb#614), so point the user at the tunnel.
+    if _web_auth.host_is_public_bind(grpc_bind):
+        _print_ui_tunnel_hint(control_port)
     spec = DataPlaneSpec(
         config=config,
         grpc_host=grpc_host,
         grpc_port=grpc_port,
+        tls=tls,
         web_host="127.0.0.1",
-        web_port=web_port,
+        web_port=_sidecar_port(base_port),
         static_dir=static_dir if (static_dir and static_dir.exists()) else None,
         log_level=log_level,
         server_log=_get_log_file(),
         token=resolved_token,
+        url_prefix=url_prefix,
     )
     code = run_control(
         spec,
@@ -1444,19 +1567,23 @@ def control_run(
 app.add_typer(control_app, name="control")
 
 
-@app.command("dashboard")
+@app.command(
+    "dashboard", help="Open the biopb dashboard, starting the control plane if needed."
+)
 def dashboard(
-    remote: bool = typer.Option(
-        False,
-        "--remote",
-        help="If the control plane isn't already running, start it in remote mode "
-        "(bind publicly behind a token). See 'biopb control start --remote'.",
-    ),
+    base_port: int = _OPT_BASE_PORT,
+    grpc_bind: Optional[str] = _OPT_GRPC_BIND,
     no_browser: bool = typer.Option(
         False,
         "--no-browser",
         help="Ensure the control plane is up but only print the dashboard URL "
         "instead of opening a browser.",
+    ),
+    remote: bool = typer.Option(
+        False,
+        "--remote",
+        hidden=True,
+        help="Deprecated alias for --grpc-bind 0.0.0.0.",
     ),
 ):
     """Open the biopb dashboard, starting the control plane first if needed.
@@ -1465,8 +1592,16 @@ def dashboard(
     plane and serves the web UI) is running, then points your default web browser
     at the dashboard. Idempotent -- if the control plane is already up it just
     opens the page. This is what the desktop shortcut the installer creates runs.
+
+    ``--base-port`` / ``--grpc-bind`` are forwarded to `biopb control start` and
+    only matter when there is nothing running to open.
     """
+    # Prefer a control that is already serving -- it publishes its endpoint, so
+    # this finds one that `--base-port` moved. Fall back to where we *would* start
+    # one, which is also what a first run resolves to.
     control_host, control_port = _control_endpoint()
+    if not _port_listening(control_host, control_port):
+        control_host, control_port = _control_bind_endpoint(base_port)
     url = f"http://{control_host}:{control_port}"
 
     if _port_listening(control_host, control_port):
@@ -1476,15 +1611,23 @@ def dashboard(
         # returns only once the control API is listening). It signals its outcome
         # by raising typer.Exit; a non-zero code means the plane never came up, so
         # bail out rather than open a browser at a dead URL.
+        #
+        # EVERY parameter has to be passed explicitly: called as a plain function
+        # the typer defaults are not applied, so an omitted one arrives as the
+        # `OptionInfo` sentinel — truthy, and not the type the body expects.
+        # test_ui_passes_every_control_start_parameter holds this to the signature.
         try:
             control_start(
                 config=DEFAULT_CONFIG,
                 static_dir=DEFAULT_WEBAPP,
-                web_port=8814,
+                base_port=base_port,
                 log_level="INFO",
-                remote=remote,
+                grpc_bind=grpc_bind,
+                tls=None,
                 token=None,
                 data_plane=True,
+                remote=remote,
+                url_prefix=None,
             )
         except typer.Exit as started:
             if started.exit_code:
@@ -1514,8 +1657,7 @@ def dashboard(
 # truth both this CLI and the control-plane dashboard call.
 agents_app = typer.Typer(
     name="agents",
-    help="Register biopb-mcp with local AI agent clients "
-    "(Claude Code, Claude Desktop, Cursor, opencode).",
+    help="Register biopb-mcp with local AI agent clients.",
 )
 
 # State -> rich style for the status column.
@@ -1576,7 +1718,9 @@ def _resolve_agent_targets(
     return targets
 
 
-@agents_app.command("list")
+@agents_app.command(
+    "list", help="Show each supported client and whether biopb is registered."
+)
 def agents_list(
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -1601,7 +1745,9 @@ def agents_list(
     console.print(table)
 
 
-@agents_app.command("register")
+@agents_app.command(
+    "register", help="Register biopb-mcp with a client (or all, with --all)."
+)
 def agents_register(
     client: Optional[str] = typer.Argument(
         None, help="Client id (e.g. claude-code); omit when using --all"
@@ -1629,7 +1775,9 @@ def agents_register(
     raise typer.Exit(1 if failures else 0)
 
 
-@agents_app.command("unregister")
+@agents_app.command(
+    "unregister", help="Remove biopb-mcp from a client (or all, with --all)."
+)
 def agents_unregister(
     client: Optional[str] = typer.Argument(
         None, help="Client id (e.g. claude-code); omit when using --all"
@@ -1865,7 +2013,11 @@ def _defender_status(targets: List[str]) -> None:
         )
 
 
-@app.command("quick-start", hidden=not _is_windows())
+@app.command(
+    "quick-start",
+    hidden=not _is_windows(),
+    help="Speed up biopb startup on Windows with a Defender exclusion.",
+)
 def quick_start(
     enabled: Optional[bool] = typer.Option(
         None,

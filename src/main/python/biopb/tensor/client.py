@@ -54,6 +54,7 @@ from biopb.tensor._session import (
     _TensorContext,
     _unresolved_source_error as _unresolved_source_error,
 )
+from biopb.tensor._tls import resolve_tls_trust
 from biopb.tensor._upload import UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -154,6 +155,8 @@ class TensorFlightClient:
         location: str = "grpc://localhost:8815",
         cache_bytes: Optional[int] = None,
         token: Optional[str] = None,
+        tls_ca_pem: Optional[bytes] = None,
+        tls_fingerprint: Optional[str] = None,
     ):
         """Initialize the Flight client.
 
@@ -164,6 +167,15 @@ class TensorFlightClient:
                 or a bare byte count) and falls back to 1 GB; a value passed here
                 overrides the env. ``0`` disables the cache.
             token: Bearer token for server authentication.  ``None`` disables auth.
+            tls_ca_pem: PEM bytes to trust for a ``grpcs://`` location (a private
+                CA, or the server's own certificate), instead of pinning whatever
+                the server presents on first connect. Bytes rather than a path:
+                which file a cert came from is the caller's policy, not the SDK's.
+            tls_fingerprint: Expected SHA-256 of the server's certificate for a
+                ``grpcs://`` location, colon-grouped or bare hex. Checked on every
+                connect, so unlike trust-on-first-use it also rejects an attacker
+                who is already in the path the first time. Ignored when
+                *tls_ca_pem* is given.
         """
         if cache_bytes is None:
             cache_bytes = _default_cache_bytes()
@@ -172,11 +184,20 @@ class TensorFlightClient:
         )
         # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
         normalized = _normalize_location(location)
+        # For a TLS location, resolve the trust -- a caller-supplied CA or
+        # fingerprint, else TOFU (once per process, memoized in _tls) -- and carry
+        # it through the connection so every dask worker trusts the same root
+        # without touching the pin store or needing the credentials itself
+        # (biopb/biopb#604). NO_TLS for plaintext.
+        tls_trust = resolve_tls_trust(
+            normalized, ca_pem=tls_ca_pem, expected_fingerprint=tls_fingerprint
+        )
         # Pickle-safe connection parameters (callers read client._client etc.)
         self._location = normalized
         self._token = token
         self._cache_bytes = cache_bytes
-        self._client = flight.FlightClient(normalized)
+        self._tls_trust = tls_trust
+        self._client = flight.FlightClient(normalized, **tls_trust.client_kwargs())
         self._call_options = _build_call_options(token)
         # The connection + the two catalog caches live in one shared _ClientState.
         # The collaborators (#278 item C) read/write it; this facade exposes the
@@ -187,6 +208,7 @@ class TensorFlightClient:
             location=self._location,
             token=self._token,
             cache_bytes=self._cache_bytes,
+            tls_trust=self._tls_trust,
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
@@ -430,6 +452,7 @@ class TensorFlightClient:
             pb.auth_token if pb.auth_token else None,
             cache_bytes,
             schema_metadata,
+            resolve_tls_trust(pb.location),
         )
 
         # Crop to the originally requested region if original_slice_hint present

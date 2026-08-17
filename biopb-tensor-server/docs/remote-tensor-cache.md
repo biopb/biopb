@@ -72,7 +72,35 @@ one segment cache.
   `source_id`s. Optional for a lone upstream; **required** once a collision is
   possible. Upstream auth rides the existing `credentials_profile` field via a
   `storage_type="biopb-tensor"` profile carrying `token` — one token per upstream,
-  no bespoke `SourceConfig.token`.
+  no bespoke `SourceConfig.token`. The same profile also carries per-upstream TLS
+  trust for a `grpcs://` upstream (`tls_fingerprint` / `tls_ca_file`, both
+  optional; unset falls back to TOFU pinning). The single-upstream
+  `BIOPB_UPSTREAM_TENSOR_TOKEN` env var remains as a convenience fallback for the
+  token only.
+
+  | Key | Meaning |
+  |---|---|
+  | `token` | Bearer token for the upstream. Beats the `BIOPB_UPSTREAM_TENSOR_TOKEN` env fallback. |
+  | `tls_fingerprint` | Expected SHA-256 of the upstream's cert (colon-grouped or bare hex, as `cert init` prints it). Verified on every connect. The light form — paste what the server printed. |
+  | `tls_ca_file` | Path to a PEM to trust — a private CA, or the upstream's own leaf. |
+
+  **TLS trust is optional, and unset means TOFU.** The zero-config default already
+  works; configuring an anchor buys the one thing TOFU cannot — rejecting an
+  impostor in the path at *first* contact, where there is no prior use to trust.
+  Both keys set → **the CA wins, with a warning**, so an operator is never left
+  believing a fingerprint is enforced when it isn't. An unreadable `tls_ca_file`
+  **raises** rather than degrading to TOFU (see *Misconfiguration is not
+  unreachability* below) — silently undoing explicitly configured trust over a
+  typo'd path would be worse than failing. The env var stays token-only: TLS trust
+  never grew an env twin, since anything worth overriding about it is inherently
+  per-upstream.
+
+  `resolve_upstream_credentials()` (`adapters/remote_tensor.py`) produces one
+  frozen `UpstreamCredentials` from the source + config, and **all three** dial
+  sites use it: the adapter's pooled client, the reconciler's bulk catalog fetch,
+  and the bare-host expansion in `core/config.py`. The latter two dial directly,
+  outside the adapter pool, so leaving either on the old token-only path would
+  have TOFU-pinned a `grpcs://` upstream whose CA was configured.
 
 **Scheme/type plumbing.** `core.remote.is_remote_url` accepts the `grpc*`
 schemes (else `Path("grpc://…").resolve()` mangles the url);
@@ -185,13 +213,27 @@ generalizes the filesystem rescan into a periodic **upstream re-list** in
 `sources/reconciler.py`: `_reconcile_due_upstreams` runs each rescan tick (default
 30 s) with an **adaptive per-upstream cadence counted in ticks** — every tick while
 an upstream is changing or failing, spacing **doubling per unchanged re-list** up to
-`_UPSTREAM_RELIST_MAX_TICKS` (120 ≈ 1 h). Any change *or* failure resets to
-every-tick, so a new/recovered upstream is mirrored within ~one tick.
+`_UPSTREAM_RELIST_MAX_TICKS` (120 ≈ 1 h). Any change *or* connectivity failure
+resets to every-tick, so a new/recovered upstream is mirrored within ~one tick.
 `_reconcile_one_upstream` diffs the alias-namespaced desired set against
 currently-mirrored claims and applies adds/removes through the **same**
 `_commit_add_claim` / `_commit_remove_source` primitives as the filesystem
 reconcile. Best-effort: an unreachable upstream keeps its mirrored sources and
 retries.
+
+**Misconfiguration is not unreachability** (#608). An `UpstreamConfigError`
+(`core/errors.py`) — raised when a credentials profile's `tls_ca_file` cannot be
+read or is empty — is the one failure the fast cadence must *not* apply to: it
+will fail identically until an operator edits the config, so re-reading the same
+broken file every tick is pure waste under a log line that says "unreachable".
+It backs the upstream off to the maximum period instead, and is reported once
+(re-reported when the error text changes) as a config error naming how long that
+back-off is. **Recovery is reported too, and resets the cadence to every-tick** —
+parking a broken upstream for an hour is only reasonable if the operator learns
+that their edit took, and an unchanged catalog on the first good re-list would
+otherwise leave it parked there. The serve-path expansion
+(`resolve_all_sources(tolerant=True)`) and the adapter-build site likewise still
+skip the source, but name it as configuration.
 
 **Unreachable upstream.** A proxy "resolve" is a cheap reconnect, not a cloud
 download, so recovery is **transparent** (no `UnresolvedSourceAdapter` consent
@@ -227,13 +269,12 @@ cache, no unification, a second connection). So the client moved **proxy-first**
 the tensor browser talks to **one** server (the local one), and remote data is
 reached by adding a `tensor-server` source. The inline "connect to any server" form
 (Server URL / Token fields + Connect button) is removed; **kept** are Refresh, the
-source tree, the server-side `query_sources` path, the background source-watcher,
-and `TensorConnection.auto_connect()`'s auto-start-a-local-server fallback. The
-endpoint is still *resolved* (`TensorConnection.resolve_from_config`:
-`BIOPB_TENSOR_URL` → `tensor_browser.server_url` config → `grpc://localhost:8815`) —
-load-bearing because bootstrap points the client at its managed proxy on a
-non-default port — only in-widget *editing* goes away. The lost "I have data on a
-remote server" workflow redirects to an "add a proxied source" affordance.
+source tree, the server-side `query_sources` path, and the background
+source-watcher. The endpoint is *resolved* at connect time by asking the control
+plane, which owns the data plane and knows the port it bound
+(`TensorConnection.auto_connect`, biopb/biopb#628) — load-bearing because the
+managed proxy may sit on a non-default port. The lost "I have data on a remote
+server" workflow redirects to an "add a proxied source" affordance.
 
 ## Local-tensor-server config editing
 

@@ -37,7 +37,7 @@ from biopb_mcp._connection import TensorConnection
 from biopb_mcp.mcp._process_ops import build_ops
 
 config = load_config()
-_conn = TensorConnection(config)
+_conn = TensorConnection()
 _conn.auto_connect()          # synchronous best-effort connect (audit; no async service)
 client = _conn.client
 
@@ -137,7 +137,16 @@ def _job_cell(snap):
     job_id = snap.get("job_id", "?")
     status = snap.get("status", "?")
     elapsed = snap.get("elapsed", "?")
-    header = f"# [{job_id} · {status} · {elapsed}s · {_fmt_ts(snap.get('created'))}]\n"
+    # Who ran it. This is what makes the export an audit rather than a
+    # transcript: agent and user cells interleave in one kernel, and read
+    # without provenance a human's `mask = mask > 0.7` is indistinguishable from
+    # the agent's own work. Older records carry no origin, so default rather
+    # than assert -- an export must never fail on a field added later.
+    origin = snap.get("origin") or "agent"
+    header = (
+        f"# [{job_id} · {origin} · {status} · {elapsed}s · "
+        f"{_fmt_ts(snap.get('created'))}]\n"
+    )
     source = header + (snap.get("code") or "")
     return _code_cell(
         source,
@@ -145,6 +154,7 @@ def _job_cell(snap):
         metadata={
             "biopb": {
                 "job_id": job_id,
+                "origin": origin,
                 "status": status,
                 "elapsed": elapsed,
                 "created": snap.get("created"),
@@ -168,23 +178,22 @@ _INTRO = (
     "*do* carry across cells. Cells whose header reads `interrupted` / `error` "
     "are kept verbatim — re-running one may re-trigger the same hang or "
     "failure, so skip or edit it. Only the most recent jobs are retained, so a "
-    "long session may be missing its start. `auto_connect()` persists the server "
-    "URL to your config; under a headless `nbconvert --execute` the `viewer` "
-    "becomes `None` and viewer cells fail."
+    "long session may be missing its start. `auto_connect()` asks the control "
+    "plane where the data plane is, so a re-run needs a running control "
+    "(`biopb control start`) or `$BIOPB_TENSOR_URL`; under a headless "
+    "`nbconvert --execute` the `viewer` becomes `None` and viewer cells fail."
 )
 
 
-def build_notebook(jobs, *, headless=False):
+def build_notebook(jobs):
     """Build an nbformat-v4 notebook dict from a list of job snapshots.
 
     *jobs* is the oldest-first list returned by ``_jobs.export()`` (each a
-    ``_Job.snapshot()`` dict). *headless* tweaks the intro wording. The result is
-    a plain dict ready to ``json.dumps`` into a ``.ipynb`` file.
+    ``_Job.snapshot()`` dict). The result is a plain dict ready to
+    ``json.dumps`` into a ``.ipynb`` file.
     """
     jobs = jobs or []
     intro = _INTRO.format(ts=_fmt_ts(_now_epoch()), n=len(jobs))
-    if headless:
-        intro += "\n\n_Exported from a headless (no-display) session._"
 
     cells = [_markdown_cell(_TITLE + "\n" + intro), _code_cell(BOOTSTRAP_SRC)]
     if jobs:

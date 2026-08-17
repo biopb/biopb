@@ -1,6 +1,7 @@
 import { useState, FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { withBase } from "../base";
 
 export function UnlockPage() {
   useDocumentTitle("BioPB tensor - unlock");
@@ -31,7 +32,7 @@ export function UnlockPage() {
       <div className="unlock-card">
         <img
           className="unlock-logo"
-          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          src={withBase("/biopb-logo.png")}
           alt="BioPB"
           width={48}
           height={48}

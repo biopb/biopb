@@ -624,6 +624,32 @@ class TestQueryHandling:
         result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
         assert result.num_rows == 2
 
+    def test_truncation_metadata_rides_on_the_doget_table(self):
+        """The truncation keys must be on the STORED table, not just the FlightInfo.
+
+        DoGet streams the pending table, so a client that reads its result from
+        the stream (rather than from the FlightInfo) sees exactly this schema.
+        Tagging only the FlightInfo left `schema.metadata is None` there, which
+        is what broke the sidecar's /api/sources/query.
+        """
+        db = MetadataDatabase(max_query_results=2)
+        for i in range(5):
+            db.sync_source_added(
+                f"test-{i}",
+                MockAdapter(
+                    f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
+                ),
+            )
+
+        info = db.handle_query("SELECT source_id FROM sources")
+        result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+
+        assert result.schema.metadata is not None
+        assert int(result.schema.metadata[b"total_sources"]) == 5
+        assert int(result.schema.metadata[b"returned_sources"]) == 2
+        # ... and the FlightInfo still agrees with it.
+        assert result.schema.metadata == info.schema.metadata
+
 
 class TestSQLValidation:
     """Test SQL query validation."""

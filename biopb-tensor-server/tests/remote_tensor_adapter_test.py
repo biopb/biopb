@@ -734,9 +734,238 @@ def test_create_from_config_resolves_token_from_credentials_profile():
     )
     source = SourceConfig(url="grpc://lab:8815/img", credentials_profile="lab-store")
     adapter = RemoteTensorAdapter.create_from_config(source, creds)
-    assert adapter._token == "s3cr3t"
+    assert adapter._credentials.token == "s3cr3t"
     assert adapter._upstream_source_id == "img"
     assert adapter._upstream_location == "grpc://lab:8815"
+
+
+# --- per-upstream TLS trust (biopb/biopb#604 item 4) --------------------------
+#
+# Cross-host, the #470 filesystem token handoff does not apply, so a downstream
+# server mounting a remote plane needs that plane's token AND its trust anchor as
+# explicit config -- per source, since it may mount several with different creds.
+
+
+def _creds(**profile_kwargs):
+    """A CredentialsConfig with one biopb-tensor profile named 'lab-store'."""
+    from biopb_tensor_server.core.remote import CredentialProfile, CredentialsConfig
+
+    profile_kwargs.setdefault("name", "lab-store")
+    profile_kwargs.setdefault("storage_type", "biopb-tensor")
+    return CredentialsConfig(
+        default_profile=None, profiles=[CredentialProfile(**profile_kwargs)]
+    )
+
+
+def _upstream_source(**kwargs):
+    from biopb_tensor_server.core.config import SourceConfig
+
+    kwargs.setdefault("url", "grpcs://lab:8815/img")
+    return SourceConfig(**kwargs)
+
+
+def test_no_profile_leaves_tls_trust_unset_so_tofu_applies():
+    """The zero-config default: nothing configured means the SDK pins on first use."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    creds = resolve_upstream_credentials(_upstream_source(), None)
+    assert creds.tls_ca_pem is None
+    assert creds.tls_fingerprint is None
+
+
+def test_profile_ca_file_is_read_into_pem_bytes(tmp_path):
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    ca = tmp_path / "lab-ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n")
+    creds = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"),
+        _creds(tls_ca_file=str(ca)),
+    )
+    assert creds.tls_ca_pem == ca.read_bytes()
+
+
+def test_profile_fingerprint_is_passed_through_normalized():
+    """The configured fingerprint reaches the credentials, canonicalized so the
+    pool key is stable across spellings (see UpstreamCredentials.__post_init__)."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    creds = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"),
+        _creds(tls_fingerprint="AB:CD:EF"),
+    )
+    assert creds.tls_fingerprint == "abcdef"
+
+
+def test_unreadable_ca_file_fails_rather_than_degrading_to_tofu(tmp_path):
+    """A typo'd path must not silently substitute the weaker default.
+
+    The operator configured an explicit anchor precisely to get *stronger* trust
+    than trust-on-first-use, so quietly falling back would undo what they asked
+    for -- and do it invisibly.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    with pytest.raises(ValueError, match="tls_ca_file"):
+        resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(tmp_path / "typo.pem")),
+        )
+
+    empty = tmp_path / "empty.pem"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError, match="empty"):
+        resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(empty)),
+        )
+
+
+def test_a_broken_trust_anchor_raises_the_config_error_type(tmp_path):
+    """It is a *config* error, and stays a ValueError (biopb/biopb#608).
+
+    The type is what lets the reconcile paths tell "the operator typo'd a path"
+    apart from "the upstream is down"; the ValueError base keeps every caller
+    written before the type working.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+    from biopb_tensor_server.core.errors import UpstreamConfigError
+
+    with pytest.raises(UpstreamConfigError) as excinfo:
+        resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(tmp_path / "typo.pem")),
+        )
+    assert isinstance(excinfo.value, ValueError)
+
+
+def test_ca_and_fingerprint_together_warns_and_keeps_only_the_ca(tmp_path, caplog):
+    """Both name an anchor; say which one is in force rather than let the operator
+    believe a fingerprint is being enforced when it is not."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(b"pem")
+    with caplog.at_level("WARNING"):
+        creds = resolve_upstream_credentials(
+            _upstream_source(credentials_profile="lab-store"),
+            _creds(tls_ca_file=str(ca), tls_fingerprint="AB:CD"),
+        )
+    assert creds.tls_ca_pem == b"pem"
+    assert creds.tls_fingerprint is None
+    assert "ignored" in caplog.text
+
+
+def test_profile_token_beats_the_single_upstream_env_var(monkeypatch):
+    """The env var is a single-upstream convenience; a profile is the real binding."""
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    monkeypatch.setenv("BIOPB_UPSTREAM_TENSOR_TOKEN", "from-env")
+    with_profile = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"), _creds(token="from-profile")
+    )
+    assert with_profile.token == "from-profile"
+    # ...and a source with no profile still gets the env fallback.
+    assert resolve_upstream_credentials(_upstream_source(), None).token == "from-env"
+
+
+def test_pooled_clients_are_isolated_by_trust_material(monkeypatch):
+    """Same endpoint + same token, different anchor -> different connection.
+
+    Sharing one would mean whichever source dialed first silently decides what
+    the other trusts.
+    """
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    built = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            built.append((location, token, tls))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    ca_a = rt.UpstreamCredentials(token="t", tls_ca_pem=b"ca-a")
+    ca_b = rt.UpstreamCredentials(token="t", tls_ca_pem=b"ca-b")
+    a = rt.RemoteTensorAdapter("lab__a", "grpcs://up:1", "a", credentials=ca_a)
+    a2 = rt.RemoteTensorAdapter("lab__a2", "grpcs://up:1", "a2", credentials=ca_a)
+    b = rt.RemoteTensorAdapter("lab__b", "grpcs://up:1", "b", credentials=ca_b)
+
+    assert a.client is a2.client  # identical credentials share one connection
+    assert b.client is not a.client
+    assert len(built) == 2
+    assert built[0][2]["tls_ca_pem"] == b"ca-a"
+    assert built[1][2]["tls_ca_pem"] == b"ca-b"
+    rt._clear_client_pool()
+
+
+def test_pool_key_is_stable_across_fingerprint_spellings(monkeypatch):
+    """Same upstream + same fingerprint in different spellings -> one connection.
+
+    The SDK normalizes fingerprints before comparing, so a colon-grouped and a
+    bare-hex spelling of one digest are the same trust decision; the pool key
+    (UpstreamCredentials) must agree, or it would open two clients the SDK then
+    treats as identical.
+    """
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    built = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            built.append(tls.get("tls_fingerprint"))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    grouped = rt.UpstreamCredentials(tls_fingerprint="AB:CD:EF")
+    bare = rt.UpstreamCredentials(tls_fingerprint="abcdef")
+    assert grouped == bare  # canonicalized in __post_init__
+    a = rt.RemoteTensorAdapter("lab__a", "grpcs://up:1", "a", credentials=grouped)
+    b = rt.RemoteTensorAdapter("lab__b", "grpcs://up:1", "b", credentials=bare)
+
+    assert a.client is b.client
+    assert len(built) == 1
+    assert built[0] == "abcdef"
+    rt._clear_client_pool()
+
+
+def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkeypatch):
+    """The catalog enumeration dials the upstream directly, outside the adapter
+    pool, so it has to carry the same anchor -- else a grpcs:// upstream with a
+    configured CA would still be TOFU-pinned at expansion time."""
+    import biopb.tensor as bt
+    from biopb_tensor_server.core.config import discover_sources
+
+    seen = {}
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
+            seen.update(location=location, token=token, **tls)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    monkeypatch.setattr(
+        "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
+        lambda client, location: ([], True),
+    )
+    discover_sources(
+        _upstream_source(url="grpcs://lab:8815", credentials_profile="lab-store"),
+        credentials_config=_creds(token="tok", tls_fingerprint="AB:CD"),
+    )
+    assert seen["token"] == "tok"
+    assert seen["tls_fingerprint"] == "abcd"  # normalized in __post_init__
 
 
 def _meta_zarr_cls():
@@ -1356,6 +1585,333 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
         upstream.shutdown()
 
 
+class TestMisconfiguredUpstreamIsNotUnreachable:
+    """A broken credentials config is not retried like a down upstream (#608).
+
+    The fast cadence exists so a *recovering* upstream is mirrored within a tick.
+    An unreadable trust anchor never recovers on its own, so pinning the fast
+    cadence to it re-reads the same broken file every tick forever, under a log
+    line that says "unreachable".
+    """
+
+    def _manager(self, credentials, url="grpc://lab-store:8815"):
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.adapters import get_default_registry
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.discovery import DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
+
+        upstream = SourceConfig(url=url, alias="lab", credentials_profile="lab-store")
+        proxy = TensorFlightServer("grpc://localhost:0")
+        manager = SourceManager(
+            server=proxy,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs=set(),
+            credentials_config=credentials,
+            monitored_upstreams=[upstream],
+        )
+        # The cadence state the due-scheduler would have seeded for this tick.
+        manager._upstream_relist[url] = {"period": 1, "countdown": 0}
+        return manager, upstream, proxy
+
+    def test_it_backs_off_instead_of_pinning_the_fast_cadence(self, tmp_path, caplog):
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            with caplog.at_level("ERROR"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        state = manager._upstream_relist[upstream.url]
+        assert state["period"] == manager._upstream_max_period
+        assert state["countdown"] == manager._upstream_max_period
+        assert upstream.url in manager._failed_upstreams
+        # ...and the operator is told it is config, not connectivity, *and* how
+        # long the back-off means they will wait after fixing it.
+        assert "MISCONFIGURED" in caplog.text
+        assert "tls_ca_file" in caplog.text
+        assert str(manager._upstream_max_period) in caplog.text
+
+    def test_a_fixed_config_is_reported_and_the_fast_cadence_returns(
+        self, tmp_path, caplog
+    ):
+        """The other half of the back-off message.
+
+        Parking a broken upstream at the slow period is only reasonable if the
+        operator learns when their edit took effect -- otherwise the fix is
+        followed by up to an hour of silence indistinguishable from still being
+        broken. Recovery also has to restore the fast cadence: this upstream is
+        slow *because* it was broken, and an unchanged catalog on the first good
+        re-list would otherwise leave it parked there.
+        """
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+            assert (
+                manager._upstream_relist[upstream.url]["period"]
+                == manager._upstream_max_period
+            )
+
+            # The edit lands and the re-list gets through, finding nothing new.
+            # Stubbed at the reconcile seam because what is under test is the
+            # scheduler's reaction to recovery, not the dial itself.
+            manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert "configured correctly again" in caplog.text
+        assert manager._upstream_relist[upstream.url]["period"] == 1
+        assert upstream.url not in manager._failed_upstreams
+
+    def test_a_healthy_upstream_does_not_announce_a_recovery(self, caplog):
+        """Nothing was broken, so there is nothing to report -- and the ordinary
+        back-off must still apply."""
+        manager, upstream, proxy = self._manager(_creds(token="fine"))
+        manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+        try:
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert caplog.text == ""
+        assert manager._upstream_relist[upstream.url]["period"] == 2  # 1 -> doubled
+
+    def test_an_unreachable_upstream_still_retries_fast(self):
+        """The control case: don't broaden the new branch into the old one."""
+        from biopb_tensor_server import TensorFlightServer
+
+        dead = TensorFlightServer("grpc://localhost:0")
+        port = dead.port
+        dead.shutdown()
+
+        manager, upstream, proxy = self._manager(
+            _creds(token="fine"), url=f"grpc://localhost:{port}"
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert manager._upstream_relist[upstream.url]["period"] == 1
+        assert upstream.url in manager._failed_upstreams
+
+    def test_the_same_error_is_reported_once_but_a_new_one_is_not_swallowed(
+        self, tmp_path, caplog
+    ):
+        manager, upstream, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        try:
+            with caplog.at_level("ERROR"):
+                manager._reconcile_and_reschedule(upstream)
+                first = caplog.text.count("MISCONFIGURED")
+
+                caplog.clear()
+                manager._reconcile_and_reschedule(upstream)
+                assert caplog.text == ""  # unchanged -> not repeated
+
+                # A different breakage (empty file, not a missing one) must be
+                # reported: silence there would hide the operator's next mistake.
+                empty = tmp_path / "empty.pem"
+                empty.write_bytes(b"")
+                manager._reconciler._credentials_config = _creds(tls_ca_file=str(empty))
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert first == 1
+        assert "which is empty" in caplog.text
+
+    def test_registering_a_single_source_entry_names_the_config_error(
+        self, tmp_path, caplog
+    ):
+        """The adapter-build site too: a static ``grpc://host/<id>`` entry does
+        not resolve credentials during discovery, so its broken profile surfaces
+        here -- and "failed to create adapter" reads like a transient upstream."""
+        from biopb_tensor_server.core.discovery import SourceClaim
+
+        manager, _, proxy = self._manager(
+            _creds(tls_ca_file=str(tmp_path / "typo.pem"))
+        )
+        claim = SourceClaim(
+            source_type="tensor-server",
+            primary_path="grpc://lab-store:8815/img",
+            source_id="lab__img",
+            extra_config={"credentials_profile": "lab-store"},
+            is_remote=True,
+        )
+        try:
+            with caplog.at_level("ERROR"):
+                registered = manager._reconciler._register_source_claim(claim)
+        finally:
+            proxy.shutdown()
+
+        assert registered is False
+        assert "MISCONFIGURED" in caplog.text
+        assert "tls_ca_file" in caplog.text
+
+
+class TestUnreachableUpstreamIsReportedOnAWindow:
+    """A down upstream retries fast but does not log fast.
+
+    The fast cadence is deliberate -- an upstream that is merely down recovers on
+    its own, so a tick-rate retry is what mirrors it back within ~one tick. What
+    is not deliberate is reporting that at tick rate: a single overnight outage at
+    the default 30s tick writes ~1200 identical tracebacks and buries every other
+    line in the log. Rate-limit the report; leave the retry alone.
+    """
+
+    def _manager(self, url="grpc://lab-store:8815"):
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.adapters import get_default_registry
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.discovery import DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
+
+        upstream = SourceConfig(url=url, alias="lab")
+        proxy = TensorFlightServer("grpc://localhost:0")
+        manager = SourceManager(
+            server=proxy,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs=set(),
+            monitored_upstreams=[upstream],
+        )
+        manager._upstream_relist[url] = {"period": 1, "countdown": 0}
+        return manager, upstream, proxy
+
+    @staticmethod
+    def _raising(exc):
+        def _reconcile(_upstream):
+            raise exc
+
+        return _reconcile
+
+    def test_the_same_outage_is_reported_once_but_still_retried_every_tick(
+        self, caplog
+    ):
+        from pyarrow import flight
+
+        manager, upstream, proxy = self._manager()
+        manager._reconciler._reconcile_one_upstream = self._raising(
+            flight.FlightUnavailableError("failed to connect to all addresses")
+        )
+        try:
+            with caplog.at_level("WARNING"):
+                for _ in range(4):
+                    manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert caplog.text.count("Upstream re-list failed") == 1
+        # The retry cadence is untouched -- only the log was throttled.
+        assert manager._upstream_relist[upstream.url]["period"] == 1
+        assert upstream.url in manager._failed_upstreams
+
+    def test_a_different_failure_is_not_held_back_by_the_window(self, caplog):
+        """A changed error is the operator's cue that something moved -- sitting on
+        it for the rest of the window would hide the only new information."""
+        from pyarrow import flight
+
+        manager, upstream, proxy = self._manager()
+        manager._reconciler._reconcile_one_upstream = self._raising(
+            flight.FlightUnavailableError("connection refused")
+        )
+        try:
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+                caplog.clear()
+                manager._reconciler._reconcile_one_upstream = self._raising(
+                    flight.FlightUnavailableError("certificate verify failed")
+                )
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert "certificate verify failed" in caplog.text
+
+    def test_the_window_expiring_re_reports_a_still_broken_upstream(self, caplog):
+        """Suppression is a window, not a mute: an outage that outlives it says so
+        again, so a log tailed hours later still shows the upstream is down."""
+        from pyarrow import flight
+
+        manager, upstream, proxy = self._manager()
+        manager._reconciler._reconcile_one_upstream = self._raising(
+            flight.FlightUnavailableError("still down")
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+            when, message = manager._upstream_failures[upstream.url]
+            manager._upstream_failures[upstream.url] = (when - 100_000, message)
+            caplog.clear()
+            with caplog.at_level("WARNING"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert caplog.text.count("Upstream re-list failed") == 1
+
+    def test_recovery_is_announced_because_the_failures_were_suppressed(self, caplog):
+        manager, upstream, proxy = self._manager()
+        from pyarrow import flight
+
+        manager._reconciler._reconcile_one_upstream = self._raising(
+            flight.FlightUnavailableError("down")
+        )
+        try:
+            manager._reconcile_and_reschedule(upstream)
+            manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+            with caplog.at_level("INFO"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert "reachable again" in caplog.text
+        assert upstream.url not in manager._upstream_failures
+
+    def test_a_healthy_upstream_announces_nothing(self, caplog):
+        manager, upstream, proxy = self._manager()
+        manager._reconciler._reconcile_one_upstream = lambda _upstream: False
+        try:
+            with caplog.at_level("INFO"):
+                manager._reconcile_and_reschedule(upstream)
+        finally:
+            proxy.shutdown()
+
+        assert "reachable again" not in caplog.text
+
+
+def test_unreachable_bulk_fetch_does_not_duplicate_the_outage_warning(caplog):
+    """The re-list scheduler reports an outage on a window; the bulk fetch used to
+    report the same one every tick, at WARNING, from the other end. Only a genuine
+    no-SQL-catalog upstream (where the fallback is the story) still warns -- see
+    ``test_fallback_warning_names_the_upstream_from_its_location_argument``."""
+    import logging
+
+    from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+    from pyarrow import flight
+
+    class _DeadClient:
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+            raise flight.FlightUnavailableError("failed to connect to all addresses")
+
+    with caplog.at_level(logging.WARNING):
+        rows, complete = fetch_upstream_catalog(_DeadClient(), "grpc://lab:8815")
+
+    assert (rows, complete) == (None, False)
+    assert caplog.text == ""
+
+
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestUnreachableUpstream:
     """Unresolved/unreachable upstream policy (#178).
@@ -1677,7 +2233,7 @@ def test_upstream_clients_are_pooled_per_endpoint(monkeypatch):
     built = []
 
     class _FakeClient:
-        def __init__(self, location, cache_bytes=0, token=None):
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
             built.append((location, token))
 
         def close(self):
@@ -1707,7 +2263,7 @@ def test_mark_unreachable_evicts_shared_client(monkeypatch):
     closed = []
 
     class _FakeClient:
-        def __init__(self, location, cache_bytes=0, token=None):
+        def __init__(self, location, cache_bytes=0, token=None, **tls):
             pass
 
         def close(self):

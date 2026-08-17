@@ -67,9 +67,19 @@ class DataPlaneSpec:
     """Everything needed to launch + probe the tensor server, resolved by the
     caller (the ``biopb control`` CLI) so the supervisor imports no server config.
 
-    ``grpc_host`` / ``grpc_port`` are the loopback-reachable endpoint the
-    liveness probe connects to (a server bound to 0.0.0.0/:: is reached over
-    127.0.0.1). ``token`` is the data-plane access token the caller resolved:
+    ``grpc_host`` / ``grpc_port`` are the **bind** the control dictates: they are
+    passed to the child as ``--host``/``--port`` (biopb/biopb#604 -- the plane's
+    bind left ``biopb.json`` and is now the launcher's call). Because the control
+    chooses the bind rather than reading it back, it cannot hold a stale view of
+    one, and there is nothing to re-derive after a restart.
+
+    ``grpc_host`` may be a wildcard (``0.0.0.0``/``::``) in remote mode; the
+    liveness probe uses :attr:`DataPlaneSupervisor._probe_host`, which maps a
+    wildcard onto the matching loopback address, since a wildcard is a bind
+    target and not a connect target.
+
+    ``tls`` serves the flight plane over TLS (``--tls``); clients then dial
+    ``grpcs://``. ``token`` is the data-plane access token the caller resolved:
     always set in remote mode, and ``None`` in local mode *unless* a token was
     supplied there too (local mode allows an optional token — enforcement is
     independent of the loopback/public bind).
@@ -78,6 +88,7 @@ class DataPlaneSpec:
     config: Path
     grpc_host: str = "127.0.0.1"
     grpc_port: int = 8815
+    tls: bool = False
     web_host: str = "127.0.0.1"
     web_port: int = 8814
     # The built web/ SPA bundle. Consumed by the *control* (it is the single web
@@ -87,6 +98,10 @@ class DataPlaneSpec:
     log_level: str = "INFO"
     server_log: Optional[Path] = None
     token: Optional[str] = None
+    # Path prefix a reverse proxy publishes the control's web origin under (an
+    # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
+    # by the web front (_control.build_app normalizes it); None = root origin.
+    url_prefix: Optional[str] = None
 
 
 @dataclass
@@ -127,10 +142,22 @@ class DataPlaneSupervisor:
 
     # --- liveness / argv / env ------------------------------------------- #
 
+    @property
+    def _probe_host(self) -> str:
+        """A connect()-able form of the bind. A wildcard is a bind target only;
+        map it onto the matching loopback address (IPv4 wildcard -> 127.0.0.1,
+        IPv6 -> ::1, so a ``::``-bound server with IPV6_V6ONLY still answers)."""
+        host = self._spec.grpc_host
+        if host in ("0.0.0.0", ""):
+            return "127.0.0.1"
+        if host == "::":
+            return "::1"
+        return host
+
     def _port_up(self, timeout: float = 0.5) -> bool:
         try:
             with socket.create_connection(
-                (self._spec.grpc_host, self._spec.grpc_port), timeout=timeout
+                (self._probe_host, self._spec.grpc_port), timeout=timeout
             ):
                 return True
         except OSError:
@@ -145,6 +172,10 @@ class DataPlaneSupervisor:
             "launch",
             "--config",
             str(s.config),
+            "--host",
+            str(s.grpc_host),
+            "--port",
+            str(s.grpc_port),
             "--web-port",
             str(s.web_port),
             "--web-host",
@@ -152,6 +183,8 @@ class DataPlaneSupervisor:
             "--log-level",
             str(s.log_level),
         ]
+        if s.tls:
+            argv.append("--tls")
         return argv
 
     def _child_env(self) -> dict:
@@ -356,7 +389,7 @@ class DataPlaneSupervisor:
 
     def _conflict_message(self) -> str:
         return (
-            f"data-plane port {self._spec.grpc_host}:{self._spec.grpc_port} is "
+            f"data-plane port {self._probe_host}:{self._spec.grpc_port} is "
             "held by a process the control did not start; refusing to manage it. "
             "Stop that server, then the control will bring up one it owns."
         )
@@ -556,7 +589,10 @@ class DataPlaneSupervisor:
                 state = "stopped"
             return {
                 "state": state,
-                "grpc_url": f"grpc://{self._spec.grpc_host}:{self._spec.grpc_port}",
+                "grpc_url": (
+                    f"{'grpcs' if self._spec.tls else 'grpc'}://"
+                    f"{self._probe_host}:{self._spec.grpc_port}"
+                ),
                 "web_url": f"http://{self._spec.web_host}:{self._spec.web_port}/",
                 "pid": self._proc.pid if child_alive else None,
                 "restarts": st.restarts,
