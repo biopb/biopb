@@ -112,8 +112,6 @@ export function vivLabels(info: TileInfo): string[] {
 // ---------------------------------------------------------------------------
 
 export interface TensorPixelSourceOptions {
-  /** Address a specific tensor of a multi-tensor source. */
-  tensorId?: string;
   /**
    * Refuse a `getRaster` bigger than this many pixels.
    *
@@ -144,33 +142,34 @@ export interface TensorPixelSources {
 
 /**
  * Build the `PixelSource[]` for a tensor (one `tile_info` round trip).
+ *
+ * `arrayId` is the whole address: `source_id` for a single-tensor source,
+ * `source_id/field` otherwise.
  */
 export async function createTensorPixelSources(
   client: TensorHttpClient,
-  sourceId: string,
+  arrayId: string,
   options: TensorPixelSourceOptions = {},
 ): Promise<TensorPixelSources> {
-  const info = await client.tileInfo(sourceId, options.tensorId, { signal: options.signal });
-  return { data: pixelSourcesFromInfo(client, sourceId, info, options), info };
+  const info = await client.tileInfo(arrayId, { signal: options.signal });
+  return { data: pixelSourcesFromInfo(client, info, options), info };
 }
 
 /** The pure half of {@link createTensorPixelSources}, for an already-fetched grid. */
 export function pixelSourcesFromInfo(
   client: TensorHttpClient,
-  sourceId: string,
   info: TileInfo,
   options: TensorPixelSourceOptions = {},
 ): PixelSource<string[]>[] {
   const labels = vivLabels(info);
   const dtype = vivDtype(info.dtype);
   return info.levels.map((level) =>
-    makeSource(client, sourceId, info, level, labels, dtype, options),
+    makeSource(client, info, level, labels, dtype, options),
   );
 }
 
 function makeSource(
   client: TensorHttpClient,
-  sourceId: string,
   info: TileInfo,
   level: TileLevel,
   labels: string[],
@@ -204,10 +203,9 @@ function makeSource(
       }
       const result = await client.tile(
         {
-          source_id: sourceId,
-          // The canonical array_id, not the caller's shorthand: `info` was
-          // fetched for this tensor, so this is unambiguous for both routes.
-          tensor_id: info.array_id,
+          // The array_id the grid was measured from, so geometry and pixels
+          // cannot address different tensors.
+          array_id: info.array_id,
           level: level.level,
           col: x,
           row: y,
@@ -244,7 +242,7 @@ function makeSource(
       });
       const arr = await client.slice(
         {
-          source_id: sourceId,
+          source_id: info.array_id.split("/", 1)[0]!,
           tensor_id: info.array_id,
           slice_start: start,
           slice_stop: stop,

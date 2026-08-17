@@ -125,21 +125,21 @@ describe("vivLabels", () => {
 
 describe("pixelSourcesFromInfo", () => {
   it("returns one source per level, index 0 full resolution", () => {
-    const sources = pixelSourcesFromInfo(stubClient(), "src0", INFO);
+    const sources = pixelSourcesFromInfo(stubClient(), INFO);
     expect(sources).toHaveLength(2);
     expect(sources[0]!.shape[INFO.plane.x]).toBe(1024);
     expect(sources[1]!.shape[INFO.plane.x]).toBe(512);
   });
 
   it("shrinks only the plane across levels", () => {
-    const [full, half] = pixelSourcesFromInfo(stubClient(), "src0", INFO);
+    const [full, half] = pixelSourcesFromInfo(stubClient(), INFO);
     // Slider axes are the same data at every zoom.
     expect(full!.shape.slice(0, 3)).toEqual([1, 3, 16]);
     expect(half!.shape.slice(0, 3)).toEqual([1, 3, 16]);
   });
 
   it("carries dtype and tileSize onto every source", () => {
-    for (const s of pixelSourcesFromInfo(stubClient(), "src0", INFO)) {
+    for (const s of pixelSourcesFromInfo(stubClient(), INFO)) {
       expect(s.dtype).toBe("Uint16");
       expect(s.tileSize).toBe(512);
     }
@@ -161,23 +161,23 @@ describe("pixelSourcesFromInfo", () => {
 describe("PixelSource.getTile", () => {
   it("maps Viv's x/y to the tile grid at this source's level", async () => {
     const client = stubClient();
-    const [, half] = pixelSourcesFromInfo(client, "src0", INFO);
+    const [, half] = pixelSourcesFromInfo(client, INFO);
     await half!.getTile({ x: 0, y: 0, selection: { t: 0, c: 0, z: 0 } });
     expect(client.tile.mock.calls[0]![0]).toMatchObject({
-      source_id: "src0", level: 1, col: 0, row: 0,
+      array_id: "src0/Image:0", level: 1, col: 0, row: 0,
     });
   });
 
   it("translates a label-keyed selection into t/z/c", async () => {
     const client = stubClient();
-    const [full] = pixelSourcesFromInfo(client, "src0", INFO);
+    const [full] = pixelSourcesFromInfo(client, INFO);
     await full!.getTile({ x: 1, y: 1, selection: { t: 0, c: 2, z: 7 } });
     expect(client.tile.mock.calls[0]![0]).toMatchObject({ c: 2, z: 7, col: 1, row: 1 });
   });
 
   it("returns a typed array view, not the raw buffer", async () => {
     const client = stubClient();
-    const [full] = pixelSourcesFromInfo(client, "src0", INFO);
+    const [full] = pixelSourcesFromInfo(client, INFO);
     const px = await full!.getTile({ x: 0, y: 0, selection: { t: 0, c: 0, z: 0 } });
     expect(px.data).toBeInstanceOf(Uint16Array);
     expect(px.data.length).toBe(512 * 512);
@@ -192,14 +192,14 @@ describe("PixelSource.getTile", () => {
         dtype: "uint8", dimLabels: [], tileSize: 512, level: 0, col: 2, row: 2,
       })),
     });
-    const [full] = pixelSourcesFromInfo(client, "rgb", RGB_INFO);
+    const [full] = pixelSourcesFromInfo(client, RGB_INFO);
     const px = await full!.getTile({ x: 2, y: 2, selection: { t: 0, c: 0, z: 0 } });
     expect([px.width, px.height]).toEqual([387, 387]);
   });
 
   it("answers an out-of-grid tile locally instead of spending a round trip", async () => {
     const client = stubClient();
-    const [, half] = pixelSourcesFromInfo(client, "src0", INFO);
+    const [, half] = pixelSourcesFromInfo(client, INFO);
     // Level 1 is a single tile; deck.gl can still ask past the edge mid-settle.
     const px = await half!.getTile({ x: 5, y: 0, selection: { t: 0, c: 0, z: 0 } });
     expect(client.tile).not.toHaveBeenCalled();
@@ -208,7 +208,7 @@ describe("PixelSource.getTile", () => {
 
   it("forwards Viv's abort signal to the request", async () => {
     const client = stubClient();
-    const [full] = pixelSourcesFromInfo(client, "src0", INFO);
+    const [full] = pixelSourcesFromInfo(client, INFO);
     const ctrl = new AbortController();
     await full!.getTile({ x: 0, y: 0, selection: { t: 0, c: 0, z: 0 }, signal: ctrl.signal });
     expect(client.tile.mock.calls[0]![1]).toEqual({ signal: ctrl.signal });
@@ -220,7 +220,7 @@ describe("PixelSource.getTile", () => {
       dim_labels: ["POS", "C", "Z", "Y", "X"],
       selectable: { t: null, c: 1, z: 2 },
     };
-    const [full] = pixelSourcesFromInfo(stubClient(), "src0", info);
+    const [full] = pixelSourcesFromInfo(stubClient(), info);
     // Index 0 is the correct default, so only a non-zero request is wrong.
     await expect(
       full!.getTile({ x: 0, y: 0, selection: { pos: 0, c: 0, z: 0 } }),
@@ -232,7 +232,7 @@ describe("PixelSource.getTile", () => {
 
   it("refuses a non-zero index on an axis the tensor does not have", async () => {
     const info: TileInfo = { ...INFO, selectable: { t: null, c: 1, z: 2 } };
-    const [full] = pixelSourcesFromInfo(stubClient(), "src0", info);
+    const [full] = pixelSourcesFromInfo(stubClient(), info);
     await expect(
       full!.getTile({ x: 0, y: 0, selection: { t: 4, c: 0, z: 0 } }),
     ).rejects.toThrow(/no "t" axis/);
@@ -246,7 +246,7 @@ describe("PixelSource.getTile", () => {
 describe("PixelSource.getRaster", () => {
   it("reads the whole level in one slice at that level's scale", async () => {
     const client = stubClient();
-    const [, half] = pixelSourcesFromInfo(client, "src0", INFO);
+    const [, half] = pixelSourcesFromInfo(client, INFO);
     await half!.getRaster({ selection: { t: 0, c: 1, z: 3 } });
     const req = client.slice.mock.calls[0]![0];
     expect(req.scale_hint).toEqual([1, 1, 1, 2, 2]);
@@ -257,7 +257,7 @@ describe("PixelSource.getRaster", () => {
 
   it("refuses a level too large to pull in one read", async () => {
     const client = stubClient();
-    const [full] = pixelSourcesFromInfo(client, "src0", INFO, { maxRasterPixels: 1000 });
+    const [full] = pixelSourcesFromInfo(client, INFO, { maxRasterPixels: 1000 });
     await expect(full!.getRaster({ selection: { t: 0, c: 0, z: 0 } }))
       .rejects.toThrow(/would read 1048576 pixels/);
     expect(client.slice).not.toHaveBeenCalled();
@@ -265,7 +265,7 @@ describe("PixelSource.getRaster", () => {
 
   it("allows it when the caller raises the budget deliberately", async () => {
     const client = stubClient();
-    const [full] = pixelSourcesFromInfo(client, "src0", INFO, { maxRasterPixels: 2e6 });
+    const [full] = pixelSourcesFromInfo(client, INFO, { maxRasterPixels: 2e6 });
     await expect(full!.getRaster({ selection: { t: 0, c: 0, z: 0 } })).resolves.toBeDefined();
   });
 });
@@ -277,7 +277,7 @@ describe("PixelSource.getRaster", () => {
 describe("PixelSource.onTileError", () => {
   it("swallows a cancelled tile", () => {
     const onTileError = vi.fn();
-    const [full] = pixelSourcesFromInfo(stubClient(), "src0", INFO, { onTileError });
+    const [full] = pixelSourcesFromInfo(stubClient(), INFO, { onTileError });
     full!.onTileError(new TensorAbortError("/api/tile/src0"));
     // Panning away is not a failure and must not reach the error UI.
     expect(onTileError).not.toHaveBeenCalled();
@@ -285,7 +285,7 @@ describe("PixelSource.onTileError", () => {
 
   it("forwards a real failure", () => {
     const onTileError = vi.fn();
-    const [full] = pixelSourcesFromInfo(stubClient(), "src0", INFO, { onTileError });
+    const [full] = pixelSourcesFromInfo(stubClient(), INFO, { onTileError });
     const err = new Error("502 upstream");
     full!.onTileError(err);
     expect(onTileError).toHaveBeenCalledWith(err);
