@@ -518,6 +518,36 @@ three-function stub removes 108 kB (38 kB gzip) from the lazy chunk plus ~120 kB
 decoder chunks that are never fetched. Not taken: it means vendoring three semantic
 definitions that can drift silently, for 38 kB off a chunk that is already lazy.
 
+**A t/c/z change has to be marked invalid; only zoom/pan may refine locally.**
+Both Viv layers keep their previous raster until a new read resolves, so a plane
+change left the old plane painted for exactly as long as the read took — frames
+measured **byte-identical** across a 6 s held read, with nothing on screen saying
+so. A stale plane is worse than a blank one: it is indistinguishable from the
+right answer, and a plane that never changes reads as a hung viewer rather than a
+slow one. deck.gl's `TileLayer` supplies the completion signal, `onViewportLoad`,
+and Viv forwards unknown props down to it while pinning the background
+`ImageLayer`'s own callback to `null` — so it fires once per completed viewport,
+not twice. Keyed against the current selection it gives an explicit valid/invalid
+state: the stale window drops from the read duration to **under ~270 ms** (a
+commit and a paint) and stops scaling with the backend. It re-fires for a fully
+cached selection, so stepping back to a visited plane clears the cover instead of
+sticking on it. Zoom and pan never invalidate — they change which tiles are
+wanted, not which plane — which is what keeps `refinementStrategy:
+'best-available'` doing its job.
+
+Two things the signal does not give for free. deck.gl counts a **failed** tile as
+loaded — `_isLoaded = true` with `content = null`, so `onError` fires and the
+tileset still reports the viewport complete — which would clear the cover over a
+canvas that never received the plane. Requiring every selected tile to carry
+content keeps it up. (An *aborted* tile is unaffected: `_isCancelled && !tileData`
+leaves it unloaded, so it never reaches the callback.) And once a plane is known
+to have landed, a featureless one still renders black, which is why the coarsest
+level's contrast samples double as an emptiness check — `sorted[0] === sorted.at(-1)`
+labels the plane rather than leaving black to mean three different things. That
+label is keyed to the selection: the samples are deliberately kept across a plane
+change so contrast does not flash, so an unkeyed label would describe the plane
+before last.
+
 ### Verified in a browser, not just in node
 
 `viv_browser_probe.mjs` drives the real `ViewerPane` in headless chromium over CDP
