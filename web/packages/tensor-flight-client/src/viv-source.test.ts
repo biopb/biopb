@@ -484,6 +484,22 @@ describe("getRaster caller signals", () => {
     dead.abort();
     await expect(half!.getRaster({ selection: SEL_A, signal: dead.signal }))
       .rejects.toBe(SIGNAL_ABORTED);
-    expect(calls[0]!.signal?.aborted).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("lets a caller that has already given up supersede nothing", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const wanted = half!.getRaster({ selection: SEL_A });
+    const dead = new AbortController();
+    dead.abort();
+    // A different selection, so taking this one at face value would retire the
+    // read somebody is still waiting on.
+    await expect(half!.getRaster({ selection: SEL_B, signal: dead.signal }))
+      .rejects.toBe(SIGNAL_ABORTED);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.signal?.aborted).toBe(false);
+    calls[0]!.settle();
+    await expect(wanted).resolves.toBeDefined();
   });
 });

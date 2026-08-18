@@ -186,6 +186,11 @@ class RasterRequests {
     start: (signal: AbortSignal) => Promise<PixelData>,
     caller?: AbortSignal,
   ): Promise<PixelData> {
+    // Before anything else, and before touching any shared state: a caller that
+    // has already given up must not supersede the generation on the strength of
+    // a selection it no longer wants, nor start a read only to abort it.
+    if (caller?.aborted) return Promise.reject(VIV_SIGNAL_ABORTED);
+
     if (key !== this.generation) {
       this.generation = key;
       for (const [id, req] of this.inFlight) {
@@ -228,12 +233,9 @@ class RasterRequests {
       }
     };
 
+    // `run` has already rejected an aborted caller, and nothing awaits between
+    // there and here, so the signal can only fire from now on.
     return new Promise<PixelData>((resolve, reject) => {
-      if (caller?.aborted) {
-        leave();
-        reject(VIV_SIGNAL_ABORTED);
-        return;
-      }
       let settled = false;
       const onAbort = () => {
         if (settled) return;
