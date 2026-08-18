@@ -40,10 +40,6 @@ logger = logging.getLogger(__name__)
 # Code 1 ("no absolute unit") carries only an aspect ratio and is excluded.
 _RESUNIT_TO_UM = {2: 25400.0, 3: 10000.0}
 
-# Sentinel for "physical scale not computed yet" -- distinct from a computed
-# ``None`` (no usable calibration), so the memoized result is never recomputed.
-_SCALE_UNSET = object()
-
 
 def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
     """One axis' pixel size in µm from a TIFF ``X``/``YResolution`` tag.
@@ -534,10 +530,6 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # serialize while reads of different files run in parallel, so one slow
         # read can't freeze every other frame.
         self._init_file_locks()
-        # Memoized physical scale: computing it reopens members[0], so cache the
-        # result (incl. a None) after the first call -- see _physical_scale.
-        self._physical_scale_cache: Any = _SCALE_UNSET
-
         # Gather every TIFF in the claimed directory. Unlike claim(), read does
         # NOT exclude OME names: the OME exclusion is a claim-time ownership
         # decision; by now the directory is claimed and its subtree pruned, so
@@ -841,14 +833,10 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (µm) from the first member's TIFF resolution tags.
 
-        Memoized: computing it reopens ``members[0]`` to read its page header, so
-        the result (a value *or* a ``None``) is cached after the first call and
-        every later open reuses it instead of reopening the TIFF. See
-        :meth:`_compute_physical_scale` for the projection itself.
+        The parent ``TensorAdapter`` memoizes the result when it fills a read
+        descriptor. See :meth:`_compute_physical_scale` for the projection itself.
         """
-        if self._physical_scale_cache is _SCALE_UNSET:
-            self._physical_scale_cache = self._compute_physical_scale()
-        return self._physical_scale_cache
+        return self._compute_physical_scale()
 
     def _compute_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Read the physical scale off ``members[0]`` (see :meth:`_physical_scale`).

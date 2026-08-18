@@ -817,14 +817,13 @@ class TestGetPhysicalScale:
 
     @staticmethod
     def _make_tiff_sequence(tiff_files, dim_labels):
-        from biopb_tensor_server.adapters.tiff import _SCALE_UNSET, TiffSequenceAdapter
+        from biopb_tensor_server.adapters.tiff import TiffSequenceAdapter
 
         a = TiffSequenceAdapter.__new__(TiffSequenceAdapter)
         a._tiff_files = tiff_files
         a.dim_labels = dim_labels
         a._source_url = str(tiff_files[0]) if tiff_files else ""
         a._init_file_locks()
-        a._physical_scale_cache = _SCALE_UNSET
         return a
 
     def test_tiff_sequence_physical_scale_resolution_tags(self):
@@ -918,11 +917,12 @@ class TestGetPhysicalScale:
         assert _tiff_pixel_size_um(page, "XResolution", None) == pytest.approx(1.0)
 
     def test_tiff_sequence_physical_scale_is_cached(self):
-        """The scale is computed once; a later call reuses it without reopening."""
+        """The parent descriptor fill computes the scale once."""
         try:
             import tifffile
         except ImportError:
             pytest.skip("tifffile not available")
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "img_0.tif")
@@ -942,10 +942,9 @@ class TestGetPhysicalScale:
                 return real_compute()
 
             a._compute_physical_scale = _counting_compute
-            first = a._physical_scale()
-            second = a._physical_scale()
-            assert first == second
-            assert first is not None
+            descriptor = TensorDescriptor(dim_labels=["i", "y", "x"])
+            a._fill_physical_scale(descriptor)
+            a._fill_physical_scale(descriptor)
             assert calls["n"] == 1  # reopened members[0] only once
 
     # ---- OME-Zarr HCS plate: per-field scale (issue #272) ------------------
