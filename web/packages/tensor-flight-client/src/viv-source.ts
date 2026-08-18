@@ -392,6 +392,41 @@ function makeSource(
       }
       const scale = level.scale;
       const sel = tileSelection(info, selection);
+      // The key is the resolved t/z/c, not the caller's selection object: the
+      // background layer and the contrast sampler build their own objects for
+      // the same plane, and only the resolved form makes those the same read.
+      const key = `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}`;
+
+      // A level that fits one tile is one tile. `_tile_levels` stops halving as
+      // soon as the plane fits the edge, so the coarsest level always has
+      // cols === rows === 1 -- and that is the only level Viv reads a raster
+      // from (the background ImageLayer and the contrast sampler both take
+      // `loader[loader.length - 1]`). The tile route answers with identical
+      // bytes and, unlike POST /api/slice, is cacheable: ETag plus
+      // `Cache-Control: private, max-age=3600`. So a revisited plane costs no
+      // backend read at all instead of one uncacheable read of the whole
+      // coarsest level.
+      if (level.cols === 1 && level.rows === 1) {
+        return requests.run(
+          level.level,
+          key,
+          async (shared) => {
+            const result = await client.tile(
+              {
+                array_id: info.array_id,
+                level: level.level,
+                col: 0,
+                row: 0,
+                ...sel,
+              },
+              { signal: shared },
+            );
+            return { data: asTypedArray(result.buffer, dtype), ...planeOf(result.shape) };
+          },
+          signal,
+        );
+      }
+
       const start: number[] = [];
       const stop: number[] = [];
       const scaleHint: number[] = [];
@@ -402,12 +437,9 @@ function makeSource(
         stop.push(isPlane ? extent : index + 1);
         scaleHint.push(i === plane.y || i === plane.x ? scale : 1);
       });
-      // The key is the resolved t/z/c, not the caller's selection object: the
-      // background layer and the contrast sampler build their own objects for
-      // the same plane, and only the resolved form makes those the same read.
       return requests.run(
         level.level,
-        `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}`,
+        key,
         async (shared) => {
           const arr = await client.slice(
             {

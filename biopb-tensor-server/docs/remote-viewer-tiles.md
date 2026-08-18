@@ -579,6 +579,37 @@ Aborts must reject with Viv's `SIGNAL_ABORTED` (`"__vivSignalAborted"`), not an
 `catch(e => { if (e !== SIGNAL_ABORTED) throw e })`, so anything else is rethrown
 inside a `.catch` nobody follows.
 
+**A level that fits one tile is one tile, so the raster never needs
+`/api/slice`.** `_tile_levels` stops halving as soon as the plane fits the edge,
+so the coarsest level always has `cols === rows === 1` — and that is the only
+level Viv reads a raster from, since both the background `ImageLayer` and the
+contrast sampler take `loader[loader.length - 1]`. Verified against the live
+server: `GET /api/tile?level=<coarsest>&col=0&row=0` and the `POST /api/slice`
+the viewer used to send return the same `X-Shape`, the same dtype, and
+**byte-for-byte identical** bodies — 425,042 B on a 922² `uint16` source, 373,827 B
+on a 1411² interleaved RGB one. The tile route carries an ETag and
+`max-age=3600`; `/api/slice` is a POST and cacheable by nothing.
+
+Routing the raster there is four lines in `viv-source.ts` and no server change.
+Measured per selection change:
+
+| | before | after |
+|---|---|---|
+| 922², 2 levels, cold | 4 tiles + 1 slice (425 KB, 14–21 ms) | 5 tiles, 0 slices |
+| 922², 2 levels, warm | 4 cache hits **+ 1 backend read** | 5 cache hits, **0 bytes** |
+| 512², 1 level, cold | 0 tiles + 1 slice (525 KB) | 1 tile |
+| 512², 1 level, warm | 1 slice, 525 KB, ~16 ms — *every time* | cached, 0 bytes, ~2 ms |
+
+The single-level row is the larger win: with one level Viv uses plain
+`ImageLayer`, so the raster is not a backdrop, it **is** the image — the whole
+render was uncacheable and is now entirely cache-served on a revisit.
+
+One honest caveat about the sharing: `RasterRequests` merges callers that
+overlap *in time*. A cold read is slow enough that the background layer and the
+contrast sampler always overlap and share one request; a warm read can complete
+in ~2 ms, between the two, so a revisit sometimes issues two requests. Both are
+cache hits costing no bytes, so this is a note rather than a defect.
+
 ### Verified in a browser, not just in node
 
 `viv_browser_probe.mjs` drives the real `ViewerPane` in headless chromium over CDP
