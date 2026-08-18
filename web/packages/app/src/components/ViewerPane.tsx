@@ -7,8 +7,12 @@
  * it cannot cover every case: it needs WebGL2, a dtype with a GPU equivalent, a
  * canonical `[..., Y, X, S]` axis order, and a server new enough to serve
  * `/api/tile_info`. The server-rendered viewer has none of those requirements,
- * so it stays as the fallback rather than being replaced outright — the failure
- * modes are all "this tensor", not "this deployment".
+ * so it stays as the fallback rather than being replaced outright.
+ *
+ * Those are all facts about the tensor or the browser, and they stay decided.
+ * A slow or failing *server* is not one of them: it says nothing about whether
+ * the tensor can be tiled, so it must not retire the tiled viewer for the rest
+ * of the visit. The two are tracked apart — see {@link FallbackKind}.
  */
 
 import { Component, Suspense, lazy, useCallback, useEffect, useState } from "react";
@@ -51,7 +55,7 @@ function hasWebGL2(): boolean {
  * with its child.
  */
 class TileViewerBoundary extends Component<
-  { children: ReactNode; onError: (reason: string) => void },
+  { children: ReactNode; onError: (reason: string, kind: FallbackKind) => void },
   { failed: boolean }
 > {
   state = { failed: false };
@@ -61,7 +65,10 @@ class TileViewerBoundary extends Component<
   }
 
   componentDidCatch(error: Error) {
-    this.props.onError(error.message || "the tiled viewer failed to start");
+    // "capability": a throw out of deck.gl is about this tensor and this GPU,
+    // and re-running the same render would reproduce it. Retrying is the user's
+    // call, not something to do automatically.
+    this.props.onError(error.message || "the tiled viewer failed to start", "capability");
   }
 
   render() {
@@ -69,36 +76,79 @@ class TileViewerBoundary extends Component<
   }
 }
 
+/**
+ * Why the pane is showing the server-rendered viewer.
+ *
+ * `"capability"` is a settled fact — this browser or this tensor cannot drive
+ * the tiled path — and is not worth re-testing until something changes.
+ * `"transport"` means the server did not answer; the tiled path was never ruled
+ * out, so it stays offered.
+ */
+export type FallbackKind = "capability" | "transport";
+
+interface Fallback {
+  reason: string;
+  kind: FallbackKind;
+}
+
+const noWebGL2: Fallback = {
+  reason: "WebGL2 is unavailable in this browser",
+  kind: "capability",
+};
+
 export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
-  const [fallback, setFallback] = useState<string | null>(
-    hasWebGL2() ? null : "WebGL2 is unavailable in this browser",
+  const [fallback, setFallback] = useState<Fallback | null>(
+    hasWebGL2() ? null : noWebGL2,
   );
+  // Bumped to remount the tiled viewer on a manual retry. The tensor has not
+  // changed, so `key={tensorId}` alone would hand back the same instance.
+  const [attempt, setAttempt] = useState(0);
 
   // A new tensor gets a fresh verdict: the previous one may have failed for a
   // reason that is specific to it (dtype, axis order).
   useEffect(() => {
-    setFallback(hasWebGL2() ? null : "WebGL2 is unavailable in this browser");
+    setFallback(hasWebGL2() ? null : noWebGL2);
   }, [sourceId, tensorId]);
 
-  const onUnsupported = useCallback((reason: string) => setFallback(reason), []);
+  const onUnsupported = useCallback(
+    (reason: string, kind: FallbackKind) => setFallback({ reason, kind }),
+    [],
+  );
+
+  const retry = useCallback(() => {
+    setFallback(null);
+    setAttempt((n) => n + 1);
+  }, []);
 
   if (fallback !== null) {
     return (
       <>
         <ImageViewer sourceId={sourceId} tensorId={tensorId} />
-        <div className="viewer-fallback-note">server-rendered — {fallback}</div>
+        <div className="viewer-fallback-note">
+          {fallback.kind === "transport" ? (
+            <>
+              server-rendered — the server did not answer in time, so the tiled
+              viewer could not start.{" "}
+              <button type="button" className="viewer-fallback-retry" onClick={retry}>
+                Try again
+              </button>
+            </>
+          ) : (
+            <>server-rendered — {fallback.reason}</>
+          )}
+        </div>
       </>
     );
   }
 
   return (
-    <TileViewerBoundary key={tensorId} onError={onUnsupported}>
+    <TileViewerBoundary key={`${tensorId}#${attempt}`} onError={onUnsupported}>
       <Suspense fallback={<div className="loading-overlay">Loading viewer…</div>}>
         <TileViewer
           // Remount per tensor: view state, contrast samples and the tile cache
           // all belong to one image, and resetting them by hand is the kind of
           // bookkeeping that goes stale.
-          key={tensorId}
+          key={`${tensorId}#${attempt}`}
           sourceId={sourceId}
           arrayId={tensorId}
           onUnsupported={onUnsupported}

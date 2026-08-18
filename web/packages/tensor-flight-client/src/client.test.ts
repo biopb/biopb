@@ -6,7 +6,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TensorHttpClient, TensorApiError, TensorAbortError } from "./client.js";
+import {
+  TensorHttpClient,
+  TensorApiError,
+  TensorAbortError,
+  TensorNetworkError,
+  isTransportError,
+} from "./client.js";
 import type { DataSourceDescriptor, TypedNdArray } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -831,5 +837,157 @@ describe("cancellation scope", () => {
     ctrl.abort();
     expect(fired).toBe(true); // our own listener, proving abort works
     // and no error surfaced from the settled request
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transport vs capability (#773)
+// ---------------------------------------------------------------------------
+
+describe("isTransportError", () => {
+  it("calls a timeout transport, because it decided nothing about the tensor", () => {
+    // The 408 this client synthesises when its own budget expires. Treating it
+    // as "this tensor cannot be tiled" is what downgraded a whole tensor to the
+    // server-rendered viewer whenever the backend was briefly slow.
+    expect(isTransportError(new TensorApiError(408, "Timeout after 8000ms (/api/tile_info/x)"))).toBe(true);
+  });
+
+  it("calls a failing server transport", () => {
+    for (const status of [500, 502, 503, 504]) {
+      expect(isTransportError(new TensorApiError(status, "upstream"))).toBe(true);
+    }
+    // What assertOk raises when the reverse proxy answers for a data plane that
+    // is still starting.
+    expect(isTransportError(new TensorApiError(503, "Server unavailable - may be starting up."))).toBe(true);
+  });
+
+  it("calls a refused request a fact about the tensor, not the transport", () => {
+    // 404 no such tensor, 422 not tileable, 400 bad request: asking again gets
+    // the same answer, so these are the ones worth making stick.
+    for (const status of [400, 404, 409, 422]) {
+      expect(isTransportError(new TensorApiError(status, "nope"))).toBe(false);
+    }
+  });
+
+  it("calls a rate limit transport, the one 4xx that is", () => {
+    // "Too many requests" is about rate, not about the request being wrong --
+    // its whole meaning is that asking again later works.
+    expect(isTransportError(new TensorApiError(429, "Rate limit exceeded (1 req/s)"))).toBe(true);
+  });
+
+  it("calls a network failure transport", () => {
+    expect(isTransportError(new TensorNetworkError("/api/tile_info/x"))).toBe(true);
+  });
+
+  it("does NOT trust a bare TypeError", () => {
+    // `fetch` rejects with one for DNS / connection / CORS -- but so does our
+    // own code when a malformed response reaches the mapping layer
+    // (`dim_labels.map` on undefined). Classifying that as transport would
+    // retry a bug and then blame the server for it, behind a "Try again"
+    // button that can never work. Only TensorNetworkError, raised around the
+    // `fetch` call alone, is trusted.
+    expect(isTransportError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isTransportError(new TypeError("Cannot read properties of undefined (reading 'map')"))).toBe(false);
+  });
+
+  it("does not guess about an error it does not recognise", () => {
+    expect(isTransportError(new RangeError("nope"))).toBe(false);
+    expect(isTransportError("a string")).toBe(false);
+    expect(isTransportError(undefined)).toBe(false);
+  });
+
+  it("does not call the caller's own abort a transport failure", () => {
+    // Callers discard these before classifying, but the answer must not be
+    // "retry" if one ever reaches here.
+    expect(isTransportError(new TensorAbortError("/api/tile_info/x"))).toBe(false);
+  });
+
+  it("does not call a mapping failure transport", () => {
+    // vivDtype / vivLabels throw plain Errors after tile_info arrived: the
+    // server answered fine and the tensor still cannot be rendered this way.
+    expect(isTransportError(new Error('Tensor dtype "<c8" has no Viv equivalent'))).toBe(false);
+    expect(isTransportError(new Error("is not in canonical [..., Y, X, S] order"))).toBe(false);
+  });
+});
+
+describe("TensorNetworkError", () => {
+  it("is raised when fetch itself rejects", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation(() => Promise.reject(new TypeError("Failed to fetch")));
+    const p = c.tileInfo("x");
+    await expect(p).rejects.toBeInstanceOf(TensorNetworkError);
+    await expect(p).rejects.toThrow(/Network request failed \(\/api\/tile_info\/x\)/);
+    await expect(p).rejects.toSatisfy(isTransportError);
+  });
+
+  it("is NOT raised for a failure while reading the response", async () => {
+    // The response arrived; whatever went wrong after that is not the network.
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        json: () => Promise.reject(new TypeError("Cannot read properties of undefined")),
+      } as unknown as Response));
+    const p = c.tileInfo("x");
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+    await expect(p).rejects.toSatisfy((e: unknown) => !isTransportError(e));
+  });
+
+  it("still reports a timeout as a timeout, not a network failure", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.tileInfoTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.tileInfo("x", { signal: new AbortController().signal });
+    await expect(p).rejects.toBeInstanceOf(TensorApiError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+  });
+
+  it("still reports a caller abort as an abort", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.tileInfo("x", { signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+  });
+});
+
+describe("tile_info's timeout budget", () => {
+  it("is its own, not the catalog budget", () => {
+    // It gates the whole tiled viewer, so expiring early does not fail one
+    // request -- it downgrades the tensor to the server-rendered path.
+    const c = new TensorHttpClient(BASE, TOKEN);
+    expect(c.tileInfoTimeoutMs).toBeGreaterThan(c.metadataTimeoutMs);
+  });
+
+  it("survives a response slower than the catalog budget", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.metadataTimeoutMs = 5;
+    c.tileInfoTimeoutMs = 200;
+    mockFetch.mockImplementation(
+      () => new Promise((res) => setTimeout(() => res(jsonResponse({ array_id: "x" })), 40)),
+    );
+    await expect(c.tileInfo("x")).resolves.toMatchObject({ array_id: "x" });
+  });
+
+  it("still gives up at its own budget", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.tileInfoTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.tileInfo("x", { signal: new AbortController().signal });
+    await expect(p).rejects.toThrow(/Timeout after 5ms/);
+    await expect(p).rejects.toSatisfy(isTransportError);
   });
 });

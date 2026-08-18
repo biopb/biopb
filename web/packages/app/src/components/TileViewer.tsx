@@ -21,10 +21,12 @@ import { DETAIL_VIEW_ID, DetailView, VivViewer, getDefaultInitialViewState } fro
 import {
   TensorAbortError,
   createTensorPixelSources,
+  isTransportError,
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
+import type { FallbackKind } from "./ViewerPane";
 import {
   contrastLimitsFrom,
   contrastSamples,
@@ -44,16 +46,28 @@ interface TileViewerProps {
   /** The tensor's whole address; `source_id` for a single-tensor source. */
   arrayId: string;
   /**
-   * The tensor cannot be shown this way — no tile route, an unsupported dtype,
-   * a non-canonical axis order. The caller falls back to the rendered-image
-   * viewer rather than leaving the pane empty.
+   * The tiled viewer gave up. `kind` says whether that is a fact about the
+   * tensor ("capability": no tile route, an unsupported dtype, a non-canonical
+   * axis order) or about the moment ("transport": the server timed out or
+   * failed). The caller falls back to the rendered-image viewer either way, but
+   * only the first is worth making permanent.
    */
-  onUnsupported: (reason: string) => void;
+  onUnsupported: (reason: string, kind: FallbackKind) => void;
 }
 
 /** Slice navigation: hold one of these and scroll. Matches {@link ImageViewer}. */
 const SLICE_KEYS = ["t", "z", "c"] as const;
 const SLICE_WHEEL_QUIET_MS = 120;
+
+/**
+ * Backoff before re-asking for `tile_info` after a transport failure.
+ *
+ * One retry, not a storm: a server slow enough to blow an 8 s budget twice is
+ * not going to be rescued by a third ask, and every attempt holds the pane
+ * empty. What this buys is the common case -- one slow response, from a cold
+ * catalog or a moment of load -- no longer costing the tensor its viewer.
+ */
+const TILE_INFO_RETRY_MS = [500];
 
 export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileViewerProps) {
   const client = useAppStore((s) => s.client);
@@ -74,27 +88,50 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   onUnsupportedRef.current = onUnsupported;
 
   // --- pixel sources ------------------------------------------------------
+  const [retrying, setRetrying] = useState(false);
   useEffect(() => {
     if (!client) return;
     const controller = new AbortController();
     let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
     setLoaded(null);
     setTileError(null);
-    createTensorPixelSources(client.http, arrayId, {
-      signal: controller.signal,
-      onTileError: (err) => {
-        if (live) setTileError(err.message);
-      },
-    })
-      .then(({ data, info }) => {
-        if (live) setLoaded({ sources: data, info });
+    setRetrying(false);
+
+    const load = () => {
+      createTensorPixelSources(client.http, arrayId, {
+        signal: controller.signal,
+        onTileError: (err) => {
+          if (live) setTileError(err.message);
+        },
       })
-      .catch((err: unknown) => {
-        if (!live || err instanceof TensorAbortError) return;
-        onUnsupportedRef.current(err instanceof Error ? err.message : String(err));
-      });
+        .then(({ data, info }) => {
+          if (live) setLoaded({ sources: data, info });
+        })
+        .catch((err: unknown) => {
+          if (!live || err instanceof TensorAbortError) return;
+          const message = err instanceof Error ? err.message : String(err);
+          const transport = isTransportError(err);
+          // A slow server says nothing about whether this tensor can be tiled,
+          // so re-ask before giving up its viewer.
+          const delay = transport ? TILE_INFO_RETRY_MS[attempt] : undefined;
+          if (delay !== undefined) {
+            attempt += 1;
+            setRetrying(true);
+            timer = setTimeout(() => {
+              if (live) load();
+            }, delay);
+            return;
+          }
+          onUnsupportedRef.current(message, transport ? "transport" : "capability");
+        });
+    };
+    load();
+
     return () => {
       live = false;
+      if (timer !== undefined) clearTimeout(timer);
       controller.abort();
     };
   }, [client, arrayId]);
@@ -252,7 +289,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           height={size.height}
         />
       ) : (
-        <div style={OVERLAY_TEXT}>Loading tiles…</div>
+        <div style={OVERLAY_TEXT}>
+          {retrying ? "Server did not answer in time — retrying…" : "Loading tiles…"}
+        </div>
       )}
       {loaded && selection && size && !dataValid && (
         // Opaque, not a scrim: the point is that the stale plane stops being

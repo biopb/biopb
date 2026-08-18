@@ -71,6 +71,63 @@ export class TensorAbortError extends Error {
   }
 }
 
+/**
+ * Did this fail because the *server* could not answer, or because the request
+ * was wrong?
+ *
+ * The viewer needs the distinction: a tensor that cannot be rendered a given way
+ * is a permanent fact about that tensor, while a timeout or a 5xx says nothing
+ * about it at all and is very likely to succeed on a second try. Treating the
+ * two alike downgrades a whole tensor to the fallback renderer because the
+ * backend was briefly busy.
+ *
+ * A caller abort is neither -- it is the caller's own doing, and callers discard
+ * it before they get here.
+ */
+export function isTransportError(err: unknown): boolean {
+  if (err instanceof TensorAbortError) return false;
+  if (err instanceof TensorNetworkError) return true;
+  if (err instanceof TensorApiError) {
+    // 408 is the timeout this client synthesises; 5xx is the server failing, or
+    // the reverse proxy answering for a data plane that is still starting. 429
+    // is the one 4xx that belongs here: "too many requests" is a statement about
+    // rate, not about the request being wrong, and the whole meaning of it is
+    // that asking again later works. Latent on the read path today -- only
+    // /api/diagnostics rate-limits -- but a rate limiter at the edge would make
+    // it live without any client change.
+    //
+    // `Retry-After` is deliberately not honoured: nothing on the read path sends
+    // it, and the caller's own backoff is the schedule that matters. Wire it
+    // through here if a limiter ever starts setting it.
+    return err.status === 408 || err.status === 429 || err.status >= 500;
+  }
+  // Anything else is unrecognised, and an unrecognised failure is far more
+  // likely to be a bug in this client than a sick server. Answering "no" keeps
+  // it out of the retry path and reports it honestly instead.
+  return false;
+}
+
+/**
+ * `fetch` itself rejected: DNS, connection refused, TLS, CORS. The request never
+ * reached the server, so nothing was decided about what it asked for.
+ *
+ * Exists so callers never have to test for the bare `TypeError` that `fetch`
+ * rejects with. That test cannot be made safe: our own code throws `TypeError`
+ * too -- a malformed response reaching `vivLabels` is one -- and treating a bug
+ * as a network blip means retrying it and then blaming the server for it. This
+ * is raised only around the `fetch` call, never around reading the response, so
+ * it means the network and nothing else.
+ */
+export class TensorNetworkError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly reason?: unknown,
+  ) {
+    super(`Network request failed (${path})`);
+    this.name = "TensorNetworkError";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
@@ -173,6 +230,17 @@ export class TensorHttpClient {
   metadataTimeoutMs = 3_000;
   /** Timeout for binary chunk/slice requests (ms). */
   chunkTimeoutMs = 8_000;
+  /**
+   * Timeout for `tile_info` (ms).
+   *
+   * Deliberately not {@link metadataTimeoutMs}: that budget is sized for small
+   * catalog calls, where giving up quickly costs a list and nothing else. This
+   * one call is the gate on the whole tiled viewer -- nothing renders until it
+   * returns -- so expiring early does not fail one request, it downgrades the
+   * tensor to the server-rendered path. Sized like the other read-path budget
+   * ({@link chunkTimeoutMs}) instead, and paired with a retry in the viewer.
+   */
+  tileInfoTimeoutMs = 8_000;
 
   /**
    * @param apiBase   Base URL of the FastAPI sidecar, e.g. "http://localhost:8816".
@@ -257,7 +325,17 @@ export class TensorHttpClient {
   ): Promise<T> {
     const composed = composeSignal(timeoutMs, opts?.signal);
     try {
-      const res = await fetch(`${this.base}${path}`, { ...init, signal: composed.signal });
+      let res: Response;
+      try {
+        res = await fetch(`${this.base}${path}`, { ...init, signal: composed.signal });
+      } catch (e) {
+        // The only rejection here that is unambiguously the network. The same
+        // `TypeError` thrown while reading the response below would be ours.
+        const mapped = abortAwareError(e, path, timeoutMs, opts?.signal);
+        throw mapped instanceof Error && mapped === e
+          ? new TensorNetworkError(path, e)
+          : mapped;
+      }
       await assertOk(res);
       return await consume(res);
     } catch (e) {
@@ -462,7 +540,7 @@ export class TensorHttpClient {
     return this.fetchJson<TileInfo>(
       `/api/tile_info/${encodeArrayId(arrayId)}`,
       undefined,
-      this.metadataTimeoutMs,
+      this.tileInfoTimeoutMs,
       opts,
     );
   }

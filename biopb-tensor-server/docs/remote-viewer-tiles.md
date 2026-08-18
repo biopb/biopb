@@ -579,6 +579,46 @@ Aborts must reject with Viv's `SIGNAL_ABORTED` (`"__vivSignalAborted"`), not an
 `catch(e => { if (e !== SIGNAL_ABORTED) throw e })`, so anything else is rethrown
 inside a `.catch` nobody follows.
 
+**A slow server is not an untileable tensor.** The pane falls back to the
+server-rendered viewer for things that are settled — no WebGL2, a dtype with no
+GPU equivalent, a non-canonical axis order, a server too old for the tile routes.
+`tile_info` failures used to join that list: it opens the load, it ran on the
+*catalog* timeout (3 s), and its synthesised 408 reached `onUnsupported` looking
+exactly like an unsupported dtype. One slow response therefore retired the tiled
+viewer for that tensor until the user navigated away and back — handing them the
+WAN-hostile render path precisely when the deployment was under stress, with the
+badge blaming the tensor (`TensorApi 408: Timeout after 3000ms`, measured).
+
+Three things separate the cases. `isTransportError` splits "the server did not
+answer" (408, 429, 5xx, `TensorNetworkError`) from "this tensor cannot be rendered
+this way" (404, 422, other 4xx, and the plain errors `vivDtype`/`vivLabels` throw
+*after* a successful fetch); an error it does not recognise is **not** transport,
+since an unrecognised failure is likelier to be a client bug than a sick server.
+429 is the one 4xx on the transport side — "too many requests" is about rate, not
+about the request being wrong, and its whole meaning is that asking again later
+works. Latent on the read path (only `/api/diagnostics` rate-limits), but a
+limiter at the edge would make it live with no client change.
+
+`TensorNetworkError` exists because the obvious test is unsafe. `fetch` rejects
+with a bare `TypeError` for DNS/connection/CORS — but so does our own code, and
+`send` wrapped `fetch`, `assertOk` and the response read in one `try`. A
+malformed `tile_info` reaching `vivLabels` (`dim_labels.map` on undefined) is a
+`TypeError`, so keying on the type would have retried a bug twice and then
+reported it as a slow server, behind a "Try again" that could never work. The
+error is now raised around the `fetch` call alone, which is the only place a
+rejection unambiguously means the network. `tile_info` gets its own budget — 8 s, the read-path
+figure, not the 3 s sized for small catalog calls — because it is the gate on the
+whole viewer, so expiring early does not fail one request, it downgrades the
+tensor; one retry follows at 500 ms. And a transport fallback is no longer
+sticky: it says the server was slow and offers "Try again", while a capability
+fallback stays decided.
+
+Measured with `/api/tile_info` held at the proxy and everything else at full
+speed: a 4 s hold went from a **permanent** downgrade to no fallback at all; a
+9 s hold shows "Server did not answer in time — retrying…" and recovers on the
+retry; a hold that never lifts falls back at ~16.5 s with the retry control, and
+clicking it brings the tiled viewer back once the server is healthy.
+
 **A level that fits one tile is one tile, so the raster never needs
 `/api/slice`.** `_tile_levels` stops halving as soon as the plane fits the edge,
 so the coarsest level always has `cols === rows === 1` — and that is the only
