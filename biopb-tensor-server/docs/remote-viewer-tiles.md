@@ -548,6 +548,37 @@ label is keyed to the selection: the samples are deliberately kept across a plan
 change so contrast does not flash, so an unkeyed label would describe the plane
 before last.
 
+And the signal arrives in **two shapes**. A pyramid reports the array of deck.gl
+tiles; an image that needs only one level is rendered by Viv's plain `ImageLayer`,
+which reports the single raster it read. Accepting only the array left every
+single-level image permanently covered — the exact case the tile grid is skipped
+for.
+
+**Nothing cancels a superseded `getRaster`, so the viewer has to.**
+`ImageLayer.updateState` makes a new `AbortController` per selection and drops the
+old one un-aborted; only `finalizeState` aborts, and only the current one. Eight
+z-steps 250 ms apart against a 6 s backend left **9 reads in flight**, monotonic,
+three of them alive until `chunkTimeoutMs` killed them at 8 s — and past the
+browser's six-connections-per-origin cap the newest read queues behind stale ones
+nobody wants. The same trigger doubled the count: the background `ImageLayer` and
+the contrast sampler both read the coarsest level for every selection, neither
+aware of the other (**16** `/api/slice` for 8 steps). `RasterRequests` in
+`viv-source.ts` keeps one in-flight read per (level, selection) — a second caller
+joins it, a new selection aborts every older one, each caller's own signal stays
+independent, and the shared read dies with its last waiter. Measured: **8**
+requests for 8 steps, **1** in flight throughout.
+
+It also removes a false clear. A superseded raster that resolves late calls
+`onViewportLoad`, which reads the *current* selection — so the cover lifted at
++4229 ms over a canvas that then changed by **45%** when the real plane landed.
+With superseded reads aborted the cover lifts at +6037 ms and the canvas changes
+by **0%**: one backend read after the last step, which is the floor.
+
+Aborts must reject with Viv's `SIGNAL_ABORTED` (`"__vivSignalAborted"`), not an
+`AbortError`. `ImageLayer` ends its chain with
+`catch(e => { if (e !== SIGNAL_ABORTED) throw e })`, so anything else is rethrown
+inside a `.catch` nobody follows.
+
 ### Verified in a browser, not just in node
 
 `viv_browser_probe.mjs` drives the real `ViewerPane` in headless chromium over CDP
