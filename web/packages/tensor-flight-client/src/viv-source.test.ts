@@ -329,3 +329,177 @@ describe("PixelSource.onTileError", () => {
     expect(onTileError).toHaveBeenCalledWith(err);
   });
 });
+
+// ---------------------------------------------------------------------------
+// getRaster coalescing (#772)
+// ---------------------------------------------------------------------------
+
+/** A `slice` that never settles on its own, so in-flight state is observable. */
+function deferredClient() {
+  const calls: {
+    signal?: AbortSignal;
+    settle: () => void;
+    fail: (err: unknown) => void;
+  }[] = [];
+  const slice = vi.fn(
+    (_req: SliceRequest, opts?: RequestOptions) =>
+      new Promise((resolve, reject) => {
+        opts?.signal?.addEventListener("abort", () =>
+          reject(new TensorAbortError("/api/slice")),
+        );
+        calls.push({
+          signal: opts?.signal,
+          settle: () =>
+            resolve({
+              buffer: new ArrayBuffer(512 * 512 * 2),
+              shape: [1, 1, 1, 512, 512],
+              dtype: "uint16",
+              dimLabels: ["T", "C", "Z", "Y", "X"],
+            }),
+          fail: reject,
+        });
+      }),
+  );
+  return { client: stubClient({ slice }), calls, slice };
+}
+
+/** What Viv's ImageLayer swallows; anything else becomes an unhandled rejection. */
+const SIGNAL_ABORTED = "__vivSignalAborted";
+
+const SEL_A = { t: 0, c: 0, z: 0 };
+const SEL_B = { t: 0, c: 0, z: 1 };
+
+describe("getRaster request sharing", () => {
+  it("serves two callers for the same plane from one read", async () => {
+    const { client, calls, slice } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const a = half!.getRaster({ selection: SEL_A });
+    const b = half!.getRaster({ selection: SEL_A });
+    // The background ImageLayer and the contrast sampler ask for exactly this,
+    // independently, on every selection change.
+    expect(slice).toHaveBeenCalledTimes(1);
+    calls[0]!.settle();
+    expect((await a).width).toBe(512);
+    expect((await b).width).toBe(512);
+  });
+
+  it("does not confuse two levels of the same plane", async () => {
+    const { client, slice } = deferredClient();
+    const [full, half] = pixelSourcesFromInfo(client, INFO);
+    void full!.getRaster({ selection: SEL_A }).catch(() => {});
+    void half!.getRaster({ selection: SEL_A }).catch(() => {});
+    expect(slice).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts a fresh read once the shared one has settled", async () => {
+    const { client, calls, slice } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const first = half!.getRaster({ selection: SEL_A });
+    calls[0]!.settle();
+    await first;
+    // Sharing is de-duplication, not caching: a later ask still reads.
+    void half!.getRaster({ selection: SEL_A }).catch(() => {});
+    expect(slice).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("getRaster superseding", () => {
+  it("aborts every level of the plane that is no longer wanted", async () => {
+    const { client, calls } = deferredClient();
+    const [full, half] = pixelSourcesFromInfo(client, INFO);
+    const stale = [
+      full!.getRaster({ selection: SEL_A }),
+      half!.getRaster({ selection: SEL_A }),
+    ];
+    expect(calls.map((c) => c.signal?.aborted)).toEqual([false, false]);
+
+    const wanted = half!.getRaster({ selection: SEL_B });
+    // Both of the previous selection's reads, not just the one re-asked.
+    expect(calls.map((c) => c.signal?.aborted)).toEqual([true, true, false]);
+    await expect(stale[0]).rejects.toBe(SIGNAL_ABORTED);
+    await expect(stale[1]).rejects.toBe(SIGNAL_ABORTED);
+
+    calls[2]!.settle();
+    await expect(wanted).resolves.toBeDefined();
+  });
+
+  it("rejects with the value Viv's ImageLayer swallows", async () => {
+    // It ends its chain with `catch(e => { if (e !== SIGNAL_ABORTED) throw e })`,
+    // so an AbortError or a TensorAbortError here is an unhandled rejection.
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const stale = half!.getRaster({ selection: SEL_A });
+    void half!.getRaster({ selection: SEL_B }).catch(() => {});
+    await expect(stale).rejects.toBe(SIGNAL_ABORTED);
+    expect(calls[0]!.signal?.aborted).toBe(true);
+  });
+
+  it("passes a real failure through untouched", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const raster = half!.getRaster({ selection: SEL_A });
+    const err = new Error("502 upstream");
+    calls[0]!.fail(err);
+    await expect(raster).rejects.toBe(err);
+  });
+});
+
+describe("getRaster caller signals", () => {
+  it("detaches one caller without cancelling the other's read", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const mine = new AbortController();
+    const leaving = half!.getRaster({ selection: SEL_A, signal: mine.signal });
+    const staying = half!.getRaster({ selection: SEL_A });
+
+    mine.abort();
+    await expect(leaving).rejects.toBe(SIGNAL_ABORTED);
+    // The shared read belongs to whoever is still waiting on it.
+    expect(calls[0]!.signal?.aborted).toBe(false);
+    calls[0]!.settle();
+    await expect(staying).resolves.toBeDefined();
+  });
+
+  it("cancels the read when the last waiter leaves", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const one = new AbortController();
+    const two = new AbortController();
+    const a = half!.getRaster({ selection: SEL_A, signal: one.signal });
+    const b = half!.getRaster({ selection: SEL_A, signal: two.signal });
+
+    one.abort();
+    expect(calls[0]!.signal?.aborted).toBe(false);
+    two.abort();
+    // Nobody is left to receive the answer, so it stops costing a connection.
+    expect(calls[0]!.signal?.aborted).toBe(true);
+    await expect(a).rejects.toBe(SIGNAL_ABORTED);
+    await expect(b).rejects.toBe(SIGNAL_ABORTED);
+  });
+
+  it("does not start a read for a caller that has already given up", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const dead = new AbortController();
+    dead.abort();
+    await expect(half!.getRaster({ selection: SEL_A, signal: dead.signal }))
+      .rejects.toBe(SIGNAL_ABORTED);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("lets a caller that has already given up supersede nothing", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const wanted = half!.getRaster({ selection: SEL_A });
+    const dead = new AbortController();
+    dead.abort();
+    // A different selection, so taking this one at face value would retire the
+    // read somebody is still waiting on.
+    await expect(half!.getRaster({ selection: SEL_B, signal: dead.signal }))
+      .rejects.toBe(SIGNAL_ABORTED);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.signal?.aborted).toBe(false);
+    calls[0]!.settle();
+    await expect(wanted).resolves.toBeDefined();
+  });
+});

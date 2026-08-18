@@ -129,14 +129,23 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // layerProps rebuild would look like a prop change to deck.gl.
   const selectionKeyRef = useRef(selectionKey);
   selectionKeyRef.current = selectionKey;
-  const onViewportLoad = useCallback((tiles?: readonly { content?: unknown }[]) => {
-    // A *failed* tile still counts as loaded to deck.gl -- `_isLoaded = true`
-    // with `content = null` -- so a viewport whose reads all errored reports
-    // itself complete. Taking that at face value would clear the cover over a
-    // canvas that never got the plane, which is the ambiguity this gate exists
-    // to remove. An aborted tile is not affected: deck.gl leaves that one
-    // unloaded, so it never reaches here.
-    if (tiles?.some((tile) => tile?.content == null)) return;
+  const onViewportLoad = useCallback((loaded?: unknown) => {
+    // Two different things call this. A pyramid gets Viv's MultiscaleImageLayer
+    // and deck.gl's TileLayer under it, which reports the array of tiles; an
+    // image small enough to need only one level gets Viv's plain ImageLayer,
+    // which reports the single raster it just read. Assuming the array shape
+    // leaves every single-level image permanently covered.
+    if (Array.isArray(loaded)) {
+      // A *failed* tile still counts as loaded to deck.gl -- `_isLoaded = true`
+      // with `content = null` -- so a viewport whose reads all errored reports
+      // itself complete. Taking that at face value would clear the cover over a
+      // canvas that never got the plane, which is the ambiguity this gate exists
+      // to remove. An aborted tile is not affected: deck.gl leaves that one
+      // unloaded, so it never reaches here.
+      if (loaded.some((tile: { content?: unknown } | null) => tile?.content == null)) return;
+    }
+    // The ImageLayer branch needs no such check: a raster that failed rejects,
+    // and it only calls this on the resolved path.
     setLoadedKey(selectionKeyRef.current);
   }, []);
   // Zoom and pan never invalidate: they change which tiles are wanted, not
@@ -297,7 +306,7 @@ function VivStage({
   contrastLimits: [number, number];
   color: [number, number, number];
   maxCacheSize: number;
-  onViewportLoad: (tiles?: readonly { content?: unknown }[]) => void;
+  onViewportLoad: (loaded?: unknown) => void;
   width: number;
   height: number;
 }) {

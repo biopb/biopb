@@ -130,6 +130,152 @@ export interface TensorPixelSourceOptions {
 const DEFAULT_MAX_RASTER_PIXELS = 16_777_216; // 4096 x 4096
 
 // ---------------------------------------------------------------------------
+// getRaster coalescing
+// ---------------------------------------------------------------------------
+
+/**
+ * Viv's abort convention, restated because `@vivjs/loaders` does not export it
+ * as a type and importing a value from it would pull the loader stack into a
+ * client that has no other use for it.
+ *
+ * It has to be this exact value. `ImageLayer.updateState` ends its promise
+ * chain with `catch(e => { if (e !== SIGNAL_ABORTED) throw e })`, so any other
+ * rejection -- an `AbortError`, our own `TensorAbortError` -- is rethrown from
+ * inside a `.catch` nobody follows, and surfaces as an unhandled rejection.
+ * Viv's own `TiffPixelSource` throws the same value for the same reason.
+ */
+const VIV_SIGNAL_ABORTED = "__vivSignalAborted";
+
+interface RasterRequest {
+  /** The selection this was started for; the generation marker. */
+  key: string;
+  promise: Promise<PixelData>;
+  controller: AbortController;
+  /** Callers still waiting. At zero the answer is wanted by nobody. */
+  waiters: number;
+}
+
+/**
+ * One in-flight `getRaster` per (level, selection), shared by every caller, and
+ * only ever for the newest selection.
+ *
+ * Two things go wrong without this, both from Viv's `ImageLayer.updateState`
+ * making a *new* `AbortController` per selection and dropping the old one
+ * un-aborted (only `finalizeState` aborts, and only the current one):
+ *
+ *  - superseded reads run to completion, or to `chunkTimeoutMs`, and survive
+ *    unmount. A scrub accumulates them without bound, and past the browser's
+ *    six-connections-per-origin cap the newest and most-wanted read queues
+ *    behind stale ones nobody wants.
+ *  - the coarsest level is read twice per selection change, by Viv's background
+ *    `ImageLayer` and by the viewer's contrast sampling, neither aware of the
+ *    other.
+ *
+ * A raster is only ever wanted for the current view, so superseding is the
+ * correct semantics and not merely a convenient one. Each caller keeps its own
+ * signal: one caller aborting detaches only itself, and the shared request is
+ * aborted when its last waiter leaves.
+ */
+class RasterRequests {
+  private readonly inFlight = new Map<string, RasterRequest>();
+  private generation: string | null = null;
+
+  run(
+    level: number,
+    key: string,
+    start: (signal: AbortSignal) => Promise<PixelData>,
+    caller?: AbortSignal,
+  ): Promise<PixelData> {
+    // Before anything else, and before touching any shared state: a caller that
+    // has already given up must not supersede the generation on the strength of
+    // a selection it no longer wants, nor start a read only to abort it.
+    if (caller?.aborted) return Promise.reject(VIV_SIGNAL_ABORTED);
+
+    if (key !== this.generation) {
+      this.generation = key;
+      for (const [id, req] of this.inFlight) {
+        if (req.key !== key) {
+          this.inFlight.delete(id);
+          req.controller.abort(VIV_SIGNAL_ABORTED);
+        }
+      }
+    }
+
+    const id = `${level}@${key}`;
+    let entry = this.inFlight.get(id);
+    if (!entry) {
+      const controller = new AbortController();
+      const started: RasterRequest = {
+        key,
+        controller,
+        waiters: 0,
+        promise: start(controller.signal),
+      };
+      this.inFlight.set(id, started);
+      // Both arms: clears the slot on failure too, and keeps the shared promise
+      // from counting as unhandled when every waiter has already detached.
+      const release = () => {
+        if (this.inFlight.get(id) === started) this.inFlight.delete(id);
+      };
+      started.promise.then(release, release);
+      entry = started;
+    }
+    return this.join(id, entry, caller);
+  }
+
+  private join(id: string, entry: RasterRequest, caller?: AbortSignal): Promise<PixelData> {
+    entry.waiters += 1;
+    const leave = () => {
+      entry.waiters -= 1;
+      if (entry.waiters <= 0 && this.inFlight.get(id) === entry) {
+        this.inFlight.delete(id);
+        entry.controller.abort(VIV_SIGNAL_ABORTED);
+      }
+    };
+
+    // `run` has already rejected an aborted caller, and nothing awaits between
+    // there and here, so the signal can only fire from now on.
+    return new Promise<PixelData>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        detach();
+        leave();
+        reject(VIV_SIGNAL_ABORTED);
+      };
+      const detach = () => caller?.removeEventListener("abort", onAbort);
+      caller?.addEventListener("abort", onAbort, { once: true });
+
+      entry.promise.then(
+        (data) => {
+          if (settled) return;
+          settled = true;
+          detach();
+          entry.waiters -= 1;
+          resolve(data);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          detach();
+          entry.waiters -= 1;
+          reject(isAbort(err) ? VIV_SIGNAL_ABORTED : err);
+        },
+      );
+    });
+  }
+}
+
+function isAbort(err: unknown): boolean {
+  return (
+    err === VIV_SIGNAL_ABORTED ||
+    err instanceof TensorAbortError ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Adapter
 // ---------------------------------------------------------------------------
 
@@ -163,8 +309,11 @@ export function pixelSourcesFromInfo(
 ): PixelSource<string[]>[] {
   const labels = vivLabels(info);
   const dtype = vivDtype(info.dtype);
+  // Shared across the levels of this image, so a selection change supersedes
+  // reads on every level and not just the one being asked again.
+  const requests = new RasterRequests();
   return info.levels.map((level) =>
-    makeSource(client, info, level, labels, dtype, options),
+    makeSource(client, info, level, labels, dtype, options, requests),
   );
 }
 
@@ -175,6 +324,7 @@ function makeSource(
   labels: string[],
   dtype: SupportedDtype,
   options: TensorPixelSourceOptions,
+  requests: RasterRequests,
 ): PixelSource<string[]> {
   const { plane } = info;
   // Values per pixel: >1 only for an interleaved RGB(A) samples axis.
@@ -252,17 +402,27 @@ function makeSource(
         stop.push(isPlane ? extent : index + 1);
         scaleHint.push(i === plane.y || i === plane.x ? scale : 1);
       });
-      const arr = await client.slice(
-        {
-          source_id: info.array_id.split("/", 1)[0]!,
-          tensor_id: info.array_id,
-          slice_start: start,
-          slice_stop: stop,
-          scale_hint: scaleHint,
+      // The key is the resolved t/z/c, not the caller's selection object: the
+      // background layer and the contrast sampler build their own objects for
+      // the same plane, and only the resolved form makes those the same read.
+      return requests.run(
+        level.level,
+        `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}`,
+        async (shared) => {
+          const arr = await client.slice(
+            {
+              source_id: info.array_id.split("/", 1)[0]!,
+              tensor_id: info.array_id,
+              slice_start: start,
+              slice_stop: stop,
+              scale_hint: scaleHint,
+            },
+            { signal: shared },
+          );
+          return { data: asTypedArray(arr.buffer, dtype), ...planeOf(arr.shape) };
         },
-        { signal },
+        signal,
       );
-      return { data: asTypedArray(arr.buffer, dtype), ...planeOf(arr.shape) };
     },
 
     onTileError(err: Error) {
