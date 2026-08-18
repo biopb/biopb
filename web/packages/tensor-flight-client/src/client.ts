@@ -86,15 +86,37 @@ export class TensorAbortError extends Error {
  */
 export function isTransportError(err: unknown): boolean {
   if (err instanceof TensorAbortError) return false;
+  if (err instanceof TensorNetworkError) return true;
   if (err instanceof TensorApiError) {
     // 408 is the timeout this client synthesises; 5xx is the server failing, or
     // the reverse proxy answering for a data plane that is still starting.
     return err.status === 408 || err.status >= 500;
   }
-  // `fetch` rejects with a TypeError for DNS, connection and CORS failures --
-  // the network never reached the server, so nothing was decided about the
-  // tensor.
-  return err instanceof TypeError;
+  // Anything else is unrecognised, and an unrecognised failure is far more
+  // likely to be a bug in this client than a sick server. Answering "no" keeps
+  // it out of the retry path and reports it honestly instead.
+  return false;
+}
+
+/**
+ * `fetch` itself rejected: DNS, connection refused, TLS, CORS. The request never
+ * reached the server, so nothing was decided about what it asked for.
+ *
+ * Exists so callers never have to test for the bare `TypeError` that `fetch`
+ * rejects with. That test cannot be made safe: our own code throws `TypeError`
+ * too -- a malformed response reaching `vivLabels` is one -- and treating a bug
+ * as a network blip means retrying it and then blaming the server for it. This
+ * is raised only around the `fetch` call, never around reading the response, so
+ * it means the network and nothing else.
+ */
+export class TensorNetworkError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly reason?: unknown,
+  ) {
+    super(`Network request failed (${path})`);
+    this.name = "TensorNetworkError";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +316,17 @@ export class TensorHttpClient {
   ): Promise<T> {
     const composed = composeSignal(timeoutMs, opts?.signal);
     try {
-      const res = await fetch(`${this.base}${path}`, { ...init, signal: composed.signal });
+      let res: Response;
+      try {
+        res = await fetch(`${this.base}${path}`, { ...init, signal: composed.signal });
+      } catch (e) {
+        // The only rejection here that is unambiguously the network. The same
+        // `TypeError` thrown while reading the response below would be ours.
+        const mapped = abortAwareError(e, path, timeoutMs, opts?.signal);
+        throw mapped instanceof Error && mapped === e
+          ? new TensorNetworkError(path, e)
+          : mapped;
+      }
       await assertOk(res);
       return await consume(res);
     } catch (e) {

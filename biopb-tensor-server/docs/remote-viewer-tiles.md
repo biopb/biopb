@@ -590,9 +590,19 @@ WAN-hostile render path precisely when the deployment was under stress, with the
 badge blaming the tensor (`TensorApi 408: Timeout after 3000ms`, measured).
 
 Three things separate the cases. `isTransportError` splits "the server did not
-answer" (408, 5xx, a network `TypeError`) from "this tensor cannot be rendered
+answer" (408, 5xx, `TensorNetworkError`) from "this tensor cannot be rendered
 this way" (404, 422, other 4xx, and the plain errors `vivDtype`/`vivLabels` throw
-*after* a successful fetch). `tile_info` gets its own budget — 8 s, the read-path
+*after* a successful fetch); an error it does not recognise is **not** transport,
+since an unrecognised failure is likelier to be a client bug than a sick server.
+
+`TensorNetworkError` exists because the obvious test is unsafe. `fetch` rejects
+with a bare `TypeError` for DNS/connection/CORS — but so does our own code, and
+`send` wrapped `fetch`, `assertOk` and the response read in one `try`. A
+malformed `tile_info` reaching `vivLabels` (`dim_labels.map` on undefined) is a
+`TypeError`, so keying on the type would have retried a bug twice and then
+reported it as a slow server, behind a "Try again" that could never work. The
+error is now raised around the `fetch` call alone, which is the only place a
+rejection unambiguously means the network. `tile_info` gets its own budget — 8 s, the read-path
 figure, not the 3 s sized for small catalog calls — because it is the gate on the
 whole viewer, so expiring early does not fail one request, it downgrades the
 tensor; one retry follows at 500 ms. And a transport fallback is no longer

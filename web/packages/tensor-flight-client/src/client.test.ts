@@ -6,7 +6,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TensorHttpClient, TensorApiError, TensorAbortError, isTransportError } from "./client.js";
+import {
+  TensorHttpClient,
+  TensorApiError,
+  TensorAbortError,
+  TensorNetworkError,
+  isTransportError,
+} from "./client.js";
 import type { DataSourceDescriptor, TypedNdArray } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -864,8 +870,24 @@ describe("isTransportError", () => {
   });
 
   it("calls a network failure transport", () => {
-    // fetch() rejects with TypeError for DNS / connection / CORS.
-    expect(isTransportError(new TypeError("Failed to fetch"))).toBe(true);
+    expect(isTransportError(new TensorNetworkError("/api/tile_info/x"))).toBe(true);
+  });
+
+  it("does NOT trust a bare TypeError", () => {
+    // `fetch` rejects with one for DNS / connection / CORS -- but so does our
+    // own code when a malformed response reaches the mapping layer
+    // (`dim_labels.map` on undefined). Classifying that as transport would
+    // retry a bug and then blame the server for it, behind a "Try again"
+    // button that can never work. Only TensorNetworkError, raised around the
+    // `fetch` call alone, is trusted.
+    expect(isTransportError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isTransportError(new TypeError("Cannot read properties of undefined (reading 'map')"))).toBe(false);
+  });
+
+  it("does not guess about an error it does not recognise", () => {
+    expect(isTransportError(new RangeError("nope"))).toBe(false);
+    expect(isTransportError("a string")).toBe(false);
+    expect(isTransportError(undefined)).toBe(false);
   });
 
   it("does not call the caller's own abort a transport failure", () => {
@@ -879,6 +901,57 @@ describe("isTransportError", () => {
     // server answered fine and the tensor still cannot be rendered this way.
     expect(isTransportError(new Error('Tensor dtype "<c8" has no Viv equivalent'))).toBe(false);
     expect(isTransportError(new Error("is not in canonical [..., Y, X, S] order"))).toBe(false);
+  });
+});
+
+describe("TensorNetworkError", () => {
+  it("is raised when fetch itself rejects", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation(() => Promise.reject(new TypeError("Failed to fetch")));
+    const p = c.tileInfo("x");
+    await expect(p).rejects.toBeInstanceOf(TensorNetworkError);
+    await expect(p).rejects.toThrow(/Network request failed \(\/api\/tile_info\/x\)/);
+    await expect(p).rejects.toSatisfy(isTransportError);
+  });
+
+  it("is NOT raised for a failure while reading the response", async () => {
+    // The response arrived; whatever went wrong after that is not the network.
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        json: () => Promise.reject(new TypeError("Cannot read properties of undefined")),
+      } as unknown as Response));
+    const p = c.tileInfo("x");
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+    await expect(p).rejects.toSatisfy((e: unknown) => !isTransportError(e));
+  });
+
+  it("still reports a timeout as a timeout, not a network failure", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.tileInfoTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.tileInfo("x", { signal: new AbortController().signal });
+    await expect(p).rejects.toBeInstanceOf(TensorApiError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+  });
+
+  it("still reports a caller abort as an abort", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.tileInfo("x", { signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
   });
 });
 
