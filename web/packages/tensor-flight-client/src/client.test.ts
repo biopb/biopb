@@ -869,6 +869,12 @@ describe("isTransportError", () => {
     }
   });
 
+  it("calls a rate limit transport, the one 4xx that is", () => {
+    // "Too many requests" is about rate, not about the request being wrong --
+    // its whole meaning is that asking again later works.
+    expect(isTransportError(new TensorApiError(429, "Rate limit exceeded (1 req/s)"))).toBe(true);
+  });
+
   it("calls a network failure transport", () => {
     expect(isTransportError(new TensorNetworkError("/api/tile_info/x"))).toBe(true);
   });

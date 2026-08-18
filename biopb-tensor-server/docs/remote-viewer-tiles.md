@@ -590,10 +590,14 @@ WAN-hostile render path precisely when the deployment was under stress, with the
 badge blaming the tensor (`TensorApi 408: Timeout after 3000ms`, measured).
 
 Three things separate the cases. `isTransportError` splits "the server did not
-answer" (408, 5xx, `TensorNetworkError`) from "this tensor cannot be rendered
+answer" (408, 429, 5xx, `TensorNetworkError`) from "this tensor cannot be rendered
 this way" (404, 422, other 4xx, and the plain errors `vivDtype`/`vivLabels` throw
 *after* a successful fetch); an error it does not recognise is **not** transport,
 since an unrecognised failure is likelier to be a client bug than a sick server.
+429 is the one 4xx on the transport side — "too many requests" is about rate, not
+about the request being wrong, and its whole meaning is that asking again later
+works. Latent on the read path (only `/api/diagnostics` rate-limits), but a
+limiter at the edge would make it live with no client change.
 
 `TensorNetworkError` exists because the obvious test is unsafe. `fetch` rejects
 with a bare `TypeError` for DNS/connection/CORS — but so does our own code, and

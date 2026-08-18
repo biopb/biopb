@@ -89,8 +89,17 @@ export function isTransportError(err: unknown): boolean {
   if (err instanceof TensorNetworkError) return true;
   if (err instanceof TensorApiError) {
     // 408 is the timeout this client synthesises; 5xx is the server failing, or
-    // the reverse proxy answering for a data plane that is still starting.
-    return err.status === 408 || err.status >= 500;
+    // the reverse proxy answering for a data plane that is still starting. 429
+    // is the one 4xx that belongs here: "too many requests" is a statement about
+    // rate, not about the request being wrong, and the whole meaning of it is
+    // that asking again later works. Latent on the read path today -- only
+    // /api/diagnostics rate-limits -- but a rate limiter at the edge would make
+    // it live without any client change.
+    //
+    // `Retry-After` is deliberately not honoured: nothing on the read path sends
+    // it, and the caller's own backoff is the schedule that matters. Wire it
+    // through here if a limiter ever starts setting it.
+    return err.status === 408 || err.status === 429 || err.status >= 500;
   }
   // Anything else is unrecognised, and an unrecognised failure is far more
   // likely to be a bug in this client than a sick server. Answering "no" keeps
