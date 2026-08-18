@@ -798,6 +798,27 @@ class TestReadPathTifffileAuthoritative:
         assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]  # TCZYX
         assert unit == ["", "", "µm", "µm", "µm"]
 
+    def test_plan_caches_physical_scale(self, tmp_path, monkeypatch):
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb_tensor_server.core.config import PyramidConfig
+
+        path = self._write_ome_tiff_with_physical_sizes(
+            str(tmp_path / "cached-phys.ome.tif"), psx=0.5, psy=0.5, psz=1.0
+        )
+        _, scene = self._scene(path, "cached-phys")
+        calls = 0
+        original = scene._physical_scale_from_ome_xml
+
+        def counting():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(scene, "_physical_scale_from_ome_xml", counting)
+        scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        assert calls == 1
+
     def test_physical_scale_missing_unit_defaults_to_micron(self, tmp_path):
         # tifffile always stamps a unit, so inject an OME-XML that omits it to lock
         # the "µm" default (the OME spec default).
