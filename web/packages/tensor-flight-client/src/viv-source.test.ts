@@ -37,6 +37,18 @@ const INFO: TileInfo = {
   ],
 };
 
+/** 2048x2048 in 512px tiles -> three levels, the middle one still 2x2 tiles. */
+const DEEP_INFO: TileInfo = {
+  ...INFO,
+  array_id: "deep/Image:0",
+  shape: [1, 3, 16, 2048, 2048],
+  levels: [
+    { level: 0, scale: 1, height: 2048, width: 2048, cols: 4, rows: 4 },
+    { level: 1, scale: 2, height: 1024, width: 1024, cols: 2, rows: 2 },
+    { level: 2, scale: 4, height: 512, width: 512, cols: 1, rows: 1 },
+  ],
+};
+
 /** Interleaved RGB: the samples axis becomes Viv's "_c". */
 const RGB_INFO: TileInfo = {
   array_id: "rgb/Image:0",
@@ -284,13 +296,14 @@ describe("PixelSource.getTile", () => {
 describe("PixelSource.getRaster", () => {
   it("reads the whole level in one slice at that level's scale", async () => {
     const client = stubClient();
-    const [, half] = pixelSourcesFromInfo(client, INFO);
-    await half!.getRaster({ selection: { t: 0, c: 1, z: 3 } });
+    // Level 1 of DEEP_INFO spans 2x2 tiles, so no single tile holds it.
+    const [, mid] = pixelSourcesFromInfo(client, DEEP_INFO);
+    await mid!.getRaster({ selection: { t: 0, c: 1, z: 3 } });
     const req = client.slice.mock.calls[0]![0];
     expect(req.scale_hint).toEqual([1, 1, 1, 2, 2]);
     // Plane full, slider axes pinned to the selected index.
     expect(req.slice_start).toEqual([0, 1, 3, 0, 0]);
-    expect(req.slice_stop).toEqual([1, 2, 4, 1024, 1024]);
+    expect(req.slice_stop).toEqual([1, 2, 4, 2048, 2048]);
   });
 
   it("refuses a level too large to pull in one read", async () => {
@@ -334,33 +347,36 @@ describe("PixelSource.onTileError", () => {
 // getRaster coalescing (#772)
 // ---------------------------------------------------------------------------
 
-/** A `slice` that never settles on its own, so in-flight state is observable. */
+/**
+ * Reads that never settle on their own, so in-flight state is observable.
+ *
+ * Both routes, recorded in one list: which endpoint serves a raster depends on
+ * whether the level fits a tile, and the sharing rules are the same either way.
+ */
 function deferredClient() {
   const calls: {
     signal?: AbortSignal;
     settle: () => void;
     fail: (err: unknown) => void;
   }[] = [];
-  const slice = vi.fn(
-    (_req: SliceRequest, opts?: RequestOptions) =>
-      new Promise((resolve, reject) => {
-        opts?.signal?.addEventListener("abort", () =>
-          reject(new TensorAbortError("/api/slice")),
-        );
-        calls.push({
-          signal: opts?.signal,
-          settle: () =>
-            resolve({
-              buffer: new ArrayBuffer(512 * 512 * 2),
-              shape: [1, 1, 1, 512, 512],
-              dtype: "uint16",
-              dimLabels: ["T", "C", "Z", "Y", "X"],
-            }),
-          fail: reject,
-        });
-      }),
-  );
-  return { client: stubClient({ slice }), calls, slice };
+  const defer = (path: string) => (_req: unknown, opts?: RequestOptions) =>
+    new Promise((resolve, reject) => {
+      opts?.signal?.addEventListener("abort", () => reject(new TensorAbortError(path)));
+      calls.push({
+        signal: opts?.signal,
+        settle: () =>
+          resolve({
+            buffer: new ArrayBuffer(512 * 512 * 2),
+            shape: [1, 1, 1, 512, 512],
+            dtype: "uint16",
+            dimLabels: ["T", "C", "Z", "Y", "X"],
+          }),
+        fail: reject,
+      });
+    });
+  const slice = vi.fn(defer("/api/slice"));
+  const tile = vi.fn(defer("/api/tile"));
+  return { client: stubClient({ slice, tile }), calls, slice, tile };
 }
 
 /** What Viv's ImageLayer swallows; anything else becomes an unhandled rejection. */
@@ -371,35 +387,35 @@ const SEL_B = { t: 0, c: 0, z: 1 };
 
 describe("getRaster request sharing", () => {
   it("serves two callers for the same plane from one read", async () => {
-    const { client, calls, slice } = deferredClient();
+    const { client, calls } = deferredClient();
     const [, half] = pixelSourcesFromInfo(client, INFO);
     const a = half!.getRaster({ selection: SEL_A });
     const b = half!.getRaster({ selection: SEL_A });
     // The background ImageLayer and the contrast sampler ask for exactly this,
     // independently, on every selection change.
-    expect(slice).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(1);
     calls[0]!.settle();
     expect((await a).width).toBe(512);
     expect((await b).width).toBe(512);
   });
 
   it("does not confuse two levels of the same plane", async () => {
-    const { client, slice } = deferredClient();
+    const { client, calls } = deferredClient();
     const [full, half] = pixelSourcesFromInfo(client, INFO);
     void full!.getRaster({ selection: SEL_A }).catch(() => {});
     void half!.getRaster({ selection: SEL_A }).catch(() => {});
-    expect(slice).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(2);
   });
 
   it("starts a fresh read once the shared one has settled", async () => {
-    const { client, calls, slice } = deferredClient();
+    const { client, calls } = deferredClient();
     const [, half] = pixelSourcesFromInfo(client, INFO);
     const first = half!.getRaster({ selection: SEL_A });
     calls[0]!.settle();
     await first;
     // Sharing is de-duplication, not caching: a later ask still reads.
     void half!.getRaster({ selection: SEL_A }).catch(() => {});
-    expect(slice).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(2);
   });
 });
 
@@ -501,5 +517,59 @@ describe("getRaster caller signals", () => {
     expect(calls[0]!.signal?.aborted).toBe(false);
     calls[0]!.settle();
     await expect(wanted).resolves.toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getRaster on a single-tile level
+// ---------------------------------------------------------------------------
+
+describe("getRaster on a level that fits one tile", () => {
+  it("reads it through the cacheable tile route, not POST /api/slice", async () => {
+    const client = stubClient();
+    // Level 1 of INFO is 512x512 at tile_size 512 -- cols === rows === 1, and
+    // the only level Viv ever asks for a raster.
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const raster = await half!.getRaster({ selection: { t: 0, c: 1, z: 3 } });
+
+    expect(client.slice).not.toHaveBeenCalled();
+    expect(client.tile).toHaveBeenCalledTimes(1);
+    const req = client.tile.mock.calls[0]![0];
+    expect(req).toMatchObject({ array_id: "src0/Image:0", level: 1, col: 0, row: 0, t: 0, c: 1, z: 3 });
+    expect(raster.width).toBe(512);
+  });
+
+  it("still slices a level that spans several tiles", async () => {
+    const client = stubClient();
+    // Level 0 is 2x2 tiles: no single tile holds it, so the whole-level read
+    // has nowhere cacheable to come from.
+    const [full] = pixelSourcesFromInfo(client, INFO);
+    await full!.getRaster({ selection: { t: 0, c: 0, z: 0 } });
+    expect(client.tile).not.toHaveBeenCalled();
+    expect(client.slice).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares one tile read between both raster callers", async () => {
+    const client = stubClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    // The background ImageLayer and the contrast sampler, same plane.
+    await Promise.all([
+      half!.getRaster({ selection: { t: 0, c: 0, z: 0 } }),
+      half!.getRaster({ selection: { t: 0, c: 0, z: 0 } }),
+    ]);
+    expect(client.tile).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not collide with the tile the tiled layer asks for", async () => {
+    // Same level, same col/row, same plane -- getTile and getRaster want the
+    // identical bytes, so sharing them is correct rather than a hazard.
+    const client = stubClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const [tile, raster] = await Promise.all([
+      half!.getTile({ x: 0, y: 0, selection: { t: 0, c: 0, z: 0 }, signal: undefined }),
+      half!.getRaster({ selection: { t: 0, c: 0, z: 0 } }),
+    ]);
+    expect(tile.width).toBe(raster.width);
+    expect(tile.height).toBe(raster.height);
   });
 });
