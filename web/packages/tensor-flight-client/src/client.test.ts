@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TensorHttpClient, TensorApiError, TensorAbortError } from "./client.js";
+import { TensorHttpClient, TensorApiError, TensorAbortError, isTransportError } from "./client.js";
 import type { DataSourceDescriptor, TypedNdArray } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -831,5 +831,84 @@ describe("cancellation scope", () => {
     ctrl.abort();
     expect(fired).toBe(true); // our own listener, proving abort works
     // and no error surfaced from the settled request
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transport vs capability (#773)
+// ---------------------------------------------------------------------------
+
+describe("isTransportError", () => {
+  it("calls a timeout transport, because it decided nothing about the tensor", () => {
+    // The 408 this client synthesises when its own budget expires. Treating it
+    // as "this tensor cannot be tiled" is what downgraded a whole tensor to the
+    // server-rendered viewer whenever the backend was briefly slow.
+    expect(isTransportError(new TensorApiError(408, "Timeout after 8000ms (/api/tile_info/x)"))).toBe(true);
+  });
+
+  it("calls a failing server transport", () => {
+    for (const status of [500, 502, 503, 504]) {
+      expect(isTransportError(new TensorApiError(status, "upstream"))).toBe(true);
+    }
+    // What assertOk raises when the reverse proxy answers for a data plane that
+    // is still starting.
+    expect(isTransportError(new TensorApiError(503, "Server unavailable - may be starting up."))).toBe(true);
+  });
+
+  it("calls a refused request a fact about the tensor, not the transport", () => {
+    // 404 no such tensor, 422 not tileable, 400 bad request: asking again gets
+    // the same answer, so these are the ones worth making stick.
+    for (const status of [400, 404, 409, 422]) {
+      expect(isTransportError(new TensorApiError(status, "nope"))).toBe(false);
+    }
+  });
+
+  it("calls a network failure transport", () => {
+    // fetch() rejects with TypeError for DNS / connection / CORS.
+    expect(isTransportError(new TypeError("Failed to fetch"))).toBe(true);
+  });
+
+  it("does not call the caller's own abort a transport failure", () => {
+    // Callers discard these before classifying, but the answer must not be
+    // "retry" if one ever reaches here.
+    expect(isTransportError(new TensorAbortError("/api/tile_info/x"))).toBe(false);
+  });
+
+  it("does not call a mapping failure transport", () => {
+    // vivDtype / vivLabels throw plain Errors after tile_info arrived: the
+    // server answered fine and the tensor still cannot be rendered this way.
+    expect(isTransportError(new Error('Tensor dtype "<c8" has no Viv equivalent'))).toBe(false);
+    expect(isTransportError(new Error("is not in canonical [..., Y, X, S] order"))).toBe(false);
+  });
+});
+
+describe("tile_info's timeout budget", () => {
+  it("is its own, not the catalog budget", () => {
+    // It gates the whole tiled viewer, so expiring early does not fail one
+    // request -- it downgrades the tensor to the server-rendered path.
+    const c = new TensorHttpClient(BASE, TOKEN);
+    expect(c.tileInfoTimeoutMs).toBeGreaterThan(c.metadataTimeoutMs);
+  });
+
+  it("survives a response slower than the catalog budget", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.metadataTimeoutMs = 5;
+    c.tileInfoTimeoutMs = 200;
+    mockFetch.mockImplementation(
+      () => new Promise((res) => setTimeout(() => res(jsonResponse({ array_id: "x" })), 40)),
+    );
+    await expect(c.tileInfo("x")).resolves.toMatchObject({ array_id: "x" });
+  });
+
+  it("still gives up at its own budget", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.tileInfoTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.tileInfo("x", { signal: new AbortController().signal });
+    await expect(p).rejects.toThrow(/Timeout after 5ms/);
+    await expect(p).rejects.toSatisfy(isTransportError);
   });
 });

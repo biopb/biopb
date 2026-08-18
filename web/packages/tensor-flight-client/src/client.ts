@@ -71,6 +71,32 @@ export class TensorAbortError extends Error {
   }
 }
 
+/**
+ * Did this fail because the *server* could not answer, or because the request
+ * was wrong?
+ *
+ * The viewer needs the distinction: a tensor that cannot be rendered a given way
+ * is a permanent fact about that tensor, while a timeout or a 5xx says nothing
+ * about it at all and is very likely to succeed on a second try. Treating the
+ * two alike downgrades a whole tensor to the fallback renderer because the
+ * backend was briefly busy.
+ *
+ * A caller abort is neither -- it is the caller's own doing, and callers discard
+ * it before they get here.
+ */
+export function isTransportError(err: unknown): boolean {
+  if (err instanceof TensorAbortError) return false;
+  if (err instanceof TensorApiError) {
+    // 408 is the timeout this client synthesises; 5xx is the server failing, or
+    // the reverse proxy answering for a data plane that is still starting.
+    return err.status === 408 || err.status >= 500;
+  }
+  // `fetch` rejects with a TypeError for DNS, connection and CORS failures --
+  // the network never reached the server, so nothing was decided about the
+  // tensor.
+  return err instanceof TypeError;
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
@@ -173,6 +199,17 @@ export class TensorHttpClient {
   metadataTimeoutMs = 3_000;
   /** Timeout for binary chunk/slice requests (ms). */
   chunkTimeoutMs = 8_000;
+  /**
+   * Timeout for `tile_info` (ms).
+   *
+   * Deliberately not {@link metadataTimeoutMs}: that budget is sized for small
+   * catalog calls, where giving up quickly costs a list and nothing else. This
+   * one call is the gate on the whole tiled viewer -- nothing renders until it
+   * returns -- so expiring early does not fail one request, it downgrades the
+   * tensor to the server-rendered path. Sized like the other read-path budget
+   * ({@link chunkTimeoutMs}) instead, and paired with a retry in the viewer.
+   */
+  tileInfoTimeoutMs = 8_000;
 
   /**
    * @param apiBase   Base URL of the FastAPI sidecar, e.g. "http://localhost:8816".
@@ -462,7 +499,7 @@ export class TensorHttpClient {
     return this.fetchJson<TileInfo>(
       `/api/tile_info/${encodeArrayId(arrayId)}`,
       undefined,
-      this.metadataTimeoutMs,
+      this.tileInfoTimeoutMs,
       opts,
     );
   }

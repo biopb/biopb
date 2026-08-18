@@ -406,6 +406,15 @@ html, body {
   color: #94a3b8; font-size: 11px; padding: 3px 8px; pointer-events: none;
 }
 
+/* The note itself stays click-through so it never blocks the canvas; the retry
+   control is the one part that has to take a click. */
+.viewer-fallback-retry {
+  pointer-events: auto;
+  background: none; border: 1px solid #475569; border-radius: 3px;
+  color: #cbd5e1; font: inherit; padding: 1px 6px; margin-left: 2px; cursor: pointer;
+}
+.viewer-fallback-retry:hover { border-color: #64748b; color: #e2e8f0; }
+
 .meta-panel {
   background: #141820;
   flex: 1;
