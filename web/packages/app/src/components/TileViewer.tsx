@@ -15,7 +15,7 @@
  * See biopb-tensor-server/docs/remote-viewer-tiles.md.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import { DETAIL_VIEW_ID, DetailView, VivViewer, getDefaultInitialViewState } from "@hms-dbmi/viv";
 import {
@@ -113,6 +113,27 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     [selectionKey],
   );
 
+  // --- is what is on screen the plane that was asked for? ------------------
+  // Both Viv layers keep their previous raster until a new read resolves, so a
+  // t/c/z change leaves the old plane painted for exactly as long as the read
+  // takes -- with nothing on screen to say so. That is worse than a blank
+  // frame: a stale plane is indistinguishable from the right one, and a plane
+  // that never changed reads as a hung viewer rather than a slow one.
+  //
+  // deck.gl's TileLayer reports when the viewport's tiles have all landed.
+  // Reached through Viv, which forwards unknown props down to it and pins the
+  // background ImageLayer's own callback to null, so this fires once per
+  // completed viewport and not twice.
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  // Read through a ref: the callback's identity has to stay stable or every
+  // layerProps rebuild would look like a prop change to deck.gl.
+  const selectionKeyRef = useRef(selectionKey);
+  selectionKeyRef.current = selectionKey;
+  const onViewportLoad = useCallback(() => setLoadedKey(selectionKeyRef.current), []);
+  // Zoom and pan never invalidate: they change which tiles are wanted, not
+  // which plane, so their partial state is legitimate progressive refinement.
+  const dataValid = loadedKey !== null && loadedKey === selectionKey;
+
   // --- contrast limits ----------------------------------------------------
   // Read the coarsest level once per selection and keep the sorted samples, so
   // the intensity slider re-derives limits locally instead of refetching.
@@ -188,11 +209,17 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           contrastLimits={contrastLimits}
           color={color}
           maxCacheSize={maxCacheSize}
+          onViewportLoad={onViewportLoad}
           width={size.width}
           height={size.height}
         />
       ) : (
         <div style={OVERLAY_TEXT}>Loading tiles…</div>
+      )}
+      {loaded && selection && size && !dataValid && (
+        // Opaque, not a scrim: the point is that the stale plane stops being
+        // visible, which a translucent overlay would not achieve.
+        <div style={{ ...OVERLAY_TEXT, background: "#1a1a2e", zIndex: 1 }}>Reading plane…</div>
       )}
       {pinned && <div style={{ ...BADGE, bottom: 10, left: 10 }}>{pinned}</div>}
       {tileError && (
@@ -216,6 +243,7 @@ function VivStage({
   contrastLimits,
   color,
   maxCacheSize,
+  onViewportLoad,
   width,
   height,
 }: {
@@ -224,6 +252,7 @@ function VivStage({
   contrastLimits: [number, number];
   color: [number, number, number];
   maxCacheSize: number;
+  onViewportLoad: () => void;
   width: number;
   height: number;
 }) {
@@ -260,9 +289,10 @@ function VivStage({
         // Reaches deck.gl's TileLayer: DetailView spreads these into the
         // MultiscaleImageLayer, which spreads its own props into the TileLayer.
         maxCacheSize,
+        onViewportLoad,
       },
     ],
-    [sources, selections, contrastLimits, color, maxCacheSize],
+    [sources, selections, contrastLimits, color, maxCacheSize, onViewportLoad],
   );
 
   return <VivViewer views={views} layerProps={layerProps} viewStates={viewStates} />;
