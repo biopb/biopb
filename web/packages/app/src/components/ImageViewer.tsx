@@ -17,6 +17,7 @@ import {
   type ViewportState,
 } from "../utils/regionUtils";
 import { resolveAutoColor, type ColorValue } from "../utils/colorUtils";
+import { clampGamma } from "../utils/vivUtils";
 
 interface ImageViewerProps {
   sourceId: string;
@@ -119,6 +120,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     reductionMethod: slice.reductionMethod,
     useMinMax: slice.useMinMax,
     percentileScale: slice.percentileScale,
+    gamma: slice.gamma,
     resolvedColor,
     percentileLo,
     percentileHi,
@@ -203,6 +205,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         color: resolvedColor,
         channel_name: channelName,
         use_min_max: currentSlice.useMinMax,
+        gamma: clampGamma(currentSlice.gamma),
         output_format: "jpeg",
         pixel_budget: 1_000_000,
       };
@@ -282,6 +285,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       reductionMethod: s.slice.reductionMethod,
       useMinMax: s.slice.useMinMax,
       percentileScale: s.slice.percentileScale,
+      gamma: s.slice.gamma,
       resolvedColor: resolveAutoColor(
         s.getChannelColor(sourceId, s.slice.c),
         s.channelNames[sourceId]?.[s.slice.c] ?? undefined,
@@ -328,6 +332,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       prev.reductionMethod !== slice.reductionMethod ||
       prev.useMinMax !== slice.useMinMax ||
       prev.percentileScale !== slice.percentileScale ||
+      prev.gamma !== slice.gamma ||
       prev.resolvedColor !== resolvedColor ||
       prev.percentileLo !== percentileLo ||
       prev.percentileHi !== percentileHi;
@@ -369,6 +374,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       reductionMethod: slice.reductionMethod,
       useMinMax: slice.useMinMax,
       percentileScale: slice.percentileScale,
+      gamma: slice.gamma,
       resolvedColor,
       percentileLo,
       percentileHi,
@@ -382,6 +388,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     slice.reductionMethod,
     slice.useMinMax,
     slice.percentileScale,
+    slice.gamma,
     resolvedColor,
     percentileLo,
     percentileHi,

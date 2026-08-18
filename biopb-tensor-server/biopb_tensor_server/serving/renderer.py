@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import re
 from typing import Optional, Tuple
 
@@ -230,11 +231,47 @@ def compute_percentile_cutoffs(
     return (lo_val, hi_val)
 
 
+def apply_gamma(normalized: np.ndarray, gamma: float) -> None:
+    """Raise a 0-255 float array to ``gamma`` in place, on its 0-1 scale.
+
+    Gamma is an exponent on the *normalized* intensity, applied after the
+    contrast window and before any color multiplier -- the same order the
+    browser's tiled viewer uses in its shader, so the two viewers agree on what
+    a given gamma looks like. Applying it to the final RGB instead would shift
+    hue as gamma moved, since ``pow(i*c) != pow(i)*c``.
+    """
+    if gamma == 1.0:
+        return
+    normalized /= 255.0
+    np.power(normalized, gamma, out=normalized)
+    normalized *= 255.0
+
+
+#: Two octaves either side of neutral -- the range of the viewer's gamma slider
+#: (``GAMMA_OCTAVES`` in web/packages/app/src/utils/vivUtils.ts). Both ends clamp
+#: to the same values there, so a stored gamma means one thing in both viewers.
+GAMMA_MIN = 0.25
+GAMMA_MAX = 4.0
+
+
+def clamp_gamma(gamma: float) -> float:
+    """A gamma safe to pass to ``np.power``.
+
+    Zero and negatives are not dim -- as an exponent they are a uniform white
+    plane -- and a value that is not a number at all did not come from the
+    viewer's control, so it reads as neutral rather than as one end of the range.
+    """
+    if not math.isfinite(gamma):
+        return 1.0
+    return min(max(gamma, GAMMA_MIN), GAMMA_MAX)
+
+
 def normalize_and_colorize(
     data: np.ndarray,
     lo_val: float,
     hi_val: float,
     color_multipliers: Tuple[float, float, float],
+    gamma: float = 1.0,
 ) -> np.ndarray:
     """Normalize to uint8 and apply pseudo-color in one pass, returning RGB (H, W, 3).
 
@@ -252,6 +289,7 @@ def normalize_and_colorize(
     normalized -= lo_val
     normalized *= scale
     np.clip(normalized, 0, 255, out=normalized)
+    apply_gamma(normalized, gamma)
 
     rgb = np.empty((*data.shape, 3), dtype=np.uint8)
     for i, mult in enumerate((r_mult, g_mult, b_mult)):
@@ -300,6 +338,7 @@ def normalize_rgb_samples(
     plane: np.ndarray,
     lo_val: float,
     hi_val: float,
+    gamma: float = 1.0,
 ) -> np.ndarray:
     """Render an interleaved RGB(A) ``[Y, X, S]`` plane to display RGB ``(H, W, 3)``.
 
@@ -318,6 +357,9 @@ def normalize_rgb_samples(
     out -= lo_val
     out *= scale
     np.clip(out, 0, 255, out=out)
+    # Per sample, on the shared stretch: the color balance is preserved because
+    # every sample gets the same curve, not because the curve is skipped.
+    apply_gamma(out, gamma)
     return out.astype(np.uint8)
 
 
@@ -328,6 +370,7 @@ def render_array_to_image_bytes(
     percentile_hi: float = 99.0,
     color: str = "auto",
     channel_name: Optional[str] = None,
+    gamma: float = 1.0,
     output_format: str = "png",
 ) -> Tuple[bytes, int, int, float, float]:
     """Render numpy array to image bytes using PIL.
@@ -363,13 +406,16 @@ def render_array_to_image_bytes(
     percentile_ms = (time.monotonic() - t2) * 1000
 
     t3 = time.monotonic()
+    safe_gamma = clamp_gamma(gamma)
     if is_rgb:
         # Interleaved RGB(A) samples: composite directly, no pseudo-color.
-        rgb = normalize_rgb_samples(yx_slice, lo_val, hi_val)
+        rgb = normalize_rgb_samples(yx_slice, lo_val, hi_val, safe_gamma)
     else:
         # Single grayscale plane: pseudo-color per the requested display color.
         color_multipliers = resolve_color(color, channel_name)
-        rgb = normalize_and_colorize(yx_slice, lo_val, hi_val, color_multipliers)
+        rgb = normalize_and_colorize(
+            yx_slice, lo_val, hi_val, color_multipliers, safe_gamma
+        )
     colorize_ms = (time.monotonic() - t3) * 1000
 
     height, width = rgb.shape[:2]

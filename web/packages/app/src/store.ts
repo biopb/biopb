@@ -13,6 +13,10 @@ export interface SliceState {
   reductionMethod: string;
   percentileScale: number;  // 0 = min-max, 1 = 1-99 percentile, 2 = 2-98 percentile
   useMinMax: boolean;  // When true, use full min-max range (0-100 percentile)
+  // Display-only exponent applied to the normalized intensity, after the
+  // contrast window and before the channel color. 1 leaves the ramp linear;
+  // below 1 lifts the dim end, above 1 pushes it down.
+  gamma: number;
 }
 
 export interface AppState {
@@ -111,6 +115,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     reductionMethod: "area",
     percentileScale: 1,  // Default 1-99 percentile
     useMinMax: false,
+    gamma: 1,
   },
 
   showAdvancedOptions: false,

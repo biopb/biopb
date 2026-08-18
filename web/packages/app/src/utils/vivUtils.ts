@@ -74,6 +74,54 @@ export function contrastLimitsFrom(
   return [lo, hi > lo ? hi : lo + 1];
 }
 
+// ---------------------------------------------------------------------------
+// Gamma
+// ---------------------------------------------------------------------------
+
+/**
+ * Half-width of the gamma slider, in octaves.
+ *
+ * The control is positioned in log2(gamma) rather than in gamma itself, because
+ * gamma is a ratio: 0.5 and 2 are equal and opposite corrections, and only a log
+ * scale puts them the same distance from neutral. On a linear 0.25-4 track,
+ * everything that brightens would be squeezed into the first fifth of the
+ * travel.
+ */
+export const GAMMA_OCTAVES = 2;
+
+/** The exponents those ends of the track correspond to. */
+export const GAMMA_MIN = 2 ** -GAMMA_OCTAVES;
+export const GAMMA_MAX = 2 ** GAMMA_OCTAVES;
+
+/** Slider position (octaves from neutral) -> gamma exponent. */
+export function gammaFromOctaves(octaves: number): number {
+  const clamped = Math.min(Math.max(octaves, -GAMMA_OCTAVES), GAMMA_OCTAVES);
+  return 2 ** clamped;
+}
+
+/** Gamma exponent -> slider position. Inverse of {@link gammaFromOctaves}. */
+export function octavesFromGamma(gamma: number): number {
+  if (!Number.isFinite(gamma)) return 0;
+  // Not log2 of a non-positive number: 0 is the direction of "brighter", so the
+  // handle belongs at that end of the track rather than back at neutral.
+  if (gamma <= 0) return -GAMMA_OCTAVES;
+  return Math.min(Math.max(Math.log2(gamma), -GAMMA_OCTAVES), GAMMA_OCTAVES);
+}
+
+/**
+ * A gamma safe to hand a shader or `np.power`.
+ *
+ * The server clamps to the same range (`renderer.clamp_gamma`), so the two
+ * viewers cannot disagree about what a stored value means. Zero and negatives
+ * are not dim -- as an exponent they are a uniform white plane -- and a value
+ * that is not a number at all did not come from this control, so it reads as
+ * neutral rather than as one end of the track.
+ */
+export function clampGamma(gamma: number): number {
+  if (!Number.isFinite(gamma)) return 1;
+  return Math.min(Math.max(gamma, GAMMA_MIN), GAMMA_MAX);
+}
+
 const RANGE_BY_DTYPE: Record<string, [number, number]> = {
   Uint8: [0, 255],
   Int8: [-128, 127],

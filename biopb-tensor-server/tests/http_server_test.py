@@ -1747,6 +1747,45 @@ class TestCancellation:
 
 
 # ===========================================================================
+# Gamma reaches the renderer
+# ===========================================================================
+
+
+class TestRenderGamma:
+    """The display curve is a request field, not a server setting.
+
+    The math lives in renderer_test; what is worth pinning here is the wiring —
+    a field can be added to the request model and then never passed on, which
+    looks exactly like a gamma slider that does nothing.
+    """
+
+    def _spy(self, tc, body):
+        from biopb_tensor_server.serving import renderer
+
+        seen = {}
+        real = renderer.render_array_to_image_bytes
+
+        def spy(**kwargs):
+            seen.update(kwargs)
+            return real(**kwargs)
+
+        with patch.object(renderer, "render_array_to_image_bytes", spy):
+            r = tc.post("/api/render", json=body)
+        assert r.status_code == 200, r.text
+        return seen
+
+    def test_gamma_is_forwarded(self, dev_client):
+        tc, _ = dev_client
+        seen = self._spy(tc, {"source_id": "src0", "tensor_id": "t0", "gamma": 0.5})
+        assert seen["gamma"] == 0.5
+
+    def test_omitting_it_renders_linear(self, dev_client):
+        tc, _ = dev_client
+        seen = self._spy(tc, {"source_id": "src0", "tensor_id": "t0"})
+        assert seen["gamma"] == 1.0
+
+
+# ===========================================================================
 # Unit tests — tile selection is checked against the axes that exist
 # ===========================================================================
 

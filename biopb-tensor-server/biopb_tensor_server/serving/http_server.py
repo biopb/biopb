@@ -332,6 +332,7 @@ class RenderRequest(BaseModel):
     color: str = "auto"  # preset name or hex (#rrggbb)
     channel_name: Optional[str] = None  # for auto color resolution
     use_min_max: bool = False  # use full min-max range instead of percentiles
+    gamma: float = 1.0  # exponent on the normalized intensity; 1.0 is linear
     output_format: str = "png"  # "png" or "jpeg"
     pixel_budget: Optional[int] = None
 
@@ -1611,6 +1612,7 @@ async def render_tensor(req: RenderRequest, request: Request) -> Response:
             percentile_hi=req.percentile_hi if not req.use_min_max else 100.0,
             color=req.color,
             channel_name=req.channel_name,
+            gamma=req.gamma,
             output_format=req.output_format,
         )
         render_ms = (time.monotonic() - t0_render) * 1000
@@ -1773,6 +1775,7 @@ async def _ws_render_one(
             percentile_hi=params.percentile_hi if not params.use_min_max else 100.0,
             color=params.color,
             channel_name=params.channel_name,
+            gamma=params.gamma,
             output_format=params.output_format,
         )
         render_ms = (time.monotonic() - t0_render) * 1000
