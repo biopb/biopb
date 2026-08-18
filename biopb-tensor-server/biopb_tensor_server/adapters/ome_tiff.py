@@ -19,6 +19,7 @@ Chunk ID format: array_id + bounds encoding (start, stop coordinates). Relies on
 the OS page cache for raw-data caching.
 """
 
+import io
 import logging
 import os
 import re
@@ -283,7 +284,9 @@ _STRIP_EMPTY_BINDATA = re.compile(
 )
 
 
-def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
+def _fast_ome_metadata(
+    ome_xml: str, *, already_reduced: bool = False
+) -> Optional[dict]:
     """Build the OME metadata dict cheaply by stripping per-plane elements first.
 
     Parses the *reduced* OME-XML (per-plane ``<Plane>``/``<TiffData>`` removed)
@@ -296,8 +299,11 @@ def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
     try:
         from ome_types import from_xml
 
-        reduced = _STRIP_PER_PLANE.sub("", ome_xml)
-        reduced = _STRIP_EMPTY_BINDATA.sub("", reduced)
+        reduced = (
+            ome_xml
+            if already_reduced
+            else _STRIP_EMPTY_BINDATA.sub("", _STRIP_PER_PLANE.sub("", ome_xml))
+        )
         ome = from_xml(reduced)
         if hasattr(ome, "model_dump"):
             return ome.model_dump(mode="json")
@@ -421,6 +427,8 @@ class OmeTiffAdapter(TensorAdapter):
         # probed-but-absent (None) result.
         self._raw_ome_xml = None
         self._raw_ome_xml_probed = False
+        self._reduced_ome_xml = None
+        self._reduced_ome_xml_probed = False
 
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -549,6 +557,9 @@ class OmeTiffAdapter(TensorAdapter):
         if self._raw_ome_xml_probed:
             adapter._raw_ome_xml = self._raw_ome_xml
             adapter._raw_ome_xml_probed = True
+        if self._reduced_ome_xml_probed:
+            adapter._reduced_ome_xml = self._reduced_ome_xml
+            adapter._reduced_ome_xml_probed = True
         self._tensor_adapters[field] = adapter
         return adapter
 
@@ -575,7 +586,11 @@ class OmeTiffAdapter(TensorAdapter):
         """
         ome_xml = self._local_ome_xml()
         if ome_xml:
-            fast = _fast_ome_metadata(ome_xml)
+            if not self._reduced_ome_xml_probed:
+                self._reduced_ome_xml_probed = True
+                reduced = _STRIP_PER_PLANE.sub("", ome_xml)
+                self._reduced_ome_xml = _STRIP_EMPTY_BINDATA.sub("", reduced)
+            fast = _fast_ome_metadata(self._reduced_ome_xml, already_reduced=True)
             if fast is not None:
                 return fast
         return {}
@@ -722,36 +737,29 @@ class OmeTiffAdapter(TensorAdapter):
             return None
 
     def _physical_scale_from_ome_xml(self):
-        """Physical scale from the local OME-XML, per-plane elements stripped.
+        """Physical scale from the local OME-XML header.
 
         Namespace-agnostic ElementTree scan (NOT an ome-types object build): find
         the ``<Image>`` at this scene's index in document order, read its
         ``<Pixels>`` ``PhysicalSizeX/Y/Z`` (+ ``...Unit``), and map onto
         ``dim_labels`` by lowercased axis label (T/C/S -> ``0.0`` / ``""``).
-        Physical sizes live on ``<Pixels>`` and survive ``_STRIP_PER_PLANE``. A
-        missing ``*Unit`` defaults to ``"µm"`` (OME spec default). Returns ``None``
-        on any failure or when no positive size is present -- never raises.
+        Physical sizes occur on ``<Pixels>`` before per-plane elements, so stream
+        only as far as the requested image's header. A missing ``*Unit`` defaults
+        to ``"µm"`` (OME spec default). Returns ``None`` on any failure or when no
+        positive size is present -- never raises.
         """
         try:
             ome_xml = self._local_ome_xml()
             if not ome_xml:
                 return None
-            reduced = _STRIP_PER_PLANE.sub("", ome_xml)
-            root = ET.fromstring(reduced)
 
             def _local(tag):
                 return str(tag).rsplit("}", 1)[-1]
 
-            images = [el for el in root.iter() if _local(el.tag) == "Image"]
             idx = self.scene_index or 0
-            if idx >= len(images):
-                return None
-            pixels = next((c for c in images[idx] if _local(c.tag) == "Pixels"), None)
-            if pixels is None:
-                return None
 
             def _size(axis):
-                raw = pixels.get(f"PhysicalSize{axis}")
+                raw = attrs.get(f"PhysicalSize{axis}")
                 if raw is None:
                     return 0.0, ""
                 try:
@@ -760,7 +768,18 @@ class OmeTiffAdapter(TensorAdapter):
                     return 0.0, ""
                 if v <= 0:
                     return 0.0, ""
-                return v, (pixels.get(f"PhysicalSize{axis}Unit") or "µm")
+                return v, (attrs.get(f"PhysicalSize{axis}Unit") or "µm")
+
+            images_seen = -1
+            attrs = None
+            for _, element in ET.iterparse(io.StringIO(ome_xml), events=("start",)):
+                if _local(element.tag) == "Image":
+                    images_seen += 1
+                elif _local(element.tag) == "Pixels" and images_seen == idx:
+                    attrs = element.attrib
+                    break
+            if attrs is None:
+                return None
 
             by_label = {"x": _size("X"), "y": _size("Y"), "z": _size("Z")}
             scale, unit = [], []
@@ -768,9 +787,7 @@ class OmeTiffAdapter(TensorAdapter):
                 v, u = by_label.get(str(lab).lower(), (0.0, ""))
                 scale.append(v)
                 unit.append(u)
-            if not any(scale):
-                return None
-            return scale, unit
+            return (scale, unit) if any(scale) else None
         except Exception:
             return None
 

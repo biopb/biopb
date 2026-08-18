@@ -1103,10 +1103,18 @@ class TensorAdapter(SourceAdapter):
         """
         descriptor.ClearField("physical_scale")
         descriptor.ClearField("physical_unit")
-        try:
-            phys = self._physical_scale()
-        except Exception:
-            phys = None
+        # Physical scale is constant for the lifetime of an adapter. Some format
+        # adapters derive it from expensive resident metadata, so cache both a
+        # value and a computed ``None`` result (there is no base __init__ shared
+        # by all adapters).
+        if hasattr(self, "_physical_scale_cache"):
+            phys = self._physical_scale_cache
+        else:
+            try:
+                phys = self._physical_scale()
+            except Exception:
+                phys = None
+            self._physical_scale_cache = phys
         if phys is not None:
             scale_vec, unit_vec = phys
             ndim = len(descriptor.dim_labels)
