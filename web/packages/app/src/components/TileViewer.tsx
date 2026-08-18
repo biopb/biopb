@@ -129,15 +129,28 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // layerProps rebuild would look like a prop change to deck.gl.
   const selectionKeyRef = useRef(selectionKey);
   selectionKeyRef.current = selectionKey;
-  const onViewportLoad = useCallback(() => setLoadedKey(selectionKeyRef.current), []);
+  const onViewportLoad = useCallback((tiles?: readonly { content?: unknown }[]) => {
+    // A *failed* tile still counts as loaded to deck.gl -- `_isLoaded = true`
+    // with `content = null` -- so a viewport whose reads all errored reports
+    // itself complete. Taking that at face value would clear the cover over a
+    // canvas that never got the plane, which is the ambiguity this gate exists
+    // to remove. An aborted tile is not affected: deck.gl leaves that one
+    // unloaded, so it never reaches here.
+    if (tiles?.some((tile) => tile?.content == null)) return;
+    setLoadedKey(selectionKeyRef.current);
+  }, []);
   // Zoom and pan never invalidate: they change which tiles are wanted, not
   // which plane, so their partial state is legitimate progressive refinement.
   const dataValid = loadedKey !== null && loadedKey === selectionKey;
 
+  // Scoped to the plane that produced it, so a failed read cannot go on
+  // labelling later planes that loaded perfectly well.
+  useEffect(() => setTileError(null), [selectionKey]);
+
   // --- contrast limits ----------------------------------------------------
   // Read the coarsest level once per selection and keep the sorted samples, so
   // the intensity slider re-derives limits locally instead of refetching.
-  const [samples, setSamples] = useState<Float64Array | null>(null);
+  const [samples, setSamples] = useState<{ key: string; values: Float64Array } | null>(null);
   useEffect(() => {
     if (!loaded || !selection) return;
     const { sources, info: grid } = loaded;
@@ -150,7 +163,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     overview
       .getRaster({ selection, signal: controller.signal })
       .then((raster) => {
-        if (live) setSamples(contrastSamples(raster.data));
+        if (live) setSamples({ key: selectionKey, values: contrastSamples(raster.data) });
       })
       .catch(() => {
         // Keep the previous limits: a failed histogram is a worse reason to
@@ -160,14 +173,30 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       live = false;
       controller.abort();
     };
-  }, [loaded, selection]);
+  }, [loaded, selection, selectionKey]);
 
   const contrastLimits = useMemo<[number, number]>(() => {
     if (!info) return [0, 1];
     const [lo, hi] = percentileBounds(slice.useMinMax, slice.percentileScale);
     if (!samples) return dtypeContrastLimits(vivDtype(info.dtype));
-    return contrastLimitsFrom(samples, lo, hi);
+    return contrastLimitsFrom(samples.values, lo, hi);
   }, [info, samples, slice.useMinMax, slice.percentileScale]);
+
+  // --- is there anything in this plane? ------------------------------------
+  // A featureless plane renders black, and so does one whose tiles have not
+  // arrived and one whose contrast window excludes everything. Black is the
+  // right rendering for an all-zero plane -- what was missing is saying so.
+  //
+  // Keyed to the selection because `samples` is deliberately kept across a
+  // plane change so the contrast does not flash: unkeyed, this label would
+  // describe the plane before last.
+  const uniformValue = useMemo(() => {
+    if (!samples || samples.key !== selectionKey) return null;
+    const v = samples.values;
+    if (v.length === 0) return null;
+    const first = v[0];
+    return first !== undefined && first === v[v.length - 1] ? first : null;
+  }, [samples, selectionKey]);
 
   // --- colour -------------------------------------------------------------
   const color = useMemo(() => {
@@ -219,9 +248,25 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       {loaded && selection && size && !dataValid && (
         // Opaque, not a scrim: the point is that the stale plane stops being
         // visible, which a translucent overlay would not achieve.
-        <div style={{ ...OVERLAY_TEXT, background: "#1a1a2e", zIndex: 1 }}>Reading plane…</div>
+        <div style={{ ...OVERLAY_TEXT, background: "#1a1a2e", zIndex: 1 }}>
+          {tileError ? "Plane unavailable" : "Reading plane…"}
+        </div>
       )}
-      {pinned && <div style={{ ...BADGE, bottom: 10, left: 10 }}>{pinned}</div>}
+      {(pinned || (dataValid && uniformValue !== null)) && (
+        <div style={{ position: "absolute", bottom: 10, left: 10, display: "grid", gap: 4, zIndex: 2 }}>
+          {dataValid && uniformValue !== null && (
+            <div
+              style={{ ...BADGE, position: "static" }}
+              title="Measured from the coarsest pyramid level, subsampled for the contrast histogram."
+            >
+              {uniformValue === 0
+                ? "empty plane (all zeros)"
+                : `uniform plane (value ${Number.isInteger(uniformValue) ? uniformValue : uniformValue.toPrecision(4)})`}
+            </div>
+          )}
+          {pinned && <div style={{ ...BADGE, position: "static" }}>{pinned}</div>}
+        </div>
+      )}
       {tileError && (
         <div style={{ ...BADGE, bottom: 10, right: 10, color: "#ff6b6b" }}>{tileError}</div>
       )}
@@ -252,7 +297,7 @@ function VivStage({
   contrastLimits: [number, number];
   color: [number, number, number];
   maxCacheSize: number;
-  onViewportLoad: () => void;
+  onViewportLoad: (tiles?: readonly { content?: unknown }[]) => void;
   width: number;
   height: number;
 }) {

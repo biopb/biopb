@@ -535,6 +535,19 @@ sticking on it. Zoom and pan never invalidate — they change which tiles are
 wanted, not which plane — which is what keeps `refinementStrategy:
 'best-available'` doing its job.
 
+Two things the signal does not give for free. deck.gl counts a **failed** tile as
+loaded — `_isLoaded = true` with `content = null`, so `onError` fires and the
+tileset still reports the viewport complete — which would clear the cover over a
+canvas that never received the plane. Requiring every selected tile to carry
+content keeps it up. (An *aborted* tile is unaffected: `_isCancelled && !tileData`
+leaves it unloaded, so it never reaches the callback.) And once a plane is known
+to have landed, a featureless one still renders black, which is why the coarsest
+level's contrast samples double as an emptiness check — `sorted[0] === sorted.at(-1)`
+labels the plane rather than leaving black to mean three different things. That
+label is keyed to the selection: the samples are deliberately kept across a plane
+change so contrast does not flash, so an unkeyed label would describe the plane
+before last.
+
 ### Verified in a browser, not just in node
 
 `viv_browser_probe.mjs` drives the real `ViewerPane` in headless chromium over CDP
