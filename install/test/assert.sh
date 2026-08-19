@@ -34,7 +34,7 @@ MARKER_PKG="cowsay"
 # A requirement that cannot resolve at any index, for the fail-soft path.
 BOGUS_PKG="biopb-not-a-real-package==99.99.99"
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/biopb"
+CONFIG_DIR="${BIOPB_CONFIG_HOME:-$HOME/.config}/biopb"
 EXTRAS_FILE="$CONFIG_DIR/extra-packages.txt"
 
 FAILURES=0

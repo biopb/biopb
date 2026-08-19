@@ -224,7 +224,7 @@ def start_plane() -> TensorPlane:
         stdout=log,
         stderr=log,
         # Not the developer's config tree, and not the developer's plane.
-        env={**os.environ, "XDG_CONFIG_HOME": str(root / "config")},
+        env={**os.environ, "BIOPB_CONFIG_HOME": str(root / "config")},
     )
     plane = TensorPlane(url=f"grpc://127.0.0.1:{port}", root=root, process=process)
     try:

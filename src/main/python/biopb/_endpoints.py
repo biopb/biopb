@@ -35,7 +35,7 @@ import tempfile
 #
 # One number places all three listeners, so a whole deployment moves together --
 # which is what lets two users run side-by-side controls on one host (each also
-# needs its own ``XDG_STATE_HOME``, since the pid / credential / runtime
+# needs its own ``BIOPB_STATE_HOME``, since the pid / credential / runtime
 # records are per-state-dir).
 #
 # The base and its offsets are **the container's** (``entrypoint.sh``:

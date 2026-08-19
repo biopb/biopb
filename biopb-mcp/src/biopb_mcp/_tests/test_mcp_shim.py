@@ -481,7 +481,7 @@ def _home_env(tmp_path):
         env["HOME"] = home
     # The XDG base dirs override HOME in _locations; drop any inherited
     # values so the HOME-based defaults (state/config/data under tmp_path) apply.
-    for var in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+    for var in ("BIOPB_STATE_HOME", "BIOPB_CONFIG_HOME", "BIOPB_DATA_HOME"):
         env.pop(var, None)
     return env
 

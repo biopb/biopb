@@ -544,7 +544,7 @@ only when *that* case uploaded something, so an `array` case still meets an
 unreachable address and a `None` client even in an invocation where some other
 case brought a plane up. The isolation does not weaken as the run goes on.
 
-**A config tree of our own.** `XDG_CONFIG_HOME` points at a temp dir, so the run
+**A config tree of our own.** `BIOPB_CONFIG_HOME` points at a temp dir, so the run
 reads neither the developer's `mcp-config.json` nor their personal
 `~/.config/biopb/skills/*.md`. The catalog under test is the shipped one.
 

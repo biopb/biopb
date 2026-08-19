@@ -26,7 +26,7 @@ set -e
 #                  the state dir (auto-generated on first use); clients dial
 #                  grpcs:// and pin it on first connect (TOFU). The cert lives in
 #                  the container's state dir, so mount a volume at
-#                  /root/.local/state (or set XDG_STATE_HOME) to keep the same
+#                  /root/.local/state (or set BIOPB_STATE_HOME) to keep the same
 #                  cert across `docker rm` -- otherwise every recreate mints a new
 #                  one and pinned clients refuse to reconnect.
 # BIOPB_TLS_CERT / BIOPB_TLS_KEY - Paths (in-container) to a BYO PEM cert + key to

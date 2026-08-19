@@ -68,13 +68,13 @@ def _isolate_pin_state(tmp_path, monkeypatch):
     """Isolate everything TOFU resolution touches outside the process.
 
     The pin store goes to a tmp state tree (``state_dir()`` honors
-    ``$XDG_STATE_HOME`` first, and CI may set it, so set it rather than relying on
+    ``$BIOPB_STATE_HOME`` first, so set it rather than relying on
     ``Path.home()``); the per-process memo is cleared so each test starts cold;
     and the hostname-override probe is stubbed out, since it opens a real socket
     to the (fictional) host these tests name. The tests that exercise the probe
     itself override this stub.
     """
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(_tls, "_resolve_hostname_override", lambda *a, **k: None)
     _tls.clear_pin_cache()
     yield

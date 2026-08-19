@@ -869,12 +869,12 @@ class TestBasePort:
         the port its own --base-port names.
         """
         monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
-        # XDG_STATE_HOME is what relocates the state tree; there is no
+        # BIOPB_STATE_HOME is what relocates the state tree; there is no
         # BIOPB_STATE_HOME. Setting a name biopb does not read leaves the tree
         # where it was, so the record lands in the developer's real state dir
         # and every client then discovers a dead port -- silently, since the
         # test still passes. See endpoints_test's fixture.
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
         cli._endpoints.write_runtime_record("127.0.0.1", 9999, 4242)
         assert cli._control_endpoint()[1] == 9999  # discovery follows it
         assert cli._control_bind_endpoint(8810)[1] == 8813  # the bind does not
@@ -896,9 +896,9 @@ class TestLiveForegroundControl:
 
     @pytest.fixture(autouse=True)
     def _isolated_state(self, tmp_path, monkeypatch):
-        # XDG_STATE_HOME, the real one -- see endpoints_test's fixture for what
+        # BIOPB_STATE_HOME, the real one -- see endpoints_test's fixture for what
         # a wrong name silently does to the developer's own state dir.
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
 
     def test_no_record_is_no_foreground_control(self):
         assert cli._live_foreground_control() is None

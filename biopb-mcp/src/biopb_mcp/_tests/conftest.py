@@ -64,13 +64,20 @@ def _isolate_config(monkeypatch, tmp_path):
        access reads the developer's real ``~/.config/biopb/mcp-config.json``.
 
     This autouse fixture points ``Path.home()`` at a per-test ``tmp_path`` (so an
-    untouched config resolves to defaults), clears inherited ``XDG_*`` env vars
+    untouched config resolves to defaults), clears inherited ``BIOPB_*`` / ``XDG_*`` env vars
     so tests start from the conventional defaults, and invalidates the cache
     before and after each test. ``monkeypatch`` is function-scoped, so tests that
     set their own ``Path.home`` compose with this -- their setattr runs later and
     wins, sharing the same ``tmp_path``.
     """
-    for var in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
+    for var in (
+        "BIOPB_CONFIG_HOME",
+        "BIOPB_STATE_HOME",
+        "BIOPB_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     CONFIG.reload()

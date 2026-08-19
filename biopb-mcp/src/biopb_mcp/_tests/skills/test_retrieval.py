@@ -333,7 +333,7 @@ def shipped_with_plugins(monkeypatch, tmp_path):
     Seeded through `seed_kernel_plugins`, the installer's own path, so this
     asks about the files users get rather than a fixture's idea of them. The
     plugin dir is patched at `biopb._locations` because `mcp_plugin_dir` reads
-    ``$XDG_CONFIG_HOME`` ahead of ``$HOME``.
+    ``$BIOPB_CONFIG_HOME`` ahead of ``$HOME``.
     """
     import biopb._locations as locations
 

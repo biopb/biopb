@@ -34,7 +34,7 @@ def skills_cfg(monkeypatch, tmp_path):
 
     ``skills_local_dir`` names a path that does not exist yet, so the default
     suite never reads a real ``~/.config/biopb/skills`` (nor whatever
-    ``$XDG_CONFIG_HOME`` points at on CI). The ``local_skills`` fixture creates
+    ``$BIOPB_CONFIG_HOME`` points at on CI). The ``local_skills`` fixture creates
     it for the tests that want local files; ``_ship`` fills the shipped one.
     """
     cfg = {
@@ -43,7 +43,7 @@ def skills_cfg(monkeypatch, tmp_path):
         # Off by default here so these tests stay about the *skill* sources. It
         # also keeps them hermetic: the plugin scan resolves
         # ``~/.config/biopb/kernel``, and `mcp_plugin_dir` honours
-        # ``$XDG_CONFIG_HOME`` ahead of the patched home — which CI sets — so a
+        # ``$BIOPB_CONFIG_HOME`` ahead of the patched home — which CI sets — so a
         # default-on scan would read whatever the machine happens to have
         # seeded. The `plugin_catalog` fixture turns it on against a tmp dir.
         "skills_index_plugins": False,
@@ -407,10 +407,10 @@ def test_local_body_gone_at_read_time_reports_instead_of_raising(
 
 def test_local_dir_defaults_under_config_dir(monkeypatch, tmp_path):
     # An unset skills_local_dir resolves to ~/.config/biopb/skills. CI sets
-    # XDG_CONFIG_HOME, which config_dir() honors first, so isolate both.
+    # BIOPB_CONFIG_HOME, which config_dir() honors first, so isolate both.
     import pathlib
 
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("BIOPB_CONFIG_HOME", raising=False)
     monkeypatch.delenv("BIOPB_CONFIG_DIR", raising=False)
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(_skills, "_setting", lambda path, default=None: "")
@@ -566,7 +566,7 @@ def plugin_catalog(skills_cfg, monkeypatch, tmp_path):
 
     Returns the dir, so a test writes ``*.py`` into it and calls
     ``find_skills``. ``mcp_plugin_dir`` is patched at its source rather than via
-    ``$HOME``, because it reads ``$XDG_CONFIG_HOME`` first.
+    ``$HOME``, because it reads ``$BIOPB_CONFIG_HOME`` first.
     """
     import biopb._locations as locations
 
