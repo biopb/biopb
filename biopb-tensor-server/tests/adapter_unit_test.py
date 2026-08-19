@@ -284,10 +284,11 @@ class TestGetScaledReadPlan:
             )
             plan = adapter.get_read_plan(request_desc)
 
-            # Should have virtual chunks (2x2 grid = 4 chunks)
-            assert len(plan.chunk_endpoints) == 4
+            # The private 50x50 zarr blocks coalesce to one 100x100 transfer
+            # chunk before the existing scale logic is applied.
+            assert len(plan.chunk_endpoints) == 1
             assert list(plan.descriptor.shape) == [50, 50]
-            assert list(plan.descriptor.chunk_shape) == [25, 25]  # Virtual chunk shape
+            assert list(plan.descriptor.chunk_shape) == [50, 50]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_virtual_scaling_with_slice(self):
@@ -316,9 +317,9 @@ class TestGetScaledReadPlan:
             )
             plan = adapter.get_read_plan(request_desc)
 
-            # Slice [10,10]->[50,50] intersects chunk [0,50]x[0,50].
-            # Realized (snapped) source bounds = [0,0]->[50,50] -> shape (50/2, 50/2) = (25, 25)
-            assert list(plan.descriptor.shape) == [25, 25]
+            # The coalesced 100x100 transfer chunk is scaled with the unchanged
+            # LCM logic, so the slice realizes that one source-space chunk.
+            assert list(plan.descriptor.shape) == [50, 50]
 
 
 class TestEmptyChunkShapeFallback:
@@ -396,6 +397,7 @@ class TestEmptyChunkShapeFallback:
             [100, 100], "uint8", ["y", "x"], chunk_shape=[50, 50]
         )
         assert adapter.get_chunk_size() == (50, 50)
+        assert adapter.get_transfer_chunk_size() == (100, 100)
 
     def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
         # An unresolved descriptor (shape known, dtype still empty) must fail the
@@ -415,6 +417,79 @@ class TestEmptyChunkShapeFallback:
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):
             adapter.get_chunk_size()
+
+
+class TestTransferChunkSize:
+    """The public Flight grid is optimized around a preferred byte target."""
+
+    def test_coalesces_plane_blocks_along_z(self):
+        from biopb_tensor_server.core.chunk import (
+            PREFERRED_ARROW_BATCH_BYTES,
+            compute_transfer_chunk_size,
+            estimate_chunk_bytes,
+        )
+
+        native = (1, 1, 1, 960, 1000)
+        shape = (1, 1, 320, 960, 1000)
+        result = compute_transfer_chunk_size(
+            native, shape, "<u2", ["t", "c", "z", "y", "x"]
+        )
+
+        assert result == (1, 1, 17, 960, 1000)
+        assert estimate_chunk_bytes(result, "<u2") <= PREFERRED_ARROW_BATCH_BYTES
+        assert all(r % n == 0 for r, n in zip(result, native, strict=True))
+        assert (
+            compute_transfer_chunk_size(result, shape, "<u2", ["t", "c", "z", "y", "x"])
+            == result
+        )
+
+    def test_divides_whole_stack_toward_preferred_size(self):
+        from biopb_tensor_server.core.chunk import (
+            PREFERRED_ARROW_BATCH_BYTES,
+            compute_transfer_chunk_size,
+            estimate_chunk_bytes,
+        )
+
+        result = compute_transfer_chunk_size(
+            (1, 1, 320, 960, 1000),
+            (1, 1, 320, 960, 1000),
+            "<u2",
+            ["t", "c", "z", "y", "x"],
+        )
+
+        assert result == (1, 1, 16, 960, 1000)
+        assert estimate_chunk_bytes(result, "<u2") <= PREFERRED_ARROW_BATCH_BYTES
+
+    def test_coalesces_spatial_tiles_without_long_strip(self):
+        from biopb_tensor_server.core.chunk import compute_transfer_chunk_size
+
+        assert compute_transfer_chunk_size(
+            (256, 256), (4096, 4096), "<u2", ["y", "x"]
+        ) == (4096, 4096)
+
+    def test_scaled_logical_chunk_is_no_larger_than_transfer_chunk(self):
+        from math import lcm
+
+        from biopb_tensor_server.core.chunk import (
+            compute_transfer_chunk_size,
+            estimate_chunk_bytes,
+        )
+
+        transfer = compute_transfer_chunk_size(
+            (1, 1, 1, 960, 1000),
+            (1, 1, 320, 960, 1000),
+            "<u2",
+            ["t", "c", "z", "y", "x"],
+        )
+        scale = (1, 1, 4, 3, 2)
+        logical = tuple(
+            lcm(chunk, factor) // factor
+            for chunk, factor in zip(transfer, scale, strict=True)
+        )
+
+        assert estimate_chunk_bytes(logical, "<u2") <= estimate_chunk_bytes(
+            transfer, "<u2"
+        )
 
 
 class TestGetPhysicalScale:
@@ -1293,7 +1368,7 @@ class TestOmeZarrPrecompute:
 
             # Should return level 1's shape
             assert list(plan.descriptor.shape) == [50, 50]
-            assert list(plan.descriptor.chunk_shape) == [25, 25]
+            assert list(plan.descriptor.chunk_shape) == [50, 50]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_precompute_no_match_raises(self):
@@ -1406,8 +1481,9 @@ class TestOmeZarrPrecompute:
 
             # Should use virtual scaling (shape based on base / scale)
             assert list(plan.descriptor.shape) == [50, 50]
-            # Virtual chunk shape is base_chunk / scale = 50/2 = 25
-            assert list(plan.descriptor.chunk_shape) == [25, 25]
+            # The base transfer grid coalesces to 100x100, then the unchanged
+            # virtual scaling logic divides it by the requested scale.
+            assert list(plan.descriptor.chunk_shape) == [50, 50]
 
 
 class TestSliceConversion:

@@ -261,7 +261,7 @@ class TestNormalizeAdapter:
             plan = adapter.get_tensor_adapter(None).plan_flight_info(
                 TensorReadOption(tensor_id="src"), PyramidConfig()
             )
-            assert len(plan.chunk_endpoints) > 1
+            assert plan.chunk_endpoints
 
             calls["n"] = 0
             for ce in plan.chunk_endpoints:  # the do_get inner loop
@@ -370,7 +370,11 @@ class TestNormalizedDescriptorAndData:
             read_opt.slice_hint.start[:] = [0, 0, 0]
             read_opt.slice_hint.stop[:] = [2, 3, 2]
             plan = adapter.plan_flight_info(read_opt, PyramidConfig())
-            assert list(plan.descriptor.shape) == [2, 3, 2]
+            # The canonical slice is interpreted correctly, then snapped
+            # outward to the coalesced public transfer grid.
+            assert list(plan.descriptor.shape) == [4, 3, 2]
+            assert list(plan.descriptor.slice_hint.start) == [0, 0, 0]
+            assert list(plan.descriptor.slice_hint.stop) == [4, 3, 2]
 
     def test_scaled_read_is_coherent_in_canonical_order(self):
         """A downsampled read is the subtlest path: the client's ``scale_hint``

@@ -829,12 +829,14 @@ class TestCacheIntegration:
             darr[: chunks[0], : chunks[1]].compute()
             nbytes1 = client.cache_info()["size_bytes"]
 
-            # Read second chunk (different region)
+            # Read a different native zarr region. Both regions belong to the
+            # same server-selected transfer chunk (#684).
             darr[chunks[0] : chunks[0] * 2, chunks[1] : chunks[1] * 2].compute()
             nbytes2 = client.cache_info()["size_bytes"]
 
-            # Cache should have grown
-            assert nbytes2 > nbytes1
+            # The client reuses the coalesced transfer entry rather than
+            # exposing one cache entry per private storage block.
+            assert nbytes2 == nbytes1
 
             client.close()
         finally:
