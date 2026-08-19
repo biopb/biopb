@@ -39,6 +39,10 @@ class UploadSession:
     """Source creation, chunk upload, and upload-status polling over one Flight
     connection.
 
+    .. note:: Experimental. This whole API -- ``create_source`` / ``upload_array``
+       / ``upload_zarr``, chunk upload, and upload-status polling -- is
+       experimental and its behavior may change.
+
     Holds only the connection handles (``FlightClient`` + ``FlightCallOptions``);
     it never touches the catalog / descriptor caches. ``TensorFlightClient``
     constructs one in its ``__init__`` and delegates its public upload API here.
@@ -59,6 +63,10 @@ class UploadSession:
         ome_metadata: Optional[dict] = None,
     ) -> str:
         """Upload dask array to server.
+
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
 
         Args:
             arr: Dask array to upload
@@ -142,6 +150,10 @@ class UploadSession:
     ) -> str:
         """Upload local zarr to server.
 
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
+
         Args:
             zarr_path: Path to local zarr directory
             source_name: Source identifier format:
@@ -195,6 +207,10 @@ class UploadSession:
     ) -> str:
         """Create source on server (internal).
 
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
+
         Args:
             source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
                          "cache:" or "ome_zarr:" → server-generated name
@@ -235,6 +251,10 @@ class UploadSession:
     ) -> None:
         """Upload single chunk (internal).
 
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
+
         Args:
             source_id: Source identifier
             bounds: Chunk start/stop coordinates
@@ -259,6 +279,10 @@ class UploadSession:
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
         """Get upload status for a writable source.
 
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
+
         Args:
             source_id: Source identifier returned by create_source()
 
@@ -279,6 +303,10 @@ class UploadSession:
     def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
         """Get upload status for a registration-first SerializedTensor handle.
 
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
+
         This helper is intended for cache-backed handles returned before upload
         completion, where tensor_descriptor.array_id is the source identifier.
 
@@ -297,6 +325,10 @@ class UploadSession:
         poll_interval_seconds: float = 0.5,
     ) -> Dict[str, Any]:
         """Poll upload status until the source reports READY.
+
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
 
         Applies only to sources created by ``create_source()`` /
         ``upload_array()``. A source the server tracks no upload for reports
@@ -350,7 +382,12 @@ class UploadSession:
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.5,
     ) -> Dict[str, Any]:
-        """Poll upload status until a registration-first SerializedTensor is READY."""
+        """Poll upload status until a registration-first SerializedTensor is READY.
+
+        .. note:: Experimental. The upload / writable-source API (source
+           creation, chunk upload, and upload-status polling) is experimental
+           and may change.
+        """
         return self.wait_for_upload_ready(
             _upload_source_id_from_pb(pb),
             timeout_seconds=timeout_seconds,

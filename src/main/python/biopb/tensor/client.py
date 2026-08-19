@@ -79,7 +79,7 @@ def _normalize_location(location: str) -> str:
     return location
 
 
-def make_debug_serialized_tensor(
+def _make_debug_serialized_tensor(
     arr: da.Array, array_id: str = "debug"
 ) -> SerializedTensor:
     """Create a SerializedTensor with debug_pickled_array for testing.
@@ -278,7 +278,10 @@ class TensorFlightClient:
         on_progress: Optional[Callable[[ResolveProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> DataSourceDescriptor:
-        """Resolve an unresolved (cloud) source. See :meth:`CatalogClient.resolve`."""
+        """Resolve an unresolved (cloud) source. See :meth:`CatalogClient.resolve`.
+
+        .. note:: Experimental -- cloud / remote source support may change.
+        """
         return self._catalog.resolve(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
@@ -290,7 +293,10 @@ class TensorFlightClient:
         on_progress: Optional[Callable[[WarmProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> WarmProgress:
-        """Hydrate-ahead a resolved multi-file source. See :meth:`CatalogClient.warm`."""
+        """Hydrate-ahead a resolved multi-file source. See :meth:`CatalogClient.warm`.
+
+        .. note:: Experimental -- cloud / remote source support may change.
+        """
         return self._catalog.warm(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
@@ -455,8 +461,8 @@ class TensorFlightClient:
         return dask_arr
 
     # ====================
-    # Upload API -- thin delegators onto the UploadSession collaborator
-    # (see biopb.tensor._upload); #278 item C.
+    # Upload API (EXPERIMENTAL) -- thin delegators onto the UploadSession
+    # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
     def upload_array(
@@ -467,7 +473,10 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Upload a dask array as a new source. See :meth:`UploadSession.upload_array`."""
+        """Upload a dask array as a new source. See :meth:`UploadSession.upload_array`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.upload_array(
             arr, source_name, chunk_shape, dim_labels, ome_metadata
         )
@@ -480,7 +489,10 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Upload a local zarr as a new source. See :meth:`UploadSession.upload_zarr`."""
+        """Upload a local zarr as a new source. See :meth:`UploadSession.upload_zarr`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.upload_zarr(
             zarr_path, source_name, chunk_shape, dim_labels, ome_metadata
         )
@@ -494,7 +506,10 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Create a writable source on the server. See :meth:`UploadSession.create_source`."""
+        """Create a writable source on the server. See :meth:`UploadSession.create_source`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.create_source(
             source_name, shape, dtype, chunk_shape, dim_labels, ome_metadata
         )
@@ -505,7 +520,10 @@ class TensorFlightClient:
         bounds: ChunkBounds,
         data: np.ndarray,
     ) -> None:
-        """Upload a single chunk. See :meth:`UploadSession.upload_chunk`."""
+        """Upload a single chunk. See :meth:`UploadSession.upload_chunk`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         self._upload.upload_chunk(source_id, bounds, data)
 
     def close(self):
@@ -560,11 +578,17 @@ class TensorFlightClient:
         return {}
 
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
-        """Upload status for a writable source. See :meth:`UploadSession.get_upload_status`."""
+        """Upload status for a writable source. See :meth:`UploadSession.get_upload_status`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.get_upload_status(source_id)
 
     def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Upload status for a SerializedTensor handle. See :meth:`UploadSession.get_upload_status_pb`."""
+        """Upload status for a SerializedTensor handle. See :meth:`UploadSession.get_upload_status_pb`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.get_upload_status_pb(pb)
 
     def wait_for_upload_ready(
@@ -573,7 +597,10 @@ class TensorFlightClient:
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.5,
     ) -> Dict[str, Any]:
-        """Poll until the source reports READY. See :meth:`UploadSession.wait_for_upload_ready`."""
+        """Poll until the source reports READY. See :meth:`UploadSession.wait_for_upload_ready`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.wait_for_upload_ready(
             source_id, timeout_seconds, poll_interval_seconds
         )
@@ -584,7 +611,10 @@ class TensorFlightClient:
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.5,
     ) -> Dict[str, Any]:
-        """Poll until a SerializedTensor handle is READY. See :meth:`UploadSession.wait_for_upload_ready_pb`."""
+        """Poll until a SerializedTensor handle is READY. See :meth:`UploadSession.wait_for_upload_ready_pb`.
+
+        .. note:: Experimental -- the upload / writable-source API may change.
+        """
         return self._upload.wait_for_upload_ready_pb(
             pb, timeout_seconds, poll_interval_seconds
         )
