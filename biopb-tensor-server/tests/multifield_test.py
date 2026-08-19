@@ -692,10 +692,8 @@ class TestDescriptorCacheCollision:
                 1024,
             ]
 
-            # get_physical_scale reads from the descriptor cache keyed on the
-            # bare tensor id "Image:0" -- the exact collision in #45. Each must
-            # return its OWN scale. With a bare-only key the second source reads
-            # the first's cached entry and returns the wrong scale.
+            # The #45 collision: two sources both name a field "Image:0". Keyed
+            # by the globally-unique array_id, each must return its OWN scale.
             scale_a, unit_a = client.get_physical_scale("aics_aaa/Image:0")
             assert scale_a == [2.0, 0.5, 0.5]
             assert unit_a == ["um", "um", "um"]
@@ -704,9 +702,10 @@ class TestDescriptorCacheCollision:
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 
-            # Both sources coexist in the cache under distinct composite keys.
-            assert client._descriptor_key("aics_aaa", "Image:0") in client._descriptors
-            assert client._descriptor_key("aics_bbb", "Image:0") in client._descriptors
+            # Both sources coexist: the qualified array_id is globally unique,
+            # so the two same-named fields cannot collide.
+            assert "aics_aaa/Image:0" in client._descriptors
+            assert "aics_bbb/Image:0" in client._descriptors
 
             client.close()
         finally:

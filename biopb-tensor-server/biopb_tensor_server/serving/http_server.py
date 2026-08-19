@@ -1727,8 +1727,7 @@ async def _ws_render_one(
         # Get tensor context (includes realized slice bounds), build the
         # uncropped dask array from its endpoints.
         cctx = client._get_tensor_context(
-            source_id=params.source_id,
-            tensor_id=params.tensor_id,
+            _request_array_id(params.source_id, params.tensor_id),
             slice_hint=slice_hint,
             scale_hint=params.scale_hint or None,
             reduction_method=params.reduction_method or None,
