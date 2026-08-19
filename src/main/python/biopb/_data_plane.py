@@ -161,7 +161,7 @@ def local_ca(url: str) -> Optional[bytes]:
             f"not be read from {cert_path} ({exc}). A local plane is trusted from "
             "its cert on disk, not by pinning it from the wire — so this is not "
             "retried as trust-on-first-use. Check the state dir is the one the "
-            "server writes to (XDG_STATE_HOME), or re-mint the cert with "
+            "server writes to (BIOPB_STATE_HOME), or re-mint the cert with "
             "`biopb-tensor-server cert init`."
         ) from exc
     if not pem.strip():

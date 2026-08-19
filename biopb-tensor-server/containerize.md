@@ -114,7 +114,7 @@ downgrading.
 > **Mount the state dir.** The generated cert lives at
 > `/root/.local/state/biopb/tls/`. Without the volume above it is lost on
 > `docker rm`, and the next container mints a *different* cert — which every
-> client that pinned the old one will refuse (by design). `-e XDG_STATE_HOME=/state`
+> client that pinned the old one will refuse (by design). `-e BIOPB_STATE_HOME=/state`
 > with `-v biopb-state:/state` works too.
 
 To serve a certificate you already have, mount it and point `BIOPB_TLS_CERT` /

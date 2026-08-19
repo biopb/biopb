@@ -662,7 +662,7 @@ silently changes what a run tests:
   an unreachable address, so `client` lands as `None` and the agent cannot wander
   into whatever catalog the developer's machine happens to hold. A
   `tensor`-presented case gets the run-scoped plane instead ([`fixtures.md`](fixtures.md) §8).
-- **A config tree of its own.** `XDG_CONFIG_HOME` points at a temp dir, so the
+- **A config tree of its own.** `BIOPB_CONFIG_HOME` points at a temp dir, so the
   catalog under test is the shipped set and not the developer's personal
   `~/.config/biopb/skills/*.md`.
 - **Only the kernel plugins the case declares.** That same private tree means an

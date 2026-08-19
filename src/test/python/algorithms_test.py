@@ -31,13 +31,14 @@ from biopb import _algorithms
 def home(tmp_path, monkeypatch):
     """Isolate the biopb-mcp config location under a per-test home.
 
-    Also drops inherited ``XDG_*``: ``_locations.config_dir`` honors
-    ``$XDG_CONFIG_HOME`` when it is set (GitHub's Linux runners set it), which
+    Also drops inherited tree vars: ``_locations.config_dir`` honors
+    ``$BIOPB_CONFIG_HOME`` when it is set (and CI sets the legacy
+    ``$XDG_CONFIG_HOME``, which is now ignored but still warns), which
     would otherwise bypass the monkeypatched ``Path.home`` and read the real
     config -- so ``configured()`` would resolve outside this per-test home.
     """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    for var in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
+    for var in ("BIOPB_CONFIG_HOME", "BIOPB_STATE_HOME", "BIOPB_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
     return tmp_path
 

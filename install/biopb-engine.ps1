@@ -139,10 +139,42 @@ if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
 # pid / sentinels in the STATE tree. Honors the XDG env var (as Python does on
 # every platform), defaulting to the conventional home-relative dir, so writer
 # (installer) and reader (code) resolve the same path.
+# biopb owns its own env namespace (BIOPB_CONFIG_HOME / BIOPB_STATE_HOME /
+# BIOPB_DATA_HOME) and no longer reads the XDG_* variables -- on Windows nothing
+# owns those, and an app that set XDG_STATE_HOME for its own purposes used to
+# drag biopb's state tree along with it (biopb/biopb#790). Must stay in step with
+# biopb._locations._tree and install.sh, or the installer writes one tree while
+# the runtime reads another.
+$script:LegacyXdgWarned = @{}
+
+# A relative value resolves against each process's working directory, so the
+# installer and the runtime would place the tree differently. Refuse it, the way
+# biopb._locations._require_absolute does.
+function Assert-BiopbAbsolute {
+    param([string]$EnvVar, [string]$Value)
+    # Matches ntpath.isabs (what biopb._locations uses) rather than
+    # [IO.Path]::IsPathRooted, which accepts the DRIVE-RELATIVE "C:foo" -- a form
+    # that resolves against that drive's working directory and so drifts exactly
+    # like a bare relative path. IsPathFullyQualified would be right but is
+    # .NET Core only; this regex works under Windows PowerShell 5.1 too.
+    if ($Value -and $Value -notmatch '^([A-Za-z]:[\\/]|[\\/])') {
+        throw "$EnvVar must be an absolute path (got '$Value'). A relative value resolves against each process's working directory, so the installer and the runtime would disagree about where this tree lives."
+    }
+}
+
 function Get-BiopbTree {
     param([string]$EnvVar, [string]$DefaultRel)
     $base = [Environment]::GetEnvironmentVariable($EnvVar)
-    if (-not $base) { $base = Join-Path $env:USERPROFILE $DefaultRel }
+    Assert-BiopbAbsolute $EnvVar $base
+    if (-not $base) {
+        $legacy = $EnvVar -replace '^BIOPB_', 'XDG_'
+        if ([Environment]::GetEnvironmentVariable($legacy) -and
+            -not $script:LegacyXdgWarned.ContainsKey($EnvVar)) {
+            $script:LegacyXdgWarned[$EnvVar] = $true
+            Report-Warn "$legacy is set but biopb no longer reads it; using the default tree. Set $EnvVar instead to relocate it."
+        }
+        $base = Join-Path $env:USERPROFILE $DefaultRel
+    }
     return Join-Path $base "biopb"
 }
 
@@ -750,7 +782,7 @@ function Show-LogTail {
 function Start-ControlPlane {
     param([string]$BiopbHome, [string]$ConfigFile, [bool]$NoStart)
 
-    $logsDir     = Join-Path (Get-BiopbTree "XDG_STATE_HOME" ".local\state") "logs"
+    $logsDir     = Join-Path (Get-BiopbTree "BIOPB_STATE_HOME" ".local\state") "logs"
     $controlLog  = Join-Path $logsDir "control.log"
     $serverLog   = Join-Path $logsDir "tensor-server.log"
 
@@ -937,7 +969,7 @@ function Install-DesktopShortcut {
         $sc.WorkingDirectory = Split-Path $biopbExe -Parent
         # Brand the shortcut with the webapp's icon (shipped in the webapp bundle);
         # only if present, else leave the default (biopb.exe's) icon.
-        $icon = Join-Path (Get-BiopbTree "XDG_DATA_HOME" ".local\share") "webapp\favicon.ico"
+        $icon = Join-Path (Get-BiopbTree "BIOPB_DATA_HOME" ".local\share") "webapp\favicon.ico"
         if (Test-Path -LiteralPath $icon) { $sc.IconLocation = "$icon,0" }
         $sc.Save()
         Report-Ok "Desktop shortcut created: $lnkPath"
@@ -989,7 +1021,7 @@ function Invoke-BiopbInstall {
     # ----- Dry run: emit the full progress stream, change nothing. -----
     if ($DryRun) {
         $BiopbHome  = $env:USERPROFILE
-        $ConfigDir  = Get-BiopbTree "XDG_CONFIG_HOME" ".config"
+        $ConfigDir  = Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"
         $configFile = Join-Path $ConfigDir "biopb.json"
         $stepMsgs = @(
             "Checking system...",
@@ -1031,10 +1063,10 @@ function Invoke-BiopbInstall {
     # clobbering the parameter -- which forced $effectiveDataDir to the data root,
     # so $seedSamples was always false (samples never seeded) and BIOPB_DATA_DIR was
     # ignored. Keep the two distinct.
-    $DataRoot    = Get-BiopbTree "XDG_DATA_HOME" ".local\share"
+    $DataRoot    = Get-BiopbTree "BIOPB_DATA_HOME" ".local\share"
     $WebappDir   = Join-Path $DataRoot "webapp"
     $SamplesDir  = Join-Path $DataRoot "samples"
-    $ConfigDir   = Get-BiopbTree "XDG_CONFIG_HOME" ".config"
+    $ConfigDir   = Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"
     $LocalBin    = Join-Path $BiopbHome ".local\bin"
 
     # Release channel: -Rc (or BIOPB_INSTALL_RC env) admits the latest candidate.
@@ -1694,10 +1726,10 @@ function Invoke-BiopbUninstall {
     $BiopbHome = $env:USERPROFILE
     # config + cached data (NOT the user's microscopy images).
     $dataDirs = @(
-        (Get-BiopbTree "XDG_CONFIG_HOME" ".config"),
+        (Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"),
         (Join-Path $BiopbHome ".config\biopb-mcp"),
-        (Get-BiopbTree "XDG_STATE_HOME" ".local\state"),
-        (Get-BiopbTree "XDG_DATA_HOME" ".local\share"),
+        (Get-BiopbTree "BIOPB_STATE_HOME" ".local\state"),
+        (Get-BiopbTree "BIOPB_DATA_HOME" ".local\share"),
         (Join-Path $BiopbHome ".local\share\biopb-mcp")
     )
 
@@ -1742,7 +1774,7 @@ function Invoke-BiopbUninstall {
             # default location, plus any custom cache.file_cache_dir read from the
             # config before it is deleted. The server was stopped in step 1.
             $cacheDirs = @((Join-Path $env:TEMP "biopb-cache-$env:USERNAME"))
-            $cfgFile = Join-Path (Get-BiopbTree "XDG_CONFIG_HOME" ".config") "biopb.json"
+            $cfgFile = Join-Path (Get-BiopbTree "BIOPB_CONFIG_HOME" ".config") "biopb.json"
             if (Test-Path -LiteralPath $cfgFile) {
                 try {
                     $custom = (Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json).cache.file_cache_dir

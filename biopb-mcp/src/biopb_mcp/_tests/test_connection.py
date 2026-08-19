@@ -1196,7 +1196,7 @@ class TestConnectErrorMessage:
 
 
 def _seed_cert(monkeypatch, tmp_path, body: bytes = b"-----BEGIN CERTIFICATE-----\n"):
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
     from biopb._locations import tls_server_cert
 
     path = tls_server_cert()
@@ -1224,7 +1224,7 @@ def test_an_unreadable_local_cert_errors_rather_than_falling_back_to_tofu(
 ):
     """Degrading here would trade a verified anchor for an unverified one exactly
     where the strong option was meant to apply."""
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
     with pytest.raises(RuntimeError, match="could not be read"):
         _connection._local_ca("grpcs://localhost:8815")
 
@@ -1264,7 +1264,7 @@ def test_an_unreadable_cert_is_not_reported_as_an_auth_problem(monkeypatch, tmp_
     needs a token" and sent the reader after a credential that had nothing to do
     with it.
     """
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
     from biopb._locations import tls_server_cert
 
     cert = tls_server_cert()

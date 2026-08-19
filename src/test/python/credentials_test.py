@@ -23,7 +23,7 @@ def _isolate_state(tmp_path, monkeypatch):
     """Redirect the state tree to a temp dir (via ``Path.home``, matching
     ``config_paths_test``) so a test never touches the machine's real credential."""
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
-    for var in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+    for var in ("BIOPB_STATE_HOME", "BIOPB_CONFIG_HOME", "BIOPB_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -35,7 +35,7 @@ class TestLocation:
         )
 
     def test_xdg_state_home_honored(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xs"))
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "xs"))
         assert C.credential_file() == tmp_path / "xs" / "biopb" / "tensor-server.token"
 
 

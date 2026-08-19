@@ -162,7 +162,7 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
     # Isolate the TOFU pin store (state/biopb/tls-known-hosts.json) to a tmp tree.
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -215,7 +215,7 @@ def test_sidecar_reads_over_tls_without_pinning(
     from biopb_tensor_server.serving.http_server import create_app
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -383,7 +383,7 @@ def test_sdk_client_derives_the_override_and_reads(
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -414,7 +414,7 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
