@@ -18,8 +18,9 @@ this file have?") and every consumer needs both:
 
 **Base directories** (the same layout on every platform, matching the
 installer's ``~/.config``-everywhere convention rather than per-OS native dirs).
-Each is relocated by its own ``BIOPB_*`` variable; biopb does **not** read the
-``XDG_*`` variables (see the note above ``_tree``):
+Each is relocated by its own ``BIOPB_*`` variable, which must be an ABSOLUTE
+path; biopb does **not** read the ``XDG_*`` variables (see the note above
+``_tree``):
 
 - config  -> ``$BIOPB_CONFIG_HOME`` (default ``~/.config``)      ``biopb.json`` etc.
 - state   -> ``$BIOPB_STATE_HOME``  (default ``~/.local/state``) logs, sessions, pids
@@ -109,22 +110,44 @@ def _warn_legacy_xdg(biopb_var: str, xdg_var: str) -> None:
     )
 
 
+def _require_absolute(env_var: str, raw: str) -> None:
+    """Refuse a relative path in a location variable.
+
+    A relative value resolves against the **current working directory**, which
+    differs between the processes that must agree on these paths: the biopb-mcp
+    shim inherits its client's cwd, a control started from a terminal has that
+    terminal's, and the installer has whatever the user ran it from. So the same
+    variable would name a different directory in each -- the failure mode
+    biopb/biopb#790 already produced once, reintroduced through the override.
+
+    Loud rather than ignored-with-a-default: the value was set deliberately, and
+    silently relocating the tree somewhere else is exactly the drift this guards.
+    """
+    if not os.path.isabs(raw):
+        raise ValueError(
+            f"{env_var} must be an absolute path (got {raw!r}). A relative value "
+            f"resolves against each process's working directory, so the installer, "
+            f"the control plane, and the biopb-mcp shim would disagree about where "
+            f"this tree lives."
+        )
+
+
 def _tree(env_var: str, legacy_xdg_var: str, default_rel: str) -> Path:
     """The ``biopb`` subdir of a base dir.
 
-    Honors *env_var* when it holds an **absolute** path (a relative value is
-    ignored, as the XDG spec required of its own variables and as every caller
-    already assumed); otherwise falls back to ``~/<default_rel>``. ``Path.home()``
-    is read at call time for test isolation.
+    Honors *env_var* when set, which must be an **absolute** path (see
+    :func:`_require_absolute`); otherwise falls back to ``~/<default_rel>``.
+    ``Path.home()`` is read at call time for test isolation.
 
     *legacy_xdg_var* is only ever *detected*, never read for its value -- see the
     note above.
     """
     raw = os.environ.get(env_var)
-    if not (raw and os.path.isabs(raw)) and os.environ.get(legacy_xdg_var):
+    if raw:
+        _require_absolute(env_var, raw)
+    elif os.environ.get(legacy_xdg_var):
         _warn_legacy_xdg(env_var, legacy_xdg_var)
-    root = Path(raw) if raw and os.path.isabs(raw) else Path.home() / default_rel
-    return root / "biopb"
+    return (Path(raw) if raw else Path.home() / default_rel) / "biopb"
 
 
 def config_dir() -> Path:
@@ -287,9 +310,14 @@ def sessions_dir() -> Path:
     """The live-session registry dir; created on access.
 
     ``BIOPB_SESSIONS_DIR`` overrides the location (used by tests and unusual
-    deployments); otherwise ``state/biopb/sessions``.
+    deployments); otherwise ``state/biopb/sessions``. The override must be an
+    absolute path -- this registry is the one directory a shim and a control
+    *must* agree on, and they do not share a working directory
+    (:func:`_require_absolute`).
     """
     raw = os.environ.get(SESSIONS_DIR_ENV)
+    if raw:
+        _require_absolute(SESSIONS_DIR_ENV, raw)
     d = Path(raw) if raw else state_dir() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
     return d

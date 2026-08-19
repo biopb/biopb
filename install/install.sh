@@ -64,6 +64,23 @@ _cmd()  { printf "  ${CYAN}%s${RESET}\n" "$*"; }
 # A deployment that relocated via XDG would otherwise silently move back to the
 # default, so name the rename. Must stay in step with biopb._locations._tree and
 # biopb-engine.ps1's Get-BiopbTree, or installer and runtime disagree on paths.
+# A relative value resolves against each process's cwd, so the installer, the
+# control and the biopb-mcp shim would each place the tree somewhere different
+# (biopb/biopb#790). Refuse it here rather than install into one tree and have
+# the runtime read another. Mirrors biopb._locations._require_absolute.
+_require_absolute_trees() {
+    local var val
+    for var in BIOPB_CONFIG_HOME BIOPB_STATE_HOME BIOPB_DATA_HOME BIOPB_SESSIONS_DIR; do
+        val="$(eval "printf '%s' \"\${$var:-}\"")"
+        case "$val" in
+            "") ;;
+            /*) ;;
+            *) _err "$var must be an absolute path (got '$val'). A relative value resolves against each process's working directory, so the installer and the runtime would disagree about where this tree lives."
+               return 1 ;;
+        esac
+    done
+}
+
 _warn_legacy_xdg() {
     local xdg biopb
     for xdg in XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME; do
@@ -1940,6 +1957,7 @@ main() {
         shift
     done
 
+    _require_absolute_trees || return 2
     _warn_legacy_xdg
 
     if [ "$action" = "uninstall" ]; then

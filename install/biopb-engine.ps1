@@ -147,9 +147,25 @@ if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
 # the runtime reads another.
 $script:LegacyXdgWarned = @{}
 
+# A relative value resolves against each process's working directory, so the
+# installer and the runtime would place the tree differently. Refuse it, the way
+# biopb._locations._require_absolute does.
+function Assert-BiopbAbsolute {
+    param([string]$EnvVar, [string]$Value)
+    # Matches ntpath.isabs (what biopb._locations uses) rather than
+    # [IO.Path]::IsPathRooted, which accepts the DRIVE-RELATIVE "C:foo" -- a form
+    # that resolves against that drive's working directory and so drifts exactly
+    # like a bare relative path. IsPathFullyQualified would be right but is
+    # .NET Core only; this regex works under Windows PowerShell 5.1 too.
+    if ($Value -and $Value -notmatch '^([A-Za-z]:[\\/]|[\\/])') {
+        throw "$EnvVar must be an absolute path (got '$Value'). A relative value resolves against each process's working directory, so the installer and the runtime would disagree about where this tree lives."
+    }
+}
+
 function Get-BiopbTree {
     param([string]$EnvVar, [string]$DefaultRel)
     $base = [Environment]::GetEnvironmentVariable($EnvVar)
+    Assert-BiopbAbsolute $EnvVar $base
     if (-not $base) {
         $legacy = $EnvVar -replace '^BIOPB_', 'XDG_'
         if ([Environment]::GetEnvironmentVariable($legacy) -and

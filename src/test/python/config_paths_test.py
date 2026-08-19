@@ -56,10 +56,32 @@ class TestBaseTrees:
             == tmp_path / "xs" / "biopb" / "logs" / "tensor-server.log"
         )
 
-    def test_relative_value_is_ignored(self, tmp_path, monkeypatch):
-        # A non-absolute base dir is invalid -> fall back to the default.
-        monkeypatch.setenv("BIOPB_CONFIG_HOME", "relative/nope")
-        assert L.config_dir() == tmp_path / ".config" / "biopb"
+    @pytest.mark.parametrize(
+        "var,accessor",
+        [
+            ("BIOPB_CONFIG_HOME", "config_dir"),
+            ("BIOPB_STATE_HOME", "state_dir"),
+            ("BIOPB_DATA_HOME", "data_dir"),
+        ],
+    )
+    def test_relative_value_is_rejected(self, monkeypatch, var, accessor):
+        # A relative value resolves against each process's cwd, so the installer,
+        # the control and the shim would each land somewhere different. Refused
+        # loudly rather than silently defaulting -- the value was set on purpose.
+        monkeypatch.setenv(var, "relative/nope")
+        with pytest.raises(ValueError, match="must be an absolute path"):
+            getattr(L, accessor)()
+
+    def test_relative_sessions_override_is_rejected(self, monkeypatch):
+        # The registry is the one dir a shim and a control MUST agree on, and
+        # they never share a working directory.
+        monkeypatch.setenv(L.SESSIONS_DIR_ENV, "relative/nope")
+        with pytest.raises(ValueError, match="must be an absolute path"):
+            L.sessions_dir()
+
+    def test_absolute_sessions_override_is_honored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(L.SESSIONS_DIR_ENV, str(tmp_path / "reg"))
+        assert L.sessions_dir() == tmp_path / "reg"
 
 
 class TestDerivedPaths:
