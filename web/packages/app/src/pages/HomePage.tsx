@@ -4,6 +4,7 @@ import { ViewerPane } from "../components/ViewerPane";
 import { MetaPanel } from "../components/MetaPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
+import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 
@@ -79,6 +80,8 @@ export function HomePage() {
           </div>
         )}
       </main>
+
+      <TipBar />
 
       {connectionError && connectionState === "error" && (
         <div className="error-toast">
