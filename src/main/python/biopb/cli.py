@@ -1087,7 +1087,7 @@ _OPT_BASE_PORT = typer.Option(
     "from it: control/browser UI = base+3, tensor HTTP sidecar = base+4, flight "
     "gRPC = base+5 (so the 8810 default gives 8813/8814/8815). Same convention "
     "as the container's BIOPB_BASE_PORT. Move it to run a second deployment "
-    "alongside another user's — give that one its own XDG_STATE_HOME too.",
+    "alongside another user's — give that one its own BIOPB_STATE_HOME too.",
 )
 _OPT_LOG_LEVEL = typer.Option("INFO", "--log-level", "-l", help="Control log level")
 _OPT_GRPC_BIND = typer.Option(

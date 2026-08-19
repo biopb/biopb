@@ -30,7 +30,7 @@ and nothing else. Every skill's Parameters table already accepts "a layer on
 `viewer`" as a source, and a session with no tensor plane is a real
 configuration a user can be in, so step 1 still has something true to resolve.
 
-**A config tree of our own.** `XDG_CONFIG_HOME` points at a temp dir, so the
+**A config tree of our own.** `BIOPB_CONFIG_HOME` points at a temp dir, so the
 run neither reads the developer's `mcp-config.json` nor their personal
 `~/.config/biopb/skills/*.md`. The catalog under test is the shipped one.
 
@@ -662,7 +662,7 @@ def live_session(
     saved = {
         k: os.environ.get(k)
         for k in (
-            "XDG_CONFIG_HOME",
+            "BIOPB_CONFIG_HOME",
             "BIOPB_TENSOR_URL",
             "QT_QPA_PLATFORM",
             "PYTHONPATH",
@@ -670,7 +670,7 @@ def live_session(
             ENV_GUARD_MARKERS,
         )
     }
-    os.environ["XDG_CONFIG_HOME"] = str(scratch / "config")
+    os.environ["BIOPB_CONFIG_HOME"] = str(scratch / "config")
     os.environ["BIOPB_TENSOR_URL"] = tensor_url or UNREACHABLE_TENSOR_URL
     os.environ.pop("QT_QPA_PLATFORM", None)  # a real GL platform, not offscreen
 
@@ -691,7 +691,7 @@ def live_session(
     stop = None
     try:
         # Inside the try, because building the wheel can fail and everything
-        # above has already redirected `XDG_CONFIG_HOME` and the tensor URL for
+        # above has already redirected `BIOPB_CONFIG_HOME` and the tensor URL for
         # this whole process. Raising past the `finally` would leave that
         # redirect in place — every later test in the process reading a temp
         # config tree that no longer exists, which is a far worse failure than

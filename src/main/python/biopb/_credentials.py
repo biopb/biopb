@@ -60,7 +60,7 @@ def credential_file() -> Path:
     """Path to the local data-plane credential (``state/biopb/tensor-server.token``).
 
     Resolved at call time (not cached) so a test that repoints ``Path.home()`` /
-    ``$XDG_STATE_HOME`` gets an isolated location.
+    ``$BIOPB_STATE_HOME`` gets an isolated location.
     """
     return state_dir() / _CREDENTIAL_NAME
 

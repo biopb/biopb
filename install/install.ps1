@@ -261,7 +261,7 @@ try {
     $BiopbHome  = $env:USERPROFILE
     # Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
     # pre-#34 install still counts as "a config exists" for the keep prompt.
-    $configDir  = Get-BiopbTree "XDG_CONFIG_HOME" ".config"
+    $configDir  = Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"
     $configFile = Join-Path $configDir "biopb.json"
     $legacyConfig = Join-Path $configDir "biopb.toml"
 
@@ -317,7 +317,7 @@ try {
     # network dependency. Only fires when no biopb-mcp config exists yet, so a
     # prior choice survives a rerun. Default is Yes (Enter = enable).
     $noRemotePlugins = $false
-    $mcpConfig = Join-Path (Get-BiopbTree "XDG_CONFIG_HOME" ".config") "mcp-config.json"
+    $mcpConfig = Join-Path (Get-BiopbTree "BIOPB_CONFIG_HOME" ".config") "mcp-config.json"
     if (-not (Test-Path -LiteralPath $mcpConfig)) {
         if ($script:NonInteractive) {
             # Consent can't be asked unattended: enable only on explicit opt-in.

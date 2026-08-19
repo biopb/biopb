@@ -58,6 +58,23 @@ _err()  { printf "${RED}ERROR:${RESET} %s\n" "$*" >&2; }
 _note() { printf "  ${DIM}NOTE: %s${RESET}\n" "$*"; }
 _cmd()  { printf "  ${CYAN}%s${RESET}\n" "$*"; }
 
+# biopb owns its own env namespace (BIOPB_CONFIG_HOME / BIOPB_STATE_HOME /
+# BIOPB_DATA_HOME) and no longer reads XDG_* (biopb/biopb#790): an unrelated app
+# setting XDG_STATE_HOME used to relocate biopb's state tree along with its own.
+# A deployment that relocated via XDG would otherwise silently move back to the
+# default, so name the rename. Must stay in step with biopb._locations._tree and
+# biopb-engine.ps1's Get-BiopbTree, or installer and runtime disagree on paths.
+_warn_legacy_xdg() {
+    local xdg biopb
+    for xdg in XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME; do
+        biopb="BIOPB_${xdg#XDG_}"
+        if [ -n "$(eval "printf '%s' \"\${$xdg:-}\"")" ] && \
+           [ -z "$(eval "printf '%s' \"\${$biopb:-}\"")" ]; then
+            _warn "$xdg is set but biopb no longer reads it; using the default tree. Set $biopb instead to relocate it."
+        fi
+    done
+}
+
 # Yes/No prompt (default Yes). Usage: if _confirm "Question?"; then ...; fi
 # Reads from /dev/tty so it works when the script is piped in from curl.
 _confirm() {
@@ -721,8 +738,8 @@ _stop_all_biopb_services() {
     # Fallback: SIGTERM (then SIGKILL) any biopb PID still recorded in a known
     # pidfile, then drop the file. control.pid is XDG-state aware; the legacy
     # daemons hard-coded ~/.local/share (not XDG), so probe both.
-    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
-    local share_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local state_dir="${BIOPB_STATE_HOME:-$HOME/.local/state}/biopb"
+    local share_dir="${BIOPB_DATA_HOME:-$HOME/.local/share}"
     local pidfile pid tries
     for pidfile in \
         "$state_dir/control.pid" \
@@ -763,7 +780,7 @@ _tail_log() {
 # control plane so the freshly installed one can spawn and own a new plane -- it
 # refuses an in-use gRPC port.
 _start_control_plane() {
-    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/biopb"
+    local state_dir="${BIOPB_STATE_HOME:-$HOME/.local/state}/biopb"
     local control_log="$state_dir/logs/control.log"
     local server_log="$state_dir/logs/tensor-server.log"
 
@@ -962,8 +979,8 @@ install_biopb() {
     # The state tree is derived at each point of use rather than here: the two
     # readers are functions that run outside this one, and uninstall_biopb never
     # executes it at all.
-    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/biopb"
-    local data_base="${XDG_DATA_HOME:-$HOME/.local/share}/biopb"
+    CONFIG_DIR="${BIOPB_CONFIG_HOME:-$HOME/.config}/biopb"
+    local data_base="${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb"
     WEBAPP_DIR="$data_base/webapp"
     SAMPLES_DIR="$data_base/samples"
 
@@ -1886,10 +1903,10 @@ PY
 
         local d
         for d in \
-            "${XDG_CONFIG_HOME:-$HOME/.config}/biopb" \
+            "${BIOPB_CONFIG_HOME:-$HOME/.config}/biopb" \
             "$HOME/.config/biopb-mcp" \
-            "${XDG_STATE_HOME:-$HOME/.local/state}/biopb" \
-            "${XDG_DATA_HOME:-$HOME/.local/share}/biopb" \
+            "${BIOPB_STATE_HOME:-$HOME/.local/state}/biopb" \
+            "${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb" \
             "$HOME/.local/share/biopb-mcp"; do
             if [ -e "$d" ]; then
                 rm -rf "$d"
@@ -1922,6 +1939,8 @@ main() {
         esac
         shift
     done
+
+    _warn_legacy_xdg
 
     if [ "$action" = "uninstall" ]; then
         uninstall_biopb "$purge"

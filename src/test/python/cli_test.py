@@ -28,8 +28,8 @@ def _no_ambient_deployment(monkeypatch, tmp_path):
     this fixture a machine with a control plane running would feed these tests a
     live endpoint, and the state dir would hand them a real credential file.
     """
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("HOME", str(tmp_path))
     for var in ("BIOPB_TENSOR_URL", "BIOPB_TENSOR_TOKEN"):
         monkeypatch.delenv(var, raising=False)

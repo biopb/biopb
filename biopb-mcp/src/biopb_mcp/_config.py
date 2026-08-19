@@ -601,7 +601,7 @@ def get_log_dir() -> Path:
     """Log directory (``~/.local/state/biopb/mcp`` on all platforms).
 
     Logs are persistent runtime state, not user-editable config, so they live in
-    the shared biopb XDG *state* tree (``$XDG_STATE_HOME``), beside the tensor
+    the shared biopb *state* tree (``$BIOPB_STATE_HOME``), beside the tensor
     server's ``logs/`` and the session registry. Delegates to
     :func:`biopb._locations.mcp_log_dir`, which creates it on access.
     """

@@ -16,12 +16,14 @@ this file have?") and every consumer needs both:
    supervisor *and* the tensor server's shutdown listener). Centralizing them
    here means a reader and a writer cannot disagree.
 
-**XDG base directories** (honored on every platform, matching the installer's
-``~/.config``-everywhere convention rather than per-OS native dirs):
+**Base directories** (the same layout on every platform, matching the
+installer's ``~/.config``-everywhere convention rather than per-OS native dirs).
+Each is relocated by its own ``BIOPB_*`` variable; biopb does **not** read the
+``XDG_*`` variables (see the note above ``_tree``):
 
-- config  -> ``$XDG_CONFIG_HOME`` (default ``~/.config``)      ``biopb.json`` etc.
-- state   -> ``$XDG_STATE_HOME``  (default ``~/.local/state``) logs, sessions, pids
-- data    -> ``$XDG_DATA_HOME``   (default ``~/.local/share``) webapp, samples
+- config  -> ``$BIOPB_CONFIG_HOME`` (default ``~/.config``)      ``biopb.json`` etc.
+- state   -> ``$BIOPB_STATE_HOME``  (default ``~/.local/state``) logs, sessions, pids
+- data    -> ``$BIOPB_DATA_HOME``   (default ``~/.local/share``) webapp, samples
 
 Logs and the session registry are XDG **state** (per-machine, regenerable), not
 **data** (portable assets) — so they sit in the state tree, beside the pid and
@@ -33,7 +35,7 @@ cheap on every CLI invocation and so both ``biopb-control`` and
 without a new dependency edge; it drags in none of the heavy adapter/discovery
 machinery ``biopb_tensor_server.core.config`` does. Paths are resolved **at call
 time**, never cached in a module constant, so a test that repoints
-``Path.home()`` / an ``XDG_*`` env var gets an isolated tree for free.
+``Path.home()`` / a ``BIOPB_*`` env var gets an isolated tree for free.
 
 JSON is the *only* on-disk config format: the config is machine-generated (the
 installer / the admin endpoint write it), and once nobody hand-edits it, TOML's
@@ -56,38 +58,88 @@ logger = logging.getLogger(__name__)
 
 # Env override for just the session-registry dir (predates this module). Kept so
 # a test / an unusual deployment can repoint the registry without moving the rest
-# of the state tree. XDG_STATE_HOME moves everything; this moves only sessions.
+# of the state tree. BIOPB_STATE_HOME moves everything; this moves only sessions.
 SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
 
 
-# --- XDG base trees ------------------------------------------------------ #
+# --- base trees ---------------------------------------------------------- #
+#
+# biopb owns its own env namespace (``BIOPB_*_HOME``) and does NOT read the
+# ``XDG_*`` variables.
+#
+# It used to read them, and that was a bug (biopb/biopb#790). The XDG variables
+# are a freedesktop convention, but biopb honored them on every platform --
+# including Windows, where nothing owns them and any process may set them for
+# its own purposes. An MCP client that sets ``XDG_STATE_HOME`` to its own
+# working directory (opencode desktop does) has that value inherited by the
+# biopb-mcp shim it spawns, while a control plane started from a terminal keeps
+# the default. The two then disagree about where the state tree is, and the
+# session registry -- whose whole contract is that the shim writes what the
+# control reads (see ``biopb._sessions``) -- silently splits in half.
+#
+# The other consumers of the state tree hid the same skew behind fallbacks: the
+# control endpoint record degrades to the default port, and the credential file
+# degrades to the tokenless path. Sessions were simply the one with no fallback.
+#
+# A ``BIOPB_*`` variable that merely takes *precedence* over ``XDG_*`` would not
+# fix this: the bug happens when the biopb variable is unset, which is the normal
+# case. So the XDG read is gone, not reordered. The DEFAULTS are unchanged
+# (``~/.config``, ``~/.local/state``, ``~/.local/share``), so an install that
+# never set an XDG variable sees no difference.
+
+_TREE_ENV_CONFIG = "BIOPB_CONFIG_HOME"
+_TREE_ENV_STATE = "BIOPB_STATE_HOME"
+_TREE_ENV_DATA = "BIOPB_DATA_HOME"
+
+# One warning per (biopb var) per process: relocating via XDG used to work, so a
+# stale deployment must be told its tree moved back to the default rather than
+# silently losing sight of its logs / certs / pids.
+_LEGACY_XDG_WARNED: set = set()
 
 
-def _tree(env_var: str, default_rel: str) -> Path:
-    """The ``biopb`` subdir of an XDG base dir.
+def _warn_legacy_xdg(biopb_var: str, xdg_var: str) -> None:
+    if biopb_var in _LEGACY_XDG_WARNED:
+        return
+    _LEGACY_XDG_WARNED.add(biopb_var)
+    logger.warning(
+        "%s is set but biopb no longer reads it; using the default tree. Set %s "
+        "instead to relocate this tree (biopb/biopb#790).",
+        xdg_var,
+        biopb_var,
+    )
 
-    Honors *env_var* when it holds an **absolute** path (the XDG spec says a
-    relative value is invalid and must be ignored); otherwise falls back to
-    ``~/<default_rel>``. ``Path.home()`` is read at call time for test isolation.
+
+def _tree(env_var: str, legacy_xdg_var: str, default_rel: str) -> Path:
+    """The ``biopb`` subdir of a base dir.
+
+    Honors *env_var* when it holds an **absolute** path (a relative value is
+    ignored, as the XDG spec required of its own variables and as every caller
+    already assumed); otherwise falls back to ``~/<default_rel>``. ``Path.home()``
+    is read at call time for test isolation.
+
+    *legacy_xdg_var* is only ever *detected*, never read for its value -- see the
+    note above.
     """
     raw = os.environ.get(env_var)
+    if not (raw and os.path.isabs(raw)) and os.environ.get(legacy_xdg_var):
+        _warn_legacy_xdg(env_var, legacy_xdg_var)
     root = Path(raw) if raw and os.path.isabs(raw) else Path.home() / default_rel
     return root / "biopb"
 
 
 def config_dir() -> Path:
     """Config tree (``~/.config/biopb``): ``biopb.json``, ``mcp-config.json``, …"""
-    return _tree("XDG_CONFIG_HOME", ".config")
+    return _tree(_TREE_ENV_CONFIG, "XDG_CONFIG_HOME", ".config")
 
 
 def state_dir() -> Path:
     """State tree (``~/.local/state/biopb``): logs, session registry, pid, sentinels."""
-    return _tree("XDG_STATE_HOME", ".local/state")
+    return _tree(_TREE_ENV_STATE, "XDG_STATE_HOME", ".local/state")
 
 
 def data_dir() -> Path:
     """Data tree (``~/.local/share/biopb``): portable assets (webapp bundle, samples)."""
-    return _tree("XDG_DATA_HOME", ".local/share")
+    return _tree(_TREE_ENV_DATA, "XDG_DATA_HOME", ".local/share")
 
 
 # --- config file (location + format) ------------------------------------- #

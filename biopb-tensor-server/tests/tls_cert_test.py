@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _isolate_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
 
 # --- cert module ------------------------------------------------------------
@@ -342,7 +342,7 @@ def test_cert_init_prints_a_bracketed_path_intact(tmp_path, monkeypatch):
     from biopb._locations import tls_server_cert
     from biopb_tensor_server.cli import app
 
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "st[ate]dir"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "st[ate]dir"))
     out = CliRunner().invoke(app, ["cert", "init"])
     assert out.exit_code == 0, out.output
     assert "st[ate]dir" in out.output

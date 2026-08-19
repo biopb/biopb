@@ -8,6 +8,7 @@ env-override rules, and the log rotator. See the module docstring for the policy
 
 from __future__ import annotations
 
+import logging
 import pathlib
 
 import pytest
@@ -15,18 +16,30 @@ from biopb import _locations as L
 
 
 @pytest.fixture(autouse=True)
-def _clean_xdg(tmp_path, monkeypatch):
-    """Isolate the home dir and drop inherited XDG_* so a test starts from the defaults.
+def _clean_env(tmp_path, monkeypatch):
+    """Isolate the home dir and drop inherited tree vars so tests start from the defaults.
 
     Isolate via ``Path.home`` rather than ``$HOME``: on Windows ``Path.home()``
     reads ``USERPROFILE``/``HOMEDRIVE``+``HOMEPATH``, not ``HOME``, so a
     ``setenv("HOME")`` would not redirect it and the machine's real home would
     leak into the default-path assertions below.
+
+    ``XDG_*`` no longer changes any path, but CI sets ``XDG_CONFIG_HOME``, and
+    leaving it set would make every test here emit the legacy-rename warning.
+    Cleared so the assertions run quiet.
     """
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
-    for var in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
+    for var in (
+        "BIOPB_CONFIG_HOME",
+        "BIOPB_STATE_HOME",
+        "BIOPB_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv(L.SESSIONS_DIR_ENV, raising=False)
+    L._LEGACY_XDG_WARNED.clear()
 
 
 class TestBaseTrees:
@@ -35,17 +48,17 @@ class TestBaseTrees:
         assert L.state_dir() == tmp_path / ".local" / "state" / "biopb"
         assert L.data_dir() == tmp_path / ".local" / "share" / "biopb"
 
-    def test_xdg_env_honored_when_absolute(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xs"))
+    def test_biopb_env_honored_when_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "xs"))
         assert L.state_dir() == tmp_path / "xs" / "biopb"
         assert (
             L.tensor_server_log()
             == tmp_path / "xs" / "biopb" / "logs" / "tensor-server.log"
         )
 
-    def test_relative_xdg_value_is_ignored(self, tmp_path, monkeypatch):
-        # The XDG spec says a non-absolute base dir is invalid -> fall back to the default.
-        monkeypatch.setenv("XDG_CONFIG_HOME", "relative/nope")
+    def test_relative_value_is_ignored(self, tmp_path, monkeypatch):
+        # A non-absolute base dir is invalid -> fall back to the default.
+        monkeypatch.setenv("BIOPB_CONFIG_HOME", "relative/nope")
         assert L.config_dir() == tmp_path / ".config" / "biopb"
 
 
@@ -105,3 +118,49 @@ class TestRotateLog:
         L.rotate_log(f, max_bytes=1024, backup_count=3)
         assert (tmp_path / "x.log.2").read_text() == "old1"
         assert (tmp_path / "x.log.1").read_bytes() == b"a" * 2048
+
+
+class TestLegacyXdgIsNotRead:
+    """biopb owns its own env namespace; ``XDG_*`` must not move any tree (#790).
+
+    The bug: an MCP client (opencode desktop) sets ``XDG_STATE_HOME`` to its own
+    working dir, the biopb-mcp shim inherits it, and a control started from a
+    terminal does not -- so the two disagree about where the session registry
+    lives and the control never sees the session.
+    """
+
+    @pytest.mark.parametrize(
+        "xdg_var,accessor,rel",
+        [
+            ("XDG_CONFIG_HOME", "config_dir", (".config",)),
+            ("XDG_STATE_HOME", "state_dir", (".local", "state")),
+            ("XDG_DATA_HOME", "data_dir", (".local", "share")),
+        ],
+    )
+    def test_xdg_is_ignored(self, tmp_path, monkeypatch, xdg_var, accessor, rel):
+        monkeypatch.setenv(xdg_var, str(tmp_path / "someone-elses-cwd"))
+        assert getattr(L, accessor)() == tmp_path.joinpath(*rel) / "biopb"
+
+    def test_biopb_var_wins_over_a_stray_xdg(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "someone-elses-cwd"))
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "mine"))
+        assert L.state_dir() == tmp_path / "mine" / "biopb"
+
+    def test_stray_xdg_warns_once_naming_the_replacement(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # A deployment that relocated via XDG silently moves back to the default,
+        # so the rename has to be announced -- but only once per process, since
+        # state_dir() is called on nearly every path lookup.
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "someone-elses-cwd"))
+        with caplog.at_level(logging.WARNING, logger=L.__name__):
+            L.state_dir()
+            L.state_dir()
+        msgs = [r.getMessage() for r in caplog.records]
+        assert len(msgs) == 1
+        assert "XDG_STATE_HOME" in msgs[0] and "BIOPB_STATE_HOME" in msgs[0]
+
+    def test_no_warning_when_no_xdg_is_set(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger=L.__name__):
+            L.state_dir()
+        assert caplog.records == []
