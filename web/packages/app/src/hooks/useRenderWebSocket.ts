@@ -19,6 +19,8 @@ export interface RenderParams {
   color: string;
   channel_name?: string;
   use_min_max: boolean;
+  /** Exponent on the normalized intensity; 1 (the server's default) is linear. */
+  gamma?: number;
   output_format: string;
   pixel_budget?: number;
 }

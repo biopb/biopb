@@ -17,7 +17,13 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
-import { DETAIL_VIEW_ID, DetailView, VivViewer, getDefaultInitialViewState } from "@hms-dbmi/viv";
+import {
+  ColorPaletteExtension,
+  DETAIL_VIEW_ID,
+  DetailView,
+  VivViewer,
+  getDefaultInitialViewState,
+} from "@hms-dbmi/viv";
 import {
   TensorAbortError,
   createTensorPixelSources,
@@ -27,7 +33,9 @@ import {
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import type { FallbackKind } from "./ViewerPane";
+import { GammaExtension } from "../utils/vivGamma";
 import {
+  clampGamma,
   contrastLimitsFrom,
   contrastSamples,
   dtypeContrastLimits,
@@ -68,6 +76,17 @@ const SLICE_WHEEL_QUIET_MS = 120;
  * catalog or a moment of load -- no longer costing the tensor its viewer.
  */
 const TILE_INFO_RETRY_MS = [500];
+
+/**
+ * Viv's default palette plus gamma. Module-level because deck.gl treats a change
+ * of this array as a change of extensions, which rebuilds every layer's shader:
+ * a fresh array per render would recompile on every slider move.
+ *
+ * ColorPaletteExtension has to be listed explicitly — naming `extensions` at all
+ * replaces Viv's default rather than adding to it, and dropping it would leave
+ * the channel colour unapplied.
+ */
+const VIV_EXTENSIONS = [new ColorPaletteExtension(), new GammaExtension()];
 
 export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileViewerProps) {
   const client = useAppStore((s) => s.client);
@@ -228,6 +247,10 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     return contrastLimitsFrom(samples.values, lo, hi);
   }, [info, samples, slice.useMinMax, slice.percentileScale]);
 
+  // Never trusted straight from the store: a persisted or hand-edited value of 0
+  // or below is a uniform white plane, not a dim one.
+  const gamma = clampGamma(slice.gamma);
+
   // --- is there anything in this plane? ------------------------------------
   // A featureless plane renders black, and so does one whose tiles have not
   // arrived and one whose contrast window excludes everything. Black is the
@@ -282,6 +305,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           sources={loaded.sources}
           selection={selection}
           contrastLimits={contrastLimits}
+          gamma={gamma}
           color={color}
           maxCacheSize={maxCacheSize}
           onViewportLoad={onViewportLoad}
@@ -334,6 +358,7 @@ function VivStage({
   sources,
   selection,
   contrastLimits,
+  gamma,
   color,
   maxCacheSize,
   onViewportLoad,
@@ -343,6 +368,7 @@ function VivStage({
   sources: PixelSources;
   selection: Record<string, number>;
   contrastLimits: [number, number];
+  gamma: number;
   color: [number, number, number];
   maxCacheSize: number;
   onViewportLoad: (loaded?: unknown) => void;
@@ -379,13 +405,17 @@ function VivStage({
         contrastLimits: [contrastLimits],
         colors: [color],
         channelsVisible: [true],
+        // Costs no fetch: gamma is a uniform, so moving it recolours the tiles
+        // already on the GPU. Same for contrastLimits.
+        extensions: VIV_EXTENSIONS,
+        gamma,
         // Reaches deck.gl's TileLayer: DetailView spreads these into the
         // MultiscaleImageLayer, which spreads its own props into the TileLayer.
         maxCacheSize,
         onViewportLoad,
       },
     ],
-    [sources, selections, contrastLimits, color, maxCacheSize, onViewportLoad],
+    [sources, selections, contrastLimits, gamma, color, maxCacheSize, onViewportLoad],
   );
 
   return <VivViewer views={views} layerProps={layerProps} viewStates={viewStates} />;

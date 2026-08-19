@@ -689,3 +689,55 @@ Steps 2–4 are plumbing that is useful regardless and do not depend on the fram
 choice — worth landing before committing to Viv, since they are also where the
 surprises live (see the cancellation coupling above, which only showed up against a
 running server).
+
+## Display controls: gamma
+
+A linear stretch between two percentiles is the wrong curve for most fluorescence
+data — the interesting structure sits in the bottom fifth of the range and a
+linear ramp buries it. Gamma is the second half of the contrast control, and like
+the first half it must cost no round trip in the tiled viewer.
+
+**It has to be a layer extension, and claiming the hook is all-or-nothing.** Viv
+applies contrast inside `DECKGL_PROCESS_INTENSITY`, a shader hook it registers on
+its own `ShaderAssembler`. `XRLayer.getShaders` fills that hook with a linear ramp
+*only if no extension defines it* (`_isHookDefinedByExtensions`), so an extension
+that adds gamma also inherits responsibility for the contrast window.
+`GammaExtension` therefore injects both — reusing `apply_contrast_limits`, which
+stays in scope because it lives in the always-included `channelIntensity` module,
+rather than restating the arithmetic.
+
+Naming `extensions` at all *replaces* Viv's default rather than adding to it, so
+the list has to carry `ColorPaletteExtension` explicitly or the channel colour
+silently stops being applied. The array is module-level: a fresh one per render
+reads as an extensions change and recompiles every layer's shader.
+
+**Gamma goes on the intensity, not on the RGB.** `pow(i*c) != pow(i)*c`, so
+applying the exponent after the colour multiplier would shift hue as the slider
+moved. Both viewers apply it to the normalized intensity, after the contrast
+window and before the colour — the tiled one in the hook above, the server-rendered
+one in `renderer.apply_gamma`. A test pins the difference (`0x804000` at half
+intensity: 91, not 128).
+
+**The control is in octaves.** Halving and doubling are equal and opposite
+corrections, so they belong the same distance from neutral; on a linear 0.25–4
+track four fifths of the travel would be darkening. The store holds the exponent
+itself, and both ends clamp identically (`clampGamma` / `renderer.clamp_gamma`) so
+a stored value means one thing in both viewers. A gamma of 0 is not "very dim" —
+as an exponent it is a uniform white plane — so it is pulled back to the end of
+the range rather than trusted.
+
+Measured in a headless browser, one source, mean canvas luminance:
+
+| gamma | 0.25 | 1 (neutral) | 4 |
+|---|---|---|---|
+| pyramid source | 97.8 | 59.8 | 17.1 |
+| single-level source | 78.9 | 38.5 | 8.4 |
+
+Returning the slider to neutral reproduced the neutral figure exactly, and a
+four-step drag issued **0 requests** — gamma is a uniform, so it recolours the
+tiles already on the GPU.
+
+Two paths it deliberately does not reach: interleaved RGB in the tiled viewer,
+which Viv draws with a `BitmapLayer` constructed with `extensions: []` (contrast
+limits do not reach it either), and `/api/tile`'s rendered output, which no UI
+control drives and whose ETag identity would have to grow a gamma term.

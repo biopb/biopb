@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { TileInfo } from "@biopb/tensor-flight-client";
 import {
   CONTRAST_SAMPLE_LIMIT,
+  GAMMA_OCTAVES,
   TILE_CACHE_BUDGET_BYTES,
+  clampGamma,
   contrastLimitsFrom,
   contrastSamples,
   dtypeContrastLimits,
+  gammaFromOctaves,
+  octavesFromGamma,
   percentileBounds,
   pinnedNotice,
   samplesPerPixel,
@@ -110,6 +114,49 @@ describe("percentileBounds", () => {
   it("cannot invert the window", () => {
     const [lo, hi] = percentileBounds(false, 90);
     expect(lo).toBeLessThanOrEqual(hi);
+  });
+});
+
+describe("gamma", () => {
+  it("is neutral at the centre of the slider", () => {
+    expect(gammaFromOctaves(0)).toBe(1);
+    expect(octavesFromGamma(1)).toBe(0);
+  });
+
+  it("puts halving and doubling the same distance from neutral", () => {
+    // The reason the control is in octaves at all: on a linear track these two
+    // equal and opposite corrections would be 0.5 and 1 apart.
+    expect(octavesFromGamma(0.5)).toBe(-1);
+    expect(octavesFromGamma(2)).toBe(1);
+  });
+
+  it("round-trips a slider position", () => {
+    for (const octaves of [-2, -1.35, 0, 0.4, 2]) {
+      expect(octavesFromGamma(gammaFromOctaves(octaves))).toBeCloseTo(octaves, 10);
+    }
+  });
+
+  it("stops at the ends of the track", () => {
+    expect(gammaFromOctaves(-99)).toBe(2 ** -GAMMA_OCTAVES);
+    expect(gammaFromOctaves(99)).toBe(2 ** GAMMA_OCTAVES);
+  });
+
+  it("pulls a stored value that is not an exponent back to the track", () => {
+    // 0 and below are not "dim": pow() would render a uniform white plane.
+    expect(clampGamma(0)).toBe(2 ** -GAMMA_OCTAVES);
+    expect(clampGamma(-3)).toBe(2 ** -GAMMA_OCTAVES);
+    expect(clampGamma(1000)).toBe(2 ** GAMMA_OCTAVES);
+  });
+
+  it("treats a non-number as neutral rather than as an end of the track", () => {
+    // NaN and Infinity are not "very dark" or "very bright" -- they are a value
+    // that never came from this control, so neutral is the honest answer.
+    expect(clampGamma(Number.NaN)).toBe(1);
+    expect(clampGamma(Number.POSITIVE_INFINITY)).toBe(1);
+  });
+
+  it("leaves a value already on the track alone", () => {
+    expect(clampGamma(0.7)).toBeCloseTo(0.7, 10);
   });
 });
 

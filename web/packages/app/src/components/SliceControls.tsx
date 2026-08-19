@@ -10,6 +10,7 @@ import {
   isHexColor,
   resolveAutoColor,
 } from "../utils/colorUtils";
+import { GAMMA_OCTAVES, gammaFromOctaves, octavesFromGamma } from "../utils/vivUtils";
 
 // Debounce delay for slider updates (matches ImageViewer's keyboard+wheel debounce)
 const SLIDER_DEBOUNCE_MS = 150;
@@ -44,6 +45,9 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const [localZ, setLocalZ] = useState(slice.z);
   const [localC, setLocalC] = useState(slice.c);
   const [localPercentile, setLocalPercentile] = useState(slice.percentileScale);
+  // Held in octaves, the units of the slider, so a drag does not round-trip
+  // through log2/exp and drift off the position the user put it at.
+  const [localOctaves, setLocalOctaves] = useState(() => octavesFromGamma(slice.gamma));
 
   // Sync local state when store slice changes (e.g., from keyboard navigation in ImageViewer)
   useEffect(() => {
@@ -51,7 +55,8 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     setLocalZ(slice.z);
     setLocalC(slice.c);
     setLocalPercentile(slice.percentileScale);
-  }, [slice.t, slice.z, slice.c, slice.percentileScale]);
+    setLocalOctaves(octavesFromGamma(slice.gamma));
+  }, [slice.t, slice.z, slice.c, slice.percentileScale, slice.gamma]);
 
   // Cleanup debounce timer on unmount
   useEffect(() => {
@@ -129,6 +134,10 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // Always show color picker - pseudo-color rendering is useful for any image
   const showColorPicker = true;
 
+  const showT = axisMap.t !== null && tSize > 1;
+  const showZ = axisMap.z !== null && zSize > 1;
+  const showC = axisMap.c !== null && cSize > 1;
+
   // Handle preset color selection
   const handlePresetChange = (value: string) => {
     if (value === "custom") {
@@ -147,7 +156,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   return (
     <section className="slice-controls">
       <div className="slice-grid" style={{ display: "grid", gap: 8 }}>
-        {axisMap.t !== null && tSize > 1 && (
+        {showT && (
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ width: 20 }}>T</span>
             <input
@@ -169,7 +178,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           </label>
         )}
 
-        {axisMap.z !== null && zSize > 1 && (
+        {showZ && (
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ width: 20 }}>Z</span>
             <input
@@ -191,7 +200,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           </label>
         )}
 
-        {axisMap.c !== null && cSize > 1 && (
+        {showC && (
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ width: 20 }}>C</span>
             <input
@@ -211,6 +220,19 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             />
             <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localC}/{cMax}</span>
           </label>
+        )}
+
+        {/* Navigation above, display below. Suppressed when nothing is above
+            it: a rule against the top of the panel divides nothing. */}
+        {(showT || showZ || showC) && (
+          <hr
+            style={{
+              width: "100%",
+              margin: 0,
+              border: 0,
+              borderTop: "1px solid #2d3748",
+            }}
+          />
         )}
 
         {/* Intensity scaling controls */}
@@ -252,6 +274,57 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           />
           <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
             {slice.useMinMax ? "0-100" : `${localPercentile.toFixed(1)}-${(100 - localPercentile).toFixed(1)}`}
+          </span>
+        </div>
+
+        {/* Gamma: the shape of the ramp between those two limits. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span
+            style={{ width: 20, fontSize: 11, color: "#64748b" }}
+            title="Gamma: exponent applied to the normalized intensity"
+          >
+            Gam
+          </span>
+          <button
+            onClick={() => {
+              setLocalOctaves(0);
+              setSlice({ gamma: 1 });
+            }}
+            disabled={slice.gamma === 1}
+            style={{
+              padding: "2px 6px",
+              fontSize: 10,
+              cursor: slice.gamma === 1 ? "default" : "pointer",
+              background: slice.gamma === 1 ? "#4a5568" : "#2d3748",
+              border: "1px solid #4a5568",
+              borderRadius: 4,
+              color: "#e2e8f0",
+            }}
+          >
+            Linear
+          </button>
+          <input
+            type="range"
+            // In octaves, not in gamma: halving and doubling are equal and
+            // opposite corrections, so they belong the same distance from the
+            // centre. A linear 0.25-4 track would spend four fifths of its
+            // travel on darkening.
+            min={-GAMMA_OCTAVES}
+            max={GAMMA_OCTAVES}
+            step={0.05}
+            value={localOctaves}
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              setLocalOctaves(val);
+              if (debounceRef.current) clearTimeout(debounceRef.current);
+              debounceRef.current = setTimeout(() => {
+                setSlice({ gamma: gammaFromOctaves(val) });
+              }, SLIDER_DEBOUNCE_MS);
+            }}
+            style={{ flex: 1 }}
+          />
+          <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
+            {gammaFromOctaves(localOctaves).toFixed(2)}
           </span>
         </div>
 

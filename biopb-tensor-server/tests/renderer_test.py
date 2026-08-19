@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from biopb_tensor_server.core.axes import plane_axes, samples_axis
 from biopb_tensor_server.serving.renderer import (
+    clamp_gamma,
     extract_yx_slice,
     render_array_to_image_bytes,
 )
@@ -230,6 +231,124 @@ class TestRenderRgb:
         out = np.frombuffer(img, np.uint8).reshape(h, w, 3)
         # green multiplier -> R=0, B=0, G>0
         assert out[0, 0, 0] == 0 and out[0, 0, 2] == 0 and out[0, 0, 1] > 0
+
+
+class TestGamma:
+    """Gamma reshapes the ramp between the contrast limits, nothing else.
+
+    The viewer offers it because a linear stretch buries dim structure in
+    fluorescence data; what matters for correctness is that it moves the
+    midtones without moving the endpoints, and that it lands in the same place
+    as the browser's shader (exponent on the normalized intensity, before the
+    color multiplier).
+    """
+
+    LABELS = ["T", "C", "Z", "Y", "X"]
+
+    def _ramp(self):
+        # A full 0..255 ramp, so lo/hi land on the endpoints and the only thing
+        # gamma can be measured against is the curve in between.
+        arr = np.zeros((1, 1, 1, 4, 256), np.uint8)
+        arr[..., :] = np.arange(256, dtype=np.uint8)[None, :]
+        return arr
+
+    def _render(self, arr, gamma):
+        img, w, h, _, _ = render_array_to_image_bytes(
+            arr=arr,
+            dim_labels=self.LABELS,
+            output_format="raw",
+            color="white",
+            percentile_lo=0,
+            percentile_hi=100,
+            gamma=gamma,
+        )
+        return np.frombuffer(img, np.uint8).reshape(h, w, 3)
+
+    def test_default_is_linear(self):
+        arr = self._ramp()
+        assert self._render(arr, 1.0).tobytes() == self._render(arr, 1.0).tobytes()
+        out = self._render(arr, 1.0)
+        assert out[0, 128, 0] == 128
+
+    def test_below_one_lifts_the_midtones(self):
+        out = self._render(self._ramp(), 0.5)
+        # (128/255) ** 0.5 * 255 ~= 181
+        assert out[0, 128, 0] == pytest.approx(181, abs=1)
+
+    def test_above_one_pushes_them_down(self):
+        out = self._render(self._ramp(), 2.0)
+        # (128/255) ** 2 * 255 ~= 64
+        assert out[0, 128, 0] == pytest.approx(64, abs=1)
+
+    def test_endpoints_are_fixed(self):
+        for gamma in (0.25, 0.5, 2.0, 4.0):
+            out = self._render(self._ramp(), gamma)
+            assert (out[0, 0, 0], out[0, -1, 0]) == (0, 255)
+
+    def test_applies_before_the_color_multiplier(self):
+        # Not after. Gamma on the final RGB would raise the multiplier too, so a
+        # half-strength channel would change hue as the slider moved; the
+        # browser's shader applies it to the intensity, and this must match.
+        arr = np.zeros((1, 1, 1, 4, 3), np.uint8)
+        arr[..., 1] = 128
+        arr[..., 2] = 255
+        img, w, h, _, _ = render_array_to_image_bytes(
+            arr=arr,
+            dim_labels=self.LABELS,
+            output_format="raw",
+            color="#804000",  # R at 128/255, G at 64/255, no B
+            percentile_lo=0,
+            percentile_hi=100,
+            gamma=0.5,
+        )
+        out = np.frombuffer(img, np.uint8).reshape(h, w, 3)
+        # sqrt(128/255) * 255 = 181 of intensity, then * (128/255) of red = 91.
+        # Gamma applied after the multiplier would give sqrt(128*128/255/255)*255
+        # = 128 -- a different, more saturated red.
+        assert out[0, 1, 0] == pytest.approx(91, abs=1)
+
+    def test_rgb_samples_keep_their_balance(self):
+        # One shared curve across R, G and B: the ratio between samples at the
+        # same pixel is what "true color" means here, and gamma must not be
+        # applied to one sample and not another.
+        h, w = 8, 8
+        arr = np.zeros((1, 1, 1, h, w, 3), np.uint8)
+        arr[..., 0] = 255
+        arr[..., 1] = 64
+        arr[..., 2] = 0
+        img, ow, oh, _, _ = render_array_to_image_bytes(
+            arr=arr,
+            dim_labels=RGB_LABELS,
+            output_format="raw",
+            percentile_lo=0,
+            percentile_hi=100,
+            gamma=0.5,
+        )
+        out = np.frombuffer(img, np.uint8).reshape(oh, ow, 3)
+        assert out[0, 0, 0] == 255  # the top of the shared stretch stays there
+        assert out[0, 0, 2] == 0  # and so does the bottom
+        # (64/255) ** 0.5 * 255 ~= 128: lifted, not left alone.
+        assert out[0, 0, 1] == pytest.approx(128, abs=1)
+
+    @pytest.mark.parametrize(
+        "given,expected",
+        [
+            (0.0, 0.25),  # not dim -- a uniform white plane
+            (-1.0, 0.25),
+            (100.0, 4.0),
+            (float("nan"), 1.0),
+            (float("inf"), 1.0),
+            (1.0, 1.0),
+        ],
+    )
+    def test_out_of_range_gamma_is_pulled_back(self, given, expected):
+        assert clamp_gamma(given) == expected
+
+    def test_a_rejected_gamma_still_renders(self):
+        # The clamp is on the render path, not only in the request model: a
+        # gamma of 0 must not reach np.power and turn the plane white.
+        out = self._render(self._ramp(), 0.0)
+        assert out[0, 128, 0] < 255
 
 
 if __name__ == "__main__":
