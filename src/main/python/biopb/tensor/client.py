@@ -45,14 +45,12 @@ from biopb.tensor._session import (
     ResolveCancelled as ResolveCancelled,
     _check_wire_protocol as _check_wire_protocol,
     _ClientState,
-    _descriptor_key,
     _extract_schema_metadata as _extract_schema_metadata,
     _fetch_endpoints_via_get_flight_info,
     _parse_version as _parse_version,
     _request_crop_slices,
     _split_array_id as _split_array_id,
     _TensorContext,
-    _unresolved_source_error as _unresolved_source_error,
 )
 from biopb.tensor._tls import resolve_tls_trust
 from biopb.tensor._upload import UploadSession
@@ -226,17 +224,12 @@ class TensorFlightClient:
         self._state.sources = value
 
     @property
-    def _descriptors(self) -> Dict[Tuple[str, str], TensorDescriptor]:
+    def _descriptors(self) -> Dict[str, TensorDescriptor]:
         return self._state.descriptors
 
     @_descriptors.setter
-    def _descriptors(self, value: Dict[Tuple[str, str], TensorDescriptor]) -> None:
+    def _descriptors(self, value: Dict[str, TensorDescriptor]) -> None:
         self._state.descriptors = value
-
-    @staticmethod
-    def _descriptor_key(source_id: str, array_id: str) -> Tuple[str, str]:
-        """Composite source-unique descriptor-cache key. See :func:`_descriptor_key`."""
-        return _descriptor_key(source_id, array_id)
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
@@ -262,12 +255,6 @@ class TensorFlightClient:
     ) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dimension physical size + unit. See :meth:`CatalogClient.get_physical_scale`."""
         return self._catalog.get_physical_scale(array_id)
-
-    def _fetch_tensor_descriptor(
-        self, source_id: str, tensor_id: Optional[str] = None
-    ) -> TensorDescriptor:
-        """See :meth:`CatalogClient._fetch_tensor_descriptor`."""
-        return self._catalog._fetch_tensor_descriptor(source_id, tensor_id)
 
     def get_descriptor(
         self,
@@ -334,15 +321,14 @@ class TensorFlightClient:
 
     def _get_tensor_context(
         self,
-        source_id: str,
-        tensor_id: Optional[str] = None,
+        array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
     ) -> _TensorContext:
         """See :meth:`ChunkFetcher._get_tensor_context`."""
         return self._fetcher._get_tensor_context(
-            source_id, tensor_id, slice_hint, scale_hint, reduction_method
+            array_id, slice_hint, scale_hint, reduction_method
         )
 
     def get_tensor(
