@@ -27,7 +27,7 @@ from biopb import _endpoints
 def _isolated_state(tmp_path, monkeypatch):
     """Point the state tree at a tmpdir and clear the env overrides.
 
-    ``XDG_STATE_HOME`` is what relocates the record -- `_locations.state_dir()`
+    ``BIOPB_STATE_HOME`` is what relocates the record -- `_locations.state_dir()`
     reads it, and CI sets it, so it must be *set* rather than merely trusted to
     be absent. Getting this wrong does not fail the test; it silently writes a
     bogus ``control.json`` into the developer's real state dir, where discovery
@@ -36,7 +36,7 @@ def _isolated_state(tmp_path, monkeypatch):
     The two ``BIOPB_CONTROL_*`` vars sit *above* the record in precedence, so a
     stray ambient value would mask exactly what these tests assert.
     """
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
     monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
     monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
 
@@ -145,7 +145,7 @@ class TestRuntimeRecord:
         """
         import pathlib
 
-        monkeypatch.delenv("XDG_STATE_HOME")
+        monkeypatch.delenv("BIOPB_STATE_HOME")
 
         def _no_home():
             raise RuntimeError("Could not determine home directory.")

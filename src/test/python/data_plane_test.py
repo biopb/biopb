@@ -6,7 +6,7 @@ an unhandled ``TypeError`` for the whole of #618 with 91/91 passing — the one
 caller of the one broken function was mocked out everywhere. So the seams here are
 driven for real: a **real** loopback HTTP server stands in for the control, and
 :func:`probe_scheme` is pointed at **real** plaintext and TLS listeners. What is
-monkeypatched is the environment (``XDG_STATE_HOME``, ``BIOPB_*``), never the
+monkeypatched is the environment (``BIOPB_STATE_HOME``, ``BIOPB_*``), never the
 function under test.
 """
 
@@ -82,12 +82,12 @@ DTisEXh80fn7dTQ97yUZJHc=
 def _isolated_state(monkeypatch, tmp_path):
     """Point every on-disk lookup (credential, cert, control record) at tmp_path.
 
-    ``XDG_STATE_HOME`` alone is enough on POSIX, but CI also sets
-    ``XDG_CONFIG_HOME``, and a stray ``BIOPB_*`` from the developer's shell would
+    ``BIOPB_STATE_HOME`` alone is enough on POSIX, but the config tree moves
+    separately, and a stray ``BIOPB_*`` from the developer's shell would
     quietly win over everything these tests set up.
     """
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BIOPB_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("HOME", str(tmp_path))
     for var in ("BIOPB_TENSOR_URL", "BIOPB_TENSOR_TOKEN"):
         monkeypatch.delenv(var, raising=False)
