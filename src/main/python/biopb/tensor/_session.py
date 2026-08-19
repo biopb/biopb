@@ -341,18 +341,8 @@ class CatalogClient:
         self._state = state
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
-        """List available data sources.
-
-        Returns:
-            Dictionary mapping source_id to DataSourceDescriptor.
-            Each DataSourceDescriptor.tensors contains TensorDescriptor info
-            with shape/dtype for all tensors in that source.
-
-        Note:
-            Results may be truncated if server has max_list_flights_results configured.
-            Check schema metadata for truncation info (truncated=True indicates
-            more sources exist on server than were returned).
-        """
+        """Backs TensorFlightClient.list_sources; see that method for the full
+        documentation."""
         source_descriptors = {}
         truncated = False
         total_sources = None
@@ -385,55 +375,8 @@ class CatalogClient:
         return source_descriptors
 
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
-        """Execute SQL query against server's source metadata database.
-
-        The server-side metadata database is mandatory (biopb/biopb#225), so any
-        standard tensor-server supports this. Only an embedded server explicitly
-        constructed without a metadata database rejects the query.
-
-        Args:
-            sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
-            format: Shape of the returned result:
-
-                - ``"arrow"`` (default) — a ``pyarrow.Table``. This is the
-                  historical return type; the default is unchanged for backward
-                  compatibility. Zero-copy, and the only format that preserves
-                  the schema metadata described under *Note*.
-                - ``"pandas"`` — a ``pandas.DataFrame`` (requires pandas).
-                - ``"records"`` — a ``list[dict]``, one dict per row.
-
-        Returns:
-            The query result in the requested ``format``; an empty query
-            returns an empty object of that same type. For ``"pandas"`` and
-            ``"records"`` the usual Arrow->Python coercion applies (list
-            columns such as ``shape_summary`` become Python lists / object
-            dtype, and nullable integer columns may widen to float). For
-            ``"pandas"``, NULLs in string columns (e.g. ``metadata_json``) are
-            normalized to ``None`` rather than the truthy float ``NaN`` Arrow
-            would otherwise produce, so ``if row.metadata_json:`` behaves as
-            expected.
-
-        Note:
-            The server reports truncation via schema metadata
-            (``total_sources`` / ``returned_sources``). Those keys survive only
-            on the ``"arrow"`` result; for every format truncation is also
-            surfaced via a logged INFO line.
-
-        Raises:
-            ValueError: If *format* is not one of the supported values. (SQL
-                validation -- forbidden keywords / disallowed tables -- happens
-                server-side and surfaces as a Flight error, below, not a
-                client-side ValueError.)
-            ImportError: If ``format="pandas"`` but pandas is not installed.
-            FlightServerError: If the server has no metadata database enabled,
-                or rejects the query (e.g. forbidden keywords / disallowed
-                tables).
-
-        Example:
-            >>> client = TensorFlightClient('grpc://localhost:8815')
-            >>> table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
-            >>> table.to_pandas()  # or pass format="pandas" to get a DataFrame
-        """
+        """Backs TensorFlightClient.query_sources; see that method for the full
+        documentation."""
         if format not in ("pandas", "arrow", "records"):
             raise ValueError(
                 f"query_sources: unknown format {format!r}; "
@@ -514,19 +457,8 @@ class CatalogClient:
         return df
 
     def get_source_metadata(self, source_id: str) -> dict:
-        """Get source-level OME/vendor metadata as a dict.
-
-        Args:
-            source_id: Source identifier
-
-        Returns:
-            The source's metadata dict (the format-specific OME/vendor metadata),
-            or an empty dict if the source carries none.
-
-        Raises:
-            ValueError: If the source is unknown, or unresolved (cloud /
-                synced-folder) -- call :meth:`resolve` first.
-        """
+        """Backs TensorFlightClient.get_source_metadata; see that method for the full
+        documentation."""
 
         if source_id not in self._state.sources:
             self.list_sources()
@@ -572,31 +504,8 @@ class CatalogClient:
     def get_physical_scale(
         self, array_id: str
     ) -> Optional[Tuple[List[float], List[str]]]:
-        """Per-dimension physical pixel size + unit for a tensor.
-
-        Returns ``(scale, unit)``: two lists aligned with the tensor's
-        ``dim_labels`` (source axis order), or ``None`` when no physical sizes
-        are known (an older server, or a format that carries none).
-
-        ``physical_scale``/``physical_unit`` are ``TensorDescriptor`` fields the
-        server fills on every ``GetFlightInfo`` (issue #31), so this reads the
-        descriptor a prior :meth:`get_tensor` already cached -- no extra RPC when
-        it is cached, and it never requests the opt-in ``metadata_json`` field on
-        that same descriptor. (Contrast :meth:`get_source_metadata`, which forces
-        ``with_metadata`` to ship the whole OME tree; do not dig physical sizes
-        out of that -- this is the compact projection meant for display scale.)
-
-        Args:
-            array_id: Globally-unique tensor id (identity policy) -- e.g.
-                ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``. A bare single-tensor
-                source id resolves to its sole tensor. A bare *multi*-tensor
-                source id anchors on the source's default (first) tensor --
-                unlike ``get_tensor``, which requires the field be named; pass the
-                qualified ``source_id/field`` to target a specific scene.
-
-        Returns:
-            ``(scale, unit)`` lists, or ``None`` if no physical scale is known.
-        """
+        """Backs TensorFlightClient.get_physical_scale; see that method for the full
+        documentation."""
         desc = self._state.descriptors.get(array_id)
         if desc is None:
             source_id, _ = _split_array_id(array_id)
@@ -695,45 +604,8 @@ class CatalogClient:
         with_pyramid: bool = True,
         with_read_plan: bool = False,
     ) -> "TensorDescriptor":
-        """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
-
-        A tensor is identified by its ``array_id`` alone (see the tensor identity
-        policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
-        takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
-        Works even when the source is beyond the (truncatable) ``list_sources()``
-        cap, and the result is cached. Passing a bare ``source_id`` (single-tensor
-        source, or to anchor on a multi-tensor source's default/first tensor) is
-        accepted. To enumerate ALL tensors/scenes of a source, use
-        ``list_sources()[source_id].tensors`` -- NOT this method.
-
-        This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
-        synced-folder) source it raises an error pointing at :meth:`resolve`,
-        never triggering a download. Call :meth:`resolve` first to read such a
-        source.
-
-        The ``with_*`` flags are the ``GetFlightInfo`` response field masks
-        (biopb/biopb#563). This is a *describe* call -- the stable per-tensor
-        facts, not a read -- so it defaults to returning shape/dtype/dim_labels/
-        chunk_shape, the resolution **pyramid**, and physical_scale, while
-        **skipping the read plan** (``with_read_plan=False`` -- the endpoints are
-        the per-request O(chunks) half a describe discards) and the **heavy OME
-        metadata tree** (``with_metadata=False``, opt-in). Set ``with_metadata=True``
-        for ``metadata_json``; set ``with_pyramid=False`` to skip pyramid sizing
-        when only the bare structure is needed.
-
-        Args:
-            array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
-                tensor source) or ``"aics_7f3/Image:0"`` (multi-tensor source).
-            with_metadata: fill ``metadata_json`` (the full OME tree). Default
-                ``False`` -- opt in when you need it.
-            with_pyramid: advertise the resolution pyramid on the descriptor.
-                Default ``True`` (the primary describe consumer reads it).
-            with_read_plan: enumerate the per-request chunk endpoints. Default
-                ``False``; a describe discards them, so the plan is skipped.
-
-        Returns:
-            The ``TensorDescriptor`` for that tensor.
-        """
+        """Backs TensorFlightClient.get_descriptor; see that method for the full
+        documentation."""
         return self._fetch_tensor_descriptor(
             array_id,
             with_metadata=with_metadata,
@@ -837,44 +709,8 @@ class CatalogClient:
         on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "DataSourceDescriptor":
-        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
-
-        .. note:: Experimental. Cloud / remote source support (unresolved sources,
-           resolve, and :meth:`warm`) is experimental and its behavior may change.
-
-        An *unresolved* source is catalogued by URL only -- its shape/dtype/field
-        list are unknown until first access (it lists with ``data_resident`` False
-        and an empty ``list_sources()[source_id].tensors``). The canonical case is
-        a cloud / synced-folder ("Files-On-Demand") source.
-
-        Resolving asks the server to hydrate it. For a dehydrated placeholder this
-        **downloads the whole file** -- a recall that can take minutes, consume
-        local disk, and fail when offline -- then reads its real shape, dtype, and
-        field list. This is the heavyweight, *consenting* operation that catalog
-        browsing (:meth:`list_sources` / :meth:`query_sources`) deliberately
-        avoids; call it only when you intend to read the data. After it returns,
-        :meth:`get_tensor` and friends work normally.
-
-        Idempotent: resolving an already-resolved source just re-fetches it.
-
-        Args:
-            source_id: The source to resolve (e.g. ``"onedrive_a3f2"``).
-            on_progress: Optional callback invoked with a ``ResolveProgress``
-                (elapsed seconds, target name, target size in bytes) on each
-                server heartbeat, so a caller can display progress. Called on the
-                calling thread; keep it cheap and non-blocking.
-            should_cancel: Optional predicate polled on each heartbeat; when it
-                returns True the client stops consuming the stream and raises
-                :class:`ResolveCancelled`. The server-side recall continues to
-                completion and is cached, so a later ``resolve`` reuses it.
-
-        Returns:
-            The full ``DataSourceDescriptor`` with every tensor/field enumerated
-            -- the complete field set in one call, regardless of catalog size.
-
-        Raises:
-            ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
-        """
+        """Backs TensorFlightClient.resolve; see that method for the full
+        documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
         # entry point that performs the (possibly minutes-long) recall, and it
         # returns the full DataSourceDescriptor directly -- no GetFlightInfo +
@@ -916,45 +752,8 @@ class CatalogClient:
         on_progress: Optional[Callable[["WarmProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "WarmProgress":
-        """Hydrate-ahead: recall a resolved source's member files on the server.
-
-        .. note:: Experimental. Cloud / remote source support (:meth:`resolve` and
-           this hydrate-ahead path) is experimental and its behavior may change.
-
-        :meth:`resolve` populates a source's *metadata* but, for a multi-file
-        cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
-        leaves the bulk pixel data dehydrated -- each member file then recalls
-        one-at-a-time, slowly, the first time a read touches it (the viewer
-        scrubbing planes is the worst case). ``warm`` opts into pulling them all
-        resident up front so later reads never stall.
-
-        The recall happens **entirely server-side** (the server walks the source
-        directory and reads each file to force the sync engine's recall); no
-        pixels cross the wire, only progress. It is idempotent -- already-resident
-        files are cheap local reads -- so a ``warm`` re-run after a cancel simply
-        finishes the remainder. Only meaningful for multi-file sources; a
-        single-file source returns immediately (resolve already recalled it).
-
-        Args:
-            source_id: The (already-resolved) source to warm.
-            on_progress: Optional callback invoked with a ``WarmProgress``
-                (files/bytes done vs total, current file name, elapsed) on each
-                progress message. Called on the calling thread; keep it cheap.
-            should_cancel: Optional predicate polled per message; when it returns
-                True the client closes the stream -- which the server observes and
-                stops the recall promptly -- and this raises
-                :class:`ResolveCancelled`. Files already recalled stay resident.
-
-        Returns:
-            The terminal ``WarmProgress`` snapshot (``files_done`` /
-            ``bytes_done`` reflect what was made resident; on a no-op source
-            ``files_total == 0``).
-
-        Raises:
-            ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
-            RuntimeError: if the server predates the ``warm`` action (too old for
-                hydrate-ahead), or closes the stream without a terminal status.
-        """
+        """Backs TensorFlightClient.warm; see that method for the full
+        documentation."""
         action = flight.Action("warm", source_id.encode("utf-8"))
         done: Optional[WarmProgress] = None
         unknown = (
@@ -989,44 +788,8 @@ class CatalogClient:
         on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "AddSourceResult":
-        """Register a local path on the SERVER as a served source at runtime.
-
-        This is the wire entrypoint behind the tensor-browser's drag-drop: it
-        hands the server a filesystem path (or directory) that it interprets on
-        *its own* filesystem, and the server routes it through the same claim ->
-        adapter -> catalog pipeline the directory watcher uses. A dropped
-        directory that is not itself a dataset is walked recursively and may
-        register several sources, so the action streams progress and a final
-        tally rather than returning a single descriptor.
-
-        The path must exist on the server. Because a dropped directory's walk has
-        no known size up front, there is no percentage -- progress is a running
-        count of sources registered so far.
-
-        Args:
-            url: Absolute path (or directory) on the server's filesystem.
-            source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
-                empty means auto-detect via the adapters' claim protocol.
-            dim_labels: Optional dimension labels for the registered tensor(s).
-            on_progress: Optional callback invoked with an ``AddSourceProgress``
-                (count + current path + last descriptor) per source as it
-                registers. Called on the calling thread; keep it cheap.
-            should_cancel: Optional predicate polled per message; when it returns
-                True the client closes the stream, which the server observes and
-                stops discovery -- sources already registered stay registered.
-
-        Returns:
-            The terminal ``AddSourceResult`` (``added`` descriptors,
-            ``already_present`` source_ids, ``failed`` ``(path, reason)`` pairs).
-            A directory dropped above the large-scan threshold comes back as a
-            ``failed`` entry, not a special flag.
-
-        Raises:
-            flight.FlightServerError: whole-request failure (path not found /
-                unreadable on the server, or the server declines the request).
-            RuntimeError: the server predates the ``add_source`` action, or
-                closed the stream without a terminal result.
-        """
+        """Backs TensorFlightClient.add_source; see that method for the full
+        documentation."""
         req = AddSourceRequest(
             url=url,
             source_type=source_type,
@@ -1066,28 +829,8 @@ class CatalogClient:
         return result
 
     def remove_source(self, root_url: str) -> "RemoveSourceResult":
-        """Deregister a drag-dropped source branch on the SERVER at runtime.
-
-        The narrow counterpart to :meth:`add_source`: it removes ONLY
-        drag-dropped sources, which the server identifies by the ``dnd://``
-        origin scheme on their catalog ``source_url``. ``root_url`` is such a
-        branch root (a ``dnd://...`` value); every source at or under it is
-        removed as a unit. A non-``dnd://`` ``root_url`` is refused by the server.
-
-        Args:
-            root_url: The ``dnd://`` branch root to remove (from the browser's
-                dropped-root node).
-
-        Returns:
-            A ``RemoveSourceResult`` with ``removed`` (source_ids) and ``failed``
-            (``AddSourceFailure`` whose ``path`` carries the source_id).
-
-        Raises:
-            flight.FlightServerError: the server refused the request (e.g. a
-                non-``dnd://`` root, or removal not enabled).
-            RuntimeError: the server predates the ``remove_source`` action, or
-                returned no result.
-        """
+        """Backs TensorFlightClient.remove_source; see that method for the full
+        documentation."""
         req = RemoveSourceRequest(root_url=root_url)
         action = flight.Action("remove_source", req.SerializeToString())
         try:
@@ -1218,23 +961,8 @@ class ChunkFetcher:
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
     ) -> da.Array:
-        """Get a lazy dask array for a tensor, addressed by its array_id.
-
-        Args:
-            array_id: Globally-unique tensor id (identity policy) -- e.g.
-                ``"zarr_a3f2"`` for a single-tensor source or
-                ``"aics_7f3/Image:0"`` for a multi-tensor source.
-            slice_hint: Optional slice tuple to filter chunks
-            scale_hint: Optional per-dimension integer downsampling factors
-            reduction_method: Optional dynamic reduction method for scaled reads
-
-        Returns:
-            dask.array with lazy chunk loading
-
-        Raises:
-            ValueError: If source not found, tensor not found, or a bare
-                multi-tensor source id is given without a within-source field
-        """
+        """Backs TensorFlightClient.get_tensor; see that method for the full
+        documentation."""
         ctx = self._get_tensor_context(
             array_id,
             slice_hint=slice_hint,
@@ -1277,23 +1005,8 @@ class ChunkFetcher:
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
     ) -> SerializedTensor:
-        """Get a SerializedTensor protobuf for cross-process transfer.
-
-        Returns a protobuf containing connection info and chunk tickets
-        for lazy reconstruction. The protobuf can be serialized to bytes
-        and broadcast to worker processes, where each worker can call
-        tensor_from_pb() to reconstruct a lazy dask array.
-
-        Args:
-            array_id: Globally-unique tensor id (identity policy) -- e.g.
-                ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``.
-            slice_hint: Optional slice tuple to filter chunks
-            scale_hint: Optional per-dimension integer downsampling factors
-            reduction_method: Optional dynamic reduction method for scaled reads
-
-        Returns:
-            SerializedTensor protobuf object
-        """
+        """Backs TensorFlightClient.get_tensor_pb; see that method for the full
+        documentation."""
         ctx = self._get_tensor_context(
             array_id,
             slice_hint=slice_hint,

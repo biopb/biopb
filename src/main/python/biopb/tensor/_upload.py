@@ -62,27 +62,8 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Upload dask array to server.
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        Args:
-            arr: Dask array to upload
-            source_name: Source identifier format:
-                - "cache:my-name" → cache-backed (ephemeral)
-                - "cache:" → cache-backed with server-generated name
-                - "ome_zarr:my-name" → zarr-backed (persistent)
-                - "ome_zarr:" → zarr-backed with server-generated name
-            chunk_shape: Override chunk shape. If None, uses arr.chunksize with
-                         automatic rechunking if chunks are non-uniform.
-            dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
-
-        Returns:
-            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
-        """
+        """Backs TensorFlightClient.upload_array; see that method for the full
+        documentation."""
         # Determine target chunk shape
         if chunk_shape is None:
             chunk_shape = arr.chunksize
@@ -148,26 +129,8 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Upload local zarr to server.
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        Args:
-            zarr_path: Path to local zarr directory
-            source_name: Source identifier format:
-                - "cache:my-name" → cache-backed (ephemeral)
-                - "cache:" → cache-backed with server-generated name
-                - "ome_zarr:my-name" → zarr-backed (persistent)
-                - "ome_zarr:" → zarr-backed with server-generated name
-            chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
-            dim_labels: Optional dimension labels (read from zarr if not provided)
-            ome_metadata: Optional OME metadata (read from zarr if not provided)
-
-        Returns:
-            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
-        """
+        """Backs TensorFlightClient.upload_zarr; see that method for the full
+        documentation."""
         import zarr
 
         arr = zarr.open_array(zarr_path, mode="r")
@@ -205,24 +168,8 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Create source on server (internal).
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        Args:
-            source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
-                         "cache:" or "ome_zarr:" → server-generated name
-            shape: Array shape
-            dtype: Data type string (numpy format)
-            chunk_shape: Chunk size per dimension
-            dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
-
-        Returns:
-            source_id assigned by server
-        """
+        """Backs TensorFlightClient.create_source; see that method for the full
+        documentation."""
         req_desc = TensorDescriptor(
             array_id=source_name,
             shape=list(shape),
@@ -249,17 +196,8 @@ class UploadSession:
         bounds: ChunkBounds,
         data: np.ndarray,
     ) -> None:
-        """Upload single chunk (internal).
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        Args:
-            source_id: Source identifier
-            bounds: Chunk start/stop coordinates
-            data: Numpy array with chunk data
-        """
+        """Backs TensorFlightClient.upload_chunk; see that method for the full
+        documentation."""
         upload = ChunkUpload(
             source_id=source_id,
             bounds=bounds,
@@ -277,18 +215,8 @@ class UploadSession:
         logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
 
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
-        """Get upload status for a writable source.
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        Args:
-            source_id: Source identifier returned by create_source()
-
-        Returns:
-            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
-        """
+        """Backs TensorFlightClient.get_upload_status; see that method for the full
+        documentation."""
         action = flight.Action("upload_status", source_id.encode("utf-8"))
         results = self._client.do_action(action, options=self._call_options)
         for result in results:
@@ -301,21 +229,8 @@ class UploadSession:
         }
 
     def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Get upload status for a registration-first SerializedTensor handle.
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        This helper is intended for cache-backed handles returned before upload
-        completion, where tensor_descriptor.array_id is the source identifier.
-
-        Args:
-            pb: SerializedTensor handle returned by a registration-first flow.
-
-        Returns:
-            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
-        """
+        """Backs TensorFlightClient.get_upload_status_pb; see that method for the full
+        documentation."""
         return self.get_upload_status(_upload_source_id_from_pb(pb))
 
     def wait_for_upload_ready(
@@ -324,33 +239,8 @@ class UploadSession:
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.5,
     ) -> Dict[str, Any]:
-        """Poll upload status until the source reports READY.
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-
-        Applies only to sources created by ``create_source()`` /
-        ``upload_array()``. A source the server tracks no upload for reports
-        UNKNOWN, and that is rejected on the first poll rather than waited out:
-        either the source was never an upload target (a catalog source, on disk
-        or in the cloud, has no upload to wait for), or its record was dropped
-        when the source was removed or the server restarted. Neither reading
-        resolves by polling.
-
-        Args:
-            source_id: Source identifier returned by create_source().
-            timeout_seconds: Maximum time to wait before timing out.
-            poll_interval_seconds: Delay between status checks.
-
-        Returns:
-            Final upload status dictionary when READY.
-
-        Raises:
-            ValueError: If the server tracks no upload for the source (UNKNOWN).
-            TimeoutError: If the upload does not reach READY within the timeout.
-            RuntimeError: If the upload reports FAILED.
-        """
+        """Backs TensorFlightClient.wait_for_upload_ready; see that method for the full
+        documentation."""
         deadline = time.monotonic() + timeout_seconds
         while True:
             status = self.get_upload_status(source_id)
@@ -382,12 +272,8 @@ class UploadSession:
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.5,
     ) -> Dict[str, Any]:
-        """Poll upload status until a registration-first SerializedTensor is READY.
-
-        .. note:: Experimental. The upload / writable-source API (source
-           creation, chunk upload, and upload-status polling) is experimental
-           and may change.
-        """
+        """Backs TensorFlightClient.wait_for_upload_ready_pb; see that method for the full
+        documentation."""
         return self.wait_for_upload_ready(
             _upload_source_id_from_pb(pb),
             timeout_seconds=timeout_seconds,
