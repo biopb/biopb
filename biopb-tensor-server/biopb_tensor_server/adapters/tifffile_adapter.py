@@ -111,26 +111,30 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
 
     @classmethod
-    def _supports_path(cls, path: str) -> bool:
-        """Return whether native descriptors can serve a local file."""
+    def _supports_path(cls, ctx: ClaimContext) -> bool:
+        """Return whether native descriptors can serve this claim context."""
         import tifffile
 
         try:
-            probe = cls(path, "claim")
-            with tifffile.TiffFile(path) as tiff:
-                # OME-TIFF ownership belongs to OmeTiffAdapter, which is
-                # registered before this claim. Keep this guard here too so
-                # the native plain-TIFF claim is self-contained.
-                if not cls._LSM and tiff.ome_metadata:
-                    return False
-                indices = probe._series_indices(tiff)
-                return bool(indices) and all(
-                    probe._series_descriptor(tiff.series[index], index) is not None
-                    for index in indices
-                )
+            probe = cls(ctx.path_str, "claim")
+            with ctx.open("rb") as fileobj:
+                with tifffile.TiffFile(fileobj) as tiff:
+                    # OME-TIFF ownership belongs to OmeTiffAdapter, which is
+                    # registered before this claim. Keep this guard here too so
+                    # the native plain-TIFF claim is self-contained.
+                    if not cls._LSM and tiff.ome_metadata:
+                        return False
+                    indices = probe._series_indices(tiff)
+                    return bool(indices) and all(
+                        probe._series_descriptor(tiff.series[index], index) is not None
+                        for index in indices
+                    )
+
+        except AssertionError:
+            raise
         except Exception:
             logger.debug(
-                "native tifffile claim probe failed for %s", path, exc_info=True
+                "native tifffile claim probe failed for %s", ctx.path_str, exc_info=True
             )
             return False
 
@@ -150,7 +154,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         if not ctx.is_resident():
             return None
 
-        if not cls._supports_path(ctx.path_str):
+        if not cls._supports_path(ctx):
             return None
 
         state.try_claim_path(ctx.path_str)

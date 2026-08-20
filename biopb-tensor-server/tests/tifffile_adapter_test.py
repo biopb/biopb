@@ -108,3 +108,13 @@ def test_named_axes_are_claimed_natively_and_kept_in_descriptor(tmp_path):
         descriptor = source.list_tensor_descriptors()[0]
         assert list(descriptor.dim_labels) == labels
         assert list(descriptor.shape) == expected_shape
+
+
+def test_invalid_lsm_declines_native_claim_after_sniff(tmp_path):
+    path = Path(tmp_path).joinpath("invalid.lsm")
+    path.write_bytes(b"\x00\x01\x02\x03")
+
+    claims = get_default_registry().get_claims_for_path(
+        ClaimContext(path), DiscoveryState()
+    )
+    assert [claim.source_type for claim in claims] == ["zeiss"]
