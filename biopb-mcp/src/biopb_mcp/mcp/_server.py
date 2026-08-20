@@ -65,7 +65,7 @@ _BASE_INSTRUCTIONS = (
     "(server-capped for large catalogs); the `sources` columns are source_id, "
     "source_url, source_type, dtype, indexed_at, metadata_json, "
     "shape_summary, data_resident, and `tensors` (a LIST of "
-    "STRUCT(array_id, dim_labels, shape, chunk_shape, dtype), one per tensor -- "
+    "STRUCT(array_id, dim_labels, shape, dtype), one per tensor -- "
     "query per-tensor with UNNEST(tensors) or list_filter; the scalar "
     "dtype/shape_summary only describe tensors[0]). Unresolved (cloud / "
     "synced-folder) sources "

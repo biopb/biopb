@@ -454,8 +454,10 @@ else:
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
 # indexed_at, metadata_json, shape_summary, data_resident, and `tensors`
-# (a LIST of STRUCT(array_id, dim_labels, shape, chunk_shape, dtype) -- one
-# per tensor; `dtype`/`shape_summary` are just the first-tensor projection).
+# (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor;
+# `dtype`/`shape_summary` are just the first-tensor projection).
+# No chunk grid here: the transfer grid is chosen per request, so
+# `client.get_descriptor(array_id).chunk_shape` is the authoritative source.
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
 print(df)
 
