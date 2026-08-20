@@ -41,13 +41,13 @@ from biopb_tensor_server.core.chunk import (
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
+    compute_transfer_chunk_size,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
     encode_chunk_id,
     encode_chunk_id_with_scale,
     is_scaled_chunk,
-    needs_splitting,
     normalized_scale_hint,
     normalized_slice_bounds,
 )
@@ -608,7 +608,7 @@ class TensorAdapter(SourceAdapter):
         """
 
     def get_chunk_size(self) -> Tuple[int, ...]:
-        """Return the chunk size for this tensor adapter.
+        """Return the adapter's private read-granularity hint.
 
         A descriptor may legitimately carry an empty ``chunk_shape`` -- it is
         documented as "can be empty [] if not readily available"
@@ -617,11 +617,10 @@ class TensorAdapter(SourceAdapter):
         proxy, biopb/biopb#266) may have none. Rather than hand the read planner
         a too-short tuple -- which indexes out of range against the full-rank
         shape (biopb/biopb#292, IndexError in ``_get_read_plan``) -- derive the
-        default transfer grid from the full shape: one chunk covering the whole
-        tensor, then split under ``MAX_ARROW_BATCH_BYTES`` (non-spatial axes
-        first, Y-X plane kept whole). This is the same sizing policy the server
-        applies everywhere else, so an empty/partial ``chunk_shape`` reads
-        identically to one that was advertised.
+        fallback read unit from the full shape, split under
+        ``MAX_ARROW_BATCH_BYTES``. The public descriptor does not expose this
+        value directly: :meth:`get_transfer_chunk_size` converts it to the
+        server-selected Flight grid.
 
         An *unresolved* descriptor (empty shape/dtype -- e.g. a not-yet-hydrated
         cloud/remote source) is rejected up front: the fallback would otherwise
@@ -635,12 +634,33 @@ class TensorAdapter(SourceAdapter):
         """
         desc = self.get_tensor_descriptor()
         require_resolved(desc)
+        return self._chunk_size_from_descriptor(desc)
+
+    @staticmethod
+    def _chunk_size_from_descriptor(desc: TensorDescriptor) -> Tuple[int, ...]:
+        """Derive the private read grid from an already-fetched descriptor."""
         chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
         shape = tuple(int(dim) for dim in desc.shape)
         if len(chunk_shape) == len(shape):
             return chunk_shape
         # Empty or rank-mismatched chunk_shape: fall back to the default grid.
         return compute_safe_chunk_size(shape, desc.dtype, list(desc.dim_labels))
+
+    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
+        """Return the server-selected public Flight transfer grid.
+
+        Adapter descriptors historically carried their native file/dask block
+        geometry. Keep that as a private planning seed and expose only the
+        divide-or-coalesce result to clients (#684).
+        """
+        desc = self.get_tensor_descriptor()
+        require_resolved(desc)
+        return compute_transfer_chunk_size(
+            self._chunk_size_from_descriptor(desc),
+            tuple(int(dim) for dim in desc.shape),
+            desc.dtype,
+            list(desc.dim_labels),
+        )
 
     @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -811,7 +831,7 @@ class TensorAdapter(SourceAdapter):
         if reduction_method == "precompute" and scale_hint is not None:
             return self._plan_precomputed_read(request_desc, scale_hint)
 
-        chunk_size = self.get_chunk_size()
+        chunk_size = self.get_transfer_chunk_size()
         # content_version is a SourceAdapter property; every TensorAdapter is a
         # SourceAdapter, so it is always present -- an unversioned source returns
         # None.
@@ -978,9 +998,12 @@ class TensorAdapter(SourceAdapter):
                 request_desc.reduction_method = read_opt.reduction_method
             read_plan = self.get_read_plan(request_desc)
         else:
-            # Describe-only: the base per-tensor descriptor, no chunk enumeration.
+            # Describe-only still exposes the server's transfer grid, never the
+            # adapter's private file/dask read geometry (#684).
+            desc = self._base_structural_descriptor(base_desc)
+            desc.chunk_shape[:] = list(self.get_transfer_chunk_size())
             read_plan = TensorReadPlan(
-                descriptor=self._base_structural_descriptor(base_desc),
+                descriptor=desc,
                 chunk_endpoints=[],
             )
 
@@ -1156,6 +1179,7 @@ _TENSOR_SCOPED_API = frozenset(
     {
         "get_tensor_descriptor",
         "get_chunk_size",
+        "get_transfer_chunk_size",
         "get_data",
         "get_arrow_schema",
         "resolve_chunk_data",
@@ -1234,24 +1258,19 @@ def _get_read_plan(
     reduction_method = normalize_reduction_method(request_desc.reduction_method)
     ndim = len(base_shape)
 
-    # STEP 1: Check if base chunk_size needs splitting FIRST
-    if needs_splitting(chunk_size, base_desc.dtype):
-        # Split chunk_size to safe_sub_chunk_size
-        safe_chunk_size = compute_safe_chunk_size(
-            chunk_size, base_desc.dtype, base_desc.dim_labels
-        )
-    else:
-        safe_chunk_size = chunk_size
+    # STEP 1 was performed by TensorAdapter.get_transfer_chunk_size(). This
+    # helper receives the public transfer grid and leaves it unchanged.
+    transfer_chunk_size = chunk_size
 
-    # STEP 2: Now compute virtual_chunk_size from safe_chunk_size
-    # (guaranteed to not need splitting since base is already safe)
+    # STEP 2: Compute the scaled grid from the bounded transfer grid. The
+    # logical scaled shape is no larger per axis than transfer_chunk_size.
     if scale_hint is None:
-        virtual_chunk_size = safe_chunk_size
-        logical_chunk_size = safe_chunk_size
+        virtual_chunk_size = transfer_chunk_size
+        logical_chunk_size = transfer_chunk_size
         output_dtype = base_desc.dtype
     else:
         virtual_chunk_size = tuple(
-            lcm(safe_chunk_size[ax], scale_hint[ax]) for ax in range(ndim)
+            lcm(transfer_chunk_size[ax], scale_hint[ax]) for ax in range(ndim)
         )
         logical_chunk_size = tuple(
             virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim)
@@ -1281,7 +1300,8 @@ def _get_read_plan(
         logical_shape = realized_shape
 
     # Generate chunk endpoints by iterating grid using np.ndindex
-    # NO NEED to check splitting here - safe_chunk_size ensures it's always safe
+    # No split check is needed here: transfer_chunk_size is bounded, and the
+    # scaled logical chunk is no larger per axis.
     logical_endpoints: List[ChunkEndpoint] = []
 
     # content_version is constant across the grid, so build its wrapper header
@@ -1329,7 +1349,7 @@ def _get_read_plan(
         virtual_bounds = ChunkBounds(start=list(virtual_start), stop=list(virtual_stop))
         logical_bounds = ChunkBounds(start=list(logical_start), stop=list(logical_stop))
 
-        # NO splitting check needed - safe_chunk_size guarantees it fits
+        # No split check is needed: the logical transfer chunk is bounded.
 
         # Encode: array_id + virtual_bounds + optional scale_hint + the requested
         # reduction_method, so do_get downsamples with the method the client asked

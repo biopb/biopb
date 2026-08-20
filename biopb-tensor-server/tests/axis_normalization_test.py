@@ -370,7 +370,11 @@ class TestNormalizedDescriptorAndData:
             read_opt.slice_hint.start[:] = [0, 0, 0]
             read_opt.slice_hint.stop[:] = [2, 3, 2]
             plan = adapter.plan_flight_info(read_opt, PyramidConfig())
+            # The canonical slice is interpreted correctly. The small source
+            # retains its native grid to preserve endpoint parallelism.
             assert list(plan.descriptor.shape) == [2, 3, 2]
+            assert list(plan.descriptor.slice_hint.start) == [0, 0, 0]
+            assert list(plan.descriptor.slice_hint.stop) == [2, 3, 2]
 
     def test_scaled_read_is_coherent_in_canonical_order(self):
         """A downsampled read is the subtlest path: the client's ``scale_hint``

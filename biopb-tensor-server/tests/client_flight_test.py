@@ -385,7 +385,7 @@ class TestTensorFlightClientRoundTrip:
         assert pb.location == "grpc://localhost:8890"
 
         # Verify endpoints are populated
-        assert len(pb.endpoints) == 4  # 4 chunks
+        assert len(pb.endpoints) == 4
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):

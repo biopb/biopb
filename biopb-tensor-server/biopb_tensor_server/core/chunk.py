@@ -17,7 +17,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.axes import labeled_axis_index
+from biopb_tensor_server.core.axes import labeled_axis_index, samples_axis
 from biopb_tensor_server.core.downsample import (
     DEFAULT_REDUCTION_METHOD,
     ceil_div,
@@ -397,8 +397,12 @@ def decode_reduction_method(chunk_id: bytes) -> str:
 
 
 # Constants
-# 64MB threshold for chunk splitting - enables parallel Flight transfers
+# Preferred transfer size and hard Arrow batch ceiling. The adapter's native
+# read unit is only a planning seed: small units are coalesced toward the
+# preferred size and large units are divided toward it (biopb/biopb#684).
+PREFERRED_ARROW_BATCH_BYTES = 8 * 1024 * 1024
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
+MIN_TRANSFER_ENDPOINTS = 4
 
 
 @dataclass(slots=True)
@@ -512,19 +516,6 @@ def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
     """
     num_elements = int(np.prod(shape, dtype=np.int64))
     return num_elements * np.dtype(dtype).itemsize
-
-
-def needs_splitting(chunk_shape: Tuple[int, ...], dtype: str) -> bool:
-    """Check if chunk exceeds Arrow batch limit.
-
-    Args:
-        chunk_shape: Chunk shape
-        dtype: Data type string
-
-    Returns:
-        True if chunk needs splitting
-    """
-    return estimate_chunk_bytes(chunk_shape, dtype) > MAX_ARROW_BATCH_BYTES
 
 
 # Defaults mirroring biopb-mcp's [pyramid] config (build_pyramid_levels). These
@@ -754,6 +745,217 @@ def compute_safe_chunk_size(
     return tuple(safe_size)
 
 
+def compute_transfer_chunk_size(
+    native_chunk_size: Tuple[int, ...],
+    tensor_shape: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+    preferred_bytes: int = PREFERRED_ARROW_BATCH_BYTES,
+    maximum_bytes: int = MAX_ARROW_BATCH_BYTES,
+    minimum_endpoints: int = MIN_TRANSFER_ENDPOINTS,
+) -> Tuple[int, ...]:
+    """Choose a public transfer grid from an adapter's private read geometry.
+
+    Native blocks above ``preferred_bytes`` are divided with the established
+    T/unknown -> C -> Z -> Y/X priority. Smaller blocks are coalesced in whole
+    native-block multiples, preferring Y/X -> Z -> C -> T/unknown, while
+    retaining enough endpoints for parallel reads and scheduler utilization.
+
+    ``maximum_bytes`` is the hard wire ceiling; ``preferred_bytes`` is the
+    optimization target. Scaled reads deliberately do not run this optimizer a
+    second time: their existing LCM alignment derives a logical grid from this
+    transfer grid.
+    """
+    if len(native_chunk_size) != len(tensor_shape):
+        raise ValueError(
+            "Native chunk rank must match tensor rank: "
+            f"chunk={len(native_chunk_size)} shape={len(tensor_shape)}"
+        )
+    if preferred_bytes <= 0 or maximum_bytes <= 0:
+        raise ValueError("Chunk byte targets must be positive")
+    if preferred_bytes > maximum_bytes:
+        raise ValueError("Preferred chunk bytes must not exceed the maximum")
+    if minimum_endpoints <= 0:
+        raise ValueError("Minimum transfer endpoints must be positive")
+    if any(int(dim) <= 0 for dim in tensor_shape):
+        raise ValueError(f"Tensor dimensions must be positive: {tensor_shape}")
+    if any(int(dim) <= 0 for dim in native_chunk_size):
+        raise ValueError(
+            f"Native chunk dimensions must be positive: {native_chunk_size}"
+        )
+
+    native = tuple(
+        min(int(chunk), int(shape))
+        for chunk, shape in zip(native_chunk_size, tensor_shape, strict=True)
+    )
+    native_bytes = estimate_chunk_bytes(native, dtype)
+
+    if native_bytes > preferred_bytes:
+        result = _divide_chunk_size(native, dtype, dim_labels, preferred_bytes)
+    elif native_bytes < preferred_bytes:
+        result = _coalesce_chunk_size(
+            native,
+            tensor_shape,
+            dtype,
+            dim_labels,
+            preferred_bytes,
+            minimum_endpoints,
+        )
+    else:
+        result = native
+
+    # Retain an explicit final guard so a future preferred-size policy change
+    # cannot accidentally weaken the Arrow safety bound.
+    if estimate_chunk_bytes(result, dtype) > maximum_bytes:
+        result = compute_safe_chunk_size(result, dtype, dim_labels)
+    return result
+
+
+def _divide_chunk_size(
+    chunk_size: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+    target_bytes: int,
+) -> Tuple[int, ...]:
+    """Divide a chunk toward ``target_bytes`` with the established priority."""
+    result = list(chunk_size)
+    result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+    split_axes: Set[int] = set()
+    labels = [str(label).lower() for label in dim_labels] if dim_labels else []
+
+    while result_bytes > target_bytes:
+        n_splits = int(np.ceil(result_bytes / target_bytes))
+        split_count = n_splits
+        axis = _choose_split_axis_excluding(
+            tuple(result), dim_labels, n_splits, split_axes
+        )
+        if axis is None:
+            # The desired ratio may exceed every one axis even though dividing
+            # several axes successively can reach it.
+            axis = _choose_split_axis_excluding(
+                tuple(result), dim_labels, 2, split_axes
+            )
+            split_count = 2
+        if axis is None:
+            break
+        label = labels[axis] if axis < len(labels) else ""
+        if label in {"y", "x"}:
+            spatial_axes = [
+                index
+                for index, candidate_label in enumerate(labels)
+                if candidate_label in {"y", "x"} and result[index] > 1
+            ]
+            if len(spatial_axes) == 2:
+                scale = (target_bytes / result_bytes) ** 0.5
+                for spatial_axis in spatial_axes:
+                    result[spatial_axis] = max(1, int(result[spatial_axis] * scale))
+                    split_axes.add(spatial_axis)
+                result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+                continue
+        result[axis] = max(1, result[axis] // min(result[axis], split_count))
+        split_axes.add(axis)
+        result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+
+    return tuple(result)
+
+
+def _coalesce_chunk_size(
+    native: Tuple[int, ...],
+    tensor_shape: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+    target_bytes: int,
+    minimum_endpoints: int,
+) -> Tuple[int, ...]:
+    """Grow whole native blocks toward ``target_bytes``.
+
+    Spatial axes share a priority tier and grow in balanced doubling steps so a
+    square tile grid does not become a needlessly long strip.
+    """
+    current = list(native)
+    max_blocks = [
+        int(shape) // int(block)
+        for block, shape in zip(native, tensor_shape, strict=True)
+    ]
+    labels = [str(label).lower() for label in dim_labels] if dim_labels else []
+
+    def priority(axis: int) -> int:
+        label = labels[axis] if axis < len(labels) else ""
+        if label in {"y", "x"}:
+            return 0
+        if label == "z":
+            return 1
+        if label in {"c", "channel", "channels"}:
+            return 2
+        if label in {"t", "time", "frame", "frames"}:
+            return 3
+        return 4
+
+    def blocks(axis: int) -> int:
+        return current[axis] // native[axis]
+
+    def endpoint_count(chunk: Sequence[int]) -> int:
+        return int(
+            np.prod(
+                [
+                    ceil_div(int(shape), int(size))
+                    for shape, size in zip(tensor_shape, chunk, strict=True)
+                ]
+            )
+        )
+
+    while True:
+        candidates = []
+        for axis in range(len(current)):
+            old_blocks = blocks(axis)
+            new_blocks = min(max_blocks[axis], old_blocks * 2)
+            if new_blocks <= old_blocks:
+                continue
+            candidate = list(current)
+            candidate[axis] = native[axis] * new_blocks
+            candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
+            if (
+                candidate_bytes <= target_bytes
+                and endpoint_count(candidate) >= minimum_endpoints
+            ):
+                candidates.append(
+                    (
+                        priority(axis),
+                        current[axis],
+                        candidate_bytes,
+                        axis,
+                        candidate,
+                    )
+                )
+        if not candidates:
+            break
+        _, _, _, _, current = min(
+            candidates, key=lambda item: (item[0], item[1], -item[2], item[3])
+        )
+
+    # Consume any remaining budget with the closest legal whole-block step.
+    current_bytes = estimate_chunk_bytes(tuple(current), dtype)
+    candidates = []
+    for axis in range(len(current)):
+        other_bytes = current_bytes // current[axis]
+        affordable_blocks = target_bytes // (other_bytes * native[axis])
+        new_blocks = min(max_blocks[axis], int(affordable_blocks))
+        if new_blocks <= blocks(axis):
+            continue
+        candidate = list(current)
+        candidate[axis] = native[axis] * new_blocks
+        candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
+        if endpoint_count(candidate) < minimum_endpoints:
+            continue
+        candidates.append(
+            (priority(axis), target_bytes - candidate_bytes, axis, candidate)
+        )
+    if candidates:
+        _, _, _, current = min(candidates, key=lambda item: item[:3])
+
+    return tuple(current)
+
+
 def _choose_split_axis_excluding(
     shape: Tuple[int, ...],
     dim_labels: Optional[List[str]],
@@ -776,9 +978,16 @@ def _choose_split_axis_excluding(
         for ax, label in enumerate(dim_labels):
             label_to_axis[label.lower()] = ax
 
-    # Eligible axes: not excluded and large enough for splits
+    # Interleaved RGB(A) samples are one pixel's indivisible components. Keep
+    # them together and divide another axis; an unlabeled trailing size-3/4 axis
+    # is deliberately not inferred as samples.
+    sample_axis = samples_axis(list(dim_labels or []), shape)
+
+    # Eligible axes: not excluded, not interleaved samples, and splittable.
     eligible = [
-        ax for ax in range(len(shape)) if ax not in exclude_axes and shape[ax] >= 2
+        ax
+        for ax in range(len(shape))
+        if ax not in exclude_axes and ax != sample_axis and shape[ax] >= 2
     ]
 
     if not eligible:
