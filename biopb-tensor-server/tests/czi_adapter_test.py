@@ -262,13 +262,31 @@ def test_idle_reader_is_reaped(tmp_path):
         ),
         # A varying one is not: read() would silently serve index 0 only.
         ({"H": (0, 3), "Z": (0, 2), "X": (0, 8), "Y": (0, 8)}, None),
-        # An axis that does not start at 0 would desynchronize descriptor
-        # position from file index.
-        ({"Z": (2, 5), "X": (0, 8), "Y": (0, 8)}, None),
+        # The extents are counts, not index ranges -- libCZI reports (0, n)
+        # whatever the file's own coordinates are -- so the start carries no
+        # information and is not read.
+        ({"Z": (2, 5), "X": (0, 8), "Y": (0, 8)}, {"T": 1, "C": 1, "Z": 3}),
     ],
 )
 def test_plane_sizes_declines_axes_it_cannot_address(bounding_box, expected):
     assert _plane_sizes(bounding_box) == expected
+
+
+def test_mixed_pixel_types_raise_rather_than_defer(tmp_path):
+    """BioIO cannot represent this either, so deferring would only obscure it.
+
+    Its reader reshapes every channel into one array and fails with "cannot
+    reshape array of size N", raised from inside the dask graph.
+    """
+    from pylibCZIrw import czi as pyczi
+
+    path = Path(tmp_path) / "mixed.czi"
+    with pyczi.create_czi(str(path)) as writer:
+        writer.write(np.zeros((8, 8, 1), np.uint16), plane={"C": 0, "Z": 0, "T": 0})
+        writer.write(np.zeros((8, 8, 3), np.uint8), plane={"C": 1, "Z": 0, "T": 0})
+
+    with pytest.raises(ValueError, match="mixes pixel types"):
+        read_layout(str(path))
 
 
 def test_rgb_document_is_outside_the_native_subset(tmp_path):
@@ -317,9 +335,50 @@ def test_remote_czi_falls_back_to_bioio(monkeypatch):
     assert built["url"] == "s3://bucket/img.czi"
 
 
-def test_cloud_root_paths_are_not_claimed(tmp_path):
-    """A cloud placeholder must not be recalled by a claim probe."""
+def test_claim_is_definite_under_a_cloud_root(tmp_path):
+    """The claim reads nothing, so a cloud placeholder is claimed, not declined.
+
+    Deferring a non-resident file belongs to the source manager
+    (``_claim_is_unresolved``). Declining here would also outlive the
+    placeholder: the resolve-time re-claim still carries ``cloud_root=True``,
+    so a hydrated file would never reach this adapter.
+    """
     path, _ = create_zeiss_czi(str(tmp_path), n_c=1, n_z=1, image_shape=(8, 8))
 
-    ctx = LiveLocalContext(Path(path), cloud_root=True)
-    assert CziAdapter.claim(ctx, DiscoveryState()) is None
+    claim = CziAdapter.claim(
+        LiveLocalContext(Path(path), cloud_root=True), DiscoveryState()
+    )
+    assert claim is not None
+    assert claim.source_type == "czi"
+    assert claim.unresolved is False
+
+
+def test_claim_does_not_open_the_file(tmp_path):
+    """Not even a stat-and-open sniff: the claim is extension-only."""
+
+    class _RaisingReadCtx(LiveLocalContext):
+        def read_text(self, subpath: str = "") -> str:
+            raise AssertionError("claim() must not read content")
+
+        def open(self, mode: str = "rb") -> object:
+            raise AssertionError("claim() must not open the file")
+
+    path = tmp_path / "not-really.czi"
+    path.write_bytes(b"\x00\x01\x02\x03")
+
+    claim = CziAdapter.claim(_RaisingReadCtx(path), DiscoveryState())
+    assert claim is not None and claim.source_type == "czi"
+
+
+def test_unopenable_file_raises_instead_of_falling_back(tmp_path):
+    """A file libCZI cannot open is an error, not a slow path.
+
+    BioIO reads CZI through this same pylibCZIrw (`use_aicspylibczi=False`), so
+    the fallback cannot read what the probe could not.
+    """
+    path = tmp_path / "corrupt.czi"
+    path.write_bytes(b"not a czi at all")
+
+    with pytest.raises(Exception) as excinfo:
+        CziAdapter.create_from_config(_source(path))
+    assert not isinstance(excinfo.value, AssertionError)

@@ -1332,7 +1332,9 @@ class TestCloudMultiFileBan:
 
     def test_cloud_tif_dir_yields_single_file_sources(self, tmp_path):
         # The whole-registry behavior: a dir of .tif files under cloud produces
-        # one single-file (generic aics) claim per .tif, never a grouped set.
+        # one single-file claim per .tif, never a grouped set. The native
+        # tifffile adapter owns that claim (it reads nothing to make it); a
+        # dehydrated placeholder is deferred by the source manager, not here.
         from biopb_tensor_server.adapters import get_default_registry
 
         registry = get_default_registry()
@@ -1345,7 +1347,7 @@ class TestCloudMultiFileBan:
             )
             claims.append(c[0] if c else None)
         assert all(c is not None for c in claims)
-        assert all(c.source_type == "aics" for c in claims)
+        assert all(c.source_type == "tiff" for c in claims)
         # Each is its own primary_path (single-file), no multi-member grouping.
         assert all(c.member_paths == {c.primary_path} for c in claims)
 

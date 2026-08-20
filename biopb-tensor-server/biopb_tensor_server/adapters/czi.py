@@ -13,12 +13,15 @@ This adapter reads through libCZI directly: ``read(plane=..., scene=...,
 roi=...)`` decodes only the subblocks the requested region covers.
 
 **Supported subset.**  Grayscale pixel types, and no acquisition dimension
-outside T/C/Z carrying more than one index.  Anything else -- an RGB (``Bgr*``)
-document, a phase/view/illumination axis, a remote URL -- is handed back to
-:class:`~biopb_tensor_server.adapters.bioio.ZeissAdapter` by
+outside T/C/Z carrying more than one index.  A document outside it -- an RGB
+(``Bgr*``) one, a phase/view/illumination axis, a remote URL -- is handed back
+to :class:`~biopb_tensor_server.adapters.bioio.ZeissAdapter` by
 :meth:`CziAdapter.create_from_config`, so every CZI stays readable and only the
-subset this reader can serve faithfully takes the fast path.  Mosaics need no
-special case: libCZI composes their tiles behind ``read()``, which is also what
+subset this reader can serve faithfully takes the fast path.  What is *not*
+deferred is a document BioIO cannot read either -- one that fails to open, or
+mixes pixel types across channels -- because BioIO reads CZI through this same
+pylibCZIrw by default: deferring would trade a precise error for a confusing
+one raised from inside a dask graph.  Mosaics need no special case: libCZI composes their tiles behind ``read()``, which is also what
 BioIO's ``reconstruct_mosaic`` returns, and the scene's bounding rectangle is
 already the composed extent.
 
@@ -112,24 +115,28 @@ def _plane_sizes(bounding_box: Dict[str, Tuple[int, int]]) -> Optional[Dict[str,
     ``total_bounding_box`` reports every acquisition dimension the document
     uses, X and Y included.  Anything outside T/C/Z (phase, view, illumination,
     rotation, block) is left at index 0 by ``read()``, so a document that varies
-    one is not fully addressable here and belongs to the BioIO fallback.  Scene
-    and mosaic axes never appear in this box -- scenes are addressed by the
-    ``scene`` argument and mosaic tiles are composed by ``read()``.
+    one is not fully addressable here.  BioIO's own model is T/C/Z/Y/X, so it
+    drops such an axis the same way -- the fallback is the status quo, not a
+    fix.  Scene and mosaic axes never appear in this box: scenes are addressed
+    by the ``scene`` argument and mosaic tiles are composed by ``read()``.
+
+    The extents are **counts, not index ranges** -- a document whose T
+    subblocks sit at 5..7 reports ``T: (0, 3)``, and its readable indices are
+    still 5..7.  So the start conveys nothing and a non-zero-based document is
+    not detectable here; ``read()`` raises "Coordinate for dimension 'T' is
+    out-of-range" on the first read.  BioIO raises the same error from the same
+    libCZI, so there is nothing to defer to and nothing to gain from finding
+    out earlier (which would cost an O(subblocks) enumeration).
     """
     sizes = {}
     for axis, extent in bounding_box.items():
-        start, stop = int(extent[0]), int(extent[1])
         if axis in ("X", "Y"):
             continue
-        size = stop - start
+        size = int(extent[1]) - int(extent[0])
         if axis not in _PLANE_DIMS:
             if size > 1:
                 return None
             continue
-        if start != 0:
-            # read() takes an absolute index; a box that does not start at 0
-            # would make descriptor position and file index disagree.
-            return None
         sizes[axis] = size
     return {axis: int(sizes.get(axis, 1)) for axis in _PLANE_DIMS}
 
@@ -168,16 +175,29 @@ def _image_information(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def read_layout(path: str) -> Optional[_CziLayout]:
-    """Probe a CZI, or return None when it is outside the supported subset."""
+    """Probe a CZI document.
+
+    Returns None when the document is readable but outside this reader's
+    subset, so the caller can defer to BioIO.  Raises when the document is one
+    *neither* reader can serve: deferring then would trade a precise error for
+    a confusing one from inside BioIO's dask graph.
+    """
     from pylibCZIrw import czi as pyczi
 
     with pyczi.open_czi(path) as czi:
         pixel_types = set(czi.pixel_types.values())
         if len(pixel_types) != 1:
-            # A per-channel pixel type has no single descriptor dtype.
-            return None
+            # No single descriptor dtype. BioIO cannot serve this either -- it
+            # reshapes every channel to one array and fails with "cannot
+            # reshape array of size N" -- so this is an error, not a fallback.
+            raise ValueError(
+                f"CZI {path} mixes pixel types across channels "
+                f"({sorted(czi.pixel_types.values())}); no reader here can "
+                "represent that as one tensor"
+            )
         dtype = _PIXEL_TYPES.get(pixel_types.pop())
         if dtype is None:
+            # An RGB (Bgr*) document. BioIO reads it as T/C/Z/Y/X/S, so defer.
             return None
 
         plane_sizes = _plane_sizes(czi.total_bounding_box)
@@ -194,7 +214,10 @@ def read_layout(path: str) -> Optional[_CziLayout]:
             rect = czi.total_bounding_rectangle
             scenes = (_CziScene(0, rect.x, rect.y, rect.w, rect.h),)
         if any(scene.width <= 0 or scene.height <= 0 for scene in scenes):
-            return None
+            # No pixels to address. Defensive: pylibCZIrw's writer cannot
+            # produce this, so it means a malformed document rather than a
+            # layout BioIO would read better.
+            raise ValueError(f"CZI {path} has a scene with an empty rectangle")
 
         metadata = czi.metadata
 
@@ -231,17 +254,22 @@ class CziAdapter(TensorAdapter):
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim a resident local CZI without reading its content.
+        """Claim a local CZI by extension alone, without reading its content.
+
+        Definite even under a cloud root and even for a dehydrated placeholder:
+        the claim reads nothing, so it cannot trigger a recall, and deferring a
+        non-resident file is the source manager's job
+        (``_claim_is_unresolved``), not this one's. Guarding on residency here
+        would also outlive the placeholder -- the resolve-time re-claim still
+        carries ``cloud_root=True``, so a hydrated file would never reach this
+        adapter.
 
         Whether libCZI can serve the document is decided at construction, where
-        an unsupported layout falls back to BioIO -- so the claim stays a pure
-        extension check and no scan recalls a cloud placeholder.
+        an unsupported layout falls back to BioIO.
         """
-        if not ctx.is_file() or ctx.is_remote or ctx.cloud_root:
+        if not ctx.is_file() or ctx.is_remote:
             return None
         if not ctx.name.lower().endswith(CZI_EXTENSION):
-            return None
-        if not ctx.is_resident():
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -271,11 +299,12 @@ class CziAdapter(TensorAdapter):
         url = str(source.url)
         path = url[len("file://") :] if url.startswith("file://") else url
 
-        try:
-            layout = read_layout(path)
-        except Exception:
-            logger.debug("CZI layout probe failed for %s", url, exc_info=True)
-            layout = None
+        # A raised probe propagates. ``bioio-czi`` reads through this same
+        # pylibCZIrw by default (``use_aicspylibczi=False``), so a file libCZI
+        # cannot open is not readable through the fallback either -- catching it
+        # here would trade a precise error for a slow path that fails anyway.
+        # Only a structural decline (None) falls back.
+        layout = read_layout(path)
         if layout is None:
             return _bioio_fallback(source, credentials_config, "unsupported layout")
 
