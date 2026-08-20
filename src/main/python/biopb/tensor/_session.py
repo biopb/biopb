@@ -85,6 +85,14 @@ class _ClientState:
     sources: Dict[str, DataSourceDescriptor] = field(default_factory=dict)
     descriptors: Dict[str, TensorDescriptor] = field(default_factory=dict)
 
+    def cache_descriptor(self, desc: TensorDescriptor) -> None:
+        """Store the structural part of ``desc`` under its array_id.
+
+        The single write path into ``descriptors``; see
+        :func:`_structural_descriptor` for what is kept and why.
+        """
+        self.descriptors[desc.array_id] = _structural_descriptor(desc)
+
 
 class ResolveCancelled(Exception):
     """Raised by :meth:`TensorFlightClient.resolve` when its ``should_cancel``
@@ -94,6 +102,33 @@ class ResolveCancelled(Exception):
     recall daemon thread runs to completion and caches its result, so a later
     :meth:`resolve` coalesces onto the finished work rather than re-downloading.
     """
+
+
+def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
+    """Return the cacheable part of ``desc``: structure plus physical scale.
+
+    Keeps what the cache is read for -- shape, dtype, dim_labels, chunk_shape,
+    plus the ~200-byte physical scale ``GetFlightInfo`` fills unconditionally.
+    Drops the two response-masked parts (biopb/biopb#795):
+
+    - ``metadata_json``, the full OME tree, runs to megabytes on a
+      per-plane-annotated file, and nothing reads it back out of here -- the one
+      metadata reader issues its own ``GetFlightInfo``. This dict has no
+      eviction and lives as long as the session.
+    - ``pyramid`` is small, but keeping it would leave entries in two grades:
+      rich when a caller happened to ask, poor when the entry came from
+      ``list_flights``, which never fills it. A reader could not tell a
+      genuinely pyramid-less tensor from one cached before anyone asked.
+
+    So every entry carries exactly what ``list_flights`` provides, whatever
+    route it arrived by. Callers lose nothing: the masks are honoured on the
+    *returned* descriptor, and ``get_descriptor`` fetches on every call.
+    """
+    lean = TensorDescriptor()
+    lean.CopyFrom(desc)
+    lean.ClearField("metadata_json")
+    lean.ClearField("pyramid")
+    return lean
 
 
 @dataclass
@@ -352,7 +387,7 @@ class CatalogClient:
             source_descriptors[source_desc.source_id] = source_desc
             # Cache tensor descriptors
             for tensor_desc in source_desc.tensors:
-                self._state.descriptors[tensor_desc.array_id] = tensor_desc
+                self._state.cache_descriptor(tensor_desc)
 
             # Check schema metadata for truncation info
             if info.schema.metadata:
@@ -565,8 +600,13 @@ class CatalogClient:
         result is never *missing* a field the caller asked for -- at worst it
         carries extra the caller drops.
 
-        The descriptor is cached in ``self._state.descriptors`` (keyed by the
-        echoed-back array_id). ``self._state.sources`` is intentionally NOT touched, so
+        This always issues the RPC: it never reads the descriptor cache, so the
+        masks a caller passes are honoured on every call. It *writes* the
+        structural part of the response to ``self._state.descriptors`` (keyed by
+        the echoed-back array_id) for the readers that want addressing facts --
+        see :func:`_structural_descriptor` for what that keeps and why the
+        masked-off parts are deliberately not stored (biopb/biopb#795).
+        ``self._state.sources`` is intentionally NOT touched, so
         a single-tensor probe never clobbers a full enumeration cached by
         ``list_sources()`` (issue #75).
         """
@@ -594,7 +634,7 @@ class CatalogClient:
                 raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
             raise
         tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
-        self._state.descriptors[tensor_desc.array_id] = tensor_desc
+        self._state.cache_descriptor(tensor_desc)
         return tensor_desc
 
     def get_descriptor(
@@ -940,7 +980,7 @@ class ChunkFetcher:
         # tensor's array_id but the crop's shape, so caching that one would hand a
         # later reader a whole-tensor descriptor describing only this request.
         if not response_desc.HasField("slice_hint") and not response_desc.scale_hint:
-            self._state.descriptors[response_desc.array_id] = response_desc
+            self._state.cache_descriptor(response_desc)
 
         # Parse endpoints into (chunk_id, bounds) pairs.
         chunk_ids, bounds_list = _parse_flight_endpoints(info)

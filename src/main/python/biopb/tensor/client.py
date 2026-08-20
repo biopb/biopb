@@ -368,10 +368,14 @@ class TensorFlightClient:
         policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
         takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
         Works even when the source is beyond the (truncatable) ``list_sources()``
-        cap, and the result is cached. Passing a bare ``source_id`` (single-tensor
-        source, or to anchor on a multi-tensor source's default/first tensor) is
-        accepted. To enumerate ALL tensors/scenes of a source, use
-        ``list_sources()[source_id].tensors`` -- NOT this method.
+        cap. Every call fetches -- the client caches only the *structural* part of
+        the answer (shape/dtype/dim_labels/chunk_shape plus physical scale) for
+        its own addressing, never ``metadata_json`` or ``pyramid``, so what you
+        get back always reflects the masks you passed. Passing a bare
+        ``source_id`` (single-tensor source, or to anchor on a multi-tensor
+        source's default/first tensor) is accepted. To enumerate ALL
+        tensors/scenes of a source, use ``list_sources()[source_id].tensors``
+        -- NOT this method.
 
         This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
         synced-folder) source it raises an error pointing at `resolve`,
