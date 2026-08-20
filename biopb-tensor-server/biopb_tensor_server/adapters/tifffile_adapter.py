@@ -37,9 +37,10 @@ def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
     Plain TIFF has no required dimension metadata.  tifffile calls otherwise
     unlabeled sequence axes ``Q`` (and some readers use ``I``).  BioIO's
     tifffile reader maps those axes from the right of ``TCZ`` for grayscale
-    data, while an RGB samples axis uses the leading ``TC`` slots.  Mirroring
-    that convention keeps a native read's descriptor compatible with the
-    existing BioIO fallback.
+    data, while an RGB samples axis uses the leading ``TC`` slots. Named ``P``
+    and ``M`` axes represent position and mosaic layouts; preserve those labels
+    rather than relabeling them as biological dimensions or handing the file to
+    BioIO.
 
     The return value has one label per native array axis, in native order.  It
     is used only for indexing; no pixel transpose is done here.
@@ -52,6 +53,12 @@ def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
     used = set()
     unknown = []
     for index, axis in enumerate(axes):
+        if axis in {"P", "M"}:
+            if axis in used:
+                return None
+            mapped[index] = axis
+            used.add(axis)
+            continue
         if axis in _CANONICAL_DIMS or axis == _SAMPLES_DIM:
             if axis in used:
                 return None
@@ -100,6 +107,30 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
 
     @classmethod
+    def _supports_path(cls, path: str) -> bool:
+        """Return whether native descriptors can serve a local file."""
+        import tifffile
+
+        try:
+            probe = cls(path, "claim")
+            with tifffile.TiffFile(path) as tiff:
+                # OME-TIFF ownership belongs to OmeTiffAdapter, which is
+                # registered before this claim. Keep this guard here too so
+                # the native plain-TIFF claim is self-contained.
+                if not cls._LSM and tiff.ome_metadata:
+                    return False
+                indices = probe._series_indices(tiff)
+                return bool(indices) and all(
+                    probe._series_descriptor(tiff.series[index], index) is not None
+                    for index in indices
+                )
+        except Exception:
+            logger.debug(
+                "native tifffile claim probe failed for %s", path, exc_info=True
+            )
+            return False
+
+    @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim a resident local TIFF or LSM, leaving OME-TIFF to its owner."""
         if not ctx.is_file() or ctx.is_remote or ctx.cloud_root:
@@ -113,6 +144,9 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             return None
 
         if not ctx.is_resident():
+            return None
+
+        if not cls._supports_path(ctx.path_str):
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -139,7 +173,12 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
         # The native store has one full plane per page.  Keep that native unit
         # in the read plan, including an interleaved RGB(A) samples axis.
-        labels = list(_CANONICAL_DIMS)
+        named_axes = [
+            axis
+            for axis in mapped
+            if axis not in _CANONICAL_DIMS and axis != _SAMPLES_DIM
+        ]
+        labels = named_axes + list(_CANONICAL_DIMS)
         if _SAMPLES_DIM in mapped:
             labels.append(_SAMPLES_DIM)
         by_axis = {axis: int(series.shape[index]) for index, axis in enumerate(mapped)}
