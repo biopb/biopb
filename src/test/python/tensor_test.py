@@ -468,5 +468,89 @@ class TestGetDescriptorFieldMasks:
         assert read_opt.with_metadata is True
 
 
+class TestDescriptorCacheStaysStructural:
+    """The descriptor cache holds addressing facts only (biopb/biopb#795).
+
+    Masked-off parts must never be stored: an entry that carried them would be
+    indistinguishable from one cached before anyone asked, and ``metadata_json``
+    is the full OME tree in a dict with no eviction and session lifetime.
+    """
+
+    @staticmethod
+    def _client(response: TensorDescriptor):
+        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        state = _ClientState(
+            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
+        )
+        info = Mock()
+        info.descriptor.command = response.SerializeToString()
+        state.client.get_flight_info.return_value = info
+        client._state = state
+        client._catalog = CatalogClient(state)
+        client._fetcher = ChunkFetcher(state, client._catalog)
+        return client
+
+    @staticmethod
+    def _fat_descriptor():
+        from biopb.tensor.descriptor_pb2 import PyramidLevel
+
+        desc = TensorDescriptor(
+            array_id="src/A2",
+            dim_labels=["z", "y", "x"],
+            shape=[8, 64, 64],
+            chunk_shape=[1, 64, 64],
+            dtype="uint16",
+            metadata_json='{"metadata": {"big": "' + "x" * 4096 + '"}}',
+        )
+        desc.physical_scale[:] = [2.0, 0.325, 0.325]
+        desc.physical_unit[:] = ["micrometer"] * 3
+        desc.pyramid.append(PyramidLevel(scale_hint=[1, 1, 1], reduction_method="area"))
+        desc.pyramid.append(PyramidLevel(scale_hint=[1, 4, 4], reduction_method="area"))
+        return desc
+
+    def test_caller_gets_the_fields_it_asked_for(self):
+        client = self._client(self._fat_descriptor())
+
+        returned = client.get_descriptor("src/A2", with_metadata=True)
+
+        assert returned.metadata_json  # the mask is honoured on the return value
+        assert len(returned.pyramid) == 2
+
+    def test_heavy_fields_never_enter_the_cache(self):
+        client = self._client(self._fat_descriptor())
+
+        client.get_descriptor("src/A2", with_metadata=True)
+
+        cached = client._descriptors["src/A2"]
+        assert cached.metadata_json == ""
+        assert list(cached.pyramid) == []
+
+    def test_addressing_facts_do_enter_the_cache(self):
+        # Stripping must not take the fields the cache exists to serve --
+        # get_physical_scale reads its answer straight out of this entry.
+        client = self._client(self._fat_descriptor())
+
+        client.get_descriptor("src/A2")
+
+        cached = client._descriptors["src/A2"]
+        assert list(cached.shape) == [8, 64, 64]
+        assert list(cached.chunk_shape) == [1, 64, 64]
+        assert cached.dtype == "uint16"
+        assert list(cached.physical_scale) == [2.0, 0.325, 0.325]
+
+    def test_masked_fetch_does_not_poison_a_later_full_fetch(self):
+        # The regression #795 asks for: a pyramid-less fetch first, then a
+        # default one. Every get_descriptor round-trips, so the second caller
+        # sees the pyramid regardless of what the first one cached.
+        client = self._client(self._fat_descriptor())
+
+        client.get_descriptor("src/A2", with_pyramid=False)
+        second = client.get_descriptor("src/A2")
+
+        assert len(second.pyramid) == 2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
