@@ -86,6 +86,8 @@ def test_nikon_direct_read_maps_scene_t_and_z_and_copies_crop(tmp_path, monkeypa
     assert adapter._scene_descriptor is not None
     assert adapter._bio_image._xarray_dask_data is None
     assert adapter._bio_image.reader._xarray_dask_data is None
+    adapter._tensor_name = "scene-1"
+    assert adapter.get_tensor_descriptor().array_id == "source/scene-1"
     bounds = ChunkBounds(start=[0, 1, 1, 1, 2], stop=[2, 2, 3, 4, 5])
 
     actual = adapter.get_data(bounds)

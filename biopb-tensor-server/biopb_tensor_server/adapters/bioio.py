@@ -308,6 +308,11 @@ class _BioioAdapterBase(TensorAdapter):
             if self._scene_descriptor is not None:
                 result = TensorDescriptor()
                 result.CopyFrom(self._scene_descriptor)
+                # The snapshot is built in the constructor, before the
+                # source-level adapter assigns this scene's ``_tensor_name``.
+                # Bind identity at retrieval time so every scene gets its
+                # source-qualified array_id rather than the bare source_id.
+                result.array_id = self.array_id
                 return result
             dask_data = self._dask_data
             return self._descriptor_from_dask(dask_data)
