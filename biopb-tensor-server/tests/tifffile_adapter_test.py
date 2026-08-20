@@ -37,6 +37,29 @@ def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     np.testing.assert_array_equal(actual, data[2:5, 3:7, 4:9][None, None])
 
 
+def test_configured_dim_labels_stay_native(tmp_path):
+    data = np.arange(5 * 8 * 9, dtype=np.uint16).reshape(5, 8, 9)
+    path = Path(tmp_path).joinpath("configured.tif")
+    tifffile.imwrite(path, data)
+
+    source = TiffAdapter.create_from_config(
+        SourceConfig(
+            url=str(path),
+            type="tiff",
+            source_id="configured",
+            dim_labels=["z", "y", "x"],
+        )
+    )
+    descriptor = source.list_tensor_descriptors()[0]
+    assert list(descriptor.dim_labels) == ["z", "y", "x"]
+    assert list(descriptor.shape) == [5, 8, 9]
+
+    scene = source.get_tensor_adapter(descriptor.array_id)
+    bounds = ChunkBounds(start=[1, 2, 3], stop=[4, 7, 9])
+    actual = scene.get_data(bounds)
+    np.testing.assert_array_equal(actual, data[1:4, 2:7, 3:9])
+
+
 def test_unsupported_tiff_declines_native_claim_and_falls_through(tmp_path):
     data = np.zeros((2, 2, 2, 2, 8, 9), dtype=np.uint8)
     path = Path(tmp_path) / "unsupported.tif"

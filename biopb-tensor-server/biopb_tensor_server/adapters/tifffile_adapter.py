@@ -99,6 +99,10 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     _LSM = False
 
+    def __init__(self, *args, dim_labels=None, **kwargs):
+        self._dim_labels_override = dim_labels is not None
+        super().__init__(*args, dim_labels=dim_labels, **kwargs)
+
     @classmethod
     def create_from_config(cls, source, credentials_config=None):
         """Create a native adapter for a local TIFF-like file."""
@@ -173,18 +177,26 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
         # The native store has one full plane per page.  Keep that native unit
         # in the read plan, including an interleaved RGB(A) samples axis.
-        named_axes = [
-            axis
-            for axis in mapped
-            if axis not in _CANONICAL_DIMS and axis != _SAMPLES_DIM
-        ]
-        labels = named_axes + list(_CANONICAL_DIMS)
-        if _SAMPLES_DIM in mapped:
-            labels.append(_SAMPLES_DIM)
-        by_axis = {axis: int(series.shape[index]) for index, axis in enumerate(mapped)}
-        shape = [by_axis.get(axis, 1) for axis in labels]
+        if self.dim_labels:
+            if len(self.dim_labels) != len(mapped):
+                return None
+            labels = list(self.dim_labels)
+            shape = [int(size) for size in series.shape]
+        else:
+            named_axes = [
+                axis
+                for axis in mapped
+                if axis not in _CANONICAL_DIMS and axis != _SAMPLES_DIM
+            ]
+            labels = named_axes + list(_CANONICAL_DIMS)
+            if _SAMPLES_DIM in mapped:
+                labels.append(_SAMPLES_DIM)
+            by_axis = {
+                axis: int(series.shape[index]) for index, axis in enumerate(mapped)
+            }
+            shape = [by_axis.get(axis, 1) for axis in labels]
         chunk_shape = [
-            size if axis in {"Y", "X", "S"} else 1
+            size if str(axis).upper() in {"Y", "X", "S"} else 1
             for axis, size in zip(labels, shape, strict=True)
         ]
         return TensorDescriptor(
@@ -196,13 +208,11 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         )
 
     def _tifffile_descriptors(self) -> Optional[List[TensorDescriptor]]:
-        """Build descriptors from tifffile without constructing a Dask graph."""
-        if self.dim_labels:
-            # Keep the pure-tifffile path's descriptor authoritative.  Custom
-            # labels would need an explicit native-axis mapping and are better
-            # handled by the configured BioIO fallback for now.
-            return None
+        """Build descriptors from tifffile without constructing a Dask graph.
 
+        Configured labels are applied positionally to the native series shape;
+        the normalization layer owns any subsequent axis reordering.
+        """
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return None
@@ -242,6 +252,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             self.source_id,
             scene_index=scene_index,
             tensor_descriptor=descriptors[scene_index],
+            dim_labels=self.dim_labels,
             io_lock=self._io_lock,
         )
         adapter._tensor_name = field
@@ -271,10 +282,16 @@ class _TifffileAdapterBase(OmeTiffAdapter):
                 raise ValueError("unsupported tifffile axis layout")
 
             descriptor = self._tifffile_descriptor
-            by_axis = {
-                axis: int(zarr_array.shape[index]) for index, axis in enumerate(axes)
-            }
-            canonical = tuple(by_axis.get(axis, 1) for axis in descriptor.dim_labels)
+            if self._dim_labels_override:
+                canonical = tuple(int(size) for size in zarr_array.shape)
+            else:
+                by_axis = {
+                    axis: int(zarr_array.shape[index])
+                    for index, axis in enumerate(axes)
+                }
+                canonical = tuple(
+                    by_axis.get(axis, 1) for axis in descriptor.dim_labels
+                )
             if (
                 canonical != tuple(descriptor.shape)
                 or zarr_array.dtype.str != descriptor.dtype
@@ -294,6 +311,12 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         self._persistent_tiff = tiff
         self._persistent_store = store
         return zarr_array, axes
+
+    def _read_region(self, za, axes, slices):
+        """Read configured-label stores in their declared native order."""
+        if self._dim_labels_override:
+            return np.asarray(za[slices])
+        return super()._read_region(za, axes, slices)
 
     def _physical_scale(self):
         """Return TIFF resolution or LSM voxel calibration in micrometres."""

@@ -151,7 +151,7 @@ class TestContentFreeClaimsDoNotRead:
             ("scan.nii", "nifti"),
             ("scan.nii.gz", "nifti"),
             ("img.czi", "zeiss"),
-            ("img.lsm", "lsm"),
+            ("img.lsm", "zeiss"),
             ("img.lif", "leica"),
             ("img.nd2", "nikon"),
             ("img.dv", "dv"),
