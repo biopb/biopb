@@ -64,12 +64,23 @@ describe("hasVisibleEntries", () => {
 
   it("stops at the first entry worth showing", () => {
     // A collapsed wide node must not pay for a full filter to draw "{...}".
+    // Each sibling reports when its own contents are read, so this asserts the
+    // work skipped rather than elapsed time -- a shared CI runner cannot be
+    // held to a millisecond bound, and the blob below allocates enough to put
+    // a GC pause inside the measured window.
+    let inspected = 0;
     const blob: Record<string, unknown> = { first: 1 };
-    for (let i = 0; i < 2000; i++) blob[`k${i}`] = { deep: Array.from({ length: 200 }, () => null) };
+    for (let i = 0; i < 2000; i++) {
+      blob[`k${i}`] = {
+        get deep() {
+          inspected++;
+          return Array.from({ length: 200 }, () => null);
+        },
+      };
+    }
 
-    const start = performance.now();
     expect(hasVisibleEntries(blob)).toBe(true);
-    expect(performance.now() - start).toBeLessThan(5);
+    expect(inspected).toBe(0);
   });
 });
 
