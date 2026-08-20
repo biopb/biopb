@@ -20,7 +20,7 @@ from biopb_tensor_server import (
     ZarrAdapter,
 )
 from biopb_tensor_server.core import downsample as _ds
-from biopb_tensor_server.core.config import parse_config
+from biopb_tensor_server.core.config import SourceConfig, parse_config
 
 
 def _zarr_available() -> bool:
@@ -2058,3 +2058,40 @@ class TestTensorAdapterCacheIsAssignedAtInit:
         assert "_tensor_adapters" in vars(a)
         assert a._tensor_adapters == {}
         assert a._tensor_adapters is not b._tensor_adapters
+
+
+class TestBioioFrameChunkDims:
+    """BioIO TIFF/LIF reads start at one frame, not one Z stack."""
+
+    @pytest.mark.parametrize(
+        ("adapter_name", "url", "expected"),
+        [
+            ("AicsImageIoAdapter", "/stack.tif", ("Y", "X", "S")),
+            ("LeicaAdapter", "/stack.lif", ("Y", "X", "S")),
+            ("NikonAdapter", "/stack.nd2", None),
+            ("AicsImageIoAdapter", "/image.png", None),
+        ],
+    )
+    def test_chunk_dims_are_gated_and_fresh(
+        self, adapter_name, url, expected, monkeypatch
+    ):
+        bioio = pytest.importorskip("bioio")
+        from biopb_tensor_server.adapters import bioio as bioio_adapters
+
+        calls = []
+
+        class _FakeBioImage:
+            def __init__(self, image, **kwargs):
+                calls.append((image, kwargs))
+
+        monkeypatch.setattr(bioio, "BioImage", _FakeBioImage)
+        adapter_cls = getattr(bioio_adapters, adapter_name)
+        source = SourceConfig(url=url, source_id="test")
+
+        adapter_cls.create_from_config(source)
+        assert calls[-1][1].get("chunk_dims") == (
+            list(expected) if expected is not None else None
+        )
+
+        if expected is not None:
+            calls[-1][1]["chunk_dims"].append("M")

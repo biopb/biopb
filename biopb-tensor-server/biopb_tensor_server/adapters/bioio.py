@@ -57,6 +57,18 @@ _CANONICAL_DIMS = "TCZYX"
 # real cached answer meaning this scene's frames cannot be addressed by T/Z.
 _FRAME_INDEX_UNCACHED = object()
 
+# BioIO's TIFF and LIF readers default to [Z, Y, X, S]. That makes a whole Z
+# stack one Dask block, so even a one-plane read materializes every plane. Keep
+# the frame dimensions in the chunk list too: the plugins append any required
+# dimensions to the list they receive, and the list must therefore be fresh for
+# every BioImage construction.
+_FRAME_CHUNK_DIMS = ("Y", "X", "S")
+
+
+def _url_without_query(url: str) -> str:
+    """Return a lower-case URL/path suitable for suffix-based format gates."""
+    return str(url).split("?", 1)[0].split("#", 1)[0].lower()
+
 
 GENERIC_IMAGE_EXTENSIONS = frozenset(
     [
@@ -171,6 +183,13 @@ class _BioioAdapterBase(TensorAdapter):
     RETAIN_SCENE_DASK = True
 
     @classmethod
+    def _chunk_dims_for_source(
+        cls, source: "SourceConfig"
+    ) -> Optional[tuple[str, ...]]:
+        """Return format-specific BioIO chunk dimensions, if supported."""
+        return None
+
+    @classmethod
     def create_from_config(
         cls,
         source: "SourceConfig",
@@ -187,6 +206,7 @@ class _BioioAdapterBase(TensorAdapter):
         """
         from bioio import BioImage
 
+        image_kwargs: dict[str, Any] = {}
         if source.is_remote:
             # Remote storage: resolve storage_options for fsspec authentication
             storage_options = {}
@@ -197,10 +217,19 @@ class _BioioAdapterBase(TensorAdapter):
 
             # Note: for OME-Zarr, use OmeZarrAdapter (which threads fs_kwargs
             # through to zarr) rather than bioio's OME-Zarr reader.
-            img = BioImage(source.url, fs_kwargs=storage_options)
+            image = source.url
+            image_kwargs["fs_kwargs"] = storage_options
         else:
             # Local filesystem
-            img = BioImage(str(source.url))
+            image = str(source.url)
+
+        chunk_dims = cls._chunk_dims_for_source(source)
+        if chunk_dims is not None:
+            # bioio-tifffile and bioio-lif mutate this list while adding their
+            # required dimensions. Never hand them a class/module-level list.
+            image_kwargs["chunk_dims"] = list(chunk_dims)
+
+        img = BioImage(image, **image_kwargs)
 
         return cls(
             img,
@@ -626,6 +655,16 @@ class ZeissAdapter(_BioioAdapterBase):
     SOURCE_TYPE = "zeiss"
 
     @classmethod
+    def _chunk_dims_for_source(
+        cls, source: "SourceConfig"
+    ) -> Optional[tuple[str, ...]]:
+        # LSM is served by bioio-tifffile; CZI has a different reader and stays
+        # on the default construction path.
+        if _url_without_query(source.url).endswith(".lsm"):
+            return _FRAME_CHUNK_DIMS
+        return None
+
+    @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim Zeiss CZI and LSM files."""
         if not ctx.is_file():
@@ -646,6 +685,12 @@ class LeicaAdapter(_BioioAdapterBase):
     """Adapter for Leica LIF files."""
 
     SOURCE_TYPE = "leica"
+
+    @classmethod
+    def _chunk_dims_for_source(
+        cls, source: "SourceConfig"
+    ) -> Optional[tuple[str, ...]]:
+        return _FRAME_CHUNK_DIMS
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -1011,6 +1056,16 @@ class AicsImageIoAdapter(_BioioAdapterBase):
     """
 
     SOURCE_TYPE = "aics"
+
+    @classmethod
+    def _chunk_dims_for_source(
+        cls, source: "SourceConfig"
+    ) -> Optional[tuple[str, ...]]:
+        # Plain TIFF and remote/exotic OME-TIFF are the only TIFF paths that
+        # reach this fallback; local OME-TIFF is owned by OmeTiffAdapter.
+        if _url_without_query(source.url).endswith((".tif", ".tiff")):
+            return _FRAME_CHUNK_DIMS
+        return None
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
