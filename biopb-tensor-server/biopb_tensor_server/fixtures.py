@@ -677,7 +677,8 @@ def create_zeiss_lsm(
     writer is more particular than it looks:
 
     - full-resolution and reduced pages must **alternate** -- ``_series_lsm``
-      takes ``pages[0::2]`` as the image and ``pages[1::2]`` as thumbnails
+      takes ``pages[0::2]`` as the image and ``pages[1::2]`` as thumbnails,
+      whose shape it reads off the pages rather than assuming a scale
     - channels ride as samples-per-pixel, not as separate pages
     - ``metadata=None``, or TiffWriter's own "shaped" description tag wins the
       series dispatch and the file degrades to one series per page
@@ -708,6 +709,10 @@ def create_zeiss_lsm(
     header["DataType"] = 1
     header["VoxelSizeX"] = header["VoxelSizeY"] = 1e-7
     header["VoxelSizeZ"] = 5e-7
+    # Absolute thumbnail dimensions, not a ratio -- real LSMs record a fixed
+    # thumbnail size, so its scale relative to the image varies per file. The
+    # halving below is this fixture's choice; nothing may depend on the ratio.
+    header["ThumbnailX"], header["ThumbnailY"] = n_x // 2, n_y // 2
     blob = info.tobytes()
 
     # Page order is (T, Z); channels are samples within a page -> TZYXC.
