@@ -237,12 +237,14 @@ class _BioioAdapterBase(TensorAdapter):
         self.scene_index = scene_index
         self.source_id = source_id
 
-        # Thread lock for serializing IO operations
+        # Serializes every touch of the shared BioImage. Reentrant because the
+        # guarded methods nest -- list_tensor_descriptors reaches _bio_image
+        # both directly and through _metadata_for_listing.
         # Source-level creates lock, scene-level receives from source
         if io_lock is not None:
             self._io_lock = io_lock
         else:
-            self._io_lock = threading.Lock()
+            self._io_lock = threading.RLock()
 
         # Source-level metadata for DataSourceDescriptor
         if source_url:
@@ -341,15 +343,17 @@ class _BioioAdapterBase(TensorAdapter):
 
     def _release_bioio_dask_cache(self) -> None:
         """Release BioIO's current-scene lazy array without clearing metadata."""
-        self._bio_image._xarray_dask_data = None
-        self._bio_image._dims = None
-        reader = self._bio_image.reader
-        reader._xarray_dask_data = None
-        reader._dims = None
+        with self._io_lock:
+            self._bio_image._xarray_dask_data = None
+            self._bio_image._dims = None
+            reader = self._bio_image.reader
+            reader._xarray_dask_data = None
+            reader._dims = None
 
     def _metadata_for_listing(self) -> Any:
         """Return metadata used by the cheap multi-scene descriptor path."""
-        return self._bio_image.ome_metadata
+        with self._io_lock:
+            return self._bio_image.ome_metadata
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors (scenes) available in this source via bioio.
@@ -365,6 +369,16 @@ class _BioioAdapterBase(TensorAdapter):
         if self._cached_descriptors is not None:
             return self._cached_descriptors
 
+        with self._io_lock:
+            # Re-check: another thread may have built these while this one
+            # waited for the lock.
+            if self._cached_descriptors is not None:
+                return self._cached_descriptors
+            self._cached_descriptors = self._build_tensor_descriptors()
+        return self._cached_descriptors
+
+    def _build_tensor_descriptors(self) -> List[TensorDescriptor]:
+        """Enumerate every scene's descriptor. Caller holds ``_io_lock``."""
         descriptors = []
         scene_ids = list(self._bio_image.scenes)
 
@@ -447,8 +461,6 @@ class _BioioAdapterBase(TensorAdapter):
                     )
                 )
 
-        # Cache for future calls
-        self._cached_descriptors = descriptors
         return descriptors
 
     def _scene_index_for_field(self, field: Optional[str]) -> int:
@@ -467,7 +479,8 @@ class _BioioAdapterBase(TensorAdapter):
                 if self._within_source_field(d.array_id) == field:
                     return i
             raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
-        scene_ids = list(self._bio_image.scenes)
+        with self._io_lock:
+            scene_ids = list(self._bio_image.scenes)
         try:
             return scene_ids.index(field)
         except ValueError as e:
@@ -521,7 +534,8 @@ class _BioioAdapterBase(TensorAdapter):
             OME metadata as dict, or empty dict if unavailable.
         """
         try:
-            ome_meta = self._bio_image.ome_metadata
+            with self._io_lock:
+                ome_meta = self._bio_image.ome_metadata
             if ome_meta is None:
                 return {}
 
@@ -552,7 +566,8 @@ class _BioioAdapterBase(TensorAdapter):
         See ``TensorAdapter._physical_scale``.
         """
         try:
-            ome = self._bio_image.ome_metadata
+            with self._io_lock:
+                ome = self._bio_image.ome_metadata
             if ome is None or not getattr(ome, "images", None):
                 return None
 
@@ -575,7 +590,11 @@ class _BioioAdapterBase(TensorAdapter):
                 "z": (px.physical_size_z, _unit(px.physical_size_z_unit)),
             }
 
-            labels = self.dim_labels or list(self._bio_image.dims.order)
+            if self.dim_labels:
+                labels = self.dim_labels
+            else:
+                with self._io_lock:
+                    labels = list(self._bio_image.dims.order)
             scale, unit = [], []
             for lab in labels:
                 v, u = by_label.get(str(lab).lower(), (None, ""))
@@ -654,10 +673,11 @@ class NikonAdapter(_BioioAdapterBase):
     def _processed_metadata(self) -> Any:
         """Return BioIO's processed metadata, degrading to empty on failure."""
         if self._metadata_cache is None:
-            try:
-                self._metadata_cache = self._bio_image.metadata
-            except Exception:
-                self._metadata_cache = {}
+            with self._io_lock:
+                try:
+                    self._metadata_cache = self._bio_image.metadata
+                except Exception:
+                    self._metadata_cache = {}
         return self._metadata_cache
 
     def _metadata_for_listing(self) -> Any:

@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -183,3 +184,70 @@ def test_nikon_metadata_failure_degrades_to_empty(tmp_path):
 
     assert adapter.get_metadata() == {}
     assert adapter._physical_scale() is None
+
+
+def test_scene_switch_does_not_race_a_concurrent_read():
+    """A descriptor listing must not repoint the scene under a running read.
+
+    list_tensor_descriptors walks every scene, leaving BioIO bound to the last
+    one. A reader bound to scene 0 that does not hold _io_lock across its own
+    set_scene and array access would come back with scene 1's pixels.
+    """
+    import time
+
+    scenes = {
+        0: np.full((1, 1, 1, 2, 2), 7, np.uint8),
+        1: np.full((1, 1, 1, 2, 2), 9, np.uint8),
+    }
+    chunks = ((1,), (1,), (1,), (2,), (2,))
+    reader_is_mid_read = threading.Event()
+    reader_thread = None
+
+    class _SceneSwitchingBioImage(_FakeBioImage):
+        def __init__(self):
+            super().__init__(scenes[0], "TCZYX", chunks)
+            self.scenes = ["s0", "s1"]
+            self.ome_metadata = None
+
+        def set_scene(self, scene_index):
+            index = (
+                self.scenes.index(scene_index)
+                if isinstance(scene_index, str)
+                else scene_index
+            )
+            self.dask_data = _FakeDaskArray(scenes[index], chunks)
+            if threading.current_thread() is reader_thread:
+                # Widen the window between binding this scene's lazy array and
+                # the caller reading it, where an unlocked lister interleaves
+                # and leaves the binding on its own last scene.
+                reader_is_mid_read.set()
+                time.sleep(0.2)
+
+    image = _SceneSwitchingBioImage()
+    source = NikonAdapter(image, scene_index=None, source_id="source")
+    reader = NikonAdapter(
+        image, scene_index=0, source_id="source", io_lock=source._io_lock
+    )
+
+    observed = []
+
+    def _read():
+        observed.append(
+            reader._get_data_via_bioio(
+                ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 2, 2])
+            )
+        )
+
+    def _list():
+        reader_is_mid_read.wait(timeout=5)
+        source.list_tensor_descriptors()
+
+    reader_thread = threading.Thread(target=_read)
+    threads = [reader_thread, threading.Thread(target=_list)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads), "deadlocked"
+    assert observed and np.array_equal(observed[0], scenes[0])
