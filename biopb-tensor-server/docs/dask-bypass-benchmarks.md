@@ -235,16 +235,23 @@ native reader against a held handle is O(1).
    The block-count row is the O(blocks) graph cost; the 4-block row isolates the
    over-read, where only the tile column moves.
 
-   The fallback to BioIO is per-condition, decided by what BioIO can actually
-   read — `bioio-czi` defaults to `use_aicspylibczi=False`, i.e. this same
-   pylibCZIrw, so "hand it to BioIO" is not a general escape hatch. An RGB
-   (`Bgr*`) document defers (BioIO reads it as T/C/Z/Y/X/S); a document mixing
-   pixel types across channels raises, because BioIO fails on it with
-   `cannot reshape array of size N` from inside its dask graph. A document
-   whose subblock coordinates do not start at 0 is not detectable at
-   registration — `total_bounding_box` reports a *count*, not an index range,
-   so a file written at T=5..7 reports `T: (0, 3)` — and both readers raise
-   `Coordinate for dimension 'T' is out-of-range` on the first read. `zoom=` is **not** wired up: the
+   `CziAdapter` has **no BioIO fallback** and imports nothing from it: every
+   local CZI is served natively, and a remote one is declined by `claim()` so
+   the registry hands it to `ZeissAdapter`. RGB (`Bgr*`) documents read with a
+   trailing samples axis, byte-identical to BioIO (libCZI returns the samples
+   as stored and BioIO does not reorder them). An acquisition dimension outside
+   T/C/Z — phase, view, illumination, rotation, block — is carried under its
+   own name ahead of the canonical axes rather than folded onto one of them;
+   the normalization contract only requires Y/X and samples to trail, so any
+   other label is legal where it sits. The one refusal is a document whose
+   channels differ in pixel type: it has no single tensor dtype, and BioIO
+   fails on it too (`cannot reshape array of size N`).
+
+   One thing neither reader can detect at registration: a document whose
+   subblock coordinates do not start at 0. `total_bounding_box` reports a
+   *count*, not an index range, so a file written at T=5..7 reports `T: (0, 3)`
+   and both readers raise `Coordinate for dimension 'T' is out-of-range` on the
+   first read. `zoom=` is **not** wired up: the
    server downsamples a scaled chunk with `downsample_block`, whose reduction
    methods (`area`/`max`/...) libCZI's own scaling accessor does not reproduce,
    so routing scaled reads through it would silently change pixel values. That

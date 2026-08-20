@@ -12,18 +12,16 @@ that way against 1.09 ms through ``pylibCZIrw.read(roi=...)``; see
 This adapter reads through libCZI directly: ``read(plane=..., scene=...,
 roi=...)`` decodes only the subblocks the requested region covers.
 
-**Supported subset.**  Grayscale pixel types, and no acquisition dimension
-outside T/C/Z carrying more than one index.  A document outside it -- an RGB
-(``Bgr*``) one, a phase/view/illumination axis, a remote URL -- is handed back
-to :class:`~biopb_tensor_server.adapters.bioio.ZeissAdapter` by
-:meth:`CziAdapter.create_from_config`, so every CZI stays readable and only the
-subset this reader can serve faithfully takes the fast path.  What is *not*
-deferred is a document BioIO cannot read either -- one that fails to open, or
-mixes pixel types across channels -- because BioIO reads CZI through this same
-pylibCZIrw by default: deferring would trade a precise error for a confusing
-one raised from inside a dask graph.  Mosaics need no special case: libCZI composes their tiles behind ``read()``, which is also what
-BioIO's ``reconstruct_mosaic`` returns, and the scene's bounding rectangle is
-already the composed extent.
+**Scope.**  Every local CZI, whatever its acquisition dimensions.  Grayscale
+and RGB (``Bgr*``) pixel types both read natively, and an axis outside T/C/Z --
+phase, view, illumination, rotation, block -- is carried as its own descriptor
+axis under its own name rather than being folded onto a biological one: the
+normalization contract only requires that Y/X (and a samples axis) come last,
+so any other label is legal wherever it sits.  A remote CZI is declined by
+:meth:`CziAdapter.claim`, so it falls to BioIO's ``ZeissAdapter`` through the
+registry -- this module imports nothing from BioIO and has no fallback path of
+its own.  The one document it refuses is one no reader can represent as a
+single tensor: pixel types that differ across channels.
 
 **Handle policy.**  The reader is kept warm between reads and closed by the
 shared idle reaper, the same opt-in :mod:`_handle_reaper` describes for
@@ -38,6 +36,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from itertools import product
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -62,18 +61,29 @@ logger = logging.getLogger(__name__)
 
 CZI_EXTENSION = ".czi"
 
-# Descriptor axis order.  libCZI addresses a plane by name and returns it as
-# Y/X, so this order is the adapter's own convention rather than the file's;
-# it matches what BioIO reported for the same documents.
+# Descriptor axis order.  libCZI addresses a plane by dimension name and hands
+# back Y/X (plus samples for RGB), so the order below is this adapter's own
+# convention; T/C/Z/Y/X matches what BioIO reports for the same documents.
 _PLANE_DIMS = ("T", "C", "Z")
-_CANONICAL_DIMS = ("T", "C", "Z", "Y", "X")
+_SPATIAL_DIMS = ("Y", "X")
+_SAMPLES_DIM = "S"
 
-# libCZI pixel types this adapter serves, mapped to their numpy dtype string.
-# Bgr* types are deliberately absent -- see the module docstring.
+# libCZI's other acquisition dimensions, outermost first (the reverse of its
+# own dimension-index order, where Z is innermost).  They are addressed exactly
+# like T/C/Z and keep their own names in the descriptor, ahead of the canonical
+# axes -- the same shape the native TIFF adapter uses for position/mosaic axes.
+_EXTRA_DIMS = ("B", "V", "H", "I", "R")
+
+# libCZI pixel types, mapped to (numpy dtype string, samples per pixel).  A
+# Bgr* read comes back as (Y, X, 3) in the file's own channel order -- BioIO
+# reports the identical values, so neither reader reorders them.
 _PIXEL_TYPES = {
-    "Gray8": "|u1",
-    "Gray16": "<u2",
-    "Gray32Float": "<f4",
+    "Gray8": ("|u1", 1),
+    "Gray16": ("<u2", 1),
+    "Gray32Float": ("<f4", 1),
+    "Bgr24": ("|u1", 3),
+    "Bgr48": ("<u2", 3),
+    "Bgr96Float": ("<f4", 3),
 }
 
 # One pool for CZI readers, separate from the OME-TIFF store pool so each is
@@ -101,44 +111,50 @@ class _CziLayout:
     """
 
     scenes: Tuple[_CziScene, ...]
+    #: Non-spatial axes in descriptor order: the document's extra acquisition
+    #: dimensions (if any) followed by T, C, Z.
+    plane_axes: Tuple[str, ...]
     plane_sizes: Dict[str, int]
     dtype: str
+    #: Samples per pixel: 1 for grayscale, 3 for an RGB (``Bgr*``) document.
+    samples: int
     scale_um: Dict[str, Optional[float]]
     #: The metadata document's Information subtree only -- the rest is hardware
     #: settings that can run to megabytes and nothing here reads them.
     information: Dict[str, Any]
 
 
-def _plane_sizes(bounding_box: Dict[str, Tuple[int, int]]) -> Optional[Dict[str, int]]:
-    """Extract T/C/Z sizes, or None when an axis this reader cannot address varies.
+def _plane_axes(
+    bounding_box: Dict[str, Tuple[int, int]],
+) -> Tuple[Tuple[str, ...], Dict[str, int]]:
+    """Split a bounding box into the non-spatial axes and their sizes.
 
     ``total_bounding_box`` reports every acquisition dimension the document
-    uses, X and Y included.  Anything outside T/C/Z (phase, view, illumination,
-    rotation, block) is left at index 0 by ``read()``, so a document that varies
-    one is not fully addressable here.  BioIO's own model is T/C/Z/Y/X, so it
-    drops such an axis the same way -- the fallback is the status quo, not a
-    fix.  Scene and mosaic axes never appear in this box: scenes are addressed
-    by the ``scene`` argument and mosaic tiles are composed by ``read()``.
+    uses, X and Y included.  T, C and Z are always described (size 1 when
+    absent) so an ordinary document keeps the T/C/Z/Y/X shape BioIO reports.
+    Any other dimension -- phase, view, illumination, rotation, block -- is
+    carried under its own name ahead of them, and only when it actually varies:
+    libCZI's own default plane coordinates include a dimension only at size > 1,
+    and ``read()`` ignores a key for a dimension the document does not vary.
+
+    Scene and mosaic axes never appear in this box: scenes are addressed by the
+    ``scene`` argument and mosaic tiles are composed by ``read()``.
 
     The extents are **counts, not index ranges** -- a document whose T
     subblocks sit at 5..7 reports ``T: (0, 3)``, and its readable indices are
-    still 5..7.  So the start conveys nothing and a non-zero-based document is
+    still 5..7.  So the start conveys nothing, and a non-zero-based document is
     not detectable here; ``read()`` raises "Coordinate for dimension 'T' is
-    out-of-range" on the first read.  BioIO raises the same error from the same
-    libCZI, so there is nothing to defer to and nothing to gain from finding
-    out earlier (which would cost an O(subblocks) enumeration).
+    out-of-range" on the first read.  Finding out earlier would cost an
+    O(subblocks) enumeration and change nothing: no reader here can serve it.
     """
-    sizes = {}
-    for axis, extent in bounding_box.items():
-        if axis in ("X", "Y"):
-            continue
-        size = int(extent[1]) - int(extent[0])
-        if axis not in _PLANE_DIMS:
-            if size > 1:
-                return None
-            continue
-        sizes[axis] = size
-    return {axis: int(sizes.get(axis, 1)) for axis in _PLANE_DIMS}
+    sizes = {
+        axis: int(extent[1]) - int(extent[0])
+        for axis, extent in bounding_box.items()
+        if axis not in _SPATIAL_DIMS
+    }
+    extra = tuple(axis for axis in _EXTRA_DIMS if sizes.get(axis, 1) > 1)
+    axes = extra + _PLANE_DIMS
+    return axes, {axis: max(1, int(sizes.get(axis, 1))) for axis in axes}
 
 
 def _scaling_um(metadata: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -174,35 +190,29 @@ def _image_information(metadata: Dict[str, Any]) -> Dict[str, Any]:
     return dict(information) if isinstance(information, dict) else {}
 
 
-def read_layout(path: str) -> Optional[_CziLayout]:
-    """Probe a CZI document.
+def read_layout(path: str) -> _CziLayout:
+    """Probe a CZI document and describe what it takes to read it.
 
-    Returns None when the document is readable but outside this reader's
-    subset, so the caller can defer to BioIO.  Raises when the document is one
-    *neither* reader can serve: deferring then would trade a precise error for
-    a confusing one from inside BioIO's dask graph.
+    Raises for a document that cannot be represented as one tensor at all --
+    channels of differing pixel type, or a scene with no pixels.  There is no
+    "outside the subset" return: every other local CZI is served here.
     """
     from pylibCZIrw import czi as pyczi
 
     with pyczi.open_czi(path) as czi:
         pixel_types = set(czi.pixel_types.values())
         if len(pixel_types) != 1:
-            # No single descriptor dtype. BioIO cannot serve this either -- it
-            # reshapes every channel to one array and fails with "cannot
-            # reshape array of size N" -- so this is an error, not a fallback.
             raise ValueError(
                 f"CZI {path} mixes pixel types across channels "
-                f"({sorted(czi.pixel_types.values())}); no reader here can "
-                "represent that as one tensor"
+                f"({sorted(czi.pixel_types.values())}); that has no single "
+                "tensor dtype"
             )
-        dtype = _PIXEL_TYPES.get(pixel_types.pop())
-        if dtype is None:
-            # An RGB (Bgr*) document. BioIO reads it as T/C/Z/Y/X/S, so defer.
-            return None
+        pixel_type = pixel_types.pop()
+        if pixel_type not in _PIXEL_TYPES:
+            raise ValueError(f"CZI {path} has unsupported pixel type {pixel_type!r}")
+        dtype, samples = _PIXEL_TYPES[pixel_type]
 
-        plane_sizes = _plane_sizes(czi.total_bounding_box)
-        if plane_sizes is None:
-            return None
+        plane_axes, plane_sizes = _plane_axes(czi.total_bounding_box)
 
         rectangles = czi.scenes_bounding_rectangle
         if rectangles:
@@ -214,37 +224,21 @@ def read_layout(path: str) -> Optional[_CziLayout]:
             rect = czi.total_bounding_rectangle
             scenes = (_CziScene(0, rect.x, rect.y, rect.w, rect.h),)
         if any(scene.width <= 0 or scene.height <= 0 for scene in scenes):
-            # No pixels to address. Defensive: pylibCZIrw's writer cannot
-            # produce this, so it means a malformed document rather than a
-            # layout BioIO would read better.
+            # Defensive: pylibCZIrw's writer cannot produce this, so it means a
+            # malformed document rather than a layout to describe.
             raise ValueError(f"CZI {path} has a scene with an empty rectangle")
 
         metadata = czi.metadata
 
     return _CziLayout(
         scenes=scenes,
+        plane_axes=plane_axes,
         plane_sizes=plane_sizes,
         dtype=dtype,
+        samples=samples,
         scale_um=_scaling_um(metadata),
         information=_image_information(metadata),
     )
-
-
-def _bioio_fallback(
-    source: "SourceConfig",
-    credentials_config: Optional[Any],
-    reason: str,
-) -> TensorAdapter:
-    """Serve a CZI this reader declines through BioIO instead."""
-    try:
-        from biopb_tensor_server.adapters.bioio import ZeissAdapter
-    except ImportError as exc:
-        raise ValueError(
-            f"CZI {source.url} needs the BioIO fallback ({reason}) "
-            "but bioio-czi is not installed"
-        ) from exc
-    logger.info("czi: serving %s through BioIO (%s)", source.url, reason)
-    return ZeissAdapter.create_from_config(source, credentials_config)
 
 
 class CziAdapter(TensorAdapter):
@@ -285,30 +279,29 @@ class CziAdapter(TensorAdapter):
         source: "SourceConfig",
         credentials_config: Optional[Any] = None,
     ) -> TensorAdapter:
-        """Build a native adapter, or BioIO's when this reader cannot serve the file.
+        """Create a native adapter for a local CZI.
 
-        Returning the fallback from here rather than declining the claim keeps
-        the decision on the one path that may read the file: discovery claims by
-        extension alone, so the layout is not yet known when the claim is made.
+        A remote CZI never reaches here through discovery -- ``claim`` declines
+        it, so BioIO's ``ZeissAdapter`` takes it from the registry -- and an
+        explicitly configured remote url is refused rather than silently
+        rerouted.  A probe that raises propagates: ``bioio-czi`` reads through
+        this same pylibCZIrw by default, so a file libCZI cannot open would not
+        be readable by way of a fallback either.
         """
         if source.is_remote:
-            return _bioio_fallback(source, credentials_config, "remote source")
+            raise ValueError(f"{cls.__name__} only supports local files")
 
         # ``file://`` counts as local (see ``is_remote_url``), but libCZI takes a
         # filesystem path.
         url = str(source.url)
         path = url[len("file://") :] if url.startswith("file://") else url
 
-        # A raised probe propagates. ``bioio-czi`` reads through this same
-        # pylibCZIrw by default (``use_aicspylibczi=False``), so a file libCZI
-        # cannot open is not readable through the fallback either -- catching it
-        # here would trade a precise error for a slow path that fails anyway.
-        # Only a structural decline (None) falls back.
-        layout = read_layout(path)
-        if layout is None:
-            return _bioio_fallback(source, credentials_config, "unsupported layout")
-
-        return cls(path, source.source_id, layout, dim_labels=source.dim_labels)
+        return cls(
+            path,
+            source.source_id,
+            layout=read_layout(path),
+            dim_labels=source.dim_labels,
+        )
 
     def __init__(
         self,
@@ -328,17 +321,20 @@ class CziAdapter(TensorAdapter):
         # Position in ``layout.scenes``, not the scene's own CZI index -- the two
         # coincide for a well-formed document but the read uses ``scene.index``.
         self.scene_position = scene_position
-        if dim_labels and len(dim_labels) != len(_CANONICAL_DIMS):
+        native_labels = list(layout.plane_axes) + list(_SPATIAL_DIMS)
+        if layout.samples > 1:
+            native_labels.append(_SAMPLES_DIM)
+        if dim_labels and len(dim_labels) != len(native_labels):
             logger.warning(
-                "czi: ignoring %d configured dim_labels for %s -- this reader "
-                "always builds a %d-axis %s array",
+                "czi: ignoring %d configured dim_labels for %s -- this document "
+                "reads as a %d-axis %s array",
                 len(dim_labels),
                 url,
-                len(_CANONICAL_DIMS),
-                "".join(_CANONICAL_DIMS),
+                len(native_labels),
+                "".join(native_labels),
             )
             dim_labels = None
-        self.dim_labels = list(dim_labels or _CANONICAL_DIMS)
+        self.dim_labels = list(dim_labels or native_labels)
 
         # One lock per source, shared with its scene adapters: libCZI's reader
         # is not documented as thread-safe, and it also fences a reaper close
@@ -361,16 +357,19 @@ class CziAdapter(TensorAdapter):
 
     def _descriptor_for(self, position: int) -> TensorDescriptor:
         scene = self._layout.scenes[position]
-        sizes = self._layout.plane_sizes
-        shape = [sizes["T"], sizes["C"], sizes["Z"], scene.height, scene.width]
+        layout = self._layout
+        trailing = [scene.height, scene.width]
+        if layout.samples > 1:
+            trailing.append(layout.samples)
+        shape = [layout.plane_sizes[axis] for axis in layout.plane_axes] + trailing
         return TensorDescriptor(
             array_id=f"{self.source_id}/Scene:{scene.index}",
             dim_labels=list(self.dim_labels),
             # libCZI decodes per subblock, and a subblock never spans planes --
             # one plane is the unit a read can be planned around.
-            chunk_shape=[1, 1, 1, scene.height, scene.width],
+            chunk_shape=[1] * len(layout.plane_axes) + trailing,
             shape=shape,
-            dtype=self._layout.dtype,
+            dtype=layout.dtype,
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
@@ -420,37 +419,50 @@ class CziAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read the requested region, one libCZI plane read per T/C/Z index."""
+        """Read the requested region, one libCZI read per plane coordinate."""
         if self.scene_position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)  # validate bounds against the descriptor
         scene = self._scene()
+        layout = self._layout
         starts = [int(value) for value in bounds.start]
         stops = [int(value) for value in bounds.stop]
-        # Descriptor positions, not labels: a configured dim_labels renames the
-        # axes but never reorders the array this adapter builds.
-        t0, c0, z0, y0, x0 = starts
-        t1, c1, z1, y1, x1 = stops
+
+        # Positions, not labels: a configured dim_labels renames the axes but
+        # never reorders the array this adapter builds. The plane axes come
+        # first, then Y and X, then samples for an RGB document.
+        n_plane = len(layout.plane_axes)
+        y0, x0 = starts[n_plane], starts[n_plane + 1]
+        y1, x1 = stops[n_plane], stops[n_plane + 1]
         roi = (scene.x + x0, scene.y + y0, x1 - x0, y1 - y0)
+        if layout.samples > 1:
+            sample_slice = slice(starts[n_plane + 2], stops[n_plane + 2])
+        else:
+            # Grayscale reads come back as (Y, X, 1); drop that trailing axis.
+            sample_slice = 0
 
         output = np.empty(
-            (t1 - t0, c1 - c0, z1 - z0, y1 - y0, x1 - x0),
-            dtype=np.dtype(self._layout.dtype),
+            tuple(stop - start for start, stop in zip(starts, stops, strict=True)),
+            dtype=np.dtype(layout.dtype),
         )
+        coordinate_ranges = [
+            range(starts[axis], stops[axis]) for axis in range(n_plane)
+        ]
         with self._io_lock:
             reader = self._acquire_reader()
             try:
-                for t in range(t0, t1):
-                    for c in range(c0, c1):
-                        for z in range(z0, z1):
-                            plane = reader.read(
-                                plane={"T": t, "C": c, "Z": z},
-                                scene=scene.index,
-                                roi=roi,
-                            )
-                            # Grayscale reads come back as (Y, X, 1).
-                            output[t - t0, c - c0, z - z0] = plane[..., 0]
+                for coordinates in product(*coordinate_ranges):
+                    plane = reader.read(
+                        plane=dict(zip(layout.plane_axes, coordinates, strict=True)),
+                        scene=scene.index,
+                        roi=roi,
+                    )
+                    destination = tuple(
+                        coordinate - starts[axis]
+                        for axis, coordinate in enumerate(coordinates)
+                    )
+                    output[destination] = plane[..., sample_slice]
                 self._persistent_last_access = time.monotonic()
             except Exception:
                 # A half-open reader is not reusable; drop it so the next read

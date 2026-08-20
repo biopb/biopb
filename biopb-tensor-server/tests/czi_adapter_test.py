@@ -16,16 +16,25 @@ pytest.importorskip("pylibCZIrw")
 
 from biopb_tensor_server.adapters import (  # noqa: E402
     CziAdapter,
+    czi as czi_module,  # noqa: E402
     get_default_registry,
 )
 from biopb_tensor_server.adapters.czi import (  # noqa: E402
-    _plane_sizes,
+    _plane_axes,
     read_layout,
 )
 from biopb_tensor_server.fixtures import (  # noqa: E402
     create_zeiss_czi,
     create_zeiss_czi_scenes,
 )
+
+
+class _RemoteCtx(LiveLocalContext):
+    """A claim context that reports itself remote, as a RemoteContext does."""
+
+    @property
+    def is_remote(self) -> bool:
+        return True
 
 
 def _source(path, source_id="czi", **kwargs):
@@ -232,8 +241,6 @@ def test_reader_stays_warm_between_reads_and_closes_on_release(tmp_path):
 
 
 def test_idle_reader_is_reaped(tmp_path):
-    from biopb_tensor_server.adapters import czi as czi_module
-
     path, _ = create_zeiss_czi(str(tmp_path), n_c=1, n_z=1, image_shape=(8, 8))
     source = _native(path)
     scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
@@ -246,30 +253,53 @@ def test_idle_reader_is_reaped(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "bounding_box, expected",
+    "bounding_box, axes, sizes",
     [
         (
             {"T": (0, 3), "C": (0, 2), "Z": (0, 4), "X": (0, 8), "Y": (0, 8)},
+            ("T", "C", "Z"),
             {"T": 3, "C": 2, "Z": 4},
         ),
-        # Absent axes are size 1, not missing.
-        ({"C": (0, 2), "X": (0, 8), "Y": (0, 8)}, {"T": 1, "C": 2, "Z": 1}),
-        # A singleton axis this reader cannot address is harmless: read() pins
-        # it at its only index anyway.
+        # Absent canonical axes are size 1, not missing -- an ordinary document
+        # keeps the T/C/Z/Y/X shape BioIO reports.
+        (
+            {"C": (0, 2), "X": (0, 8), "Y": (0, 8)},
+            ("T", "C", "Z"),
+            {"T": 1, "C": 2, "Z": 1},
+        ),
+        # A singleton exotic axis is not carried: libCZI's own default plane
+        # coordinates include a dimension only at size > 1.
         (
             {"H": (0, 1), "Z": (0, 2), "X": (0, 8), "Y": (0, 8)},
+            ("T", "C", "Z"),
             {"T": 1, "C": 1, "Z": 2},
         ),
-        # A varying one is not: read() would silently serve index 0 only.
-        ({"H": (0, 3), "Z": (0, 2), "X": (0, 8), "Y": (0, 8)}, None),
+        # A varying one keeps its own name, ahead of the canonical axes.
+        (
+            {"H": (0, 3), "Z": (0, 2), "X": (0, 8), "Y": (0, 8)},
+            ("H", "T", "C", "Z"),
+            {"H": 3, "T": 1, "C": 1, "Z": 2},
+        ),
+        # Several, outermost first.
+        (
+            {"H": (0, 2), "V": (0, 4), "X": (0, 8), "Y": (0, 8)},
+            ("V", "H", "T", "C", "Z"),
+            {"V": 4, "H": 2, "T": 1, "C": 1, "Z": 1},
+        ),
         # The extents are counts, not index ranges -- libCZI reports (0, n)
         # whatever the file's own coordinates are -- so the start carries no
         # information and is not read.
-        ({"Z": (2, 5), "X": (0, 8), "Y": (0, 8)}, {"T": 1, "C": 1, "Z": 3}),
+        (
+            {"Z": (2, 5), "X": (0, 8), "Y": (0, 8)},
+            ("T", "C", "Z"),
+            {"T": 1, "C": 1, "Z": 3},
+        ),
     ],
 )
-def test_plane_sizes_declines_axes_it_cannot_address(bounding_box, expected):
-    assert _plane_sizes(bounding_box) == expected
+def test_plane_axes_carries_exotic_dimensions_under_their_own_names(
+    bounding_box, axes, sizes
+):
+    assert _plane_axes(bounding_box) == (axes, sizes)
 
 
 def test_mixed_pixel_types_raise_rather_than_defer(tmp_path):
@@ -289,50 +319,67 @@ def test_mixed_pixel_types_raise_rather_than_defer(tmp_path):
         read_layout(str(path))
 
 
-def test_rgb_document_is_outside_the_native_subset(tmp_path):
+def test_rgb_document_reads_natively_with_a_samples_axis(tmp_path):
+    """A Bgr* document gets a trailing samples axis, in the file's own order.
+
+    libCZI hands back the three samples as stored and BioIO reports the
+    identical values, so neither reader reorders them.
+    """
     from pylibCZIrw import czi as pyczi
 
     path = Path(tmp_path) / "rgb.czi"
+    expected = np.zeros((6, 8, 3), dtype=np.uint8)
+    expected[..., 0], expected[..., 1], expected[..., 2] = 11, 22, 33
     with pyczi.create_czi(str(path)) as writer:
-        writer.write(
-            np.zeros((8, 8, 3), dtype=np.uint8), plane={"C": 0, "Z": 0, "T": 0}
-        )
+        writer.write(expected, plane={"C": 0, "Z": 0, "T": 0})
 
-    assert read_layout(str(path)) is None
+    source = _native(path)
+    descriptor = source.list_tensor_descriptors()[0]
+    assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X", "S"]
+    assert list(descriptor.shape) == [1, 1, 1, 6, 8, 3]
+    assert descriptor.dtype == np.dtype(np.uint8).str
 
+    scene = source.get_tensor_adapter(descriptor.array_id)
+    whole = scene.get_data(ChunkBounds(start=[0] * 6, stop=[1, 1, 1, 6, 8, 3]))
+    np.testing.assert_array_equal(whole[0, 0, 0], expected)
 
-def test_declined_layout_falls_back_to_bioio(tmp_path, monkeypatch):
-    pytest.importorskip("bioio_czi")
-    from biopb_tensor_server.adapters import czi as czi_module
-    from biopb_tensor_server.adapters.bioio import ZeissAdapter
-
-    path, expected = create_zeiss_czi(str(tmp_path), n_c=1, n_z=2, image_shape=(16, 16))
-    monkeypatch.setattr(czi_module, "read_layout", lambda _: None)
-
-    source = CziAdapter.create_from_config(_source(path))
-    assert isinstance(source, ZeissAdapter)
-
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
-    np.testing.assert_array_equal(
-        scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 2, 16, 16])), expected
+    # A crop still addresses Y/X through the ROI and slices samples.
+    crop = scene.get_data(
+        ChunkBounds(start=[0, 0, 0, 2, 3, 1], stop=[1, 1, 1, 5, 7, 3])
     )
+    np.testing.assert_array_equal(crop[0, 0, 0], expected[2:5, 3:7, 1:3])
 
 
-def test_remote_czi_falls_back_to_bioio(monkeypatch):
-    pytest.importorskip("bioio_czi")
-    from biopb_tensor_server.adapters.bioio import ZeissAdapter
+def test_remote_source_is_refused_rather_than_rerouted(tmp_path):
+    """Discovery never routes a remote CZI here -- ``claim`` declines it."""
+    path = Path(tmp_path) / "img.czi"
+    path.write_bytes(b"ZISRAWFILE")
 
-    built = {}
+    assert CziAdapter.claim(_RemoteCtx(path), DiscoveryState()) is None
 
-    def fake_create(source, credentials_config=None):
-        built["url"] = str(source.url)
-        return "bioio-adapter"
-
-    monkeypatch.setattr(ZeissAdapter, "create_from_config", fake_create)
     source = SourceConfig(url="s3://bucket/img.czi", type="czi", source_id="remote")
+    with pytest.raises(ValueError, match="only supports local files"):
+        CziAdapter.create_from_config(source)
 
-    assert CziAdapter.create_from_config(source) == "bioio-adapter"
-    assert built["url"] == "s3://bucket/img.czi"
+
+def test_remote_czi_is_claimed_by_the_bioio_adapter(tmp_path):
+    """The hand-off is the registry's, not an import: BioIO claims what this
+    adapter declines."""
+    pytest.importorskip("bioio_czi")
+    path = Path(tmp_path) / "img.czi"
+    path.write_bytes(b"ZISRAWFILE")
+
+    claims = get_default_registry().get_claims_for_path(
+        _RemoteCtx(path), DiscoveryState()
+    )
+    assert [c.source_type for c in claims] == ["zeiss"]
+
+
+def test_module_does_not_import_bioio():
+    """No fallback path, so no BioIO dependency in this module."""
+    source = Path(czi_module.__file__).read_text()
+    assert "adapters.bioio" not in source
+    assert "import bioio" not in source
 
 
 def test_claim_is_definite_under_a_cloud_root(tmp_path):

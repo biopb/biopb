@@ -135,8 +135,8 @@ def get_default_registry() -> AdapterRegistry:
       native pyramid)
     - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
     - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
-    - ZeissAdapter - Zeiss microscopy (remote/cloud/non-resident CZI and LSM
-      fallback, and any CZI layout the native reader declines)
+    - ZeissAdapter - Zeiss microscopy (remote CZI and LSM only; the native
+      adapters above own every local one)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
     - DvAdapter - DeltaVision DV files
@@ -172,8 +172,8 @@ def get_default_registry() -> AdapterRegistry:
     registry.register(LsmAdapter, "lsm")
 
     # Native libCZI path, same shape as the tifffile ones above.  Its claim is
-    # extension-only; a layout this reader cannot serve faithfully falls back to
-    # BioIO when the adapter is constructed, not when the claim is made.
+    # extension-only and definite for every local .czi -- it declines only
+    # remote paths, which fall through to BioIO's ZeissAdapter below.
     if CziAdapter is not None:
         registry.register(CziAdapter, "czi")
 

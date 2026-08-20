@@ -18,7 +18,8 @@ descriptor/data consistency; with no file present the test self-skips.
 
 A local `.czi` is claimed by the native `CziAdapter` now (biopb/biopb#799), so
 the CZI row's test asserts that routing while still reading through
-`ZeissAdapter` — the path that serves any layout the native reader declines.
+`ZeissAdapter` — which keeps this a regression test for the `bioio-czi` plugin
+itself, the path a *remote* CZI still takes.
 
 The first matching file (alphabetical) per extension is used. Point
 `BIOPB_TEST_VENDOR_DIR` at another directory to override this location (e.g. a
