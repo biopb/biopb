@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters import TiffAdapter, get_default_registry
@@ -60,15 +61,26 @@ def test_configured_dim_labels_stay_native(tmp_path):
     np.testing.assert_array_equal(actual, data[1:4, 2:7, 3:9])
 
 
-def test_unsupported_tiff_declines_native_claim_and_falls_through(tmp_path):
-    data = np.zeros((2, 2, 2, 2, 8, 9), dtype=np.uint8)
-    path = Path(tmp_path) / "unsupported.tif"
+def test_unknown_axes_claim_and_read_natively(tmp_path):
+    shape = (2, 2, 2, 2, 8, 9)
+    data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    path = Path(tmp_path) / "unknown.tif"
     tifffile.imwrite(path, data, metadata={"axes": "QQQQYX"})
 
-    claims = get_default_registry().get_claims_for_path(
-        ClaimContext(path), DiscoveryState()
+    registry = get_default_registry()
+    claims = registry.get_claims_for_path(ClaimContext(path), DiscoveryState())
+    assert [claim.source_type for claim in claims] == ["tiff"]
+
+    source = registry.get_adapter_for_type("tiff").create_from_config(
+        SourceConfig(url=str(path), type="tiff", source_id="unknown")
     )
-    assert [claim.source_type for claim in claims] == ["aics"]
+    descriptor = source.list_tensor_descriptors()[0]
+    assert list(descriptor.dim_labels) == list("QQQQYX")
+    assert list(descriptor.shape) == list(shape)
+
+    scene = source.get_tensor_adapter(descriptor.array_id)
+    bounds = ChunkBounds(start=[0] * len(shape), stop=list(shape))
+    np.testing.assert_array_equal(scene.get_data(bounds), data)
 
 
 def test_named_position_and_mosaic_axes_are_not_relabelled():
@@ -110,11 +122,53 @@ def test_named_axes_are_claimed_natively_and_kept_in_descriptor(tmp_path):
         assert list(descriptor.shape) == expected_shape
 
 
-def test_invalid_lsm_declines_native_claim_after_sniff(tmp_path):
-    path = Path(tmp_path).joinpath("invalid.lsm")
+@pytest.mark.parametrize(
+    "filename, source_type",
+    [("invalid.tif", "tiff"), ("invalid.lsm", "lsm")],
+)
+def test_malformed_native_claims_then_initialization_raises(
+    tmp_path, filename, source_type
+):
+    path = Path(tmp_path).joinpath(filename)
     path.write_bytes(b"\x00\x01\x02\x03")
 
+    registry = get_default_registry()
+    claims = registry.get_claims_for_path(ClaimContext(path), DiscoveryState())
+    assert [claim.source_type for claim in claims] == [source_type]
+
+    adapter_cls = registry.get_adapter_for_type(source_type)
+    with pytest.raises(ValueError, match="cannot read TIFF source"):
+        adapter_cls.create_from_config(
+            SourceConfig(url=str(path), type=source_type, source_id="invalid")
+        )
+
+
+class _RemoteClaimStore:
+    def isfile(self, path=""):
+        return True
+
+    def isdir(self, path=""):
+        return False
+
+    def exists(self, path=""):
+        return True
+
+    def open(self, path="", mode="rb"):
+        raise AssertionError("remote native claim must not read content")
+
+    def find(self, pattern="*", maxdepth=None, withdirs=False):
+        return []
+
+    def _join(self, path):
+        return f"remote://{path}"
+
+
+@pytest.mark.parametrize(
+    "filename, source_type",
+    [("remote.tif", "aics"), ("remote.lsm", "zeiss")],
+)
+def test_remote_tiff_and_lsm_fall_back_without_sniff(filename, source_type):
     claims = get_default_registry().get_claims_for_path(
-        ClaimContext(path), DiscoveryState()
+        ClaimContext(filename, _RemoteClaimStore()), DiscoveryState()
     )
-    assert [claim.source_type for claim in claims] == ["zeiss"]
+    assert [claim.source_type for claim in claims] == [source_type]

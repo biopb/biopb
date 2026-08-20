@@ -40,7 +40,8 @@ def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
     data, while an RGB samples axis uses the leading ``TC`` slots. Named ``P``
     and ``M`` axes represent position and mosaic layouts; preserve those labels
     rather than relabeling them as biological dimensions or handing the file to
-    BioIO.
+    BioIO. If there are more unknown axes than canonical slots, preserve the
+    native labels instead of declining a readable array.
 
     The return value has one label per native array axis, in native order.  It
     is used only for indexing; no pixel transpose is done here.
@@ -84,7 +85,11 @@ def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
             targets = [axis for axis in ("T", "C", "Z") if axis not in used]
             targets = targets[-len(unknown) :]
         if len(targets) != len(unknown):
-            return None
+            # The normalization contract permits unknown leading labels. Keep
+            # the native order for e.g. QQQQYX rather than treating a readable
+            # array as a fallback-only format. The positional read path below
+            # handles repeated unknown labels safely.
+            return axes
         for index, axis in zip(unknown, targets, strict=True):
             mapped[index] = axis
             used.add(axis)
@@ -102,6 +107,14 @@ class _TifffileAdapterBase(OmeTiffAdapter):
     def __init__(self, *args, dim_labels=None, **kwargs):
         self._dim_labels_override = dim_labels is not None
         super().__init__(*args, dim_labels=dim_labels, **kwargs)
+        if self.scene_index is None and self._tifffile_descriptor is None:
+            descriptors = self._tifffile_descriptors()
+            if not descriptors:
+                raise ValueError(
+                    f"{self.__class__.__name__} cannot read TIFF source "
+                    f"{self._source_url!r}"
+                )
+            self._cached_descriptors = descriptors
 
     @classmethod
     def create_from_config(cls, source, credentials_config=None):
@@ -111,36 +124,14 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
 
     @classmethod
-    def _supports_path(cls, ctx: ClaimContext) -> bool:
-        """Return whether native descriptors can serve this claim context."""
-        import tifffile
-
-        try:
-            probe = cls(ctx.path_str, "claim")
-            with ctx.open("rb") as fileobj:
-                with tifffile.TiffFile(fileobj) as tiff:
-                    # OME-TIFF ownership belongs to OmeTiffAdapter, which is
-                    # registered before this claim. Keep this guard here too so
-                    # the native plain-TIFF claim is self-contained.
-                    if not cls._LSM and tiff.ome_metadata:
-                        return False
-                    indices = probe._series_indices(tiff)
-                    return bool(indices) and all(
-                        probe._series_descriptor(tiff.series[index], index) is not None
-                        for index in indices
-                    )
-
-        except AssertionError:
-            raise
-        except Exception:
-            logger.debug(
-                "native tifffile claim probe failed for %s", ctx.path_str, exc_info=True
-            )
-            return False
-
-    @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim a resident local TIFF or LSM, leaving OME-TIFF to its owner."""
+        """Claim a resident local TIFF or LSM without reading its content.
+
+        Claim ownership is determined by registry priority and source family.
+        Native construction validates the file and raises for malformed or
+        otherwise unreadable resident files; those files cannot be made usable
+        by the lower-priority BioIO fallback anyway.
+        """
         if not ctx.is_file() or ctx.is_remote or ctx.cloud_root:
             return None
 
@@ -152,9 +143,6 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             return None
 
         if not ctx.is_resident():
-            return None
-
-        if not cls._supports_path(ctx):
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -185,6 +173,13 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             if len(self.dim_labels) != len(mapped):
                 return None
             labels = list(self.dim_labels)
+            shape = [int(size) for size in series.shape]
+        elif len(set(mapped)) != len(mapped):
+            # Unknown axes may repeat (QQQQYX). They are valid descriptor labels,
+            # but cannot be resolved through label-to-index dictionaries without
+            # collapsing positions. Keep the native rank/order and use the
+            # positional store reader below.
+            labels = list(mapped)
             shape = [int(size) for size in series.shape]
         else:
             named_axes = [
@@ -286,7 +281,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
                 raise ValueError("unsupported tifffile axis layout")
 
             descriptor = self._tifffile_descriptor
-            if self._dim_labels_override:
+            if self._dim_labels_override or len(set(axes)) != len(axes):
                 canonical = tuple(int(size) for size in zarr_array.shape)
             else:
                 by_axis = {
@@ -318,7 +313,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     def _read_region(self, za, axes, slices):
         """Read configured-label stores in their declared native order."""
-        if self._dim_labels_override:
+        if self._dim_labels_override or len(set(axes)) != len(axes):
             return np.asarray(za[slices])
         return super()._read_region(za, axes, slices)
 

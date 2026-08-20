@@ -148,7 +148,7 @@ def get_default_registry() -> AdapterRegistry:
     registry = AdapterRegistry()
 
     # Pure-tifffile OME-TIFF adapter first (no bioio dependency, so always
-    # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
+    # available), so it wins for a local OME-TIFF; a remote/non-resident .tif it
     # declines falls through to the generic bioio adapter registered below.
     registry.register(OmeTiffAdapter, "ome-tiff")
 
