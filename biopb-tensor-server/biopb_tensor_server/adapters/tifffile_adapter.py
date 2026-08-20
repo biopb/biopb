@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_PERSISTENT_PAGE_THRESHOLD = 16_384
 _CANONICAL_DIMS = ("T", "C", "Z", "Y", "X")
 _SAMPLES_DIM = "S"
 _SUPPORTED_EXTENSIONS = (".tif", ".tiff")
@@ -108,12 +109,18 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         self._dim_labels_override = dim_labels is not None
         super().__init__(*args, dim_labels=dim_labels, **kwargs)
         if self.scene_index is None and self._tifffile_descriptor is None:
-            descriptors = self._tifffile_descriptors()
+            message = (
+                f"{self.__class__.__name__} cannot read TIFF source "
+                f"{self._source_url!r}"
+            )
+            try:
+                descriptors = self._tifffile_descriptors()
+            except OSError:
+                raise
+            except Exception as exc:
+                raise ValueError(message) from exc
             if not descriptors:
-                raise ValueError(
-                    f"{self.__class__.__name__} cannot read TIFF source "
-                    f"{self._source_url!r}"
-                )
+                raise ValueError(message)
             self._cached_descriptors = descriptors
 
     @classmethod
@@ -169,7 +176,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
         # The native store has one full plane per page.  Keep that native unit
         # in the read plan, including an interleaved RGB(A) samples axis.
-        if self.dim_labels:
+        if self._dim_labels_override:
             if len(self.dim_labels) != len(mapped):
                 return None
             labels = list(self.dim_labels)
@@ -221,22 +228,14 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
         import tifffile
 
-        try:
-            with tifffile.TiffFile(path) as tiff:
-                descriptors = []
-                for index in self._series_indices(tiff):
-                    descriptor = self._series_descriptor(tiff.series[index], index)
-                    if descriptor is None:
-                        return None
-                    descriptors.append(descriptor)
-                return descriptors or None
-        except Exception:
-            logger.debug(
-                "tifffile descriptor path unavailable for %s",
-                self._source_url,
-                exc_info=True,
-            )
-            return None
+        with tifffile.TiffFile(path) as tiff:
+            descriptors = []
+            for index in self._series_indices(tiff):
+                descriptor = self._series_descriptor(tiff.series[index], index)
+                if descriptor is None:
+                    return None
+                descriptors.append(descriptor)
+            return descriptors or None
 
     def get_tensor_adapter(self, tensor_id: str) -> "_TifffileAdapterBase":
         """Create a scene adapter of the same native type."""
@@ -273,6 +272,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         series_index = self.scene_index or 0
         tiff = tifffile.TiffFile(path)
         try:
+            self._tifffile_page_count = len(tiff.pages)
             series = tiff.series[series_index]
             store = series.aszarr(level=0, chunkmode="page")
             zarr_array = zarr.open(store, mode="r")
@@ -310,6 +310,10 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         self._persistent_tiff = tiff
         self._persistent_store = store
         return zarr_array, axes
+
+    def _should_persist_store(self) -> bool:
+        """Keep a native file handle only when the TIFF has many pages."""
+        return getattr(self, "_tifffile_page_count", 0) >= _PERSISTENT_PAGE_THRESHOLD
 
     def _read_region(self, za, axes, slices):
         """Read configured-label stores in their declared native order."""

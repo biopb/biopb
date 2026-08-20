@@ -149,6 +149,8 @@ class TestContentFreeClaimsDoNotRead:
         "filename, source_type",
         [
             ("scan.nii", "nifti"),
+            ("img.tif", "tiff"),
+            ("img.lsm", "lsm"),
             ("scan.nii.gz", "nifti"),
             ("img.czi", "zeiss"),
             ("img.lif", "leica"),

@@ -7,7 +7,10 @@ import pytest
 import tifffile
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters import TiffAdapter, get_default_registry
-from biopb_tensor_server.adapters.tifffile_adapter import _mapped_axes
+from biopb_tensor_server.adapters.tifffile_adapter import (
+    _PERSISTENT_PAGE_THRESHOLD,
+    _mapped_axes,
+)
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
@@ -36,6 +39,24 @@ def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     bounds = ChunkBounds(start=[0, 0, 2, 3, 4], stop=[1, 1, 5, 7, 9])
     actual = scene.get_data(bounds)
     np.testing.assert_array_equal(actual, data[2:5, 3:7, 4:9][None, None])
+    assert scene._persistent_tiff is None
+    assert scene._persistent_store is None
+
+
+def test_native_store_persistence_starts_at_page_threshold(tmp_path):
+    path = Path(tmp_path) / "threshold.tif"
+    tifffile.imwrite(path, np.zeros((8, 8), dtype=np.uint8))
+
+    source = TiffAdapter.create_from_config(
+        SourceConfig(url=str(path), type="tiff", source_id="threshold")
+    )
+    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+
+    assert _PERSISTENT_PAGE_THRESHOLD == 16_384
+    scene._tifffile_page_count = _PERSISTENT_PAGE_THRESHOLD - 1
+    assert scene._should_persist_store() is False
+    scene._tifffile_page_count = _PERSISTENT_PAGE_THRESHOLD
+    assert scene._should_persist_store() is True
 
 
 def test_configured_dim_labels_stay_native(tmp_path):
@@ -137,10 +158,39 @@ def test_malformed_native_claims_then_initialization_raises(
     assert [claim.source_type for claim in claims] == [source_type]
 
     adapter_cls = registry.get_adapter_for_type(source_type)
-    with pytest.raises(ValueError, match="cannot read TIFF source"):
+    with pytest.raises(ValueError, match="cannot read TIFF source") as exc_info:
         adapter_cls.create_from_config(
             SourceConfig(url=str(path), type=source_type, source_id="invalid")
         )
+    assert exc_info.value.__cause__ is not None
+
+
+def test_native_init_propagates_oserror(tmp_path, monkeypatch):
+    path = Path(tmp_path) / "unreadable.tif"
+    path.write_bytes(b"placeholder")
+    failure = OSError("disk unavailable")
+
+    def fail(_adapter):
+        raise failure
+
+    monkeypatch.setattr(TiffAdapter, "_tifffile_descriptors", fail)
+    with pytest.raises(OSError) as exc_info:
+        TiffAdapter(str(path), "unreadable")
+    assert exc_info.value is failure
+
+
+def test_native_init_chains_non_oserror(tmp_path, monkeypatch):
+    path = Path(tmp_path) / "broken.tif"
+    path.write_bytes(b"placeholder")
+    failure = RuntimeError("descriptor parser failed")
+
+    def fail(_adapter):
+        raise failure
+
+    monkeypatch.setattr(TiffAdapter, "_tifffile_descriptors", fail)
+    with pytest.raises(ValueError, match="cannot read TIFF source") as exc_info:
+        TiffAdapter(str(path), "broken")
+    assert exc_info.value.__cause__ is failure
 
 
 class _RemoteClaimStore:
