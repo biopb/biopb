@@ -702,6 +702,7 @@ class TestGetPhysicalScale:
 
     def _make_aics_adapter(self, dim_labels, scene_index, scenes, images):
         """Build an AicsImageIoAdapterBase without __init__ (no real file)."""
+        import threading
         from unittest.mock import MagicMock
 
         from biopb_tensor_server.adapters.bioio import (
@@ -711,6 +712,9 @@ class TestGetPhysicalScale:
         a = _BioioAdapterBase.__new__(_BioioAdapterBase)
         a.dim_labels = dim_labels
         a.scene_index = scene_index
+        # Normally set by __init__, which this fixture skips; every _bio_image
+        # read takes it.
+        a._io_lock = threading.RLock()
         a._bio_image = MagicMock()
         a._bio_image.scenes = scenes
         a._bio_image.ome_metadata.images = images
