@@ -428,7 +428,9 @@ class TestListSourceDescriptors:
         assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
         assert list(tensors[1].dim_labels) == ["z", "y", "x"]
         assert list(tensors[1].shape) == [8, 256, 256]
-        assert list(tensors[1].chunk_shape) == [1, 256, 256]
+        # ListFlights descriptors deliberately omit read-planning geometry;
+        # GetFlightInfo is authoritative for the transfer grid.
+        assert list(tensors[1].chunk_shape) == []
         assert tensors[1].dtype == "uint8"
 
     def test_ordered_by_source_id(self):

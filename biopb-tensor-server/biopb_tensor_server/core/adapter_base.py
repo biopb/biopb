@@ -634,6 +634,11 @@ class TensorAdapter(SourceAdapter):
         """
         desc = self.get_tensor_descriptor()
         require_resolved(desc)
+        return self._chunk_size_from_descriptor(desc)
+
+    @staticmethod
+    def _chunk_size_from_descriptor(desc: TensorDescriptor) -> Tuple[int, ...]:
+        """Derive the private read grid from an already-fetched descriptor."""
         chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
         shape = tuple(int(dim) for dim in desc.shape)
         if len(chunk_shape) == len(shape):
@@ -651,7 +656,7 @@ class TensorAdapter(SourceAdapter):
         desc = self.get_tensor_descriptor()
         require_resolved(desc)
         return compute_transfer_chunk_size(
-            self.get_chunk_size(),
+            self._chunk_size_from_descriptor(desc),
             tuple(int(dim) for dim in desc.shape),
             desc.dtype,
             list(desc.dim_labels),

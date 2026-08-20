@@ -821,6 +821,7 @@ def _divide_chunk_size(
     result = list(chunk_size)
     result_bytes = estimate_chunk_bytes(tuple(result), dtype)
     split_axes: Set[int] = set()
+    labels = [str(label).lower() for label in dim_labels] if dim_labels else []
 
     while result_bytes > target_bytes:
         n_splits = int(np.ceil(result_bytes / target_bytes))
@@ -837,7 +838,6 @@ def _divide_chunk_size(
             split_count = 2
         if axis is None:
             break
-        labels = [str(label).lower() for label in dim_labels] if dim_labels else []
         label = labels[axis] if axis < len(labels) else ""
         if label in {"y", "x"}:
             spatial_axes = [
@@ -951,7 +951,7 @@ def _coalesce_chunk_size(
             (priority(axis), target_bytes - candidate_bytes, axis, candidate)
         )
     if candidates:
-        _, _, _, current = min(candidates)
+        _, _, _, current = min(candidates, key=lambda item: item[:3])
 
     return tuple(current)
 

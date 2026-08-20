@@ -73,6 +73,16 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     src = src_desc or _make_source_desc()
 
     mc.list_sources.return_value = {src.source_id: src}
+
+    def get_descriptor(array_id, **_kwargs):
+        for tensor in src.tensors:
+            if tensor.array_id == array_id:
+                return tensor
+        if array_id == src.source_id and len(src.tensors) == 1:
+            return src.tensors[0]
+        raise KeyError(array_id)
+
+    mc.get_descriptor.side_effect = get_descriptor
     mc.get_source_metadata.return_value = {"ome_ngff": {"version": "0.4"}}
     mc.cache_info.return_value = {"hits": 3, "misses": 1}
     # /readyz reports whatever Flight says, so the mock has to say something a

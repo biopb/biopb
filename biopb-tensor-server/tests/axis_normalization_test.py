@@ -261,7 +261,7 @@ class TestNormalizeAdapter:
             plan = adapter.get_tensor_adapter(None).plan_flight_info(
                 TensorReadOption(tensor_id="src"), PyramidConfig()
             )
-            assert plan.chunk_endpoints
+            assert len(plan.chunk_endpoints) > 1
 
             calls["n"] = 0
             for ce in plan.chunk_endpoints:  # the do_get inner loop

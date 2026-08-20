@@ -604,7 +604,7 @@ _TILE_MAX_AGE = 3600
 
 
 def _tensor_desc_by_array_id(client: TensorFlightClient, array_id: str) -> Any:
-    """The catalog TensorDescriptor named by *array_id*, or ``None``.
+    """The authoritative TensorDescriptor named by *array_id*, or ``None``.
 
     Addressed by array_id ALONE, per the identity policy at the top of
     ``proto/biopb/tensor/descriptor.proto``: array_id is globally unique and
@@ -625,9 +625,9 @@ def _tensor_desc_by_array_id(client: TensorFlightClient, array_id: str) -> Any:
         return None
     for td in desc.tensors:
         if td.array_id == array_id:
-            return td
+            return client.get_descriptor(array_id, with_pyramid=False)
     if array_id == desc.source_id and len(desc.tensors) == 1:
-        return desc.tensors[0]
+        return client.get_descriptor(array_id, with_pyramid=False)
     return None
 
 
@@ -1209,8 +1209,9 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
     """Everything a tiled client needs to address this tensor.
 
     The browser must not derive the tile grid itself: the edge follows the
-    stored ``chunk_shape`` so tiles nest (see :func:`_tile_edge`), and that is a
-    server-side fact. Shaped to drop straight into a Viv ``PixelSource[]`` --
+    GetFlightInfo transfer ``chunk_shape`` so tiles nest (see :func:`_tile_edge`),
+    and that is a server-side fact. Shaped to drop straight into a Viv
+    ``PixelSource[]`` --
     one entry per level, index 0 full resolution.
     """
     ctx = _sidecar(request)
