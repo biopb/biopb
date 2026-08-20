@@ -214,12 +214,13 @@ class MetadataDatabase:
                 -- shrinking a source's tensor set can't leave ghost rows and a
                 -- read never straddles a torn sources-tensors join. Unresolved
                 -- cloud sources carry an empty list. Query per tensor with
-                -- UNNEST(tensors) or list_filter(tensors, t -> ...).
+                -- UNNEST(tensors) or list_filter(tensors, t -> ...). No chunk
+                -- grid: it is chosen per request, so only GetFlightInfo can
+                -- answer for it and a stored copy could only disagree.
                 tensors STRUCT(
                     array_id VARCHAR,
                     dim_labels VARCHAR[],
                     shape BIGINT[],
-                    chunk_shape BIGINT[],
                     dtype VARCHAR
                 )[]
             )
@@ -406,7 +407,6 @@ class MetadataDatabase:
                 "array_id": t.array_id,
                 "dim_labels": list(t.dim_labels),
                 "shape": [int(s) for s in t.shape],
-                "chunk_shape": [int(c) for c in t.chunk_shape],
                 "dtype": t.dtype,
             }
             for t in source_desc.tensors
@@ -496,8 +496,9 @@ class MetadataDatabase:
 
         Only the cheap/structural fields the lean descriptor carries are
         reconstructed: per-tensor ``array_id``/``dim_labels``/``shape``/``dtype``
-        from the ``tensors`` STRUCT[] (biopb/biopb#224). ``chunk_shape`` is left
-        empty; GetFlightInfo is authoritative for the transfer grid.
+        from the ``tensors`` STRUCT[] (biopb/biopb#224). No ``chunk_shape``: the
+        transfer grid is chosen per request, so GetFlightInfo is authoritative
+        for it and the catalog carries no grid at all.
         ``metadata_json`` is left empty (filled by ``GetFlightInfo``), exactly
         like the adapter path. ``data_resident`` is the stored snapshot -- the
         field is advisory/volatile by contract (the authoritative gate is a fresh
@@ -541,7 +542,6 @@ class MetadataDatabase:
                     array_id=t["array_id"],
                     dim_labels=t["dim_labels"] or [],
                     shape=t["shape"] or [],
-                    chunk_shape=[],
                     dtype=t["dtype"] or "",
                 )
                 for t in (tensors or [])
