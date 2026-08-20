@@ -661,3 +661,310 @@ def create_zarr_array(
         arr[slices] = chunk_value + 1  # Avoid zero for better test visibility
 
     return str(zarr_path), shape, chunks
+
+
+def create_zeiss_lsm(
+    tmpdir: str,
+    n_t: int = 2,
+    n_z: int = 5,
+    n_c: int = 3,
+    image_shape: Tuple[int, int] = (64, 64),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, np.ndarray]:
+    """Create a Zeiss LSM file (a TIFF carrying a CZ_LSMINFO tag).
+
+    tifffile only builds an LSM series when three conditions hold, so this
+    writer is more particular than it looks:
+
+    - full-resolution and reduced pages must **alternate** -- ``_series_lsm``
+      takes ``pages[0::2]`` as the image and ``pages[1::2]`` as thumbnails
+    - channels ride as samples-per-pixel, not as separate pages
+    - ``metadata=None``, or TiffWriter's own "shaped" description tag wins the
+      series dispatch and the file degrades to one series per page
+
+    Args:
+        tmpdir: Temporary directory to create the file in
+        n_t: Number of timepoints
+        n_z: Number of Z planes
+        n_c: Number of channels
+        image_shape: (height, width) of each plane
+        dtype: Pixel data type
+
+    Returns:
+        Tuple of (lsm_path, expected_array) with expected_array in TCZYX order
+    """
+    import tifffile
+    from tifffile import TIFF
+
+    n_y, n_x = image_shape
+    info = np.zeros(1, dtype=np.dtype(TIFF.CZ_LSMINFO))
+    header = info[0]
+    header["MagicNumber"] = 50350412
+    header["StructureSize"] = info.dtype.itemsize
+    header["DimensionX"], header["DimensionY"] = n_x, n_y
+    header["DimensionZ"], header["DimensionChannels"] = n_z, n_c
+    header["DimensionTime"] = n_t
+    header["ScanType"] = 6  # maps to TZCYX in TIFF.CZ_LSMINFO_SCANTYPE
+    header["DataType"] = 1
+    header["VoxelSizeX"] = header["VoxelSizeY"] = 1e-7
+    header["VoxelSizeZ"] = 5e-7
+    blob = info.tobytes()
+
+    # Page order is (T, Z); channels are samples within a page -> TZYXC.
+    data = np.arange(n_t * n_z * n_y * n_x * n_c, dtype=np.uint32) % 4000
+    data = data.astype(dtype).reshape(n_t, n_z, n_y, n_x, n_c)
+
+    lsm_path = Path(tmpdir) / "test.lsm"
+    photometric = "rgb" if n_c == 3 else "minisblack"
+    drop_samples = (lambda a: a[..., 0]) if n_c == 1 else (lambda a: a)
+    with tifffile.TiffWriter(str(lsm_path)) as writer:
+        first = True
+        for t in range(n_t):
+            for z in range(n_z):
+                writer.write(
+                    drop_samples(data[t, z]),
+                    photometric=photometric,
+                    planarconfig="contig",
+                    metadata=None,
+                    extratags=(
+                        [(34412, "B", len(blob), blob, True)] if first else None
+                    ),
+                )
+                first = False
+                writer.write(
+                    drop_samples(data[t, z, ::2, ::2]),
+                    photometric=photometric,
+                    planarconfig="contig",
+                    metadata=None,
+                    subfiletype=1,
+                )
+
+    return str(lsm_path), data.transpose(0, 4, 1, 2, 3)
+
+
+def create_leica_lif(
+    tmpdir: str,
+    n_t: int = 2,
+    n_z: int = 5,
+    n_c: int = 2,
+    image_shape: Tuple[int, int] = (64, 64),
+    bit_depth: int = 16,
+) -> Tuple[str, np.ndarray]:
+    """Create a Leica LIF file.
+
+    readlif ships no writer, so the container is assembled from what its parser
+    reads (readlif ``LifFile.__init__`` / ``LifImage._get_item``)::
+
+        header:  70 00 00 00 | 4 ignored bytes | 2a |
+                 int32 xml_len_in_chars | UTF-16 XML
+        block:   70 00 00 00 | 4 ignored bytes | 2a | int32 data_len | 2a |
+                 int32 name_len_in_chars | UTF-16 name | pixel data
+
+    Two constraints beyond the byte layout: bioio-lif requires ``LUTName`` on
+    every ChannelDescription, and readlif infers channel-before-Z ordering by
+    comparing BytesInc values, so the Z BytesInc must be at least the summed
+    channel BytesInc for the plane order written here.
+
+    Args:
+        tmpdir: Temporary directory to create the file in
+        n_t: Number of timepoints
+        n_z: Number of Z planes
+        n_c: Number of channels
+        image_shape: (height, width) of each plane
+        bit_depth: 8 or 16
+
+    Returns:
+        Tuple of (lif_path, expected_array) with expected_array in TCZYX order
+    """
+    import struct
+
+    magic = b"\x70\x00\x00\x00"
+    mem = b"\x2a"
+    n_y, n_x = image_shape
+    dtype = np.uint16 if bit_depth == 16 else np.uint8
+    plane_bytes = n_x * n_y * (bit_depth // 8)
+    z_inc = plane_bytes * n_c
+
+    dims = [
+        f'<DimensionDescription DimID="1" NumberOfElements="{n_x}" '
+        f'Length="{(n_x - 1) * 1e-7:.9e}" BytesInc="{bit_depth // 8}"/>',
+        f'<DimensionDescription DimID="2" NumberOfElements="{n_y}" '
+        f'Length="{(n_y - 1) * 1e-7:.9e}" BytesInc="{n_x * bit_depth // 8}"/>',
+    ]
+    if n_z > 1:
+        dims.append(
+            f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" '
+            f'Length="{(n_z - 1) * 5e-7:.9e}" BytesInc="{z_inc}"/>'
+        )
+    if n_t > 1:
+        dims.append(
+            f'<DimensionDescription DimID="4" NumberOfElements="{n_t}" '
+            f'Length="{(n_t - 1) * 1.0:.9e}" BytesInc="{z_inc * n_z}"/>'
+        )
+    luts = ("Gray", "Green", "Red", "Blue")
+    channels = "".join(
+        f'<ChannelDescription Resolution="{bit_depth}" BytesInc="{plane_bytes}" '
+        f'LUTName="{luts[i % len(luts)]}"/>'
+        for i in range(n_c)
+    )
+    xml = (
+        '<LMSDataContainerHeader Version="2">'
+        '<Element Name="test.lif"><Children>'
+        '<Element Name="Image0"><Data><Image><ImageDescription>'
+        f"<Dimensions>{''.join(dims)}</Dimensions>"
+        f"<Channels>{channels}</Channels>"
+        "</ImageDescription></Image></Data></Element>"
+        "</Children></Element></LMSDataContainerHeader>"
+    )
+    xml_bytes = xml.encode("utf-16")  # BOM included; the parser decodes it
+
+    # Plane order inside the block is n = t*(C*Z) + z*C + c, per get_frame().
+    planes = [
+        (
+            np.arange(n_y * n_x, dtype=np.uint32).reshape(n_y, n_x)
+            + t * 1000
+            + z * 100
+            + c * 10
+        ).astype(dtype)
+        for t in range(n_t)
+        for z in range(n_z)
+        for c in range(n_c)
+    ]
+    payload = np.concatenate([p.ravel() for p in planes]).tobytes()
+    block_name = "MemBlock".encode("utf-16-le")
+
+    lif_path = Path(tmpdir) / "test.lif"
+    with open(lif_path, "wb") as handle:
+        handle.write(magic + struct.pack("<I", 0) + mem)
+        handle.write(struct.pack("<I", len(xml_bytes) // 2))
+        handle.write(xml_bytes)
+        handle.write(magic + struct.pack("<I", 0) + mem)
+        handle.write(struct.pack("<I", len(payload)) + mem)
+        handle.write(struct.pack("<I", len(block_name) // 2))
+        handle.write(block_name)
+        handle.write(payload)
+
+    expected = np.stack(planes).reshape(n_t, n_z, n_c, n_y, n_x)
+    return str(lif_path), expected.transpose(0, 2, 1, 3, 4)
+
+
+def create_zeiss_czi(
+    tmpdir: str,
+    n_z: int = 4,
+    n_c: int = 2,
+    image_shape: Tuple[int, int] = (128, 128),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, np.ndarray]:
+    """Create a Zeiss CZI file via pylibCZIrw's writer.
+
+    Args:
+        tmpdir: Temporary directory to create the file in
+        n_z: Number of Z planes
+        n_c: Number of channels
+        image_shape: (height, width) of each plane
+        dtype: Pixel data type
+
+    Returns:
+        Tuple of (czi_path, expected_array) with expected_array in TCZYX order
+    """
+    from pylibCZIrw import czi as pyczi
+
+    n_y, n_x = image_shape
+    czi_path = Path(tmpdir) / "test.czi"
+    expected = np.zeros((1, n_c, n_z, n_y, n_x), dtype=dtype)
+    with pyczi.create_czi(str(czi_path)) as writer:
+        for c in range(n_c):
+            for z in range(n_z):
+                plane = (
+                    np.arange(n_y * n_x, dtype=np.uint32).reshape(n_y, n_x) % 4000
+                    + c * 100
+                    + z * 10
+                ).astype(dtype)
+                expected[0, c, z] = plane
+                writer.write(plane[..., np.newaxis], plane={"C": c, "Z": z, "T": 0})
+
+    _complete_czi_metadata(czi_path)
+    return str(czi_path), expected
+
+
+def _complete_czi_metadata(czi_path: Path) -> None:
+    """Add the metadata bioio-czi needs but pylibCZIrw's writer omits.
+
+    The writer always records a bounding rectangle for scene 0 but never emits
+    the matching metadata, so bioio-czi's scenes property takes its
+    "normal CZI" branch and then fails to find Scene[@Index='0'] (its no-scene
+    fallback only runs when there is no bounding rectangle at all).
+
+    Two more elements are needed because the czi-to-ome XSLT emits their OME
+    attributes unconditionally, so a missing source element becomes an empty
+    string and fails OME validation: Channel/AcquisitionMode (an enum) and
+    Image/ComponentBitCount (SignificantBits, an int).
+
+    The metadata segment cannot grow in place -- the subblock directory follows
+    it -- so a corrected segment is appended at EOF and the file header's
+    MetadataPosition (offset 92) is repointed at it. The stale segment is left
+    as dead space; readers reach metadata through that pointer.
+    """
+    import re
+    import struct
+
+    raw = bytearray(czi_path.read_bytes())
+    position = struct.unpack_from("<q", raw, 92)[0]
+    xml_size = struct.unpack_from("<i", raw, position + 32)[0]
+    body = position + 32 + 256
+    xml = raw[body : body + xml_size].decode("utf-8")
+
+    # Read the bit count off the file rather than assuming a dtype.
+    pixel_type = re.search(r"<PixelType>Gray(\d+)</PixelType>", xml)
+    bits = pixel_type.group(1) if pixel_type else "16"
+
+    xml = xml.replace(
+        "</Channel>", "<AcquisitionMode>WideField</AcquisitionMode></Channel>"
+    )
+    xml = xml.replace(
+        "</Image>", f"<ComponentBitCount>{bits}</ComponentBitCount></Image>", 1
+    )
+    scenes = '<S><Scenes><Scene Index="0" Name="Scene:0"/></Scenes></S>'
+    xml = xml.replace("<Dimensions>", "<Dimensions>" + scenes, 1)
+    payload = xml.encode("utf-8")
+
+    used = 256 + len(payload)
+    allocated = (used + 31) // 32 * 32
+    segment = bytearray(b"ZISRAWMETADATA".ljust(16, b"\x00"))
+    segment += struct.pack("<qq", allocated, used)
+    segment += struct.pack("<ii", len(payload), 0) + b"\x00" * 248
+    segment += payload + b"\x00" * (allocated - used)
+
+    struct.pack_into("<q", raw, 92, len(raw))
+    czi_path.write_bytes(bytes(raw) + bytes(segment))
+
+
+def create_deltavision_dv(
+    tmpdir: str,
+    n_z: int = 8,
+    image_shape: Tuple[int, int] = (64, 64),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, np.ndarray]:
+    """Create a DeltaVision DV file via mrc's writer.
+
+    Single-channel only: ``mrc.save`` writes no channel count, so bioio reads a
+    multi-channel array back with a mismatched C coordinate and raises.
+
+    Args:
+        tmpdir: Temporary directory to create the file in
+        n_z: Number of Z planes
+        image_shape: (height, width) of each plane
+        dtype: Pixel data type
+
+    Returns:
+        Tuple of (dv_path, expected_array) with expected_array in TCZYX order
+    """
+    import mrc
+
+    n_y, n_x = image_shape
+    data = (
+        np.arange(n_z * n_y * n_x, dtype=np.uint32).reshape(n_z, n_y, n_x) % 4000
+    ).astype(dtype)
+    dv_path = Path(tmpdir) / "test.dv"
+    mrc.save(data, str(dv_path), ifExists="overwrite")
+    return str(dv_path), data.reshape(1, 1, n_z, n_y, n_x)
