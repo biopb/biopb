@@ -1,9 +1,9 @@
-"""Read-path coverage for the bioio-backed vendor formats.
+"""Read-path coverage for vendor formats, including the Phase 1 native TIFF/LSM path.
 
 LSM, LIF, CZI and DV have no checked-in sample data, so each is synthesized
 (biopb_tensor_server.fixtures) and driven through the real adapter: claim,
-descriptor, pixels. These are the formats whose reads still go through bioio's
-dask array, so a regression here is a regression in the path documented in
+descriptor, pixels. The LSM case exercises the native persistent tifffile path;
+the remaining vendor cases still cover BioIO's dask path documented in
 docs/dask-bypass-benchmarks.md.
 """
 
@@ -22,11 +22,11 @@ from biopb_tensor_server.fixtures import (
     create_zeiss_lsm,
 )
 
-# (fixture factory, required plugin module, expected source_type, scene count).
-# LSM carries two scenes: the image and the reduced thumbnail series tifffile
-# builds from the interleaved pages. The image is always scene 0.
+# (fixture factory, optional plugin module, expected source_type, scene count).
+# LSM's reduced thumbnail series is deliberately dropped by the native adapter.
+# The full-resolution image is the only exposed scene.
 FORMATS = [
-    pytest.param(create_zeiss_lsm, "bioio_tifffile", "zeiss", 2, id="lsm"),
+    pytest.param(create_zeiss_lsm, None, "lsm", 1, id="lsm"),
     pytest.param(create_leica_lif, "bioio_lif", "leica", 1, id="lif"),
     pytest.param(create_zeiss_czi, "bioio_czi", "zeiss", 1, id="czi"),
     pytest.param(create_deltavision_dv, "bioio_dv", "dv", 1, id="dv"),
@@ -34,7 +34,8 @@ FORMATS = [
 
 
 def _build(factory, plugin, tmp_path):
-    pytest.importorskip(plugin)
+    if plugin:
+        pytest.importorskip(plugin)
     path, expected = factory(str(tmp_path))
     return path, expected
 

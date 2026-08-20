@@ -414,6 +414,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._persistent_store = None
         self._persistent_tiff = None
         self._persistent_attempted = False
+        self._ephemeral_store_open = False
         self._persistent_last_access = 0.0
         # In-flight lock-free reads on this scene's store. get_data holds _io_lock
         # only to acquire the store + bookkeep, then reads without it (tifffile
@@ -475,9 +476,12 @@ class OmeTiffAdapter(TensorAdapter):
             # Default: read+decode under _io_lock (concurrent reads serialized).
             with self._io_lock:
                 za, axes = self._acquire_store_or_raise()
-                result = self._read_region(za, axes, slices)
-                self._persistent_last_access = time.monotonic()
-                return result
+                try:
+                    result = self._read_region(za, axes, slices)
+                    self._persistent_last_access = time.monotonic()
+                    return result
+                finally:
+                    self._release_ephemeral_store()
 
         # Opt-in lock-free: register the read as in-flight, decode without the lock.
         with self._io_lock:
@@ -489,6 +493,7 @@ class OmeTiffAdapter(TensorAdapter):
             with self._io_lock:
                 self._active_reads -= 1
                 self._persistent_last_access = time.monotonic()
+                self._release_ephemeral_store()
 
     def _acquire_store_or_raise(self):
         """Open (or reuse) the persistent aszarr store; stamp last-access.
@@ -792,6 +797,14 @@ class OmeTiffAdapter(TensorAdapter):
             return None
 
     # ---- persistent aszarr store -------------------------------------------
+    def _should_persist_store(self) -> bool:
+        """Whether an opened aszarr store should remain open between reads."""
+        return True
+
+    def _release_ephemeral_store(self) -> None:
+        """Close a per-read store once no lock-free reads still use it."""
+        if self._ephemeral_store_open and self._active_reads == 0:
+            self._release_persistent_handle()
 
     def _ensure_store(self):
         """Open the aszarr store as a zarr array once (caller holds ``_io_lock``).
@@ -816,7 +829,9 @@ class OmeTiffAdapter(TensorAdapter):
         if opened is not None:
             self._persistent_zarr, self._persistent_axes = opened
             self._persistent_last_access = time.monotonic()
-            _store_reaper.register(self)
+            self._ephemeral_store_open = not self._should_persist_store()
+            if not self._ephemeral_store_open:
+                _store_reaper.register(self)
             return opened
         return None
 
@@ -914,6 +929,7 @@ class OmeTiffAdapter(TensorAdapter):
                     obj.close()
                 except Exception:
                     logger.debug("error closing persistent tiff store", exc_info=True)
+        self._ephemeral_store_open = False
 
     # ---- claim --------------------------------------------------------------
 

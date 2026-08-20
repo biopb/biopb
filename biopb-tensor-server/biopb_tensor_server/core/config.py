@@ -354,6 +354,8 @@ class SourceConfig:
             "hdf5",
             "ome-tiff",
             "ome-tiff-multifile",
+            "tiff",
+            "lsm",
             "ome-zarr",
             "ome-zarr-hcs",
             "aics",

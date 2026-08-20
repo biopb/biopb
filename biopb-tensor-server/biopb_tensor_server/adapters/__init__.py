@@ -20,6 +20,7 @@ from .tiff import (
     MicroManagerLegacyAdapter,
     TiffSequenceAdapter,
 )
+from .tifffile_adapter import LsmAdapter, TiffAdapter
 from .zarr import ZarrAdapter
 
 # Optional ndtiff adapter (Micro-Manager NDTiff storage format)
@@ -90,6 +91,8 @@ __all__ = [
     "Hdf5Adapter",
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
+    "TiffAdapter",
+    "LsmAdapter",
     "OmeZarrAdapter",
     "RemoteTensorAdapter",
     "NdTiffAdapter",
@@ -115,11 +118,13 @@ def get_default_registry() -> AdapterRegistry:
 
     Adapter registration order (by priority/specificity, highest first):
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
+    - TiffAdapter - local plain TIFF files (.tif/.tiff)
+    - LsmAdapter - local Zeiss LSM files (.lsm)
     - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
       native pyramid)
     - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
     - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
-    - ZeissAdapter - Zeiss microscopy (CZI, LSM)
+    - ZeissAdapter - Zeiss microscopy (CZI; remote/cloud/non-resident LSM fallback)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
     - DvAdapter - DeltaVision DV files
@@ -143,9 +148,16 @@ def get_default_registry() -> AdapterRegistry:
     registry = AdapterRegistry()
 
     # Pure-tifffile OME-TIFF adapter first (no bioio dependency, so always
-    # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
+    # available), so it wins for a local OME-TIFF; a remote/non-resident .tif it
     # declines falls through to the generic bioio adapter registered below.
     registry.register(OmeTiffAdapter, "ome-tiff")
+
+    # Native tifffile paths have higher claim priority than the generic BioIO
+    # adapters below.  They use dedicated source types so the winning scanner
+    # claim resolves directly to the same adapter; remote/cloud paths decline
+    # and remain eligible for BioIO's fallback claims.
+    registry.register(TiffAdapter, "tiff")
+    registry.register(LsmAdapter, "lsm")
 
     # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
     # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not
