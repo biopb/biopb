@@ -477,6 +477,16 @@ class TestTransferChunkSize:
             preferred_bytes=16 << 20,
         ) == (512, 512)
 
+    def test_coalesces_channels_before_time(self):
+        from biopb_tensor_server.core.chunk import compute_transfer_chunk_size
+
+        assert compute_transfer_chunk_size(
+            (1, 1, 1, 512, 512),
+            (1000, 3, 1, 512, 512),
+            "<u2",
+            ["t", "c", "z", "y", "x"],
+        ) == (5, 3, 1, 512, 512)
+
     def test_divides_xy_as_a_balanced_pair(self):
         from biopb_tensor_server.core.chunk import (
             compute_transfer_chunk_size,
@@ -489,6 +499,35 @@ class TestTransferChunkSize:
 
         assert result[0] == result[1]
         assert estimate_chunk_bytes(result, "<u2") <= 8 << 20
+
+    def test_dividing_interleaved_rgb_keeps_samples_together(self):
+        from biopb_tensor_server.core.chunk import (
+            compute_transfer_chunk_size,
+            estimate_chunk_bytes,
+        )
+
+        result = compute_transfer_chunk_size(
+            (1, 2048, 2048, 3),
+            (1, 2048, 2048, 3),
+            "uint8",
+            ["t", "y", "x", "s"],
+        )
+
+        assert result[-1] == 3
+        assert result[1] == result[2]
+        assert estimate_chunk_bytes(result, "uint8") <= 8 << 20
+
+    def test_dividing_unlabeled_trailing_three_axis_does_not_assume_rgb(self):
+        from biopb_tensor_server.core.chunk import compute_transfer_chunk_size
+
+        result = compute_transfer_chunk_size(
+            (1, 2048, 2048, 3),
+            (1, 2048, 2048, 3),
+            "uint8",
+            ["t", "y", "x", "dim3"],
+        )
+
+        assert result[-1] == 1
 
     def test_scaled_logical_chunk_is_no_larger_than_transfer_chunk(self):
         from math import lcm

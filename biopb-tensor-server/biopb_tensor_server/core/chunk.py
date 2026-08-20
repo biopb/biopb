@@ -17,7 +17,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.axes import labeled_axis_index
+from biopb_tensor_server.core.axes import labeled_axis_index, samples_axis
 from biopb_tensor_server.core.downsample import (
     DEFAULT_REDUCTION_METHOD,
     ceil_div,
@@ -758,7 +758,7 @@ def compute_transfer_chunk_size(
 
     Native blocks above ``preferred_bytes`` are divided with the established
     T/unknown -> C -> Z -> Y/X priority. Smaller blocks are coalesced in whole
-    native-block multiples, preferring Y/X -> Z -> T -> C -> unknown, while
+    native-block multiples, preferring Y/X -> Z -> C -> T/unknown, while
     retaining enough endpoints for parallel reads and scheduler utilization.
 
     ``maximum_bytes`` is the hard wire ceiling; ``preferred_bytes`` is the
@@ -885,9 +885,9 @@ def _coalesce_chunk_size(
             return 0
         if label == "z":
             return 1
-        if label in {"t", "time", "frame", "frames"}:
-            return 2
         if label in {"c", "channel", "channels"}:
+            return 2
+        if label in {"t", "time", "frame", "frames"}:
             return 3
         return 4
 
@@ -978,9 +978,16 @@ def _choose_split_axis_excluding(
         for ax, label in enumerate(dim_labels):
             label_to_axis[label.lower()] = ax
 
-    # Eligible axes: not excluded and large enough for splits
+    # Interleaved RGB(A) samples are one pixel's indivisible components. Keep
+    # them together and divide another axis; an unlabeled trailing size-3/4 axis
+    # is deliberately not inferred as samples.
+    sample_axis = samples_axis(list(dim_labels or []), shape)
+
+    # Eligible axes: not excluded, not interleaved samples, and splittable.
     eligible = [
-        ax for ax in range(len(shape)) if ax not in exclude_axes and shape[ax] >= 2
+        ax
+        for ax in range(len(shape))
+        if ax not in exclude_axes and ax != sample_axis and shape[ax] >= 2
     ]
 
     if not eligible:
