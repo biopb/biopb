@@ -304,8 +304,8 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         if not path:
             return None
 
-        labels = self.dim_labels or list(self.get_tensor_descriptor().dim_labels)
         try:
+            labels = self.dim_labels or list(self.get_tensor_descriptor().dim_labels)
             import tifffile
 
             with tifffile.TiffFile(path) as tiff:
@@ -338,7 +338,12 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             return None
 
     def get_metadata(self) -> dict:
-        """Return lightweight native TIFF/LSM metadata when available."""
+        """Return lightweight metadata exposed by the native TIFF reader.
+
+        ImageJ and LSM metadata take precedence. Plain TIFFs commonly carry
+        tifffile's JSON-shaped metadata (for example, the stored shape) in
+        the image description; use that when ImageJ metadata is absent.
+        """
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return {}
@@ -351,7 +356,13 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             with tifffile.TiffFile(path) as tiff:
                 if self._LSM:
                     return dict(tiff.lsm_metadata or {})
-                return dict(tiff.imagej_metadata or {})
+                imagej = tiff.imagej_metadata or {}
+                if imagej:
+                    return dict(imagej)
+                for metadata in tiff.shaped_metadata or ():
+                    if metadata:
+                        return dict(metadata)
+                return {}
         except Exception:
             return {}
 

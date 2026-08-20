@@ -118,11 +118,13 @@ def get_default_registry() -> AdapterRegistry:
 
     Adapter registration order (by priority/specificity, highest first):
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
+    - TiffAdapter - local plain TIFF files (.tif/.tiff)
+    - LsmAdapter - local Zeiss LSM files (.lsm)
     - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
       native pyramid)
     - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
     - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
-    - ZeissAdapter - Zeiss microscopy (CZI, LSM)
+    - ZeissAdapter - Zeiss microscopy (CZI; remote/cloud/non-resident LSM fallback)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
     - DvAdapter - DeltaVision DV files

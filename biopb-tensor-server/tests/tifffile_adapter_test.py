@@ -29,6 +29,7 @@ def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     descriptor = source.list_tensor_descriptors()[0]
     assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
     assert list(descriptor.shape) == [1, 1, 5, 8, 9]
+    assert source.get_metadata() == {"shape": [5, 8, 9]}
 
     scene = source.get_tensor_adapter(descriptor.array_id)
     bounds = ChunkBounds(start=[0, 0, 2, 3, 4], stop=[1, 1, 5, 7, 9])
