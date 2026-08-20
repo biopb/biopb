@@ -27,6 +27,7 @@ Chunk ID format:
 import logging
 import os
 import threading
+from itertools import product
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
@@ -163,6 +164,7 @@ class _BioioAdapterBase(TensorAdapter):
 
     # Class-level source type (override in subclasses)
     SOURCE_TYPE: str = "aics"
+    RETAIN_SCENE_DASK = True
 
     @classmethod
     def create_from_config(
@@ -212,6 +214,7 @@ class _BioioAdapterBase(TensorAdapter):
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
+        metadata_cache: Optional[Any] = None,
     ):
         """Initialize bioio adapter.
 
@@ -224,6 +227,7 @@ class _BioioAdapterBase(TensorAdapter):
             io_lock: Optional thread lock for IO serialization. Source-level
                      adapters create a new lock if None; scene-level adapters
                      receive the lock from the source-level adapter.
+            metadata_cache: Optional processed metadata shared by scene adapters.
         """
         self._bio_image = bio_image
         self.scene_index = scene_index
@@ -249,8 +253,10 @@ class _BioioAdapterBase(TensorAdapter):
         # a documented blind spot. None (unresolved url) leaves it unversioned.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
+        self._metadata_cache = metadata_cache
 
         self._dask_data = None  # scene-level dask array, bound below
+        self._scene_descriptor = None
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -264,6 +270,10 @@ class _BioioAdapterBase(TensorAdapter):
             self.dim_labels = (
                 dim_labels if dim_labels else list(self._bio_image.dims.order)
             )
+            if not self.RETAIN_SCENE_DASK:
+                self._scene_descriptor = self._descriptor_from_dask(self._dask_data)
+                self._dask_data = None
+                self._release_bioio_dask_cache()
         else:
             # Source-level: no bound reader; dim_labels is the default for scenes.
             self.dim_labels = dim_labels
@@ -295,17 +305,40 @@ class _BioioAdapterBase(TensorAdapter):
         Source-level (scene_index=None): the first scene's descriptor.
         """
         if self.scene_index is not None:
+            if self._scene_descriptor is not None:
+                result = TensorDescriptor()
+                result.CopyFrom(self._scene_descriptor)
+                return result
             dask_data = self._dask_data
-            chunk_shape = [max(c) for c in dask_data.chunks]
-            return TensorDescriptor(
-                array_id=self.array_id,
-                dim_labels=self.dim_labels if self.dim_labels else [],
-                shape=list(dask_data.shape),
-                chunk_shape=chunk_shape,
-                dtype=dask_data.dtype.str,
-            )
+            return self._descriptor_from_dask(dask_data)
         # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
+
+    def _read_chunk_shape(self, dask_data: Any) -> List[int]:
+        """Return the backend's native read-granularity hint."""
+        return [max(c) for c in dask_data.chunks]
+
+    def _descriptor_from_dask(self, dask_data: Any) -> TensorDescriptor:
+        """Snapshot the structural facts exposed by a scene Dask array."""
+        return TensorDescriptor(
+            array_id=self.array_id,
+            dim_labels=self.dim_labels if self.dim_labels else [],
+            shape=list(dask_data.shape),
+            chunk_shape=self._read_chunk_shape(dask_data),
+            dtype=dask_data.dtype.str,
+        )
+
+    def _release_bioio_dask_cache(self) -> None:
+        """Release BioIO's current-scene lazy array without clearing metadata."""
+        self._bio_image._xarray_dask_data = None
+        self._bio_image._dims = None
+        reader = self._bio_image.reader
+        reader._xarray_dask_data = None
+        reader._dims = None
+
+    def _metadata_for_listing(self) -> Any:
+        """Return metadata used by the cheap multi-scene descriptor path."""
+        return self._bio_image.ome_metadata
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors (scenes) available in this source via bioio.
@@ -326,7 +359,7 @@ class _BioioAdapterBase(TensorAdapter):
 
         # Try OME metadata first (much faster - no scene switching)
         try:
-            ome_meta = self._bio_image.ome_metadata
+            ome_meta = self._metadata_for_listing()
             if (
                 ome_meta is not None
                 and hasattr(ome_meta, "images")
@@ -462,6 +495,7 @@ class _BioioAdapterBase(TensorAdapter):
             dim_labels=self.dim_labels,
             source_url=self._source_url,
             io_lock=self._io_lock,
+            metadata_cache=self._metadata_cache,
         )
         # Set tensor context in the adapter
         adapter._tensor_name = tensor_id
@@ -604,6 +638,181 @@ class NikonAdapter(_BioioAdapterBase):
     """Adapter for Nikon ND2 files."""
 
     SOURCE_TYPE = "nikon"
+    RETAIN_SCENE_DASK = False
+
+    def _metadata_for_listing(self) -> Any:
+        if self._metadata_cache is None:
+            self._metadata_cache = self._bio_image.metadata
+        return self._metadata_cache
+
+    def get_metadata(self) -> dict:
+        """Read and retain BioIO's processed metadata once for this ND2 source."""
+        if self._metadata_cache is None:
+            self._metadata_cache = self._bio_image.metadata
+        return self._metadata_to_dict(self._metadata_cache)
+
+    @staticmethod
+    def _metadata_to_dict(metadata: Any) -> dict:
+        if metadata is None:
+            return {}
+        if hasattr(metadata, "model_dump"):
+            return metadata.model_dump(mode="json")
+        if hasattr(metadata, "dict"):
+            return metadata.dict(by_alias=False, exclude_none=False)
+        if hasattr(metadata, "__dict__"):
+            return {
+                key: value
+                for key, value in metadata.__dict__.items()
+                if not key.startswith("_")
+            }
+        return {}
+
+    def _physical_scale(self):
+        """Derive this scene's scale from the shared processed metadata cache."""
+        if self._metadata_cache is None:
+            self._metadata_cache = self._bio_image.metadata
+        ome = self._metadata_cache
+        if ome is None or not getattr(ome, "images", None):
+            return None
+        idx = self.scene_index if self.scene_index is not None else 0
+        if idx >= len(ome.images):
+            return None
+        px = ome.images[idx].pixels
+
+        def unit(value):
+            if value is None:
+                return ""
+            return str(getattr(value, "value", None) or value)
+
+        by_label = {
+            "x": (px.physical_size_x, unit(px.physical_size_x_unit)),
+            "y": (px.physical_size_y, unit(px.physical_size_y_unit)),
+            "z": (px.physical_size_z, unit(px.physical_size_z_unit)),
+        }
+        scale, units = [], []
+        for label in self.dim_labels or []:
+            value, axis_unit = by_label.get(str(label).lower(), (None, ""))
+            try:
+                numeric = float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                numeric = 0.0
+            scale.append(numeric if numeric > 0 else 0.0)
+            units.append(axis_unit if numeric > 0 else "")
+        return (scale, units) if any(scale) else None
+
+    def _read_chunk_shape(self, dask_data: Any) -> List[int]:
+        """Describe one ND2 sequence frame, preserving its pixel layout.
+
+        ``nd2.read_frame`` indexes the acquisition loops (T/Z and the scene's
+        position) and returns the complete C/Y/X[/S] frame. Some BioIO/Dask
+        arrays report several sequence frames as one chunk, which is not the
+        granularity available from the reader below. Keep any smaller pixel
+        tiling BioIO reports, but never combine T or Z frames in this private
+        planning hint.
+        """
+        chunk_shape = super()._read_chunk_shape(dask_data)
+        for axis, label in enumerate(self.dim_labels or []):
+            if label.upper() in {"T", "Z"}:
+                chunk_shape[axis] = 1
+        return chunk_shape
+
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read requested pixels directly from ND2 sequence frames.
+
+        BioIO remains authoritative for scenes and metadata. Pixel reads skip
+        its Dask graph because ``nd2.read_frame`` exposes the same frame-level
+        access directly. Only the requested subregion is copied, while the ND2
+        file is open, so no reader-backed view escapes this method.
+        """
+        if self.scene_index is None:
+            raise ValueError("Cannot get data from source-level adapter")
+
+        TensorAdapter.get_data(self, bounds)
+        if not self._source_url or not os.path.isfile(self._source_url):
+            return self._get_data_via_bioio(bounds)
+
+        import nd2
+
+        desc = self.get_tensor_descriptor()
+        labels = [label.upper() for label in desc.dim_labels]
+        if len(labels) != len(desc.shape) or not {"Y", "X"}.issubset(labels):
+            return self._get_data_via_bioio(bounds)
+        if any(label not in {"T", "C", "Z", "Y", "X", "S"} for label in labels):
+            return self._get_data_via_bioio(bounds)
+        shape = tuple(int(dim) for dim in desc.shape)
+        starts = tuple(int(value) for value in bounds.start)
+        stops = tuple(int(value) for value in bounds.stop)
+        output = np.empty(
+            tuple(stop - start for start, stop in zip(starts, stops, strict=True)),
+            dtype=np.dtype(desc.dtype),
+        )
+
+        sequence_axes = [
+            axis for axis, label in enumerate(labels) if label in {"T", "Z"}
+        ]
+        sequence_ranges = [range(starts[axis], stops[axis]) for axis in sequence_axes]
+        frame_shape = tuple(
+            1 if label in {"T", "Z"} else size
+            for label, size in zip(labels, shape, strict=True)
+        )
+
+        with self._io_lock, nd2.ND2File(self._source_url) as reader:
+            frame_indices = self._nd2_frame_indices(reader)
+            for coordinates in product(*sequence_ranges):
+                coordinate_by_label = {
+                    labels[axis]: coordinate
+                    for axis, coordinate in zip(sequence_axes, coordinates, strict=True)
+                }
+                frame_index = frame_indices[
+                    (
+                        coordinate_by_label.get("T", 0),
+                        coordinate_by_label.get("Z", 0),
+                    )
+                ]
+                frame = reader.read_frame(frame_index).reshape(frame_shape)
+
+                source_slices = []
+                output_slices = []
+                for axis, label in enumerate(labels):
+                    if label in {"T", "Z"}:
+                        coordinate = coordinate_by_label[label]
+                        source_slices.append(slice(0, 1))
+                        output_slices.append(
+                            slice(
+                                coordinate - starts[axis],
+                                coordinate - starts[axis] + 1,
+                            )
+                        )
+                    else:
+                        source_slices.append(slice(starts[axis], stops[axis]))
+                        output_slices.append(slice(None))
+                output[tuple(output_slices)] = frame[tuple(source_slices)]
+
+        return output
+
+    def _get_data_via_bioio(self, bounds: ChunkBounds) -> np.ndarray:
+        """Use an ephemeral BioIO Dask array for unsupported direct-read cases."""
+        slices = self._bounds_to_slices(bounds)
+        with self._io_lock:
+            self._bio_image.set_scene(self.scene_index)
+            try:
+                return self._bio_image.dask_data[slices].compute()
+            finally:
+                self._release_bioio_dask_cache()
+
+    def _nd2_frame_indices(self, reader: Any) -> dict[tuple[int, int], int]:
+        """Map this BioIO scene's T/Z coordinates to ND2 sequence indices."""
+        result: dict[tuple[int, int], int] = {}
+        for frame_index, coordinates in enumerate(reader.loop_indices):
+            if int(coordinates.get("P", 0)) != self.scene_index:
+                continue
+            key = (int(coordinates.get("T", 0)), int(coordinates.get("Z", 0)))
+            if key in result:
+                # Unknown acquisition loops cannot be represented by BioIO's
+                # TCZYXS tensor. Do not silently choose one of their frames.
+                raise ValueError(f"Ambiguous ND2 frame coordinates for T/Z {key}")
+            result[key] = frame_index
+        return result
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
