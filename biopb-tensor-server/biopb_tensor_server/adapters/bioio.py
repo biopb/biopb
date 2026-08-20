@@ -53,6 +53,10 @@ if TYPE_CHECKING:
 # RGB/samples one it must defer to scene switching.
 _CANONICAL_DIMS = "TCZYX"
 
+# "Not built yet" for the ND2 frame-index cache. Distinct from None, which is a
+# real cached answer meaning this scene's frames cannot be addressed by T/Z.
+_FRAME_INDEX_UNCACHED = object()
+
 
 GENERIC_IMAGE_EXTENSIONS = frozenset(
     [
@@ -257,7 +261,7 @@ class _BioioAdapterBase(TensorAdapter):
 
         self._dask_data = None  # scene-level dask array, bound below
         self._scene_descriptor = None
-        self._nd2_frame_index_cache = None
+        self._nd2_frame_index_cache: Any = _FRAME_INDEX_UNCACHED
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -782,31 +786,34 @@ class NikonAdapter(_BioioAdapterBase):
                 )
                 requested_frames.append((coordinate_by_label, key))
 
-            fallback_to_bioio = any(
+            # BioIO serves what the direct path cannot address: a scene whose
+            # frames have no T/Z map, or a coordinate the ND2 experiment never
+            # enumerated. Decided here but acted on below, once _io_lock is
+            # released -- _get_data_via_bioio takes that same lock.
+            fallback_to_bioio = frame_indices is None or any(
                 key not in frame_indices for _, key in requested_frames
             )
-            for coordinate_by_label, key in (
-                requested_frames if not fallback_to_bioio else ()
-            ):
-                frame_index = frame_indices[key]
-                frame = reader.read_frame(frame_index).reshape(frame_shape)
+            if not fallback_to_bioio:
+                for coordinate_by_label, key in requested_frames:
+                    frame_index = frame_indices[key]
+                    frame = reader.read_frame(frame_index).reshape(frame_shape)
 
-                source_slices = []
-                output_slices = []
-                for axis, label in enumerate(labels):
-                    if label in {"T", "Z"}:
-                        coordinate = coordinate_by_label[label]
-                        source_slices.append(slice(0, 1))
-                        output_slices.append(
-                            slice(
-                                coordinate - starts[axis],
-                                coordinate - starts[axis] + 1,
+                    source_slices = []
+                    output_slices = []
+                    for axis, label in enumerate(labels):
+                        if label in {"T", "Z"}:
+                            coordinate = coordinate_by_label[label]
+                            source_slices.append(slice(0, 1))
+                            output_slices.append(
+                                slice(
+                                    coordinate - starts[axis],
+                                    coordinate - starts[axis] + 1,
+                                )
                             )
-                        )
-                    else:
-                        source_slices.append(slice(starts[axis], stops[axis]))
-                        output_slices.append(slice(None))
-                output[tuple(output_slices)] = frame[tuple(source_slices)]
+                        else:
+                            source_slices.append(slice(starts[axis], stops[axis]))
+                            output_slices.append(slice(None))
+                    output[tuple(output_slices)] = frame[tuple(source_slices)]
 
         if fallback_to_bioio:
             return self._get_data_via_bioio(bounds)
@@ -822,9 +829,15 @@ class NikonAdapter(_BioioAdapterBase):
             finally:
                 self._release_bioio_dask_cache()
 
-    def _nd2_frame_indices(self, reader: Any) -> dict[tuple[int, int], int]:
-        """Map this BioIO scene's T/Z coordinates to ND2 sequence indices."""
-        if self._nd2_frame_index_cache is not None:
+    def _nd2_frame_indices(self, reader: Any) -> Optional[dict[tuple[int, int], int]]:
+        """Map this BioIO scene's T/Z coordinates to ND2 sequence indices.
+
+        Returns None when two frames share a (T, Z) coordinate. An unknown or
+        custom acquisition loop collapses onto one T/Z pair, so the direct path
+        cannot tell those frames apart; the caller reads the scene through
+        BioIO rather than choosing one of them here.
+        """
+        if self._nd2_frame_index_cache is not _FRAME_INDEX_UNCACHED:
             return self._nd2_frame_index_cache
         result: dict[tuple[int, int], int] = {}
         for frame_index, coordinates in enumerate(reader.loop_indices):
@@ -832,12 +845,11 @@ class NikonAdapter(_BioioAdapterBase):
                 continue
             key = (int(coordinates.get("T", 0)), int(coordinates.get("Z", 0)))
             if key in result:
-                # Unknown acquisition loops cannot be represented by BioIO's
-                # TCZYXS tensor. Do not silently choose one of their frames.
-                raise ValueError(f"Ambiguous ND2 frame coordinates for T/Z {key}")
+                self._nd2_frame_index_cache = None
+                return None
             result[key] = frame_index
         self._nd2_frame_index_cache = result
-        return self._nd2_frame_index_cache
+        return result
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:

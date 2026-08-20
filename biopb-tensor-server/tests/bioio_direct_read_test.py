@@ -130,9 +130,12 @@ def test_nikon_direct_read_preserves_rgb_samples(tmp_path, monkeypatch):
     assert np.array_equal(actual, data[:, :, :, 1:3, 1:4, 1:3])
 
 
-def test_nikon_direct_read_rejects_unrepresented_sequence_loop(tmp_path, monkeypatch):
-    data = np.zeros((1, 1, 1, 2, 2), dtype=np.uint8)
-    _FakeND2File.frames = [data[0, :, 0], data[0, :, 0]]
+def test_nikon_unrepresented_sequence_loop_falls_back_to_bioio(tmp_path, monkeypatch):
+    # Two frames of an unknown loop collapse onto the same (T, Z), so the
+    # direct path cannot tell them apart. The zeroed frames stand in for the
+    # arbitrary pick it must not make; BioIO's array carries the real pixels.
+    data = np.arange(2 * 2, dtype=np.uint8).reshape(1, 1, 1, 2, 2) + 1
+    _FakeND2File.frames = [np.zeros((1, 1, 2, 2), np.uint8)] * 2
     _FakeND2File.loop_indices_value = ({"P": 1, "M": 0}, {"P": 1, "M": 1})
     _FakeND2File.loop_indices_accesses = 0
     monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
@@ -143,8 +146,13 @@ def test_nikon_direct_read_rejects_unrepresented_sequence_loop(tmp_path, monkeyp
         ((1,), (1,), (1,), (2,), (2,)),
     )
 
-    with pytest.raises(ValueError, match="Ambiguous ND2 frame coordinates"):
-        adapter.get_data(ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 2, 2]))
+    bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 2, 2])
+    actual = adapter.get_data(bounds)
+
+    assert np.array_equal(actual, data)
+    # The ambiguity verdict caches too: no second walk of the whole file.
+    adapter.get_data(bounds)
+    assert _FakeND2File.loop_indices_accesses == 1
 
 
 def test_nikon_missing_tz_coordinate_falls_back_to_bioio(tmp_path, monkeypatch):
