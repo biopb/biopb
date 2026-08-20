@@ -400,7 +400,7 @@ def decode_reduction_method(chunk_id: bytes) -> str:
 # Preferred transfer size and hard Arrow batch ceiling. The adapter's native
 # read unit is only a planning seed: small units are coalesced toward the
 # preferred size and large units are divided toward it (biopb/biopb#684).
-PREFERRED_ARROW_BATCH_BYTES = 16 * 1024 * 1024
+PREFERRED_ARROW_BATCH_BYTES = 8 * 1024 * 1024
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 MIN_TRANSFER_ENDPOINTS = 4
 

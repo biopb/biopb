@@ -434,7 +434,7 @@ class TestTransferChunkSize:
             native, shape, "<u2", ["t", "c", "z", "y", "x"]
         )
 
-        assert result == (1, 1, 8, 960, 1000)
+        assert result == (1, 1, 4, 960, 1000)
         assert estimate_chunk_bytes(result, "<u2") <= PREFERRED_ARROW_BATCH_BYTES
         assert all(r % n == 0 for r, n in zip(result, native, strict=True))
         assert (
@@ -456,7 +456,7 @@ class TestTransferChunkSize:
             ["t", "c", "z", "y", "x"],
         )
 
-        assert result == (1, 1, 8, 960, 1000)
+        assert result == (1, 1, 4, 960, 1000)
         assert estimate_chunk_bytes(result, "<u2") <= PREFERRED_ARROW_BATCH_BYTES
 
     def test_coalesces_spatial_tiles_without_long_strip(self):
@@ -488,7 +488,7 @@ class TestTransferChunkSize:
         )
 
         assert result[0] == result[1]
-        assert estimate_chunk_bytes(result, "<u2") <= 16 << 20
+        assert estimate_chunk_bytes(result, "<u2") <= 8 << 20
 
     def test_scaled_logical_chunk_is_no_larger_than_transfer_chunk(self):
         from math import lcm
