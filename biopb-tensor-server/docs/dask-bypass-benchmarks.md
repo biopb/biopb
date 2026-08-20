@@ -6,9 +6,9 @@ actually reaches `adapters/bioio.py`.
 
 **Answer: yes, and the reason is not the one #640 gives.** The dominant cost is
 not per-byte and not a fixed per-read overhead. It scales with the number of
-blocks in the *whole* dask array, so it is worst on long time series — and
-`_FRAME_CHUNK_DIMS` makes it worse, because forcing one block per frame
-maximizes the block count.
+blocks in the *whole* dask array, so it is worst on long time series. A second,
+independent cost is over-read: a request smaller than a block pays for the whole
+block, and on `dev` a `.tif`/`.lsm`/`.lif` block is an entire Z stack.
 
 ## Scope
 
@@ -38,12 +38,10 @@ against the identical region read straight from the native library, verified
 with `np.array_equal` (every row below is `match=True`; an earlier revision
 failed this and was reading the wrong planes).
 
-- `BioImage` is built **outside** the timed region, as the adapter holds it, and
-  with the `chunk_dims` biopb passes (`("Y","X","S")` for `.tif`/`.lsm`/`.lif`).
-  That `_FRAME_CHUNK_DIMS` override is **not on `dev` yet** -- it arrives with
-  the pending frame-chunking change (#685). Rows labelled "frame", and the
-  `.tif`/`.lsm`/`.lif` rows generally, assume it; rows labelled "default" are
-  what `dev` does today.
+- `BioImage` is built **outside** the timed region, as the adapter holds it.
+  A `_FRAME_CHUNK_DIMS` override was proposed in #685 / #798 and closed; every
+  headline number here is `dev`'s behaviour (bioio's own `chunk_dims`), and the
+  frame-chunked configuration is measured separately below.
 - Best of 3, warm page cache — this isolates CPU/graph cost, which is what is
   under test. A cold-cache run would narrow every ratio.
 - The native path always **copies**. A memmap view costs nothing and reads
@@ -54,38 +52,41 @@ failed this and was reading the wrong planes).
 `.tif` and `.nd2` are real files. `.lsm`, `.lif`, `.czi` and `.dv` are
 synthesized — see "Fixtures" below.
 
-## One frame, in biopb's configuration
+## One plane, as `dev` reads it today
 
-Averaged over a walk of **distinct** frames on both sides. Re-reading a single
-frame keeps its page offsets warm and flatters the native side -- on the
-2800-page TIFF that alone was the difference between 0.05 and 0.086 ms.
+Cost to serve a single (T, C, Z) plane, averaged over distinct planes on both
+paths. Comparable regardless of chunking: asking dask for one plane out of a
+Z-stack block still materializes the block, and that over-read is the thing
+being measured.
 
-| format | adapter | blocks | dask | native | |
-| --- | --- | --- | --- | --- | --- |
-| `.tif` | aics | 2800 | 235.2 ms | 0.086 ms | **2730x** |
-| `.lsm` | zeiss | 30 | 11.3 ms | 0.009 ms | 1224x |
-| `.lif` | leica | 20 | 2.5 ms | 0.044 ms | 57x |
-| `.dv` | dv | 80 | 1.4 ms | 0.060 ms | 23x |
-| `.czi` | zeiss | 40 | 3.6 ms | 2.019 ms | 2x |
-| `.nd2` | nikon | 1 | 141.1 ms | 70.2 ms | 2x |
+| format | adapter | blocks | block size | dask | native | |
+| --- | --- | --- | --- | --- | --- | --- |
+| `.lsm` | zeiss | 6 | 0.04 MB | 32.60 ms | 0.022 ms | **1473x** |
+| `.tif` | aics | 20 | 4.62 MB | 57.01 ms | 0.093 ms | **610x** |
+| `.lif` | leica | 4 | 0.04 MB | 1.87 ms | 0.062 ms | 30x |
+| `.dv` | dv | 80 | 0.52 MB | 1.44 ms | 0.074 ms | 20x |
+| `.czi` | zeiss | 40 | 2.10 MB | 3.87 ms | 1.999 ms | 2x |
+| `.nd2` | nikon | 1 | 202.57 MB | 124.12 ms | 70.08 ms | 2x |
 
-The ratio tracks block count, not format. `.nd2` is bottom of the table only
-because that file is a single frame (T=1, Z=1) and therefore one block -- the
-same file type with 40 000 frames sits where `.tif` is. `.czi` looks cheap here
-only because every request above is a **whole plane**, the one shape with no
-over-read to remove; see the next section.
+`.nd2` is low only because that file is a single frame (T=1, Z=1) and therefore
+one block; the same format with 40 000 frames sits at the top. `.czi` is low
+because every request here is a whole plane, the one shape with no over-read to
+remove -- see the next section.
 
-Native reads run at 1.5-1.9 GB/s against a 13-15 GB/s memcpy floor -- the gap is
+Native reads run at 1.5-1.9 GB/s against a 13-15 GB/s memcpy floor; the gap is
 tifffile's per-page Python work, not I/O. They are real reads: `pages.cache` is
-False and `asarray()` returns a fresh array each call.
+False and `asarray()` returns a fresh array each call. Re-reading one hot plane
+instead of distinct planes would flatter the native side by roughly 2x on a
+many-page file.
 
 ## Sub-plane requests over-read the whole block
 
 Every measurement above asks for a whole plane. A viewer asking for a tile does
-not, and the dask block is a whole plane for `.czi` (`bioio_czi` sets
-`chunk_shape = shape[-2:]`, always per-plane -- never a Z stack) and for
-`.tif`/`.lsm`/`.lif` under `_FRAME_CHUNK_DIMS`. So a tile request materializes
-the entire plane and throws most of it away.
+not. For `.czi` the block is a whole plane (`bioio_czi` sets
+`chunk_shape = shape[-2:]`, always per-plane -- never a Z stack), so a tile
+request materializes the plane and throws most of it away. For
+`.tif`/`.lsm`/`.lif` on `dev` the block is a whole *Z stack*, so the same
+request is worse still.
 
 CZI, a 256x256 tile out of a 4096x4096 plane (33.6 MB block):
 
@@ -135,29 +136,36 @@ read, so the whole graph is re-optimized every time. Profiling a 40 000-frame
 source: of 9.7 s, **5.5 s is `__dask_graph__` → `optimize`/`order`/`fuse`/`cull`**
 and only 1.4 s is execution.
 
-This is why `_FRAME_CHUNK_DIMS` cuts both ways. It removes
-read amplification — without it a one-plane read materialized a whole Z-stack —
-but it maximizes block count. On `organoids.tif` the same single frame costs
-48.3 ms under bioio's default chunking and **221.5 ms** under frame chunking.
+This is also why chunking cannot be tuned out of the problem: shrinking blocks
+to remove the Z-stack over-read raises the block count, and the graph cost rises
+with it. See the next section.
 
-## Frame chunking (#685) is shape-dependent
+## Frame chunking (#685 / #798) was evaluated and closed
 
-`_FRAME_CHUNK_DIMS` removes read amplification but multiplies block count, and
-which effect wins depends entirely on the source's shape. Twelve single-plane
-reads, fresh process per row:
+Forcing `chunk_dims = ("Y","X","S")` removes the Z-stack over-read but
+multiplies block count, and which effect wins depends entirely on the source's
+shape. Twelve single-plane reads, fresh process per row:
 
-| source | chunking | blocks | block size | time | peak RSS |
-| --- | --- | --- | --- | --- | --- |
-| deepstack.tif (1 T, 320 Z) | default | 1 | 153.6 MB | 1935.7 ms | +313 MB |
-| deepstack.tif (1 T, 320 Z) | **frame** | 320 | 0.48 MB | **425.9 ms** | **+20 MB** |
-| organoids.tif (20 T, 140 Z) | default | 20 | 4.62 MB | **858.4 ms** | **+28 MB** |
-| organoids.tif (20 T, 140 Z) | **frame** | 2800 | 0.03 MB | 2778.5 ms | +33 MB |
+| source | chunking | blocks | time | peak RSS |
+| --- | --- | --- | --- | --- |
+| deepstack.tif (1 T, 320 Z) | default | 1 | 1935.7 ms | +313 MB |
+| deepstack.tif (1 T, 320 Z) | **frame** | 320 | **425.9 ms** | **+20 MB** |
+| organoids.tif (20 T, 140 Z) | default | 20 | **858.4 ms** | **+28 MB** |
+| organoids.tif (20 T, 140 Z) | **frame** | 2800 | 2778.5 ms | +33 MB |
 
-#685 measured the first shape, where frame chunking is 4.5x faster and 15x
-leaner. On the second it is 3.2x *slower* with no memory win, because the default
-block was already small and T multiplies the block count. Neither setting is
-right for every source, which is the argument for getting off the dask array
-rather than tuning its chunking.
+#685 measured the first shape, where it is 4.5x faster and 15x leaner. On the
+second it is 3.2x *slower* with no memory win, because the default block was
+already small and T multiplies the block count. Per plane across the corpus:
+
+| format | dev default | frame chunked |
+| --- | --- | --- |
+| `.tif` | 57.01 ms | 216.23 ms |
+| `.lif` | 1.87 ms | 2.67 ms |
+| `.lsm` | 32.60 ms | 32.53 ms |
+
+Neither setting is right for every source, which is why #798 was closed in
+favour of getting off the dask array entirely (#799) rather than tuning its
+chunking.
 
 ## No generic fix captures it
 
@@ -198,12 +206,21 @@ native reader against a held handle is O(1).
    it is worth more than the dask bypass on many-block sources. It interacts with
    `_handle_reaper`, and must respect #640's constraint that no view escapes
    `_io_lock`.
-2. **`.tif` and `.lsm`** — worst measured, and both are tifffile-backed, so they
-   can reuse the existing `_read_aszarr_plane` / persistent-store machinery in
-   `ome_tiff.py` and `tiff.py` rather than needing a new bypass.
-3. **`.lif`** (readlif) and **`.czi`** (pylibCZIrw) — real O(blocks) cost, each
-   needs its own small direct path.
-4. **`.dv`** — flat in block count; lowest priority.
+2. **`.lsm` and `.tif`** — worst measured (1473x and 610x per plane), and both
+   are tifffile-backed, so one path serves both and can reuse the existing
+   `_read_aszarr_plane` / persistent-store machinery in `ome_tiff.py` and
+   `tiff.py` rather than needing new read code. `.lsm` carries one decision the
+   others do not: tifffile builds a second, reduced series from the interleaved
+   thumbnail pages and bioio exposes it as a scene. It is **not** a pyramid
+   level — `CZ_LSMINFO` records `ThumbnailX`/`ThumbnailY` as absolute pixel
+   counts, so its scale varies per file — so the adapter should decide
+   deliberately rather than inherit it.
+3. **`.czi`** — only 2x on whole planes, but 20-29x on tiles plus a native
+   `zoom=` that subsumes the fused read+reduce #640 asks for. The case rests on
+   sub-plane and pyramid access, not on plane reads.
+4. **`.lif`** — O(blocks) overhead only; readlif offers no ROI, so there is no
+   over-read win on top.
+5. **`.dv`** — flat in block count and a memmap underneath; lowest priority.
 
 ## Fixtures
 
