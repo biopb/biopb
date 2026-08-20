@@ -40,6 +40,10 @@ failed this and was reading the wrong planes).
 
 - `BioImage` is built **outside** the timed region, as the adapter holds it, and
   with the `chunk_dims` biopb passes (`("Y","X","S")` for `.tif`/`.lsm`/`.lif`).
+  That `_FRAME_CHUNK_DIMS` override is **not on `dev` yet** -- it arrives with
+  the pending frame-chunking change (#685). Rows labelled "frame", and the
+  `.tif`/`.lsm`/`.lif` rows generally, assume it; rows labelled "default" are
+  what `dev` does today.
 - Best of 3, warm page cache — this isolates CPU/graph cost, which is what is
   under test. A cold-cache run would narrow every ratio.
 - The native path always **copies**. A memmap view costs nothing and reads
@@ -131,7 +135,7 @@ read, so the whole graph is re-optimized every time. Profiling a 40 000-frame
 source: of 9.7 s, **5.5 s is `__dask_graph__` → `optimize`/`order`/`fuse`/`cull`**
 and only 1.4 s is execution.
 
-This is why `_FRAME_CHUNK_DIMS` (commit `0e5c7a50`) cuts both ways. It removes
+This is why `_FRAME_CHUNK_DIMS` cuts both ways. It removes
 read amplification — without it a one-plane read materialized a whole Z-stack —
 but it maximizes block count. On `organoids.tif` the same single frame costs
 48.3 ms under bioio's default chunking and **221.5 ms** under frame chunking.
