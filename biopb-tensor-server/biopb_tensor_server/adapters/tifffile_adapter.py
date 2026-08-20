@@ -1,0 +1,344 @@
+"""Native tifffile adapters for plain TIFF and Zeiss LSM files.
+
+The BioIO tifffile reader builds one Dask task per TIFF page.  That is a poor
+fit for local files with many pages: a small read pays the graph construction
+and optimization cost before any pixels are decoded.  These adapters keep the
+same tifffile ``aszarr`` read path as :class:`OmeTiffAdapter`, but open the
+store once and slice it directly.
+
+OME-TIFF remains owned by ``OmeTiffAdapter``.  TIFF sequences and
+Micro-Manager datasets remain owned by their directory-level adapters.
+"""
+
+import logging
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+
+import numpy as np
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+from biopb_tensor_server.adapters._scale import MICRON, scale_by_label, unit_to_um
+from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+from biopb_tensor_server.adapters.tiff import _tiff_pixel_size_um
+from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+
+if TYPE_CHECKING:
+    from biopb_tensor_server.core.discovery import DiscoveryState
+
+logger = logging.getLogger(__name__)
+
+_CANONICAL_DIMS = ("T", "C", "Z", "Y", "X")
+_SAMPLES_DIM = "S"
+_SUPPORTED_EXTENSIONS = (".tif", ".tiff")
+
+
+def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
+    """Map tifffile axes onto the canonical descriptor vocabulary.
+
+    Plain TIFF has no required dimension metadata.  tifffile calls otherwise
+    unlabeled sequence axes ``Q`` (and some readers use ``I``).  BioIO's
+    tifffile reader maps those axes from the right of ``TCZ`` for grayscale
+    data, while an RGB samples axis uses the leading ``TC`` slots.  Mirroring
+    that convention keeps a native read's descriptor compatible with the
+    existing BioIO fallback.
+
+    The return value has one label per native array axis, in native order.  It
+    is used only for indexing; no pixel transpose is done here.
+    """
+    axes = str(native_axes or "").upper()
+    if len(axes) != len(shape) or axes.count("Y") != 1 or axes.count("X") != 1:
+        return None
+
+    mapped: List[Optional[str]] = [None] * len(axes)
+    used = set()
+    unknown = []
+    for index, axis in enumerate(axes):
+        if axis in _CANONICAL_DIMS or axis == _SAMPLES_DIM:
+            if axis in used:
+                return None
+            mapped[index] = axis
+            used.add(axis)
+        else:
+            unknown.append(index)
+
+    if unknown:
+        if _SAMPLES_DIM in used:
+            # BioIO treats QSYX / QQSYX as C/YX and TC/YX respectively;
+            # additional unknown axes, if any, occupy Z after those.
+            preferred = ["C"] if len(unknown) == 1 else ["T", "C", "Z"][: len(unknown)]
+            targets = [axis for axis in preferred if axis not in used]
+            targets.extend(
+                axis
+                for axis in ("T", "C", "Z")
+                if axis not in used and axis not in targets
+            )
+            targets = targets[: len(unknown)]
+        else:
+            # QYX / QQYX / QQQYX map to Z / CZ / TCZ.
+            targets = [axis for axis in ("T", "C", "Z") if axis not in used]
+            targets = targets[-len(unknown) :]
+        if len(targets) != len(unknown):
+            return None
+        for index, axis in zip(unknown, targets, strict=True):
+            mapped[index] = axis
+            used.add(axis)
+
+    if any(axis is None for axis in mapped):
+        return None
+    return "".join(mapped)  # type: ignore[arg-type]
+
+
+class _TifffileAdapterBase(OmeTiffAdapter):
+    """Shared source/scene adapter for local plain TIFF-like files."""
+
+    _LSM = False
+
+    @classmethod
+    def create_from_config(cls, source, credentials_config=None):
+        """Use native tifffile locally and retain BioIO for fallback sources."""
+        url = str(source.url).lower()
+        native = not source.is_remote and (
+            url.endswith(".lsm") if cls._LSM else url.endswith(_SUPPORTED_EXTENSIONS)
+        )
+        if native:
+            return super().create_from_config(source, credentials_config)
+
+        from biopb_tensor_server.adapters.bioio import (
+            AicsImageIoAdapter,
+            ZeissAdapter,
+        )
+
+        fallback = ZeissAdapter if cls._LSM else AicsImageIoAdapter
+        return fallback.create_from_config(source, credentials_config)
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim a resident local TIFF or LSM, leaving OME-TIFF to its owner."""
+        if not ctx.is_file() or ctx.is_remote or ctx.cloud_root:
+            return None
+
+        name = ctx.name.lower()
+        if cls._LSM:
+            if not name.endswith(".lsm"):
+                return None
+        elif not name.endswith(_SUPPORTED_EXTENSIONS):
+            return None
+
+        if not ctx.is_resident():
+            return None
+
+        state.try_claim_path(ctx.path_str)
+        return SourceClaim(
+            source_type=cls.SOURCE_TYPE,
+            primary_path=ctx.path_str,
+            is_remote=False,
+        )
+
+    def _series_indices(self, tiff: Any) -> List[int]:
+        """Return the series exposed as tensors by this adapter."""
+        # tifffile creates a reduced LSM thumbnail as a second series.  It is a
+        # thumbnail, not a pyramid level: its absolute dimensions vary by file
+        # and it has no stable scale relationship to the full-resolution image.
+        return [0] if self._LSM else list(range(len(tiff.series)))
+
+    def _series_descriptor(
+        self, series: Any, series_index: int
+    ) -> Optional[TensorDescriptor]:
+        native_axes = str(series.axes).upper()
+        mapped = _mapped_axes(native_axes, tuple(series.shape))
+        if mapped is None:
+            return None
+
+        # The native store has one full plane per page.  Keep that native unit
+        # in the read plan, including an interleaved RGB(A) samples axis.
+        labels = list(_CANONICAL_DIMS)
+        if _SAMPLES_DIM in mapped:
+            labels.append(_SAMPLES_DIM)
+        by_axis = {axis: int(series.shape[index]) for index, axis in enumerate(mapped)}
+        shape = [by_axis.get(axis, 1) for axis in labels]
+        chunk_shape = [
+            size if axis in {"Y", "X", "S"} else 1
+            for axis, size in zip(labels, shape, strict=True)
+        ]
+        return TensorDescriptor(
+            array_id=f"{self.source_id}/Image:{series_index}",
+            dim_labels=labels,
+            shape=shape,
+            chunk_shape=chunk_shape,
+            dtype=np.dtype(series.dtype).str,
+        )
+
+    def _tifffile_descriptors(self) -> Optional[List[TensorDescriptor]]:
+        """Build descriptors from tifffile without constructing a Dask graph."""
+        if self.dim_labels:
+            # Keep the pure-tifffile path's descriptor authoritative.  Custom
+            # labels would need an explicit native-axis mapping and are better
+            # handled by the configured BioIO fallback for now.
+            return None
+
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return None
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return None
+
+        import tifffile
+
+        try:
+            with tifffile.TiffFile(path) as tiff:
+                descriptors = []
+                for index in self._series_indices(tiff):
+                    descriptor = self._series_descriptor(tiff.series[index], index)
+                    if descriptor is None:
+                        return None
+                    descriptors.append(descriptor)
+                return descriptors or None
+        except Exception:
+            logger.debug(
+                "tifffile descriptor path unavailable for %s",
+                self._source_url,
+                exc_info=True,
+            )
+            return None
+
+    def get_tensor_adapter(self, tensor_id: str) -> "_TifffileAdapterBase":
+        """Create a scene adapter of the same native type."""
+        descriptors = self.list_tensor_descriptors()
+        field = self._within_source_field(tensor_id)
+        scene_index = self._scene_index_for_field(field)
+        if field in self._tensor_adapters:
+            return self._tensor_adapters[field]
+
+        adapter = self.__class__(
+            self._source_url,
+            self.source_id,
+            scene_index=scene_index,
+            tensor_descriptor=descriptors[scene_index],
+            io_lock=self._io_lock,
+        )
+        adapter._tensor_name = field
+        self._tensor_adapters[field] = adapter
+        return adapter
+
+    def _open_store(self):
+        """Open the selected tifffile series as a persistent page store."""
+        import tifffile
+        import zarr
+
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return None
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return None
+
+        series_index = self.scene_index or 0
+        tiff = tifffile.TiffFile(path)
+        try:
+            series = tiff.series[series_index]
+            store = series.aszarr(level=0, chunkmode="page")
+            zarr_array = zarr.open(store, mode="r")
+            axes = _mapped_axes(str(series.axes), tuple(zarr_array.shape))
+            if axes is None:
+                raise ValueError("unsupported tifffile axis layout")
+
+            descriptor = self._tifffile_descriptor
+            by_axis = {
+                axis: int(zarr_array.shape[index]) for index, axis in enumerate(axes)
+            }
+            canonical = tuple(by_axis.get(axis, 1) for axis in descriptor.dim_labels)
+            if (
+                canonical != tuple(descriptor.shape)
+                or zarr_array.dtype.str != descriptor.dtype
+            ):
+                for obj in (store, tiff):
+                    try:
+                        obj.close()
+                    except Exception:
+                        logger.debug(
+                            "error closing rejected tifffile store", exc_info=True
+                        )
+                return None
+        except Exception:
+            tiff.close()
+            raise
+
+        self._persistent_tiff = tiff
+        self._persistent_store = store
+        return zarr_array, axes
+
+    def _physical_scale(self):
+        """Return TIFF resolution or LSM voxel calibration in micrometres."""
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return None
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return None
+
+        labels = self.dim_labels or list(self.get_tensor_descriptor().dim_labels)
+        try:
+            import tifffile
+
+            with tifffile.TiffFile(path) as tiff:
+                page = tiff.pages[0]
+                if self._LSM and tiff.lsm_metadata:
+                    metadata = tiff.lsm_metadata
+                    values = {
+                        "x": float(metadata.get("VoxelSizeX", 0.0)) * 1e6,
+                        "y": float(metadata.get("VoxelSizeY", 0.0)) * 1e6,
+                        "z": float(metadata.get("VoxelSizeZ", 0.0)) * 1e6,
+                    }
+                else:
+                    imagej = tiff.imagej_metadata or {}
+                    imagej_unit_um = unit_to_um(imagej.get("unit"))
+                    values = {
+                        "x": _tiff_pixel_size_um(page, "XResolution", imagej_unit_um),
+                        "y": _tiff_pixel_size_um(page, "YResolution", imagej_unit_um),
+                        "z": None,
+                    }
+                    spacing = imagej.get("spacing")
+                    if spacing is not None and imagej_unit_um is not None:
+                        values["z"] = float(spacing) * imagej_unit_um
+            return scale_by_label(labels, values, MICRON)
+        except Exception:
+            logger.debug(
+                "tifffile physical scale unavailable for %s",
+                self._source_url,
+                exc_info=True,
+            )
+            return None
+
+    def get_metadata(self) -> dict:
+        """Return lightweight native TIFF/LSM metadata when available."""
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return {}
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return {}
+        try:
+            import tifffile
+
+            with tifffile.TiffFile(path) as tiff:
+                if self._LSM:
+                    return dict(tiff.lsm_metadata or {})
+                return dict(tiff.imagej_metadata or {})
+        except Exception:
+            return {}
+
+
+class TiffAdapter(_TifffileAdapterBase):
+    """Native adapter for local non-OME ``.tif`` / ``.tiff`` files."""
+
+    SOURCE_TYPE = "aics"
+
+
+class LsmAdapter(_TifffileAdapterBase):
+    """Native adapter for Zeiss ``.lsm`` files (full-resolution series only)."""
+
+    SOURCE_TYPE = "zeiss"
+    _LSM = True
+
+
+__all__ = ["TiffAdapter", "LsmAdapter"]

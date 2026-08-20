@@ -22,6 +22,7 @@ from biopb_tensor_server.adapters.tiff import (
     MicroManagerLegacyAdapter,
     TiffSequenceAdapter,
 )
+from biopb_tensor_server.adapters.tifffile_adapter import LsmAdapter, TiffAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
 # Optional bioio vendor-format adapters (installed via the [aics] extra)
@@ -86,6 +87,8 @@ __all__ = [
     "TensorReadPlan",
     "ZarrAdapter",
     "Hdf5Adapter",
+    "TiffAdapter",
+    "LsmAdapter",
     "OmeTiffAdapter",
     "ZeissAdapter",
     "LeicaAdapter",

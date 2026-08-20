@@ -185,6 +185,22 @@ class _BioioAdapterBase(TensorAdapter):
         Returns:
             Adapter instance (source-level, scene_index=None)
         """
+        # Local plain TIFF and LSM keep their stable BioIO source types while
+        # using the native tifffile adapters for pixel reads.  The import is
+        # lazy so the optional BioIO package remains optional for native files.
+        if not source.is_remote:
+            url_lower = str(source.url).lower()
+            if cls.__name__ == "AicsImageIoAdapter" and url_lower.endswith(
+                (".tif", ".tiff")
+            ):
+                from biopb_tensor_server.adapters.tifffile_adapter import TiffAdapter
+
+                return TiffAdapter.create_from_config(source, credentials_config)
+            if cls.__name__ == "ZeissAdapter" and url_lower.endswith(".lsm"):
+                from biopb_tensor_server.adapters.tifffile_adapter import LsmAdapter
+
+                return LsmAdapter.create_from_config(source, credentials_config)
+
         from bioio import BioImage
 
         if source.is_remote:

@@ -1,8 +1,10 @@
 # Is bypassing dask worth it beyond ND2?
 
 Follow-up to #640, which measured ND2 only and closed with "worth measuring per
-adapter before generalizing". This is that measurement, across every format that
-actually reaches `adapters/bioio.py`.
+adapter before generalizing". This is that pre-Phase-1 measurement, across every
+format that then reached `adapters/bioio.py`. Phase 1 now serves local plain
+`.tif`/`.tiff` and `.lsm` through native persistent tifffile adapters; their rows below are the historical
+baseline.
 
 **Answer: yes, and the reason is not the one #640 gives.** The dominant cost is
 not per-byte and not a fixed per-read overhead. It scales with the number of
@@ -12,15 +14,16 @@ block, and on `dev` a `.tif`/`.lsm`/`.lif` block is an entire Z stack.
 
 ## Scope
 
-Only these reach the bioio adapter. OME-TIFF (`OmeTiffAdapter`), TIFF sequences
-and MicroManager (`tiff.py`) are pure tifffile on a persistent `aszarr` store and
-never touch dask, so they are **out of scope** — an earlier revision of this
-document benchmarked them by mistake.
+The measurements below predate Phase 1. Local plain TIFF and LSM now use
+`TiffAdapter` and `LsmAdapter`, respectively; remote TIFF and all other formats
+listed here still use BioIO where their dedicated native phase is not complete.
+OME-TIFF (`OmeTiffAdapter`), TIFF sequences and MicroManager (`tiff.py`) are
+pure tifffile on a persistent `aszarr` store and never touch dask.
 
 | adapter | extension | bioio plugin | native reader |
 | --- | --- | --- | --- |
-| AicsImageIoAdapter | `.tif`/`.tiff` (plain) | bioio-tifffile | tifffile |
-| ZeissAdapter | `.lsm` | bioio-tifffile | tifffile |
+| TiffAdapter | `.tif`/`.tiff` (plain, local) | — | tifffile |
+| LsmAdapter | `.lsm` (local) | — | tifffile |
 | ZeissAdapter | `.czi` | bioio-czi | pylibCZIrw |
 | LeicaAdapter | `.lif` | bioio-lif | readlif |
 | NikonAdapter | `.nd2` | bioio-nd2 | nd2 (already bypassed) |
@@ -195,13 +198,13 @@ native reader against a held handle is O(1).
 
 ## Recommendation
 
-0. **Remote sources stay on bioio.** `OmeTiffAdapter` and `TiffSequenceAdapter`
+0. **Phase 1 local TIFF/LSM is complete; remote sources stay on BioIO.**
+   `OmeTiffAdapter` and `TiffSequenceAdapter`
    both decline remote URLs today, so a remote `.tif` already falls through to
    the bioio `aics` adapter and its fsspec path -- `ome_tiff.py`'s persistent
-   `aszarr` store is local-only by choice ("persistent local handle N/A"). A
-   dedicated `.tif`/`.lsm` adapter can follow the same shape: claim local,
-   decline remote. That contains the gap rather than closing it -- remote reads
-   keep the O(blocks) cost measured above.
+   `aszarr` store is local-only by choice ("persistent local handle N/A"). The
+   dedicated adapters claim local and decline remote. That contains the gap
+   rather than closing it -- remote reads keep the O(blocks) cost measured above.
 1. **Hold the file handle open across reads.** This is where O(1) comes from and
    it is worth more than the dask bypass on many-block sources. It interacts with
    `_handle_reaper`, and must respect #640's constraint that no view escapes
@@ -213,8 +216,9 @@ native reader against a held handle is O(1).
    others do not: tifffile builds a second, reduced series from the interleaved
    thumbnail pages and bioio exposes it as a scene. It is **not** a pyramid
    level — `CZ_LSMINFO` records `ThumbnailX`/`ThumbnailY` as absolute pixel
-   counts, so its scale varies per file — so the adapter should decide
-   deliberately rather than inherit it.
+   counts, so its scale varies per file. `LsmAdapter` deliberately exposes only the
+   full-resolution series and drops the thumbnail; computed pyramid levels remain the
+   server's responsibility.
 3. **`.czi`** — only 2x on whole planes, but 20-29x on tiles plus a native
    `zoom=` that subsumes the fused read+reduce #640 asks for. The case rests on
    sub-plane and pyramid access, not on plane reads.

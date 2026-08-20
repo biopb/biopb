@@ -172,8 +172,8 @@ justified by open cost.
 
 | Open cost | Policy | Adapters |
 |---|---|---|
-| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
-| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, `qptiff`, `ndtiff` |
+| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, TIFF sequences, `bioio`, `dicom`, local `zarr` |
+| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, native plain TIFF/LSM, `qptiff`, `ndtiff` |
 
 ---
 

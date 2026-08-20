@@ -20,6 +20,7 @@ from .tiff import (
     MicroManagerLegacyAdapter,
     TiffSequenceAdapter,
 )
+from .tifffile_adapter import LsmAdapter, TiffAdapter
 from .zarr import ZarrAdapter
 
 # Optional ndtiff adapter (Micro-Manager NDTiff storage format)
@@ -90,6 +91,8 @@ __all__ = [
     "Hdf5Adapter",
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
+    "TiffAdapter",
+    "LsmAdapter",
     "OmeZarrAdapter",
     "RemoteTensorAdapter",
     "NdTiffAdapter",
@@ -146,6 +149,13 @@ def get_default_registry() -> AdapterRegistry:
     # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
     # declines falls through to the generic bioio adapter registered below.
     registry.register(OmeTiffAdapter, "ome-tiff")
+
+    # Native tifffile paths for local plain TIFF and LSM.  OME-TIFF has already
+    # won above; remote sources intentionally fall through to BioIO until the
+    # remote policy is decided.  LSM is registered separately so its source
+    # type remains explicit even though both classes share the implementation.
+    registry.register(TiffAdapter)
+    registry.register(LsmAdapter)
 
     # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
     # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not
