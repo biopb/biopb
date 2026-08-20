@@ -229,8 +229,20 @@ class _BioioAdapterBase(TensorAdapter):
             # required dimensions. Never hand them a class/module-level list.
             image_kwargs["chunk_dims"] = list(chunk_dims)
 
-        img = BioImage(image, **image_kwargs)
+        try:
+            img = BioImage(image, **image_kwargs)
+        except TypeError:
+            if "chunk_dims" not in image_kwargs:
+                raise
+            # A fallback plugin may be selected after the chunk-capable
+            # reader rejects the file, but not accept this plugin-only kwarg.
+            logger.debug(
+                "BioIO plugin rejected chunk_dims for %s; retrying without it",
+                image,
+            )
+            image_kwargs.pop("chunk_dims")
 
+            img = BioImage(image, **image_kwargs)
         return cls(
             img,
             scene_index=None,  # Source-level adapter

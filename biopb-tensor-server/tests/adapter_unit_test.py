@@ -2095,3 +2095,52 @@ class TestBioioFrameChunkDims:
 
         if expected is not None:
             calls[-1][1]["chunk_dims"].append("M")
+            adapter_cls.create_from_config(source)
+            assert calls[-1][1]["chunk_dims"] == list(expected)
+            assert "M" not in calls[-1][1]["chunk_dims"]
+
+    def test_tiff_z_stack_has_one_plane_native_blocks(self, tmp_path):
+        pytest.importorskip("bioio")
+        import tifffile
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+
+        path = tmp_path / "stack.tif"
+        data = np.arange(1 * 1 * 4 * 8 * 10, dtype=np.uint16).reshape(1, 1, 4, 8, 10)
+        tifffile.imwrite(
+            path, data, photometric="minisblack", metadata={"axes": "TCZYX"}
+        )
+
+        adapter = AicsImageIoAdapter.create_from_config(
+            SourceConfig(url=str(path), source_id="tiff")
+        )
+        descriptor = adapter.list_tensor_descriptors()[0]
+        scene = adapter.get_tensor_adapter(descriptor.array_id)
+
+        assert list(scene.get_tensor_descriptor().chunk_shape) == [1, 1, 1, 8, 10]
+        assert scene._bio_image.dask_data.numblocks == (1, 1, 4, 1, 1)
+
+        actual = scene.get_data(
+            ChunkBounds(start=[0, 0, 2, 0, 0], stop=[1, 1, 3, 8, 10])
+        )
+        np.testing.assert_array_equal(actual, data[:, :, 2:3])
+
+    def test_chunk_dims_retry_without_unsupported_kwarg(self, monkeypatch):
+        bioio = pytest.importorskip("bioio")
+        from biopb_tensor_server.adapters import bioio as bioio_adapters
+
+        calls = []
+
+        class _FallbackBioImage:
+            def __init__(self, image, **kwargs):
+                calls.append(kwargs)
+                if "chunk_dims" in kwargs:
+                    raise TypeError("unsupported chunk_dims")
+
+        monkeypatch.setattr(bioio, "BioImage", _FallbackBioImage)
+        source = SourceConfig(url="/stack.lif", source_id="lif")
+        bioio_adapters.LeicaAdapter.create_from_config(source)
+
+        assert calls == [
+            {"chunk_dims": ["Y", "X", "S"]},
+            {},
+        ]
