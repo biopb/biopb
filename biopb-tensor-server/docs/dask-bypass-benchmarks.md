@@ -67,13 +67,47 @@ frame keeps its page offsets warm and flatters the native side -- on the
 
 The ratio tracks block count, not format. `.nd2` is bottom of the table only
 because that file is a single frame (T=1, Z=1) and therefore one block -- the
-same file type with 40 000 frames sits where `.tif` is. `.czi` is last on merit:
-pylibCZIrw genuinely spends ~2 ms decoding a 1024x1024 plane, so there is little
-overhead to remove.
+same file type with 40 000 frames sits where `.tif` is. `.czi` looks cheap here
+only because every request above is a **whole plane**, the one shape with no
+over-read to remove; see the next section.
 
 Native reads run at 1.5-1.9 GB/s against a 13-15 GB/s memcpy floor -- the gap is
 tifffile's per-page Python work, not I/O. They are real reads: `pages.cache` is
 False and `asarray()` returns a fresh array each call.
+
+## Sub-plane requests over-read the whole block
+
+Every measurement above asks for a whole plane. A viewer asking for a tile does
+not, and the dask block is a whole plane for `.czi` (`bioio_czi` sets
+`chunk_shape = shape[-2:]`, always per-plane -- never a Z stack) and for
+`.tif`/`.lsm`/`.lif` under `_FRAME_CHUNK_DIMS`. So a tile request materializes
+the entire plane and throws most of it away.
+
+CZI, a 256x256 tile out of a 4096x4096 plane (33.6 MB block):
+
+| requested | dask | native `roi=` | |
+| --- | --- | --- | --- |
+| 256x256 (0.13 MB) | 31.4 ms | 1.09 ms | **28.8x** |
+| 512x512 (0.52 MB) | 32.1 ms | 1.22 ms | 26.3x |
+| 1024x1024 (2.10 MB) | 31.8 ms | 1.62 ms | 19.6x |
+
+TIFF, a crop out of a 341 MB single-plane `E14.tif`. The file is **striped, not
+tiled**, and still wins: tifffile's `aszarr` store exposes strip-level chunks
+(11 rows x full width), so the crop reads a few strips instead of the plane.
+
+| requested | dask | `aszarr` | |
+| --- | --- | --- | --- |
+| 256x256 | 339.4 ms | 7.9 ms | **42.9x** |
+| 1024x1024 | 335.8 ms | 40.8 ms | 8.2x |
+
+pylibCZIrw also reads downsampled natively: `zoom=0.25` returns the 1024x1024
+reduction of that plane in **5.74 ms** against 36.4 ms for the full-plane dask
+read. That fuses read and reduction the way #640 asks for on the precache path,
+without materializing the full-resolution intermediate.
+
+Not every format can do this. readlif has no ROI API -- `_get_item` reads the
+whole plane's bytes into a PIL image -- so `.lif` gains nothing here. `.dv`
+needs nothing: it is a memmap, so a crop only touches the pages it covers.
 
 ## Cost scales with blocks in the array
 
