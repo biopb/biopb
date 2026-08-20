@@ -400,8 +400,9 @@ def decode_reduction_method(chunk_id: bytes) -> str:
 # Preferred transfer size and hard Arrow batch ceiling. The adapter's native
 # read unit is only a planning seed: small units are coalesced toward the
 # preferred size and large units are divided toward it (biopb/biopb#684).
-PREFERRED_ARROW_BATCH_BYTES = 32 * 1024 * 1024
+PREFERRED_ARROW_BATCH_BYTES = 16 * 1024 * 1024
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
+MIN_TRANSFER_ENDPOINTS = 4
 
 
 @dataclass(slots=True)
@@ -515,19 +516,6 @@ def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
     """
     num_elements = int(np.prod(shape, dtype=np.int64))
     return num_elements * np.dtype(dtype).itemsize
-
-
-def needs_splitting(chunk_shape: Tuple[int, ...], dtype: str) -> bool:
-    """Check if chunk exceeds Arrow batch limit.
-
-    Args:
-        chunk_shape: Chunk shape
-        dtype: Data type string
-
-    Returns:
-        True if chunk needs splitting
-    """
-    return estimate_chunk_bytes(chunk_shape, dtype) > MAX_ARROW_BATCH_BYTES
 
 
 # Defaults mirroring biopb-mcp's [pyramid] config (build_pyramid_levels). These
@@ -764,12 +752,14 @@ def compute_transfer_chunk_size(
     dim_labels: Optional[List[str]],
     preferred_bytes: int = PREFERRED_ARROW_BATCH_BYTES,
     maximum_bytes: int = MAX_ARROW_BATCH_BYTES,
+    minimum_endpoints: int = MIN_TRANSFER_ENDPOINTS,
 ) -> Tuple[int, ...]:
     """Choose a public transfer grid from an adapter's private read geometry.
 
     Native blocks above ``preferred_bytes`` are divided with the established
     T/unknown -> C -> Z -> Y/X priority. Smaller blocks are coalesced in whole
-    native-block multiples, preferring Y/X -> Z -> T -> C -> unknown.
+    native-block multiples, preferring Y/X -> Z -> T -> C -> unknown, while
+    retaining enough endpoints for parallel reads and scheduler utilization.
 
     ``maximum_bytes`` is the hard wire ceiling; ``preferred_bytes`` is the
     optimization target. Scaled reads deliberately do not run this optimizer a
@@ -785,6 +775,8 @@ def compute_transfer_chunk_size(
         raise ValueError("Chunk byte targets must be positive")
     if preferred_bytes > maximum_bytes:
         raise ValueError("Preferred chunk bytes must not exceed the maximum")
+    if minimum_endpoints <= 0:
+        raise ValueError("Minimum transfer endpoints must be positive")
     if any(int(dim) <= 0 for dim in tensor_shape):
         raise ValueError(f"Tensor dimensions must be positive: {tensor_shape}")
     if any(int(dim) <= 0 for dim in native_chunk_size):
@@ -802,7 +794,12 @@ def compute_transfer_chunk_size(
         result = _divide_chunk_size(native, dtype, dim_labels, preferred_bytes)
     elif native_bytes < preferred_bytes:
         result = _coalesce_chunk_size(
-            native, tensor_shape, dtype, dim_labels, preferred_bytes
+            native,
+            tensor_shape,
+            dtype,
+            dim_labels,
+            preferred_bytes,
+            minimum_endpoints,
         )
     else:
         result = native
@@ -840,6 +837,21 @@ def _divide_chunk_size(
             split_count = 2
         if axis is None:
             break
+        labels = [str(label).lower() for label in dim_labels] if dim_labels else []
+        label = labels[axis] if axis < len(labels) else ""
+        if label in {"y", "x"}:
+            spatial_axes = [
+                index
+                for index, candidate_label in enumerate(labels)
+                if candidate_label in {"y", "x"} and result[index] > 1
+            ]
+            if len(spatial_axes) == 2:
+                scale = (target_bytes / result_bytes) ** 0.5
+                for spatial_axis in spatial_axes:
+                    result[spatial_axis] = max(1, int(result[spatial_axis] * scale))
+                    split_axes.add(spatial_axis)
+                result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+                continue
         result[axis] = max(1, result[axis] // min(result[axis], split_count))
         split_axes.add(axis)
         result_bytes = estimate_chunk_bytes(tuple(result), dtype)
@@ -853,6 +865,7 @@ def _coalesce_chunk_size(
     dtype: str,
     dim_labels: Optional[List[str]],
     target_bytes: int,
+    minimum_endpoints: int,
 ) -> Tuple[int, ...]:
     """Grow whole native blocks toward ``target_bytes``.
 
@@ -881,6 +894,16 @@ def _coalesce_chunk_size(
     def blocks(axis: int) -> int:
         return current[axis] // native[axis]
 
+    def endpoint_count(chunk: Sequence[int]) -> int:
+        return int(
+            np.prod(
+                [
+                    ceil_div(int(shape), int(size))
+                    for shape, size in zip(tensor_shape, chunk, strict=True)
+                ]
+            )
+        )
+
     while True:
         candidates = []
         for axis in range(len(current)):
@@ -891,7 +914,10 @@ def _coalesce_chunk_size(
             candidate = list(current)
             candidate[axis] = native[axis] * new_blocks
             candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
-            if candidate_bytes <= target_bytes:
+            if (
+                candidate_bytes <= target_bytes
+                and endpoint_count(candidate) >= minimum_endpoints
+            ):
                 candidates.append(
                     (
                         priority(axis),
@@ -919,6 +945,8 @@ def _coalesce_chunk_size(
         candidate = list(current)
         candidate[axis] = native[axis] * new_blocks
         candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
+        if endpoint_count(candidate) < minimum_endpoints:
+            continue
         candidates.append(
             (priority(axis), target_bytes - candidate_bytes, axis, candidate)
         )

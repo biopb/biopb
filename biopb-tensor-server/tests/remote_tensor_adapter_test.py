@@ -229,8 +229,9 @@ class TestRemoteTensorProxy:
                 )
                 try:
                     pc = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-                    # Request the middle z-plane. The upstream snaps it outward
-                    # to its coalesced public transfer chunk.
+                    # Request the middle z-plane. The three-plane source retains
+                    # its native grid because it is already below the endpoint
+                    # parallelism floor.
                     sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
                     read_opt = TensorReadOption(tensor_id="hpc__aics", slice_hint=sl)
                     cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
@@ -239,8 +240,8 @@ class TestRemoteTensorProxy:
                     desc = TensorDescriptor.FromString(info.descriptor.command)
                     # The forwarded plan carries the realized-bounds crop signal.
                     assert desc.HasField("slice_hint")
-                    assert list(desc.slice_hint.start) == [0, 0, 0]
-                    assert list(desc.slice_hint.stop) == [3, 40, 50]
+                    assert list(desc.slice_hint.start) == [1, 0, 0]
+                    assert list(desc.slice_hint.stop) == [2, 40, 50]
                     # The explicit endpoint list is shipped.
                     assert len(list(info.endpoints)) >= 1
                     pc.close()
@@ -387,9 +388,10 @@ class TestRemoteTensorProxy:
 
                 assert plan is not None
                 # The upstream, not the proxy's empty advisory seed, selects and
-                # publishes the coalesced transfer grid.
-                assert list(plan.descriptor.chunk_shape) == [3, 40, 50]
-                assert len(plan.chunk_endpoints) == 1
+                # publishes the transfer grid. Its three native endpoints are
+                # retained rather than coalesced below the parallelism floor.
+                assert list(plan.descriptor.chunk_shape) == [1, 40, 50]
+                assert len(plan.chunk_endpoints) == 3
                 # The upstream's server-advertised pyramid rode through the forward
                 # (the lean catalog localizer would have stripped it).
                 assert len(plan.descriptor.pyramid) >= 1

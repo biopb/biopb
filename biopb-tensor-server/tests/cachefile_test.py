@@ -1265,7 +1265,7 @@ class TestCachefileIntegration:
 
             block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
             assert cmod._cachefile_support.get(loc) is True  # fast path was used
-            assert block.shape == (96, 96)
+            assert block.shape == (48, 48)
             assert not block.flags.writeable
             with pytest.raises(ValueError):
                 block[0, 0] = 0

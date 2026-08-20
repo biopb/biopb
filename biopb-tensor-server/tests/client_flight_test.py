@@ -379,13 +379,13 @@ class TestTensorFlightClientRoundTrip:
         assert list(pb.tensor_descriptor.shape) == [128, 128]
         # dtype may be uint8 or |u1 depending on server
         assert pb.tensor_descriptor.dtype in ("uint8", "|u1")
-        assert list(pb.tensor_descriptor.chunk_shape) == [128, 128]
+        assert list(pb.tensor_descriptor.chunk_shape) == [64, 64]
 
         # Verify location is populated
         assert pb.location == "grpc://localhost:8890"
 
         # Verify endpoints are populated
-        assert len(pb.endpoints) == 1
+        assert len(pb.endpoints) == 4
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):
