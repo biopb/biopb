@@ -28,8 +28,8 @@ bioio is the official successor from the same group (Allen Institute for Cell Sc
 
 | Subclass | `SOURCE_TYPE` | Claims | bioio plugin |
 |---|---|---|---|
-| `TiffAdapter` | `aics` | local plain `.tif`, `.tiff` | native `tifffile` |
-| `LsmAdapter` | `zeiss` | local `.lsm` | native `tifffile` |
+| `TiffAdapter` | `tiff` | local plain `.tif`, `.tiff` | native `tifffile` |
+| `LsmAdapter` | `lsm` | local `.lsm` | native `tifffile` |
 | `ZeissAdapter` | `zeiss` | `.czi` | `bioio-czi` |
 | `LeicaAdapter` | `leica` | `.lif` | `bioio-lif` |
 | `NikonAdapter` | `nikon` | `.nd2` | `bioio-nd2` |
@@ -38,7 +38,7 @@ bioio is the official successor from the same group (Allen Institute for Cell Sc
 | `BioformatsAdapter` | `bioformats` | `.zvi`/`.lei`/`.vsi` (gated on `bioio_bioformats` importable) | `bioio-bioformats` |
 | `AicsImageIoAdapter` (fallback) | `aics` | remote/exotic `.tif`, microscopy/scientific exts | `bioio-tifffile`, `bioio-imageio` |
 
-`SOURCE_TYPE` strings are kept verbatim for catalog back-compat. bioio *adds* a native SlideBook reader (`bioio-sldy`) aicsimageio lacked — not adopted (no users). OME-TIFF is **not** here: biopb reads it through its own pure-tifffile `OmeTiffAdapter` (biopb/biopb#213); the bioio fallback only sees a remote/exotic `.tif` that adapter declined.
+The generic BioIO source types remain available for remote and unsupported fallback paths. bioio *adds* a native SlideBook reader (`bioio-sldy`) aicsimageio lacked — not adopted (no users). OME-TIFF is **not** here: biopb reads it through its own pure-tifffile `OmeTiffAdapter` (biopb/biopb#213); the bioio fallback only sees a remote/exotic `.tif` that adapter declined.
 
 ## The pins that remain, and why
 

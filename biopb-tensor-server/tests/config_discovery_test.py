@@ -267,7 +267,7 @@ class TestCreatedSourceRegression:
             claims = registry.get_claims_for_path(ctx, state)
 
             assert len(claims) >= 1
-            assert claims[0].source_type == "aics"
+            assert claims[0].source_type == "tiff"
 
 
 class _RaisingOnBadPathAdapter:

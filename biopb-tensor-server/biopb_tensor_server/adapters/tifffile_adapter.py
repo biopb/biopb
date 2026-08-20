@@ -94,21 +94,10 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     @classmethod
     def create_from_config(cls, source, credentials_config=None):
-        """Use native tifffile locally and retain BioIO for fallback sources."""
-        url = str(source.url).lower()
-        native = not source.is_remote and (
-            url.endswith(".lsm") if cls._LSM else url.endswith(_SUPPORTED_EXTENSIONS)
-        )
-        if native:
-            return super().create_from_config(source, credentials_config)
-
-        from biopb_tensor_server.adapters.bioio import (
-            AicsImageIoAdapter,
-            ZeissAdapter,
-        )
-
-        fallback = ZeissAdapter if cls._LSM else AicsImageIoAdapter
-        return fallback.create_from_config(source, credentials_config)
+        """Create a native adapter for a local TIFF-like file."""
+        if source.is_remote:
+            raise ValueError(f"{cls.__name__} only supports local files")
+        return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -331,13 +320,13 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 class TiffAdapter(_TifffileAdapterBase):
     """Native adapter for local non-OME ``.tif`` / ``.tiff`` files."""
 
-    SOURCE_TYPE = "aics"
+    SOURCE_TYPE = "tiff"
 
 
 class LsmAdapter(_TifffileAdapterBase):
     """Native adapter for Zeiss ``.lsm`` files (full-resolution series only)."""
 
-    SOURCE_TYPE = "zeiss"
+    SOURCE_TYPE = "lsm"
     _LSM = True
 
 

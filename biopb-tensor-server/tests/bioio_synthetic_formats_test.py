@@ -26,7 +26,7 @@ from biopb_tensor_server.fixtures import (
 # LSM's reduced thumbnail series is deliberately dropped by the native adapter.
 # The full-resolution image is the only exposed scene.
 FORMATS = [
-    pytest.param(create_zeiss_lsm, None, "zeiss", 1, id="lsm"),
+    pytest.param(create_zeiss_lsm, None, "lsm", 1, id="lsm"),
     pytest.param(create_leica_lif, "bioio_lif", "leica", 1, id="lif"),
     pytest.param(create_zeiss_czi, "bioio_czi", "zeiss", 1, id="czi"),
     pytest.param(create_deltavision_dv, "bioio_dv", "dv", 1, id="dv"),

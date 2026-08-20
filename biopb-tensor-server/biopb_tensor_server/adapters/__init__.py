@@ -150,12 +150,12 @@ def get_default_registry() -> AdapterRegistry:
     # declines falls through to the generic bioio adapter registered below.
     registry.register(OmeTiffAdapter, "ome-tiff")
 
-    # Native tifffile paths for local plain TIFF and LSM.  OME-TIFF has already
-    # won above; remote sources intentionally fall through to BioIO until the
-    # remote policy is decided.  LSM is registered separately so its source
-    # type remains explicit even though both classes share the implementation.
-    registry.register(TiffAdapter)
-    registry.register(LsmAdapter)
+    # Native tifffile paths have higher claim priority than the generic BioIO
+    # adapters below.  They use dedicated source types so the winning scanner
+    # claim resolves directly to the same adapter; remote/cloud paths decline
+    # and remain eligible for BioIO's fallback claims.
+    registry.register(TiffAdapter, "tiff")
+    registry.register(LsmAdapter, "lsm")
 
     # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
     # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not

@@ -10,18 +10,18 @@ from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 
-def test_plain_tiff_claims_as_aics_but_reads_with_tifffile(tmp_path):
+def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     data = np.arange(5 * 8 * 9, dtype=np.uint16).reshape(5, 8, 9)
     path = Path(tmp_path) / "plain.tif"
     tifffile.imwrite(path, data)
 
     registry = get_default_registry()
     claims = registry.get_claims_for_path(ClaimContext(path), DiscoveryState())
-    assert [claim.source_type for claim in claims] == ["aics"]
+    assert [claim.source_type for claim in claims] == ["tiff"]
 
-    adapter_cls = registry.get_adapter_for_type("aics")
+    adapter_cls = registry.get_adapter_for_type("tiff")
     source = adapter_cls.create_from_config(
-        SourceConfig(url=str(path), type="aics", source_id="plain")
+        SourceConfig(url=str(path), type="tiff", source_id="plain")
     )
     assert isinstance(source, TiffAdapter)
 
