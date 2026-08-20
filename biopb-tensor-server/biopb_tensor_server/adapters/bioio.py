@@ -257,6 +257,7 @@ class _BioioAdapterBase(TensorAdapter):
 
         self._dask_data = None  # scene-level dask array, bound below
         self._scene_descriptor = None
+        self._nd2_frame_index_cache = None
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -265,15 +266,16 @@ class _BioioAdapterBase(TensorAdapter):
         self._tensor_adapters: dict = {}
         if scene_index is not None:
             # Scene-level: bind this scene's bioio dask array eagerly.
-            self._bio_image.set_scene(scene_index)
-            self._dask_data = self._bio_image.dask_data
-            self.dim_labels = (
-                dim_labels if dim_labels else list(self._bio_image.dims.order)
-            )
-            if not self.RETAIN_SCENE_DASK:
-                self._scene_descriptor = self._descriptor_from_dask(self._dask_data)
-                self._dask_data = None
-                self._release_bioio_dask_cache()
+            with self._io_lock:
+                self._bio_image.set_scene(scene_index)
+                self._dask_data = self._bio_image.dask_data
+                self.dim_labels = (
+                    dim_labels if dim_labels else list(self._bio_image.dims.order)
+                )
+                if not self.RETAIN_SCENE_DASK:
+                    self._scene_descriptor = self._descriptor_from_dask(self._dask_data)
+                    self._dask_data = None
+                    self._release_bioio_dask_cache()
         else:
             # Source-level: no bound reader; dim_labels is the default for scenes.
             self.dim_labels = dim_labels
@@ -645,16 +647,21 @@ class NikonAdapter(_BioioAdapterBase):
     SOURCE_TYPE = "nikon"
     RETAIN_SCENE_DASK = False
 
-    def _metadata_for_listing(self) -> Any:
+    def _processed_metadata(self) -> Any:
+        """Return BioIO's processed metadata, degrading to empty on failure."""
         if self._metadata_cache is None:
-            self._metadata_cache = self._bio_image.metadata
+            try:
+                self._metadata_cache = self._bio_image.metadata
+            except Exception:
+                self._metadata_cache = {}
         return self._metadata_cache
+
+    def _metadata_for_listing(self) -> Any:
+        return self._processed_metadata()
 
     def get_metadata(self) -> dict:
         """Read and retain BioIO's processed metadata once for this ND2 source."""
-        if self._metadata_cache is None:
-            self._metadata_cache = self._bio_image.metadata
-        return self._metadata_to_dict(self._metadata_cache)
+        return self._metadata_to_dict(self._processed_metadata())
 
     @staticmethod
     def _metadata_to_dict(metadata: Any) -> dict:
@@ -674,9 +681,7 @@ class NikonAdapter(_BioioAdapterBase):
 
     def _physical_scale(self):
         """Derive this scene's scale from the shared processed metadata cache."""
-        if self._metadata_cache is None:
-            self._metadata_cache = self._bio_image.metadata
-        ome = self._metadata_cache
+        ome = self._processed_metadata()
         if ome is None or not getattr(ome, "images", None):
             return None
         idx = self.scene_index if self.scene_index is not None else 0
@@ -716,6 +721,8 @@ class NikonAdapter(_BioioAdapterBase):
         planning hint.
         """
         chunk_shape = super()._read_chunk_shape(dask_data)
+        if len(chunk_shape) != len(self.dim_labels or []):
+            return chunk_shape
         for axis, label in enumerate(self.dim_labels or []):
             if label.upper() in {"T", "Z"}:
                 chunk_shape[axis] = 1
@@ -763,17 +770,25 @@ class NikonAdapter(_BioioAdapterBase):
 
         with self._io_lock, nd2.ND2File(self._source_url) as reader:
             frame_indices = self._nd2_frame_indices(reader)
+            requested_frames = []
             for coordinates in product(*sequence_ranges):
                 coordinate_by_label = {
                     labels[axis]: coordinate
                     for axis, coordinate in zip(sequence_axes, coordinates, strict=True)
                 }
-                frame_index = frame_indices[
-                    (
-                        coordinate_by_label.get("T", 0),
-                        coordinate_by_label.get("Z", 0),
-                    )
-                ]
+                key = (
+                    coordinate_by_label.get("T", 0),
+                    coordinate_by_label.get("Z", 0),
+                )
+                requested_frames.append((coordinate_by_label, key))
+
+            fallback_to_bioio = any(
+                key not in frame_indices for _, key in requested_frames
+            )
+            for coordinate_by_label, key in (
+                requested_frames if not fallback_to_bioio else ()
+            ):
+                frame_index = frame_indices[key]
                 frame = reader.read_frame(frame_index).reshape(frame_shape)
 
                 source_slices = []
@@ -793,6 +808,8 @@ class NikonAdapter(_BioioAdapterBase):
                         output_slices.append(slice(None))
                 output[tuple(output_slices)] = frame[tuple(source_slices)]
 
+        if fallback_to_bioio:
+            return self._get_data_via_bioio(bounds)
         return output
 
     def _get_data_via_bioio(self, bounds: ChunkBounds) -> np.ndarray:
@@ -807,6 +824,8 @@ class NikonAdapter(_BioioAdapterBase):
 
     def _nd2_frame_indices(self, reader: Any) -> dict[tuple[int, int], int]:
         """Map this BioIO scene's T/Z coordinates to ND2 sequence indices."""
+        if self._nd2_frame_index_cache is not None:
+            return self._nd2_frame_index_cache
         result: dict[tuple[int, int], int] = {}
         for frame_index, coordinates in enumerate(reader.loop_indices):
             if int(coordinates.get("P", 0)) != self.scene_index:
@@ -817,7 +836,8 @@ class NikonAdapter(_BioioAdapterBase):
                 # TCZYXS tensor. Do not silently choose one of their frames.
                 raise ValueError(f"Ambiguous ND2 frame coordinates for T/Z {key}")
             result[key] = frame_index
-        return result
+        self._nd2_frame_index_cache = result
+        return self._nd2_frame_index_cache
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:

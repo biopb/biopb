@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 
-import nd2
 import numpy as np
 import pytest
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.bioio import NikonAdapter
+
+nd2 = pytest.importorskip("nd2")
 
 
 class _FakeDaskArray:
@@ -35,7 +36,8 @@ class _FakeBioImage:
 
 class _FakeND2File:
     frames: list[np.ndarray] = []
-    loop_indices: tuple[dict[str, int], ...] = ()
+    loop_indices_value: tuple[dict[str, int], ...] = ()
+    loop_indices_accesses = 0
     closed = False
 
     def __init__(self, _path: str):
@@ -49,6 +51,11 @@ class _FakeND2File:
 
     def read_frame(self, frame_index: int) -> np.ndarray:
         return self.frames[frame_index]
+
+    @property
+    def loop_indices(self):
+        type(self).loop_indices_accesses += 1
+        return self.loop_indices_value
 
 
 def _adapter(tmp_path, data, labels, chunks):
@@ -73,7 +80,8 @@ def test_nikon_direct_read_maps_scene_t_and_z_and_copies_crop(tmp_path, monkeypa
                 loops.append({"P": position, "T": time, "Z": z})
                 frames.append(data[time, :, z].copy() + position * 10_000)
     _FakeND2File.frames = frames
-    _FakeND2File.loop_indices = tuple(loops)
+    _FakeND2File.loop_indices_value = tuple(loops)
+    _FakeND2File.loop_indices_accesses = 0
     monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
 
     adapter = _adapter(
@@ -91,11 +99,13 @@ def test_nikon_direct_read_maps_scene_t_and_z_and_copies_crop(tmp_path, monkeypa
     bounds = ChunkBounds(start=[0, 1, 1, 1, 2], stop=[2, 2, 3, 4, 5])
 
     actual = adapter.get_data(bounds)
+    adapter.get_data(bounds)
 
     expected = (data + 10_000)[0:2, 1:2, 1:3, 1:4, 2:5]
     assert np.array_equal(actual, expected)
     assert actual.flags.owndata
     assert _FakeND2File.closed
+    assert _FakeND2File.loop_indices_accesses == 1
     assert list(adapter.get_tensor_descriptor().chunk_shape) == [1, 2, 1, 4, 5]
 
 
@@ -103,7 +113,8 @@ def test_nikon_direct_read_preserves_rgb_samples(tmp_path, monkeypatch):
     shape = (1, 1, 1, 3, 4, 3)
     data = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
     _FakeND2File.frames = [data[0, :, 0].copy()]
-    _FakeND2File.loop_indices = ({"P": 1},)
+    _FakeND2File.loop_indices_value = ({"P": 1},)
+    _FakeND2File.loop_indices_accesses = 0
     monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
     adapter = _adapter(
         tmp_path,
@@ -122,7 +133,8 @@ def test_nikon_direct_read_preserves_rgb_samples(tmp_path, monkeypatch):
 def test_nikon_direct_read_rejects_unrepresented_sequence_loop(tmp_path, monkeypatch):
     data = np.zeros((1, 1, 1, 2, 2), dtype=np.uint8)
     _FakeND2File.frames = [data[0, :, 0], data[0, :, 0]]
-    _FakeND2File.loop_indices = ({"P": 1, "M": 0}, {"P": 1, "M": 1})
+    _FakeND2File.loop_indices_value = ({"P": 1, "M": 0}, {"P": 1, "M": 1})
+    _FakeND2File.loop_indices_accesses = 0
     monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
     adapter = _adapter(
         tmp_path,
@@ -133,3 +145,33 @@ def test_nikon_direct_read_rejects_unrepresented_sequence_loop(tmp_path, monkeyp
 
     with pytest.raises(ValueError, match="Ambiguous ND2 frame coordinates"):
         adapter.get_data(ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 2, 2]))
+
+
+def test_nikon_missing_tz_coordinate_falls_back_to_bioio(tmp_path, monkeypatch):
+    data = np.arange(2 * 2 * 2, dtype=np.uint8).reshape(2, 1, 1, 2, 2)
+    _FakeND2File.frames = [data[0, :, 0]]
+    _FakeND2File.loop_indices_value = ({"P": 1, "T": 0},)
+    _FakeND2File.loop_indices_accesses = 0
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+    adapter = _adapter(
+        tmp_path,
+        data,
+        "TCZYX",
+        ((1, 1), (1,), (1,), (2,), (2,)),
+    )
+
+    actual = adapter.get_data(ChunkBounds(start=[1, 0, 0, 0, 0], stop=[2, 1, 1, 2, 2]))
+
+    assert np.array_equal(actual, data[1:2])
+
+
+def test_nikon_metadata_failure_degrades_to_empty(tmp_path):
+    image = _FakeBioImage(
+        np.zeros((1, 1, 1, 2, 2), dtype=np.uint8),
+        "TCZYX",
+        ((1,), (1,), (1,), (2,), (2,)),
+    )
+    adapter = NikonAdapter(image, scene_index=None, source_id="source")
+
+    assert adapter.get_metadata() == {}
+    assert adapter._physical_scale() is None
