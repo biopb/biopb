@@ -25,6 +25,7 @@ Chunk ID format:
 """
 
 import logging
+import math
 import os
 import threading
 from itertools import product
@@ -270,8 +271,6 @@ class _BioioAdapterBase(TensorAdapter):
         self._dask_data = None  # scene-level dask array, bound below
         self._scene_descriptor = None
         self._nd2_frame_index_cache: Any = _FRAME_INDEX_UNCACHED
-        # ND2 channel-interleave probe (NikonAdapter); None = not yet read.
-        self._interleaved_cache: Optional[bool] = None
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -784,85 +783,56 @@ class NikonAdapter(_BioioAdapterBase):
                 block[axis] = 1
         return block
 
-    def _channel_interleaved(self, itemsize: int) -> bool:
-        """Whether this ND2 stores its channels interleaved within a row.
-
-        An uncompressed multi-component ND2 lays a frame out as ``(Y, X, C)``, so
-        a row of the stored image is ``widthPx * componentCount * itemsize``
-        bytes: on a 4-channel 14234-wide uint16 file ``widthBytes == 113872 ==
-        14234 * 4 * 2``, and channel 0's bytes are 2 of every 8. A planar file
-        fails that identity -- ``widthBytes`` covers one component -- and is
-        unaffected.
-
-        ``itemsize`` comes from the tensor's own dtype rather than the file's
-        ``bitsPerComponent*`` attributes, whose names vary by nd2 version (real
-        files carry ``bitsPerComponentInMemory``; reading the other spelling
-        yields 0 and silently answers "planar" for every file).
-
-        Probed once and cached: a wrong answer only reshapes the transfer grid,
-        but re-opening the file per descriptor call would not be free.
-        """
-        if self._interleaved_cache is None:
-            self._interleaved_cache = False
-            try:
-                import nd2
-
-                with nd2.ND2File(self._source_url) as reader:
-                    attrs = reader.attributes
-                    components = int(getattr(attrs, "componentCount", 1) or 1)
-                    width_px = int(getattr(attrs, "widthPx", 0) or 0)
-                    width_bytes = int(getattr(attrs, "widthBytes", 0) or 0)
-                    self._interleaved_cache = (
-                        components > 1
-                        and width_px > 0
-                        and width_bytes == width_px * components * itemsize
-                    )
-            except Exception:
-                logger.debug(
-                    "ND2 interleave probe failed for %s",
-                    self._source_url,
-                    exc_info=True,
-                )
-        return self._interleaved_cache
-
     def _transfer_chunk_shape(
         self, shape: List[int], dtype: str, dask_data: Any
     ) -> List[int]:
-        """Keep an interleaved ND2's channels together in one transfer chunk.
+        """Never split an ND2's component axes -- they are inside the pixel.
 
-        For a channel-interleaved frame C is the *innermost* axis on disk, so a
-        per-channel chunk pays the full page cost of the band and discards 3/4 of
-        what it faulted in, then the next channel repeats the read. Measured on a
-        4-channel 14234-wide uint16 file, full-width band, pages warm: all four
-        channels in one read cost 96.4 ms for 233.2 MB (0.41 ms/MB) against 43.9
-        ms for 58.3 MB (0.75 ms/MB) for one channel -- 4x the pixels for 2.2x the
-        time (biopb/biopb#806).
+        ND2 has no planar variant. Every frame is materialised in one layout,
+        ``(Y, X, channel, RGB component)`` (``modern_reader._actual_frame_shape``),
+        so both C and S sit *below* X: one channel's bytes are ``itemsize`` of
+        every ``componentCount * itemsize``. A per-channel chunk therefore faults
+        in every page the other components occupy and discards what it did not
+        ask for, then the next channel repeats the read. Measured on a 4-channel
+        14234-wide uint16 file, full-width band, pages warm: all four channels in
+        one read cost 96.4 ms for 233.2 MB (0.41 ms/MB) against 43.9 ms for
+        58.3 MB (0.75 ms/MB) for one -- 4x the pixels for 2.2x the time
+        (biopb/biopb#806).
 
-        So the declared *unit* is "all channels of one pixel": C is inside the
-        unit and therefore cannot be split, and nothing downstream re-shapes a
+        There is nothing to detect. An earlier version probed ``widthBytes ==
+        widthPx * componentCount * itemsize`` and treated a mismatch as planar,
+        but that identity is nd2's test for **row padding**, not for layout: when
+        it fails the reader keeps the same interleaved shape and uses
+        ``widthBytes`` as the row stride. So the probe read a padded row -- an
+        odd-width RGB camera -- as planar and handed C back to the generic
+        splitter, which is exactly the bug #806 is about.
+
+        The declared *unit* is one pixel's worth of every component. C and S are
+        inside it and so cannot be split, and nothing downstream re-shapes a
         declared grid (biopb/biopb#809) -- which is what makes this stick, where
-        the old fixed divide/coalesce priority took C apart again.
-
-        The plane is left to the shared sizing, which grows Y and X coupled. A
-        full-width band reads better sequentially -- it is one contiguous run per
-        channel group -- but it turns a 512x512 tile into one fetch per band it
-        crosses, and tiles are how this data is viewed. Between C-whole aspect
-        ratios the cold cost is within scene-to-scene variance (a paired A/B of
-        1024x1024 against 512x2048 on untouched scenes ranged 0.73x to 4.2x in
-        both directions), so there is nothing here to trade the round trips for.
-        Keeping C whole is where the measurable win is.
+        the old fixed divide/coalesce priority took C apart again. The plane is
+        left to the shared sizing, which grows Y and X coupled: a full-width band
+        reads better sequentially, but turns a 512x512 tile into one fetch per
+        band it crosses, and between C-whole aspect ratios the cold cost is
+        within scene-to-scene variance (a paired A/B of 1024x1024 against
+        512x2048 on untouched scenes ranged 0.73x to 4.2x in *both* directions).
+        Keeping the components together is where the measurable win is.
         """
         labels = [str(label).upper() for label in (self.dim_labels or [])]
-        if len(labels) != len(shape) or "C" not in labels or "X" not in labels:
-            return super()._transfer_chunk_shape(shape, dtype, dask_data)
-        if not self._channel_interleaved(np.dtype(dtype).itemsize):
+        if len(labels) != len(shape):
             return super()._transfer_chunk_shape(shape, dtype, dask_data)
         unit = [
             int(size) if label in {"C", "S"} else 1
             for label, size in zip(labels, shape, strict=True)
         ]
-        # All channels of one pixel already at or above the target leaves nothing
-        # to grow; declare it and let the Arrow clamp handle an extreme depth.
+        # componentCount == 1: C and S are absent or singleton, so there is no
+        # interleaved run to protect and the backend's own block is the better
+        # seed. (nd2 reports C = componentCount for a mono file and C x S =
+        # componentCount for an RGB one, so this product IS componentCount.)
+        if math.prod(unit) <= 1:
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        # One pixel of every component already at or above the target leaves
+        # nothing to grow; declare it and let the Arrow clamp handle the rest.
         if estimate_chunk_bytes(tuple(unit), dtype) >= (
             chunk_policy.PREFERRED_ARROW_BATCH_BYTES
         ):

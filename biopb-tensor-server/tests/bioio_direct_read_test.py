@@ -67,10 +67,6 @@ class _FakeND2File:
         type(self).loop_indices_accesses += 1
         return self.loop_indices_value
 
-    # The interleave probe reads these off the file (biopb/biopb#806). The
-    # default describes a planar ND2, so existing tests keep their grid.
-    attributes = SimpleNamespace(componentCount=1, widthPx=5, widthBytes=10)
-
 
 def _adapter(tmp_path, data, labels, chunks):
     path = tmp_path / "source.nd2"
@@ -269,36 +265,17 @@ def test_scene_switch_does_not_race_a_concurrent_read():
     assert observed and np.array_equal(observed[0], scenes[0])
 
 
-def test_interleaved_nd2_keeps_all_channels_in_one_transfer_chunk(
-    tmp_path, monkeypatch
-):
-    """An interleaved ND2 declares C as part of the unit, not an axis to split.
+def test_component_axes_are_never_split(tmp_path, monkeypatch):
+    """C and S live inside the pixel, so a chunk always holds all of them.
 
-    For a `(Y, X, C)` frame, C is the *innermost* axis on disk: one channel's
-    bytes are `itemsize` of every `C * itemsize`, so a per-channel chunk faults
-    in every page the other channels occupy and discards what it did not ask
-    for, then the next channel repeats the read. The declared unit is therefore
-    "all channels of one pixel" -- C inside the unit, so it cannot be split
-    (biopb/biopb#806) -- and the plane is left to the shared coupled sizing.
-
-    Nothing downstream re-shapes a declared grid (biopb/biopb#809), which is what
-    makes this hold -- the fixed divide/coalesce priority used to take C apart
-    again.
+    ND2 has no planar variant: every frame is `(Y, X, channel, RGB component)`,
+    so one channel's bytes are `itemsize` of every `componentCount * itemsize`.
+    A per-channel chunk faults in every page the others occupy and discards what
+    it did not ask for (biopb/biopb#806). There is nothing to detect and no
+    probe -- the layout is a property of the format.
     """
-    # Wide enough that a whole frame is 134 MB: the planar treatment has to
-    # divide it, and the axis it reaches for first is C.
     data = _ZeroFrame((1, 4, 1, 4096, 4096), np.dtype("uint16"))
     monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
-    monkeypatch.setattr(
-        _FakeND2File,
-        "attributes",
-        SimpleNamespace(
-            componentCount=4,
-            widthPx=4096,
-            # 4096 px * 4 components * 2 bytes -- the interleaved identity.
-            widthBytes=4096 * 4 * 2,
-        ),
-    )
 
     adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (4,), (1,), (4096,), (4096,)))
     grid = list(adapter.get_tensor_descriptor().chunk_shape)
@@ -315,21 +292,38 @@ def test_interleaved_nd2_keeps_all_channels_in_one_transfer_chunk(
     assert estimate_chunk_bytes(tuple(grid), "<u2") <= PREFERRED_ARROW_BATCH_BYTES
 
 
-def test_planar_nd2_is_not_treated_as_interleaved(tmp_path, monkeypatch):
-    """The probe keys on the file's own byte layout, not the channel count.
+def test_rgb_samples_are_never_split(tmp_path, monkeypatch):
+    """The RGB axis is the same story: nd2 puts it inside the pixel too.
 
-    The same geometry as the test above, declared planar: C is an outer axis, so
-    splitting it is cheap and the standard sizing applies unchanged.
+    ``components_per_channel == 3`` makes nd2 report an ``S`` axis rather than
+    folding the components into ``C`` -- a two-channel RGB file is ``C=2, S=3``,
+    six interleaved components per pixel -- so both axes have to stay whole.
     """
-    data = _ZeroFrame((1, 4, 1, 4096, 4096), np.dtype("uint16"))
+    data = _ZeroFrame((1, 2, 1, 2048, 2048, 3), np.dtype("uint8"))
     monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
-    monkeypatch.setattr(
-        _FakeND2File,
-        "attributes",
-        # Multi-component but planar: widthBytes covers one component only.
-        SimpleNamespace(componentCount=4, widthPx=4096, widthBytes=4096 * 2),
-    )
 
-    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (4,), (1,), (4096,), (4096,)))
-    assert adapter._channel_interleaved(2) is False
-    assert list(adapter.get_tensor_descriptor().chunk_shape) == [1, 1, 1, 2048, 2048]
+    adapter = _adapter(
+        tmp_path,
+        data,
+        "TCZYXS",
+        ((1,), (2,), (1,), (2048,), (2048,), (3,)),
+    )
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+
+    assert grid[1] == 2 and grid[5] == 3  # C and S whole
+    assert grid[3] == grid[4]  # plane square
+
+
+def test_single_component_nd2_uses_the_backend_block(tmp_path, monkeypatch):
+    """``componentCount == 1`` has no interleaved run to protect.
+
+    nd2 drops size-1 axes, so a mono single-channel file has neither C nor S and
+    the backend's own block is the better seed.
+    """
+    data = _ZeroFrame((1, 1, 1, 4096, 4096), np.dtype("uint16"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+
+    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (1,), (1,), (4096,), (4096,)))
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+    assert grid[3] == grid[4]  # still a coupled, square plane
+    assert grid[1] == 1
