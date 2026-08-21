@@ -867,36 +867,20 @@ def _setup_flight_server(
     # (which syncs each), and monitored sources stream in through the background
     # first scan -- both before this line. No separate initial_sync is needed.
 
-    # Background precache worker: warm the file cache for sources added live.
-    # Wire the commit hook BEFORE source_manager.start(). Under progressive
-    # discovery the startup set is committed by the *background* scan (after
-    # start); the manager gates it out of the prompt enqueue via
-    # _initial_scan_done and seeds it into the backlog through the first-scan
-    # callback below. The worker no-ops on a memory backend.
+    # Background cache warmer, driven entirely by observed reads: nothing is
+    # warmed until a client reads something, and then at that client's own
+    # scale. No-ops on a memory backend.
     precache_worker = None
     if server_config.precache.enabled:
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
-        source_manager.set_source_committed_hook(precache_worker.enqueue)
         # Residency gate (#174): let the worker re-check, at warm time, that a
         # cloud-root source's files are still resident before reading them, so a
-        # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
-        # registration.
+        # warm never recalls bytes OneDrive has re-dehydrated since registration.
         precache_worker.should_warm = source_manager.should_warm
-        # Demand tier: let the worker see what clients actually read, so it can
-        # warm the rest of that level (and the source's other tensors) at the
-        # client's own scale rather than one the server picked.
+        # The only trigger there is: what clients actually read.
         server.set_read_observer(precache_worker.observe_read)
-
-    # Seed the precache backlog with the startup catalog the moment the first
-    # full scan establishes it (newest first; warmed when the server is idle).
-    # Wired before start() so the background scan's completion finds it.
-    def _seed_backlog_on_first_scan() -> None:
-        if precache_worker is not None and server_config.precache.backlog_enabled:
-            precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
-
-    source_manager.set_initial_scan_complete_hook(_seed_backlog_on_first_scan)
 
     # Report "a full scan is running" from the first SERVING moment. The
     # background scan sets this itself on entry, but pre-setting here closes the

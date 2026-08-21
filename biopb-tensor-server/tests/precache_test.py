@@ -209,6 +209,29 @@ class TestFlightIdleProbe:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def _scaled_chunk_id(adapter, scale, reduction_method="area"):
+    """A scaled chunk_id for a source's first tensor, as a client's read carries.
+
+    The warmer is driven entirely by observed reads now, so nearly every test
+    needs one of these rather than a source_id.
+    """
+    from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+    td = adapter.list_tensor_descriptors()[0]
+    ta = adapter.get_tensor_adapter(td.array_id)
+    base = ta.get_tensor_descriptor()
+    req = TensorDescriptor(
+        array_id=base.array_id,
+        dim_labels=base.dim_labels,
+        shape=base.shape,
+        chunk_shape=base.chunk_shape,
+        dtype=base.dtype,
+    )
+    req.scale_hint[:] = list(scale)
+    req.reduction_method = reduction_method
+    return ta.get_read_plan(req).chunk_endpoints[0].chunk_id
+
+
 class TestWarming:
     def _make_server_with_zarr(self, tmp_path, shape):
         import zarr
@@ -243,7 +266,9 @@ class TestWarming:
             worker = PrecacheWorker(server, cfg)
 
             # Drive synchronously (no thread) for determinism.
-            worker._process_source("warm-src")
+            worker._process_source(
+                "warm-src", scale_hint=[4, 4], reduction_method="area"
+            )
 
             cache_manager = CacheManager.get_instance()
             stats = cache_manager.stats()
@@ -306,7 +331,9 @@ class TestWarming:
             real_get = server.sources.get
             server.sources.get = lambda sid: adapter_calls.append(sid) or real_get(sid)
 
-            worker._process_source("warm-src")
+            worker._process_source(
+                "warm-src", scale_hint=[4, 4], reduction_method="area"
+            )
 
             assert adapter_calls == []  # gate fired before any adapter access
             # ... and consequently nothing was computed/cached.
@@ -346,9 +373,10 @@ class TestWarming:
 
             server.sources.get = lambda sid: _RemoteAdapter()
 
-            preempted = worker._process_source("remote-src")
+            worker._process_source(
+                "remote-src", scale_hint=[4, 4], reduction_method="area"
+            )
 
-            assert preempted is False
             assert listed == []  # skipped before enumerating the source's tensors
             stats = CacheManager.get_instance().stats()
             assert stats.misses == 0
@@ -367,7 +395,9 @@ class TestWarming:
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker._process_source("warm-src")
+            worker._process_source(
+                "warm-src", scale_hint=[4, 4], reduction_method="area"
+            )
 
             # File-backend gate: nothing computed on a memory backend.
             stats = CacheManager.get_instance().stats()
@@ -532,6 +562,7 @@ class TestRuntimePhaseGating:
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestPreemptionAndLifecycle:
     def test_no_warming_while_in_flight(self, tmp_path):
+        """The idle debounce still parks the worker while a read is in flight."""
         import zarr
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.cache import CacheManager
@@ -570,9 +601,8 @@ class TestPreemptionAndLifecycle:
             assert holding.wait(2.0)
 
             worker.start()
-            worker.enqueue("pre-src")
-            # While the request is in flight, the worker should not have warmed
-            # anything yet.
+            worker.observe_read(_scaled_chunk_id(adapter, (4, 4)))
+            # While the request is in flight, nothing should have warmed yet.
             time.sleep(0.5)
             assert CacheManager.get_instance().stats().misses == 0
 
@@ -590,18 +620,6 @@ class TestPreemptionAndLifecycle:
             server.shutdown()
             CacheManager.get_instance().close()
             CacheManager.reset()
-
-    def test_enqueue_dedup(self):
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            worker = PrecacheWorker(server, PrecacheConfig())
-            worker.enqueue("a")
-            worker.enqueue("a")
-            worker.enqueue("b")
-            # 'a' deduped while still queued.
-            assert worker._queue.qsize() == 2
-        finally:
-            server.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +688,7 @@ class TestHeadroomProbe:
     def test_has_headroom_tracks_high_water(self, monkeypatch):
         from biopb_tensor_server.serving import precache as pc
 
-        worker = PrecacheWorker(None, PrecacheConfig(backlog_high_water=0.8))
+        worker = PrecacheWorker(None, PrecacheConfig(high_water=0.8))
         backend = _FakeBackend(total=0, mx=1000)
         mgr = SimpleNamespace(backend=backend)
         monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
@@ -694,41 +712,6 @@ class TestHeadroomProbe:
         # No cache at all.
         monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: None)
         assert worker._has_headroom() is False
-
-
-class TestBacklogSeeding:
-    def test_orders_newest_mtime_first(self):
-        worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("old", 100.0), ("new", 200.0), ("mid", 150.0)])
-        assert worker._pop_backlog()[1] == "new"
-        assert worker._pop_backlog()[1] == "mid"
-        assert worker._pop_backlog()[1] == "old"
-        assert worker._pop_backlog() is None
-
-    def test_skips_live_queued_sources(self):
-        worker = PrecacheWorker(None, PrecacheConfig())
-        worker.enqueue("a")  # now in the live tier (_seen)
-        worker.seed_backlog([("a", 100.0), ("b", 50.0)])
-        # 'a' is already live -> only 'b' lands in the backlog.
-        assert worker._pop_backlog()[1] == "b"
-        assert worker._pop_backlog() is None
-
-    def test_seed_dedups_within_backlog(self):
-        worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("a", 100.0)])
-        worker.seed_backlog([("a", 999.0)])  # already present -> ignored
-        assert worker._pop_backlog()[1] == "a"
-        assert worker._pop_backlog() is None
-
-    def test_requeue_restores_front_priority(self):
-        worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("a", 100.0), ("b", 200.0)])
-        neg_mtime, sid = worker._pop_backlog()
-        assert sid == "b"  # newest
-        worker._requeue_backlog(sid, neg_mtime)
-        # Resumes at the front (still the newest among remaining).
-        assert worker._pop_backlog()[1] == "b"
-        assert worker._pop_backlog()[1] == "a"
 
 
 class TestIterLocalSourceMtimes:
@@ -812,161 +795,6 @@ class TestIterLocalSourceMtimes:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestBacklogWarming:
-    def _init_file_cache(self, tmp_path):
-        from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.core.config import CacheConfig
-
-        CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
-
-    def test_backlog_warms_existing_sources(self, tmp_path):
-        from biopb_tensor_server.cache import CacheManager
-
-        self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            _register_zarr(server, tmp_path, "s-old")
-            _register_zarr(server, tmp_path, "s-new")
-            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker.seed_backlog([("s-old", 100.0), ("s-new", 200.0)])
-            worker.start()
-            cm = CacheManager.get_instance()
-            deadline = time.time() + 8.0
-            while time.time() < deadline and not _located_all(
-                server, cm, ("s-old", "s-new")
-            ):
-                time.sleep(0.05)
-            worker.stop()
-            assert _located_all(server, cm, ("s-old", "s-new"))
-        finally:
-            server.shutdown()
-            CacheManager.get_instance().close()
-            CacheManager.reset()
-
-    def test_live_and_backlog_both_warm(self, tmp_path):
-        from biopb_tensor_server.cache import CacheManager
-
-        self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            _register_zarr(server, tmp_path, "live")
-            _register_zarr(server, tmp_path, "backlog")
-            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker.seed_backlog([("backlog", 100.0)])
-            worker.enqueue("live")
-            worker.start()
-            cm = CacheManager.get_instance()
-            deadline = time.time() + 8.0
-            while time.time() < deadline and not _located_all(
-                server, cm, ("live", "backlog")
-            ):
-                time.sleep(0.05)
-            worker.stop()
-            assert _located_all(server, cm, ("live", "backlog"))
-        finally:
-            server.shutdown()
-            CacheManager.get_instance().close()
-            CacheManager.reset()
-
-    def test_backlog_tensor_preempts_on_live_traffic(self, tmp_path):
-        from biopb_tensor_server.cache import CacheManager
-
-        self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            _register_zarr(server, tmp_path, "src")
-            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            # A live source is waiting -> a backlog tensor must yield immediately,
-            # before warming any chunk.
-            worker._queue.put("live")
-            adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
-            cm = CacheManager.get_instance()
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
-            assert preempted is True
-            assert cm.stats().misses == 0  # bailed before the first chunk
-        finally:
-            server.shutdown()
-            CacheManager.get_instance().close()
-            CacheManager.reset()
-
-    def test_backlog_tensor_preempts_when_cache_full(self, tmp_path, monkeypatch):
-        from biopb_tensor_server.cache import CacheManager
-
-        self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            _register_zarr(server, tmp_path, "src")
-            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            monkeypatch.setattr(worker, "_has_headroom", lambda: False)
-            adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
-            cm = CacheManager.get_instance()
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
-            assert preempted is True
-            assert cm.stats().misses == 0  # no eviction-causing writes
-        finally:
-            server.shutdown()
-            CacheManager.get_instance().close()
-            CacheManager.reset()
-
-    def test_backlog_tensor_warms_when_clear(self, tmp_path):
-        from biopb_tensor_server.cache import CacheManager
-
-        self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            _register_zarr(server, tmp_path, "src")
-            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
-            cm = CacheManager.get_instance()
-            # Empty live queue + plenty of headroom -> warms, no preempt.
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
-            assert preempted is False
-            assert cm.stats().misses > 0
-        finally:
-            server.shutdown()
-            CacheManager.get_instance().close()
-            CacheManager.reset()
-
-    def test_run_skips_backlog_without_headroom(self, tmp_path, monkeypatch):
-        from biopb_tensor_server.cache import CacheManager
-
-        self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            _register_zarr(server, tmp_path, "src")
-            worker = PrecacheWorker(
-                server,
-                PrecacheConfig(
-                    idle_debounce_seconds=0.0, backlog_idle_recheck_seconds=0.05
-                ),
-            )
-            monkeypatch.setattr(worker, "_has_headroom", lambda: False)
-            worker.seed_backlog([("src", 100.0)])
-            worker.start()
-            time.sleep(0.5)
-            worker.stop()
-            # Cache full -> the backlog tier never warms, and the source stays
-            # queued for a later retry.
-            assert CacheManager.get_instance().stats().misses == 0
-            assert worker._backlog_has_items()
-        finally:
-            server.shutdown()
-            CacheManager.get_instance().close()
-            CacheManager.reset()
-
-
-# ---------------------------------------------------------------------------
-# Skip natively-multiscale sources (well-formed OME-Zarr pyramids).
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestSkipNativePyramid:
     def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
         import zarr
@@ -1008,8 +836,9 @@ class TestSkipNativePyramid:
             server.register_source("ome-native", adapter)
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             # File backend is active, so absent the skip this would warm chunks.
-            preempted = worker._process_source("ome-native")
-            assert preempted is False
+            worker._process_source(
+                "ome-native", scale_hint=[2, 2], reduction_method="area"
+            )
             assert CacheManager.get_instance().stats().misses == 0
         finally:
             server.shutdown()
@@ -1268,8 +1097,8 @@ class TestDemandTier:
             server.shutdown()
 
 
-class TestSkipUnscaledCoarsestLevel:
-    """A tensor whose coarsest advertised level is full resolution is not warmed.
+class TestSkipUnscaledLevel:
+    """A level with nothing to downsample is never warmed.
 
     Warming it would cache the source 1:1 and save an open nothing, because
     there is no decode+downsample to precompute.
@@ -1284,8 +1113,8 @@ class TestSkipUnscaledCoarsestLevel:
             CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
         )
 
-    def _warm_one_tensor(self, tmp_path, shape, labels, chunks=None):
-        """Run one tensor through the worker; return the cache's miss count."""
+    def _warm_one_tensor(self, tmp_path, shape, labels, scale, chunks=None):
+        """Warm one tensor at *scale*; return the cache's miss count."""
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
@@ -1297,23 +1126,29 @@ class TestSkipUnscaledCoarsestLevel:
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             cm = CacheManager.get_instance()
             td = adapter.list_tensor_descriptors()[0]
-            preempted = worker._process_tensor(adapter, td, cm)
-            assert preempted is False
+            stopped = worker._process_tensor(
+                adapter, td, cm, scale_hint=list(scale), reduction_method="area"
+            )
+            assert stopped is False
             return cm.stats().misses
         finally:
             server.shutdown()
             CacheManager.get_instance().close()
             CacheManager.reset()
 
-    def test_skips_tensor_already_under_the_pixel_budget(self, tmp_path):
-        # 1024x1024 needs no downsampling, so the coarsest level is level 0.
-        assert compute_precache_scale_hint([1024, 1024], ["y", "x"]) == [1, 1]
-        assert self._warm_one_tensor(tmp_path, (1024, 1024), ("y", "x")) == 0
+    def test_skips_a_full_resolution_level(self, tmp_path):
+        # An all-ones scale caches the source 1:1 and saves an open nothing.
+        assert self._warm_one_tensor(tmp_path, (1024, 1024), ("y", "x"), (1, 1)) == 0
 
-    def test_warms_tensor_that_has_a_scale_rung(self, tmp_path):
-        # The contrast case: 8192x8192 earns a 4x rung, so warming pays.
-        assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [4, 4]
-        assert self._warm_one_tensor(tmp_path, (8192, 8192), ("y", "x")) > 0
+    def test_warms_a_genuinely_scaled_level(self, tmp_path):
+        assert self._warm_one_tensor(tmp_path, (8192, 8192), ("y", "x"), (4, 4)) > 0
+
+    def test_rejects_a_level_of_the_wrong_rank(self, tmp_path):
+        """A sibling of another rank cannot use the observed level.
+
+        Coercing it would warm chunk_ids no client asks for, so it is dropped.
+        """
+        assert self._warm_one_tensor(tmp_path, (8192, 8192), ("y", "x"), (1, 4, 4)) == 0
 
     def test_skips_long_timelapse_with_small_frames(self, tmp_path):
         """The case the gate exists for.
@@ -1324,7 +1159,12 @@ class TestSkipUnscaledCoarsestLevel:
         """
         shape, labels = (4000, 256, 256), ("t", "y", "x")
         assert compute_precache_scale_hint(list(shape), list(labels)) == [1, 1, 1]
-        assert self._warm_one_tensor(tmp_path, shape, labels, chunks=(1, 256, 256)) == 0
+        assert (
+            self._warm_one_tensor(
+                tmp_path, shape, labels, (1, 1, 1), chunks=(1, 256, 256)
+            )
+            == 0
+        )
 
     def test_gate_tracks_the_planner_not_a_size_threshold(self):
         """The skip condition is exactly the planner's all-ones coarsest level.
@@ -1530,17 +1370,19 @@ class TestAdvertisedPyramidDescriptor:
         )
         return ZarrAdapter(arr, "big", ["y", "x"])
 
-    def test_get_flight_info_advertises_computed_pyramid(self, tmp_path):
+    def test_advertises_nothing_without_a_native_pyramid(self, tmp_path):
+        """The server no longer publishes a *computed* ladder.
+
+        It was arithmetic over facts the client already has, so it expressed a
+        policy rather than knowledge -- and one the server cannot choose for
+        every client (a Viv viewer needs strict 2x, this plan stepped 4x). Empty
+        means "decide client-side", which the proto already documents.
+        """
         server = TensorFlightServer("grpc://localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             desc = self._descriptor(self._flight_info(server, "big", "big"))
-            assert len(desc.pyramid) >= 2
-            assert list(desc.pyramid[0].scale_hint) == [1, 1]
-            assert all(not lv.native for lv in desc.pyramid)
-            assert list(desc.pyramid[-1].scale_hint) == compute_precache_scale_hint(
-                [20000, 20000], ["y", "x"]
-            )
+            assert list(desc.pyramid) == []
         finally:
             server.shutdown()
 
@@ -1560,9 +1402,9 @@ class TestAdvertisedPyramidDescriptor:
         finally:
             server.shutdown()
 
-    def test_get_flight_info_on_1d_source_is_single_unscaled_level(self, tmp_path):
-        # A 1-D tensor has no Y/X plane; GetFlightInfo must advertise one full-res
-        # level rather than raise (regression for the <2-D guard).
+    def test_get_flight_info_on_1d_source_does_not_raise(self, tmp_path):
+        # A 1-D tensor has no Y/X plane; GetFlightInfo must still answer rather
+        # than raise (regression for the <2-D guard).
         import zarr
         from biopb_tensor_server import ZarrAdapter
 
@@ -1577,9 +1419,8 @@ class TestAdvertisedPyramidDescriptor:
         try:
             server.register_source("line", ZarrAdapter(arr, "line", ["x"]))
             desc = self._descriptor(self._flight_info(server, "line", "line"))
-            assert len(desc.pyramid) == 1
-            assert list(desc.pyramid[0].scale_hint) == [1]
-            assert list(desc.pyramid[0].shape) == [100000]
+            assert list(desc.shape) == [100000]
+            assert list(desc.pyramid) == []
         finally:
             server.shutdown()
 
@@ -1612,14 +1453,20 @@ class TestAdvertisedPyramidDescriptor:
         desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         return server.get_flight_info(None, desc)
 
-    def test_pyramid_advertisement_is_opt_in(self, tmp_path):
-        # with_pyramid gates the pyramid: unset (default false) => none advertised;
-        # set => the computed pyramid rides the descriptor.
+    def test_pyramid_advertisement_is_opt_in(self, multires_ome_zarr):
+        # with_pyramid gates the pyramid: unset (default false) => none
+        # advertised; set => the native levels ride the descriptor. Needs a
+        # native source now that a computed ladder is never advertised.
+        import zarr
         from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb_tensor_server import OmeZarrAdapter
+
+        zarr_path, _level_paths, _zattrs = multires_ome_zarr
+        root = zarr.open_group(zarr_path, mode="r")
 
         server = TensorFlightServer("grpc://localhost:0")
         try:
-            server.register_source("big", self._big_zarr_adapter(tmp_path))
+            server.register_source("big", OmeZarrAdapter(root["0"], "big"))
             bare = self._descriptor(
                 self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
             )
@@ -1663,38 +1510,6 @@ class TestAdvertisedPyramidDescriptor:
             assert len(info.endpoints) == 0
             desc = self._descriptor(info)
             assert list(desc.shape) == [20000, 20000]  # base per-tensor facts
-            assert len(desc.pyramid) >= 2  # pyramid advertised (its own mask)
-        finally:
-            server.shutdown()
-
-
-@pytest.mark.skipif(not _zarr_available(), reason="zarr not installed")
-class TestPrecacheAdvertisedAlignment:
-    """Precache warms exactly the scale the server advertises (no drift)."""
-
-    def test_worker_coarsest_equals_advertised_coarsest(self, tmp_path):
-        import zarr
-        from biopb_tensor_server import ZarrAdapter
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        arr = zarr.open_array(
-            str(tmp_path / "big.zarr"),
-            mode="w",
-            shape=(20000, 20000),
-            chunks=(1024, 1024),
-            dtype="uint8",
-        )
-        adapter = ZarrAdapter(arr, "big", ["y", "x"])
-        server = TensorFlightServer("grpc://localhost:0")
-        try:
-            server.register_source("big", adapter)
-            base_desc = adapter.get_tensor_descriptor()
-            advertised = adapter._advertised_pyramid(base_desc, server._pyramid_config)
-            # The worker warms build_pyramid_plan(...)[-1]; the server advertises
-            # the same plan -- so their coarsest scales are identical.
-            worker_coarsest = build_pyramid_plan(
-                list(base_desc.shape), list(base_desc.dim_labels)
-            )[-1]
-            assert list(advertised[-1].scale_hint) == list(worker_coarsest.scale_hint)
+            assert list(desc.pyramid) == []  # computed ladders are never sent
         finally:
             server.shutdown()

@@ -1,67 +1,54 @@
-"""Background pre-cache worker for the tensor server.
+"""Background cache warmer for the tensor server.
 
-This worker warms the file cache so the first view a scientist opens is already
-warm instead of paying a cold decode+downsample on the critical path. It warms
-the coarsest level of the same pyramid the server advertises on the tensor
-descriptor (see ``chunk.build_pyramid_plan``), so the warmed scale always matches
-what the client requests on open.
+Warms the chunks around what a client has *actually read*, so that moving
+within a source -- to another plane, or to another tensor of the same file --
+does not pay a cold decode. It is demand-driven by construction: an observed
+read names the tensor, the scale and the reduction method, so the worker never
+has to guess a level.
 
-It serves three tiers, in strict priority order:
-
-- **Demand tier (highest).** Triggered by a chunk a client actually read
-  (``observe_read``, fed from the server's read paths): warms the rest of that
-  tensor's level first, then the source's other tensors, all at the *client's*
-  scale and reduction method. This is the only tier with evidence behind it --
-  somebody is looking at this source right now -- and the only one whose target
-  the server does not have to guess, since the observed read carries the scale.
-  A client running its own pyramid policy is therefore warmed correctly without
-  the server modelling that policy.
-- **Live tier.** Sources added to the catalog *after* startup, fed by
-  ``SourceManager``'s commit hook (``enqueue``). Always warmed.
-- **Backlog tier (lowest, off by default).** Local sources already present at
-  startup, seeded once via ``seed_backlog`` and ordered newest-mtime-first.
-  Drained only when the live queue is empty, and bounded so it never evicts live
-  data (see below). Disabled by default because it is the tier with no evidence
-  behind it: it warms the entire catalog against the chance someone opens some
-  of it, and when the footprint exceeds the cache the ``backlog_high_water``
-  stop decides *which* sources stay warm by mtime rather than by value. The
-  demand tier covers the same ground for sources anyone actually opens.
+That is the whole design constraint, and it is why the two speculative tiers
+this worker used to run are gone (biopb/biopb#89). Warming a level the server
+picked only pays off for a client that happens to want that level, and the
+server has no way to know which one that is: a computed pyramid is arithmetic
+over the tensor's shape, so it encodes a policy rather than knowledge. Two
+clients here already disagree -- the napari path follows the server's 4x plan,
+the Viv-based viewer needs strict 2x levels and stops once a plane fits one
+tile -- and the guess was wrong for whichever one it was not written for.
 
 Design constraints (all best-effort, never fatal to the server):
 
 - **File backend only.** Inert unless the cache is the persistent
-  ``ArrowFileBackend``; on a memory backend it drops queued work.
+  ``ArrowFileBackend``.
+- **Scaled reads only.** A full-resolution read is the computation pattern (a
+  dask graph walking the array once); warming for it would charge a cache write
+  to a workflow with no re-read to pay it back.
 - **Stays out of the way.** Before each chunk it waits until the Flight server
   has been idle for ``idle_debounce_seconds`` (no in-flight ``do_get``), and it
-  re-checks between chunks so a burst of live traffic preempts it at chunk
-  granularity. On the locked adapters precache's reads also serialize behind
-  live reads through the per-source ``_io_lock``, so it never races a
-  non-thread-safe reader.
-- **Backlog never evicts live data.** The file cache evicts globally on every
-  write, so the backlog tier gates each chunk on cache fill and stops above
-  ``backlog_high_water`` of the cache's ``max_bytes``, and yields the moment a
-  live source is enqueued.
-- **Only warms what scaling makes cheap.** A tensor whose coarsest advertised
-  level is full resolution is skipped: warming it would cache the source 1:1 to
-  save an open nothing. Without this the worker chases a footprint far larger
-  than the cache, and the ``backlog_high_water`` stop then decides *which*
-  sources stay warm by mtime order rather than by what warming is worth.
+  re-checks between chunks so live traffic preempts it at chunk granularity. On
+  the locked adapters its reads also serialize behind live reads through the
+  per-source ``_io_lock``, so it never races a non-thread-safe reader.
+- **Never evicts live data.** The file cache evicts globally on every write, so
+  warming stops above ``high_water`` of the cache's ``max_bytes``.
+- **Skips native pyramids.** A tensor that ships its own coarse levels serves
+  overviews cheaply already.
+
+What is deliberately *not* covered: the first read of a source nobody has
+touched. Nothing predicts it, so it stays cold -- once per source, since the
+first read then warms that source's other tensors.
 """
 
 from __future__ import annotations
 
-import heapq
 import logging
 import queue
 import threading
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
 from biopb_tensor_server.core.chunk import (
-    build_pyramid_plan,
     decode_reduction_method,
     decode_scale_info,
     is_scaled_chunk,
@@ -103,9 +90,6 @@ class PrecacheWorker:
 
             pyramid_config = PyramidConfig()
         self._pyramid_cfg = pyramid_config
-        self._queue: queue.Queue[str] = queue.Queue()
-        self._seen: Set[str] = set()
-        self._seen_lock = threading.Lock()
         # Demand tier: chunk_ids clients actually read. Bounded and lossy on
         # purpose -- an observation is a hint about what someone is looking at
         # *now*, so a backlog of stale ones is worth less than the newest few.
@@ -126,11 +110,6 @@ class PrecacheWorker:
             OrderedDict()
         )
         self._demand_lock = threading.Lock()
-        # Backlog tier: a newest-mtime-first heap of (-mtime, seq, source_id).
-        self._backlog: List[Tuple[float, int, str]] = []
-        self._backlog_ids: Set[str] = set()
-        self._backlog_seq = 0
-        self._backlog_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # Residency gate: re-checks at warm time whether a cloud-root source's
@@ -163,17 +142,6 @@ class PrecacheWorker:
 
     # -- producer API ------------------------------------------------------
 
-    def enqueue(self, source_id: str) -> None:
-        """Queue a live (runtime) source for warming (non-blocking, deduped).
-
-        Handed to ``SourceManager._on_source_committed``.
-        """
-        with self._seen_lock:
-            if source_id in self._seen:
-                return
-            self._seen.add(source_id)
-        self._queue.put(source_id)
-
     def observe_read(self, chunk_id: bytes) -> None:
         """Record that a client actually read ``chunk_id``.
 
@@ -195,73 +163,15 @@ class PrecacheWorker:
         except queue.Full:
             pass
 
-    def seed_backlog(self, items: Sequence[Tuple[str, float]]) -> None:
-        """Seed the secondary backlog with ``(source_id, mtime)`` pairs.
-
-        Called once at startup with the existing local sources. Items already
-        queued in the live tier or the backlog are skipped.
-        """
-        if not items:
-            return
-        with self._seen_lock:
-            seen_snapshot = set(self._seen)
-        added = 0
-        with self._backlog_lock:
-            for source_id, mtime in items:
-                if source_id in self._backlog_ids or source_id in seen_snapshot:
-                    continue
-                self._backlog_seq += 1
-                heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
-                self._backlog_ids.add(source_id)
-                added += 1
-        logger.info(
-            "precache: seeded %d/%d existing sources into backlog",
-            added,
-            len(items),
-        )
-
     # -- worker loop -------------------------------------------------------
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            # 0. Demand tier: a client is reading this source right now, so it
-            #    outranks both speculative tiers.
             try:
-                observed = self._demand.get_nowait()
-            except queue.Empty:
-                observed = None
-            if observed is not None:
-                self._process_demand(observed)
-                continue
-
-            # 1. Live tier: always drained before the backlog.
-            try:
-                source_id = self._queue.get_nowait()
-            except queue.Empty:
-                source_id = None
-            if source_id is not None:
-                self._process_live(source_id)
-                continue
-
-            # 2. Backlog tier (secondary): only on a file backend with headroom.
-            if self._backlog_has_items():
-                if not self._file_backend_active():
-                    self._clear_backlog()
-                    continue
-                if not self._has_headroom():
-                    # Cache is full; warming would evict live data. Nap and
-                    # re-check (live eviction may free room later).
-                    self._stop.wait(self._cfg.backlog_idle_recheck_seconds)
-                    continue
-                self._drain_one_backlog()
-                continue
-
-            # 3. Idle: block briefly for the next live addition.
-            try:
-                source_id = self._queue.get(timeout=0.5)
+                observed = self._demand.get(timeout=0.5)
             except queue.Empty:
                 continue
-            self._process_live(source_id)
+            self._process_demand(observed)
 
     def _process_demand(self, chunk_id: bytes) -> None:
         """Warm the siblings of a tensor a client just read, at its scale.
@@ -313,58 +223,6 @@ class PrecacheWorker:
         except Exception:
             logger.exception("precache: demand warm failed for %s", source_id)
 
-    def _process_live(self, source_id: str) -> None:
-        # Drop the dedup marker before processing: a commit that arrives while
-        # we work should be allowed to re-queue a fresh pass.
-        with self._seen_lock:
-            self._seen.discard(source_id)
-        try:
-            self._process_source(source_id)
-        except Exception:
-            logger.exception("precache: failed for source %s", source_id)
-
-    def _drain_one_backlog(self) -> None:
-        entry = self._pop_backlog()
-        if entry is None:
-            return
-        neg_mtime, source_id = entry
-        try:
-            preempted = self._process_source(source_id, backlog=True)
-        except Exception:
-            logger.exception("precache: backlog failed for source %s", source_id)
-            preempted = False
-        if preempted:
-            # Live traffic or a full cache interrupted us; resume this source
-            # (newest first) once conditions allow. Re-warm is cheap (hits).
-            self._requeue_backlog(source_id, neg_mtime)
-
-    # -- backlog bookkeeping -----------------------------------------------
-
-    def _backlog_has_items(self) -> bool:
-        with self._backlog_lock:
-            return bool(self._backlog)
-
-    def _pop_backlog(self) -> Optional[Tuple[float, str]]:
-        with self._backlog_lock:
-            if not self._backlog:
-                return None
-            neg_mtime, _seq, source_id = heapq.heappop(self._backlog)
-            self._backlog_ids.discard(source_id)
-            return neg_mtime, source_id
-
-    def _requeue_backlog(self, source_id: str, neg_mtime: float) -> None:
-        with self._backlog_lock:
-            if source_id in self._backlog_ids:
-                return
-            self._backlog_seq += 1
-            heapq.heappush(self._backlog, (neg_mtime, self._backlog_seq, source_id))
-            self._backlog_ids.add(source_id)
-
-    def _clear_backlog(self) -> None:
-        with self._backlog_lock:
-            self._backlog.clear()
-            self._backlog_ids.clear()
-
     # -- gates -------------------------------------------------------------
 
     def _file_backend_active(self) -> bool:
@@ -375,10 +233,11 @@ class PrecacheWorker:
         )
 
     def _has_headroom(self) -> bool:
-        """True while the file cache is below the backlog high-water mark.
+        """True while the file cache is below the high-water mark.
 
-        Keeps the backlog tier from filling the cache to the brim and evicting
-        genuinely-hot live data (the cache evicts globally on every write).
+        Keeps speculative warming from filling the cache to the brim and
+        evicting genuinely-hot live data (the cache evicts globally on every
+        write) -- including the very chunks the triggering read just cached.
         """
         cache_manager = CacheManager.get_instance()
         if cache_manager is None:
@@ -389,7 +248,7 @@ class PrecacheWorker:
             return False
         if st.max_bytes <= 0:
             return False
-        return st.total_bytes < st.max_bytes * self._cfg.backlog_high_water
+        return st.total_bytes < st.max_bytes * self._cfg.high_water
 
     def _wait_until_idle(self) -> bool:
         """Block until the Flight server is idle. Return False if asked to stop."""
@@ -405,23 +264,21 @@ class PrecacheWorker:
     def _process_source(
         self,
         source_id: str,
-        backlog: bool = False,
-        scale_hint: Optional[List[int]] = None,
-        reduction_method: Optional[str] = None,
+        scale_hint: List[int],
+        reduction_method: str,
         first_array_id: Optional[str] = None,
-    ) -> bool:
-        """Warm every tensor of a source. Return True if a backlog pass was
-        preempted (and should be re-queued).
+    ) -> None:
+        """Warm every tensor of a source at an observed level.
 
-        ``scale_hint``/``reduction_method`` override the server's own pyramid
-        plan -- the demand tier passes the level a client was observed reading.
+        ``scale_hint``/``reduction_method`` are the level a client was seen
+        reading -- there is no server-chosen fallback, which is the point.
         ``first_array_id`` moves one tensor to the front: the one the client is
         actually looking at, whose unread planes matter more than any sibling."""
         # Runtime file-backend gate: the "only run if file-based caching"
         # condition, enforced regardless of config.
         if not self._file_backend_active():
             logger.debug("precache: file backend not active, skipping %s", source_id)
-            return False
+            return
         # Residency gate (#174): under a cloud root, skip a source whose member
         # files have been re-dehydrated since registration. Reading them would
         # recall content the cloud=true policy is meant to keep offline. Coarse
@@ -431,12 +288,12 @@ class PrecacheWorker:
             logger.debug(
                 "precache: source %s not resident (cloud), skipping warm", source_id
             )
-            return False
+            return
         cache_manager = CacheManager.get_instance()
 
         source_adapter = self._server.sources.get(source_id)
         if source_adapter is None:
-            return False
+            return
 
         # Skip non-local (remote) sources entirely (biopb/biopb#299). Warming a
         # remote-tensor proxy source would speculatively pull every chunk across
@@ -451,9 +308,9 @@ class PrecacheWorker:
 
         if is_remote_url(source_adapter.source_url or ""):
             logger.debug(
-                "precache: skipping non-local source %s (warmed on demand)", source_id
+                "precache: skipping non-local source %s (read directly)", source_id
             )
-            return False
+            return
 
         try:
             descriptors = source_adapter.list_tensor_descriptors()
@@ -461,7 +318,7 @@ class PrecacheWorker:
             logger.exception(
                 "precache: list_tensor_descriptors failed for %s", source_id
             )
-            return False
+            return
 
         if first_array_id is not None:
             descriptors = sorted(
@@ -470,31 +327,25 @@ class PrecacheWorker:
 
         for td in descriptors:
             if self._stop.is_set():
-                return False
+                return
             if self._process_tensor(
                 source_adapter,
                 td,
                 cache_manager,
-                backlog=backlog,
                 scale_hint=scale_hint,
                 reduction_method=reduction_method,
             ):
-                return True  # preempted mid-source
-        return False
+                return  # cache filled up; the rest can warm on their own reads
 
     def _process_tensor(
         self,
         source_adapter,
         td,
         cache_manager,
-        backlog: bool = False,
-        scale_hint: Optional[List[int]] = None,
-        reduction_method: Optional[str] = None,
+        scale_hint: List[int],
+        reduction_method: str,
     ) -> bool:
-        """Warm one tensor level. Return True if preempted (backlog).
-
-        Defaults to the coarsest level of the server-advertised plan; the demand
-        tier passes an observed ``scale_hint``/``reduction_method`` instead."""
+        """Warm one tensor at an observed level. True if it stopped early."""
         # The client passes the descriptor's array_id verbatim as tensor_id
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
@@ -524,37 +375,18 @@ class PrecacheWorker:
             logger.exception("precache: get_tensor_descriptor failed for %s", tensor_id)
             return False
 
-        # An observed level wins over the advertised plan: it is what a client
-        # demonstrably reads, whereas the plan is what the server guesses it
-        # should. A client with its own pyramid policy only ever agrees with the
-        # former. Rank mismatches are dropped rather than coerced -- an override
-        # from a different tensor would warm chunk_ids nobody asks for.
-        if scale_hint is not None:
-            if len(scale_hint) != len(base_desc.shape):
-                logger.debug(
-                    "precache: observed scale rank %d != tensor rank %d for %s",
-                    len(scale_hint),
-                    len(base_desc.shape),
-                    tensor_id,
-                )
-                return False
-            level_scale = list(scale_hint)
-            level_method = reduction_method or self._pyramid_cfg.reduction_method
-        else:
-            # Warm the coarsest level of the same plan the server advertises (a
-            # non-native source: native ones are skipped above), so the warmed
-            # chunk_ids are exactly what the client fetches on open.
-            cfg = self._pyramid_cfg
-            coarsest = build_pyramid_plan(
-                list(base_desc.shape),
-                list(base_desc.dim_labels),
-                reduction_method=cfg.reduction_method,
-                threshold=cfg.threshold,
-                downscale_factor=cfg.downscale_factor,
-                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-            )[-1]
-            level_scale = list(coarsest.scale_hint)
-            level_method = coarsest.reduction_method
+        # A sibling of a different rank cannot use this level: warming it would
+        # produce chunk_ids nobody asks for. Drop rather than coerce.
+        if len(scale_hint) != len(base_desc.shape):
+            logger.debug(
+                "precache: observed scale rank %d != tensor rank %d for %s",
+                len(scale_hint),
+                len(base_desc.shape),
+                tensor_id,
+            )
+            return False
+        level_scale = list(scale_hint)
+        level_method = reduction_method
 
         # Nothing to precompute when the coarsest level is full resolution:
         # warming caches the source 1:1 and saves an open nothing.
@@ -601,20 +433,10 @@ class PrecacheWorker:
         for ce in endpoints:
             if self._stop.is_set():
                 return False
-            if backlog:
-                # Yield to live work the instant any arrives.
-                if not self._queue.empty():
-                    return True
-                # Respect cache headroom: live traffic may have filled it.
-                if not self._has_headroom():
-                    return True
-            elif scale_hint is not None and not self._has_headroom():
-                # Demand tier: better evidence than the backlog has, but still
-                # speculative, so it observes the same ceiling. It does *not*
-                # yield to the live queue -- a source someone is reading now
-                # outranks one that was merely added.
-                logger.debug("precache: demand warm stopped, cache at high water")
-                return False
+            if not self._has_headroom():
+                # Speculative work must never evict what live reads just put in.
+                logger.debug("precache: warm stopped, cache at high water")
+                return True
             # Debounce + preempt between chunks: wait for the server to be idle
             # before warming each chunk.
             if not self._wait_until_idle():
@@ -627,13 +449,10 @@ class PrecacheWorker:
                 logger.debug("precache: chunk warm failed for %s: %s", tensor_id, e)
 
         logger.info(
-            "precache: warmed %d/%d chunks for %s at scale=%s%s",
+            "precache: warmed %d/%d chunks for %s at scale=%s",
             warmed,
             len(endpoints),
             tensor_id,
             level_scale,
-            " (observed)"
-            if scale_hint is not None
-            else (" (backlog)" if backlog else ""),
         )
         return False

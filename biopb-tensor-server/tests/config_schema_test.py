@@ -156,8 +156,8 @@ def test_installer_default_config_validates(validator):
     "cfg",
     [
         {"pyramid": {"downscale_factor": 2}},  # boundary (min)
-        {"precache": {"backlog_high_water": 0.0}},  # boundary (min)
-        {"precache": {"backlog_high_water": 1.0}},  # boundary (max)
+        {"precache": {"high_water": 0.0}},  # boundary (min)
+        {"precache": {"high_water": 1.0}},  # boundary (max)
         {"metadata_db": {"query_timeout_ms": 1}},  # boundary (min)
         {"server": {"log_level": "info"}},  # case-insensitive enum stays lenient
         {"cache": {"backend": "memory"}},
@@ -180,7 +180,7 @@ def test_accepts_valid(validator, cfg):
         {"pyramid": {"downscale_factor": 1}},  # silently single-level before
         {"pyramid": {"downscale_factor": 0}},  # ZeroDivisionError before
         {"pyramid": {"pixel_budget_cubic_root": 0}},  # infinite loop before
-        {"precache": {"backlog_high_water": 2}},
+        {"precache": {"high_water": 2}},
         {"cache": {"file_max_total_gb": 0}},
         {"sources": [{"type": "zarr"}]},  # missing required url
         {"sources": [{"url": "/d", "type": "madeup"}]},  # type not in enum

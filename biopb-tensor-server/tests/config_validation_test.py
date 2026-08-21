@@ -76,8 +76,8 @@ def _default_of(section, field):
         ({"cache": {"backend": "bogus"}}, "cache", "backend"),
         ({"cache": {"max_bytes": 0}}, "cache", "memory_max_bytes"),
         ({"cache": {"file_max_total_gb": -1}}, "cache", "file_max_total_bytes"),
-        ({"precache": {"backlog_high_water": 1.5}}, "precache", "backlog_high_water"),
-        ({"precache": {"backlog_high_water": -0.1}}, "precache", "backlog_high_water"),
+        ({"precache": {"high_water": 1.5}}, "precache", "high_water"),
+        ({"precache": {"high_water": -0.1}}, "precache", "high_water"),
         (
             {"metadata_db": {"max_query_results": 0}},
             "metadata_db",
@@ -153,15 +153,15 @@ def test_valid_defaults_do_not_warn(caplog):
         ),
         # boundaries are inclusive.
         (
-            {"precache": {"backlog_high_water": 0.0}},
+            {"precache": {"high_water": 0.0}},
             "precache",
-            "backlog_high_water",
+            "high_water",
             0.0,
         ),
         (
-            {"precache": {"backlog_high_water": 1.0}},
+            {"precache": {"high_water": 1.0}},
             "precache",
-            "backlog_high_water",
+            "high_water",
             1.0,
         ),
     ],

@@ -430,10 +430,39 @@ class TestNormalizedDescriptorAndData:
 
     def test_advertised_pyramid_levels_are_canonical(self):
         """Each level carries its own per-axis ``shape`` and ``scale_hint``, so
-        the permutation has to reach inside them too."""
+        the permutation has to reach inside them too.
+
+        Only *native* levels are advertised now (biopb/biopb#89), so the source
+        has to report some for the permutation to have anything to act on -- but
+        the property under test is unchanged, and still live for any real
+        pyramidal source stored in a non-canonical axis order.
+        """
+        from biopb.tensor.descriptor_pb2 import PyramidLevel
+
         with tempfile.TemporaryDirectory() as tmp:
             src = np.zeros((128, 64, 4), np.uint16)  # x, y, z
-            adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
+            inner = _zarr_adapter(tmp, src, ["x", "y", "z"])
+
+            # Levels in the *store's* axis order (x, y, z): halve x and y.
+            def _native_levels(_self=None):
+                return [
+                    PyramidLevel(
+                        scale_hint=[1, 1, 1],
+                        shape=[128, 64, 4],
+                        native=True,
+                        reduction_method="precompute",
+                    ),
+                    PyramidLevel(
+                        scale_hint=[4, 2, 1],
+                        shape=[32, 32, 4],
+                        native=True,
+                        reduction_method="precompute",
+                    ),
+                ]
+
+            inner.get_native_pyramid_levels = _native_levels
+
+            adapter = normalize_adapter(inner)
             plan = adapter.plan_flight_info(
                 TensorReadOption(tensor_id="src", with_pyramid=True),
                 PyramidConfig(threshold=32),
@@ -448,13 +477,12 @@ class TestNormalizedDescriptorAndData:
                     )
                 ]
                 assert list(level.shape) == expected
-            # A pyramid reduces X and Y. Those are the *canonical* trailing axes
-            # here, not the ones the store labels x/y -- so a coarse level having
-            # reduced index 2 is what proves the plan was built against the
-            # normalized labels.
+            # The store's x axis is the *canonical* trailing axis here, so its
+            # 4x reduction must land at index 2 -- that is what proves the levels
+            # were permuted rather than passed through in store order.
             coarsest = plan.descriptor.pyramid[-1]
-            assert coarsest.scale_hint[2] > 1
-            assert coarsest.shape[2] <= 32
+            assert coarsest.scale_hint[2] == 4
+            assert coarsest.shape[2] == 32
 
     def test_writes_are_refused_rather_than_permuted(self):
         from biopb_tensor_server.core.errors import WriteNotSupportedError

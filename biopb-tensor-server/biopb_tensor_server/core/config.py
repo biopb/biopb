@@ -227,8 +227,7 @@ _CONSTRAINTS = {
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),
         "demand_queue_max": _Range(min=1),
-        "backlog_high_water": _Range(min=0.0, max=1.0),
-        "backlog_idle_recheck_seconds": _Range(min=0),
+        "high_water": _Range(min=0.0, max=1.0),
     },
     "MetadataDbConfig": {
         "max_query_results": _Range(min=1),
@@ -624,27 +623,11 @@ class PrecacheConfig:
             "full (a stale hint is worth less than a fresh one)."
         },
     )
-    # Startup-backlog (existing sources) knobs.
-    backlog_enabled: bool = field(
-        default=False,
-        metadata={
-            "help": "Also warm every source already present at startup, behind "
-            "live additions. Off by default: it warms the whole catalog on a "
-            "guess, where the demand tier warms what a client actually reads."
-        },
-    )
-    backlog_high_water: float = field(
+    high_water: float = field(
         default=0.8,
         metadata={
-            "help": "Stop backlog warming once the file cache fills past this "
-            "fraction of its budget (0-1), so precache never evicts live data."
-        },
-    )
-    backlog_idle_recheck_seconds: float = field(
-        default=5.0,
-        metadata={
-            "help": "Over the high-water mark, seconds the backlog naps before "
-            "re-checking for freed room."
+            "help": "Stop warming once the file cache fills past this fraction "
+            "of its budget (0-1), so warming never evicts live data."
         },
     )
 
@@ -1292,9 +1275,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(precache_kwargs, "idle_debounce_seconds", precache_data, cast=float)
     _carry(precache_kwargs, "demand_enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "demand_queue_max", precache_data, cast=int)
-    _carry(precache_kwargs, "backlog_enabled", precache_data, cast=bool)
-    _carry(precache_kwargs, "backlog_high_water", precache_data, cast=float)
-    _carry(precache_kwargs, "backlog_idle_recheck_seconds", precache_data, cast=float)
+    # Legacy name first so an explicit new-style key wins over it.
+    _carry(
+        precache_kwargs,
+        "high_water",
+        precache_data,
+        key="backlog_high_water",
+        cast=float,
+    )
+    _carry(precache_kwargs, "high_water", precache_data, cast=float)
     precache_config = PrecacheConfig(**precache_kwargs)
 
     # Parse credentials settings (NEW)
