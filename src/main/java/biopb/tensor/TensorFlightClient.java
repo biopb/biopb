@@ -207,7 +207,9 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * Each data source may contain multiple tensors (for multifield acquisitions
      * where tensors have different shapes). The returned DataSourceDescriptor
-     * contains full tensor metadata (shape, dtype, chunk_shape) for all tensors.
+     * carries the structural entry (array_id, dim_labels, shape, dtype) for every
+     * tensor. The transfer chunk_shape is empty here -- it is answered per tensor
+     * by GetFlightInfo, which is what getTensor()/tensorFromPb() plan on.
      *
      * Results may be truncated if server has max_list_flights_results configured.
      * Check returned map size vs total_sources in schema metadata for truncation

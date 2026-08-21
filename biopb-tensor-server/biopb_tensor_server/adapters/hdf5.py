@@ -18,7 +18,10 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -178,7 +181,7 @@ class Hdf5Adapter(TensorAdapter):
         )
 
     def list_tensor_descriptors(self):
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim voxel size (µm) from the ``element_size_um`` attribute.

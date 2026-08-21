@@ -31,6 +31,7 @@ from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
     CHUNK_WIRE_SCHEMA,
     TensorAdapter,
+    catalog_entry,
 )
 from biopb_tensor_server.core.chunk import encode_chunk_id, wrap_content_version
 
@@ -148,7 +149,7 @@ class CachedSourceAdapter(TensorAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """Cache sources are single-tensor."""
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def get_metadata(self) -> dict:
         """Return OME metadata."""

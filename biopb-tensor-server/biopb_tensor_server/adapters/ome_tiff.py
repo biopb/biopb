@@ -38,7 +38,10 @@ from biopb_tensor_server.adapters._handle_reaper import (
     DEFAULT_HANDLE_REAPER_TTL,
     IdleHandleReaper,
 )
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -521,10 +524,16 @@ class OmeTiffAdapter(TensorAdapter):
         """Scene-level: the handed-down tifffile descriptor. Source-level: scene 0."""
         if self.scene_index is not None:
             return self._tifffile_descriptor
-        return self.list_tensor_descriptors()[0]
+        return self._scene_descriptors()[0]
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """Per-scene descriptors derived from tifffile (cached).
+    def _scene_descriptors(self) -> List[TensorDescriptor]:
+        """Per-scene **serving** descriptors derived from tifffile (cached).
+
+        Each carries its own scene's transfer grid, seeded by that scene's page
+        geometry, and is handed straight to the scene adapter by
+        :meth:`get_tensor_adapter` -- the one object the listing and the read
+        agree on. Internal: the catalog surface is
+        :meth:`list_tensor_descriptors`, which projects these.
 
         Returns an empty list when the source is not a tifffile-readable local
         OME-TIFF (remote, custom dim_labels, non-OME, exotic axes) -- ``claim``
@@ -536,13 +545,17 @@ class OmeTiffAdapter(TensorAdapter):
         self._cached_descriptors = descriptors if descriptors is not None else []
         return self._cached_descriptors
 
+    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+        """Structural catalog entries for every scene (no grid, #812)."""
+        return [catalog_entry(d) for d in self._scene_descriptors()]
+
     def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Build (and cache) the scene adapter for a within-source field.
 
         The scene adapter is handed the scene's tifffile descriptor, so it never
         re-derives it and reads straight from the aszarr store.
         """
-        descriptors = self.list_tensor_descriptors()
+        descriptors = self._scene_descriptors()
         field = self._within_source_field(tensor_id)
         scene_idx = self._scene_index_for_field(field)
 
@@ -557,7 +570,7 @@ class OmeTiffAdapter(TensorAdapter):
             io_lock=self._io_lock,
         )
         adapter._tensor_name = field
-        # Hand the scene the source's already-parsed OME-XML (list_tensor_descriptors
+        # Hand the scene the source's already-parsed OME-XML (_scene_descriptors
         # above populated it) so the scene's metadata / physical-scale paths read
         # the cached string instead of re-opening the master file once per scene --
         # the source parses the OME-XML once, every scene inherits it (mirrors how
@@ -577,7 +590,7 @@ class OmeTiffAdapter(TensorAdapter):
         The cached descriptors are in series/scene order, so the position IS the
         scene index (and the aszarr ``series[index]`` the read opens).
         """
-        for i, d in enumerate(self.list_tensor_descriptors()):
+        for i, d in enumerate(self._scene_descriptors()):
             if self._within_source_field(d.array_id) == field:
                 return i
         raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")

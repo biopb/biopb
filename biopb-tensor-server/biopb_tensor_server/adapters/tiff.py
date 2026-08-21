@@ -22,7 +22,10 @@ from biopb_tensor_server.adapters._scale import (
     scale_by_label,
     unit_to_um,
 )
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -699,7 +702,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def _read_padded_plane(
         self,
@@ -1288,7 +1291,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.

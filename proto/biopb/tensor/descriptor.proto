@@ -53,11 +53,20 @@ message TensorDescriptor {
   // the server-side adapter that knows how the bytes sit on disk; it is not the
   // store's own block size, and no read is issued at any other granularity.
   //
-  // On a *response* it is the grid you will read on: the stable per-tensor grid
-  // in a describe or catalog listing, and for a scaled read the grid of that
-  // response's (already reduced) chunks. On an upload *request* it is the grid
-  // you will write on -- it sets the created store's blocking and the bounds
-  // every chunk must land on.
+  // On a *response* it is the grid you will read on -- the tensor's own grid in
+  // a describe, and for a scaled read the grid of that response's (already
+  // reduced) chunks. It is answered ONLY by GetFlightInfo, which resolves the
+  // tensor adapter first: the grid depends on facts that exist only once a
+  // specific tensor/scene is bound (its backing chunk layout, its dimension
+  // labels, format layout rules, the native pyramid level, the request scale),
+  // so a source-level listing cannot own it. ListFlights and
+  // DataSourceDescriptor.tensors therefore carry it EMPTY -- like pyramid and
+  // physical_scale -- and an empty grid is not a usable fallback: a client that
+  // needs one for Dask construction, tiling or prefetching must describe the
+  // tensor. (Empty also means "old server"; the field has always been optional.)
+  //
+  // On an upload *request* it is the grid you will write on -- it sets the
+  // created store's blocking and the bounds every chunk must land on.
   repeated int64 chunk_shape = 4;
 
   // Element dtype (numpy-style, e.g., "uint8", "float32", "float64")
@@ -244,8 +253,12 @@ message DataSourceDescriptor {
   // Source type: "aics", "micromanager", "ome-zarr", "zarr", "hdf5", etc.
   string source_type = 3;
 
-  // All tensor descriptors in this source
-  // metadata_json field not populated here (source-level metadata only)
+  // Every tensor in this source, as a STRUCTURAL catalog entry: array_id,
+  // dim_labels, shape, dtype. The serving fields are left empty here --
+  // chunk_shape (the transfer grid), pyramid, physical_scale, metadata_json --
+  // because a source lists all its tensors without binding any of them, and
+  // those are answered by the adapter GetFlightInfo binds to one tensor. Read
+  // this to enumerate and address; describe the tensor to plan a read.
   repeated TensorDescriptor tensors = 4;
 
   // Source-level OME/vendor metadata (JSON format)

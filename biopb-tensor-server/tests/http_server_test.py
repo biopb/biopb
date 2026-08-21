@@ -1950,6 +1950,62 @@ def _multi_tensor_client():
             yield tc, mock_fc
 
 
+class TestTileGridComesFromTheDescribedTensor:
+    """The tile grid is read from GetFlightInfo, never from the source listing.
+
+    A source listing is structural and carries an empty ``chunk_shape``
+    (biopb/biopb#812); the tile edge nests inside the transfer grid, so it has to
+    come from describing the tensor. Here the two surfaces disagree on purpose:
+    the listed entry has no grid at all, and only ``get_descriptor`` fills one.
+    """
+
+    @staticmethod
+    def _client():
+        listed = _make_tensor_desc(
+            array_id="s",
+            shape=[1, 1, 1, 512, 512],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        )
+        listed.chunk_shape = []  # what ListFlights actually publishes
+        described = _make_tensor_desc(
+            array_id="s",
+            shape=[1, 1, 1, 512, 512],
+            dtype="uint16",
+            dim_labels=["T", "C", "Z", "Y", "X"],
+        )
+        described.chunk_shape = [1, 1, 1, 256, 256]
+
+        mock_fc = _build_mock_client(_make_source_desc("s", tensors=[listed]))
+        mock_fc.get_descriptor.side_effect = lambda array_id, **_k: described
+        return mock_fc
+
+    def test_tile_info_reports_the_described_grid(self):
+        mock_fc = self._client()
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            with TestClient(create_app(token=None)) as tc:
+                body = tc.get("/api/tile_info/s").json()
+
+        assert body["chunk_shape"] == [1, 1, 1, 256, 256]
+        assert body["tile_size"] == 256
+        assert mock_fc.get_descriptor.called
+
+    def test_the_source_listing_publishes_no_grid(self):
+        mock_fc = self._client()
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            with TestClient(create_app(token=None)) as tc:
+                (source,) = tc.get("/api/sources").json()
+
+        assert source["tensors"][0]["shape"] == [1, 1, 1, 512, 512]
+        assert source["tensors"][0]["chunk_shape"] == []
+
+
 class TestTileArrayIdAddressing:
     """array_id is the whole address (identity policy in descriptor.proto).
 

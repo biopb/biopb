@@ -327,3 +327,66 @@ def test_single_component_nd2_uses_the_backend_block(tmp_path, monkeypatch):
     grid = list(adapter.get_tensor_descriptor().chunk_shape)
     assert grid[3] == grid[4]  # still a coupled, square plane
     assert grid[1] == 1
+
+
+def _source_adapter(tmp_path, data, labels, chunks, scenes):
+    """A source-level adapter (no bound scene) over the same fakes."""
+    path = tmp_path / "source.nd2"
+    path.touch()
+    image = _FakeBioImage(data, labels, chunks)
+    image.scenes = scenes
+    return NikonAdapter(
+        image,
+        scene_index=None,
+        source_id="source",
+        source_url=str(path),
+        dim_labels=list(labels),
+    )
+
+
+def _ome_metadata(shape, n_scenes):
+    """Just enough OME for the metadata-only listing path."""
+    t, c, z, y, x = shape
+    pixels = SimpleNamespace(size_t=t, size_c=c, size_z=z, size_y=y, size_x=x)
+    return SimpleNamespace(
+        images=[SimpleNamespace(pixels=pixels) for _ in range(n_scenes)]
+    )
+
+
+@pytest.mark.parametrize("fast_path", [True, False])
+def test_source_listing_publishes_no_grid(tmp_path, monkeypatch, fast_path):
+    """A source lists structure; the grid is the bound scene's to answer.
+
+    Both listing paths -- the OME metadata fast path and the scene-switching
+    fallback -- enumerate every scene without binding one, so neither may name a
+    transfer grid (biopb/biopb#812). The fast path is the case that showed why:
+    it has no scene bound at all, and the grid it used to publish was the generic
+    per-channel one, which for an interleaved ND2 is not the grid any read has
+    issued since #806.
+    """
+    shape = (1, 4, 1, 4096, 4096)
+    data = _ZeroFrame(shape, np.dtype("uint16"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+    chunks = ((1,), (4,), (1,), (4096,), (4096,))
+    adapter = _source_adapter(tmp_path, data, "TCZYX", chunks, ["A1", "B2"])
+    if fast_path:
+        monkeypatch.setattr(
+            adapter, "_metadata_for_listing", lambda: _ome_metadata(shape, 2)
+        )
+    else:
+        monkeypatch.setattr(
+            adapter,
+            "_metadata_for_listing",
+            lambda: (_ for _ in ()).throw(NotImplementedError),
+        )
+
+    listed = adapter.list_tensor_descriptors()
+    assert [d.array_id for d in listed] == ["source/A1", "source/B2"]
+    for descriptor in listed:
+        assert list(descriptor.shape) == list(shape)
+        assert descriptor.dtype == data.dtype.str
+        assert list(descriptor.chunk_shape) == []
+
+    # ... and the scene that IS bound answers it, C whole (biopb/biopb#806).
+    served = _adapter(tmp_path, data, "TCZYX", chunks).get_transfer_chunk_size()
+    assert served[1] == 4

@@ -48,7 +48,10 @@ from biopb_tensor_server.adapters._handle_reaper import (
     IdleHandleReaper,
 )
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -382,8 +385,11 @@ class CziAdapter(TensorAdapter):
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+        # Structural entries only: every scene shares one layout here, so the
+        # grid would be right -- but the catalog is not where a grid is
+        # published, whoever could compute it (biopb/biopb#812).
         return [
-            self._descriptor_for(position)
+            catalog_entry(self._descriptor_for(position))
             for position in range(len(self._layout.scenes))
         ]
 

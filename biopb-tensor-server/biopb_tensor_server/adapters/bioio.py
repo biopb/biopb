@@ -331,8 +331,16 @@ class _BioioAdapterBase(TensorAdapter):
                 return result
             dask_data = self._dask_data
             return self._descriptor_from_dask(dask_data)
-        # Source-level: return first scene descriptor
-        return self.list_tensor_descriptors()[0]
+        # Source-level: the default (first) scene -- answered by the adapter
+        # bound to it, not read back off the catalog listing, which carries no
+        # transfer grid (biopb/biopb#812).
+        entries = self.list_tensor_descriptors()
+        if not entries:
+            raise TensorNotFound(
+                f"source {self.source_id!r} exposes no scenes",
+                reason="unknown_source",
+            )
+        return self.get_tensor_adapter(entries[0].array_id).get_tensor_descriptor()
 
     def _native_block(self, dask_data: Any) -> Optional[List[int]]:
         """The backend's own block, used to align the transfer grid.
@@ -346,7 +354,12 @@ class _BioioAdapterBase(TensorAdapter):
     def _transfer_chunk_shape(
         self, shape: List[int], dtype: str, dask_data: Any
     ) -> List[int]:
-        """This tensor's transfer grid -- the meaning of ``chunk_shape`` (#809)."""
+        """This tensor's transfer grid -- the meaning of ``chunk_shape`` (#809).
+
+        Only ever called on a scene-bound adapter, whose ``dask_data`` is that
+        scene's own array: the grid is a serving fact and the listing path does
+        not compute one (biopb/biopb#812).
+        """
         return default_transfer_chunk_shape(
             shape, dtype, self.dim_labels, native=self._native_block(dask_data)
         )
@@ -378,11 +391,13 @@ class _BioioAdapterBase(TensorAdapter):
             return self._bio_image.ome_metadata
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """List all tensors (scenes) available in this source via bioio.
+        """List every scene as a structural catalog entry.
 
         Uses OME metadata for shapes without scene switching when possible, else
-        falls back to per-scene switching. Chunk info is NOT populated -- clients
-        call get_flight_info for accurate per-scene chunk/metadata details.
+        falls back to per-scene switching. The transfer grid is NOT populated: it
+        is a serving fact of the scene ``get_tensor_adapter`` binds, and the
+        fast path here has bound no scene to answer for it (biopb/biopb#812).
+        Clients call ``GetFlightInfo`` for the grid.
 
         Returns:
             List of TensorDescriptor for all scenes in this source
@@ -455,15 +470,6 @@ class _BioioAdapterBase(TensorAdapter):
                                 array_id=f"{self.source_id}/{scene_ids[i]}",
                                 dim_labels=list(labels),
                                 shape=shape,
-                                # The grid is arithmetic on shape/dtype/labels
-                                # -- no scene switch, no Dask graph -- so the
-                                # catalog can carry it (biopb/biopb#809). The
-                                # per-scene block is unavailable on this
-                                # metadata-only path; the sized grid is the same
-                                # one an unseeded tensor gets.
-                                chunk_shape=default_transfer_chunk_shape(
-                                    shape, dtype, list(labels)
-                                ),
                                 dtype=dtype,
                             )
                         )
@@ -476,19 +482,19 @@ class _BioioAdapterBase(TensorAdapter):
             for scene_id in scene_ids:
                 self._bio_image.set_scene(scene_id)
                 dask_data = self._bio_image.dask_data
+                labels = (
+                    list(self.dim_labels)
+                    if self.dim_labels
+                    else list(self._bio_image.dims.order)
+                )
 
                 descriptors.append(
                     TensorDescriptor(
                         # Globally-unique array_id = source_id/field (identity
                         # policy); the scene id is the within-source field.
                         array_id=f"{self.source_id}/{scene_id}",
-                        dim_labels=self.dim_labels
-                        if self.dim_labels
-                        else list(self._bio_image.dims.order),
+                        dim_labels=labels,
                         shape=list(dask_data.shape),
-                        chunk_shape=self._transfer_chunk_shape(
-                            list(dask_data.shape), dask_data.dtype.str, dask_data
-                        ),
                         dtype=dask_data.dtype.str,
                     )
                 )

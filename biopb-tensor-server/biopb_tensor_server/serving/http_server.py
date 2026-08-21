@@ -2229,6 +2229,13 @@ def _source_desc_to_dict(desc: Any) -> Dict[str, Any]:
 
 
 def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
+    """JSON form of one tensor entry inside a source listing.
+
+    ``chunk_shape`` is carried for shape-compatibility with the TS
+    ``TensorDescriptor`` and is always ``[]`` here: a source listing is
+    structural, and the transfer grid is answered per resolved tensor by
+    ``/api/tile_info`` (which describes the tensor) -- biopb/biopb#812.
+    """
     return {
         "array_id": td.array_id,
         "dim_labels": list(td.dim_labels),

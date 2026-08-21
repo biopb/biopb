@@ -4,6 +4,12 @@ export interface TensorDescriptor {
   dim_labels: string[];
   /** Full array shape (per dimension). */
   shape: number[];
+  /**
+   * Transfer grid. EMPTY inside a `DataSourceDescriptor.tensors` entry: a source
+   * listing is structural, and the grid is answered per resolved tensor. Use
+   * `GET /api/tile_info` (`TileInfo.chunk_shape` / `tile_size`) when you need
+   * one -- an empty array is not a usable grid.
+   */
   chunk_shape: number[];
   /** NumPy-style dtype string, e.g. "uint8", "float32". */
   dtype: string;
@@ -16,6 +22,7 @@ export interface DataSourceDescriptor {
   source_type: string;
   /** Raw OME-NGFF JSON string, or null. */
   metadata_json: string | null;
+  /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
   tensors: TensorDescriptor[];
 }
 

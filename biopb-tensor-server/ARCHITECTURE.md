@@ -78,7 +78,7 @@ in three collaborators it composes:
 
 | Method | Description |
 |--------|-------------|
-| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: leaves `TensorDescriptor.pyramid` and `metadata_json` empty |
+| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: each `TensorDescriptor` is the **structural** entry (`array_id`/`dim_labels`/`shape`/`dtype`) and leaves `chunk_shape`, `pyramid` and `metadata_json` empty |
 | `GetFlightInfo` | Returns query ticket for real data (pixel or metadata). Pixel data request respects `TensorReadOptions` and optionally fills `TensorDescriptor.pyramid` or `metadata_json` when asked |
 | `DoGet` | Fetches data by ticket, either a single pixel chunk or metadata query results; returns a `RecordBatch` stream |
 
@@ -118,11 +118,32 @@ no tensors until it resolves.
 
 | Method | Returns |
 |--------|---------|
-| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors |
+| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors, as structural catalog entries |
 | `get_source_descriptor()` | `DataSourceDescriptor` proto |
-| `get_tensor_descriptor()` | `TensorDescriptor` proto |
+| `get_tensor_descriptor()` | `TensorDescriptor` proto — the full serving descriptor of one *bound* tensor |
 | `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
 | `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native pyramid levels |
+
+### Catalog entry vs serving descriptor (biopb/biopb#812)
+
+The two descriptor methods answer different questions, and the split runs all the
+way to the wire:
+
+- **Structural** — `array_id`, `dim_labels`, `shape`, `dtype`. Stable per tensor
+  and derivable from the container's index without opening one, so a *source*
+  answers for all its tensors at once. This is what `list_tensor_descriptors()`
+  returns, what the DuckDB `sources.tensors` STRUCT stores, and what
+  `ListFlights` publishes.
+- **Serving** — above all the transfer `chunk_shape`, plus `pyramid` and
+  `physical_scale`. These depend on the tensor actually being selected: the bound
+  scene's own chunk layout, its labels, its native pyramid level, the request's
+  scale. Only the adapter `get_tensor_adapter(array_id)` returns can answer them,
+  and `GetFlightInfo` — which binds first — is where they reach a client.
+
+`adapter_base.catalog_entry()` is the projection, and `get_source_descriptor()`
+applies it to every listed entry, so no adapter can publish a read plan into the
+catalog. A client that needs a grid describes the tensor; an empty `chunk_shape`
+is not a fallback to plan on.
 
 ### Canonical axis order (biopb/biopb#596)
 

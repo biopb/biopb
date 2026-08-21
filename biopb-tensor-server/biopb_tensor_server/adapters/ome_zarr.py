@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
+from biopb_tensor_server.core.adapter_base import catalog_entry
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -632,10 +632,13 @@ class OmeZarrAdapter(ZarrAdapter):
     def _enumerate_hcs_fields(self) -> List[TensorDescriptor]:
         """Enumerate all fields in HCS plate as flattened tensor list.
 
+        Structural catalog entries only (biopb/biopb#812): a field's transfer
+        grid is answered by the ``ZarrAdapter`` ``get_tensor_adapter`` binds to
+        that field's own level-0 array, not by the plate.
+
         Returns TensorDescriptors with:
         - array_id = '{well_name}/{field_index}'
         - shape from multiscales metadata
-        - chunk_shape from multiscales metadata
         - dtype from field array
 
         Returns:
@@ -655,7 +658,6 @@ class OmeZarrAdapter(ZarrAdapter):
                 field_key = f"{well_name}/{field_idx}"
 
                 shape = []
-                native_chunks = None
                 dtype = ""
                 dim_labels = self.dim_labels
 
@@ -663,14 +665,13 @@ class OmeZarrAdapter(ZarrAdapter):
                 multiscales = (field_zattrs or {}).get("multiscales", [])
                 res = _first_dataset_path(multiscales)
                 if res is not None:
-                    # Open the level-0 array for actual shape/chunks/dtype.
+                    # Open the level-0 array for actual shape/dtype.
                     try:
                         arr = zarr.open_array(
                             self._field_array_path(well_path, field_path, res),
                             mode="r",
                         )
                         shape = list(arr.shape)
-                        native_chunks = arr.chunks
                         dtype = arr.dtype.str
                     except Exception:
                         # Fallback: leave shape/dtype unfilled (metadata-only).
@@ -691,16 +692,6 @@ class OmeZarrAdapter(ZarrAdapter):
                         array_id=f"{self.source_id}/{field_key}",
                         dim_labels=dim_labels,
                         shape=shape,
-                        # The transfer grid, seeded by the store's blocks (#809);
-                        # empty when the level-0 array could not be opened, which
-                        # leaves the descriptor metadata-only.
-                        chunk_shape=(
-                            default_transfer_chunk_shape(
-                                shape, dtype, dim_labels, native=native_chunks
-                            )
-                            if shape and dtype
-                            else []
-                        ),
                         dtype=dtype,
                     )
                 )
@@ -834,7 +825,7 @@ class OmeZarrAdapter(ZarrAdapter):
             return self._enumerate_hcs_fields()
         else:
             # Single multiscale image
-            return [self.get_tensor_descriptor()]
+            return [catalog_entry(self.get_tensor_descriptor())]
 
     def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Get adapter for a specific tensor.

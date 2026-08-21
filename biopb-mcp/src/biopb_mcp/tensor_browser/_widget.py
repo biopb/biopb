@@ -2227,10 +2227,11 @@ class TensorBrowserWidget(QWidget):
             f"Dtype: {tensor_desc.dtype}",
             f"Dims: {dims_str}",
         ]
-        # These descriptors come from the catalog listing, which carries no chunk
-        # grid: the transfer grid is chosen per request and GetFlightInfo is
-        # authoritative for it (biopb/biopb#684). Omit the row rather than render
-        # an empty one; a descriptor that does carry a grid still shows it.
+        # These descriptors come from the catalog listing, which is structural
+        # and carries no chunk grid: the transfer grid belongs to the tensor
+        # GetFlightInfo binds, which is authoritative for it (biopb/biopb#684,
+        # biopb/biopb#812). Omit the row rather than render an empty one; a
+        # descriptor that does carry a grid still shows it.
         if tensor_desc.chunk_shape:
             lines.append(f"Chunks: {_format_shape(tensor_desc.chunk_shape)}")
         self._metadata_label.setText("\n".join(lines))

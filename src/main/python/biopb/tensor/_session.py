@@ -107,9 +107,9 @@ class ResolveCancelled(Exception):
 def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
     """Return the cacheable part of ``desc``: structure plus physical scale.
 
-    Keeps what the cache is read for -- shape, dtype, dim_labels, chunk_shape,
-    plus the ~200-byte physical scale ``GetFlightInfo`` fills unconditionally.
-    Drops the two response-masked parts (biopb/biopb#795):
+    Keeps what the cache is read for -- shape, dtype, dim_labels -- plus the
+    ~200-byte physical scale ``GetFlightInfo`` fills unconditionally. Drops the
+    parts that arrive only on some routes (biopb/biopb#795, biopb/biopb#812):
 
     - ``metadata_json``, the full OME tree, runs to megabytes on a
       per-plane-annotated file, and nothing reads it back out of here -- the one
@@ -119,6 +119,12 @@ def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
       rich when a caller happened to ask, poor when the entry came from
       ``list_flights``, which never fills it. A reader could not tell a
       genuinely pyramid-less tensor from one cached before anyone asked.
+    - ``chunk_shape`` is now exactly the same shape of problem: the server
+      answers the transfer grid only on ``GetFlightInfo``, for the tensor it
+      bound, and leaves it empty on every ``list_flights`` entry. Caching it
+      would let an entry seeded from a listing shadow the real grid, and an
+      empty grid is not a fallback anyone may plan on -- so the cache holds none
+      and a caller that needs one describes the tensor.
 
     So every entry carries exactly what ``list_flights`` provides, whatever
     route it arrived by. Callers lose nothing: the masks are honoured on the
@@ -128,6 +134,7 @@ def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
     lean.CopyFrom(desc)
     lean.ClearField("metadata_json")
     lean.ClearField("pyramid")
+    lean.ClearField("chunk_shape")
     return lean
 
 
