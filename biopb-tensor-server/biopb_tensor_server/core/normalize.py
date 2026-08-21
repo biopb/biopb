@@ -396,6 +396,12 @@ class NormalizingAdapter(TensorAdapter):
     def close(self) -> None:
         self._inner.close()
 
+    def release_registration_cache(self) -> None:
+        # Declared on SourceAdapter, so it resolves on the wrapper and never
+        # reaches __getattr__ -- delegate explicitly or the inner adapter would
+        # never hear about it.
+        self._inner.release_registration_cache()
+
     # --- tensor role ----------------------------------------------------------
 
     def get_tensor_descriptor(self) -> TensorDescriptor:

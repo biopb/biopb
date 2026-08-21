@@ -187,6 +187,17 @@ class UnresolvedSourceAdapter(SourceAdapter):
         if resolved is not None:
             resolved.close()
 
+    def release_registration_cache(self) -> None:
+        """Forward the post-catalog release to the resolved adapter, if any.
+
+        An unresolved source has no adapter and nothing to release; the resolve
+        that creates one re-syncs the catalog (``_on_source_resolved``), so the
+        forwarded call lands then.
+        """
+        resolved = self._resolved
+        if resolved is not None:
+            resolved.release_registration_cache()
+
     # --- resolution (the consented hook) ------------------------------------
 
     def resolve(self) -> DataSourceDescriptor:
