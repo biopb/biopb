@@ -19,6 +19,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label, unit_to_um
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.tiff import _tiff_pixel_size_um
+from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -206,16 +207,20 @@ class _TifffileAdapterBase(OmeTiffAdapter):
                 axis: int(series.shape[index]) for index, axis in enumerate(mapped)
             }
             shape = [by_axis.get(axis, 1) for axis in labels]
-        chunk_shape = [
+        # One whole page (full Y/X and the RGB samples axis) is the read path's
+        # native unit; it seeds the transfer grid rather than being it, so a
+        # small plane ships several planes per chunk (biopb/biopb#809).
+        page = [
             size if str(axis).upper() in {"Y", "X", "S"} else 1
             for axis, size in zip(labels, shape, strict=True)
         ]
+        dtype = np.dtype(series.dtype).str
         return TensorDescriptor(
             array_id=f"{self.source_id}/Image:{series_index}",
             dim_labels=labels,
             shape=shape,
-            chunk_shape=chunk_shape,
-            dtype=np.dtype(series.dtype).str,
+            chunk_shape=default_transfer_chunk_shape(shape, dtype, labels, native=page),
+            dtype=dtype,
         )
 
     def _tifffile_descriptors(self) -> Optional[List[TensorDescriptor]]:

@@ -25,6 +25,7 @@ Chunk ID format:
 """
 
 import logging
+import math
 import os
 import threading
 from itertools import product
@@ -34,8 +35,14 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    compute_transfer_chunk_size,
+    content_version_from_path,
+    default_transfer_chunk_shape,
+    estimate_chunk_bytes,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -327,18 +334,33 @@ class _BioioAdapterBase(TensorAdapter):
         # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
 
-    def _read_chunk_shape(self, dask_data: Any) -> List[int]:
-        """Return the backend's native read-granularity hint."""
+    def _native_block(self, dask_data: Any) -> Optional[List[int]]:
+        """The backend's own block, used to align the transfer grid.
+
+        Only an alignment seed: no read is issued at this granularity
+        (biopb/biopb#809). An adapter whose bytes sit on disk in a shape BioIO's
+        block does not describe overrides :meth:`_transfer_chunk_shape` instead.
+        """
         return [max(c) for c in dask_data.chunks]
+
+    def _transfer_chunk_shape(
+        self, shape: List[int], dtype: str, dask_data: Any
+    ) -> List[int]:
+        """This tensor's transfer grid -- the meaning of ``chunk_shape`` (#809)."""
+        return default_transfer_chunk_shape(
+            shape, dtype, self.dim_labels, native=self._native_block(dask_data)
+        )
 
     def _descriptor_from_dask(self, dask_data: Any) -> TensorDescriptor:
         """Snapshot the structural facts exposed by a scene Dask array."""
+        shape = list(dask_data.shape)
+        dtype = dask_data.dtype.str
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels if self.dim_labels else [],
-            shape=list(dask_data.shape),
-            chunk_shape=self._read_chunk_shape(dask_data),
-            dtype=dask_data.dtype.str,
+            shape=shape,
+            chunk_shape=self._transfer_chunk_shape(shape, dtype, dask_data),
+            dtype=dtype,
         )
 
     def _release_bioio_dask_cache(self) -> None:
@@ -433,7 +455,15 @@ class _BioioAdapterBase(TensorAdapter):
                                 array_id=f"{self.source_id}/{scene_ids[i]}",
                                 dim_labels=list(labels),
                                 shape=shape,
-                                chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                                # The grid is arithmetic on shape/dtype/labels
+                                # -- no scene switch, no Dask graph -- so the
+                                # catalog can carry it (biopb/biopb#809). The
+                                # per-scene block is unavailable on this
+                                # metadata-only path; the sized grid is the same
+                                # one an unseeded tensor gets.
+                                chunk_shape=default_transfer_chunk_shape(
+                                    shape, dtype, list(labels)
+                                ),
                                 dtype=dtype,
                             )
                         )
@@ -456,7 +486,9 @@ class _BioioAdapterBase(TensorAdapter):
                         if self.dim_labels
                         else list(self._bio_image.dims.order),
                         shape=list(dask_data.shape),
-                        chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                        chunk_shape=self._transfer_chunk_shape(
+                            list(dask_data.shape), dask_data.dtype.str, dask_data
+                        ),
                         dtype=dask_data.dtype.str,
                     )
                 )
@@ -734,23 +766,80 @@ class NikonAdapter(_BioioAdapterBase):
             units.append(axis_unit if numeric > 0 else "")
         return (scale, units) if any(scale) else None
 
-    def _read_chunk_shape(self, dask_data: Any) -> List[int]:
+    def _native_block(self, dask_data: Any) -> Optional[List[int]]:
         """Describe one ND2 sequence frame, preserving its pixel layout.
 
         ``nd2.read_frame`` indexes the acquisition loops (T/Z and the scene's
         position) and returns the complete C/Y/X[/S] frame. Some BioIO/Dask
         arrays report several sequence frames as one chunk, which is not the
         granularity available from the reader below. Keep any smaller pixel
-        tiling BioIO reports, but never combine T or Z frames in this private
-        planning hint.
+        tiling BioIO reports, but never combine T or Z frames in this seed.
         """
-        chunk_shape = super()._read_chunk_shape(dask_data)
-        if len(chunk_shape) != len(self.dim_labels or []):
-            return chunk_shape
+        block = super()._native_block(dask_data)
+        if block is None or len(block) != len(self.dim_labels or []):
+            return block
         for axis, label in enumerate(self.dim_labels or []):
             if label.upper() in {"T", "Z"}:
-                chunk_shape[axis] = 1
-        return chunk_shape
+                block[axis] = 1
+        return block
+
+    def _transfer_chunk_shape(
+        self, shape: List[int], dtype: str, dask_data: Any
+    ) -> List[int]:
+        """Never split an ND2's component axes -- they are inside the pixel.
+
+        ND2 has no planar variant. Every frame is materialised in one layout,
+        ``(Y, X, channel, RGB component)`` (``modern_reader._actual_frame_shape``),
+        so both C and S sit *below* X: one channel's bytes are ``itemsize`` of
+        every ``componentCount * itemsize``. A per-channel chunk therefore faults
+        in every page the other components occupy and discards what it did not
+        ask for, then the next channel repeats the read. Measured on a 4-channel
+        14234-wide uint16 file, full-width band, pages warm: all four channels in
+        one read cost 96.4 ms for 233.2 MB (0.41 ms/MB) against 43.9 ms for
+        58.3 MB (0.75 ms/MB) for one -- 4x the pixels for 2.2x the time
+        (biopb/biopb#806).
+
+        There is nothing to detect. An earlier version probed ``widthBytes ==
+        widthPx * componentCount * itemsize`` and treated a mismatch as planar,
+        but that identity is nd2's test for **row padding**, not for layout: when
+        it fails the reader keeps the same interleaved shape and uses
+        ``widthBytes`` as the row stride. So the probe read a padded row -- an
+        odd-width RGB camera -- as planar and handed C back to the generic
+        splitter, which is exactly the bug #806 is about.
+
+        The declared *unit* is one pixel's worth of every component. C and S are
+        inside it and so cannot be split, and nothing downstream re-shapes a
+        declared grid (biopb/biopb#809) -- which is what makes this stick, where
+        the old fixed divide/coalesce priority took C apart again. The plane is
+        left to the shared sizing, which grows Y and X coupled: a full-width band
+        reads better sequentially, but turns a 512x512 tile into one fetch per
+        band it crosses, and between C-whole aspect ratios the cold cost is
+        within scene-to-scene variance (a paired A/B of 1024x1024 against
+        512x2048 on untouched scenes ranged 0.73x to 4.2x in *both* directions).
+        Keeping the components together is where the measurable win is.
+        """
+        labels = [str(label).upper() for label in (self.dim_labels or [])]
+        if len(labels) != len(shape):
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        unit = [
+            int(size) if label in {"C", "S"} else 1
+            for label, size in zip(labels, shape, strict=True)
+        ]
+        # componentCount == 1: C and S are absent or singleton, so there is no
+        # interleaved run to protect and the backend's own block is the better
+        # seed. (nd2 reports C = componentCount for a mono file and C x S =
+        # componentCount for an RGB one, so this product IS componentCount.)
+        if math.prod(unit) <= 1:
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        # One pixel of every component already at or above the target leaves
+        # nothing to grow; declare it and let the Arrow clamp handle the rest.
+        if estimate_chunk_bytes(tuple(unit), dtype) >= (
+            chunk_policy.PREFERRED_ARROW_BATCH_BYTES
+        ):
+            return unit
+        return list(
+            compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, labels)
+        )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read requested pixels directly from ND2 sequence frames.

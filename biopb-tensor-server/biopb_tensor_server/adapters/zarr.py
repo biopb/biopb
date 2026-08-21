@@ -12,7 +12,10 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -262,7 +265,17 @@ class ZarrAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.zarr_array.shape),
-            chunk_shape=list(self.zarr_array.chunks),
+            # The store's chunk grid is an alignment seed, not the transfer
+            # unit: zarr blocks are routinely far below the transfer target, and
+            # shipping one per chunk is what biopb/biopb#684 measured as too many
+            # endpoints. Reads are served from a real backend at any bounds, so
+            # the grid is free to be a whole multiple of the store's.
+            chunk_shape=default_transfer_chunk_shape(
+                self.zarr_array.shape,
+                self.zarr_array.dtype.str,
+                self.dim_labels,
+                native=self.zarr_array.chunks,
+            ),
             dtype=self.zarr_array.dtype.str,
         )
 

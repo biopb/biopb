@@ -53,7 +53,9 @@ class TestZarrAdapter:
 
             assert desc.array_id == "test-array"
             assert list(desc.shape) == [100, 200]
-            assert list(desc.chunk_shape) == [50, 100]
+            # chunk_shape is the transfer grid, not the store's blocks: a 40 KB
+            # array fits one preferred-size chunk, so it is one (biopb/biopb#809).
+            assert list(desc.chunk_shape) == [100, 200]
             assert desc.dtype == "<u2"
             assert list(desc.dim_labels) == ["y", "x"]
 
@@ -258,9 +260,14 @@ class TestGetScaledReadPlan:
     """Tests for TensorAdapter.get_scaled_read_plan default implementation."""
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_default_uses_virtual_scaling(self):
+    def test_default_uses_virtual_scaling(self, transfer_target):
         """Test that default get_scaled_read_plan uses virtual scaling."""
         import zarr
+
+        # Four transfer chunks over a 100x100 uint8 array once the scale grows
+        # each read to transfer*scale; at the default target the whole thing is
+        # one chunk (biopb/biopb#809) and the grid logic never shows itself.
+        transfer_target(625)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.zarr")
@@ -284,16 +291,17 @@ class TestGetScaledReadPlan:
             )
             plan = adapter.get_read_plan(request_desc)
 
-            # The four native blocks are retained to preserve endpoint-level
-            # parallelism before the existing scale logic is applied.
+            # Four transfer chunks, each scaled before delivery.
             assert len(plan.chunk_endpoints) == 4
             assert list(plan.descriptor.shape) == [50, 50]
             assert list(plan.descriptor.chunk_shape) == [25, 25]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_virtual_scaling_with_slice(self):
+    def test_virtual_scaling_with_slice(self, transfer_target):
         """Test virtual scaling with slice hint."""
         import zarr
+
+        transfer_target(625)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.zarr")
@@ -317,17 +325,16 @@ class TestGetScaledReadPlan:
             )
             plan = adapter.get_read_plan(request_desc)
 
-            # A 100x100 tensor cannot grow the read block without dropping below
-            # the endpoint floor, so the grid is the transfer grid, scaled.
+            # The slice snaps out to the transfer grid, then scales.
             assert list(plan.descriptor.shape) == [25, 25]
 
 
 class TestEmptyChunkShapeFallback:
-    """get_chunk_size() must tolerate an empty/partial chunk_shape.
+    """get_transfer_chunk_size() must tolerate an empty/partial chunk_shape.
 
-    A descriptor may legitimately omit chunk_shape (documented as "can be empty
-    []"; the lean ListFlights form drops it, and the bulk-seeded remote proxy
-    mirrors that lean catalog -- biopb/biopb#266). Before the fix, get_chunk_size
+    A descriptor may still omit chunk_shape -- an unresolved source has no shape
+    to size a grid from, and the bulk-seeded remote proxy mirrors whatever the
+    upstream catalog gave it (biopb/biopb#266). Before the fix the accessor
     returned a too-short tuple and _get_read_plan indexed it out of range against
     the full-rank shape, so every read of such a source raised IndexError.
     """
@@ -373,7 +380,7 @@ class TestEmptyChunkShapeFallback:
 
         from biopb_tensor_server.core.chunk import compute_safe_chunk_size
 
-        chunk = adapter.get_chunk_size()
+        chunk = adapter.get_transfer_chunk_size()
         # A full-rank grid (no longer a 0-length tuple).
         assert len(chunk) == len(shape)
         # Matches the server's default transfer-grid policy exactly.
@@ -396,7 +403,8 @@ class TestEmptyChunkShapeFallback:
         adapter = self._StubTensorAdapter(
             [100, 100], "uint8", ["y", "x"], chunk_shape=[50, 50]
         )
-        assert adapter.get_chunk_size() == (50, 50)
+        # The adapter's declared grid, served verbatim -- the server clamps to
+        # the Arrow ceiling and re-sizes nothing (biopb/biopb#809).
         assert adapter.get_transfer_chunk_size() == (50, 50)
 
     def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
@@ -409,14 +417,61 @@ class TestEmptyChunkShapeFallback:
             [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
         )
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_chunk_size()
+            adapter.get_transfer_chunk_size()
 
     def test_unresolved_empty_shape_raises_source_unresolved(self):
         from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_chunk_size()
+            adapter.get_transfer_chunk_size()
+
+
+class TestDeclaredGridIsServedVerbatim:
+    """The adapter owns chunk_shape; the server only clamps (biopb/biopb#809).
+
+    Sizing used to happen here, on the way out: the adapter advertised its file
+    geometry and the server re-shaped it with a fixed axis priority. That undid
+    any adapter that knew better than the labels how its bytes sit on disk
+    (biopb/biopb#806, biopb/biopb#807), and it re-planned the cache-backed
+    sources whose grid is binding rather than advisory. So the only thing left
+    is the wire bound.
+    """
+
+    _Stub = TestEmptyChunkShapeFallback._StubTensorAdapter
+
+    def test_grid_far_below_the_transfer_target_is_untouched(self):
+        # 8 KB against an 8 MB preferred size, and 16 endpoints' worth of room
+        # to coalesce into. Both the old divide/coalesce pass and the endpoint
+        # floor would have moved this; neither runs now.
+        adapter = self._Stub(
+            [1, 1, 64, 1024, 1024], "<u2", ["t", "c", "z", "y", "x"], [1, 1, 1, 64, 64]
+        )
+        assert adapter.get_transfer_chunk_size() == (1, 1, 1, 64, 64)
+
+    def test_grid_declaring_one_chunk_is_honoured(self):
+        adapter = self._Stub([64, 64], "uint8", ["y", "x"], [64, 64])
+        assert adapter.get_transfer_chunk_size() == (64, 64)
+
+    def test_grid_above_the_arrow_ceiling_is_resplit(self):
+        from biopb_tensor_server.core.chunk import (
+            MAX_ARROW_BATCH_BYTES,
+            estimate_chunk_bytes,
+        )
+
+        shape = [1, 1, 512, 2048, 2048]
+        adapter = self._Stub(shape, "<u2", ["t", "c", "z", "y", "x"], shape)
+        grid = adapter.get_transfer_chunk_size()
+
+        assert estimate_chunk_bytes(grid, "<u2") <= MAX_ARROW_BATCH_BYTES
+        # Clamped, not re-optimized: it is not pulled down to the 8 MB target.
+        assert estimate_chunk_bytes(grid, "<u2") > 8 << 20
+        # Y/X are kept whole -- the ceiling is met by splitting a navigable axis.
+        assert grid[-2:] == (2048, 2048)
+
+    def test_grid_is_clipped_to_the_shape(self):
+        adapter = self._Stub([4, 8], "uint8", ["y", "x"], [64, 64])
+        assert adapter.get_transfer_chunk_size() == (4, 8)
 
 
 class TestTransferChunkSize:
@@ -467,7 +522,13 @@ class TestTransferChunkSize:
             (256, 256), (4096, 4096), "<u2", ["y", "x"]
         ) == (2048, 2048)
 
-    def test_coalescing_retains_minimum_endpoint_parallelism(self):
+    def test_a_tensor_that_fits_one_chunk_becomes_one_chunk(self):
+        """No endpoint floor: chunk size is the only knob (biopb/biopb#809).
+
+        A floor split a 512x512 snapshot into four chunks to manufacture
+        parallelism, paying round trips to parallelize work that was never the
+        bottleneck. An operator who wants more chunks lowers the preferred size.
+        """
         from biopb_tensor_server.core.chunk import compute_transfer_chunk_size
 
         assert compute_transfer_chunk_size(
@@ -476,6 +537,17 @@ class TestTransferChunkSize:
             "uint8",
             ["y", "x"],
             preferred_bytes=16 << 20,
+        ) == (1024, 1024)
+        assert compute_transfer_chunk_size(
+            (256, 256), (512, 512), "uint8", ["y", "x"]
+        ) == (512, 512)
+
+    def test_preferred_size_is_the_knob_that_splits(self):
+        """Lowering the target is how a caller gets more endpoints."""
+        from biopb_tensor_server.core.chunk import compute_transfer_chunk_size
+
+        assert compute_transfer_chunk_size(
+            (256, 256), (1024, 1024), "uint8", ["y", "x"], preferred_bytes=256 << 10
         ) == (512, 512)
 
     def test_coalesces_channels_before_time(self):
@@ -712,34 +784,37 @@ class TestTransferChunkSize:
                 expected = ceil_div(stop, scale[axis])
                 index += 1
 
-    def test_scaled_read_block_respects_the_endpoint_floor(self):
-        """Growing the read block must not collapse the read onto one endpoint."""
-        from math import ceil
+    def test_scaled_read_block_is_bounded_by_transfer_times_scale(self):
+        """``transfer * scale`` is what stops unbounded growth, not a floor.
 
+        There is no minimum endpoint count (biopb/biopb#809), so a memory
+        ceiling far above anything real must still leave the extent bounded --
+        by the rule that keeps the *delivered* chunk at the transfer target.
+        """
         from biopb_tensor_server.core.chunk import (
-            MIN_TRANSFER_ENDPOINTS,
             compute_transfer_chunk_size,
             scaled_virtual_chunk_size,
         )
 
         shape = (1, 1, 1, 4096, 4096)
         labels = ["t", "c", "z", "y", "x"]
+        scale = (1, 1, 1, 8, 8)
         transfer = compute_transfer_chunk_size(
             (1, 1, 1, 512, 512), shape, "uint8", labels
         )
         virtual = scaled_virtual_chunk_size(
             transfer,
             shape,
-            (1, 1, 1, 8, 8),
+            scale,
             "uint8",
             labels,
             "uint8",
             max_read_block_bytes=8 * 1024 * 1024 * 1024,
         )
-        count = 1
-        for extent, size in zip(shape, virtual, strict=True):
-            count *= ceil(extent / size)
-        assert count >= MIN_TRANSFER_ENDPOINTS
+        assert all(
+            extent <= min(t * sc, dim)
+            for extent, t, sc, dim in zip(virtual, transfer, scale, shape, strict=True)
+        )
 
 
 class TestGetPhysicalScale:
@@ -1557,7 +1632,7 @@ class TestOmeZarrPrecompute:
             assert adapter._find_level_for_scale((3, 3)) is None  # No match
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_scaled_read_plan_precompute(self):
+    def test_get_scaled_read_plan_precompute(self, transfer_target):
         """Test get_scaled_read_plan with precompute method."""
         import json
 
@@ -1604,6 +1679,10 @@ class TestOmeZarrPrecompute:
             }
             with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
                 json.dump(zattrs, f)
+
+            # Keep each level on its own store grid so the routing shows up as a
+            # grid, not a single chunk (biopb/biopb#809).
+            transfer_target(625)
 
             root = zarr.open_group(zarr_path, mode="r")
             base_arr = root["0"]
@@ -1680,7 +1759,7 @@ class TestOmeZarrPrecompute:
                 adapter.get_read_plan(request_desc)
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_precompute_falls_back_to_virtual_for_other_methods(self):
+    def test_precompute_falls_back_to_virtual_for_other_methods(self, transfer_target):
         """Test that non-precompute methods use virtual scaling."""
         import json
 
@@ -1717,6 +1796,9 @@ class TestOmeZarrPrecompute:
             }
             with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
                 json.dump(zattrs, f)
+
+            # Keep each level on its own store grid (biopb/biopb#809).
+            transfer_target(625)
 
             root = zarr.open_group(zarr_path, mode="r")
             base_arr = root["0"]

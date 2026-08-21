@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -654,7 +655,7 @@ class OmeZarrAdapter(ZarrAdapter):
                 field_key = f"{well_name}/{field_idx}"
 
                 shape = []
-                chunk_shape = []
+                native_chunks = None
                 dtype = ""
                 dim_labels = self.dim_labels
 
@@ -669,7 +670,7 @@ class OmeZarrAdapter(ZarrAdapter):
                             mode="r",
                         )
                         shape = list(arr.shape)
-                        chunk_shape = list(arr.chunks)
+                        native_chunks = arr.chunks
                         dtype = arr.dtype.str
                     except Exception:
                         # Fallback: leave shape/dtype unfilled (metadata-only).
@@ -690,7 +691,16 @@ class OmeZarrAdapter(ZarrAdapter):
                         array_id=f"{self.source_id}/{field_key}",
                         dim_labels=dim_labels,
                         shape=shape,
-                        chunk_shape=chunk_shape,
+                        # The transfer grid, seeded by the store's blocks (#809);
+                        # empty when the level-0 array could not be opened, which
+                        # leaves the descriptor metadata-only.
+                        chunk_shape=(
+                            default_transfer_chunk_shape(
+                                shape, dtype, dim_labels, native=native_chunks
+                            )
+                            if shape and dtype
+                            else []
+                        ),
                         dtype=dtype,
                     )
                 )

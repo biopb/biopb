@@ -11,7 +11,10 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -235,7 +238,10 @@ class NiftiAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self._shape),
-            chunk_shape=list(self._shape),  # Single chunk
+            # No on-disk blocking to align to: size from the shape (#809).
+            chunk_shape=default_transfer_chunk_shape(
+                self._shape, self._dtype, self.dim_labels
+            ),
             dtype=self._dtype,
         )
 

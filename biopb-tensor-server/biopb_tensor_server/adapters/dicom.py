@@ -13,7 +13,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import scale_by_label
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -447,7 +450,11 @@ class DicomAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self._shape),
-            chunk_shape=list(self._shape),  # Single chunk
+            # One frame is the natural unit but is often far below the transfer
+            # target, so seed the grid with the shape and let it size (#809).
+            chunk_shape=default_transfer_chunk_shape(
+                self._shape, self._dtype, self.dim_labels
+            ),
             dtype=self._dtype,
         )
 
@@ -724,7 +731,14 @@ class DicomSeriesAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self._shape),
-            chunk_shape=[1, self._rows, self._cols],  # One slice per chunk
+            # One slice is the read unit of a DICOM series; it seeds a grid that
+            # spans several slices when a slice is small (#809).
+            chunk_shape=default_transfer_chunk_shape(
+                self._shape,
+                self._dtype,
+                self.dim_labels,
+                native=[1, self._rows, self._cols],
+            ),
             dtype=self._dtype,
         )
 

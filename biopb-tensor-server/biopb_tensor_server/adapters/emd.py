@@ -32,7 +32,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -168,8 +171,14 @@ class EmdAdapter(TensorAdapter):
                     dim_labels=self._labels_for(sig),
                     shape=list(data.shape),
                     # rsciio forwards the native HDF5 chunks; chunksize is the
-                    # per-dim max (single chunk per grid cell here).
-                    chunk_shape=list(data.chunksize),
+                    # per-dim max (single chunk per grid cell here). It seeds
+                    # the transfer grid, which is what chunk_shape means (#809).
+                    chunk_shape=default_transfer_chunk_shape(
+                        data.shape,
+                        np.dtype(data.dtype).str,
+                        self._labels_for(sig),
+                        native=data.chunksize,
+                    ),
                     dtype=np.dtype(data.dtype).str,
                 )
             )
@@ -182,7 +191,12 @@ class EmdAdapter(TensorAdapter):
                 array_id=self.array_id,
                 dim_labels=self.dim_labels if self.dim_labels else [],
                 shape=list(data.shape),
-                chunk_shape=list(data.chunksize),
+                chunk_shape=default_transfer_chunk_shape(
+                    data.shape,
+                    np.dtype(data.dtype).str,
+                    self.dim_labels,
+                    native=data.chunksize,
+                ),
                 dtype=np.dtype(data.dtype).str,
             )
         # Source-level: first signal's descriptor.

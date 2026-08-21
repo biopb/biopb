@@ -127,7 +127,17 @@ class CachedSourceAdapter(TensorAdapter):
         self._source_type = "cache"
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return TensorDescriptor for this cache source."""
+        """Return TensorDescriptor for this cache source.
+
+        ``chunk_shape`` is the uploader's write grid, verbatim and unnegotiable.
+        This source has no backend -- ``get_data`` raises and
+        ``resolve_chunk_data`` serves only the chunk_ids that were actually
+        written -- so a read planned on any other grid asks for bounds that were
+        never stored and fails outright. That is exactly what happened while the
+        server re-sized every adapter's grid: a (1,1,1,1024,1024) upload was
+        planned at (1,1,4,1024,1024) and none of the 64 planned chunk_ids
+        existed (biopb/biopb#809). Nothing may re-shape this value.
+        """
         return TensorDescriptor(
             array_id=self.source_id,
             dim_labels=self._dim_labels,

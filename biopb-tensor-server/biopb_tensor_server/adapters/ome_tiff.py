@@ -39,7 +39,10 @@ from biopb_tensor_server.adapters._handle_reaper import (
     IdleHandleReaper,
 )
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -710,17 +713,13 @@ class OmeTiffAdapter(TensorAdapter):
                         # A non-OME axis (Q/I): decline the whole source.
                         return None
                     dim_labels, shape = mapped
-                    # Page-aligned transfer grid: one whole plane per chunk --
+                    # One whole page seeds the grid --
                     # series.aszarr(chunkmode="page").chunks in canonical order
-                    # (full Y/X and RGB samples S, 1 elsewhere). This is the read
-                    # path's native unit, so a plane read transfers one plane rather
-                    # than the 64 MiB-packed default the server derives from an empty
-                    # chunk_shape. A >cap single plane is still re-split at read-plan
-                    # time (base.get_chunk_size -> _get_read_plan).
-                    chunk_shape = [
-                        n if d in ("Y", "X", "S") else 1
-                        for d, n in zip(dim_labels, shape, strict=True)
-                    ]
+                    # (full Y/X and RGB samples S, 1 elsewhere). It is the read
+                    # path's native unit, so the transfer grid stays a whole
+                    # multiple of it rather than straddling pages; a page above
+                    # the Arrow ceiling is still re-split by
+                    # get_transfer_chunk_size (biopb/biopb#809).
                     descriptors.append(
                         TensorDescriptor(
                             # Identity policy: array_id = source_id/field; the
@@ -728,7 +727,15 @@ class OmeTiffAdapter(TensorAdapter):
                             array_id=f"{self.source_id}/{scene_ids[i]}",
                             dim_labels=dim_labels,
                             shape=shape,
-                            chunk_shape=chunk_shape,
+                            chunk_shape=default_transfer_chunk_shape(
+                                shape,
+                                s.dtype.str,
+                                dim_labels,
+                                native=[
+                                    n if d in ("Y", "X", "S") else 1
+                                    for d, n in zip(dim_labels, shape, strict=True)
+                                ],
+                            ),
                             dtype=s.dtype.str,
                         )
                     )

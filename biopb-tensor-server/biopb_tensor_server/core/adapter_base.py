@@ -41,7 +41,6 @@ from biopb_tensor_server.core.chunk import (
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
-    compute_transfer_chunk_size,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
@@ -382,11 +381,15 @@ class SourceAdapter(ABC):
               for multi-tensor: source_id/tensor_name)
             - shape: Tensor shape as list of ints
 
-            Optional fields (populated by get_tensor_descriptor() for actual reads):
-            - chunk_shape: Chunk shape. Can be empty [] if not readily available
-              without expensive computation (e.g., multi-scene files).
-              Clients should call get_tensor_adapter() + get_tensor_descriptor()
-              for accurate chunk info before reading.
+            - chunk_shape: The transfer grid this adapter chose (biopb/biopb#809).
+              Sizing it is arithmetic on shape/dtype/dim_labels -- see
+              ``default_transfer_chunk_shape`` -- so it costs no I/O and belongs
+              here, where it reaches the catalog and lean ListFlights. May still
+              be empty on a descriptor with no shape to size from (an unresolved
+              cloud source); the read path then falls back to the whole tensor
+              split under the Arrow ceiling.
+
+            Optional fields:
             - dtype: Data type string. Can be omitted if expensive to compute.
               Must be populated by get_tensor_descriptor() for actual reads.
 
@@ -599,7 +602,10 @@ class TensorAdapter(SourceAdapter):
             - array_id: Unique tensor identifier (for single-tensor: source_id;
               for multi-tensor: source_id/tensor_name)
             - shape: Tensor shape as list of ints
-            - chunk_shape: Chunk shape as list of ints
+            - chunk_shape: The transfer grid, as list of ints. The adapter owns
+              this choice; the server only clamps it to the Arrow ceiling
+              (biopb/biopb#809). An adapter with no layout knowledge to apply
+              calls ``default_transfer_chunk_shape``.
             - dtype: Data type string (numpy dtype.str format)
         Recommended fields to populate:
             - dim_labels: Dimension labels
@@ -608,57 +614,46 @@ class TensorAdapter(SourceAdapter):
             for field requirements).
         """
 
-    def get_chunk_size(self) -> Tuple[int, ...]:
-        """Return the adapter's private read-granularity hint.
+    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
+        """Return this tensor's transfer grid, clamped to the Arrow ceiling.
 
-        A descriptor may legitimately carry an empty ``chunk_shape`` -- it is
-        documented as "can be empty [] if not readily available"
-        (:meth:`get_tensor_descriptor`), and the lean ListFlights form omits it,
-        so a descriptor sourced from the catalog (e.g. the bulk-seeded remote
-        proxy, biopb/biopb#266) may have none. Rather than hand the read planner
-        a too-short tuple -- which indexes out of range against the full-rank
-        shape (biopb/biopb#292, IndexError in ``_get_read_plan``) -- derive the
-        fallback read unit from the full shape, split under
-        ``MAX_ARROW_BATCH_BYTES``. The public descriptor does not expose this
-        value directly: :meth:`get_transfer_chunk_size` converts it to the
-        server-selected Flight grid.
+        ``chunk_shape`` *is* the transfer grid and the adapter chose it
+        (biopb/biopb#809). The server sizes nothing on the adapter's behalf here
+        -- an adapter that knows its physical layout would only have its answer
+        undone, which is what made biopb/biopb#806 unfixable while the planner
+        ran on this seam -- and re-planning would also break the cache-backed
+        sources, which serve *only* the chunk_ids that were written, so a grid
+        that is not theirs asks for bounds that do not exist.
 
-        An *unresolved* descriptor (empty shape/dtype -- e.g. a not-yet-hydrated
+        The one thing left is the wire bound: ``MAX_ARROW_BATCH_BYTES`` is a
+        property of Arrow IPC, not of any format, so a declared grid above it is
+        re-split here rather than failing mid-transfer.
+
+        A descriptor may still carry an empty ``chunk_shape`` -- documented as
+        "can be empty [] if not readily available" (:meth:`get_tensor_descriptor`)
+        and the shape a bulk-seeded remote proxy arrives with (biopb/biopb#266).
+        Handing the read planner a too-short tuple indexes out of range against
+        the full-rank shape (biopb/biopb#292), so fall back to the whole tensor
+        split under the ceiling.
+
+        An *unresolved* descriptor (empty shape/dtype -- a not-yet-hydrated
         cloud/remote source) is rejected up front: the fallback would otherwise
         reach ``np.dtype("")`` inside ``compute_safe_chunk_size`` and raise a raw,
         illegible ``TypeError``. ``require_resolved`` converts it to a clean
         ``SourceUnresolvedError`` at this read-planning boundary, exactly as
         ``get_arrow_schema`` and ``_get_read_plan`` already do.
-
-        Returns:
-            Tuple of chunk dimensions (e.g., (64, 64, 64) for 3D chunks)
         """
         desc = self.get_tensor_descriptor()
         require_resolved(desc)
-        return self._chunk_size_from_descriptor(desc)
-
-    @staticmethod
-    def _chunk_size_from_descriptor(desc: TensorDescriptor) -> Tuple[int, ...]:
-        """Derive the private read grid from an already-fetched descriptor."""
-        chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
         shape = tuple(int(dim) for dim in desc.shape)
-        if len(chunk_shape) == len(shape):
-            return chunk_shape
-        # Empty or rank-mismatched chunk_shape: fall back to the default grid.
-        return compute_safe_chunk_size(shape, desc.dtype, list(desc.dim_labels))
-
-    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
-        """Return the server-selected public Flight transfer grid.
-
-        Adapter descriptors historically carried their native file/dask block
-        geometry. Keep that as a private planning seed and expose only the
-        divide-or-coalesce result to clients (#684).
-        """
-        desc = self.get_tensor_descriptor()
-        require_resolved(desc)
-        return compute_transfer_chunk_size(
-            self._chunk_size_from_descriptor(desc),
-            tuple(int(dim) for dim in desc.shape),
+        chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
+        if len(chunk_shape) != len(shape):
+            chunk_shape = shape
+        return compute_safe_chunk_size(
+            tuple(
+                min(max(1, chunk), dim)
+                for chunk, dim in zip(chunk_shape, shape, strict=True)
+            ),
             desc.dtype,
             list(desc.dim_labels),
         )
@@ -1191,7 +1186,6 @@ _SOURCE_SCOPED_API = frozenset(
 _TENSOR_SCOPED_API = frozenset(
     {
         "get_tensor_descriptor",
-        "get_chunk_size",
         "get_transfer_chunk_size",
         "get_data",
         "get_arrow_schema",

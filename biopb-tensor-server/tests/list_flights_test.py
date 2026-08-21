@@ -92,7 +92,12 @@ def test_list_flights_all_healthy():
 
     returned_ids = {_command_source_id(info) for info in infos}
     assert returned_ids == {"good-1", "good-2"}
-    assert all(not _command_descriptor(info).tensors[0].chunk_shape for info in infos)
+    # The lean listing carries the transfer grid: it is the adapter's stable
+    # per-tensor choice, not a per-request one (biopb/biopb#809).
+    assert all(
+        list(_command_descriptor(info).tensors[0].chunk_shape) == [10, 10]
+        for info in infos
+    )
 
 
 # --- DuckDB-catalog-backed path (biopb/biopb#265) ---------------------------
@@ -138,7 +143,7 @@ def test_list_flights_served_from_catalog_not_adapters():
     infos = list(server.list_flights(None, b""))
     returned_ids = {_command_source_id(i) for i in infos}
     assert returned_ids == {"in-db"}
-    assert not _command_descriptor(infos[0]).tensors[0].chunk_shape
+    assert list(_command_descriptor(infos[0]).tensors[0].chunk_shape) == [10, 10]
 
 
 def test_list_flights_catalog_truncation_signaled():

@@ -470,7 +470,10 @@ class TestDicomSeriesAdapter:
             desc = adapter.get_tensor_descriptor()
             assert desc.array_id == "test_series"
             assert desc.shape == [num_slices, rows, cols]
-            assert desc.chunk_shape == [1, rows, cols]
+            # One slice is the read unit and seeds the transfer grid; the whole
+            # 10 KB series fits one chunk, so that is what it ships as
+            # (biopb/biopb#809). Slices are never straddled.
+            assert desc.chunk_shape == [num_slices, rows, cols]
 
     def test_get_metadata(self):
         from pydicom.uid import generate_uid

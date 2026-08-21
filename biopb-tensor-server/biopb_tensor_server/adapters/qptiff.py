@@ -46,7 +46,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 logger = logging.getLogger(__name__)
@@ -272,7 +275,10 @@ class QptiffAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=labels,
             shape=list(shape),
-            chunk_shape=list(za.chunks),  # native tile grid
+            # Seeded by the native tile grid, sized to the transfer target (#809).
+            chunk_shape=default_transfer_chunk_shape(
+                shape, za.dtype.str, labels, native=za.chunks
+            ),
             dtype=za.dtype.str,
         )
         return self._cached_descriptor

@@ -142,8 +142,14 @@ class TestQptiffAdapter:
                 assert list(desc.shape) == [3, 512, 512]
                 assert list(desc.dim_labels) == ["c", "y", "x"]
                 assert desc.dtype == np.dtype("uint16").str
-                # Native tile grid as the advertised access chunk.
-                assert list(desc.chunk_shape) == [1, 256, 256]
+                # The advertised grid is the transfer grid, aligned to the
+                # native 256x256 tiles rather than equal to one (#809).
+                grid = list(desc.chunk_shape)
+                assert all(
+                    g % n == 0 and g <= s
+                    for g, n, s in zip(grid, [1, 256, 256], [3, 512, 512], strict=True)
+                )
+                assert grid != [1, 256, 256]
             finally:
                 adapter.close()
 

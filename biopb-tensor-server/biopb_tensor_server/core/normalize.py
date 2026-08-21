@@ -403,13 +403,6 @@ class NormalizingAdapter(TensorAdapter):
         perm = self.perm
         return desc if perm is None else _permute_descriptor(desc, perm)
 
-    def get_chunk_size(self) -> Tuple[int, ...]:
-        chunk_size = self._inner.get_chunk_size()
-        perm = self.perm
-        if perm is None or len(chunk_size) != len(perm):
-            return chunk_size
-        return tuple(_permute(chunk_size, perm))
-
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read ``bounds`` -- given in canonical order -- as a canonical array."""
         perm = self.perm

@@ -48,7 +48,16 @@ message TensorDescriptor {
   // Full array shape (per dimension)
   repeated int64 shape = 3;
 
-  // Nominal chunk size per dimension (actual may vary for edge chunks)
+  // Nominal transfer chunk size per dimension (actual may vary for edge
+  // chunks). This is the grid the tensor's chunks are delivered on, chosen by
+  // the server-side adapter that knows how the bytes sit on disk; it is not the
+  // store's own block size, and no read is issued at any other granularity.
+  //
+  // On a *response* it is the grid you will read on: the stable per-tensor grid
+  // in a describe or catalog listing, and for a scaled read the grid of that
+  // response's (already reduced) chunks. On an upload *request* it is the grid
+  // you will write on -- it sets the created store's blocking and the bounds
+  // every chunk must land on.
   repeated int64 chunk_shape = 4;
 
   // Element dtype (numpy-style, e.g., "uint8", "float32", "float64")

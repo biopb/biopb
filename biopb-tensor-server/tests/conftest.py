@@ -115,3 +115,23 @@ def hdf5_dataset(temp_dir):
 def simple_zarr_array(temp_dir):
     """Simple Zarr array for basic tests."""
     return create_zarr_array(temp_dir)
+
+
+@pytest.fixture
+def transfer_target(monkeypatch):
+    """Set the transfer-size target in bytes for the duration of a test.
+
+    Chunk size is the only knob on the transfer grid (biopb/biopb#809): there is
+    no minimum-endpoint floor, so a tiny fixture is one chunk at the 8 MB
+    default. A test whose subject is multi-chunk behaviour -- cache entries per
+    region, grid snapping under a slice, endpoint counts -- lowers the target
+    rather than relying on a fixture that happens to sit above a floor.
+    """
+
+    def _set(nbytes: int) -> int:
+        from biopb_tensor_server.core import chunk
+
+        monkeypatch.setattr(chunk, "PREFERRED_ARROW_BATCH_BYTES", int(nbytes))
+        return int(nbytes)
+
+    return _set

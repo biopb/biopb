@@ -31,7 +31,10 @@ from biopb_tensor_server.adapters._handle_reaper import (
 )
 from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -363,12 +366,18 @@ class NdTiffAdapter(TensorAdapter):
         self._shape = list(self._dask_arr.shape)
         self._dtype = str(self._dask_arr.dtype)
 
-        # Chunk shape: one 2D plane per chunk (1, 1, 1, 1, Y, X) or subset
-        # This matches ndtiff's tile-based storage
+        # One 2D plane matches ndtiff's tile-based storage; it seeds the
+        # transfer grid rather than being it (biopb/biopb#809), so a small plane
+        # ships several planes per chunk instead of one endpoint each.
         spatial_shape = self._shape[-2:]  # Y, X
         n_spatial = len(spatial_shape)
         n_non_spatial = len(self._shape) - n_spatial
-        self._chunk_shape = [1] * n_non_spatial + spatial_shape
+        self._chunk_shape = default_transfer_chunk_shape(
+            self._shape,
+            self._dtype,
+            self.dim_labels,
+            native=[1] * n_non_spatial + spatial_shape,
+        )
 
         # Only a reopen-capable adapter is worth reaping -- one handed a bare
         # dataset it cannot rebuild must keep it. Registering also lazily starts

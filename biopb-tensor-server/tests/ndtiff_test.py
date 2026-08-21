@@ -159,8 +159,8 @@ class TestNdTiffAdapterDescriptor:
 
         assert list(desc.dim_labels) == ["t", "c", "z", "y", "x"]
 
-    def test_chunk_shape_is_2d_planes(self):
-        """Chunk shape should be one 2D plane per chunk."""
+    def test_chunk_shape_is_whole_planes(self):
+        """The transfer grid is built from whole 2D planes (biopb/biopb#809)."""
         from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
 
         mock_dataset = MagicMock()
@@ -181,8 +181,13 @@ class TestNdTiffAdapterDescriptor:
 
         desc = adapter.get_tensor_descriptor()
 
-        # Chunk shape: (1, 1, Y, X) - one 2D plane
-        assert list(desc.chunk_shape) == [1, 1, 256, 256]
+        # One plane (1, 1, Y, X) is the seed; a 128 KB plane is well under the
+        # transfer target, so the grid spans several planes rather than shipping
+        # one endpoint each. Y/X stay whole -- planes are never straddled.
+        grid = list(desc.chunk_shape)
+        assert grid[-2:] == [256, 256]
+        assert grid[0] <= 4 and grid[1] <= 3
+        assert grid != [1, 1, 256, 256]
 
 
 @pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")

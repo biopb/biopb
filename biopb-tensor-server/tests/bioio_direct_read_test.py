@@ -9,6 +9,15 @@ from biopb_tensor_server.adapters.bioio import NikonAdapter
 nd2 = pytest.importorskip("nd2")
 
 
+class _ZeroFrame:
+    """Shape/dtype only -- the grid tests never touch pixels, and materializing
+    the 4096x4096x4 geometry they need would cost 134 MB for nothing."""
+
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+
 class _FakeDaskArray:
     def __init__(self, data: np.ndarray, chunks: tuple[tuple[int, ...], ...]):
         self._data = data
@@ -107,7 +116,10 @@ def test_nikon_direct_read_maps_scene_t_and_z_and_copies_crop(tmp_path, monkeypa
     assert actual.flags.owndata
     assert _FakeND2File.closed
     assert _FakeND2File.loop_indices_accesses == 1
-    assert list(adapter.get_tensor_descriptor().chunk_shape) == [1, 2, 1, 4, 5]
+    # The frame ND2 hands back -- all channels, whole Y/X, one T and one Z --
+    # seeds the transfer grid; the grid is whole frames of it (biopb/biopb#809).
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+    assert [grid[1], grid[3], grid[4]] == [2, 4, 5]
 
 
 def test_nikon_direct_read_preserves_rgb_samples(tmp_path, monkeypatch):
@@ -251,3 +263,67 @@ def test_scene_switch_does_not_race_a_concurrent_read():
 
     assert not any(thread.is_alive() for thread in threads), "deadlocked"
     assert observed and np.array_equal(observed[0], scenes[0])
+
+
+def test_component_axes_are_never_split(tmp_path, monkeypatch):
+    """C and S live inside the pixel, so a chunk always holds all of them.
+
+    ND2 has no planar variant: every frame is `(Y, X, channel, RGB component)`,
+    so one channel's bytes are `itemsize` of every `componentCount * itemsize`.
+    A per-channel chunk faults in every page the others occupy and discards what
+    it did not ask for (biopb/biopb#806). There is nothing to detect and no
+    probe -- the layout is a property of the format.
+    """
+    data = _ZeroFrame((1, 4, 1, 4096, 4096), np.dtype("uint16"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+
+    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (4,), (1,), (4096,), (4096,)))
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+
+    # All four channels in one chunk, and a square plane: Y and X are coupled,
+    # so a tile read touches one chunk rather than one per band it crosses.
+    assert grid == [1, 4, 1, 1024, 1024]
+
+    from biopb_tensor_server.core.chunk import (
+        PREFERRED_ARROW_BATCH_BYTES,
+        estimate_chunk_bytes,
+    )
+
+    assert estimate_chunk_bytes(tuple(grid), "<u2") <= PREFERRED_ARROW_BATCH_BYTES
+
+
+def test_rgb_samples_are_never_split(tmp_path, monkeypatch):
+    """The RGB axis is the same story: nd2 puts it inside the pixel too.
+
+    ``components_per_channel == 3`` makes nd2 report an ``S`` axis rather than
+    folding the components into ``C`` -- a two-channel RGB file is ``C=2, S=3``,
+    six interleaved components per pixel -- so both axes have to stay whole.
+    """
+    data = _ZeroFrame((1, 2, 1, 2048, 2048, 3), np.dtype("uint8"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+
+    adapter = _adapter(
+        tmp_path,
+        data,
+        "TCZYXS",
+        ((1,), (2,), (1,), (2048,), (2048,), (3,)),
+    )
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+
+    assert grid[1] == 2 and grid[5] == 3  # C and S whole
+    assert grid[3] == grid[4]  # plane square
+
+
+def test_single_component_nd2_uses_the_backend_block(tmp_path, monkeypatch):
+    """``componentCount == 1`` has no interleaved run to protect.
+
+    nd2 drops size-1 axes, so a mono single-channel file has neither C nor S and
+    the backend's own block is the better seed.
+    """
+    data = _ZeroFrame((1, 1, 1, 4096, 4096), np.dtype("uint16"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+
+    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (1,), (1,), (4096,), (4096,)))
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+    assert grid[3] == grid[4]  # still a coupled, square plane
+    assert grid[1] == 1
