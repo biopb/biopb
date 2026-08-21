@@ -732,7 +732,11 @@ class RemoteTensorAdapter(TensorAdapter):
         self._require_canonical_upstream(plan.descriptor)
         return plan
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
+    def get_read_plan(
+        self,
+        request_desc: TensorDescriptor,
+        max_read_block_bytes: Optional[int] = None,
+    ) -> TensorReadPlan:
         """Plan a read, refusing a non-canonical upstream first (#596).
 
         The other read boundary besides ``plan_flight_info``: the precache warms
@@ -741,7 +745,7 @@ class RemoteTensorAdapter(TensorAdapter):
         caller already holds.
         """
         self._require_canonical_upstream(request_desc)
-        return super().get_read_plan(request_desc)
+        return super().get_read_plan(request_desc, max_read_block_bytes)
 
     def _require_canonical_upstream(self, desc: TensorDescriptor) -> None:
         """Refuse to serve an upstream whose axis order is not canonical (#596).

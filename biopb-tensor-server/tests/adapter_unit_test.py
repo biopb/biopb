@@ -317,7 +317,8 @@ class TestGetScaledReadPlan:
             )
             plan = adapter.get_read_plan(request_desc)
 
-            # The 50x50 transfer chunk is scaled with the unchanged LCM logic.
+            # A 100x100 tensor cannot grow the read block without dropping below
+            # the endpoint floor, so the grid is the transfer grid, scaled.
             assert list(plan.descriptor.shape) == [25, 25]
 
 
@@ -530,28 +531,215 @@ class TestTransferChunkSize:
         assert result[-1] == 1
 
     def test_scaled_logical_chunk_is_no_larger_than_transfer_chunk(self):
-        from math import lcm
+        """The delivered chunk stays at the size the transfer optimizer picked.
 
+        This is the bound that shapes a normal scaled read: the extent is capped
+        at ``transfer * scale``, so reducing it lands back on the transfer
+        target. Drop that cap and the block grows to whatever memory allows --
+        at a 512 MiB ceiling a 1/2 read delivered 62.9 MB against an 8 MB target.
+
+        The predecessor of this test asserted the same invariant but recomputed
+        the lcm inline instead of calling the planner, so it held no matter what
+        the planner did.
+        """
         from biopb_tensor_server.core.chunk import (
+            MAX_ARROW_BATCH_BYTES,
+            ceil_div,
             compute_transfer_chunk_size,
             estimate_chunk_bytes,
+            scaled_virtual_chunk_size,
         )
 
+        shape = (1, 1, 320, 960, 1000)
+        labels = ["t", "c", "z", "y", "x"]
         transfer = compute_transfer_chunk_size(
-            (1, 1, 1, 960, 1000),
-            (1, 1, 320, 960, 1000),
-            "<u2",
-            ["t", "c", "z", "y", "x"],
+            (1, 1, 1, 960, 1000), shape, "<u2", labels
         )
         scale = (1, 1, 4, 3, 2)
-        logical = tuple(
-            lcm(chunk, factor) // factor
-            for chunk, factor in zip(transfer, scale, strict=True)
-        )
 
+        # A memory ceiling far above anything real must not let the delivered
+        # chunk drift past the transfer target.
+        virtual = scaled_virtual_chunk_size(
+            transfer,
+            shape,
+            scale,
+            "<u2",
+            labels,
+            "<u2",
+            max_read_block_bytes=8 * 1024 * 1024 * 1024,
+        )
+        logical = tuple(
+            ceil_div(extent, factor)
+            for extent, factor in zip(virtual, scale, strict=True)
+        )
         assert estimate_chunk_bytes(logical, "<u2") <= estimate_chunk_bytes(
             transfer, "<u2"
         )
+        assert estimate_chunk_bytes(logical, "<u2") <= MAX_ARROW_BATCH_BYTES
+
+    def test_scaled_endpoint_count_falls_with_the_scale(self):
+        """A 1/S read has 1/S the output pixels, so it needs proportionally
+        fewer transfer-sized chunks. Holding the delivered chunk at the target
+        is what produces that; a ceiling flat in bytes would not."""
+        from math import ceil
+
+        from biopb_tensor_server.core.chunk import (
+            compute_transfer_chunk_size,
+            scaled_virtual_chunk_size,
+        )
+
+        shape = (1, 4, 1, 14234, 14234)
+        labels = ["t", "c", "z", "y", "x"]
+        transfer = compute_transfer_chunk_size(
+            (1, 1, 1, 2048, 2048), shape, "<u2", labels
+        )
+
+        def endpoints(chunk):
+            count = 1
+            for extent, size in zip(shape, chunk, strict=True):
+                count *= ceil(extent / size)
+            return count
+
+        full_res = endpoints(transfer)
+        halved = endpoints(
+            scaled_virtual_chunk_size(
+                transfer, shape, (1, 1, 1, 2, 2), "<u2", labels, "<u2"
+            )
+        )
+        quartered = endpoints(
+            scaled_virtual_chunk_size(
+                transfer, shape, (1, 1, 1, 4, 4), "<u2", labels, "<u2"
+            )
+        )
+        assert halved < full_res
+        assert quartered < halved
+
+    def test_scaled_read_block_grows_with_the_scale(self):
+        """Regression for biopb/biopb#805.
+
+        lcm(transfer, scale) is a no-op whenever the scale divides the transfer
+        extent, so a scaled read did full-resolution work per round trip and
+        returned a fraction of the payload. The read block must grow instead.
+        """
+        from math import ceil
+
+        from biopb_tensor_server.core.chunk import (
+            compute_transfer_chunk_size,
+            scaled_virtual_chunk_size,
+        )
+
+        shape = (1, 4, 1, 14234, 14234)
+        labels = ["t", "c", "z", "y", "x"]
+        transfer = compute_transfer_chunk_size(
+            (1, 1, 1, 2048, 2048), shape, "<u2", labels
+        )
+        virtual = scaled_virtual_chunk_size(
+            transfer, shape, (1, 1, 1, 32, 32), "<u2", labels, "<u2"
+        )
+
+        assert virtual != transfer
+        spatial = [axis for axis, label in enumerate(labels) if label in {"y", "x"}]
+        assert any(virtual[axis] > transfer[axis] for axis in spatial)
+
+        def endpoints(chunk):
+            count = 1
+            for extent, size in zip(shape, chunk, strict=True):
+                count *= ceil(extent / size)
+            return count
+
+        assert endpoints(virtual) < endpoints(transfer)
+
+    def test_scaled_read_block_stays_grid_aligned(self):
+        """The read block must tile the scale grid and the transfer grid alike.
+
+        A multiple of the scale keeps logical chunks from overlapping; a multiple
+        of the transfer extent keeps reads aligned to the grid the adapter
+        reports. An axis clamped to the tensor is one chunk wide, so exempt.
+        """
+        from biopb_tensor_server.core.chunk import (
+            compute_transfer_chunk_size,
+            scaled_virtual_chunk_size,
+        )
+
+        shape = (1, 4, 16, 3000, 4000)
+        labels = ["t", "c", "z", "y", "x"]
+        transfer = compute_transfer_chunk_size(
+            (1, 1, 1, 500, 500), shape, "<u2", labels
+        )
+        for scale in [(1, 1, 1, 2, 2), (1, 1, 2, 4, 4), (1, 1, 1, 3, 5)]:
+            virtual = scaled_virtual_chunk_size(
+                transfer, shape, scale, "<u2", labels, "<u2"
+            )
+            for axis in range(len(shape)):
+                if virtual[axis] == shape[axis]:
+                    continue
+                assert virtual[axis] % scale[axis] == 0, (scale, axis, virtual)
+                assert virtual[axis] % transfer[axis] == 0, (scale, axis, virtual)
+
+    def test_oversized_lcm_unit_gives_up_alignment_not_the_memory_bound(self):
+        """Nothing bounds a client's scale_hint, and a scale coprime with the
+        transfer extent makes lcm() explode -- (5, 7, 11) against a
+        64x2048x2048 transfer chunk asks for a 129 GB block. The unit must fall
+        back to the scale alone, which still tiles, rather than handing an
+        unbounded allocation to get_data.
+        """
+        from biopb_tensor_server.core.chunk import (
+            MAX_READ_BLOCK_BYTES,
+            ceil_div,
+            estimate_chunk_bytes,
+            scaled_virtual_chunk_size,
+        )
+
+        shape = (1, 4, 512, 14234, 14234)
+        labels = ["t", "c", "z", "y", "x"]
+        transfer = (1, 1, 64, 2048, 2048)
+        scale = (1, 1, 5, 7, 11)
+
+        virtual = scaled_virtual_chunk_size(
+            transfer, shape, scale, "<u2", labels, "<u2"
+        )
+        assert estimate_chunk_bytes(virtual, "<u2") <= MAX_READ_BLOCK_BYTES
+
+        # Giving up transfer-grid alignment must not cost the tiling invariant:
+        # consecutive logical chunks still abut exactly, with no overlap or gap.
+        for axis in range(len(shape)):
+            expected = 0
+            index = 0
+            while index * virtual[axis] < shape[axis]:
+                start = index * virtual[axis]
+                stop = min(start + virtual[axis], shape[axis])
+                assert start // scale[axis] == expected
+                expected = ceil_div(stop, scale[axis])
+                index += 1
+
+    def test_scaled_read_block_respects_the_endpoint_floor(self):
+        """Growing the read block must not collapse the read onto one endpoint."""
+        from math import ceil
+
+        from biopb_tensor_server.core.chunk import (
+            MIN_TRANSFER_ENDPOINTS,
+            compute_transfer_chunk_size,
+            scaled_virtual_chunk_size,
+        )
+
+        shape = (1, 1, 1, 4096, 4096)
+        labels = ["t", "c", "z", "y", "x"]
+        transfer = compute_transfer_chunk_size(
+            (1, 1, 1, 512, 512), shape, "uint8", labels
+        )
+        virtual = scaled_virtual_chunk_size(
+            transfer,
+            shape,
+            (1, 1, 1, 8, 8),
+            "uint8",
+            labels,
+            "uint8",
+            max_read_block_bytes=8 * 1024 * 1024 * 1024,
+        )
+        count = 1
+        for extent, size in zip(shape, virtual, strict=True):
+            count *= ceil(extent / size)
+        assert count >= MIN_TRANSFER_ENDPOINTS
 
 
 class TestGetPhysicalScale:
