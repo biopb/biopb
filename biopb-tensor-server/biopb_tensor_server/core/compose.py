@@ -185,14 +185,27 @@ def _accumulate_area(
     local_start: Sequence[int],
     scale_hint: Sequence[int],
 ) -> None:
-    """Add one chunk's block sums into the output accumulator, in place."""
-    work = chunk.astype(accumulator.dtype, copy=False)
+    """Add one chunk's block sums into the output accumulator, in place.
+
+    ``reduceat`` accumulates at ``dtype`` off the narrow input, so the widening
+    never materializes: casting the chunk up front instead would allocate and
+    touch a second, wider copy of every chunk -- 2.4 GB across a 1.2 GB scene,
+    to produce the same sums. The first reduced axis does the widening; later
+    axes are already at accumulator width.
+    """
+    work = chunk
+    reduced = False
     for axis in range(work.ndim):
         scale = max(1, int(scale_hint[axis]))
         if scale == 1:
             continue
         breaks = _block_breaks(int(local_start[axis]), work.shape[axis], scale)
-        work = np.add.reduceat(work, breaks, axis=axis)
+        work = np.add.reduceat(work, breaks, axis=axis, dtype=accumulator.dtype)
+        reduced = True
+    if not reduced:
+        # scale 1 on every axis: no block to sum, but the accumulator still has
+        # to receive this chunk at its own width.
+        work = work.astype(accumulator.dtype, copy=False)
     offsets = [
         int(local_start[axis]) // max(1, int(scale_hint[axis]))
         for axis in range(work.ndim)
