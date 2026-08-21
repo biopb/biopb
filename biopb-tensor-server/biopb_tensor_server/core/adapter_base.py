@@ -23,7 +23,6 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from math import lcm
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
@@ -36,6 +35,7 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import (
+    MAX_READ_BLOCK_BYTES,
     ChunkEndpoint,
     _version_header,
     build_pyramid_plan,
@@ -50,6 +50,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     normalized_scale_hint,
     normalized_slice_bounds,
+    scaled_virtual_chunk_size,
 )
 from biopb_tensor_server.core.downsample import (
     ceil_div,
@@ -810,7 +811,11 @@ class TensorAdapter(SourceAdapter):
 
         return data
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
+    def get_read_plan(
+        self,
+        request_desc: TensorDescriptor,
+        max_read_block_bytes: Optional[int] = None,
+    ) -> TensorReadPlan:
         """Generate a read plan for the requested tensor descriptor.
 
         A native-pyramid adapter routes a ``precompute`` + ``scale_hint`` read to
@@ -821,6 +826,10 @@ class TensorAdapter(SourceAdapter):
         Args:
             request_desc: TensorDescriptor from the client's read request, which may
                           include slice_hint and scale_hint/reduction_method directly.
+            max_read_block_bytes: Ceiling on the source bytes one computed-scale
+                          chunk may materialize
+                          (``PyramidConfig.max_read_block_mb``). ``None`` takes
+                          the module default; unscaled reads ignore it.
         Returns:
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
         """
@@ -840,6 +849,7 @@ class TensorAdapter(SourceAdapter):
             request_desc,
             chunk_size,
             content_version=self.content_version,
+            max_read_block_bytes=max_read_block_bytes,
         )
 
     # ---- native-pyramid precompute routing ---------------------------------
@@ -996,7 +1006,10 @@ class TensorAdapter(SourceAdapter):
                 request_desc.scale_hint[:] = list(read_opt.scale_hint)
             if read_opt.reduction_method:
                 request_desc.reduction_method = read_opt.reduction_method
-            read_plan = self.get_read_plan(request_desc)
+            read_plan = self.get_read_plan(
+                request_desc,
+                max_read_block_bytes=pyramid_config.max_read_block_mb * 1024 * 1024,
+            )
         else:
             # Describe-only still exposes the server's transfer grid, never the
             # adapter's private file/dask read geometry (#684).
@@ -1236,6 +1249,7 @@ def _get_read_plan(
     request_desc: TensorDescriptor,
     chunk_size: Tuple[int, ...],
     content_version: Optional[bytes] = None,
+    max_read_block_bytes: Optional[int] = None,
 ) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
@@ -1269,11 +1283,29 @@ def _get_read_plan(
         logical_chunk_size = transfer_chunk_size
         output_dtype = base_desc.dtype
     else:
-        virtual_chunk_size = tuple(
-            lcm(transfer_chunk_size[ax], scale_hint[ax]) for ax in range(ndim)
+        # Scale the read extent up with the scale factor so the *delivered*
+        # chunk lands on the transfer target. Taking a least-common-multiple
+        # against the scale is a no-op whenever the scale divides the transfer
+        # extent -- the common power-of-two case -- which left every scaled read
+        # doing full-resolution work per round trip for a fraction of the
+        # payload (biopb/biopb#805).
+        virtual_chunk_size = scaled_virtual_chunk_size(
+            transfer_chunk_size,
+            base_shape,
+            scale_hint,
+            base_desc.dtype,
+            list(base_desc.dim_labels),
+            get_output_dtype(base_desc.dtype, reduction_method),
+            max_read_block_bytes=(
+                MAX_READ_BLOCK_BYTES
+                if max_read_block_bytes is None
+                else int(max_read_block_bytes)
+            ),
         )
+        # ceil_div, not //: clamping the extent to the tensor leaves a partial
+        # scale block on axes whose length is not a whole multiple of the scale.
         logical_chunk_size = tuple(
-            virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim)
+            ceil_div(virtual_chunk_size[ax], scale_hint[ax]) for ax in range(ndim)
         )
         output_dtype = get_output_dtype(base_desc.dtype, reduction_method)
 
@@ -1300,8 +1332,9 @@ def _get_read_plan(
         logical_shape = realized_shape
 
     # Generate chunk endpoints by iterating grid using np.ndindex
-    # No split check is needed here: transfer_chunk_size is bounded, and the
-    # scaled logical chunk is no larger per axis.
+    # No split check is needed here: the unscaled grid is the bounded transfer
+    # grid, and a scaled grid's read block may only grow to where its reduction
+    # still clears the Arrow ceiling (scaled_virtual_chunk_size).
     logical_endpoints: List[ChunkEndpoint] = []
 
     # content_version is constant across the grid, so build its wrapper header
@@ -1348,8 +1381,6 @@ def _get_read_plan(
 
         virtual_bounds = ChunkBounds(start=list(virtual_start), stop=list(virtual_stop))
         logical_bounds = ChunkBounds(start=list(logical_start), stop=list(logical_stop))
-
-        # No split check is needed: the logical transfer chunk is bounded.
 
         # Encode: array_id + virtual_bounds + optional scale_hint + the requested
         # reduction_method, so do_get downsamples with the method the client asked
