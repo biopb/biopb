@@ -618,11 +618,11 @@ class TestTransferChunkSize:
         """
         from biopb_tensor_server.core.chunk import (
             MAX_ARROW_BATCH_BYTES,
-            ceil_div,
             compute_transfer_chunk_size,
             estimate_chunk_bytes,
             scaled_virtual_chunk_size,
         )
+        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = (1, 1, 320, 960, 1000)
         labels = ["t", "c", "z", "y", "x"]
@@ -759,10 +759,10 @@ class TestTransferChunkSize:
         """
         from biopb_tensor_server.core.chunk import (
             MAX_READ_BLOCK_BYTES,
-            ceil_div,
             estimate_chunk_bytes,
             scaled_virtual_chunk_size,
         )
+        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = (1, 4, 512, 14234, 14234)
         labels = ["t", "c", "z", "y", "x"]
