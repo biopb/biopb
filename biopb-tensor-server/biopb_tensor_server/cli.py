@@ -884,6 +884,10 @@ def _setup_flight_server(
         # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
         # registration.
         precache_worker.should_warm = source_manager.should_warm
+        # Demand tier: let the worker see what clients actually read, so it can
+        # warm the rest of that level (and the source's other tensors) at the
+        # client's own scale rather than one the server picked.
+        server.set_read_observer(precache_worker.observe_read)
 
     # Seed the precache backlog with the startup catalog the moment the first
     # full scan establishes it (newest first; warmed when the server is idle).

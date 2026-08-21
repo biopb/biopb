@@ -1022,6 +1022,252 @@ class TestSkipNativePyramid:
 # ---------------------------------------------------------------------------
 
 
+class TestDemandTier:
+    """Warming driven by what a client actually read, not by a server guess."""
+
+    def _init_file_cache(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+
+    def _worker(self, server, **cfg):
+        cfg.setdefault("idle_debounce_seconds", 0.0)
+        return PrecacheWorker(server, PrecacheConfig(**cfg))
+
+    def _observed_chunk_id(self, adapter, scale):
+        """A scaled chunk_id for this tensor, as a client's read would carry."""
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        td = adapter.list_tensor_descriptors()[0]
+        ta = adapter.get_tensor_adapter(td.array_id)
+        base = ta.get_tensor_descriptor()
+        req = TensorDescriptor(
+            array_id=base.array_id,
+            dim_labels=base.dim_labels,
+            shape=base.shape,
+            chunk_shape=base.chunk_shape,
+            dtype=base.dtype,
+        )
+        req.scale_hint[:] = list(scale)
+        req.reduction_method = "area"
+        plan = ta.get_read_plan(req)
+        return plan.chunk_endpoints[0].chunk_id
+
+    # -- producer -----------------------------------------------------------
+
+    def test_observe_read_is_non_blocking_and_lossy_when_full(self):
+        """The producer runs on a serving thread, so it must never block."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server, demand_queue_max=2)
+            for i in range(20):
+                worker.observe_read(b"chunk-%d" % i)
+            assert worker._demand.qsize() == 2
+        finally:
+            server.shutdown()
+
+    def test_observe_read_ignores_everything_when_disabled(self):
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server, demand_enabled=False)
+            worker.observe_read(b"anything")
+            assert worker._demand.qsize() == 0
+        finally:
+            server.shutdown()
+
+    def test_observe_read_never_raises_on_garbage(self):
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker.observe_read(b"")
+            worker.observe_read(b"\xff\xfe not a chunk id")
+        finally:
+            server.shutdown()
+
+    # -- consumer gating ----------------------------------------------------
+
+    def test_full_resolution_read_triggers_no_warm(self, tmp_path):
+        """A full-res read is the computation pattern; warming it is wrong."""
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            cid = self._observed_chunk_id(adapter, (1, 1))
+            cm = CacheManager.get_instance()
+            worker._process_demand(cid)
+            assert cm.stats().misses == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_undecodable_observation_is_dropped(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker._process_demand(b"not a chunk id")
+            assert CacheManager.get_instance().stats().misses == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    # -- the warm itself ----------------------------------------------------
+
+    def test_scaled_read_warms_the_rest_of_that_level(self, tmp_path):
+        """The case a channel-interleaved layout hides.
+
+        ND2 decodes every channel whichever one you ask for, so a read leaves
+        the whole level resident and there is nothing left to warm. A planar
+        source does not, so the observed tensor's unread chunks stay cold unless
+        the demand tier warms them -- which is why it must not skip the tensor
+        that triggered it.
+        """
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            cid = self._observed_chunk_id(adapter, (4, 4))
+            cm = CacheManager.get_instance()
+
+            worker._process_demand(cid)
+            assert cm.stats().misses > 0, "observed level was never warmed"
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_warms_at_the_observed_scale_not_the_server_plan(self, tmp_path):
+        """The whole point: the client's scale wins over the advertised one."""
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.chunk import decode_scale_info
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            # 2x is a level the server's own 4x plan never produces.
+            observed = (2, 2)
+            assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [4, 4]
+
+            warmed = []
+            worker = self._worker(server)
+            real = worker._process_tensor
+
+            def spy(source_adapter, td, cm, **kw):
+                warmed.append(kw.get("scale_hint"))
+                return real(source_adapter, td, cm, **kw)
+
+            worker._process_tensor = spy
+            cid = self._observed_chunk_id(adapter, observed)
+            assert tuple(decode_scale_info(cid)) == observed
+            worker._process_demand(cid)
+
+            assert warmed == [[2, 2]], f"warmed at {warmed}, not the observed scale"
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_second_read_of_a_warmed_level_does_not_re_warm(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            cid = self._observed_chunk_id(adapter, (4, 4))
+            cm = CacheManager.get_instance()
+
+            worker._process_demand(cid)
+            first = cm.stats().misses
+            worker._process_demand(cid)
+            assert cm.stats().misses == first, "level was warmed twice"
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_demand_memory_is_bounded_so_eviction_can_be_re_warmed(self, tmp_path):
+        """An unbounded memory would turn an eviction into a permanent cold spot."""
+        import biopb_tensor_server.serving.precache as precache_mod
+
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            for i in range(precache_mod._DEMAND_MEMORY + 50):
+                worker._demand_done[(f"src{i}", (4, 4), "area")] = None
+                while len(worker._demand_done) > precache_mod._DEMAND_MEMORY:
+                    worker._demand_done.popitem(last=False)
+            assert len(worker._demand_done) == precache_mod._DEMAND_MEMORY
+            # The oldest entries are the ones dropped, so they can warm again.
+            assert ("src0", (4, 4), "area") not in worker._demand_done
+        finally:
+            server.shutdown()
+
+    def test_observed_tensor_is_warmed_before_its_siblings(self, tmp_path):
+        """The tensor on screen outranks any sibling."""
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            td = adapter.list_tensor_descriptors()[0]
+
+            order = []
+            real = worker._process_tensor
+
+            def spy(source_adapter, tdesc, cm, **kw):
+                order.append(tdesc.array_id)
+                return real(source_adapter, tdesc, cm, **kw)
+
+            worker._process_tensor = spy
+            worker._process_demand(self._observed_chunk_id(adapter, (4, 4)))
+            assert order and order[0] == td.array_id
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    # -- server wiring ------------------------------------------------------
+
+    def test_server_observer_is_best_effort(self):
+        """A failing observer must never break the read that triggered it."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+
+            def boom(_chunk_id):
+                raise RuntimeError("observer exploded")
+
+            server.set_read_observer(boom)
+            server._observe_read(b"chunk")  # must not raise
+        finally:
+            server.shutdown()
+
+    def test_server_with_no_observer_is_a_no_op(self):
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server._observe_read(b"chunk")
+        finally:
+            server.shutdown()
+
+
 class TestSkipUnscaledCoarsestLevel:
     """A tensor whose coarsest advertised level is full resolution is not warmed.
 

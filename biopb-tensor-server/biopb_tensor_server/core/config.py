@@ -226,6 +226,7 @@ _CONSTRAINTS = {
     },
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),
+        "demand_queue_max": _Range(min=1),
         "backlog_high_water": _Range(min=0.0, max=1.0),
         "backlog_idle_recheck_seconds": _Range(min=0),
     },
@@ -606,6 +607,21 @@ class PrecacheConfig:
         metadata={
             "help": "Quiet period after live traffic before the worker resumes "
             "(seconds)."
+        },
+    )
+    # Demand tier (observed reads) knobs.
+    demand_enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Warm the sibling tensors of a tensor a client actually "
+            "read, at the scale the client used."
+        },
+    )
+    demand_queue_max: int = field(
+        default=64,
+        metadata={
+            "help": "Maximum pending observed reads; oldest are dropped once "
+            "full (a stale hint is worth less than a fresh one)."
         },
     )
     # Startup-backlog (existing sources) knobs.
@@ -1273,6 +1289,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     precache_kwargs: Dict[str, Any] = {}
     _carry(precache_kwargs, "enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "idle_debounce_seconds", precache_data, cast=float)
+    _carry(precache_kwargs, "demand_enabled", precache_data, cast=bool)
+    _carry(precache_kwargs, "demand_queue_max", precache_data, cast=int)
     _carry(precache_kwargs, "backlog_enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "backlog_high_water", precache_data, cast=float)
     _carry(precache_kwargs, "backlog_idle_recheck_seconds", precache_data, cast=float)

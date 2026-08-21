@@ -357,6 +357,31 @@ class TensorFlightServer(flight.FlightServerBase):
         # dnd:// sources to remove, so removal is a no-op there anyway.
         self._remove_source_handler: Optional[Callable[..., Any]] = None
 
+        # Read observer: notified with the chunk_id of every chunk actually
+        # served, so the precache worker can warm what a client demonstrably
+        # reads instead of what the server guessed it would. Injected at launch
+        # (``PrecacheWorker.observe_read``); ``None`` when there is no worker.
+        self._read_observer: Optional[Callable[[bytes], None]] = None
+
+    def set_read_observer(self, observer: Optional[Callable[[bytes], None]]) -> None:
+        """Register a callback fired with each served chunk_id."""
+        self._read_observer = observer
+
+    def _observe_read(self, chunk_id: bytes) -> None:
+        """Notify the read observer, never at the expense of the read.
+
+        Both callers have already produced the client's data by this point, so a
+        failure here must not turn a successful read into an error -- the hint is
+        strictly best-effort.
+        """
+        observer = self._read_observer
+        if observer is None:
+            return
+        try:
+            observer(chunk_id)
+        except Exception:
+            logger.debug("read observer failed", exc_info=True)
+
     def flight_idle_for(self, seconds: float) -> bool:
         """True if no heavy read is in flight and none finished within *seconds*.
 
@@ -1435,6 +1460,8 @@ class TensorFlightServer(flight.FlightServerBase):
                     f"I/O error reading chunk data: {e}"
                 ) from e
 
+            self._observe_read(tensor_ticket.chunk_id)
+
             batch_size = sum(col.nbytes for col in record_batch.columns)
             logger.debug(f"do_get: returning {batch_size} bytes")
 
@@ -1499,6 +1526,10 @@ class TensorFlightServer(flight.FlightServerBase):
 
             if location is None:
                 return json.dumps({"available": False})
+
+            # This path *replaces* do_get for localhost clients, so without a
+            # hook here the observer would never see the reads that matter most.
+            self._observe_read(chunk_id)
 
             return json.dumps(
                 {
