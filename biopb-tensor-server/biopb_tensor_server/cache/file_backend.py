@@ -1773,16 +1773,39 @@ class ArrowFileBackend(CacheBackend):
                 return False
             time.sleep(0.005)
 
-    def _stop_writer(self) -> None:
-        """Drain the queue and retire the writer thread."""
+    def _stop_writer(self, timeout: float = 60.0) -> bool:
+        """Retire the writer thread. False means it is still running.
+
+        A False return is load-bearing, not advisory. ``_close_writer`` takes no
+        ``_write_lock`` -- it detaches the writer/sink and closes them -- while
+        ``_persist_entry``'s blocking phase runs with ``_lock`` released and
+        holds references it captured earlier. So closing segments while this
+        thread is alive closes a sink out from under an in-flight write, and any
+        ``.idx`` sidecar written from the index at that moment disagrees with the
+        segment it describes. That is not the torn tail the boot walk tolerates;
+        it is a sidecar that lies. The caller must leave the segments alone.
+
+        ``_writer_stopping`` is set first so nothing new is admitted while the
+        queue drains: the wait is bounded by the byte budget, not by traffic.
+        """
         thread = self._writer_thread
         if thread is None:
-            return
+            return True
         self._writer_stopping = True
-        self.flush_deferred_writes(timeout=60.0)
+        drained = self.flush_deferred_writes(timeout=timeout)
         self._write_queue.put(None)
-        thread.join(timeout=60.0)
+        thread.join(timeout=timeout)
+        if thread.is_alive() or not drained:
+            logger.error(
+                "cache writer did not retire within %.0fs (drained=%s); "
+                "leaving segments, WAL and process lock untouched so the next "
+                "start recovers them",
+                timeout,
+                drained,
+            )
+            return False
         self._writer_thread = None
+        return True
 
     def fail_entry(self, key: bytes, error: Exception) -> None:
         """Mark pending entry as failed."""
@@ -1929,7 +1952,7 @@ class ArrowFileBackend(CacheBackend):
         """Get recovery status from last initialization."""
         return self._recovery_status
 
-    def release_process_lock(self) -> None:
+    def release_process_lock(self, drain_timeout: float = 30.0) -> None:
         """Release the process lock + clear the WAL, leaving handles OPEN.
 
         The graceful-shutdown fast path (biopb/biopb#300). This is the cheap,
@@ -1948,17 +1971,27 @@ class ArrowFileBackend(CacheBackend):
         ones are held by a daemon thread that dies with the process, so what this
         path hands the next boot would silently be missing them -- and clearing
         the WAL underneath an in-flight write would drop its pending record too.
-        Bounded, because a wedged writer must not hold up shutdown; what does not
-        drain in time was re-derivable data, and the next read re-reads it.
+
+        Bounded, and on a failed drain this does nothing at all rather than
+        doing half of it. Both statements it would make are false while a writer
+        is still running: the WAL has pending records that still matter, and the
+        process lock is what stops a second process opening the segments that
+        thread is writing. Leaving both is what makes the next start recover;
+        see :meth:`close` for the whole policy.
         """
-        self.flush_deferred_writes(timeout=30.0)
+        if not self.flush_deferred_writes(timeout=drain_timeout):
+            logger.error(
+                "cache writer still running at shutdown; keeping the WAL and "
+                "the process lock so the next start recovers"
+            )
+            return
         with self._lock:
             if self._wal:
                 self._wal.clear()
             if self._process_lock:
                 self._process_lock.release()
 
-    def close(self) -> None:
+    def close(self, drain_timeout: float = 60.0) -> None:
         """Close backend and release resources.
 
         This preserves segment files for persistence across restarts.
@@ -1968,8 +2001,34 @@ class ArrowFileBackend(CacheBackend):
         disk only once its queued write lands, and sealing the segments out from
         under the writer would lose exactly the entries a restart is meant to
         find.
+
+        If that drain fails, this shuts down WITHOUT touching the segments, the
+        WAL or the process lock, and the next start recovers instead. Waiting
+        indefinitely is not the alternative: shutdown is deliberately bounded
+        (``cli.py`` runs the Flight drain in a daemon thread for the same
+        reason), and a wedged filesystem is when exiting matters most. So the
+        choice is what to leave behind, and the answer is: the evidence.
+
+        - The WAL keeps its pending records, which is what makes the next start
+          run ``_recover()``.
+        - The process lock is NOT released. It is what stops two processes
+          writing one segment, and a daemon writer thread is still writing. It
+          also becomes the second, independent trigger for recovery.
+        - No segment is sealed and no ``.idx`` sidecar is written, so the boot
+          walks the bodies -- which already tolerates a torn tail -- rather than
+          trusting an index that was still moving.
+
+        The cost is a slower next start for those segments, on a path that
+        should be unreachable in practice: the queue is capped by
+        ``max_deferred_write_bytes`` and admissions stop when the drain begins,
+        so a 512 MiB budget at the measured ~368 MB/s drains in ~1.4 s against a
+        60 s bound. A timeout here means the disk is gone, not that it was busy.
+
+        ``drain_timeout`` is how long that bound is. It exists as an argument
+        because the bound is a deployment question, not a constant.
         """
-        self._stop_writer()
+        if not self._stop_writer(drain_timeout):
+            return
 
         # Seal the still-open write segments (flush their streams), capturing
         # their index records so we can persist their sidecars below.

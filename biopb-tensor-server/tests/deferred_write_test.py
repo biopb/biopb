@@ -403,3 +403,138 @@ def test_awaiting_a_key_with_no_deferred_write_is_free(directory):
         assert backend.flush_deferred_write(b"never-stored", timeout=30) is True
     finally:
         backend.close()
+
+
+# ==============================================================================
+# Shutdown when the writer will not stop
+# ==============================================================================
+
+
+def _wedge_mid_write(backend):
+    """A writer stuck *inside* a write, after its WAL pending record.
+
+    ``_persist_entry`` logs pending, writes the batch, then logs committed.
+    Blocking at the last step is the state the shutdown policy is about: the WAL
+    says a write is outstanding, and it is -- so clearing it would erase the one
+    signal that makes the next start recover.
+    """
+    stuck, release = threading.Event(), threading.Event()
+    original = backend._wal.log_committed
+
+    def wedged(key):
+        stuck.set()
+        release.wait(120)
+        return original(key)
+
+    backend._wal.log_committed = wedged
+    return stuck, release, original
+
+
+def _wedge_the_writer(backend):
+    """A writer thread that never finishes its current write."""
+    stuck = threading.Event()
+    original = backend._persist_entry
+
+    def wedged(*args, **kwargs):
+        if threading.current_thread().name == "biopb-cache-writer":
+            stuck.set()
+            release.wait(120)
+        return original(*args, **kwargs)
+
+    release = threading.Event()
+    backend._persist_entry = wedged
+    return stuck, release, original
+
+
+def test_a_wedged_writer_does_not_get_its_segment_closed_underneath_it(directory):
+    """The race this policy exists to prevent.
+
+    ``_close_writer`` takes no ``_write_lock``: it detaches the writer and sink
+    and closes them, while ``_persist_entry``'s blocking phase runs with
+    ``_lock`` released, on references it captured earlier. Closing segments
+    while that thread is alive closes a sink out from under an in-flight write.
+    So ``close()`` must decline to touch anything when the drain fails.
+    """
+    backend = _backend(directory, deferred_mb=64)
+    stuck, release, original = _wedge_the_writer(backend)
+    try:
+        _store(backend, b"k", _batch(10))
+        backend.release(b"k")
+        assert stuck.wait(10), "writer never reached the wedged write"
+        open_ids = backend._open_segment_ids()
+
+        backend._stop_writer(timeout=0.2)
+        # The thread is still alive, so it must still own its segments.
+        assert backend._writer_thread is not None
+        assert backend._open_segment_ids() == open_ids
+        for segment_id in open_ids:
+            assert segment_id in backend._pool_writers
+    finally:
+        release.set()
+        backend._persist_entry = original
+        backend.flush_deferred_writes(timeout=30)
+        backend.close()
+
+
+def test_a_failed_drain_leaves_the_evidence_for_the_next_start(directory):
+    """WAL pending + process lock held are what trigger recovery.
+
+    Clearing either would tell the next start that this one finished cleanly,
+    which is exactly the claim that is false while a writer is still running.
+    """
+    backend = _backend(directory, deferred_mb=64)
+    stuck, release, original = _wedge_mid_write(backend)
+    try:
+        _store(backend, b"k", _batch(11))
+        backend.release(b"k")
+        assert stuck.wait(10)
+
+        # close() re-drains with its own bound, so give it a short one: the
+        # writer is wedged on purpose and the real bound is 60 s.
+        backend.close(drain_timeout=0.2)
+
+        assert backend._wal is not None and backend._wal.has_pending()
+        assert backend._process_lock is not None
+        assert backend._process_lock.is_held()
+        # No sidecar was written for a segment whose index was still moving.
+        assert not list(Path(directory).rglob("*.idx"))
+    finally:
+        release.set()
+        backend._wal.log_committed = original
+        backend.flush_deferred_writes(timeout=30)
+        backend.close()
+
+
+def test_release_process_lock_declines_rather_than_doing_half_of_it(directory):
+    """Its two effects are both claims that are false mid-write."""
+    backend = _backend(directory, deferred_mb=64)
+    stuck, release, original = _wedge_mid_write(backend)
+    try:
+        _store(backend, b"k", _batch(12))
+        backend.release(b"k")
+        assert stuck.wait(10)
+
+        # Short bound: the writer is wedged on purpose, and the point is
+        # what this declines to do, not how long it waits first.
+        backend.release_process_lock(drain_timeout=0.2)
+
+        assert backend._wal.has_pending()
+        assert backend._process_lock.is_held()
+    finally:
+        release.set()
+        backend._wal.log_committed = original
+        backend.flush_deferred_writes(timeout=30)
+        backend.close()
+
+
+def test_a_clean_drain_still_clears_everything(directory):
+    """The guard must not fire on the ordinary path."""
+    backend = _backend(directory, deferred_mb=64)
+    for index in range(4):
+        key = f"k{index}".encode()
+        _store(backend, key, _batch(index))
+        backend.release(key)
+    backend.close()
+
+    assert not backend._wal.has_pending()
+    assert not backend._process_lock.is_held()
