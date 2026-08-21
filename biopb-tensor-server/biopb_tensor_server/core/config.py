@@ -559,11 +559,25 @@ class PyramidConfig:
     max_read_block_mb: int = field(
         default=512,
         metadata={
-            "help": "Ceiling, in MiB, on the source pixels one computed-scale "
-            "chunk may materialize. A resident-memory bound, not a throughput "
-            "knob: lower it on a memory-constrained server, raise it if reads "
-            "have headroom. The delivered chunk is separately bounded by the "
-            "Arrow wire ceiling."
+            "help": "Ceiling, in MiB, on the source extent one computed-scale "
+            "chunk covers. It bounds resident memory when that extent is read "
+            "in one call, and bounds the number of chunks folded together when "
+            "compute_scale_from_chunks is on -- which never holds the extent, "
+            "so the memory it bounds there is one chunk. Lower it on a "
+            "memory-constrained server, raise it if reads have headroom. The "
+            "delivered chunk is separately bounded by the Arrow wire ceiling."
+        },
+    )
+    compute_scale_from_chunks: bool = field(
+        default=False,
+        metadata={
+            "help": "EXPERIMENTAL. Build a computed-scale chunk by reducing the "
+            "full-resolution chunks under it, instead of reading its whole "
+            "source extent in one call. Leaves those chunks in the cache, so a "
+            "later read at any scale -- full resolution included -- is served "
+            "from it rather than re-reading the source. Off by default: it "
+            "multiplies the bytes a scaled read writes to the cache by the "
+            "scale product, which is a capacity trade, not a free win."
         },
     )
 

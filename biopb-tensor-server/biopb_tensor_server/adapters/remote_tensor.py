@@ -968,8 +968,20 @@ class RemoteTensorAdapter(TensorAdapter):
         batch = self._upstream_record_batch(upstream_chunk_id)
         return unpack_chunk_array(batch)
 
-    def resolve_chunk_data(self, chunk_id: bytes, cache_manager=None) -> pa.RecordBatch:
+    def resolve_chunk_data(
+        self,
+        chunk_id: bytes,
+        cache_manager=None,
+        compose: bool = False,
+        _compose_depth: int = 0,
+    ) -> pa.RecordBatch:
         """Serve a chunk by forwarding the envelope's inner chunk_id to the upstream.
+
+        ``compose``/``_compose_depth`` are accepted and ignored. Composing here
+        would fan a single scaled request out into one network round trip per
+        full-resolution chunk; forwarding keeps the reduction upstream, where
+        the pixels already are, and only the reduced result crosses the wire.
+        If the upstream composes, this side inherits the benefit for free.
 
         The served chunk_id is a proxy envelope; peel it and forward the opaque
         inner (the upstream chunk_id) VERBATIM -- no decode, no rewrite -- so the

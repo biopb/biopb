@@ -1427,7 +1427,9 @@ class TensorFlightServer(flight.FlightServerBase):
             # Read the chunk, using the configured cache backend when applicable.
             try:
                 record_batch = adapter.resolve_chunk_data(
-                    tensor_ticket.chunk_id, cache_manager
+                    tensor_ticket.chunk_id,
+                    cache_manager,
+                    compose=self._pyramid_config.compute_scale_from_chunks,
                 )
             except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
@@ -1482,7 +1484,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 # materialize (same path as do_get) on a genuine cold miss.
                 location = cache_manager.locate_entry(cache_key)
                 if location is None:
-                    adapter.resolve_chunk_data(chunk_id, cache_manager)
+                    adapter.resolve_chunk_data(
+                        chunk_id,
+                        cache_manager,
+                        compose=self._pyramid_config.compute_scale_from_chunks,
+                    )
                     location = cache_manager.locate_entry(cache_key)
             except (OSError, ValueError) as e:
                 raise flight.FlightInternalError(

@@ -414,6 +414,12 @@ class PrecacheWorker:
             if not self._wait_until_idle():
                 return False
             try:
+                # No compose= here, deliberately. This warms the *coarsest*
+                # level of every tensor in the catalog; composing would make
+                # each of those chunks materialize and cache its full-resolution
+                # source, turning a cheap overview warmer into a whole-catalog
+                # hydrator against a cache the live path is already competing
+                # for. _has_headroom() gates volume, not this change in kind.
                 tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
                 warmed += 1
             except Exception as e:
