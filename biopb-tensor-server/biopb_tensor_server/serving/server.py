@@ -1483,6 +1483,14 @@ class TensorFlightServer(flight.FlightServerBase):
                 location = cache_manager.locate_entry(cache_key)
                 if location is None:
                     adapter.resolve_chunk_data(chunk_id, cache_manager)
+                    # A deferred cache write returns before the bytes are on
+                    # disk, and this reply IS a byte range -- so unlike do_get,
+                    # which is happy with the entry in memory, this caller has to
+                    # wait for the write it just triggered. Without it, every
+                    # cold locate would answer "unavailable" and send the client
+                    # back for a do_get, retiring the fast path exactly where it
+                    # was meant to win.
+                    cache_manager.await_deferred_write(cache_key)
                     location = cache_manager.locate_entry(cache_key)
             except (OSError, ValueError) as e:
                 raise flight.FlightInternalError(

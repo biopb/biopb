@@ -16,6 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
 from typing import Callable, Dict, Literal, Optional, Tuple
 
 import pyarrow as pa
@@ -164,6 +165,11 @@ class ArrowFileConfig:
     max_segment_bytes: int = 64 * 1024 * 1024  # 64 MB per segment
     max_total_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GB total
     pending_timeout: float = 300.0  # Max wait time for pending entries
+    # Bytes of committed-but-unwritten entries allowed to queue behind the
+    # writer thread. 0 keeps every write on the caller's thread. See
+    # ArrowFileBackend._enqueue_write for why this is a byte budget and not a
+    # queue depth, and what happens when it is reached.
+    max_deferred_write_bytes: int = 0
 
     def __post_init__(self):
         if isinstance(self.cache_dir, str):
@@ -189,6 +195,8 @@ class ArrowFileBackend(CacheBackend):
     4. Crash recovery: WAL detects incomplete writes
     """
 
+    SUPPORTS_DEFERRED_WRITES = True
+
     def __init__(self, config: ArrowFileConfig):
         self._config = config
         # ``_lock`` guards the in-memory index (``_entries``, ``_metadata``,
@@ -204,6 +212,26 @@ class ArrowFileBackend(CacheBackend):
         # sole mutators of writer/segment state). Readers never take it, so a
         # stalled or orphaned write can block only future writes, not reads.
         self._write_lock = threading.Lock()
+
+        # Deferred writes (max_deferred_write_bytes > 0). A committed entry is
+        # served from memory while one writer thread persists it, so a cold read
+        # stops paying for its own cache write. State guarded by _lock:
+        #   _deferred      keys whose write is queued or in flight. They are
+        #                  already READY, so _persist_entry's "still PENDING"
+        #                  guards consult this too, and they hold a reference so
+        #                  eviction cannot drop the batch out from under the
+        #                  writer.
+        #   _queued_bytes  the budget. Reaching it does not block and does not
+        #                  grow: the caller writes its own entry inline, so
+        #                  backpressure degrades to today's behaviour.
+        # `Queue` not `queue.Queue`: this module already uses `queue` as a
+        # local name when ranking pool queues, and the module import shadows it.
+        self._write_queue: Queue = Queue()
+        self._deferred: set = set()
+        self._queued_bytes = 0
+        self._deferred_write_failures = 0
+        self._writer_thread: Optional[threading.Thread] = None
+        self._writer_stopping = False
 
         # In-memory entries for pending/ready/error state management
         # Only stores small metadata; actual data is in segment files
@@ -1459,6 +1487,7 @@ class ArrowFileBackend(CacheBackend):
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
+        allow_deferred: bool = True,
     ) -> None:
         """Mark a pending entry as ready and persist it to a segment.
 
@@ -1470,10 +1499,27 @@ class ArrowFileBackend(CacheBackend):
         """
         if self._skip_if_oversized(key, data, size_bytes):
             return
+        if allow_deferred and self._enqueue_write(key, data, size_bytes):
+            return
+        self._persist_entry(key, data, size_bytes)
 
-        # Serialize the whole write/evict/close critical section. complete_entry
-        # is the only mutator of writer/segment state, so holding _write_lock
-        # keeps the selected segment stable across the unlocked write below.
+    def _persist_entry(
+        self,
+        key: bytes,
+        data: pa.RecordBatch,
+        size_bytes: int,
+    ) -> None:
+        """Write one entry to its segment and index it.
+
+        Runs on the caller's thread, or on the writer thread for a deferred
+        write. In the deferred case the entry is already READY and already in
+        ``_deferred``, which is what the ``_still_wanted`` guards below key on --
+        without that they would read "not PENDING, someone else handled it" and
+        drop the write on the floor.
+        """
+        # Serialize the whole write/evict/close critical section. This is the
+        # only mutator of writer/segment state, so holding _write_lock keeps the
+        # selected segment stable across the unlocked write below.
         with self._write_lock:
             # ---- PHASE 1: in-memory bookkeeping + segment selection ----
             # Everything here is in-memory or non-blocking-on-ENOSPC (dict
@@ -1484,7 +1530,7 @@ class ArrowFileBackend(CacheBackend):
             # every-chunk write+flush below is the path that matters.
             with self._lock:
                 entry = self._entries.get(key)
-                if entry is None or entry.state != EntryState.PENDING:
+                if not self._still_wanted(key, entry):
                     return
 
                 size_class = _get_size_class(size_bytes)
@@ -1544,7 +1590,7 @@ class ArrowFileBackend(CacheBackend):
             need_close = False
             with self._lock:
                 entry = self._entries.get(key)
-                if entry is None or entry.state != EntryState.PENDING:
+                if not self._still_wanted(key, entry):
                     # Raced away (failed/evicted while we wrote). The written
                     # bytes are harmless slack in the segment.
                     return
@@ -1574,7 +1620,8 @@ class ArrowFileBackend(CacheBackend):
                         byte_length=byte_length,
                     ),
                 )
-                entry.set_ready(data, size_bytes)
+                if entry.state == EntryState.PENDING:
+                    entry.set_ready(data, size_bytes)
                 need_close = bool(
                     seg_info and seg_info.size_bytes >= self._config.max_segment_bytes
                 )
@@ -1587,6 +1634,180 @@ class ArrowFileBackend(CacheBackend):
 
             if self._wal:
                 self._wal.log_committed(key)
+
+    # ---- deferred writes ----------------------------------------------------
+
+    def _still_wanted(self, key: bytes, entry: Optional[CacheEntry]) -> bool:
+        """Should ``_persist_entry`` keep going for this key? Caller holds _lock.
+
+        A synchronous write is persisting a PENDING entry. A deferred one is
+        persisting an entry already made READY, and only ``_deferred`` says the
+        write is still owed -- an entry that fell out of it was failed or
+        superseded while queued.
+        """
+        if entry is None:
+            return False
+        if entry.state == EntryState.PENDING:
+            return True
+        return entry.state == EntryState.READY and key in self._deferred
+
+    def _enqueue_write(
+        self,
+        key: bytes,
+        data: pa.RecordBatch,
+        size_bytes: int,
+    ) -> bool:
+        """Commit the entry from memory and queue its write. False = write now.
+
+        The entry goes READY before a byte reaches disk, so waiters and the
+        caller are released immediately. That is safe for a *cache*: the batch
+        is correct in memory, and until the write lands ``locate_entry`` finds
+        no byte range and the localhost handoff falls back to do_get, which is
+        the same fallback it already takes for an entry with no recorded range.
+        It is NOT safe where the cache is the only copy of the data -- see
+        ``CacheManager.put``, which never comes through here.
+
+        Returning False on a full budget is the whole backpressure story: the
+        caller writes its own entry inline and the queue stops growing. No
+        blocking, no unbounded memory, and the degraded behaviour is exactly
+        what every write does today.
+        """
+        if self._config.max_deferred_write_bytes <= 0:
+            return False
+        with self._lock:
+            if self._queued_bytes + size_bytes > self._config.max_deferred_write_bytes:
+                return False
+            entry = self._entries.get(key)
+            if entry is None or entry.state != EntryState.PENDING:
+                return False
+            # Hold a reference across the queue: the writer needs this batch, and
+            # an evicted entry would take it away mid-flight.
+            entry.acquire()
+            entry.set_ready(data, size_bytes)
+            self._deferred.add(key)
+            self._queued_bytes += size_bytes
+            self._ensure_writer()
+        self._write_queue.put((key, data, size_bytes))
+        return True
+
+    def _ensure_writer(self) -> None:
+        """Start the single writer thread on first use. Caller holds _lock.
+
+        One thread, not a pool: ``_persist_entry`` serializes on ``_write_lock``
+        anyway, so more threads would only queue against each other, and one
+        keeps segment writes in submission order.
+        """
+        if self._writer_thread is not None or self._writer_stopping:
+            return
+        self._writer_thread = threading.Thread(
+            target=self._drain_writes,
+            name="biopb-cache-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
+    def _drain_writes(self) -> None:
+        """Persist queued entries until told to stop."""
+        while True:
+            item = self._write_queue.get()
+            try:
+                if item is None:
+                    return
+                key, data, size_bytes = item
+                try:
+                    self._persist_entry(key, data, size_bytes)
+                except Exception as error:  # noqa: BLE001 - counted, not raised
+                    # The batch is still correct in memory and still served; it
+                    # just will not survive a restart. Nothing to fail, because
+                    # the caller was released long ago -- so the only honest
+                    # response is to say so loudly and count it.
+                    with self._lock:
+                        self._deferred_write_failures += 1
+                    logger.warning(
+                        "deferred cache write failed (serving from memory): %s",
+                        error,
+                    )
+                finally:
+                    with self._lock:
+                        self._deferred.discard(key)
+                        self._queued_bytes -= size_bytes
+                        entry = self._entries.get(key)
+                        if entry is not None:
+                            entry.release()
+            finally:
+                self._write_queue.task_done()
+
+    def flush_deferred_write(self, key: bytes, timeout: float = 5.0) -> bool:
+        """Wait for one key's deferred write, if it has one. True when on disk.
+
+        For the caller that specifically needs the *bytes on disk*, not the data:
+        the localhost handoff (issue #9) answers with a segment byte range, and a
+        committed-from-memory entry has none yet. Without this, deferring would
+        turn every cold locate into "unavailable" plus a do_get -- correct, but
+        it would retire the fast path exactly where it was meant to win.
+
+        Returns True when there is nothing to wait for, so a caller can treat it
+        as "is this locatable now" without knowing whether deferral is on.
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self._lock:
+                if key not in self._deferred:
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.002)
+
+    def flush_deferred_writes(self, timeout: Optional[float] = None) -> bool:
+        """Block until the queue drains. Returns False on timeout.
+
+        For shutdown and for tests that need "is it on disk yet" to be a
+        question with an answer.
+        """
+        if self._writer_thread is None:
+            return True
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            with self._lock:
+                if not self._deferred and self._write_queue.empty():
+                    return True
+            if deadline is not None and time.time() >= deadline:
+                return False
+            time.sleep(0.005)
+
+    def _stop_writer(self, timeout: float = 60.0) -> bool:
+        """Retire the writer thread. False means it is still running.
+
+        A False return is load-bearing, not advisory. ``_close_writer`` takes no
+        ``_write_lock`` -- it detaches the writer/sink and closes them -- while
+        ``_persist_entry``'s blocking phase runs with ``_lock`` released and
+        holds references it captured earlier. So closing segments while this
+        thread is alive closes a sink out from under an in-flight write, and any
+        ``.idx`` sidecar written from the index at that moment disagrees with the
+        segment it describes. That is not the torn tail the boot walk tolerates;
+        it is a sidecar that lies. The caller must leave the segments alone.
+
+        ``_writer_stopping`` is set first so nothing new is admitted while the
+        queue drains: the wait is bounded by the byte budget, not by traffic.
+        """
+        thread = self._writer_thread
+        if thread is None:
+            return True
+        self._writer_stopping = True
+        drained = self.flush_deferred_writes(timeout=timeout)
+        self._write_queue.put(None)
+        thread.join(timeout=timeout)
+        if thread.is_alive() or not drained:
+            logger.error(
+                "cache writer did not retire within %.0fs (drained=%s); "
+                "leaving segments, WAL and process lock untouched so the next "
+                "start recovers them",
+                timeout,
+                drained,
+            )
+            return False
+        self._writer_thread = None
+        return True
 
     def fail_entry(self, key: bytes, error: Exception) -> None:
         """Mark pending entry as failed."""
@@ -1724,6 +1945,8 @@ class ArrowFileBackend(CacheBackend):
             pending_waits=self._pending_waits,
             ref_held_evictions_skipped=self._ref_held_skips,
             oversized_skips=self._oversized_skips,
+            deferred_write_bytes=self._queued_bytes,
+            deferred_write_failures=self._deferred_write_failures,
             pool_stats=pool_stats,
         )
 
@@ -1731,7 +1954,7 @@ class ArrowFileBackend(CacheBackend):
         """Get recovery status from last initialization."""
         return self._recovery_status
 
-    def release_process_lock(self) -> None:
+    def release_process_lock(self, drain_timeout: float = 30.0) -> None:
         """Release the process lock + clear the WAL, leaving handles OPEN.
 
         The graceful-shutdown fast path (biopb/biopb#300). This is the cheap,
@@ -1744,19 +1967,71 @@ class ArrowFileBackend(CacheBackend):
         message (it breaks on ArrowInvalid/EOF), so torn-write safety does not
         depend on the WAL surviving. ``ProcessLock.release()`` is idempotent, so
         a later :meth:`close` re-releasing the lock is a harmless no-op.
+
+        Deferred writes are drained first. "Completed writes are already flushed"
+        stops being true once an entry can be committed from memory: the queued
+        ones are held by a daemon thread that dies with the process, so what this
+        path hands the next boot would silently be missing them -- and clearing
+        the WAL underneath an in-flight write would drop its pending record too.
+
+        Bounded, and on a failed drain this does nothing at all rather than
+        doing half of it. Both statements it would make are false while a writer
+        is still running: the WAL has pending records that still matter, and the
+        process lock is what stops a second process opening the segments that
+        thread is writing. Leaving both is what makes the next start recover;
+        see :meth:`close` for the whole policy.
         """
+        if not self.flush_deferred_writes(timeout=drain_timeout):
+            logger.error(
+                "cache writer still running at shutdown; keeping the WAL and "
+                "the process lock so the next start recovers"
+            )
+            return
         with self._lock:
             if self._wal:
                 self._wal.clear()
             if self._process_lock:
                 self._process_lock.release()
 
-    def close(self) -> None:
+    def close(self, drain_timeout: float = 60.0) -> None:
         """Close backend and release resources.
 
         This preserves segment files for persistence across restarts.
         Only releases locks and closes handles.
+
+        Drains any deferred writes first: an entry committed from memory is on
+        disk only once its queued write lands, and sealing the segments out from
+        under the writer would lose exactly the entries a restart is meant to
+        find.
+
+        If that drain fails, this shuts down WITHOUT touching the segments, the
+        WAL or the process lock, and the next start recovers instead. Waiting
+        indefinitely is not the alternative: shutdown is deliberately bounded
+        (``cli.py`` runs the Flight drain in a daemon thread for the same
+        reason), and a wedged filesystem is when exiting matters most. So the
+        choice is what to leave behind, and the answer is: the evidence.
+
+        - The WAL keeps its pending records, which is what makes the next start
+          run ``_recover()``.
+        - The process lock is NOT released. It is what stops two processes
+          writing one segment, and a daemon writer thread is still writing. It
+          also becomes the second, independent trigger for recovery.
+        - No segment is sealed and no ``.idx`` sidecar is written, so the boot
+          walks the bodies -- which already tolerates a torn tail -- rather than
+          trusting an index that was still moving.
+
+        The cost is a slower next start for those segments, on a path that
+        should be unreachable in practice: the queue is capped by
+        ``max_deferred_write_bytes`` and admissions stop when the drain begins,
+        so a 512 MiB budget at the measured ~368 MB/s drains in ~1.4 s against a
+        60 s bound. A timeout here means the disk is gone, not that it was busy.
+
+        ``drain_timeout`` is how long that bound is. It exists as an argument
+        because the bound is a deployment question, not a constant.
         """
+        if not self._stop_writer(drain_timeout):
+            return
+
         # Seal the still-open write segments (flush their streams), capturing
         # their index records so we can persist their sidecars below.
         # Rotation-sealed segments already have a sidecar and are not open.
