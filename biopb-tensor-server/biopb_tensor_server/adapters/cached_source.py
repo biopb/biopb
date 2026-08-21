@@ -284,6 +284,12 @@ class CachedSourceAdapter(TensorAdapter):
     ) -> pa.RecordBatch:
         """Resolve chunk data from cache manager.
 
+        Never composes, and needs no signature to say so: this override does not
+        reach the base implementation at all. The source has no backend to
+        compose *from* and serves only chunk_ids that were written; making a
+        scaled read work here means composing out of those written chunks, which
+        is a separate change.
+
         Cache-backed sources have no backend data - all data is stored in
         the cache manager via write_chunk/write_chunk_arrow.
 

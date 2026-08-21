@@ -61,6 +61,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     routing_array_id,
 )
+from biopb_tensor_server.core.compose import without_composition
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
@@ -611,7 +612,16 @@ class PrecacheWorker:
             if not self._wait_until_idle():
                 return _Outcome.HALTED
             try:
-                tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
+                # Opted out deliberately. Warming is scaled-reads-only on
+                # purpose (see the module docstring): a full-resolution warm
+                # charges a cache write to a workflow with no re-read to pay it
+                # back. Composing would write those full-resolution chunks
+                # anyway, as a side effect of every scaled warm, multiplying
+                # what one warmed chunk costs the cache by the scale product.
+                # _has_headroom() gates volume between chunks, so it cannot see
+                # that coming and cannot gate a change in kind.
+                with without_composition():
+                    tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
                 warmed += 1
                 if pass_ctx is not None:
                     pass_ctx.warmed += 1

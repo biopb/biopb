@@ -539,6 +539,16 @@ class NormalizingAdapter(TensorAdapter):
         if perm is None:
             return self._inner.resolve_chunk_data(chunk_id, cache_manager)
 
+        # Under a real permutation composing does not apply, and nothing has to
+        # suppress it: the delegate is handed no cache manager below -- this
+        # wrapper owns the caching so that what lands in a segment is what the
+        # client is served -- and composing without one is a no-op by
+        # construction. It could not work anyway: the chunk_ids on this side are
+        # in canonical axis order while the delegate's grid is in its own, so
+        # ids minted here would name bounds the delegate never serves. Composing
+        # a transposed source means minting them on the delegate's side, which
+        # is its own change.
+
         should_cache = cache_manager is not None and (
             is_scaled_chunk(chunk_id)
             or isinstance(cache_manager.backend, ArrowFileBackend)

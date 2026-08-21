@@ -47,6 +47,12 @@ class CacheManager:
 
     def __init__(self, config: CacheConfig):
         """Initialize with CacheConfig, selecting backend based on config.backend."""
+        # Read by ``compose.enabled_for``. It lives here rather than as an
+        # argument to ``resolve_chunk_data`` because that signature is the
+        # adapter contract and must keep working for adapters written against
+        # the published one -- and because what composing changes is what this
+        # cache ends up holding.
+        self.compose_scaled_reads = config.compute_scale_from_chunks
         if config.backend == "memory":
             self._backend = MemoryCacheBackend(
                 MemoryCacheConfig(

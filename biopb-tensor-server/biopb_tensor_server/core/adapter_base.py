@@ -40,6 +40,7 @@ from biopb_tensor_server.core.chunk import (
     _version_header,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
+    content_version_of,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
@@ -49,6 +50,12 @@ from biopb_tensor_server.core.chunk import (
     normalized_scale_hint,
     normalized_slice_bounds,
     scaled_virtual_chunk_size,
+    wrap_content_version,
+)
+from biopb_tensor_server.core.compose import (
+    compose_scaled_chunk,
+    descending as composing_descent,
+    enabled_for as compose_enabled_for,
 )
 from biopb_tensor_server.core.downsample import (
     ceil_div,
@@ -835,6 +842,17 @@ class TensorAdapter(SourceAdapter):
         The default implementation reads raw chunk data with ``self.get_data()``.
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+
+        A scaled chunk may be built from the full-resolution chunks under it
+        rather than from one read of the whole extent
+        (:mod:`biopb_tensor_server.core.compose`), which is what leaves those
+        chunks in the cache for the next read at any scale. Whether to is a
+        property of the cache being populated, so it is read off the manager --
+        deliberately not a new parameter here. This signature is the adapter
+        contract: it is quoted in docs/remote-tensor-cache.md and
+        docs/volume-rendering.md and listed in ``_TENSOR_SCOPED_API``, so an
+        out-of-tree adapter overriding it as documented must keep working.
+        ``compose.without_composition()`` is how a caller opts out.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
@@ -853,15 +871,31 @@ class TensorAdapter(SourceAdapter):
         )
 
         def compute_fn():
-            result_arr = self.get_data(bounds)
-
             if is_scaled_chunk_flag:
-                scale_hint = decode_scale_info(chunk_id)
                 # The requested reduction_method rides in the chunk_id (#578), so a
                 # do_get honors it; a method-free (old/area) scaled chunk_id decodes
-                # to the default. Crop + downsample (bounds aligned via floor_div).
+                # to the default.
+                scale_hint = decode_scale_info(chunk_id)
                 reduction_method = decode_reduction_method(chunk_id)
-                result_arr = downsample_block(result_arr, scale_hint, reduction_method)
+                composed = self._compose_scaled_chunk(
+                    chunk_id,
+                    bounds,
+                    scale_hint,
+                    reduction_method,
+                    cache_manager,
+                )
+                # Crop + downsample (bounds aligned via floor_div) is the path
+                # taken whenever composing is off, inexact for this reduction, or
+                # the extent is off the transfer grid.
+                result_arr = (
+                    composed
+                    if composed is not None
+                    else downsample_block(
+                        self.get_data(bounds), scale_hint, reduction_method
+                    )
+                )
+            else:
+                result_arr = self.get_data(bounds)
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
             # string, wrapped zero-copy. This preserves the exact dtype including
@@ -882,6 +916,76 @@ class TensorAdapter(SourceAdapter):
             data, _ = compute_fn()
 
         return data
+
+    def _compose_scaled_chunk(
+        self,
+        chunk_id: bytes,
+        bounds: ChunkBounds,
+        scale_hint: Tuple[int, ...],
+        reduction_method: str,
+        cache_manager: Optional[CacheManager],
+    ) -> Optional[np.ndarray]:
+        """Build a scaled chunk from cached full-resolution chunks, or None.
+
+        None means "not composable here" and is the normal answer, not an error:
+        the caller falls back to reading the extent. Refused when
+
+        - this cache is not configured to compose, this thread opted out, or
+          this is already a composed fetch (``compose.enabled_for``);
+        - the backend does not cache raw chunks (``should_cache`` only extends
+          to them on ``ArrowFileBackend``), so composing would fetch the same
+          bytes and keep none of them -- all of the cost, none of the point;
+        - the descriptor is unresolved, so there is no grid to tile with.
+
+        :func:`compose_scaled_chunk` refuses the remaining two cases itself --
+        a reduction that does not stream exactly, and an extent off the grid.
+        """
+        from biopb_tensor_server.cache import ArrowFileBackend
+
+        if cache_manager is None or not compose_enabled_for(cache_manager):
+            return None
+        if not isinstance(cache_manager.backend, ArrowFileBackend):
+            return None
+
+        descriptor = self.get_tensor_descriptor()
+        try:
+            require_resolved(descriptor)
+        except SourceUnresolvedError:
+            return None
+        tensor_shape = tuple(int(dim) for dim in descriptor.shape)
+        transfer_chunk = self.get_transfer_chunk_size()
+        if len(transfer_chunk) != len(tensor_shape):
+            return None
+
+        array_id = descriptor.array_id
+        # The raw chunk_ids must be byte-identical to the ones a full-resolution
+        # read plan mints, or the chunks land in a namespace nothing else looks
+        # in. That means carrying this chunk_id's own content_version (#178).
+        version = content_version_of(chunk_id)
+
+        def fetch(chunk_start, chunk_stop):
+            raw_bounds = ChunkBounds(start=list(chunk_start), stop=list(chunk_stop))
+            raw_id = encode_chunk_id(array_id, raw_bounds)
+            if version is not None:
+                raw_id = wrap_content_version(raw_id, version)
+            # Straight back through resolve_chunk_data, so the raw chunk is
+            # cached under its own key by the same code the read path uses --
+            # which also means the reference it takes is released there, and
+            # nothing is held across the fold below.
+            with composing_descent():
+                batch = self.resolve_chunk_data(raw_id, cache_manager)
+            return unpack_chunk_array(batch)
+
+        return compose_scaled_chunk(
+            fetch,
+            tuple(int(value) for value in bounds.start),
+            tuple(int(value) for value in bounds.stop),
+            tensor_shape,
+            tuple(int(value) for value in transfer_chunk),
+            tuple(int(value) for value in scale_hint),
+            reduction_method,
+            descriptor.dtype,
+        )
 
     def get_read_plan(
         self,

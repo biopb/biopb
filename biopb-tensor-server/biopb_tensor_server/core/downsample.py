@@ -280,6 +280,24 @@ def _plan_integer_area(
     return _integer_accumulator(dtype, block_size), block_size
 
 
+def streaming_area_plan(
+    dtype: np.dtype, scale_hint: Tuple[int, ...]
+) -> Tuple[Optional[np.dtype], int]:
+    """The area plan :func:`downsample_block` would use, for a streamed reduce.
+
+    Public because composing a scaled chunk out of full-resolution chunks
+    (``core/compose.py``) has to reproduce this function's output bit for bit,
+    and can only do so on the integer path: block sums are exact and order
+    independent, so they may be accumulated chunk by chunk in any order. The
+    staged float means are neither, so a composer that gets ``None`` here has to
+    read the whole extent and call :func:`downsample_block` instead.
+
+    Exported rather than reimplemented so the two paths cannot drift on which
+    inputs qualify.
+    """
+    return _plan_integer_area(dtype, scale_hint)
+
+
 def get_output_dtype(base_dtype: str, reduction_method: str) -> str:
     return np.dtype(base_dtype).str
 
