@@ -362,3 +362,44 @@ def test_the_graceful_shutdown_path_drains_too(directory):
             assert backend.locate_entry(f"k{index}".encode()) is not None
     finally:
         backend.close()
+
+
+def test_a_cold_locate_still_answers_with_a_byte_range(directory):
+    """The localhost handoff must not be retired by deferring.
+
+    A cold locate does not simply fall back to do_get: the handler resolves the
+    chunk -- materializing AND caching it -- then locates again, and only reports
+    "unavailable" if that second locate fails. Deferring makes the second locate
+    fail every time, because the entry is committed from memory with no byte
+    range yet, so this caller has to wait for the write it just triggered. It is
+    the one reader that wants bytes on disk rather than data in hand.
+    """
+    backend = _backend(directory, deferred_mb=64)
+    try:
+        batch = _batch(8)
+        # Step 1: cold, nothing to locate.
+        assert backend.locate_entry(b"k") is None
+        # Step 2: the handler resolves, which caches from memory.
+        _store(backend, b"k", batch)
+        backend.release(b"k")
+        # Step 3: without the wait this is still None and the client is sent
+        # away; with it, the fast path answers as it did before deferring.
+        assert backend.flush_deferred_write(b"k", timeout=30) is True
+        assert backend.locate_entry(b"k") is not None
+    finally:
+        backend.close()
+
+
+def test_awaiting_a_key_with_no_deferred_write_is_free(directory):
+    """True immediately, so the caller need not know whether deferral is on."""
+    backend = _backend(directory, deferred_mb=0)
+    try:
+        batch = _batch(9)
+        _store(backend, b"k", batch)
+        backend.release(b"k")
+        start = time.perf_counter()
+        assert backend.flush_deferred_write(b"k", timeout=30) is True
+        assert time.perf_counter() - start < 0.5
+        assert backend.flush_deferred_write(b"never-stored", timeout=30) is True
+    finally:
+        backend.close()

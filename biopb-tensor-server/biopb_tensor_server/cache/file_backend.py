@@ -1735,6 +1735,27 @@ class ArrowFileBackend(CacheBackend):
             finally:
                 self._write_queue.task_done()
 
+    def flush_deferred_write(self, key: bytes, timeout: float = 5.0) -> bool:
+        """Wait for one key's deferred write, if it has one. True when on disk.
+
+        For the caller that specifically needs the *bytes on disk*, not the data:
+        the localhost handoff (issue #9) answers with a segment byte range, and a
+        committed-from-memory entry has none yet. Without this, deferring would
+        turn every cold locate into "unavailable" plus a do_get -- correct, but
+        it would retire the fast path exactly where it was meant to win.
+
+        Returns True when there is nothing to wait for, so a caller can treat it
+        as "is this locatable now" without knowing whether deferral is on.
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self._lock:
+                if key not in self._deferred:
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.002)
+
     def flush_deferred_writes(self, timeout: Optional[float] = None) -> bool:
         """Block until the queue drains. Returns False on timeout.
 
