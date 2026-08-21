@@ -621,9 +621,9 @@ class TensorAdapter(SourceAdapter):
         (biopb/biopb#809). The server sizes nothing on the adapter's behalf here
         -- an adapter that knows its physical layout would only have its answer
         undone, which is what made biopb/biopb#806 unfixable while the planner
-        ran on this seam -- and it must not apply the endpoint floor either: the
-        cache-backed sources serve *only* the chunk_ids that were written, so a
-        re-planned grid asks for bounds that do not exist.
+        ran on this seam -- and re-planning would also break the cache-backed
+        sources, which serve *only* the chunk_ids that were written, so a grid
+        that is not theirs asks for bounds that do not exist.
 
         The one thing left is the wire bound: ``MAX_ARROW_BATCH_BYTES`` is a
         property of Arrow IPC, not of any format, so a declared grid above it is

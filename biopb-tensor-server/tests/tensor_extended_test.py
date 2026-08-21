@@ -267,7 +267,14 @@ class TestHdf5Adapter:
             desc = adapter.get_tensor_descriptor()
             assert desc.array_id == "hdf5-test"
             assert tuple(desc.shape) == shape
-            assert tuple(desc.chunk_shape) == chunks
+            # The HDF5 chunks seed the transfer grid; they are not it. This
+            # dataset is far below the transfer target, so it ships whole
+            # (biopb/biopb#809), still a whole multiple of the native blocks.
+            grid = tuple(desc.chunk_shape)
+            assert all(
+                g % c == 0 and g <= dim
+                for g, c, dim in zip(grid, chunks, shape, strict=True)
+            )
 
     @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
     def test_holds_no_handle_between_reads(self, hdf5_dataset):

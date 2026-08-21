@@ -398,13 +398,18 @@ def decode_reduction_method(chunk_id: bytes) -> str:
 
 
 # Constants
-# Preferred transfer size and hard Arrow batch ceiling (biopb/biopb#684). Only
-# MAX_ARROW_BATCH_BYTES is a wire fact the server enforces on every grid; the
-# other two are the default sizing policy, applied where an adapter asks for it
-# via default_transfer_chunk_shape and never over a grid it declared itself.
+# Preferred transfer size and hard Arrow batch ceiling (biopb/biopb#684).
+# MAX_ARROW_BATCH_BYTES is a wire fact the server enforces on every grid;
+# PREFERRED_ARROW_BATCH_BYTES is the default sizing target, applied only where an
+# adapter asks for it via default_transfer_chunk_shape and never over a grid the
+# adapter declared itself.
+#
+# There is deliberately no minimum-endpoint floor. Chunk size is the only knob:
+# a tensor that fits in one preferred-size chunk *is* one chunk, and splitting a
+# 512x512 snapshot into four to manufacture parallelism costs round trips to
+# parallelize work that was never the bottleneck.
 PREFERRED_ARROW_BATCH_BYTES = 8 * 1024 * 1024
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
-MIN_TRANSFER_ENDPOINTS = 4
 
 
 @dataclass(slots=True)
@@ -764,7 +769,6 @@ def scaled_virtual_chunk_size(
     output_dtype: Optional[str] = None,
     max_read_block_bytes: int = MAX_READ_BLOCK_BYTES,
     maximum_bytes: int = MAX_ARROW_BATCH_BYTES,
-    minimum_endpoints: int = MIN_TRANSFER_ENDPOINTS,
 ) -> Tuple[int, ...]:
     """Size the source extent one scaled chunk reads.
 
@@ -783,8 +787,9 @@ def scaled_virtual_chunk_size(
     the scale, so the logical chunks tile without overlapping, and a multiple of
     the transfer extent, so reads stay aligned to the grid the adapter reports.
     It is clamped by ``max_read_block_bytes``, which exists to bound resident
-    memory rather than to tune throughput, and stops before the grid falls below
-    ``minimum_endpoints``, which is what keeps endpoint-level parallelism.
+    memory rather than to tune throughput. Nothing holds a minimum endpoint
+    count: ``transfer * scale`` already pins the delivered chunk to the transfer
+    target, so a read that fits in one chunk is one chunk.
 
     Growth uses the generic axis priority, but it moves in whole units, so an
     adapter that folded its physical layout into the transfer grid keeps it
@@ -837,9 +842,7 @@ def scaled_virtual_chunk_size(
         estimate_chunk_bytes(unit, dtype),
         min(scaled_target, max_read_block_bytes, wire_limit),
     )
-    return _coalesce_chunk_size(
-        unit, tensor_shape, dtype, dim_labels, target_bytes, minimum_endpoints
-    )
+    return _coalesce_chunk_size(unit, tensor_shape, dtype, dim_labels, target_bytes)
 
 
 def default_transfer_chunk_shape(
@@ -877,7 +880,6 @@ def compute_transfer_chunk_size(
     dim_labels: Optional[List[str]],
     preferred_bytes: Optional[int] = None,
     maximum_bytes: Optional[int] = None,
-    minimum_endpoints: Optional[int] = None,
 ) -> Tuple[int, ...]:
     """Size a transfer grid around ``native_chunk_size``.
 
@@ -889,11 +891,6 @@ def compute_transfer_chunk_size(
     T/unknown, while retaining enough endpoints for parallel reads and scheduler
     utilization.
 
-    ``minimum_endpoints`` lives here rather than in the server's clamp on the
-    adapter's answer: it is a sizing policy, and enforcing it over a *declared*
-    grid would overrule an adapter that means "one chunk" -- and would re-break
-    the cache-backed sources whose grid is binding (biopb/biopb#809).
-
     ``maximum_bytes`` is the hard wire ceiling; ``preferred_bytes`` is the
     optimization target. Both default to the module constants, read at call time
     so a sweep can move them. Scaled reads do not run this optimizer a second
@@ -904,9 +901,6 @@ def compute_transfer_chunk_size(
         PREFERRED_ARROW_BATCH_BYTES if preferred_bytes is None else preferred_bytes
     )
     maximum_bytes = MAX_ARROW_BATCH_BYTES if maximum_bytes is None else maximum_bytes
-    minimum_endpoints = (
-        MIN_TRANSFER_ENDPOINTS if minimum_endpoints is None else minimum_endpoints
-    )
     if len(native_chunk_size) != len(tensor_shape):
         raise ValueError(
             "Native chunk rank must match tensor rank: "
@@ -916,8 +910,6 @@ def compute_transfer_chunk_size(
         raise ValueError("Chunk byte targets must be positive")
     if preferred_bytes > maximum_bytes:
         raise ValueError("Preferred chunk bytes must not exceed the maximum")
-    if minimum_endpoints <= 0:
-        raise ValueError("Minimum transfer endpoints must be positive")
     if any(int(dim) <= 0 for dim in tensor_shape):
         raise ValueError(f"Tensor dimensions must be positive: {tensor_shape}")
     if any(int(dim) <= 0 for dim in native_chunk_size):
@@ -940,7 +932,6 @@ def compute_transfer_chunk_size(
             dtype,
             dim_labels,
             preferred_bytes,
-            minimum_endpoints,
         )
     else:
         result = native
@@ -1006,12 +997,13 @@ def _coalesce_chunk_size(
     dtype: str,
     dim_labels: Optional[List[str]],
     target_bytes: int,
-    minimum_endpoints: int,
 ) -> Tuple[int, ...]:
     """Grow whole native blocks toward ``target_bytes``.
 
     Spatial axes share a priority tier and grow in balanced doubling steps so a
-    square tile grid does not become a needlessly long strip.
+    square tile grid does not become a needlessly long strip. Growth stops at
+    ``target_bytes`` and at the tensor's own extent -- nothing else. A tensor
+    small enough to fit in one chunk becomes one chunk.
     """
     current = list(native)
     max_blocks = [
@@ -1035,16 +1027,6 @@ def _coalesce_chunk_size(
     def blocks(axis: int) -> int:
         return current[axis] // native[axis]
 
-    def endpoint_count(chunk: Sequence[int]) -> int:
-        return int(
-            np.prod(
-                [
-                    ceil_div(int(shape), int(size))
-                    for shape, size in zip(tensor_shape, chunk, strict=True)
-                ]
-            )
-        )
-
     while True:
         candidates = []
         for axis in range(len(current)):
@@ -1055,10 +1037,7 @@ def _coalesce_chunk_size(
             candidate = list(current)
             candidate[axis] = native[axis] * new_blocks
             candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
-            if (
-                candidate_bytes <= target_bytes
-                and endpoint_count(candidate) >= minimum_endpoints
-            ):
+            if candidate_bytes <= target_bytes:
                 candidates.append(
                     (
                         priority(axis),
@@ -1086,8 +1065,6 @@ def _coalesce_chunk_size(
         candidate = list(current)
         candidate[axis] = native[axis] * new_blocks
         candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
-        if endpoint_count(candidate) < minimum_endpoints:
-            continue
         candidates.append(
             (priority(axis), target_bytes - candidate_bytes, axis, candidate)
         )

@@ -193,7 +193,7 @@ class TestRemoteTensorProxy:
             upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_proxy_sliced_read_preserves_slice_hint(self):
+    def test_proxy_sliced_read_preserves_slice_hint(self, transfer_target):
         """A sliced read through the proxy keeps slice_hint on the forwarded plan,
         so the client can crop the outward-snapped result.
 
@@ -212,6 +212,11 @@ class TestRemoteTensorProxy:
             TensorReadOption,
         )
         from pyarrow import flight
+
+        # One plane per chunk upstream, so the forwarded grid is something the
+        # proxy could get wrong; at the default target the whole 12 KB volume is
+        # one chunk and the test would prove nothing (biopb/biopb#809).
+        transfer_target(40 * 50 * 2)
 
         with tempfile.TemporaryDirectory() as tmp:
             zpath = f"{tmp}/vol.zarr"
@@ -331,7 +336,7 @@ class TestRemoteTensorProxy:
                 upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_forward_flight_info_returns_upstream_transfer_grid(self):
+    def test_forward_flight_info_returns_upstream_transfer_grid(self, transfer_target):
         """forward_flight_info forwards a whole GetFlightInfo to the upstream and
         returns ITS endpoints on the transfer grid + server-advertised pyramid --
         the proxy re-derives no grid or pyramid locally, so the advisory (empty)
@@ -348,6 +353,11 @@ class TestRemoteTensorProxy:
             peel_proxy_envelope,
             routing_array_id,
         )
+
+        # One plane per chunk upstream, so the forwarded grid is something the
+        # proxy could get wrong; at the default target the whole 12 KB volume is
+        # one chunk and the test would prove nothing (biopb/biopb#809).
+        transfer_target(40 * 50 * 2)
 
         with tempfile.TemporaryDirectory() as tmp:
             zpath = f"{tmp}/vol.zarr"

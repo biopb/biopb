@@ -236,7 +236,9 @@ class TestNormalizeAdapter:
             said = lines[0].getMessage()
             assert "['z', 'y', 'x']" in said and "['x', 'y', 'z']" in said
 
-    def test_the_chunk_lookup_path_does_not_reclassify(self, monkeypatch):
+    def test_the_chunk_lookup_path_does_not_reclassify(
+        self, monkeypatch, transfer_target
+    ):
         """``get_tensor_adapter`` / ``get_level_adapter`` sit on the do_get path
         -- the server resolves a chunk's adapter through them on *every* read --
         so running the source-level classifier there cost a full
@@ -244,6 +246,10 @@ class TestNormalizeAdapter:
         it permutes is ``perm``'s business, made per access.
         """
         from biopb_tensor_server import ZarrAdapter
+
+        # The subject is the per-chunk lookup, so the plan needs several chunks;
+        # at the default target this 96-byte array is one (biopb/biopb#809).
+        transfer_target(32)
 
         calls = {"n": 0}
         real = ZarrAdapter.list_tensor_descriptors
@@ -375,17 +381,20 @@ class TestNormalizedDescriptorAndData:
                 out[sl] = arr
             np.testing.assert_array_equal(out, src.transpose(2, 1, 0))
 
-    def test_slice_hint_is_interpreted_in_canonical_order(self):
+    def test_slice_hint_is_interpreted_in_canonical_order(self, transfer_target):
         """A client's hints arrive canonical and must be inverse-permuted before
         the delegate plans against them."""
+        # One canonical block per chunk, so the requested slice is a real subset
+        # of the grid; at the default target this 48-byte source is one chunk
+        # and the slice would snap out to the whole tensor (biopb/biopb#809).
+        transfer_target(4)
         with tempfile.TemporaryDirectory() as tmp:
             adapter, src = self._wrapped(tmp)
             read_opt = TensorReadOption(tensor_id="src")
             read_opt.slice_hint.start[:] = [0, 0, 0]
             read_opt.slice_hint.stop[:] = [2, 3, 2]
             plan = adapter.plan_flight_info(read_opt, PyramidConfig())
-            # The canonical slice is interpreted correctly. The small source
-            # retains its native grid to preserve endpoint parallelism.
+            # The canonical slice is interpreted correctly.
             assert list(plan.descriptor.shape) == [2, 3, 2]
             assert list(plan.descriptor.slice_hint.start) == [0, 0, 0]
             assert list(plan.descriptor.slice_hint.stop) == [2, 3, 2]

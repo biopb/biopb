@@ -252,9 +252,10 @@ class TestCachedSourceAdapter:
         planned at four blocks per chunk and *none* of the planned chunk_ids
         existed -- every read raised "Chunk not found" (biopb/biopb#809).
 
-        The array is deliberately big enough that coalescing had room to move:
-        the older tests here use 100x100, where the endpoint floor pinned the
-        grid to the native one and hid the bug.
+        The array is deliberately big enough that coalescing had room to move.
+        The older tests here use 100x100, which the sizing policy of the day
+        happened to leave on its native grid -- so they passed either way and
+        hid the bug.
         """
         shape = [1, 4, 64, 1024, 1024]
         grid = [1, 1, 1, 1024, 1024]

@@ -801,10 +801,17 @@ class TestCacheIntegration:
             server.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_different_regions_different_cache_entries(self, simple_zarr_array):
+    def test_different_regions_different_cache_entries(
+        self, simple_zarr_array, transfer_target
+    ):
         """Test that different regions create different cache entries."""
         import zarr
         from biopb_tensor_server import ZarrAdapter
+
+        # Two regions can only land in different cache entries if they land in
+        # different chunks; at the default target this 16 KB array is one chunk
+        # (biopb/biopb#809).
+        transfer_target(64 * 64)
 
         zarr_path, shape, chunks = simple_zarr_array
 
@@ -829,8 +836,7 @@ class TestCacheIntegration:
             darr[: chunks[0], : chunks[1]].compute()
             nbytes1 = client.cache_info()["size_bytes"]
 
-            # Read a different native zarr region. This four-block tensor keeps
-            # its native grid to preserve endpoint-level parallelism (#684).
+            # Read a different chunk of the grid the target above pins.
             darr[chunks[0] : chunks[0] * 2, chunks[1] : chunks[1] * 2].compute()
             nbytes2 = client.cache_info()["size_bytes"]
 
