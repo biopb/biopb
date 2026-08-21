@@ -132,14 +132,22 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim a resident local TIFF or LSM without reading its content.
+        """Claim a local TIFF or LSM by extension alone, without reading it.
 
         Claim ownership is determined by registry priority and source family.
         Native construction validates the file and raises for malformed or
         otherwise unreadable resident files; those files cannot be made usable
         by the lower-priority BioIO fallback anyway.
+
+        Definite even under a cloud root and even for a dehydrated placeholder:
+        the claim reads nothing, so it cannot trigger a recall, and deferring a
+        non-resident file is the source manager's job
+        (``_claim_is_unresolved``), not this one's. Guarding on residency here
+        would also outlive the placeholder -- the resolve-time re-claim still
+        carries ``cloud_root=True``, so a hydrated file would never reach this
+        adapter.
         """
-        if not ctx.is_file() or ctx.is_remote or ctx.cloud_root:
+        if not ctx.is_file() or ctx.is_remote:
             return None
 
         name = ctx.name.lower()
@@ -147,9 +155,6 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             if not name.endswith(".lsm"):
                 return None
         elif not name.endswith(_SUPPORTED_EXTENSIONS):
-            return None
-
-        if not ctx.is_resident():
             return None
 
         state.try_claim_path(ctx.path_str)

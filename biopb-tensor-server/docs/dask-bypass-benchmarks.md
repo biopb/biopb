@@ -198,7 +198,8 @@ native reader against a held handle is O(1).
 
 ## Recommendation
 
-0. **Phase 1 local TIFF/LSM is complete; remote sources stay on BioIO.**
+0. **Local TIFF/LSM (phase 1) and CZI (phase 2) are complete; remote sources
+   stay on BioIO.**
    `OmeTiffAdapter` and `TiffSequenceAdapter`
    both decline remote URLs today, so a remote `.tif` already falls through to
    the bioio `aics` adapter and its fsspec path -- `ome_tiff.py`'s persistent
@@ -221,7 +222,40 @@ native reader against a held handle is O(1).
    server's responsibility.
 3. **`.czi`** — only 2x on whole planes, but 20-29x on tiles plus a native
    `zoom=` that subsumes the fused read+reduce #640 asks for. The case rests on
-   sub-plane and pyramid access, not on plane reads.
+   sub-plane and pyramid access, not on plane reads. **Delivered** by
+   `CziAdapter` (`adapters/czi.py`), measured end to end through `get_data`
+   against the same file read through BioIO:
+
+   | blocks | plane read | 256x256 tile |
+   | --- | --- | --- |
+   | 40 (2C x 20Z, 512²) | 3.30 -> 0.161 ms (20.5x) | 3.25 -> 0.154 ms (21.1x) |
+   | 1 000 (2C x 500Z, 512²) | 78.77 -> 0.172 ms (459x) | 79.32 -> 0.142 ms (560x) |
+   | 4 (1C x 4Z, 2048²) | 3.65 -> 2.114 ms (1.7x) | 3.75 -> 0.887 ms (4.2x) |
+
+   The block-count row is the O(blocks) graph cost; the 4-block row isolates the
+   over-read, where only the tile column moves.
+
+   `CziAdapter` has **no BioIO fallback** and imports nothing from it: every
+   local CZI is served natively, and a remote one is declined by `claim()` so
+   the registry hands it to `ZeissAdapter`. RGB (`Bgr*`) documents read with a
+   trailing samples axis, byte-identical to BioIO (libCZI returns the samples
+   as stored and BioIO does not reorder them). An acquisition dimension outside
+   T/C/Z — phase, view, illumination, rotation, block — is carried under its
+   own name ahead of the canonical axes rather than folded onto one of them;
+   the normalization contract only requires Y/X and samples to trail, so any
+   other label is legal where it sits. The one refusal is a document whose
+   channels differ in pixel type: it has no single tensor dtype, and BioIO
+   fails on it too (`cannot reshape array of size N`).
+
+   One thing neither reader can detect at registration: a document whose
+   subblock coordinates do not start at 0. `total_bounding_box` reports a
+   *count*, not an index range, so a file written at T=5..7 reports `T: (0, 3)`
+   and both readers raise `Coordinate for dimension 'T' is out-of-range` on the
+   first read. `zoom=` is **not** wired up: the
+   server downsamples a scaled chunk with `downsample_block`, whose reduction
+   methods (`area`/`max`/...) libCZI's own scaling accessor does not reproduce,
+   so routing scaled reads through it would silently change pixel values. That
+   is a read-planner change, not an adapter one.
 4. **`.lif`** — O(blocks) overhead only; readlif offers no ROI, so there is no
    over-read win on top.
 5. **`.dv`** — flat in block count and a memmap underneath; lowest priority.
@@ -239,7 +273,10 @@ native reader against a held handle is O(1).
   magic `70 00 00 00`, a UTF-16 XML header, then memory blocks. `bioio-lif`
   additionally requires `LUTName` on each `ChannelDescription`. Plane order
   inside a block is `n = t*(C*Z) + z*C + c`, matching `get_frame()`.
-- **CZI** via `pylibCZIrw.create_czi`, **DV** via `mrc.save`. `mrc.save` records
+- **CZI** via `pylibCZIrw.create_czi` (`create_zeiss_czi`, plus
+  `create_zeiss_czi_scenes` for a document whose scenes sit at different plane
+  offsets — the layout that separates absolute from scene-relative ROI
+  coordinates), **DV** via `mrc.save`. `mrc.save` records
   no channel count, so a multi-channel DV fails bioio's coordinate validation —
   keep synthetic DV single-channel.
 

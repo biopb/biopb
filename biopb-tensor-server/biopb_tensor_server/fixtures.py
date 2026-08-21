@@ -853,14 +853,23 @@ def create_leica_lif(
     return str(lif_path), expected.transpose(0, 2, 1, 3, 4)
 
 
+def _czi_plane(n_y: int, n_x: int, seed: int, dtype: np.dtype) -> np.ndarray:
+    """A per-plane pattern distinguishable from every other plane in the file."""
+    return (
+        np.arange(n_y * n_x, dtype=np.uint32).reshape(n_y, n_x) % 4000 + seed
+    ).astype(dtype)
+
+
 def create_zeiss_czi(
     tmpdir: str,
     n_z: int = 4,
     n_c: int = 2,
     image_shape: Tuple[int, int] = (128, 128),
     dtype: np.dtype = np.uint16,
+    n_t: int = 1,
+    pixel_size_um: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[str, np.ndarray]:
-    """Create a Zeiss CZI file via pylibCZIrw's writer.
+    """Create a single-scene Zeiss CZI file via pylibCZIrw's writer.
 
     Args:
         tmpdir: Temporary directory to create the file in
@@ -868,6 +877,9 @@ def create_zeiss_czi(
         n_c: Number of channels
         image_shape: (height, width) of each plane
         dtype: Pixel data type
+        n_t: Number of timepoints
+        pixel_size_um: (x, y, z) voxel size in micrometres, recorded in the
+            document's Scaling items; omitted (unscaled) when None
 
     Returns:
         Tuple of (czi_path, expected_array) with expected_array in TCZYX order
@@ -876,27 +888,72 @@ def create_zeiss_czi(
 
     n_y, n_x = image_shape
     czi_path = Path(tmpdir) / "test.czi"
-    expected = np.zeros((1, n_c, n_z, n_y, n_x), dtype=dtype)
+    expected = np.zeros((n_t, n_c, n_z, n_y, n_x), dtype=dtype)
     with pyczi.create_czi(str(czi_path)) as writer:
-        for c in range(n_c):
-            for z in range(n_z):
-                plane = (
-                    np.arange(n_y * n_x, dtype=np.uint32).reshape(n_y, n_x) % 4000
-                    + c * 100
-                    + z * 10
-                ).astype(dtype)
-                expected[0, c, z] = plane
-                writer.write(plane[..., np.newaxis], plane={"C": c, "Z": z, "T": 0})
+        for t in range(n_t):
+            for c in range(n_c):
+                for z in range(n_z):
+                    plane = _czi_plane(n_y, n_x, t * 1000 + c * 100 + z * 10, dtype)
+                    expected[t, c, z] = plane
+                    writer.write(plane[..., np.newaxis], plane={"C": c, "Z": z, "T": t})
 
-    _complete_czi_metadata(czi_path)
+    _complete_czi_metadata(czi_path, pixel_size_um=pixel_size_um)
     return str(czi_path), expected
 
 
-def _complete_czi_metadata(czi_path: Path) -> None:
+def create_zeiss_czi_scenes(
+    tmpdir: str,
+    n_scenes: int = 2,
+    n_z: int = 2,
+    n_c: int = 2,
+    image_shape: Tuple[int, int] = (32, 40),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, List[np.ndarray]]:
+    """Create a multi-scene CZI whose scenes sit at different plane offsets.
+
+    Each scene is written at its own location, so the document's total bounding
+    rectangle is larger than any one scene -- the layout that distinguishes a
+    reader addressing scenes in absolute CZI coordinates from one assuming they
+    all start at the origin.
+
+    Returns:
+        Tuple of (czi_path, [expected_array per scene]), each in TCZYX order
+    """
+    from pylibCZIrw import czi as pyczi
+
+    n_y, n_x = image_shape
+    czi_path = Path(tmpdir) / "scenes.czi"
+    expected = [np.zeros((1, n_c, n_z, n_y, n_x), dtype=dtype) for _ in range(n_scenes)]
+    with pyczi.create_czi(str(czi_path)) as writer:
+        for scene in range(n_scenes):
+            # Offset both axes so a scene-relative read cannot pass by accident.
+            location = (scene * (n_x + 60), scene * (n_y + 28))
+            for c in range(n_c):
+                for z in range(n_z):
+                    plane = _czi_plane(
+                        n_y, n_x, scene * 10000 + c * 100 + z * 10, dtype
+                    )
+                    expected[scene][0, c, z] = plane
+                    writer.write(
+                        plane[..., np.newaxis],
+                        location=location,
+                        plane={"C": c, "Z": z, "T": 0},
+                        scene=scene,
+                    )
+
+    _complete_czi_metadata(czi_path, n_scenes=n_scenes)
+    return str(czi_path), expected
+
+
+def _complete_czi_metadata(
+    czi_path: Path,
+    n_scenes: int = 1,
+    pixel_size_um: Optional[Tuple[float, float, float]] = None,
+) -> None:
     """Add the metadata bioio-czi needs but pylibCZIrw's writer omits.
 
-    The writer always records a bounding rectangle for scene 0 but never emits
-    the matching metadata, so bioio-czi's scenes property takes its
+    The writer always records a bounding rectangle for each scene but never
+    emits the matching metadata, so bioio-czi's scenes property takes its
     "normal CZI" branch and then fails to find Scene[@Index='0'] (its no-scene
     fallback only runs when there is no bounding rectangle at all).
 
@@ -929,8 +986,20 @@ def _complete_czi_metadata(czi_path: Path) -> None:
     xml = xml.replace(
         "</Image>", f"<ComponentBitCount>{bits}</ComponentBitCount></Image>", 1
     )
-    scenes = '<S><Scenes><Scene Index="0" Name="Scene:0"/></Scenes></S>'
-    xml = xml.replace("<Dimensions>", "<Dimensions>" + scenes, 1)
+    entries = "".join(
+        f'<Scene Index="{index}" Name="Scene:{index}"/>' for index in range(n_scenes)
+    )
+    xml = xml.replace(
+        "<Dimensions>", f"<Dimensions><S><Scenes>{entries}</Scenes></S>", 1
+    )
+    if pixel_size_um is not None:
+        # CZI records Scaling in metres; the writer emits zero-valued items.
+        for axis, size_um in zip("XYZ", pixel_size_um, strict=True):
+            xml = xml.replace(
+                f'<Distance Id="{axis}"><Value>0</Value></Distance>',
+                f'<Distance Id="{axis}"><Value>{size_um * 1e-6!r}</Value></Distance>',
+                1,
+            )
     payload = xml.encode("utf-8")
 
     used = 256 + len(payload)

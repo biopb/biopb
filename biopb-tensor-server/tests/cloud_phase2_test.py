@@ -152,7 +152,7 @@ class TestContentFreeClaimsDoNotRead:
             ("img.tif", "tiff"),
             ("img.lsm", "lsm"),
             ("scan.nii.gz", "nifti"),
-            ("img.czi", "zeiss"),
+            ("img.czi", "czi"),
             ("img.lif", "leica"),
             ("img.nd2", "nikon"),
             ("img.dv", "dv"),
@@ -172,6 +172,31 @@ class TestContentFreeClaimsDoNotRead:
         claims = registry.get_claims_for_path(ctx, state)
         assert claims, f"{filename} should be claimed"
         assert claims[0].source_type == source_type
+
+    @pytest.mark.parametrize(
+        "filename, source_type",
+        [("img.tif", "tiff"), ("img.lsm", "lsm"), ("img.czi", "czi")],
+    )
+    def test_native_adapters_claim_a_dehydrated_placeholder(
+        self, tmp_path, force_nonresident, filename, source_type
+    ):
+        """The native claims stay definite for a non-resident file.
+
+        They read nothing, so they cannot recall it, and deferring is
+        ``_claim_is_unresolved``'s job. Declining here would also outlive the
+        placeholder: the resolve-time re-claim still carries
+        ``cloud_root=True``, so a hydrated file would never reach the native
+        adapter (biopb/biopb#799).
+        """
+        from biopb_tensor_server.adapters import get_default_registry
+
+        f = tmp_path / filename
+        f.write_bytes(b"II*\x00")
+        claims = get_default_registry().get_claims_for_path(
+            _RaisingReadCtx(f, cloud_root=True), DiscoveryState()
+        )
+        assert [c.source_type for c in claims] == [source_type]
+        assert claims[0].unresolved is False
 
     def test_ndtiff_claims_by_index_existence_without_reading(self, tmp_path):
         from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
@@ -1332,7 +1357,9 @@ class TestCloudMultiFileBan:
 
     def test_cloud_tif_dir_yields_single_file_sources(self, tmp_path):
         # The whole-registry behavior: a dir of .tif files under cloud produces
-        # one single-file (generic aics) claim per .tif, never a grouped set.
+        # one single-file claim per .tif, never a grouped set. The native
+        # tifffile adapter owns that claim (it reads nothing to make it); a
+        # dehydrated placeholder is deferred by the source manager, not here.
         from biopb_tensor_server.adapters import get_default_registry
 
         registry = get_default_registry()
@@ -1345,7 +1372,7 @@ class TestCloudMultiFileBan:
             )
             claims.append(c[0] if c else None)
         assert all(c is not None for c in claims)
-        assert all(c.source_type == "aics" for c in claims)
+        assert all(c.source_type == "tiff" for c in claims)
         # Each is its own primary_path (single-file), no multi-member grouping.
         assert all(c.member_paths == {c.primary_path} for c in claims)
 

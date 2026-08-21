@@ -30,7 +30,8 @@ bioio is the official successor from the same group (Allen Institute for Cell Sc
 |---|---|---|---|
 | `TiffAdapter` | `tiff` | local plain `.tif`, `.tiff` | native `tifffile` |
 | `LsmAdapter` | `lsm` | local `.lsm` | native `tifffile` |
-| `ZeissAdapter` | `zeiss` | `.czi` | `bioio-czi` |
+| `CziAdapter` | `czi` | local `.czi` | native `pylibCZIrw` |
+| `ZeissAdapter` | `zeiss` | remote `.czi` and `.lsm` | `bioio-czi` |
 | `LeicaAdapter` | `leica` | `.lif` | `bioio-lif` |
 | `NikonAdapter` | `nikon` | `.nd2` | `bioio-nd2` |
 | `DvAdapter` | `dv` | `.dv` | `bioio-dv` |

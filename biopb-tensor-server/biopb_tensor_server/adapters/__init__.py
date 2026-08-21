@@ -39,6 +39,15 @@ try:
     from .qptiff import QptiffAdapter
 except ImportError:
     QptiffAdapter = None  # type: ignore
+# Native CZI reads need pylibCZIrw (shipped with bioio-czi). Without it .czi is
+# left to the bioio group below, exactly as before this adapter existed.
+try:
+    import pylibCZIrw  # noqa: F401
+
+    from .czi import CziAdapter
+except ImportError:
+    CziAdapter = None  # type: ignore
+
 # Optional electron-microscopy adapters (rosettasciio)
 try:
     from .mrc import MrcAdapter
@@ -100,6 +109,7 @@ __all__ = [
     "QptiffAdapter",
     "MrcAdapter",
     "EmdAdapter",
+    "CziAdapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",
@@ -120,11 +130,13 @@ def get_default_registry() -> AdapterRegistry:
     - OmeTiffAdapter - OME-TIFF files (embedded OME-XML, companion.ome)
     - TiffAdapter - local plain TIFF files (.tif/.tiff)
     - LsmAdapter - local Zeiss LSM files (.lsm)
+    - CziAdapter - local Zeiss CZI files (.czi; pylibCZIrw)
     - QptiffAdapter - Akoya PhenoImager QPTIFF (.qptiff by extension; tifffile,
       native pyramid)
     - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
     - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
-    - ZeissAdapter - Zeiss microscopy (CZI; remote/cloud/non-resident LSM fallback)
+    - ZeissAdapter - Zeiss microscopy (remote CZI and LSM only; the native
+      adapters above own every local one)
     - LeicaAdapter - Leica LIF files
     - NikonAdapter - Nikon ND2 files
     - DvAdapter - DeltaVision DV files
@@ -158,6 +170,12 @@ def get_default_registry() -> AdapterRegistry:
     # and remain eligible for BioIO's fallback claims.
     registry.register(TiffAdapter, "tiff")
     registry.register(LsmAdapter, "lsm")
+
+    # Native libCZI path, same shape as the tifffile ones above.  Its claim is
+    # extension-only and definite for every local .czi -- it declines only
+    # remote paths, which fall through to BioIO's ZeissAdapter below.
+    if CziAdapter is not None:
+        registry.register(CziAdapter, "czi")
 
     # QPTIFF before the bioio group so it owns .qptiff (bioio would drop the
     # QPTIFF pyramid). Claim is suffix-only -- a QPTIFF saved as .tif is not

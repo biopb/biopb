@@ -356,6 +356,7 @@ class SourceConfig:
             "ome-tiff-multifile",
             "tiff",
             "lsm",
+            "czi",
             "ome-zarr",
             "ome-zarr-hcs",
             "aics",
