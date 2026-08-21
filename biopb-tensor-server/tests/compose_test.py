@@ -18,6 +18,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import ArrowFileBackend
 from biopb_tensor_server.cache.file_backend import ArrowFileConfig
+from biopb_tensor_server.core import compose as compose_module
 from biopb_tensor_server.core.adapter_base import TensorAdapter, unpack_chunk_array
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.compose import (
@@ -245,14 +246,25 @@ class _ArrayAdapter(TensorAdapter):
 class _Manager:
     """The slice of CacheManager resolve_chunk_data actually uses."""
 
-    def __init__(self, backend):
+    def __init__(self, backend, compose=False):
         self.backend = backend
+        self.compose_scaled_reads = compose
 
     def get_or_acquire(self, key, compute_fn):
         return self.backend.get_or_acquire(key, compute_fn)
 
     def release(self, key):
         return self.backend.release(key)
+
+
+def _composing(manager):
+    """The same cache, seen as one configured to compose.
+
+    The policy rides on the manager rather than on a ``resolve_chunk_data``
+    argument, so that signature stays what the docs publish and an out-of-tree
+    adapter overriding it keeps working.
+    """
+    return _Manager(manager.backend, compose=True)
 
 
 @pytest.fixture
@@ -288,7 +300,7 @@ def test_composing_leaves_the_full_resolution_chunks_in_the_cache(cache):
     scale = (1, 1, 1, 4, 4)
     chunk_id = _scaled_id(adapter, shape, scale)
 
-    adapter.resolve_chunk_data(chunk_id, cache, compose=True)
+    adapter.resolve_chunk_data(chunk_id, _composing(cache))
 
     # Every full-resolution chunk under the extent is now serveable by its own
     # chunk_id, which is what a later full-resolution read will ask for.
@@ -315,7 +327,7 @@ def test_not_composing_reads_the_extent_and_keeps_none_of_it(cache):
     adapter, shape, grid = _fixture_adapter()
     chunk_id = _scaled_id(adapter, shape, (1, 1, 1, 4, 4))
 
-    adapter.resolve_chunk_data(chunk_id, cache, compose=False)
+    adapter.resolve_chunk_data(chunk_id, cache)
 
     assert adapter.reads == [((0,) * 5, tuple(shape))]  # one read of the extent
     for chunk_start, chunk_stop in covering_chunks((0,) * 5, shape, grid, shape):
@@ -333,7 +345,7 @@ def test_composed_and_direct_agree_through_the_adapter(cache):
     chunk_id = _scaled_id(adapter, shape, scale)
 
     composed = unpack_chunk_array(
-        adapter.resolve_chunk_data(chunk_id, cache, compose=True)
+        adapter.resolve_chunk_data(chunk_id, _composing(cache))
     )
     direct = downsample_block(adapter._data, scale, "area")
     assert np.array_equal(composed, direct)
@@ -360,7 +372,7 @@ def test_memory_backend_does_not_compose():
     adapter, shape, _ = _fixture_adapter()
     manager = _Manager(MemoryCacheBackend(MemoryCacheConfig()))
     adapter.resolve_chunk_data(
-        _scaled_id(adapter, shape, (1, 1, 1, 4, 4)), manager, compose=True
+        _scaled_id(adapter, shape, (1, 1, 1, 4, 4)), _composing(manager)
     )
     assert adapter.reads == [((0,) * 5, tuple(shape))]
 
@@ -378,7 +390,7 @@ def test_composed_ids_are_the_ids_a_full_resolution_plan_asks_for(cache):
     """
     adapter, shape, grid = _fixture_adapter()
     adapter.resolve_chunk_data(
-        _scaled_id(adapter, shape, (1, 1, 1, 4, 4)), cache, compose=True
+        _scaled_id(adapter, shape, (1, 1, 1, 4, 4)), _composing(cache)
     )
 
     request = TensorDescriptor(
@@ -402,26 +414,62 @@ def test_composed_ids_are_the_ids_a_full_resolution_plan_asks_for(cache):
 # ==============================================================================
 
 
-def test_compose_refuses_above_depth_zero(cache):
+def test_compose_refuses_inside_a_composition(cache):
     """The acyclicity guard, asserted rather than assumed.
 
     Composition adds scaled -> raw edges to the cache's promise graph. Raw keys
     wait on nothing, so the graph stays bipartite and cannot cycle -- but only
-    while nothing composes from a composed chunk. This is that invariant.
+    while nothing composes from a composed chunk. This is that invariant, held
+    per-thread because the inner fetches run inline on the calling thread.
     """
     adapter, shape, _ = _fixture_adapter()
-    assert (
-        adapter._compose_scaled_chunk(
-            _scaled_id(adapter, shape, (1, 1, 1, 4, 4)),
-            ChunkBounds(start=[0] * 5, stop=list(shape)),
-            (1, 1, 1, 4, 4),
-            "area",
-            cache,
-            compose=True,
-            depth=1,
-        )
-        is None
+    args = (
+        _scaled_id(adapter, shape, (1, 1, 1, 4, 4)),
+        ChunkBounds(start=[0] * 5, stop=list(shape)),
+        (1, 1, 1, 4, 4),
+        "area",
+        _composing(cache),
     )
+    with compose_module.descending():
+        assert adapter._compose_scaled_chunk(*args) is None
+    # ... and outside that scope the same call composes.
+    assert adapter._compose_scaled_chunk(*args) is not None
+
+
+def test_a_thread_can_opt_out(cache):
+    """``without_composition`` is how precache declines, at its own call site."""
+    adapter, shape, grid = _fixture_adapter()
+    with compose_module.without_composition():
+        adapter.resolve_chunk_data(
+            _scaled_id(adapter, shape, (1, 1, 1, 4, 4)), _composing(cache)
+        )
+    assert adapter.reads == [((0,) * 5, tuple(shape))]  # one read of the extent
+
+
+def test_the_published_signature_still_works(cache):
+    """An adapter written against the documented two-argument form must serve.
+
+    ``resolve_chunk_data(chunk_id, cache_manager)`` is quoted in
+    docs/remote-tensor-cache.md and docs/volume-rendering.md and listed in
+    ``_TENSOR_SCOPED_API``. Composing must not have widened it: an out-of-tree
+    adapter overriding it as documented would raise TypeError on the first
+    do_get, which is a server-side 500 for every read of that source.
+    """
+    import inspect
+
+    from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.core.normalize import NormalizingAdapter
+
+    expected = ["self", "chunk_id", "cache_manager"]
+    for klass in (
+        TensorAdapter,
+        CachedSourceAdapter,
+        RemoteTensorAdapter,
+        NormalizingAdapter,
+    ):
+        parameters = list(inspect.signature(klass.resolve_chunk_data).parameters)
+        assert parameters == expected, f"{klass.__name__} widened the contract"
 
 
 def test_neither_cache_lock_is_held_while_a_chunk_is_computed(cache):
@@ -464,7 +512,7 @@ def test_concurrent_composers_of_the_same_chunk_all_complete(cache):
         try:
             results.append(
                 unpack_chunk_array(
-                    adapter.resolve_chunk_data(chunk_id, cache, compose=True)
+                    adapter.resolve_chunk_data(chunk_id, _composing(cache))
                 )
             )
         except BaseException as exc:  # noqa: BLE001 - reported, not swallowed

@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import itertools
 import logging
+import threading
+from contextlib import contextmanager
 from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -60,6 +62,74 @@ from biopb_tensor_server.core.downsample import (
 logger = logging.getLogger(__name__)
 
 Bounds = Tuple[Tuple[int, ...], Tuple[int, ...]]
+
+# Per-thread composition state, deliberately NOT parameters on
+# ``resolve_chunk_data``. That method is the adapter contract -- quoted in
+# docs/remote-tensor-cache.md and docs/volume-rendering.md, listed in
+# ``_TENSOR_SCOPED_API`` -- and an out-of-tree adapter overriding it with the
+# signature those documents show would raise TypeError the first time the server
+# passed a new keyword. Both of these are dynamically scoped anyway ("for this
+# call and everything under it"), which is what a thread-local is for.
+_state = threading.local()
+
+
+def _depth() -> int:
+    return getattr(_state, "depth", 0)
+
+
+def suppressed() -> bool:
+    """Whether this thread has opted out of composing."""
+    return getattr(_state, "suppressed", False)
+
+
+@contextmanager
+def without_composition() -> Iterator[None]:
+    """Opt this thread out. For a caller that must not populate at scale.
+
+    Precache is the one that matters: it warms the *coarsest* level of every
+    tensor in the catalog, so composing there would make each of those chunks
+    materialize and cache its full-resolution source -- a cheap overview warmer
+    turned into a whole-catalog hydrator.
+    """
+    previous = suppressed()
+    _state.suppressed = True
+    try:
+        yield
+    finally:
+        _state.suppressed = previous
+
+
+@contextmanager
+def descending() -> Iterator[None]:
+    """Mark the inner fetches of a composition, so they cannot compose again.
+
+    The acyclicity guard. Composing adds scaled -> raw edges to the cache's
+    promise graph and raw keys wait on nothing, so it stays bipartite -- but
+    only while nothing composes from a composed chunk. Correctness does not
+    *depend* on this (an inner fetch carries a raw chunk_id, which has nothing to
+    compose), which is why per-thread scope is enough: it turns the invariant
+    into something a future change trips over rather than something a reader has
+    to re-derive.
+    """
+    _state.depth = _depth() + 1
+    try:
+        yield
+    finally:
+        _state.depth -= 1
+
+
+def enabled_for(cache_manager: object) -> bool:
+    """Whether this call should compose, given the cache it would populate.
+
+    The policy rides on the cache manager because that is what composing acts
+    on, and because it is already an argument of every ``resolve_chunk_data``
+    signature in existence.
+    """
+    return (
+        getattr(cache_manager, "compose_scaled_reads", False)
+        and not suppressed()
+        and _depth() == 0
+    )
 
 
 def can_compose(

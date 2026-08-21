@@ -247,6 +247,7 @@ def test_uploads_are_never_deferred(directory):
     )
     try:
         batch = _batch(5)
+        assert manager.backend.SUPPORTS_DEFERRED_WRITES is True
         assert manager.put(b"upload", batch, batch.nbytes) is True
         # On disk the moment put() returns -- no drain, nothing queued.
         assert manager.backend.locate_entry(b"upload") is not None
@@ -538,3 +539,41 @@ def test_a_clean_drain_still_clears_everything(directory):
 
     assert not backend._wal.has_pending()
     assert not backend._process_lock.is_held()
+
+
+def test_a_backend_that_cannot_defer_keeps_its_original_signature():
+    """``complete_entry`` must not have widened for backends that never defer.
+
+    ``CacheManager.put`` asks ``SUPPORTS_DEFERRED_WRITES`` before it passes
+    ``allow_deferred``, so a backend written against the historical three-
+    argument form -- the memory backend, or one outside this tree -- is called
+    exactly as it always was.
+    """
+    import inspect
+
+    from biopb_tensor_server.cache.base import CacheBackend
+    from biopb_tensor_server.cache.memory_backend import MemoryCacheBackend
+
+    for klass in (CacheBackend, MemoryCacheBackend):
+        assert klass.SUPPORTS_DEFERRED_WRITES is False
+        assert list(inspect.signature(klass.complete_entry).parameters) == [
+            "self",
+            "key",
+            "data",
+            "size_bytes",
+        ], f"{klass.__name__} widened the contract"
+    assert ArrowFileBackend.SUPPORTS_DEFERRED_WRITES is True
+
+
+def test_put_works_against_a_backend_that_does_not_defer(directory):
+    """The compatibility branch, exercised rather than reasoned about."""
+    from biopb_tensor_server.cache.manager import CacheManager
+    from biopb_tensor_server.core.config import CacheConfig
+
+    manager = CacheManager(CacheConfig(backend="memory"))
+    try:
+        assert manager.backend.SUPPORTS_DEFERRED_WRITES is False
+        batch = _batch(13)
+        assert manager.put(b"upload", batch, batch.nbytes) is True
+    finally:
+        manager.close()

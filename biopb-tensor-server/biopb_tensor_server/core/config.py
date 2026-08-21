@@ -512,6 +512,19 @@ class CacheConfig:
         default=4 * 1024 * 1024 * 1024,  # 4 GB total
         metadata={"help": "Maximum total size of the on-disk chunk cache (GB)."},
     )
+    compute_scale_from_chunks: bool = field(
+        default=False,
+        metadata={
+            "help": "EXPERIMENTAL. Build a computed-scale chunk by reducing the "
+            "full-resolution chunks under it, instead of reading its whole "
+            "source extent in one call. Leaves those chunks in the cache, so a "
+            "later read at any scale -- full resolution included -- is served "
+            "from it rather than re-reading the source. A cache setting because "
+            "what it changes is what the cache ends up holding: it multiplies "
+            "the bytes a scaled read writes by the scale product, which is a "
+            "capacity trade, not a free win. Off by default."
+        },
+    )
     file_deferred_write_mb: int = field(
         default=0,
         metadata={
@@ -577,18 +590,6 @@ class PyramidConfig:
             "so the memory it bounds there is one chunk. Lower it on a "
             "memory-constrained server, raise it if reads have headroom. The "
             "delivered chunk is separately bounded by the Arrow wire ceiling."
-        },
-    )
-    compute_scale_from_chunks: bool = field(
-        default=False,
-        metadata={
-            "help": "EXPERIMENTAL. Build a computed-scale chunk by reducing the "
-            "full-resolution chunks under it, instead of reading its whole "
-            "source extent in one call. Leaves those chunks in the cache, so a "
-            "later read at any scale -- full resolution included -- is served "
-            "from it rather than re-reading the source. Off by default: it "
-            "multiplies the bytes a scaled read writes to the cache by the "
-            "scale product, which is a capacity trade, not a free win."
         },
     )
 

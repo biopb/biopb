@@ -47,6 +47,12 @@ class CacheManager:
 
     def __init__(self, config: CacheConfig):
         """Initialize with CacheConfig, selecting backend based on config.backend."""
+        # Read by ``compose.enabled_for``. It lives here rather than as an
+        # argument to ``resolve_chunk_data`` because that signature is the
+        # adapter contract and must keep working for adapters written against
+        # the published one -- and because what composing changes is what this
+        # cache ends up holding.
+        self.compose_scaled_reads = config.compute_scale_from_chunks
         if config.backend == "memory":
             self._backend = MemoryCacheBackend(
                 MemoryCacheConfig(
@@ -160,9 +166,14 @@ class CacheManager:
         _entry, is_owner = self._backend.start_compute(key)
         try:
             if is_owner:
-                self._backend.complete_entry(
-                    key, data, size_bytes, allow_deferred=False
-                )
+                if self._backend.SUPPORTS_DEFERRED_WRITES:
+                    self._backend.complete_entry(
+                        key, data, size_bytes, allow_deferred=False
+                    )
+                else:
+                    # A backend that cannot defer is called as it always was, so
+                    # one written against the historical signature keeps working.
+                    self._backend.complete_entry(key, data, size_bytes)
         except BaseException as e:
             # A failed commit must not strand a PENDING entry: readers of this
             # key would block on it until pending_timeout.

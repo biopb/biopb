@@ -1427,9 +1427,7 @@ class TensorFlightServer(flight.FlightServerBase):
             # Read the chunk, using the configured cache backend when applicable.
             try:
                 record_batch = adapter.resolve_chunk_data(
-                    tensor_ticket.chunk_id,
-                    cache_manager,
-                    compose=self._pyramid_config.compute_scale_from_chunks,
+                    tensor_ticket.chunk_id, cache_manager
                 )
             except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
@@ -1484,11 +1482,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 # materialize (same path as do_get) on a genuine cold miss.
                 location = cache_manager.locate_entry(cache_key)
                 if location is None:
-                    adapter.resolve_chunk_data(
-                        chunk_id,
-                        cache_manager,
-                        compose=self._pyramid_config.compute_scale_from_chunks,
-                    )
+                    adapter.resolve_chunk_data(chunk_id, cache_manager)
                     # A deferred cache write returns before the bytes are on
                     # disk, and this reply IS a byte range -- so unlike do_get,
                     # which is happy with the entry in memory, this caller has to

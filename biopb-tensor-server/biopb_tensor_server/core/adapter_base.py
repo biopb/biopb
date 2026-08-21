@@ -53,7 +53,11 @@ from biopb_tensor_server.core.chunk import (
     scaled_virtual_chunk_size,
     wrap_content_version,
 )
-from biopb_tensor_server.core.compose import compose_scaled_chunk
+from biopb_tensor_server.core.compose import (
+    compose_scaled_chunk,
+    descending as composing_descent,
+    enabled_for as compose_enabled_for,
+)
 from biopb_tensor_server.core.downsample import (
     ceil_div,
     downsample_block,
@@ -809,8 +813,6 @@ class TensorAdapter(SourceAdapter):
         self,
         chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
-        compose: bool = False,
-        _compose_depth: int = 0,
     ) -> pa.RecordBatch:
         """Resolve chunk data, handling scaled chunks and backend caching.
 
@@ -818,22 +820,16 @@ class TensorAdapter(SourceAdapter):
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
 
-        ``compose`` opts a scaled chunk into being built from the
-        full-resolution chunks under it rather than one read of the whole extent
+        A scaled chunk may be built from the full-resolution chunks under it
+        rather than from one read of the whole extent
         (:mod:`biopb_tensor_server.core.compose`), which is what leaves those
-        chunks in the cache for the next read at any scale. Off by default: it
-        multiplies the bytes a scaled read writes by the scale product, and that
-        is a capacity decision for the caller, not this method. Precache in
-        particular must leave it off -- it warms the *coarsest* level of every
-        tensor, so composing there would hydrate the whole catalog at full
-        resolution.
-
-        ``_compose_depth`` is the acyclicity guard. Composition makes a scaled
-        key wait on raw keys, and raw keys wait on nothing, so the cache's
-        promise graph stays bipartite and cannot cycle. That holds only while
-        nothing composes from a composed chunk, so the recursive call carries a
-        depth and composition refuses above zero rather than trusting that no
-        future caller reintroduces the edge.
+        chunks in the cache for the next read at any scale. Whether to is a
+        property of the cache being populated, so it is read off the manager --
+        deliberately not a new parameter here. This signature is the adapter
+        contract: it is quoted in docs/remote-tensor-cache.md and
+        docs/volume-rendering.md and listed in ``_TENSOR_SCOPED_API``, so an
+        out-of-tree adapter overriding it as documented must keep working.
+        ``compose.without_composition()`` is how a caller opts out.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
@@ -864,8 +860,6 @@ class TensorAdapter(SourceAdapter):
                     scale_hint,
                     reduction_method,
                     cache_manager,
-                    compose=compose,
-                    depth=_compose_depth,
                 )
                 # Crop + downsample (bounds aligned via floor_div) is the path
                 # taken whenever composing is off, inexact for this reduction, or
@@ -907,15 +901,14 @@ class TensorAdapter(SourceAdapter):
         scale_hint: Tuple[int, ...],
         reduction_method: str,
         cache_manager: Optional[CacheManager],
-        compose: bool,
-        depth: int,
     ) -> Optional[np.ndarray]:
         """Build a scaled chunk from cached full-resolution chunks, or None.
 
         None means "not composable here" and is the normal answer, not an error:
         the caller falls back to reading the extent. Refused when
 
-        - the caller did not opt in, or this is already a composed fetch;
+        - this cache is not configured to compose, this thread opted out, or
+          this is already a composed fetch (``compose.enabled_for``);
         - the backend does not cache raw chunks (``should_cache`` only extends
           to them on ``ArrowFileBackend``), so composing would fetch the same
           bytes and keep none of them -- all of the cost, none of the point;
@@ -926,7 +919,7 @@ class TensorAdapter(SourceAdapter):
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
-        if not compose or depth > 0 or cache_manager is None:
+        if cache_manager is None or not compose_enabled_for(cache_manager):
             return None
         if not isinstance(cache_manager.backend, ArrowFileBackend):
             return None
@@ -956,9 +949,8 @@ class TensorAdapter(SourceAdapter):
             # cached under its own key by the same code the read path uses --
             # which also means the reference it takes is released there, and
             # nothing is held across the fold below.
-            batch = self.resolve_chunk_data(
-                raw_id, cache_manager, compose=False, _compose_depth=depth + 1
-            )
+            with composing_descent():
+                batch = self.resolve_chunk_data(raw_id, cache_manager)
             return unpack_chunk_array(batch)
 
         return compose_scaled_chunk(

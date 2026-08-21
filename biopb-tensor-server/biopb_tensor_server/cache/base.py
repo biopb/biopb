@@ -167,6 +167,12 @@ class CacheBackend(ABC):
     pattern for safe concurrent access.
     """
 
+    # Whether ``complete_entry`` accepts ``allow_deferred`` -- i.e. whether this
+    # backend can commit an entry before its write lands. False keeps the
+    # historical signature, so a backend that predates deferred writes, or one
+    # written outside this tree, is called exactly as it always was.
+    SUPPORTS_DEFERRED_WRITES: bool = False
+
     @abstractmethod
     def get_or_acquire(
         self,
@@ -213,7 +219,6 @@ class CacheBackend(ABC):
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
-        allow_deferred: bool = True,
     ) -> None:
         """Mark a pending entry as ready with computed data.
 

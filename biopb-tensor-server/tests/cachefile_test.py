@@ -652,7 +652,7 @@ class TestChunkLocateAction:
             class _Probe:
                 source_id = "z"
 
-                def resolve_chunk_data(self, chunk_id, cache_manager, **kwargs):
+                def resolve_chunk_data(self, chunk_id, cache_manager):
                     # Called on a cold miss -- the heaviest work in the handler.
                     observed.append(server.flight_idle_for(0.0))
                     raise ValueError("no data")

@@ -514,8 +514,6 @@ class NormalizingAdapter(TensorAdapter):
         self,
         chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
-        compose: bool = False,
-        _compose_depth: int = 0,
     ) -> pa.RecordBatch:
         """Serve one chunk, transposed into canonical order **before** caching.
 
@@ -533,18 +531,17 @@ class NormalizingAdapter(TensorAdapter):
 
         perm = self.perm
         if perm is None:
-            return self._inner.resolve_chunk_data(
-                chunk_id, cache_manager, compose=compose, _compose_depth=_compose_depth
-            )
+            return self._inner.resolve_chunk_data(chunk_id, cache_manager)
 
-        # Under a real permutation, composing is not just unforwarded, it does
-        # not apply: the chunk_ids on this side are in canonical axis order and
-        # the delegate's grid is in its own, so the raw ids a composer minted
-        # here would name bounds the delegate never serves. The delegate is also
-        # handed no cache manager below -- this wrapper owns the caching so that
-        # what lands in a segment is what the client is served -- and composing
-        # without one is a no-op by construction. Composing a transposed source
-        # means minting the ids on the delegate's side, which is its own change.
+        # Under a real permutation composing does not apply, and nothing has to
+        # suppress it: the delegate is handed no cache manager below -- this
+        # wrapper owns the caching so that what lands in a segment is what the
+        # client is served -- and composing without one is a no-op by
+        # construction. It could not work anyway: the chunk_ids on this side are
+        # in canonical axis order while the delegate's grid is in its own, so
+        # ids minted here would name bounds the delegate never serves. Composing
+        # a transposed source means minting them on the delegate's side, which
+        # is its own change.
 
         should_cache = cache_manager is not None and (
             is_scaled_chunk(chunk_id)

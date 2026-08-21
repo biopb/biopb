@@ -195,6 +195,8 @@ class ArrowFileBackend(CacheBackend):
     4. Crash recovery: WAL detects incomplete writes
     """
 
+    SUPPORTS_DEFERRED_WRITES = True
+
     def __init__(self, config: ArrowFileConfig):
         self._config = config
         # ``_lock`` guards the in-memory index (``_entries``, ``_metadata``,

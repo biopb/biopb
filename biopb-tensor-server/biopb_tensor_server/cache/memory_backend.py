@@ -234,7 +234,6 @@ class MemoryCacheBackend(CacheBackend):
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
-        allow_deferred: bool = True,  # nothing to defer: there is no disk
     ) -> None:
         """Mark pending entry as ready."""
         if self._skip_if_oversized(key, data, size_bytes):
