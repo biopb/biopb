@@ -699,14 +699,33 @@ class OmeTiffAdapter(TensorAdapter):
 
         Only flips the released flag when there was a string to drop, so a
         source with no embedded OME-XML keeps answering None from cache.
-        Cascades to any scene adapters, and is safe to call twice.
+        Safe to call twice.
+
+        Derives the stripped form BEFORE dropping the source string, and hands
+        it down to every scene, because what a scene inherited in
+        ``get_tensor_adapter`` is a snapshot of whatever existed when it was
+        built. A scene built between descriptor discovery and ``get_metadata``
+        -- the window the reconciler opens by registering a source before
+        syncing it, during which a ``GetFlightInfo`` or a precache warm can land
+        -- holds the raw string and no stripped one. Releasing that scene
+        without settling it first would leave it with nothing but the file, and
+        its next physical-scale call would reopen the file AND re-cache the raw
+        string for good: the leak back, on a scene nothing releases again.
         """
+        # Settle first, drop second: a get_tensor_adapter racing this then
+        # inherits either (raw, unsettled) and gets cascaded below, or (no raw,
+        # settled) and needs nothing.
+        reduced = self._reduced_ome_xml_cached()
         if self._raw_ome_xml is not None:
             self._raw_ome_xml = None
             self._raw_ome_xml_released = True
         for adapter in list(self._tensor_adapters.values()):
-            if adapter is not self:
-                adapter.release_registration_cache()
+            if adapter is self:
+                continue
+            if reduced is not None and not adapter._reduced_ome_xml_probed:
+                adapter._reduced_ome_xml = reduced
+                adapter._reduced_ome_xml_probed = True
+            adapter.release_registration_cache()
 
     def __del__(self):
         # GC backstop: release the handle even without an explicit close().

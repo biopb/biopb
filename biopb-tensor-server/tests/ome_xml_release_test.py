@@ -125,6 +125,50 @@ def test_scene_built_after_release_keeps_physical_scale_without_reopening(
     assert count_opens == []
 
 
+def test_scene_built_in_the_registration_gap_is_settled_by_the_release(
+    per_plane_tiff, count_opens
+):
+    """The window the reconciler opens: registered, not yet synced.
+
+    ``_commit_add_claim`` calls ``register_source`` BEFORE ``sync_source_added``,
+    so the source is live on the Flight server while its catalog row is still
+    being written. A GetFlightInfo (or a precache warm) landing in there builds a
+    scene that inherited the raw XML and no stripped one -- inheritance in
+    ``get_tensor_adapter`` is a snapshot -- and that scene is cached for the
+    process lifetime. Releasing it unsettled would leave it with only the file:
+    its next physical-scale call would reopen AND re-cache the raw string, which
+    is the leak back on an adapter nothing releases a second time.
+    """
+    source = OmeTiffAdapter(per_plane_tiff, "perplane")
+    source.get_source_descriptor()  # descriptor discovery
+    scene = source.get_tensor_adapter(FIELD)  # <-- in the gap
+    assert scene._raw_ome_xml and scene._reduced_ome_xml is None
+
+    MetadataDatabase().sync_source_added("perplane", source)  # get_metadata + release
+
+    assert scene._raw_ome_xml is None
+    assert scene._reduced_ome_xml  # settled on the way down
+    count_opens.clear()
+    assert scene._physical_scale() is not None
+    assert scene.get_metadata()["images"][0]["pixels"]["id"] == "Pixels:0"
+    assert count_opens == []
+    assert scene._raw_ome_xml is None  # and never re-cached the raw string
+
+
+def test_release_settles_the_stripped_form_even_if_metadata_never_ran(per_plane_tiff):
+    # The release derives what it needs rather than assuming get_metadata went
+    # first, so the invariant holds under any call order: no adapter is ever
+    # released into a state where the file is its only remaining source.
+    source = OmeTiffAdapter(per_plane_tiff, "perplane")
+    source.get_source_descriptor()
+    scene = source.get_tensor_adapter(FIELD)
+
+    source.release_registration_cache()
+
+    assert source._raw_ome_xml is None and source._reduced_ome_xml
+    assert scene._raw_ome_xml is None and scene._reduced_ome_xml
+
+
 def test_scene_created_before_release_is_released_too(registered):
     scene = registered.get_tensor_adapter(FIELD)
     assert scene._raw_ome_xml
