@@ -18,9 +18,14 @@ It serves three tiers, in strict priority order:
   the server modelling that policy.
 - **Live tier.** Sources added to the catalog *after* startup, fed by
   ``SourceManager``'s commit hook (``enqueue``). Always warmed.
-- **Backlog tier (secondary).** Local sources already present at startup, seeded
-  once via ``seed_backlog`` and ordered newest-mtime-first. Drained only when the
-  live queue is empty, and bounded so it never evicts live data (see below).
+- **Backlog tier (lowest, off by default).** Local sources already present at
+  startup, seeded once via ``seed_backlog`` and ordered newest-mtime-first.
+  Drained only when the live queue is empty, and bounded so it never evicts live
+  data (see below). Disabled by default because it is the tier with no evidence
+  behind it: it warms the entire catalog against the chance someone opens some
+  of it, and when the footprint exceeds the cache the ``backlog_high_water``
+  stop decides *which* sources stay warm by mtime rather than by value. The
+  demand tier covers the same ground for sources anyone actually opens.
 
 Design constraints (all best-effort, never fatal to the server):
 

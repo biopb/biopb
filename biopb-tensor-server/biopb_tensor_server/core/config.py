@@ -626,10 +626,11 @@ class PrecacheConfig:
     )
     # Startup-backlog (existing sources) knobs.
     backlog_enabled: bool = field(
-        default=True,
+        default=False,
         metadata={
-            "help": "Also warm sources already present at startup, behind live "
-            "additions."
+            "help": "Also warm every source already present at startup, behind "
+            "live additions. Off by default: it warms the whole catalog on a "
+            "guess, where the demand tier warms what a client actually reads."
         },
     )
     backlog_high_water: float = field(
