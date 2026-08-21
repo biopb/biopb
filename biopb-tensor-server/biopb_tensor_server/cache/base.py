@@ -146,6 +146,12 @@ class CacheStats:
     pending_waits: int = 0  # Threads that waited on pending entries
     ref_held_evictions_skipped: int = 0  # Evictions skipped due to ref_count
     oversized_skips: int = 0  # Chunks skipped due to exceeding Arrow batch size limit
+    deferred_write_bytes: int = 0  # Committed from memory, not yet on disk
+    # Deferred writes that never reached disk. The batches were still served, so
+    # this is not an error count -- it is "the cache has quietly stopped
+    # persisting", which is otherwise invisible because the caller was released
+    # before the write was attempted.
+    deferred_write_failures: int = 0
     pool_stats: Dict[str, PoolStats] = field(default_factory=dict)
 
 
@@ -207,6 +213,7 @@ class CacheBackend(ABC):
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
+        allow_deferred: bool = True,
     ) -> None:
         """Mark a pending entry as ready with computed data.
 

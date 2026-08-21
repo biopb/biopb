@@ -60,6 +60,9 @@ class CacheManager:
                     cache_dir=config.file_cache_dir,
                     max_segment_bytes=config.file_max_segment_bytes,
                     max_total_bytes=config.file_max_total_bytes,
+                    max_deferred_write_bytes=config.file_deferred_write_mb
+                    * 1024
+                    * 1024,
                 )
             )
         else:
@@ -142,6 +145,13 @@ class CacheManager:
         that must not collide with a previous one gets a fresh cache namespace
         from its ``content_version`` (biopb/biopb#178), not from an overwrite.
 
+        Never deferred, whatever the backend is configured for. Deferring a
+        write is safe when the cache is a cache -- a lost write costs a re-read
+        from the backend. This path has no backend to re-read: an upload's only
+        copy is what lands in the segment (``CachedSourceAdapter.get_data``
+        raises, and it serves only chunk_ids that were written). So this caller
+        must not be told the bytes are stored until they are.
+
         Args:
             key: Cache key bytes
             data: The batch to store
@@ -150,7 +160,9 @@ class CacheManager:
         _entry, is_owner = self._backend.start_compute(key)
         try:
             if is_owner:
-                self._backend.complete_entry(key, data, size_bytes)
+                self._backend.complete_entry(
+                    key, data, size_bytes, allow_deferred=False
+                )
         except BaseException as e:
             # A failed commit must not strand a PENDING entry: readers of this
             # key would block on it until pending_timeout.
