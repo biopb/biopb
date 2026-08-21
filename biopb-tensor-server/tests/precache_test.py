@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
-    compute_precache_scale_hint,
     is_scaled_chunk,
 )
 from biopb_tensor_server.core.config import PrecacheConfig
@@ -83,81 +82,6 @@ def _simulate_client_terminal_scale(shape, labels, threshold, downscale, budget_
 
 # ---------------------------------------------------------------------------
 # 1. Scale-hint computation -- must match biopb-mcp's coarsest pyramid level.
-# ---------------------------------------------------------------------------
-
-
-class TestComputePrecacheScaleHint:
-    @pytest.mark.parametrize(
-        "shape,labels,expected",
-        [
-            # Small 2-D: below threshold, no downsampling.
-            ([2048, 2048], ["y", "x"], [1, 1]),
-            # Large 2-D: X/Y land in (1024, 4096].
-            ([20000, 20000], ["y", "x"], [16, 16]),
-            # Deep volume: the 512**3 voxel budget dominates, not the 4096 X/Y
-            # rule -- this is the case a naive "shrink X/Y to <4096" gets wrong.
-            ([1000, 8000, 8000], ["z", "y", "x"], [4, 16, 16]),
-            # Thin-z stack: z stays at the floor (never over-shrunk).
-            ([8, 20000, 20000], ["z", "y", "x"], [1, 16, 16]),
-            # Non-spatial axes (t, c) stay at 1.
-            ([10, 3, 20000, 20000], ["t", "c", "y", "x"], [1, 1, 16, 16]),
-            # Missing labels: positional [..., Z, Y, X] fallback.
-            ([1000, 8000, 8000], None, [4, 16, 16]),
-            # 2-D positional fallback (last two axes = Y, X).
-            ([20000, 20000], None, [16, 16]),
-        ],
-    )
-    def test_scale_hint_values(self, shape, labels, expected):
-        assert compute_precache_scale_hint(shape, labels) == expected
-
-    def test_no_z_label_means_no_z_scale(self):
-        # [t, y, x] with labels: the leading axis is time, not z, so it stays 1.
-        scale = compute_precache_scale_hint([1000, 20000, 20000], ["t", "y", "x"])
-        assert scale[0] == 1
-        assert scale[1:] == [16, 16]
-
-    def test_custom_knobs(self):
-        # Tighter threshold downsamples further.
-        scale = compute_precache_scale_hint([20000, 20000], ["y", "x"], threshold=1024)
-        ly = (20000 + scale[0] - 1) // scale[0]
-        assert ly <= 1024
-
-    @pytest.mark.skipif(
-        _import_biopb_mcp() is None,
-        reason="biopb-mcp not importable for cross-check",
-    )
-    def test_matches_biopb_mcp_loop(self):
-        """Cross-check against biopb-mcp's actual pyramid loop, if importable."""
-        tu = _import_biopb_mcp()
-        get_setting = tu.get_setting
-        cfg = tu.CONFIG.as_dict()
-        threshold = get_setting(cfg, "pyramid.threshold")
-        downscale = get_setting(cfg, "pyramid.downscale_factor")
-        budget_root = get_setting(cfg, "pyramid.pixel_budget_cubic_root")
-
-        for shape, labels in [
-            ([20000, 20000], ["y", "x"]),
-            ([1000, 8000, 8000], ["z", "y", "x"]),
-            ([8, 20000, 20000], ["z", "y", "x"]),
-        ]:
-            ours = compute_precache_scale_hint(
-                shape,
-                labels,
-                threshold=threshold,
-                downscale_factor=downscale,
-                pixel_budget_cubic_root=budget_root,
-            )
-            theirs = _simulate_client_terminal_scale(
-                shape, labels, threshold, downscale, budget_root
-            )
-            assert ours == theirs, f"mismatch for {shape}: {ours} != {theirs}"
-
-
-# ---------------------------------------------------------------------------
-# 2. Flight-activity idle probe.
-# ---------------------------------------------------------------------------
-
-
 class TestFlightIdleProbe:
     def test_idle_when_no_traffic(self):
         server = TensorFlightServer("grpc://localhost:0")
@@ -279,8 +203,7 @@ class TestWarming:
             adapter = server.sources.get("warm-src")
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
-            scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
-            assert scale == [4, 4]
+            scale = [4, 4]  # 8192 -> 4x in Y/X
             from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
             req = TensorDescriptor(
@@ -657,7 +580,7 @@ def _located_all(server, cache_manager, source_ids):
         adapter = server.sources.get(sid)
         td = adapter.list_tensor_descriptors()[0]
         ta = adapter.get_tensor_adapter(td.array_id)
-        scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
+        scale = [4, 4]  # 8192 -> 4x in Y/X
         req = TensorDescriptor(
             array_id=td.array_id,
             dim_labels=td.dim_labels,
@@ -988,9 +911,7 @@ class TestDemandTier:
         server = TensorFlightServer("grpc://localhost:0")
         try:
             adapter = _register_zarr(server, tmp_path, "src")
-            # 2x is a level the server's own 4x plan never produces.
             observed = (2, 2)
-            assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [4, 4]
 
             warmed = []
             worker = self._worker(server)
@@ -1158,7 +1079,6 @@ class TestSkipUnscaledLevel:
         most expensive thing to warm and the one warming does nothing for.
         """
         shape, labels = (4000, 256, 256), ("t", "y", "x")
-        assert compute_precache_scale_hint(list(shape), list(labels)) == [1, 1, 1]
         assert (
             self._warm_one_tensor(
                 tmp_path, shape, labels, (1, 1, 1), chunks=(1, 256, 256)
@@ -1166,110 +1086,7 @@ class TestSkipUnscaledLevel:
             == 0
         )
 
-    def test_gate_tracks_the_planner_not_a_size_threshold(self):
-        """The skip condition is exactly the planner's all-ones coarsest level.
 
-        If the two ever diverge the worker would warm chunk_ids no client asks
-        for, so this pins them together rather than to a pixel count.
-        """
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        for shape, labels in [
-            ([1024, 1024], ["y", "x"]),
-            ([4000, 256, 256], ["t", "y", "x"]),
-            ([8192, 8192], ["y", "x"]),
-            ([10, 3, 20000, 20000], ["t", "c", "y", "x"]),
-        ]:
-            levels = build_pyramid_plan(shape, labels)
-            unscaled = all(s == 1 for s in levels[-1].scale_hint)
-            assert unscaled == (len(levels) == 1)
-
-
-class TestBuildPyramidPlan:
-    """The full computed plan generalizes the coarsest-only helper."""
-
-    def test_level_zero_is_full_resolution(self):
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        levels = build_pyramid_plan([20000, 20000], ["y", "x"])
-        assert list(levels[0].scale_hint) == [1, 1]
-        assert list(levels[0].shape) == [20000, 20000]
-        assert levels[0].native is False
-        assert levels[0].reduction_method == "area"
-
-    def test_coarsest_matches_precache_helper(self):
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        for shape, labels in [
-            ([20000, 20000], ["y", "x"]),
-            ([1000, 8000, 8000], ["z", "y", "x"]),
-            ([8, 20000, 20000], ["z", "y", "x"]),
-            ([10, 3, 20000, 20000], ["t", "c", "y", "x"]),
-        ]:
-            levels = build_pyramid_plan(shape, labels)
-            assert list(levels[-1].scale_hint) == compute_precache_scale_hint(
-                shape, labels
-            )
-
-    def test_each_level_shape_is_ceil_div(self):
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-        from biopb_tensor_server.core.downsample import ceil_div
-
-        shape = [1000, 8000, 8000]
-        levels = build_pyramid_plan(shape, ["z", "y", "x"])
-        for level in levels:
-            expected = [
-                ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint, strict=True)
-            ]
-            assert list(level.shape) == expected
-
-    def test_levels_strictly_coarsen(self):
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        levels = build_pyramid_plan([20000, 20000], ["y", "x"])
-        # Each successive level downsamples at least one axis further.
-        for prev, nxt in zip(levels, levels[1:], strict=False):
-            assert any(
-                b > a for a, b in zip(prev.scale_hint, nxt.scale_hint, strict=True)
-            )
-
-    def test_small_source_is_single_full_res_level(self):
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        levels = build_pyramid_plan([512, 512], ["y", "x"])
-        assert len(levels) == 1
-        assert list(levels[0].scale_hint) == [1, 1]
-
-    @pytest.mark.parametrize(
-        "shape,labels",
-        [
-            ([100000], ["x"]),  # 1-D with a label
-            ([100000], None),  # 1-D, no labels (no X/Y to resolve)
-            ([], []),  # 0-D scalar
-        ],
-    )
-    def test_sub_2d_is_single_unscaled_level(self, shape, labels):
-        # <2-D tensors have no Y/X plane: one full-resolution level, never a raise
-        # (regression -- _precache_xy_indices used to raise, breaking GetFlightInfo).
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        levels = build_pyramid_plan(shape, labels)
-        assert len(levels) == 1
-        assert list(levels[0].scale_hint) == [1] * len(shape)
-        assert list(levels[0].shape) == list(shape)
-        # The coarsest-helper wrapper must agree (no scaling).
-        assert compute_precache_scale_hint(shape, labels) == [1] * len(shape)
-
-    def test_reduction_method_is_configurable(self):
-        from biopb_tensor_server.core.chunk import build_pyramid_plan
-
-        levels = build_pyramid_plan(
-            [20000, 20000], ["y", "x"], reduction_method="nearest"
-        )
-        assert all(level.reduction_method == "nearest" for level in levels)
-
-
-@pytest.mark.skipif(not _zarr_available(), reason="zarr not installed")
 class TestNativePyramidLevels:
     """OME-Zarr advertises its on-disk levels, and they round-trip."""
 

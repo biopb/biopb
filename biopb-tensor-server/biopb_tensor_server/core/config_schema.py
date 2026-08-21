@@ -82,6 +82,33 @@ _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
         "watcher_type": ("string", "Deprecated alias for monitor_mode."),
         "poll_interval": ("number", "Deprecated alias for rescan_interval."),
     },
+    "pyramid": {
+        # Removed with the server-computed level ladder (biopb/biopb#89): only
+        # natively-stored levels are advertised now, and warming follows what
+        # clients read, so nothing downsamples on a schedule the server picked.
+        # Kept as tolerated no-ops so an old config is *warned* rather than
+        # reported as unknown.
+        "reduction_method": (
+            "string",
+            "Removed (biopb/biopb#89): the server no longer computes a level "
+            "ladder. Clients choose their own scale per read. Ignored.",
+        ),
+        "threshold": (
+            "number",
+            "Removed (biopb/biopb#89): there is no server-chosen coarsest "
+            "level to bound. Ignored.",
+        ),
+        "downscale_factor": (
+            "number",
+            "Removed (biopb/biopb#89): the server no longer steps between "
+            "levels. Ignored.",
+        ),
+        "pixel_budget_cubic_root": (
+            "number",
+            "Removed (biopb/biopb#89): there is no server-chosen coarsest "
+            "level to budget. Ignored.",
+        ),
+    },
     "precache": {
         # Removed with the speculative warming tiers (biopb/biopb#89): the
         # worker now warms only what a client has actually read, so there is no

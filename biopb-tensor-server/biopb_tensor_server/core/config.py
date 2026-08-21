@@ -80,7 +80,6 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 # (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
 # `_CONSTRAINTS` table and config_schema keep their existing spelling.
 from biopb._config_constraints import (
-    PYRAMID_CONSTRAINTS,
     Enum as _Enum,
     Range as _Range,
 )
@@ -171,9 +170,11 @@ def _default_cache_backend() -> str:
 # --- Declarative config validation (biopb/biopb#34) ---------------------------
 #
 # Out-of-range / bad-enum values used to be accepted silently and blow up later:
-# downscale_factor=0 -> ZeroDivisionError in GetFlightInfo; pixel_budget_cubic_root
-# <= 0 -> infinite loop in the precache worker; reduction_method="bogus" -> a
-# read-time ValueError; downscale_factor=1 -> a silently single-level pyramid.
+# a zero cache budget, a negative debounce, a high-water mark outside 0-1. (The
+# original motivating cases were pyramid knobs -- downscale_factor=0 dividing by
+# zero in GetFlightInfo, pixel_budget_cubic_root <= 0 looping forever in the
+# warmer -- which are gone with the computed ladder, biopb/biopb#89. The table
+# outlived them.)
 # The declarative fix is this table, checked at the read step (parse_config) by
 # the shared biopb._config_validate walker -- the same walker and the same policy
 # biopb-mcp and the control's admin endpoints use, so a knob is judged identically
@@ -187,29 +188,11 @@ def _default_cache_backend() -> str:
 # bad value still never reaches the request path, which was the actual ask.
 # `validate` and the admin PUT stay strict: a human is there to act on it.
 
-# Methods PyramidConfig.reduction_method accepts (matched case-insensitively):
-# the *computable* subset of the protocol vocabulary, plus its aliases.
-# Intentionally narrower than downsample.normalize_reduction_method, which also
-# accepts "precompute"/"precomputed" -- that value is a protocol concern (a
-# client requesting a native on-disk level), not a way the server can compute a
-# pyramid level, so it is invalid here. "linear" stays as a tolerated deprecated
-# alias: old configs keep validating, and normalize_reduction_method folds it
-# to "area" with a warning at read time.
-_REDUCTION_METHODS = {
-    "area",
-    "linear",
-    "nearest",
-    "stride",
-    "decimate",
-    "mean",
-}
-
-
 # Per-dataclass field constraints, keyed by class name (so this table can sit
 # above the class definitions). full_rescan_interval is intentionally absent:
 # a value <= 0 *disables* the periodic full-scan backstop (documented sentinel).
-# `_Range`/`_Enum` and the pyramid rows (PYRAMID_CONSTRAINTS) come from
-# biopb._config_constraints so biopb-mcp validates the same knobs identically.
+# `_Range`/`_Enum` come from biopb._config_constraints so biopb-mcp judges the
+# knobs it shares with this server identically.
 _CONSTRAINTS = {
     "CacheConfig": {
         "backend": _Enum({"memory", "file"}),
@@ -219,10 +202,12 @@ _CONSTRAINTS = {
         "file_max_total_bytes": _Range(min=1),
     },
     "PyramidConfig": {
-        # reduction_method is server-local (on-the-fly reduction is a compute
-        # concern, not a biopb-mcp knob); the numeric rows are shared.
-        "reduction_method": _Enum(_REDUCTION_METHODS, case_insensitive=True),
-        **PYRAMID_CONSTRAINTS,
+        # PYRAMID_CONSTRAINTS (threshold / downscale_factor /
+        # pixel_budget_cubic_root) is deliberately NOT spread in here any more:
+        # this server has no level ladder to constrain (biopb/biopb#89). The
+        # shared table stays where it is because biopb-mcp still owns those
+        # knobs -- its client-side ladder is now the only one.
+        "max_read_block_mb": _Range(min=1),
     },
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),
@@ -531,42 +516,18 @@ class CacheConfig:
 
 @dataclass
 class PyramidConfig:
-    """Resolution-pyramid level definition -- the server's single source of truth.
+    """Bound on what one scaled read may materialize.
 
-    These knobs decide the levels the server *advertises* on a tensor descriptor
-    (``TensorDescriptor.pyramid``, filled by GetFlightInfo) and that the precache
-    worker warms. Owning them server-side is the point: the client reads the
-    advertised levels and the precache worker warms those same scales, so the two
-    can no longer drift (previously these lived in biopb-mcp's [pyramid] config
-    and were mirrored here by hand). They still default to biopb-mcp's historical
-    values so an un-upgraded client computing the pyramid itself stays aligned.
+    Named for the pyramid because it used to define one: the level ladder the
+    server advertised and warmed. That ladder is gone (biopb/biopb#89) -- only
+    natively-stored levels are advertised now, and warming follows what clients
+    read -- so the downsampling knobs went with it and this holds the one
+    remaining, unrelated setting.
 
     Per-field help lives in each field's ``metadata["help"]`` (read by the config
     JSON Schema).
     """
 
-    reduction_method: str = field(
-        default="area",
-        metadata={
-            "help": "Downsampling method for computed levels ('area' = averaging). "
-            "Native on-disk levels are served precomputed regardless."
-        },
-    )
-    threshold: int = field(
-        default=4096,
-        metadata={"help": "Maximum X/Y extent (pixels) of the coarsest level."},
-    )
-    downscale_factor: int = field(
-        default=4,
-        metadata={"help": "Per-level linear downsampling step, per spatial axis."},
-    )
-    pixel_budget_cubic_root: int = field(
-        default=512,
-        metadata={
-            "help": "Cube root of the coarsest level's voxel budget "
-            "(Lx*Ly*Lz <= this**3); bounds a whole-volume 3-D read."
-        },
-    )
     max_read_block_mb: int = field(
         default=512,
         metadata={
@@ -1253,20 +1214,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     pyramid_data = data.get("pyramid", {})
     precache_data = data.get("precache", {})
 
-    # Back-compat: these knobs used to live under [precache]; honor an old
-    # [precache] value when [pyramid] omits the key. An absent knob falls through
-    # to PyramidConfig's default.
     pyramid_kwargs: Dict[str, Any] = {}
-    for _knob, _cast in (
-        ("reduction_method", str),
-        ("threshold", int),
-        ("downscale_factor", int),
-        ("pixel_budget_cubic_root", int),
-    ):
-        if _knob in pyramid_data:
-            pyramid_kwargs[_knob] = _cast(pyramid_data[_knob])
-        elif _knob in precache_data:
-            pyramid_kwargs[_knob] = _cast(precache_data[_knob])
+    _carry(pyramid_kwargs, "max_read_block_mb", pyramid_data, cast=int)
     pyramid_config = PyramidConfig(**pyramid_kwargs)
 
     # Parse precache settings (operational knobs only).

@@ -1097,9 +1097,7 @@ class TensorAdapter(SourceAdapter):
         # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
         if read_opt.with_pyramid:
-            read_plan.descriptor.pyramid.extend(
-                self._advertised_pyramid(base_desc, pyramid_config)
-            )
+            read_plan.descriptor.pyramid.extend(self._advertised_pyramid(base_desc))
         self._fill_physical_scale(read_plan.descriptor)
         return read_plan
 
@@ -1130,9 +1128,7 @@ class TensorAdapter(SourceAdapter):
         """
         return self.get_native_pyramid_levels() is not None
 
-    def _advertised_pyramid(
-        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
-    ) -> List[PyramidLevel]:
+    def _advertised_pyramid(self, base_desc: TensorDescriptor) -> List[PyramidLevel]:
         """The resolution-pyramid levels to advertise for this tensor.
 
         **Native levels only.** A tensor without an on-disk pyramid advertises

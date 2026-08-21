@@ -465,7 +465,7 @@ class TestNormalizedDescriptorAndData:
             adapter = normalize_adapter(inner)
             plan = adapter.plan_flight_info(
                 TensorReadOption(tensor_id="src", with_pyramid=True),
-                PyramidConfig(threshold=32),
+                PyramidConfig(),
             )
             assert list(plan.descriptor.shape) == [4, 64, 128]
             assert len(plan.descriptor.pyramid) > 1

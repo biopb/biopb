@@ -189,11 +189,13 @@ class TestReductionMethodNormalization:
         with pytest.raises(ValueError, match="Unsupported reduction method"):
             _ds.normalize_reduction_method("cubic")
 
-    def test_pyramid_config_accepts_linear_alias(self):
-        from biopb_tensor_server.core.config import PyramidConfig
+    def test_linear_alias_still_folds_to_area_on_a_read(self):
+        # "linear" was a config value once (PyramidConfig.reduction_method, gone
+        # with the computed ladder in biopb/biopb#89). It remains live protocol
+        # vocabulary a client may send on a read, so the read path still folds it.
+        from biopb_tensor_server.core.downsample import normalize_reduction_method
 
-        # Tolerated deprecated alias: old configs must keep validating.
-        PyramidConfig(reduction_method="linear")
+        assert normalize_reduction_method("linear") == "area"
 
 
 class TestAdvisoryReductionCacheKey:
