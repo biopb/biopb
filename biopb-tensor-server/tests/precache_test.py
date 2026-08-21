@@ -612,7 +612,9 @@ class TestPreemptionAndLifecycle:
 from types import SimpleNamespace  # noqa: E402
 
 
-def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
+def _register_zarr(
+    server, tmp_path, source_id, shape=(8192, 8192), labels=("y", "x"), chunks=None
+):
     import zarr
     from biopb_tensor_server import ZarrAdapter
 
@@ -620,11 +622,11 @@ def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
         str(tmp_path / f"{source_id}.zarr"),
         mode="w",
         shape=shape,
-        chunks=(1024, 1024),
+        chunks=chunks or (1024, 1024),
         dtype="uint16",
     )
     arr[:] = 3
-    adapter = ZarrAdapter(arr, source_id, ["y", "x"])
+    adapter = ZarrAdapter(arr, source_id, list(labels))
     server.register_source(source_id, adapter)
     return adapter
 
@@ -1018,6 +1020,83 @@ class TestSkipNativePyramid:
 # ---------------------------------------------------------------------------
 # Server-advertised pyramid plan (server-decided multi-scale).
 # ---------------------------------------------------------------------------
+
+
+class TestSkipUnscaledCoarsestLevel:
+    """A tensor whose coarsest advertised level is full resolution is not warmed.
+
+    Warming it would cache the source 1:1 and save an open nothing, because
+    there is no decode+downsample to precompute.
+    """
+
+    def _init_file_cache(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+
+    def _warm_one_tensor(self, tmp_path, shape, labels, chunks=None):
+        """Run one tensor through the worker; return the cache's miss count."""
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(
+                server, tmp_path, "src", shape=shape, labels=labels, chunks=chunks
+            )
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            cm = CacheManager.get_instance()
+            td = adapter.list_tensor_descriptors()[0]
+            preempted = worker._process_tensor(adapter, td, cm)
+            assert preempted is False
+            return cm.stats().misses
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_skips_tensor_already_under_the_pixel_budget(self, tmp_path):
+        # 1024x1024 needs no downsampling, so the coarsest level is level 0.
+        assert compute_precache_scale_hint([1024, 1024], ["y", "x"]) == [1, 1]
+        assert self._warm_one_tensor(tmp_path, (1024, 1024), ("y", "x")) == 0
+
+    def test_warms_tensor_that_has_a_scale_rung(self, tmp_path):
+        # The contrast case: 8192x8192 earns a 4x rung, so warming pays.
+        assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [4, 4]
+        assert self._warm_one_tensor(tmp_path, (8192, 8192), ("y", "x")) > 0
+
+    def test_skips_long_timelapse_with_small_frames(self, tmp_path):
+        """The case the gate exists for.
+
+        The planner scores ``Lx*Ly*Lz`` only, so T never enters the pixel budget
+        and is never scaled: a many-frame series of small frames is both the
+        most expensive thing to warm and the one warming does nothing for.
+        """
+        shape, labels = (4000, 256, 256), ("t", "y", "x")
+        assert compute_precache_scale_hint(list(shape), list(labels)) == [1, 1, 1]
+        assert self._warm_one_tensor(tmp_path, shape, labels, chunks=(1, 256, 256)) == 0
+
+    def test_gate_tracks_the_planner_not_a_size_threshold(self):
+        """The skip condition is exactly the planner's all-ones coarsest level.
+
+        If the two ever diverge the worker would warm chunk_ids no client asks
+        for, so this pins them together rather than to a pixel count.
+        """
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
+
+        for shape, labels in [
+            ([1024, 1024], ["y", "x"]),
+            ([4000, 256, 256], ["t", "y", "x"]),
+            ([8192, 8192], ["y", "x"]),
+            ([10, 3, 20000, 20000], ["t", "c", "y", "x"]),
+        ]:
+            levels = build_pyramid_plan(shape, labels)
+            unscaled = all(s == 1 for s in levels[-1].scale_hint)
+            assert unscaled == (len(levels) == 1)
 
 
 class TestBuildPyramidPlan:

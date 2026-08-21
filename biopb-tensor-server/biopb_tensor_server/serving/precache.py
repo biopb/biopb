@@ -28,6 +28,11 @@ Design constraints (all best-effort, never fatal to the server):
   write, so the backlog tier gates each chunk on cache fill and stops above
   ``backlog_high_water`` of the cache's ``max_bytes``, and yields the moment a
   live source is enqueued.
+- **Only warms what scaling makes cheap.** A tensor whose coarsest advertised
+  level is full resolution is skipped: warming it would cache the source 1:1 to
+  save an open nothing. Without this the worker chases a footprint far larger
+  than the cache, and the ``backlog_high_water`` stop then decides *which*
+  sources stay warm by mtime order rather than by what warming is worth.
 """
 
 from __future__ import annotations
@@ -372,6 +377,22 @@ class PrecacheWorker:
             downscale_factor=cfg.downscale_factor,
             pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
         )[-1]
+
+        # Nothing to precompute when the coarsest level is full resolution:
+        # warming caches the source 1:1 and saves an open nothing.
+        #
+        # Test the planner's scale_hint rather than a pixel threshold of our
+        # own -- it is already the answer to "is the spatial extent worth a
+        # level?", and tying the gate to it keeps precache from warming
+        # chunk_ids no client requests. Biggest effect is on long timelapses:
+        # the plan scores Lx*Ly*Lz only, so T is never scaled and a many-frame
+        # series is both the costliest warm and the one warming cannot help.
+        if all(int(s) == 1 for s in coarsest.scale_hint):
+            logger.debug(
+                "precache: skipping tensor %s (coarsest level is full resolution)",
+                tensor_id,
+            )
+            return False
 
         # Build the request descriptor exactly as get_flight_info does, so the
         # read plan's scaled chunk_ids match what the client will fetch.
