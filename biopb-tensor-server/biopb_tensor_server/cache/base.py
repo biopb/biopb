@@ -146,6 +146,12 @@ class CacheStats:
     pending_waits: int = 0  # Threads that waited on pending entries
     ref_held_evictions_skipped: int = 0  # Evictions skipped due to ref_count
     oversized_skips: int = 0  # Chunks skipped due to exceeding Arrow batch size limit
+    deferred_write_bytes: int = 0  # Committed from memory, not yet on disk
+    # Deferred writes that never reached disk. The batches were still served, so
+    # this is not an error count -- it is "the cache has quietly stopped
+    # persisting", which is otherwise invisible because the caller was released
+    # before the write was attempted.
+    deferred_write_failures: int = 0
     pool_stats: Dict[str, PoolStats] = field(default_factory=dict)
 
 
@@ -160,6 +166,12 @@ class CacheBackend(ABC):
     The key method is get_or_acquire() which implements the future/promise
     pattern for safe concurrent access.
     """
+
+    # Whether ``complete_entry`` accepts ``allow_deferred`` -- i.e. whether this
+    # backend can commit an entry before its write lands. False keeps the
+    # historical signature, so a backend that predates deferred writes, or one
+    # written outside this tree, is called exactly as it always was.
+    SUPPORTS_DEFERRED_WRITES: bool = False
 
     @abstractmethod
     def get_or_acquire(

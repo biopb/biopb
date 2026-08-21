@@ -60,6 +60,9 @@ class CacheManager:
                     cache_dir=config.file_cache_dir,
                     max_segment_bytes=config.file_max_segment_bytes,
                     max_total_bytes=config.file_max_total_bytes,
+                    max_deferred_write_bytes=config.file_deferred_write_mb
+                    * 1024
+                    * 1024,
                 )
             )
         else:
@@ -142,6 +145,13 @@ class CacheManager:
         that must not collide with a previous one gets a fresh cache namespace
         from its ``content_version`` (biopb/biopb#178), not from an overwrite.
 
+        Never deferred, whatever the backend is configured for. Deferring a
+        write is safe when the cache is a cache -- a lost write costs a re-read
+        from the backend. This path has no backend to re-read: an upload's only
+        copy is what lands in the segment (``CachedSourceAdapter.get_data``
+        raises, and it serves only chunk_ids that were written). So this caller
+        must not be told the bytes are stored until they are.
+
         Args:
             key: Cache key bytes
             data: The batch to store
@@ -150,7 +160,14 @@ class CacheManager:
         _entry, is_owner = self._backend.start_compute(key)
         try:
             if is_owner:
-                self._backend.complete_entry(key, data, size_bytes)
+                if self._backend.SUPPORTS_DEFERRED_WRITES:
+                    self._backend.complete_entry(
+                        key, data, size_bytes, allow_deferred=False
+                    )
+                else:
+                    # A backend that cannot defer is called as it always was, so
+                    # one written against the historical signature keeps working.
+                    self._backend.complete_entry(key, data, size_bytes)
         except BaseException as e:
             # A failed commit must not strand a PENDING entry: readers of this
             # key would block on it until pending_timeout.
@@ -169,6 +186,16 @@ class CacheManager:
     def remove(self, key: bytes) -> bool:
         """Remove entry (only if evictable)."""
         return self._backend.remove(key)
+
+    def await_deferred_write(self, key: bytes, timeout: float = 5.0) -> bool:
+        """Wait for one key's deferred write. True if nothing is owed.
+
+        For the caller that needs bytes on disk rather than data in hand -- the
+        localhost handoff, which answers with a segment byte range. Backends that
+        never defer answer True immediately.
+        """
+        waiter = getattr(self._backend, "flush_deferred_write", None)
+        return True if waiter is None else waiter(key, timeout)
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk ChunkLocation for a cached chunk, or None.
