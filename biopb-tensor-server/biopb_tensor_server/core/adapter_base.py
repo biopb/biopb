@@ -592,6 +592,30 @@ class SourceAdapter(ABC):
         adapters override it. An override must be safe to call twice.
         """
 
+    def release_registration_cache(  # noqa: B027 - concrete no-op default
+        self,
+    ) -> None:
+        """Drop whatever was held only to answer registration, keeping derived state.
+
+        Called by :meth:`MetadataDatabase.sync_source_added` once the catalog row
+        is committed -- the moment the catalog, not the adapter, owns this
+        source's metadata (biopb/biopb#253). An adapter that parked a bulky
+        intermediate on itself to build that row may release it here; anything
+        the serve path still needs must survive.
+
+        Declared on the interface rather than sniffed with ``getattr`` for the
+        same reason :meth:`close` is: a delegating wrapper's author has to see it
+        (biopb/biopb#71). Default no-op -- only adapters with something big to
+        drop override it. Like ``close``, an override must be safe to call twice,
+        and must not make the released state unrecoverable: ``sync_source_added``
+        runs again when an unresolved source resolves.
+
+        A server with no catalog (the embedded image-base cache builds its
+        ``TensorFlightServer`` with ``metadata_db=None``) never calls this, so
+        nothing is released out from under a source whose metadata has nowhere
+        else to live.
+        """
+
     def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
         """Reduce a source-qualified array_id to its within-source field, for the
         multi-tensor ``get_tensor_adapter`` overrides.
@@ -1235,6 +1259,7 @@ _SOURCE_SCOPED_API = frozenset(
         "get_tensor_adapter",
         "put_chunk",
         "close",
+        "release_registration_cache",
     }
 )
 _TENSOR_SCOPED_API = frozenset(

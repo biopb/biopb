@@ -379,6 +379,10 @@ class MetadataDatabase:
         back the matching ``register_source`` so the catalog and ``ListFlights``
         never silently disagree. Logging is the caller's responsibility.
 
+        Once the row is committed this calls
+        ``adapter.release_registration_cache()``: the catalog now holds the
+        metadata, so the adapter may drop whatever it kept only to produce it.
+
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
@@ -438,6 +442,18 @@ class MetadataDatabase:
                     source_desc.data_resident,
                     tensors,
                 ],
+            )
+
+        # The row is committed, so the catalog -- not the adapter -- now owns this
+        # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
+        # parked on itself only to build the row; OME-TIFF's raw OME-XML is tens
+        # of MB on a per-plane acquisition (biopb/biopb#783). Best-effort: a
+        # balky release must not fail a registration that already succeeded.
+        try:
+            adapter.release_registration_cache()
+        except Exception:  # pragma: no cover - release is an optimization
+            logger.debug(
+                "release_registration_cache failed for %s", source_id, exc_info=True
             )
 
         logger.debug(f"Synced source to metadata database: {source_id}")

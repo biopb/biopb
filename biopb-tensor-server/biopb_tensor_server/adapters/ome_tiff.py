@@ -432,8 +432,19 @@ class OmeTiffAdapter(TensorAdapter):
         # descriptor, metadata, and physical-scale paths so registration opens the
         # file once. ``_raw_ome_xml_probed`` distinguishes "not looked yet" from a
         # probed-but-absent (None) result.
+        #
+        # The raw string is registration-scope only: it is tens of MB on a
+        # per-plane acquisition (one <Plane> + one <TiffData> per T*C*Z), and
+        # ``release_registration_cache`` drops it once the catalog owns the
+        # metadata (biopb/biopb#783). ``_raw_ome_xml_released`` is the third
+        # state -- "there IS XML in the file, we just are not holding it" -- so a
+        # later consumer re-reads instead of seeing a false None. Only the
+        # plane-stripped ``_reduced_ome_xml`` (hundreds of bytes to a few KB)
+        # stays resident; it carries every <Image>/<Pixels> header, which is all
+        # the metadata and physical-scale paths read.
         self._raw_ome_xml = None
         self._raw_ome_xml_probed = False
+        self._raw_ome_xml_released = False
         self._reduced_ome_xml = None
         self._reduced_ome_xml_probed = False
 
@@ -574,10 +585,14 @@ class OmeTiffAdapter(TensorAdapter):
         # above populated it) so the scene's metadata / physical-scale paths read
         # the cached string instead of re-opening the master file once per scene --
         # the source parses the OME-XML once, every scene inherits it (mirrors how
-        # bioio threads its shared _bio_image into scene adapters).
+        # bioio threads its shared _bio_image into scene adapters). Scenes are
+        # built lazily at serve time, i.e. normally AFTER the post-registration
+        # release, so in practice what they inherit is the stripped form -- which
+        # is why physical scale must be derivable from it (biopb/biopb#783).
         if self._raw_ome_xml_probed:
             adapter._raw_ome_xml = self._raw_ome_xml
             adapter._raw_ome_xml_probed = True
+            adapter._raw_ome_xml_released = self._raw_ome_xml_released
         if self._reduced_ome_xml_probed:
             adapter._reduced_ome_xml = self._reduced_ome_xml
             adapter._reduced_ome_xml_probed = True
@@ -604,17 +619,38 @@ class OmeTiffAdapter(TensorAdapter):
         stripped -- the same ome-types structure MINUS the per-plane arrays at a
         fraction of the cost. Runs at registration (the metadata-DB sync calls
         get_metadata), so keeping it cheap is what moves the OME parse off startup.
+
+        Goes through ``_reduced_ome_xml_cached()``, not the raw string, so a re-sync
+        (an unresolved source resolving) re-parses the stripped form already in
+        hand rather than re-opening the file for a string it would strip again.
         """
-        ome_xml = self._local_ome_xml()
-        if ome_xml:
-            if not self._reduced_ome_xml_probed:
-                self._reduced_ome_xml_probed = True
-                reduced = _STRIP_PER_PLANE.sub("", ome_xml)
-                self._reduced_ome_xml = _STRIP_EMPTY_BINDATA.sub("", reduced)
-            fast = _fast_ome_metadata(self._reduced_ome_xml, already_reduced=True)
+        reduced = self._reduced_ome_xml_cached()
+        if reduced:
+            fast = _fast_ome_metadata(reduced, already_reduced=True)
             if fast is not None:
                 return fast
         return {}
+
+    def _reduced_ome_xml_cached(self) -> Optional[str]:
+        """The plane-stripped OME-XML, computed once and kept for the adapter's life.
+
+        This is the form everything downstream of registration actually reads:
+        ``<Plane>``/``<TiffData>`` removed (biopb/biopb#168) plus the degenerate
+        ``<BinData>`` placeholder (biopb/biopb#199), so it is O(structure) rather
+        than O(plane count) -- hundreds of bytes where the raw string is tens of
+        MB. Retaining THIS and dropping the raw is the whole of biopb/biopb#783.
+        Returns None for a source with no embedded OME-XML.
+        """
+        if self._reduced_ome_xml_probed:
+            return self._reduced_ome_xml
+        ome_xml = self._local_ome_xml()
+        if not ome_xml:
+            return None  # leave unprobed: nothing to strip, and nothing cached
+        self._reduced_ome_xml_probed = True
+        self._reduced_ome_xml = _STRIP_EMPTY_BINDATA.sub(
+            "", _STRIP_PER_PLANE.sub("", ome_xml)
+        )
+        return self._reduced_ome_xml
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the local OME-XML (or None)."""
@@ -644,6 +680,34 @@ class OmeTiffAdapter(TensorAdapter):
                 except Exception:
                     logger.debug("error closing scene adapter", exc_info=True)
 
+    def release_registration_cache(self) -> None:
+        """Drop the raw OME-XML now that the catalog holds the metadata (#783).
+
+        The raw string exists to build the catalog row; once that row is
+        committed it is an uncompressed duplicate of something DuckDB already
+        stores in stripped form, resident for as long as the source is
+        registered -- i.e. forever, in a serving process. On a per-plane
+        acquisition (40,000 timepoints is real) that is tens of MB per source.
+
+        Kept: ``_reduced_ome_xml``, which carries every ``<Image>``/``<Pixels>``
+        header and so still answers ``get_metadata`` and ``_physical_scale``
+        without touching the file. Also kept is ``_raw_ome_xml_probed`` -- the
+        release marks ``_raw_ome_xml_released`` instead of un-probing, or every
+        later call would re-open the file and we would have traded a memory leak
+        for an I/O one. Recoverable, not lossy: a consumer that genuinely needs
+        the full document calls ``_local_ome_xml()`` and pays for it once.
+
+        Only flips the released flag when there was a string to drop, so a
+        source with no embedded OME-XML keeps answering None from cache.
+        Cascades to any scene adapters, and is safe to call twice.
+        """
+        if self._raw_ome_xml is not None:
+            self._raw_ome_xml = None
+            self._raw_ome_xml_released = True
+        for adapter in list(self._tensor_adapters.values()):
+            if adapter is not self:
+                adapter.release_registration_cache()
+
     def __del__(self):
         # GC backstop: release the handle even without an explicit close().
         try:
@@ -660,10 +724,16 @@ class OmeTiffAdapter(TensorAdapter):
         path) so registration opens the file at most once across the descriptor,
         metadata, and physical-scale paths. Returns None for remote or non-OME
         sources.
+
+        After ``release_registration_cache`` the cache is gone but the file
+        still has the XML, so this re-reads it (biopb/biopb#783). That re-read
+        is the price of asking for the full document post-registration -- no
+        in-tree caller does; both remaining consumers read the stripped form.
         """
-        if self._raw_ome_xml_probed:
+        if self._raw_ome_xml_probed and not self._raw_ome_xml_released:
             return self._raw_ome_xml
         self._raw_ome_xml_probed = True
+        self._raw_ome_xml_released = False
         self._raw_ome_xml = None
 
         url = self._source_url or ""
@@ -711,6 +781,7 @@ class OmeTiffAdapter(TensorAdapter):
                 # Cache for the metadata path so it does not reopen the file.
                 self._raw_ome_xml = ome_xml or None
                 self._raw_ome_xml_probed = True
+                self._raw_ome_xml_released = False
                 if not ome_xml:
                     return None
                 series = tiff.series
@@ -762,7 +833,39 @@ class OmeTiffAdapter(TensorAdapter):
             return None
 
     def _physical_scale_from_ome_xml(self):
-        """Physical scale from the local OME-XML header.
+        """Physical scale from this scene's ``<Pixels>`` header, or None.
+
+        Scans the plane-stripped XML when it is already in hand -- stripping
+        removes only ``<Plane>``/``<TiffData>``, so every ``<Image>``/
+        ``<Pixels>`` header survives it, and after the post-registration release
+        it is the only document left (biopb/biopb#783). Registration always
+        computes it (``get_metadata`` does), so post-release it is always there.
+
+        Never *computes* it just for this: ``iterparse`` stops at the requested
+        image's ``<Pixels>``, which is cheaper than the whole-document strip that
+        would produce the reduced form. Falling back to the raw document is also
+        what happens if the stripped one fails to parse -- which would equally
+        have failed ``get_metadata``. A stripped document that parses and names
+        no physical size is a legitimate ``None``, not a reason to re-read.
+        Never raises.
+        """
+        if self._reduced_ome_xml:
+            try:
+                return self._scan_physical_scale(self._reduced_ome_xml)
+            except Exception:
+                logger.debug(
+                    "physical-scale scan failed on stripped OME-XML for %s",
+                    self._source_url,
+                    exc_info=True,
+                )
+        try:
+            ome_xml = self._local_ome_xml()
+            return self._scan_physical_scale(ome_xml) if ome_xml else None
+        except Exception:
+            return None
+
+    def _scan_physical_scale(self, ome_xml: str):
+        """Scan one OME-XML document for this scene's physical pixel size.
 
         Namespace-agnostic ElementTree scan (NOT an ome-types object build): find
         the ``<Image>`` at this scene's index in document order, read its
@@ -770,51 +873,45 @@ class OmeTiffAdapter(TensorAdapter):
         ``dim_labels`` by lowercased axis label (T/C/S -> ``0.0`` / ``""``).
         Physical sizes occur on ``<Pixels>`` before per-plane elements, so stream
         only as far as the requested image's header. A missing ``*Unit`` defaults
-        to ``"µm"`` (OME spec default). Returns ``None`` on any failure or when no
-        positive size is present -- never raises.
+        to ``"µm"`` (OME spec default). Returns ``None`` when no positive size is
+        present; propagates a parse error so the caller can pick another document.
         """
-        try:
-            ome_xml = self._local_ome_xml()
-            if not ome_xml:
-                return None
 
-            def _local(tag):
-                return str(tag).rsplit("}", 1)[-1]
+        def _local(tag):
+            return str(tag).rsplit("}", 1)[-1]
 
-            idx = self.scene_index or 0
+        idx = self.scene_index or 0
 
-            def _size(axis):
-                raw = attrs.get(f"PhysicalSize{axis}")
-                if raw is None:
-                    return 0.0, ""
-                try:
-                    v = float(raw)
-                except (TypeError, ValueError):
-                    return 0.0, ""
-                if v <= 0:
-                    return 0.0, ""
-                return v, (attrs.get(f"PhysicalSize{axis}Unit") or "µm")
+        def _size(axis):
+            raw = attrs.get(f"PhysicalSize{axis}")
+            if raw is None:
+                return 0.0, ""
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                return 0.0, ""
+            if v <= 0:
+                return 0.0, ""
+            return v, (attrs.get(f"PhysicalSize{axis}Unit") or "µm")
 
-            images_seen = -1
-            attrs = None
-            for _, element in ET.iterparse(io.StringIO(ome_xml), events=("start",)):
-                if _local(element.tag) == "Image":
-                    images_seen += 1
-                elif _local(element.tag) == "Pixels" and images_seen == idx:
-                    attrs = element.attrib
-                    break
-            if attrs is None:
-                return None
-
-            by_label = {"x": _size("X"), "y": _size("Y"), "z": _size("Z")}
-            scale, unit = [], []
-            for lab in self.dim_labels or []:
-                v, u = by_label.get(str(lab).lower(), (0.0, ""))
-                scale.append(v)
-                unit.append(u)
-            return (scale, unit) if any(scale) else None
-        except Exception:
+        images_seen = -1
+        attrs = None
+        for _, element in ET.iterparse(io.StringIO(ome_xml), events=("start",)):
+            if _local(element.tag) == "Image":
+                images_seen += 1
+            elif _local(element.tag) == "Pixels" and images_seen == idx:
+                attrs = element.attrib
+                break
+        if attrs is None:
             return None
+
+        by_label = {"x": _size("X"), "y": _size("Y"), "z": _size("Z")}
+        scale, unit = [], []
+        for lab in self.dim_labels or []:
+            v, u = by_label.get(str(lab).lower(), (0.0, ""))
+            scale.append(v)
+            unit.append(u)
+        return (scale, unit) if any(scale) else None
 
     # ---- persistent aszarr store -------------------------------------------
     def _should_persist_store(self) -> bool:

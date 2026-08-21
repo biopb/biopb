@@ -448,6 +448,62 @@ def create_multi_series_ome_tiff(
     return str(tiff_path), series_names, series_info
 
 
+def create_per_plane_ome_tiff(
+    path: str,
+    n_t: int = 200,
+    plane_shape: Tuple[int, int] = (16, 16),
+    physical_size: float = 0.25,
+    dtype: np.dtype = np.uint16,
+) -> str:
+    """Create an OME-TIFF whose OME-XML carries one ``<Plane>``/``<TiffData>`` per T.
+
+    This is the shape of a real per-plane acquisition (an MMStack timelapse), and
+    the reason it needs synthesising is that nothing else in the corpus has it:
+    every ``samples/*.ome.tif`` is a conversion from plain TIFF with **zero**
+    ``<Plane>`` elements, so the OME-XML paths that are O(plane count) look free
+    on the sample data and only bite on a real acquisition (biopb/biopb#783).
+
+    The XML grows ~200 B per plane, so ``n_t`` is the knob that makes the raw
+    string big relative to the plane-stripped form (which stays constant).
+    ``<Plane>`` follows ``<TiffData>`` per the OME schema's child order, and
+    ``metadata=None`` on write stops tifffile stamping its own "shaped" series
+    metadata over the OME series assembly.
+
+    Returns the written path.
+    """
+    import tifffile
+
+    h, w = plane_shape
+    tiff_data = "".join(
+        f'<TiffData FirstC="0" FirstZ="0" FirstT="{t}" IFD="{t}" PlaneCount="1"/>'
+        for t in range(n_t)
+    )
+    # Stage position + timestamp per plane: the per-plane payload a real
+    # acquisition writes, and what makes the raw XML tens of MB at 40k timepoints.
+    planes = "".join(
+        f'<Plane TheC="0" TheZ="0" TheT="{t}" DeltaT="{t * 0.1}" '
+        f'PositionX="1.0" PositionY="2.0" PositionZ="0.0"/>'
+        for t in range(n_t)
+    )
+    # "&#181;m" not a literal micro sign: an ImageDescription tag must be 7-bit
+    # ASCII, and the entity decodes back to "\u00b5m" on parse.
+    xml = (
+        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+        '<Image ID="Image:0" Name="perplane">'
+        '<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16" '
+        f'SizeX="{w}" SizeY="{h}" SizeZ="1" SizeC="1" SizeT="{n_t}" '
+        f'PhysicalSizeX="{physical_size}" PhysicalSizeXUnit="&#181;m" '
+        f'PhysicalSizeY="{physical_size}" PhysicalSizeYUnit="&#181;m">'
+        '<Channel ID="Channel:0:0" SamplesPerPixel="1"/>'
+        f"{tiff_data}{planes}</Pixels></Image></OME>"
+    )
+
+    data = np.zeros((n_t, h, w), dtype=dtype)
+    with tifffile.TiffWriter(str(path)) as writer:
+        writer.write(data, description=xml, metadata=None, photometric="minisblack")
+    return str(path)
+
+
 def create_multifile_embedded_ome_tiff(
     tmpdir: str,
     n_files: int = 3,
