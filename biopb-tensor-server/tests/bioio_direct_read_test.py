@@ -9,6 +9,15 @@ from biopb_tensor_server.adapters.bioio import NikonAdapter
 nd2 = pytest.importorskip("nd2")
 
 
+class _ZeroFrame:
+    """Shape/dtype only -- the grid tests never touch pixels, and materializing
+    the 4096x4096x4 geometry they need would cost 134 MB for nothing."""
+
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+
 class _FakeDaskArray:
     def __init__(self, data: np.ndarray, chunks: tuple[tuple[int, ...], ...]):
         self._data = data
@@ -57,6 +66,10 @@ class _FakeND2File:
     def loop_indices(self):
         type(self).loop_indices_accesses += 1
         return self.loop_indices_value
+
+    # The interleave probe reads these off the file (biopb/biopb#806). The
+    # default describes a planar ND2, so existing tests keep their grid.
+    attributes = SimpleNamespace(componentCount=1, widthPx=5, widthBytes=10)
 
 
 def _adapter(tmp_path, data, labels, chunks):
@@ -107,7 +120,10 @@ def test_nikon_direct_read_maps_scene_t_and_z_and_copies_crop(tmp_path, monkeypa
     assert actual.flags.owndata
     assert _FakeND2File.closed
     assert _FakeND2File.loop_indices_accesses == 1
-    assert list(adapter.get_tensor_descriptor().chunk_shape) == [1, 2, 1, 4, 5]
+    # The frame ND2 hands back -- all channels, whole Y/X, one T and one Z --
+    # seeds the transfer grid; the grid is whole frames of it (biopb/biopb#809).
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+    assert [grid[1], grid[3], grid[4]] == [2, 4, 5]
 
 
 def test_nikon_direct_read_preserves_rgb_samples(tmp_path, monkeypatch):
@@ -251,3 +267,69 @@ def test_scene_switch_does_not_race_a_concurrent_read():
 
     assert not any(thread.is_alive() for thread in threads), "deadlocked"
     assert observed and np.array_equal(observed[0], scenes[0])
+
+
+def test_interleaved_nd2_keeps_all_channels_in_one_transfer_chunk(
+    tmp_path, monkeypatch
+):
+    """An interleaved ND2 declares C as part of the unit, not an axis to split.
+
+    For a `(Y, X, C)` frame, C is the *innermost* axis on disk: one channel's
+    bytes are `itemsize` of every `C * itemsize`, so a per-channel chunk faults
+    in every page the other channels occupy and discards what it did not ask
+    for, then the next channel repeats the read. The declared unit is therefore
+    "all channels of one full-width row", and only Y grows from it
+    (biopb/biopb#806).
+
+    Nothing downstream re-shapes a declared grid (biopb/biopb#809), which is what
+    makes this hold -- the fixed divide/coalesce priority used to take C apart
+    again.
+    """
+    # Wide enough that a whole frame is 134 MB: the planar treatment has to
+    # divide it, and the axis it reaches for first is C.
+    data = _ZeroFrame((1, 4, 1, 4096, 4096), np.dtype("uint16"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+    monkeypatch.setattr(
+        _FakeND2File,
+        "attributes",
+        SimpleNamespace(
+            componentCount=4,
+            widthPx=4096,
+            # 4096 px * 4 components * 2 bytes -- the interleaved identity.
+            widthBytes=4096 * 4 * 2,
+        ),
+    )
+
+    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (4,), (1,), (4096,), (4096,)))
+    grid = list(adapter.get_tensor_descriptor().chunk_shape)
+
+    # All four channels and the whole row: the contiguous run is never cut.
+    # Only Y grew, to the row count that fills the transfer target.
+    assert grid == [1, 4, 1, 256, 4096]
+
+    from biopb_tensor_server.core.chunk import (
+        PREFERRED_ARROW_BATCH_BYTES,
+        estimate_chunk_bytes,
+    )
+
+    assert estimate_chunk_bytes(tuple(grid), "<u2") <= PREFERRED_ARROW_BATCH_BYTES
+
+
+def test_planar_nd2_is_not_treated_as_interleaved(tmp_path, monkeypatch):
+    """The probe keys on the file's own byte layout, not the channel count.
+
+    The same geometry as the test above, declared planar: C is an outer axis, so
+    splitting it is cheap and the standard sizing applies unchanged.
+    """
+    data = _ZeroFrame((1, 4, 1, 4096, 4096), np.dtype("uint16"))
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+    monkeypatch.setattr(
+        _FakeND2File,
+        "attributes",
+        # Multi-component but planar: widthBytes covers one component only.
+        SimpleNamespace(componentCount=4, widthPx=4096, widthBytes=4096 * 2),
+    )
+
+    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (4,), (1,), (4096,), (4096,)))
+    assert adapter._channel_interleaved(2) is False
+    assert list(adapter.get_tensor_descriptor().chunk_shape) == [1, 1, 1, 2048, 2048]

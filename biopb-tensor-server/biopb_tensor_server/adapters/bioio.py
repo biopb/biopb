@@ -35,7 +35,13 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    PREFERRED_ARROW_BATCH_BYTES,
+    compute_transfer_chunk_size,
+    content_version_from_path,
+    default_transfer_chunk_shape,
+    estimate_chunk_bytes,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -264,6 +270,8 @@ class _BioioAdapterBase(TensorAdapter):
         self._dask_data = None  # scene-level dask array, bound below
         self._scene_descriptor = None
         self._nd2_frame_index_cache: Any = _FRAME_INDEX_UNCACHED
+        # ND2 channel-interleave probe (NikonAdapter); None = not yet read.
+        self._interleaved_cache: Optional[bool] = None
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -327,18 +335,33 @@ class _BioioAdapterBase(TensorAdapter):
         # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
 
-    def _read_chunk_shape(self, dask_data: Any) -> List[int]:
-        """Return the backend's native read-granularity hint."""
+    def _native_block(self, dask_data: Any) -> Optional[List[int]]:
+        """The backend's own block, used to align the transfer grid.
+
+        Only an alignment seed: no read is issued at this granularity
+        (biopb/biopb#809). An adapter whose bytes sit on disk in a shape BioIO's
+        block does not describe overrides :meth:`_transfer_chunk_shape` instead.
+        """
         return [max(c) for c in dask_data.chunks]
+
+    def _transfer_chunk_shape(
+        self, shape: List[int], dtype: str, dask_data: Any
+    ) -> List[int]:
+        """This tensor's transfer grid -- the meaning of ``chunk_shape`` (#809)."""
+        return default_transfer_chunk_shape(
+            shape, dtype, self.dim_labels, native=self._native_block(dask_data)
+        )
 
     def _descriptor_from_dask(self, dask_data: Any) -> TensorDescriptor:
         """Snapshot the structural facts exposed by a scene Dask array."""
+        shape = list(dask_data.shape)
+        dtype = dask_data.dtype.str
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels if self.dim_labels else [],
-            shape=list(dask_data.shape),
-            chunk_shape=self._read_chunk_shape(dask_data),
-            dtype=dask_data.dtype.str,
+            shape=shape,
+            chunk_shape=self._transfer_chunk_shape(shape, dtype, dask_data),
+            dtype=dtype,
         )
 
     def _release_bioio_dask_cache(self) -> None:
@@ -433,7 +456,15 @@ class _BioioAdapterBase(TensorAdapter):
                                 array_id=f"{self.source_id}/{scene_ids[i]}",
                                 dim_labels=list(labels),
                                 shape=shape,
-                                chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                                # The grid is arithmetic on shape/dtype/labels
+                                # -- no scene switch, no Dask graph -- so the
+                                # catalog can carry it (biopb/biopb#809). The
+                                # per-scene block is unavailable on this
+                                # metadata-only path; the sized grid is the same
+                                # one an unseeded tensor gets.
+                                chunk_shape=default_transfer_chunk_shape(
+                                    shape, dtype, list(labels)
+                                ),
                                 dtype=dtype,
                             )
                         )
@@ -456,7 +487,9 @@ class _BioioAdapterBase(TensorAdapter):
                         if self.dim_labels
                         else list(self._bio_image.dims.order),
                         shape=list(dask_data.shape),
-                        chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                        chunk_shape=self._transfer_chunk_shape(
+                            list(dask_data.shape), dask_data.dtype.str, dask_data
+                        ),
                         dtype=dask_data.dtype.str,
                     )
                 )
@@ -734,23 +767,99 @@ class NikonAdapter(_BioioAdapterBase):
             units.append(axis_unit if numeric > 0 else "")
         return (scale, units) if any(scale) else None
 
-    def _read_chunk_shape(self, dask_data: Any) -> List[int]:
+    def _native_block(self, dask_data: Any) -> Optional[List[int]]:
         """Describe one ND2 sequence frame, preserving its pixel layout.
 
         ``nd2.read_frame`` indexes the acquisition loops (T/Z and the scene's
         position) and returns the complete C/Y/X[/S] frame. Some BioIO/Dask
         arrays report several sequence frames as one chunk, which is not the
         granularity available from the reader below. Keep any smaller pixel
-        tiling BioIO reports, but never combine T or Z frames in this private
-        planning hint.
+        tiling BioIO reports, but never combine T or Z frames in this seed.
         """
-        chunk_shape = super()._read_chunk_shape(dask_data)
-        if len(chunk_shape) != len(self.dim_labels or []):
-            return chunk_shape
+        block = super()._native_block(dask_data)
+        if block is None or len(block) != len(self.dim_labels or []):
+            return block
         for axis, label in enumerate(self.dim_labels or []):
             if label.upper() in {"T", "Z"}:
-                chunk_shape[axis] = 1
-        return chunk_shape
+                block[axis] = 1
+        return block
+
+    def _channel_interleaved(self, itemsize: int) -> bool:
+        """Whether this ND2 stores its channels interleaved within a row.
+
+        An uncompressed multi-component ND2 lays a frame out as ``(Y, X, C)``, so
+        a row of the stored image is ``widthPx * componentCount * itemsize``
+        bytes: on a 4-channel 14234-wide uint16 file ``widthBytes == 113872 ==
+        14234 * 4 * 2``, and channel 0's bytes are 2 of every 8. A planar file
+        fails that identity -- ``widthBytes`` covers one component -- and is
+        unaffected.
+
+        ``itemsize`` comes from the tensor's own dtype rather than the file's
+        ``bitsPerComponent*`` attributes, whose names vary by nd2 version (real
+        files carry ``bitsPerComponentInMemory``; reading the other spelling
+        yields 0 and silently answers "planar" for every file).
+
+        Probed once and cached: a wrong answer only reshapes the transfer grid,
+        but re-opening the file per descriptor call would not be free.
+        """
+        if self._interleaved_cache is None:
+            self._interleaved_cache = False
+            try:
+                import nd2
+
+                with nd2.ND2File(self._source_url) as reader:
+                    attrs = reader.attributes
+                    components = int(getattr(attrs, "componentCount", 1) or 1)
+                    width_px = int(getattr(attrs, "widthPx", 0) or 0)
+                    width_bytes = int(getattr(attrs, "widthBytes", 0) or 0)
+                    self._interleaved_cache = (
+                        components > 1
+                        and width_px > 0
+                        and width_bytes == width_px * components * itemsize
+                    )
+            except Exception:
+                logger.debug(
+                    "ND2 interleave probe failed for %s",
+                    self._source_url,
+                    exc_info=True,
+                )
+        return self._interleaved_cache
+
+    def _transfer_chunk_shape(
+        self, shape: List[int], dtype: str, dask_data: Any
+    ) -> List[int]:
+        """Keep an interleaved ND2's channels together in one transfer chunk.
+
+        For a channel-interleaved frame C is the *innermost* axis on disk, so a
+        per-channel chunk pays the full page cost of the band and discards 3/4 of
+        what it faulted in, then the next channel repeats the read. Measured on a
+        4-channel 14234-wide uint16 file, full-width band, pages warm: all four
+        channels in one read cost 96.4 ms for 233.2 MB (0.41 ms/MB) against 43.9
+        ms for 58.3 MB (0.75 ms/MB) for one channel -- 4x the pixels for 2.2x the
+        time (biopb/biopb#806).
+
+        So the declared *unit* is "all channels of one full-width row", and only
+        Y grows from it. C cannot be split because it is inside the unit, and
+        nothing downstream re-shapes a declared grid (biopb/biopb#809) -- which
+        is what makes this stick; the old fixed divide/coalesce priority took C
+        apart again and grew the two axes that stride over the data.
+        """
+        labels = [str(label).upper() for label in (self.dim_labels or [])]
+        if len(labels) != len(shape) or "C" not in labels or "X" not in labels:
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        if not self._channel_interleaved(np.dtype(dtype).itemsize):
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        unit = [
+            int(size) if label in {"C", "X", "S"} else 1
+            for label, size in zip(labels, shape, strict=True)
+        ]
+        # A single all-channel row already at or above the target leaves nothing
+        # to grow; declare it and let the Arrow clamp handle an extreme width.
+        if estimate_chunk_bytes(tuple(unit), dtype) >= PREFERRED_ARROW_BATCH_BYTES:
+            return unit
+        return list(
+            compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, labels)
+        )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read requested pixels directly from ND2 sequence frames.

@@ -323,11 +323,11 @@ class TestGetScaledReadPlan:
 
 
 class TestEmptyChunkShapeFallback:
-    """get_chunk_size() must tolerate an empty/partial chunk_shape.
+    """get_transfer_chunk_size() must tolerate an empty/partial chunk_shape.
 
-    A descriptor may legitimately omit chunk_shape (documented as "can be empty
-    []"; the lean ListFlights form drops it, and the bulk-seeded remote proxy
-    mirrors that lean catalog -- biopb/biopb#266). Before the fix, get_chunk_size
+    A descriptor may still omit chunk_shape -- an unresolved source has no shape
+    to size a grid from, and the bulk-seeded remote proxy mirrors whatever the
+    upstream catalog gave it (biopb/biopb#266). Before the fix the accessor
     returned a too-short tuple and _get_read_plan indexed it out of range against
     the full-rank shape, so every read of such a source raised IndexError.
     """
@@ -373,7 +373,7 @@ class TestEmptyChunkShapeFallback:
 
         from biopb_tensor_server.core.chunk import compute_safe_chunk_size
 
-        chunk = adapter.get_chunk_size()
+        chunk = adapter.get_transfer_chunk_size()
         # A full-rank grid (no longer a 0-length tuple).
         assert len(chunk) == len(shape)
         # Matches the server's default transfer-grid policy exactly.
@@ -396,7 +396,8 @@ class TestEmptyChunkShapeFallback:
         adapter = self._StubTensorAdapter(
             [100, 100], "uint8", ["y", "x"], chunk_shape=[50, 50]
         )
-        assert adapter.get_chunk_size() == (50, 50)
+        # The adapter's declared grid, served verbatim -- the server clamps to
+        # the Arrow ceiling and re-sizes nothing (biopb/biopb#809).
         assert adapter.get_transfer_chunk_size() == (50, 50)
 
     def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
@@ -409,14 +410,61 @@ class TestEmptyChunkShapeFallback:
             [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
         )
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_chunk_size()
+            adapter.get_transfer_chunk_size()
 
     def test_unresolved_empty_shape_raises_source_unresolved(self):
         from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_chunk_size()
+            adapter.get_transfer_chunk_size()
+
+
+class TestDeclaredGridIsServedVerbatim:
+    """The adapter owns chunk_shape; the server only clamps (biopb/biopb#809).
+
+    Sizing used to happen here, on the way out: the adapter advertised its file
+    geometry and the server re-shaped it with a fixed axis priority. That undid
+    any adapter that knew better than the labels how its bytes sit on disk
+    (biopb/biopb#806, biopb/biopb#807), and it re-planned the cache-backed
+    sources whose grid is binding rather than advisory. So the only thing left
+    is the wire bound.
+    """
+
+    _Stub = TestEmptyChunkShapeFallback._StubTensorAdapter
+
+    def test_grid_far_below_the_transfer_target_is_untouched(self):
+        # 8 KB against an 8 MB preferred size, and 16 endpoints' worth of room
+        # to coalesce into. Both the old divide/coalesce pass and the endpoint
+        # floor would have moved this; neither runs now.
+        adapter = self._Stub(
+            [1, 1, 64, 1024, 1024], "<u2", ["t", "c", "z", "y", "x"], [1, 1, 1, 64, 64]
+        )
+        assert adapter.get_transfer_chunk_size() == (1, 1, 1, 64, 64)
+
+    def test_grid_declaring_one_chunk_is_honoured(self):
+        adapter = self._Stub([64, 64], "uint8", ["y", "x"], [64, 64])
+        assert adapter.get_transfer_chunk_size() == (64, 64)
+
+    def test_grid_above_the_arrow_ceiling_is_resplit(self):
+        from biopb_tensor_server.core.chunk import (
+            MAX_ARROW_BATCH_BYTES,
+            estimate_chunk_bytes,
+        )
+
+        shape = [1, 1, 512, 2048, 2048]
+        adapter = self._Stub(shape, "<u2", ["t", "c", "z", "y", "x"], shape)
+        grid = adapter.get_transfer_chunk_size()
+
+        assert estimate_chunk_bytes(grid, "<u2") <= MAX_ARROW_BATCH_BYTES
+        # Clamped, not re-optimized: it is not pulled down to the 8 MB target.
+        assert estimate_chunk_bytes(grid, "<u2") > 8 << 20
+        # Y/X are kept whole -- the ceiling is met by splitting a navigable axis.
+        assert grid[-2:] == (2048, 2048)
+
+    def test_grid_is_clipped_to_the_shape(self):
+        adapter = self._Stub([4, 8], "uint8", ["y", "x"], [64, 64])
+        assert adapter.get_transfer_chunk_size() == (4, 8)
 
 
 class TestTransferChunkSize:

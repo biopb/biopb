@@ -61,8 +61,11 @@ def test_local_czi_claims_natively_and_reads_through_libczi(tmp_path):
     assert len(descriptors) == 1
     assert list(descriptors[0].dim_labels) == ["T", "C", "Z", "Y", "X"]
     assert list(descriptors[0].shape) == [2, 2, 3, 24, 32]
-    # One plane is the unit libCZI decodes, so it is the unit reads plan around.
-    assert list(descriptors[0].chunk_shape) == [1, 1, 1, 24, 32]
+    # One plane is the unit libCZI decodes; the transfer grid is built from
+    # whole planes rather than being one (biopb/biopb#809).
+    grid = list(descriptors[0].chunk_shape)
+    assert grid[-2:] == [24, 32]
+    assert all(g <= s for g, s in zip(grid, [2, 2, 3, 24, 32], strict=True))
 
     scene = source.get_tensor_adapter(descriptors[0].array_id)
     whole = scene.get_data(ChunkBounds(start=[0, 0, 0, 0, 0], stop=[2, 2, 3, 24, 32]))

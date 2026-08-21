@@ -89,11 +89,11 @@ def _make_store(tmpdir: str) -> str:
 def _set_grid_policy(mode) -> None:
     """Force the server's transfer-grid choice.
 
-    ``adapter_base`` imports the symbol by name, so patching only ``core.chunk``
-    leaves the already-bound reference in place and the patch silently does
-    nothing.
+    Adapters reach the sizing policy through ``default_transfer_chunk_shape``,
+    which resolves ``compute_transfer_chunk_size`` as a module global of
+    ``core.chunk`` -- so patching it there is enough, and reaches every adapter
+    that did not declare a grid of its own (biopb/biopb#809).
     """
-    import biopb_tensor_server.core.adapter_base as adapter_base
     import biopb_tensor_server.core.chunk as chunk
 
     real = getattr(chunk, "_real_compute_transfer_chunk_size", None)
@@ -114,7 +114,6 @@ def _set_grid_policy(mode) -> None:
             return real(native, shape, dtype, labels, preferred_bytes=mode)
 
     chunk.compute_transfer_chunk_size = policy
-    adapter_base.compute_transfer_chunk_size = policy
 
 
 def _start_server(zarr_path: str):

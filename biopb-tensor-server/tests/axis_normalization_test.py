@@ -291,7 +291,16 @@ class TestNormalizedDescriptorAndData:
             desc = adapter.get_tensor_descriptor()
             assert list(desc.dim_labels) == ["z", "y", "x"]
             assert list(desc.shape) == [4, 3, 2]
-            assert list(desc.chunk_shape) == [2, 1, 1]
+            # chunk_shape rides the same permutation as shape. Its *value* is the
+            # adapter's transfer grid, which is sized rather than native
+            # (biopb/biopb#809), so compare against the unwrapped adapter's own
+            # grid rather than a literal -- x,y,z -> z,y,x is a full reversal.
+            native = list(
+                _zarr_adapter(tmp, src, ["x", "y", "z"], name="raw")
+                .get_tensor_descriptor()
+                .chunk_shape
+            )
+            assert list(desc.chunk_shape) == native[::-1]
 
     def test_source_descriptor_and_catalog_row_are_canonical(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,8 +314,13 @@ class TestNormalizedDescriptorAndData:
 
     def test_chunk_size_is_canonical(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, _ = self._wrapped(tmp)
-            assert adapter.get_chunk_size() == (2, 1, 1)
+            adapter, src = self._wrapped(tmp)
+            native = list(
+                _zarr_adapter(tmp, src, ["x", "y", "z"], name="raw")
+                .get_tensor_descriptor()
+                .chunk_shape
+            )
+            assert adapter.get_transfer_chunk_size() == tuple(native[::-1])
 
     def test_get_data_takes_and_returns_canonical_axes(self):
         with tempfile.TemporaryDirectory() as tmp:

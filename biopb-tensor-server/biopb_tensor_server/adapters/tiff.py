@@ -23,7 +23,10 @@ from biopb_tensor_server.adapters._scale import (
     unit_to_um,
 )
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -674,6 +677,15 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             self.chunk_shape = [1] + self._spatial_chunk
             self.dim_labels = dim_labels if dim_labels else ["i", "y", "x"]
 
+        # chunk_shape is the transfer grid (biopb/biopb#809). The per-page block
+        # above -- one tile, or one whole page for a striped TIFF -- is only the
+        # alignment seed it grows from; a single page is usually well under the
+        # transfer target, and one endpoint per page is what biopb/biopb#684
+        # measured as too many.
+        self.chunk_shape = default_transfer_chunk_shape(
+            self.full_shape, self._dtype, self.dim_labels, native=self.chunk_shape
+        )
+
         # Total IFDs for coordinate mapping
         self._total_ifds = sum(n for _, n in self._file_ifd_map)
 
@@ -1238,6 +1250,11 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
                 label = axis_alias.get(axis.lower(), axis.lower()[0])
                 self.dim_labels.append(label)
             self.dim_labels.extend(["y", "x"])
+
+        # Transfer grid, seeded by the tile/page block computed above (#809).
+        self.chunk_shape = default_transfer_chunk_shape(
+            self.full_shape, self._dtype, self.dim_labels, native=self.chunk_shape
+        )
 
         # Build index for efficient lookups
         self._build_file_index()

@@ -823,10 +823,13 @@ class RemoteTensorAdapter(TensorAdapter):
         The server's ``get_flight_info`` calls this for a proxy tensor *instead*
         of running its local read planner (biopb/biopb#295). A caching proxy
         re-derives **no** chunk grid, pyramid, or physical scale of its own (see
-        the module docstring); the default planner would guess a grid from the
-        seed's ``chunk_shape`` (advisory, and often empty for the aicsimageio/
-        OME-TIFF family), fall through to the 64 MB default grid, and
-        over-amplify a single-plane read ~125x. Instead, consult the upstream
+        the module docstring). The seed's ``chunk_shape`` is now the upstream's
+        own transfer grid rather than an advisory hint (biopb/biopb#809), so the
+        local fallback is no longer the 64 MB default grid that over-amplified a
+        single-plane read ~125x -- but a seed can still be empty (an upstream
+        that never resolved), and only the upstream can answer for a *scaled*
+        read's grid, its pyramid, or its scaled ``chunk_id``s. So consult the
+        upstream
         once for its **authoritative** ``GetFlightInfo`` -- carrying the native
         grid, the server-advertised pyramid when the request opted in via
         ``with_pyramid`` (a pyramidal OME-Zarr upstream's precompute levels

@@ -270,15 +270,13 @@ class TestPerTensorCatalog:
             ("hcs/A2/0", ["z", "y", "x"], [8, 256, 256], "uint8"),
         ]
 
-    def test_catalog_stores_no_chunk_grid(self):
-        """The per-tensor STRUCT carries no chunk grid at all.
+    def test_catalog_stores_the_transfer_grid(self):
+        """The per-tensor STRUCT carries the adapter's transfer grid.
 
-        ``_fields`` advertises a native ``chunk_shape`` and the schema used to
-        store it, which put two different grids under one name: the catalog
-        answered with the adapter's native geometry while GetFlightInfo answered
-        with the server-selected transfer grid. Only the latter is authoritative,
-        so the column is gone rather than stored-and-empty -- a SELECT of it
-        should fail loudly instead of returning a plausible ``[]``.
+        There is one grid now, not two: ``chunk_shape`` means the transfer chunk
+        wherever it appears, the adapter chose it, and it is a stable per-tensor
+        fact like ``shape`` (biopb/biopb#809). So the catalog stores it and
+        ``query_sources`` can answer for it without a GetFlightInfo round trip.
         """
         db = MetadataDatabase()
         db.sync_source_added(
@@ -290,7 +288,14 @@ class TestPerTensorCatalog:
         (struct,) = conn.execute(
             "SELECT u.t FROM sources, UNNEST(tensors) AS u(t) LIMIT 1"
         ).fetchone()
-        assert set(struct) == {"array_id", "dim_labels", "shape", "dtype"}
+        assert set(struct) == {
+            "array_id",
+            "dim_labels",
+            "shape",
+            "chunk_shape",
+            "dtype",
+        }
+        assert struct["chunk_shape"] == [512, 512]
 
     def test_per_tensor_dtype_filter(self):
         """A dtype predicate over the nested list finds a source by ANY of its
@@ -450,9 +455,8 @@ class TestListSourceDescriptors:
         assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
         assert list(tensors[1].dim_labels) == ["z", "y", "x"]
         assert list(tensors[1].shape) == [8, 256, 256]
-        # ListFlights descriptors deliberately omit read-planning geometry;
-        # GetFlightInfo is authoritative for the transfer grid.
-        assert list(tensors[1].chunk_shape) == []
+        # The transfer grid round-trips through the catalog (biopb/biopb#809).
+        assert list(tensors[1].chunk_shape) == [1, 256, 256]
         assert tensors[1].dtype == "uint8"
 
     def test_ordered_by_source_id(self):

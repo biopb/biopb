@@ -1142,8 +1142,6 @@ class TensorFlightServer(flight.FlightServerBase):
             # success, so a partial flight is never emitted.
             try:
                 source_desc = adapter.get_source_descriptor()
-                for tensor_desc in source_desc.tensors:
-                    tensor_desc.ClearField("chunk_shape")
 
                 # Build schema with truncation metadata
                 schema = pa.schema([], metadata=base_metadata)

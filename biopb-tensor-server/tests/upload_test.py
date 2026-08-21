@@ -6,6 +6,7 @@ and Python client upload methods.
 
 import tempfile
 import threading
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -241,6 +242,51 @@ class TestCachedSourceAdapter:
         np.testing.assert_array_equal(arr, test_data)
 
         CacheManager.reset()
+
+    def test_read_plan_uses_the_uploaded_write_grid(self):
+        """A cache-backed read must plan on the grid the upload was written on.
+
+        This source has no backend: ``get_data`` raises and
+        ``resolve_chunk_data`` serves only chunk_ids that were actually written.
+        While the server re-sized every adapter's grid, a 2 MiB-block upload was
+        planned at four blocks per chunk and *none* of the planned chunk_ids
+        existed -- every read raised "Chunk not found" (biopb/biopb#809).
+
+        The array is deliberately big enough that coalescing had room to move:
+        the older tests here use 100x100, where the endpoint floor pinned the
+        grid to the native one and hid the bug.
+        """
+        shape = [1, 4, 64, 1024, 1024]
+        grid = [1, 1, 1, 1024, 1024]
+        adapter = CachedSourceAdapter(
+            source_id="grid",
+            shape=shape,
+            dtype="<u2",
+            chunk_shape=grid,
+            dim_labels=["t", "c", "z", "y", "x"],
+        )
+
+        assert adapter.get_transfer_chunk_size() == tuple(grid)
+
+        plan = adapter.get_read_plan(adapter.get_tensor_descriptor())
+        written = {
+            encode_chunk_id(
+                "grid",
+                ChunkBounds(
+                    start=list(index),
+                    stop=[
+                        min(start + step, dim)
+                        for start, step, dim in zip(index, grid, shape, strict=True)
+                    ],
+                ),
+            )
+            for index in product(
+                *(range(0, d, c) for d, c in zip(shape, grid, strict=True))
+            )
+        }
+        planned = [bytes(ce.chunk_id) for ce in plan.chunk_endpoints]
+        assert planned, "a read plan with no endpoints would pass vacuously"
+        assert all(chunk_id in written for chunk_id in planned)
 
     def test_write_chunk_arbitrary_bounds(self):
         """Cache sources accept arbitrary chunk bounds."""

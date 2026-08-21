@@ -128,8 +128,9 @@ occurrence resolves. Empty for an ordinary TCZYX tensor.
 
 **`level` 0 is full resolution** (Viv's `PixelSource[]` index convention, not the
 map-tile one where z grows with detail); each level halves. `tile_size` is derived
-from `chunk_shape` so a tile *nests* inside a stored chunk rather than straddling
-one — clients must not assume a constant.
+from `chunk_shape` — the transfer grid the adapter chose — so a tile *nests*
+inside a delivered chunk rather than straddling one; clients must not assume a
+constant.
 
 `GET /api/tile/{array_id}` takes `level`, `col`, `row`, the selection
 `t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, plus

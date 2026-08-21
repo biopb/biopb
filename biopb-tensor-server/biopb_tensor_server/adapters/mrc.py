@@ -39,7 +39,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -181,7 +184,13 @@ class MrcAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self._shape),
-            chunk_shape=list(self._shape),  # single chunk; base splits oversize
+            # A flat MRC volume has no block structure to align to, so the grid
+            # is sized from the shape alone (biopb/biopb#809 -- the server no
+            # longer splits an oversized declared grid down to the transfer
+            # target, only to the Arrow ceiling).
+            chunk_shape=default_transfer_chunk_shape(
+                self._shape, self._dtype.str, self.dim_labels
+            ),
             dtype=self._dtype.str,
         )
 

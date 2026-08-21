@@ -398,9 +398,10 @@ def decode_reduction_method(chunk_id: bytes) -> str:
 
 
 # Constants
-# Preferred transfer size and hard Arrow batch ceiling. The adapter's native
-# read unit is only a planning seed: small units are coalesced toward the
-# preferred size and large units are divided toward it (biopb/biopb#684).
+# Preferred transfer size and hard Arrow batch ceiling (biopb/biopb#684). Only
+# MAX_ARROW_BATCH_BYTES is a wire fact the server enforces on every grid; the
+# other two are the default sizing policy, applied where an adapter asks for it
+# via default_transfer_chunk_shape and never over a grid it declared itself.
 PREFERRED_ARROW_BATCH_BYTES = 8 * 1024 * 1024
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 MIN_TRANSFER_ENDPOINTS = 4
@@ -783,9 +784,13 @@ def scaled_virtual_chunk_size(
     the transfer extent, so reads stay aligned to the grid the adapter reports.
     It is clamped by ``max_read_block_bytes``, which exists to bound resident
     memory rather than to tune throughput, and stops before the grid falls below
-    ``minimum_endpoints``, which is what keeps endpoint-level parallelism. The
-    growth priority is the transfer grid's and does not yet account for physical
-    axis order (biopb/biopb#807).
+    ``minimum_endpoints``, which is what keeps endpoint-level parallelism.
+
+    Growth uses the generic axis priority, but it moves in whole units, so an
+    adapter that folded its physical layout into the transfer grid keeps it
+    here: an interleaved ND2's ``[1, C, 1, rows, X]`` unit can only be
+    multiplied, never cut, so C and X stay whole through a scaled read too
+    (biopb/biopb#809).
     """
     unit = tuple(
         min(lcm(int(transfer), max(1, int(scale))), int(shape))
@@ -837,27 +842,71 @@ def scaled_virtual_chunk_size(
     )
 
 
+def default_transfer_chunk_shape(
+    tensor_shape: Sequence[int],
+    dtype: str,
+    dim_labels: Optional[Sequence[str]] = None,
+    native: Optional[Sequence[int]] = None,
+) -> List[int]:
+    """The transfer grid for an adapter with no layout knowledge to apply.
+
+    ``chunk_shape`` is the *transfer* grid and the adapter owns it
+    (biopb/biopb#809): the server sizes nothing on the adapter's behalf, it only
+    clamps the result to the Arrow ceiling. An adapter that knows how its bytes
+    sit on disk -- an interleaved ND2 whose channels are one unit, a page-aligned
+    TIFF -- states that grid directly. Every other adapter calls this.
+
+    ``native`` seeds the search with the store's own block (zarr chunks, a TIFF
+    tile, one plane) so the grid stays a whole multiple of it; omit it and the
+    seed is the whole tensor, divided down. The seed is an *alignment* hint, not
+    a read unit: no read is ever issued at it.
+    """
+    shape = tuple(int(dim) for dim in tensor_shape)
+    labels = list(dim_labels) if dim_labels else None
+    if native is not None and len(native) == len(shape):
+        seed = tuple(max(1, int(dim)) for dim in native)
+    else:
+        seed = shape
+    return list(compute_transfer_chunk_size(seed, shape, dtype, labels))
+
+
 def compute_transfer_chunk_size(
     native_chunk_size: Tuple[int, ...],
     tensor_shape: Tuple[int, ...],
     dtype: str,
     dim_labels: Optional[List[str]],
-    preferred_bytes: int = PREFERRED_ARROW_BATCH_BYTES,
-    maximum_bytes: int = MAX_ARROW_BATCH_BYTES,
-    minimum_endpoints: int = MIN_TRANSFER_ENDPOINTS,
+    preferred_bytes: Optional[int] = None,
+    maximum_bytes: Optional[int] = None,
+    minimum_endpoints: Optional[int] = None,
 ) -> Tuple[int, ...]:
-    """Choose a public transfer grid from an adapter's private read geometry.
+    """Size a transfer grid around ``native_chunk_size``.
 
-    Native blocks above ``preferred_bytes`` are divided with the established
-    T/unknown -> C -> Z -> Y/X priority. Smaller blocks are coalesced in whole
-    native-block multiples, preferring Y/X -> Z -> C -> T/unknown, while
-    retaining enough endpoints for parallel reads and scheduler utilization.
+    The engine behind :func:`default_transfer_chunk_shape`, and the sizing policy
+    an adapter reuses when it wants the standard treatment of a grid it has
+    already shaped. Blocks above ``preferred_bytes`` are divided with the
+    established T/unknown -> C -> Z -> Y/X priority; smaller blocks are coalesced
+    in whole ``native_chunk_size`` multiples, preferring Y/X -> Z -> C ->
+    T/unknown, while retaining enough endpoints for parallel reads and scheduler
+    utilization.
+
+    ``minimum_endpoints`` lives here rather than in the server's clamp on the
+    adapter's answer: it is a sizing policy, and enforcing it over a *declared*
+    grid would overrule an adapter that means "one chunk" -- and would re-break
+    the cache-backed sources whose grid is binding (biopb/biopb#809).
 
     ``maximum_bytes`` is the hard wire ceiling; ``preferred_bytes`` is the
-    optimization target. Scaled reads do not run this optimizer a second time:
-    :func:`scaled_virtual_chunk_size` derives their read extent from this
-    transfer grid, so the reduced chunk they deliver lands on the same target.
+    optimization target. Both default to the module constants, read at call time
+    so a sweep can move them. Scaled reads do not run this optimizer a second
+    time: :func:`scaled_virtual_chunk_size` derives their read extent from the
+    chosen transfer grid, so the reduced chunk they deliver lands on the target.
     """
+    preferred_bytes = (
+        PREFERRED_ARROW_BATCH_BYTES if preferred_bytes is None else preferred_bytes
+    )
+    maximum_bytes = MAX_ARROW_BATCH_BYTES if maximum_bytes is None else maximum_bytes
+    minimum_endpoints = (
+        MIN_TRANSFER_ENDPOINTS if minimum_endpoints is None else minimum_endpoints
+    )
     if len(native_chunk_size) != len(tensor_shape):
         raise ValueError(
             "Native chunk rank must match tensor rank: "

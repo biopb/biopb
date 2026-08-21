@@ -19,7 +19,10 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -168,7 +171,9 @@ class Hdf5Adapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self._shape),
-            chunk_shape=list(self._chunks or self._shape),
+            chunk_shape=default_transfer_chunk_shape(
+                self._shape, self._dtype.str, self.dim_labels, native=self._chunks
+            ),
             dtype=self._dtype.str,
         )
 

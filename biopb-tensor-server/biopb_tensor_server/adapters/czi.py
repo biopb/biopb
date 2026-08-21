@@ -49,7 +49,10 @@ from biopb_tensor_server.adapters._handle_reaper import (
 )
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -365,9 +368,15 @@ class CziAdapter(TensorAdapter):
         return TensorDescriptor(
             array_id=f"{self.source_id}/Scene:{scene.index}",
             dim_labels=list(self.dim_labels),
-            # libCZI decodes per subblock, and a subblock never spans planes --
-            # one plane is the unit a read can be planned around.
-            chunk_shape=[1] * len(layout.plane_axes) + trailing,
+            # libCZI decodes per subblock, and a subblock never spans planes,
+            # so one plane is the alignment seed; the transfer grid grows whole
+            # planes from it (biopb/biopb#809).
+            chunk_shape=default_transfer_chunk_shape(
+                shape,
+                layout.dtype,
+                self.dim_labels,
+                native=[1] * len(layout.plane_axes) + trailing,
+            ),
             shape=shape,
             dtype=layout.dtype,
         )
