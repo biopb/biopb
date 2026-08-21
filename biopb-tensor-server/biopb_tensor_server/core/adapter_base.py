@@ -191,6 +191,36 @@ def strip_source_prefix(source_id: str, array_id: Optional[str]) -> Optional[str
     return array_id
 
 
+def catalog_entry(desc: TensorDescriptor) -> TensorDescriptor:
+    """Project a descriptor onto the **structural catalog entry** a source lists.
+
+    The catalog surface and the serving surface are different facts about a
+    tensor, and only one of them a *source* can answer (biopb/biopb#812):
+
+    * Structural -- ``array_id`` / ``dim_labels`` / ``shape`` / ``dtype``. Stable
+      per tensor, derivable from the container's own index, and what
+      ``ListFlights`` and the DuckDB ``sources.tensors`` rows carry.
+    * Serving -- above all the transfer ``chunk_shape``, plus the pyramid and the
+      physical scale. These belong to the *tensor-bound* adapter that will
+      actually serve the read: the grid can depend on the bound scene's Dask
+      chunks, its own backend block, its native pyramid level, and the request's
+      scale. A source-level adapter that answers for them is guessing on behalf
+      of a scene it has not selected, and the guess is published as fact.
+
+    So a source lists this projection, and ``GetFlightInfo`` -- which resolves
+    the tensor adapter first -- is the one place a grid is published. Keeping
+    ``TensorDescriptor`` as the wire type for both (rather than splitting the
+    proto message) makes the invariant "``chunk_shape`` is empty on every
+    catalog entry", enforced here and in :meth:`SourceAdapter.get_source_descriptor`.
+    """
+    return TensorDescriptor(
+        array_id=desc.array_id,
+        dim_labels=desc.dim_labels,
+        shape=desc.shape,
+        dtype=desc.dtype,
+    )
+
+
 @dataclass
 class TensorReadPlan:
     """Logical tensor read plan returned by the server planning layer."""
@@ -367,27 +397,19 @@ class SourceAdapter(ABC):
 
     @abstractmethod
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """List all tensors available in this source.
+        """List this source's tensors as **structural catalog entries**.
 
-        This method is primarily for source listing/discovery. It returns
-        lightweight descriptors without requiring expensive operations like
-        scene switching or chunk layout computation.
+        The source-listing/discovery surface: what the DuckDB catalog stores and
+        what ``ListFlights`` publishes. It returns lightweight entries without
+        expensive operations like scene switching or chunk-layout computation.
 
         Returns:
-            List of TensorDescriptor for all tensors in this source.
+            List of TensorDescriptor, each a :func:`catalog_entry` projection:
 
             Required fields:
             - array_id: Unique tensor identifier (for single-tensor: source_id;
               for multi-tensor: source_id/tensor_name)
             - shape: Tensor shape as list of ints
-
-            - chunk_shape: The transfer grid this adapter chose (biopb/biopb#809).
-              Sizing it is arithmetic on shape/dtype/dim_labels -- see
-              ``default_transfer_chunk_shape`` -- so it costs no I/O and belongs
-              here, where it reaches the catalog and lean ListFlights. May still
-              be empty on a descriptor with no shape to size from (an unresolved
-              cloud source); the read path then falls back to the whole tensor
-              split under the Arrow ceiling.
 
             Optional fields:
             - dtype: Data type string. Can be omitted if expensive to compute.
@@ -395,6 +417,21 @@ class SourceAdapter(ABC):
 
             Recommended optional fields:
             - dim_labels: Dimension labels (cheap to include)
+
+            Required to be EMPTY:
+            - chunk_shape: the transfer grid is a *serving* fact owned by the
+              tensor-bound adapter (:meth:`TensorAdapter.get_tensor_descriptor`),
+              not a catalog one. A source lists every tensor without binding any
+              of them, so any grid it names here is a guess about a scene it has
+              not selected -- published as fact to every client
+              (biopb/biopb#812). ``GetFlightInfo`` resolves the tensor adapter
+              first and is the one place a grid is answered.
+            - pyramid / physical_scale / metadata_json: likewise open-time only.
+
+        Implementations return :func:`catalog_entry` of whatever they have (the
+        single-tensor idiom is ``[catalog_entry(self.get_tensor_descriptor())]``);
+        :meth:`get_source_descriptor` re-applies it so the invariant holds for
+        the catalog even if an implementation forgets.
         """
 
     @abstractmethod
@@ -420,7 +457,11 @@ class SourceAdapter(ABC):
             source_id=self.source_id,
             source_url=self._catalog_url or to_catalog_url(self._source_url),
             source_type=self._source_type,
-            tensors=self.list_tensor_descriptors(),
+            # The catalog invariant's enforcement point: every path into the
+            # DuckDB row and into ListFlights goes through here, so a listing
+            # that still carries a serving field cannot reach a client
+            # (biopb/biopb#812). See :func:`catalog_entry`.
+            tensors=[catalog_entry(t) for t in self.list_tensor_descriptors()],
             metadata_json="",  # filled by GetFlightInfo()
             data_resident=self.is_resident(),
         )
@@ -596,22 +637,34 @@ class TensorAdapter(SourceAdapter):
 
     @abstractmethod
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return the TensorDescriptor for this specific tensor adapter.
+        """Return the full **serving** descriptor for this bound tensor.
+
+        The counterpart to :meth:`SourceAdapter.list_tensor_descriptors`, which
+        answers the structural half for every tensor without binding any of them.
+        This is called on an adapter that ``get_tensor_adapter(array_id)`` has
+        already bound to one tensor -- a bioio/CZI scene, an OME-Zarr HCS field,
+        a QPTIFF level -- so it can answer for facts that only exist once that
+        selection is made (biopb/biopb#812).
 
         Field must be populated:
             - array_id: Unique tensor identifier (for single-tensor: source_id;
               for multi-tensor: source_id/tensor_name)
             - shape: Tensor shape as list of ints
-            - chunk_shape: The transfer grid, as list of ints. The adapter owns
-              this choice; the server only clamps it to the Arrow ceiling
-              (biopb/biopb#809). An adapter with no layout knowledge to apply
-              calls ``default_transfer_chunk_shape``.
+            - chunk_shape: The transfer grid, as list of ints, for THIS tensor --
+              sized against the bound tensor's own dtype, labels, and backend
+              block, never a sibling's. The adapter owns the choice; the server
+              only clamps it to the Arrow ceiling (biopb/biopb#809). An adapter
+              with no layout knowledge to apply calls
+              ``default_transfer_chunk_shape``.
             - dtype: Data type string (numpy dtype.str format)
         Recommended fields to populate:
             - dim_labels: Dimension labels
         Returns:
-            TensorDescriptor with required fields populated (see list_tensor_descriptors
-            for field requirements).
+            TensorDescriptor with required fields populated.
+
+        A source-level adapter that also fills the tensor role (see the class
+        docstring) answers here for its default tensor, and must do so by binding
+        it -- not by reading its own catalog listing back, which carries no grid.
         """
 
     def get_transfer_chunk_size(self) -> Tuple[int, ...]:
@@ -629,12 +682,13 @@ class TensorAdapter(SourceAdapter):
         property of Arrow IPC, not of any format, so a declared grid above it is
         re-split here rather than failing mid-transfer.
 
-        A descriptor may still carry an empty ``chunk_shape`` -- documented as
-        "can be empty [] if not readily available" (:meth:`get_tensor_descriptor`)
-        and the shape a bulk-seeded remote proxy arrives with (biopb/biopb#266).
-        Handing the read planner a too-short tuple indexes out of range against
-        the full-rank shape (biopb/biopb#292), so fall back to the whole tensor
-        split under the ceiling.
+        A descriptor may still reach here with an empty ``chunk_shape``: a
+        bulk-seeded remote proxy whose upstream is unreachable, or a
+        :func:`catalog_entry` handed in by a caller that should have bound the
+        tensor first. Handing the read planner a too-short tuple indexes out of
+        range against the full-rank shape (biopb/biopb#292), so fall back to the
+        whole tensor split under the ceiling -- a safe answer, never a good one,
+        which is why the catalog grid is not a fallback anyone may plan on.
 
         An *unresolved* descriptor (empty shape/dtype -- a not-yet-hydrated
         cloud/remote source) is rejected up front: the fallback would otherwise

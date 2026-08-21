@@ -84,6 +84,12 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 > registered *before* the greedy `{source_id:path}` catch-all to avoid Starlette
 > first-match shadowing.
 
+> **Source listings are structural.** Each `tensors[]` entry on `/api/sources`
+> carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
+> there and is **not** a usable grid. The transfer grid belongs to the tensor the
+> server binds to serve a read, so ask `/api/tile_info/{array_id}` for it
+> (biopb/biopb#812).
+
 `/ws/render` takes its token from the `Authorization` / `X-Biopb-Token` header
 **or a `token` query parameter**, since browsers cannot set custom headers on a
 WebSocket handshake; an unauthorized socket is closed with code `4001`. It holds
@@ -128,9 +134,9 @@ occurrence resolves. Empty for an ordinary TCZYX tensor.
 
 **`level` 0 is full resolution** (Viv's `PixelSource[]` index convention, not the
 map-tile one where z grows with detail); each level halves. `tile_size` is derived
-from `chunk_shape` — the transfer grid the adapter chose — so a tile *nests*
-inside a delivered chunk rather than straddling one; clients must not assume a
-constant.
+from `chunk_shape` — the transfer grid, taken from a `GetFlightInfo` describe of
+this tensor, not from the source listing — so a tile *nests* inside a delivered
+chunk rather than straddling one; clients must not assume a constant.
 
 `GET /api/tile/{array_id}` takes `level`, `col`, `row`, the selection
 `t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, plus

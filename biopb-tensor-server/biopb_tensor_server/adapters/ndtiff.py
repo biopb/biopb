@@ -30,7 +30,10 @@ from biopb_tensor_server.adapters._handle_reaper import (
     IdleHandleReaper,
 )
 from biopb_tensor_server.adapters._scale import mm_summary_scale
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -397,7 +400,7 @@ class NdTiffAdapter(TensorAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors - single tensor source."""
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the dask array.

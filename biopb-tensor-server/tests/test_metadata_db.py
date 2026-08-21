@@ -270,13 +270,16 @@ class TestPerTensorCatalog:
             ("hcs/A2/0", ["z", "y", "x"], [8, 256, 256], "uint8"),
         ]
 
-    def test_catalog_stores_the_transfer_grid(self):
-        """The per-tensor STRUCT carries the adapter's transfer grid.
+    def test_catalog_is_structural_and_stores_no_transfer_grid(self):
+        """The per-tensor STRUCT carries structure only -- no read plan.
 
-        There is one grid now, not two: ``chunk_shape`` means the transfer chunk
-        wherever it appears, the adapter chose it, and it is a stable per-tensor
-        fact like ``shape`` (biopb/biopb#809). So the catalog stores it and
-        ``query_sources`` can answer for it without a GetFlightInfo round trip.
+        ``chunk_shape`` is the transfer grid of the adapter bound to a *specific*
+        tensor, and it can depend on facts that exist only after that binding (a
+        scene's own Dask chunks, its labels, its native pyramid level, the
+        request's scale). A source-level listing that names one is guessing for a
+        scene it never selected, so the catalog stores none and GetFlightInfo
+        answers it per resolved tensor (biopb/biopb#812). The adapter double here
+        hands one in anyway; the column it would go in does not exist.
         """
         db = MetadataDatabase()
         db.sync_source_added(
@@ -292,10 +295,8 @@ class TestPerTensorCatalog:
             "array_id",
             "dim_labels",
             "shape",
-            "chunk_shape",
             "dtype",
         }
-        assert struct["chunk_shape"] == [512, 512]
 
     def test_per_tensor_dtype_filter(self):
         """A dtype predicate over the nested list finds a source by ANY of its
@@ -455,8 +456,9 @@ class TestListSourceDescriptors:
         assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
         assert list(tensors[1].dim_labels) == ["z", "y", "x"]
         assert list(tensors[1].shape) == [8, 256, 256]
-        # The transfer grid round-trips through the catalog (biopb/biopb#809).
-        assert list(tensors[1].chunk_shape) == [1, 256, 256]
+        # Structural only: no grid is stored, so none is reconstructed
+        # (biopb/biopb#812).
+        assert list(tensors[1].chunk_shape) == []
         assert tensors[1].dtype == "uint8"
 
     def test_ordered_by_source_id(self):

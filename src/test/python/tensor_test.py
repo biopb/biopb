@@ -527,6 +527,18 @@ class TestDescriptorCacheStaysStructural:
         assert cached.metadata_json == ""
         assert list(cached.pyramid) == []
 
+    def test_the_transfer_grid_never_enters_the_cache(self):
+        # The server answers a grid only on GetFlightInfo, for the tensor it
+        # bound; a list_flights entry carries none (biopb/biopb#812). Caching it
+        # would leave entries in two grades, and an empty one must never read as
+        # a usable grid -- so the cache keeps none and the caller describes.
+        client = self._client(self._fat_descriptor())
+
+        returned = client.get_descriptor("src/A2")
+
+        assert list(returned.chunk_shape) == [1, 64, 64]  # honoured on the return
+        assert list(client._descriptors["src/A2"].chunk_shape) == []
+
     def test_addressing_facts_do_enter_the_cache(self):
         # Stripping must not take the fields the cache exists to serve --
         # get_physical_scale reads its answer straight out of this entry.
@@ -536,7 +548,6 @@ class TestDescriptorCacheStaysStructural:
 
         cached = client._descriptors["src/A2"]
         assert list(cached.shape) == [8, 64, 64]
-        assert list(cached.chunk_shape) == [1, 64, 64]
         assert cached.dtype == "uint16"
         assert list(cached.physical_scale) == [2.0, 0.325, 0.325]
 

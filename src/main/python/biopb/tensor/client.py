@@ -240,8 +240,11 @@ class TensorFlightClient:
 
         Returns:
             Dictionary mapping source_id to DataSourceDescriptor.
-            Each DataSourceDescriptor.tensors contains TensorDescriptor info
-            with shape/dtype for all tensors in that source.
+            Each DataSourceDescriptor.tensors carries the *structural* entry for
+            every tensor in that source -- array_id, dim_labels, shape, dtype.
+            The transfer ``chunk_shape`` is empty here by contract; ask
+            :meth:`get_descriptor` for the grid of a specific tensor
+            (biopb/biopb#812).
 
         Note:
             Results may be truncated if server has max_list_flights_results configured.
@@ -368,10 +371,13 @@ class TensorFlightClient:
         policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
         takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
         Works even when the source is beyond the (truncatable) ``list_sources()``
-        cap. Every call fetches -- the client caches only the *structural* part of
-        the answer (shape/dtype/dim_labels/chunk_shape plus physical scale) for
-        its own addressing, never ``metadata_json`` or ``pyramid``, so what you
-        get back always reflects the masks you passed. Passing a bare
+        cap. **This is the only call that answers the transfer ``chunk_shape``**:
+        the grid belongs to the tensor the server binds here, and ``list_sources``
+        entries carry it empty (biopb/biopb#812). Every call fetches -- the client
+        caches only the *structural* part of the answer (shape/dtype/dim_labels
+        plus physical scale) for its own addressing, never ``chunk_shape``,
+        ``metadata_json`` or ``pyramid``, so what you get back always reflects the
+        masks you passed. Passing a bare
         ``source_id`` (single-tensor source, or to anchor on a multi-tensor
         source's default/first tensor) is accepted. To enumerate ALL
         tensors/scenes of a source, use ``list_sources()[source_id].tensors``
@@ -383,9 +389,9 @@ class TensorFlightClient:
         source.
 
         The ``with_*`` flags are the ``GetFlightInfo`` response field masks
-        (biopb/biopb#563). This is a *describe* call -- the stable per-tensor
-        facts, not a read -- so it defaults to returning shape/dtype/dim_labels/
-        chunk_shape, the resolution **pyramid**, and physical_scale, while
+        (biopb/biopb#563). This is a *describe* call -- the per-tensor facts, not
+        a read -- so it defaults to returning shape/dtype/dim_labels/chunk_shape,
+        the resolution **pyramid**, and physical_scale, while
         **skipping the read plan** (``with_read_plan=False`` -- the endpoints are
         the per-request O(chunks) half a describe discards) and the **heavy OME
         metadata tree** (``with_metadata=False``, opt-in). Set ``with_metadata=True``

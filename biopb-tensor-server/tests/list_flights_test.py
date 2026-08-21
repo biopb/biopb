@@ -143,7 +143,13 @@ def test_list_flights_served_from_catalog_not_adapters():
     infos = list(server.list_flights(None, b""))
     returned_ids = {_command_source_id(i) for i in infos}
     assert returned_ids == {"in-db"}
-    assert list(_command_descriptor(infos[0]).tensors[0].chunk_shape) == [10, 10]
+    listed = _command_descriptor(infos[0]).tensors[0]
+    assert list(listed.shape) == [10, 10]
+    # Structural entry only. The adapter double hands the catalog a grid; the
+    # catalog does not store one and ListFlights does not publish one -- the
+    # transfer grid is GetFlightInfo's to answer, per the tensor it binds
+    # (biopb/biopb#812).
+    assert list(listed.chunk_shape) == []
 
 
 def test_list_flights_catalog_truncation_signaled():

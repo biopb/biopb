@@ -172,9 +172,12 @@ class TestFastPathParity:
         assert descriptors[0].array_id == "noparse/Image:0"
         assert list(descriptors[0].shape) == [1, 2, 1, 32, 32]
         assert list(descriptors[0].dim_labels) == list("TCZYX")
+        # Structural entry: the transfer grid is the scene adapter's to answer
+        # (biopb/biopb#812).
+        assert list(descriptors[0].chunk_shape) == []
         # Cached, and still served from cache without parsing.
-        assert adapter._cached_descriptors is descriptors
-        assert adapter.list_tensor_descriptors() is descriptors
+        assert adapter._cached_descriptors == adapter._scene_descriptors()
+        assert adapter.list_tensor_descriptors() == descriptors
 
 
 class TestClaim:
@@ -230,7 +233,9 @@ class TestPageAlignedChunkShape:
 
     def test_chunk_shape_is_aligned_to_the_page_grid(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        desc = OmeTiffAdapter(path, "pg").list_tensor_descriptors()[0]
+        source = OmeTiffAdapter(path, "pg")
+        scene_id = source.list_tensor_descriptors()[0].array_id
+        desc = source.get_tensor_adapter(scene_id).get_tensor_descriptor()
         page = self._za_page_chunks_canonical(path, list(desc.dim_labels))
         grid = list(desc.chunk_shape)
         # Full Y/X -- a page is never cut -- and a whole multiple of the page
@@ -251,7 +256,9 @@ class TestPageAlignedChunkShape:
             metadata={"axes": "CYX"},
             tile=(32, 32),
         )
-        desc = OmeTiffAdapter(str(p), "tl").list_tensor_descriptors()[0]
+        source = OmeTiffAdapter(str(p), "tl")
+        scene_id = source.list_tensor_descriptors()[0].array_id
+        desc = source.get_tensor_adapter(scene_id).get_tensor_descriptor()
         # Whole planes despite the 32x32 internal tiling (chunkmode="page"): the
         # grid is built from pages, so Y/X stay whole and never fall back to the
         # tile size.

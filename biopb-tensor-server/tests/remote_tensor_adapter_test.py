@@ -2304,7 +2304,12 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
     seeded structural descriptor -- no get_descriptor RPC -- so a bulk-mirrored
     GetFlightInfo makes no upstream call for the descriptor. Falls back to a live
     fetch only when a tensor is not in the seed (covered by the e2e proxy tests,
-    which register without seeding)."""
+    which register without seeding).
+
+    The upstream catalog rows carry no ``chunk_shape`` (biopb/biopb#812), so the
+    seed carries none either: reconciliation and the structural serve path both
+    keep working, and the grid arrives with the forwarded upstream GetFlightInfo
+    (``forward_flight_info``) rather than being reconstructed here."""
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     adapter = RemoteTensorAdapter(
@@ -2318,19 +2323,22 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
                 "array_id": "img",
                 "dim_labels": ["y", "x"],
                 "shape": [4, 4],
-                "chunk_shape": [4, 4],
                 "dtype": "uint8",
             },
             {
                 "array_id": "img/A2",
                 "dim_labels": ["y", "x"],
                 "shape": [2, 2],
-                "chunk_shape": [2, 2],
                 "dtype": "uint16",
             },
         ],
         {"ome": "meta"},
     )
+
+    # the mirrored catalog surface is structural, and complete
+    listed = adapter.list_tensor_descriptors()
+    assert [d.array_id for d in listed] == ["lab__img", "lab__img/A2"]
+    assert all(list(d.chunk_shape) == [] for d in listed)
 
     # default (first) tensor
     desc = adapter.get_tensor_descriptor()
