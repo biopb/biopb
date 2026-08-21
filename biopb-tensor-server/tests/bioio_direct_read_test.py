@@ -278,8 +278,8 @@ def test_interleaved_nd2_keeps_all_channels_in_one_transfer_chunk(
     bytes are `itemsize` of every `C * itemsize`, so a per-channel chunk faults
     in every page the other channels occupy and discards what it did not ask
     for, then the next channel repeats the read. The declared unit is therefore
-    "all channels of one full-width row", and only Y grows from it
-    (biopb/biopb#806).
+    "all channels of one pixel" -- C inside the unit, so it cannot be split
+    (biopb/biopb#806) -- and the plane is left to the shared coupled sizing.
 
     Nothing downstream re-shapes a declared grid (biopb/biopb#809), which is what
     makes this hold -- the fixed divide/coalesce priority used to take C apart
@@ -303,9 +303,9 @@ def test_interleaved_nd2_keeps_all_channels_in_one_transfer_chunk(
     adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (4,), (1,), (4096,), (4096,)))
     grid = list(adapter.get_tensor_descriptor().chunk_shape)
 
-    # All four channels and the whole row: the contiguous run is never cut.
-    # Only Y grew, to the row count that fills the transfer target.
-    assert grid == [1, 4, 1, 256, 4096]
+    # All four channels in one chunk, and a square plane: Y and X are coupled,
+    # so a tile read touches one chunk rather than one per band it crosses.
+    assert grid == [1, 4, 1, 1024, 1024]
 
     from biopb_tensor_server.core.chunk import (
         PREFERRED_ARROW_BATCH_BYTES,

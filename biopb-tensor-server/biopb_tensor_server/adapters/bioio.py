@@ -34,9 +34,9 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.chunk import (
-    PREFERRED_ARROW_BATCH_BYTES,
     compute_transfer_chunk_size,
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -838,11 +838,19 @@ class NikonAdapter(_BioioAdapterBase):
         ms for 58.3 MB (0.75 ms/MB) for one channel -- 4x the pixels for 2.2x the
         time (biopb/biopb#806).
 
-        So the declared *unit* is "all channels of one full-width row", and only
-        Y grows from it. C cannot be split because it is inside the unit, and
-        nothing downstream re-shapes a declared grid (biopb/biopb#809) -- which
-        is what makes this stick; the old fixed divide/coalesce priority took C
-        apart again and grew the two axes that stride over the data.
+        So the declared *unit* is "all channels of one pixel": C is inside the
+        unit and therefore cannot be split, and nothing downstream re-shapes a
+        declared grid (biopb/biopb#809) -- which is what makes this stick, where
+        the old fixed divide/coalesce priority took C apart again.
+
+        The plane is left to the shared sizing, which grows Y and X coupled. A
+        full-width band reads better sequentially -- it is one contiguous run per
+        channel group -- but it turns a 512x512 tile into one fetch per band it
+        crosses, and tiles are how this data is viewed. Between C-whole aspect
+        ratios the cold cost is within scene-to-scene variance (a paired A/B of
+        1024x1024 against 512x2048 on untouched scenes ranged 0.73x to 4.2x in
+        both directions), so there is nothing here to trade the round trips for.
+        Keeping C whole is where the measurable win is.
         """
         labels = [str(label).upper() for label in (self.dim_labels or [])]
         if len(labels) != len(shape) or "C" not in labels or "X" not in labels:
@@ -850,12 +858,14 @@ class NikonAdapter(_BioioAdapterBase):
         if not self._channel_interleaved(np.dtype(dtype).itemsize):
             return super()._transfer_chunk_shape(shape, dtype, dask_data)
         unit = [
-            int(size) if label in {"C", "X", "S"} else 1
+            int(size) if label in {"C", "S"} else 1
             for label, size in zip(labels, shape, strict=True)
         ]
-        # A single all-channel row already at or above the target leaves nothing
-        # to grow; declare it and let the Arrow clamp handle an extreme width.
-        if estimate_chunk_bytes(tuple(unit), dtype) >= PREFERRED_ARROW_BATCH_BYTES:
+        # All channels of one pixel already at or above the target leaves nothing
+        # to grow; declare it and let the Arrow clamp handle an extreme depth.
+        if estimate_chunk_bytes(tuple(unit), dtype) >= (
+            chunk_policy.PREFERRED_ARROW_BATCH_BYTES
+        ):
             return unit
         return list(
             compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, labels)

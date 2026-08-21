@@ -793,9 +793,8 @@ def scaled_virtual_chunk_size(
 
     Growth uses the generic axis priority, but it moves in whole units, so an
     adapter that folded its physical layout into the transfer grid keeps it
-    here: an interleaved ND2's ``[1, C, 1, rows, X]`` unit can only be
-    multiplied, never cut, so C and X stay whole through a scaled read too
-    (biopb/biopb#809).
+    here: an interleaved ND2's ``[1, C, 1, y, x]`` unit can only be multiplied,
+    never cut, so C stays whole through a scaled read too (biopb/biopb#809).
     """
     unit = tuple(
         min(lcm(int(transfer), max(1, int(scale))), int(shape))
@@ -1000,10 +999,16 @@ def _coalesce_chunk_size(
 ) -> Tuple[int, ...]:
     """Grow whole native blocks toward ``target_bytes``.
 
-    Spatial axes share a priority tier and grow in balanced doubling steps so a
-    square tile grid does not become a needlessly long strip. Growth stops at
-    ``target_bytes`` and at the tensor's own extent -- nothing else. A tensor
-    small enough to fit in one chunk becomes one chunk.
+    Y and X grow **as a pair**, never one at a time: a chunk that is square-ish
+    in the plane is what makes a square region read touch few chunks. Growing
+    them independently reaches the same byte target with a better sequential
+    read -- a full-width band is contiguous on disk -- but turns a 512x512 tile
+    into one fetch per band it crosses. Coupling is the middle ground: the plane
+    stays roughly square, and the axes that are genuinely free to differ (Z, C,
+    T) still grow on their own.
+
+    Growth stops at ``target_bytes`` and at the tensor's own extent -- nothing
+    else. A tensor small enough to fit in one chunk becomes one chunk.
     """
     current = list(native)
     max_blocks = [
@@ -1027,9 +1032,22 @@ def _coalesce_chunk_size(
     def blocks(axis: int) -> int:
         return current[axis] // native[axis]
 
+    spatial = [axis for axis in range(len(current)) if priority(axis) == 0]
+    spatial_set = set(spatial)
+
+    def doubled_spatial() -> Optional[List[int]]:
+        """The spatial pair with every growable axis doubled, or None."""
+        candidate = list(current)
+        for axis in spatial:
+            new_blocks = min(max_blocks[axis], blocks(axis) * 2)
+            candidate[axis] = native[axis] * new_blocks
+        return candidate if candidate != current else None
+
     while True:
         candidates = []
         for axis in range(len(current)):
+            if axis in spatial_set:
+                continue
             old_blocks = blocks(axis)
             new_blocks = min(max_blocks[axis], old_blocks * 2)
             if new_blocks <= old_blocks:
@@ -1047,16 +1065,40 @@ def _coalesce_chunk_size(
                         candidate,
                     )
                 )
+        # One candidate for the whole spatial pair, so Y and X move together.
+        spatial_candidate = doubled_spatial()
+        if spatial_candidate is not None:
+            candidate_bytes = estimate_chunk_bytes(tuple(spatial_candidate), dtype)
+            if candidate_bytes <= target_bytes:
+                candidates.append(
+                    (
+                        0,
+                        current[spatial[0]],
+                        candidate_bytes,
+                        spatial[0],
+                        spatial_candidate,
+                    )
+                )
         if not candidates:
             break
         _, _, _, _, current = min(
             candidates, key=lambda item: (item[0], item[1], -item[2], item[3])
         )
 
-    # Consume any remaining budget with the closest legal whole-block step.
+    # Consume any remaining budget. The spatial pair goes first and stays square:
+    # size the plane from the budget's square root, then round each axis down to
+    # whole native blocks. Doubling has already brought it within a factor of two,
+    # so the back-off below runs a block or two at most.
+    if spatial and _fill_spatial(
+        current, native, max_blocks, spatial, spatial_set, dtype, target_bytes
+    ):
+        return tuple(current)
+
     current_bytes = estimate_chunk_bytes(tuple(current), dtype)
     candidates = []
     for axis in range(len(current)):
+        if axis in spatial_set:
+            continue
         other_bytes = current_bytes // current[axis]
         affordable_blocks = target_bytes // (other_bytes * native[axis])
         new_blocks = min(max_blocks[axis], int(affordable_blocks))
@@ -1072,6 +1114,58 @@ def _coalesce_chunk_size(
         _, _, _, current = min(candidates, key=lambda item: item[:3])
 
     return tuple(current)
+
+
+def _fill_spatial(
+    current: List[int],
+    native: Tuple[int, ...],
+    max_blocks: List[int],
+    spatial: List[int],
+    spatial_set: Set[int],
+    dtype: str,
+    target_bytes: int,
+) -> bool:
+    """Spend the remaining budget on Y/X together, keeping the plane square.
+
+    Mutates ``current`` in place and reports whether it grew. Sizing the plane
+    from ``sqrt(budget)`` rather than stepping one axis keeps the two extents
+    within a block of each other, which is the whole point of coupling them.
+    """
+    per_element = estimate_chunk_bytes(
+        tuple(
+            1 if axis in spatial_set else current[axis] for axis in range(len(current))
+        ),
+        dtype,
+    )
+    if per_element <= 0:
+        return False
+    plane_budget = target_bytes // per_element
+    if plane_budget <= 0:
+        return False
+
+    side = max(1, int(plane_budget**0.5))
+    proposed = list(current)
+    for axis in spatial:
+        want = max(current[axis] // native[axis], side // native[axis])
+        proposed[axis] = native[axis] * min(max_blocks[axis], max(1, want))
+
+    # Whole blocks can overshoot the square: back the longer extent off a block
+    # at a time, never below where doubling already got us.
+    while estimate_chunk_bytes(tuple(proposed), dtype) > target_bytes:
+        shrinkable = [
+            axis
+            for axis in spatial
+            if proposed[axis] // native[axis] > current[axis] // native[axis]
+        ]
+        if not shrinkable:
+            return False
+        axis = max(shrinkable, key=lambda a: (proposed[a], a))
+        proposed[axis] -= native[axis]
+
+    if proposed == current:
+        return False
+    current[:] = proposed
+    return True
 
 
 def _choose_split_axis_excluding(
