@@ -471,10 +471,30 @@ debugging) than on a tuning dial.
   compute on band N overlaps readahead of band N+1, but it is not measured).
   And the flag is keyed on the adapter class while the cost model is really about
   *storage*: an ND2 on NFS — which is what biopb.org runs — is still mmap-able,
-  but a band read there multiplies round trips and works against server-side
-  readahead. `core/fs_detect.py` already classifies exactly this
-  (`network_filesystem_type`), and the band decision should consult it before
-  this is turned on for a network-backed source.
+  but a band read there is not free. `core/fs_detect.py` already classifies this
+  (`network_filesystem_type`), and the band decision should consult it before this
+  is turned on for a network-backed source.
+
+  Estimated rather than measured (no network mount on the dev box), and an
+  earlier draft of this section overstated it. Banding does **not** multiply round
+  trips: NFS already splits any read into `rsize`-sized RPCs, so a 128 MiB extent
+  is ~128 RPCs whether it arrives as one call or as 17 bands. What it adds is
+  per-call overhead, bounded by `(bands - 1) x RTT` in the worst case where
+  readahead does not cover a band boundary — and since bands are contiguous and
+  ascending, the pattern stays sequential and readahead should mostly survive.
+
+  The extents in §1 band into 17 (scale 4, 128 MiB) and 50 (scale 32, 385 MiB),
+  so 16 and 49 extra calls: roughly 8 ms and 25 ms on a LAN mount at ~0.5 ms RTT,
+  0.2-0.5 s on a WAN one at ~10 ms. Against the ~34 ms the scale-4 reduce saves
+  (63 -> 29 ms), **the crossover is around 2 ms RTT**. At scale 32 there is no
+  time saving to offset with at all (0.96x), so there banding on NFS is purely
+  memory-for-latency: 49 x RTT to take peak residency from 385 MiB to 8 MiB.
+
+  Two things would make it worse than this estimate: a multi-channel extent makes
+  each band several discontiguous runs (51 instead of 3 for `[1, 3, 1, Y, X]`),
+  which is the likeliest way to lose readahead; and an adapter whose `get_data`
+  does per-call work — open, stat, seek, decode — swamps any filesystem effect,
+  which is the case `BANDED_SCALED_READ` exists to exclude.
 
 ## 6. Phase 2 — per-adapter fusion
 
