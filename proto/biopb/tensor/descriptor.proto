@@ -85,8 +85,11 @@ message TensorDescriptor {
   // or "precompute" (serve a native on-disk pyramid level).
   // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
   // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
-  // Advisory for caching: the server may serve an existing cached chunk
-  // computed under a different method at the same bounds/scale.
+  // An empty or omitted value is resolved to "nearest" by the server.
+  // Clients that want averaging must set this field explicitly to "area".
+  // Note: already-cached chunk IDs that carry no method byte (issued before
+  // this default was established) are decoded as "area" for compatibility;
+  // only newly minted IDs default to "nearest".
   string reduction_method = 8;
 
   // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
