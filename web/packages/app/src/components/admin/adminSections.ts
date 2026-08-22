@@ -84,8 +84,9 @@ export const ADMIN_NAV: AdminNavItem[] = [
     id: "precache",
     label: "Precache",
     description:
-      "Background warming of the coarsest pyramid level while the server is idle, " +
-      "so the first view of a source is fast.",
+      "Background warming of what clients actually read: after a scaled read, " +
+      "the rest of that source is warmed at the same scale while the server is " +
+      "idle, so moving to another plane or channel is fast.",
     kind: "fields",
     section: "precache",
     commonFields: ["enabled"],

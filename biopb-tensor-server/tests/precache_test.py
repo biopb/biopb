@@ -790,6 +790,16 @@ class TestDemandTier:
         cfg.setdefault("idle_debounce_seconds", 0.0)
         return PrecacheWorker(server, PrecacheConfig(**cfg))
 
+    def _synthetic_chunk_id(self, source_id, scale=(4, 4), start=(0, 0)):
+        """A scaled chunk_id for a level, minted without an adapter."""
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
+
+        bounds = ChunkBounds(start=list(start), stop=[s + 1024 for s in start])
+        return encode_chunk_id_with_scale(
+            f"{source_id}/0", bounds, tuple(scale), "area"
+        )
+
     def _observed_chunk_id(self, adapter, scale):
         """A scaled chunk_id for this tensor, as a client's read would carry."""
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -817,24 +827,23 @@ class TestDemandTier:
         try:
             worker = self._worker(server, demand_queue_max=2)
             for i in range(20):
-                worker.observe_read(b"chunk-%d" % i)
-            assert worker._demand.qsize() == 2
+                worker.observe_read(self._synthetic_chunk_id(f"src{i}"))
+            assert len(worker._demand) == 2
         finally:
             server.shutdown()
 
     def test_a_full_queue_drops_the_oldest_observation_not_the_newest(self):
-        """Overflow means the client outran the worker, so the queue holds the
-        stale guesses and the arriving one is where the client actually is.
+        """Overflow means clients outran the worker, so the queue holds the
+        stale levels and the arriving one is where someone actually is.
         Keeping the backlog and rejecting the newcomer would pin the tier to
-        wherever the client was when the worker fell behind.
+        wherever they were when the worker fell behind.
         """
         server = TensorFlightServer("grpc://localhost:0")
         try:
             worker = self._worker(server, demand_queue_max=2)
             for i in range(20):
-                worker.observe_read(b"chunk-%d" % i)
-            drained = [worker._demand.get_nowait() for _ in range(2)]
-            assert drained == [b"chunk-18", b"chunk-19"]
+                worker.observe_read(self._synthetic_chunk_id(f"src{i}"))
+            assert [k[0] for k in worker._demand] == ["src18", "src19"]
         finally:
             server.shutdown()
 
@@ -842,8 +851,77 @@ class TestDemandTier:
         server = TensorFlightServer("grpc://localhost:0")
         try:
             worker = self._worker(server, demand_enabled=False)
-            worker.observe_read(b"anything")
-            assert worker._demand.qsize() == 0
+            worker.observe_read(self._synthetic_chunk_id("src"))
+            assert len(worker._demand) == 0
+        finally:
+            server.shutdown()
+
+    def test_reads_of_one_level_hold_a_single_slot(self):
+        """A client browsing one level emits a chunk_id per tile. Queued raw,
+        those duplicates would be the whole queue -- and the warm they ask for
+        is one pass either way."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server, demand_queue_max=8)
+            for i in range(50):
+                worker.observe_read(
+                    self._synthetic_chunk_id("src", start=(i * 1024, 0))
+                )
+            assert len(worker._demand) == 1
+        finally:
+            server.shutdown()
+
+    def test_one_busy_source_cannot_evict_another_sources_hint(self):
+        """The failure the keyed queue exists to prevent: a fast scroll on one
+        image burying every other client's only observation."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server, demand_queue_max=2)
+            worker.observe_read(self._synthetic_chunk_id("quiet"))
+            for i in range(50):
+                worker.observe_read(
+                    self._synthetic_chunk_id("busy", start=(i * 1024, 0))
+                )
+            assert [k[0] for k in worker._demand] == ["quiet", "busy"]
+        finally:
+            server.shutdown()
+
+    def test_re_reading_a_pending_level_keeps_its_place_in_line(self):
+        """Refreshing the tensor hint must not send the level to the back --
+        that is how a busy client starves the level queued behind it."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker.observe_read(self._synthetic_chunk_id("first"))
+            worker.observe_read(self._synthetic_chunk_id("second"))
+            worker.observe_read(self._synthetic_chunk_id("first", start=(2048, 0)))
+            assert [k[0] for k in worker._demand] == ["first", "second"]
+        finally:
+            server.shutdown()
+
+    def test_the_tensor_hint_is_the_most_recent_read_of_that_level(self):
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            from biopb.tensor.ticket_pb2 import ChunkBounds
+            from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
+
+            worker = self._worker(server)
+            bounds = ChunkBounds(start=[0, 0], stop=[1024, 1024])
+            for array_id in ("src/0", "src/1"):
+                worker.observe_read(
+                    encode_chunk_id_with_scale(array_id, bounds, (4, 4), "area")
+                )
+            assert list(worker._demand.values()) == ["src/1"]
+        finally:
+            server.shutdown()
+
+    def test_a_full_resolution_read_takes_no_slot(self):
+        """Unwarmable by policy, so it must not cost a pending level its place."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker.observe_read(self._synthetic_chunk_id("src", scale=(1, 1)))
+            assert len(worker._demand) == 0
         finally:
             server.shutdown()
 
@@ -1037,6 +1115,96 @@ class TestDemandTier:
             adapter.list_tensor_descriptors = boom
             worker._process_demand(cid)
             assert not worker._demand_done
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    # -- preemption ---------------------------------------------------------
+
+    def _pass(self, worker, key, quantum=0.0, warmed=1):
+        import biopb_tensor_server.serving.precache as precache_mod
+
+        return precache_mod._Pass(
+            key=key, deadline=time.monotonic() + quantum, warmed=warmed
+        )
+
+    def test_a_pass_steps_aside_for_another_sources_level(self):
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            mine = ("mine", (4, 4), "area")
+            worker.observe_read(self._synthetic_chunk_id("theirs"))
+            assert worker._preempted_by_newer_demand(self._pass(worker, mine))
+        finally:
+            server.shutdown()
+
+    def test_a_pass_does_not_step_aside_for_its_own_level(self):
+        """A client browsing the level being warmed re-observes it constantly.
+        Treating that as a newer demand would abandon the pass on the very
+        reads that asked for it."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker.observe_read(self._synthetic_chunk_id("mine", start=(2048, 0)))
+            mine = ("mine", (4, 4), "area")
+            assert not worker._preempted_by_newer_demand(self._pass(worker, mine))
+        finally:
+            server.shutdown()
+
+    def test_the_quantum_holds_the_worker_for_one_source_at_a_time(self):
+        """Two clients on two sources is ordinary for a shared server. Without
+        a floor they trade the worker every chunk and neither gets warmed."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker.observe_read(self._synthetic_chunk_id("theirs"))
+            mine = ("mine", (4, 4), "area")
+            assert not worker._preempted_by_newer_demand(
+                self._pass(worker, mine, quantum=30.0)
+            )
+        finally:
+            server.shutdown()
+
+    def test_a_pass_never_yields_before_it_has_warmed_anything(self):
+        """The livelock guard: with a quantum of 0, two alternating clients
+        would otherwise hand the worker back and forth at zero chunks each."""
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server)
+            worker.observe_read(self._synthetic_chunk_id("theirs"))
+            mine = ("mine", (4, 4), "area")
+            assert not worker._preempted_by_newer_demand(
+                self._pass(worker, mine, warmed=0)
+            )
+        finally:
+            server.shutdown()
+
+    def test_a_preempted_pass_is_left_retryable(self, tmp_path):
+        """Stepping aside is not a verdict on the level: the abandoned source
+        must warm again on its next read."""
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.config import PyramidConfig
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "mine")
+            # A 1 MiB read block leaves the level with many chunks, so the pass
+            # has somewhere to be interrupted.
+            worker = PrecacheWorker(
+                server,
+                PrecacheConfig(idle_debounce_seconds=0.0, demand_quantum_seconds=0.0),
+                PyramidConfig(max_read_block_mb=1),
+            )
+            cm = CacheManager.get_instance()
+            worker.observe_read(self._synthetic_chunk_id("theirs"))
+
+            worker._process_demand(self._observed_chunk_id(adapter, (4, 4)))
+
+            assert cm.stats().misses > 0, "the guard should let one chunk through"
+            assert not worker._demand_done, "an abandoned pass was remembered"
+            assert [k[0] for k in worker._demand] == ["theirs"]
         finally:
             server.shutdown()
             CacheManager.get_instance().close()

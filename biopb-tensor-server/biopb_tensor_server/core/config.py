@@ -212,6 +212,7 @@ _CONSTRAINTS = {
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),
         "demand_queue_max": _Range(min=1),
+        "demand_quantum_seconds": _Range(min=0),
         "high_water": _Range(min=0.0, max=1.0),
     },
     "MetadataDbConfig": {
@@ -580,8 +581,16 @@ class PrecacheConfig:
     demand_queue_max: int = field(
         default=64,
         metadata={
-            "help": "Maximum pending observed reads; oldest are dropped once "
-            "full (a stale hint is worth less than a fresh one)."
+            "help": "Maximum levels waiting to be warmed; oldest are dropped "
+            "once full (a stale hint is worth less than a fresh one)."
+        },
+    )
+    demand_quantum_seconds: float = field(
+        default=5.0,
+        metadata={
+            "help": "How long a source keeps the warmer before it may step "
+            "aside for another client's source. Lower shares a busy server "
+            "sooner; 0 yields at the first chunk boundary."
         },
     )
     high_water: float = field(
@@ -1224,6 +1233,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(precache_kwargs, "idle_debounce_seconds", precache_data, cast=float)
     _carry(precache_kwargs, "demand_enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "demand_queue_max", precache_data, cast=int)
+    _carry(precache_kwargs, "demand_quantum_seconds", precache_data, cast=float)
     # Legacy name first so an explicit new-style key wins over it.
     _carry(
         precache_kwargs,
