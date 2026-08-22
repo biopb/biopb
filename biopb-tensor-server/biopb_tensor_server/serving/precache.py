@@ -93,6 +93,7 @@ class PrecacheWorker:
         # Demand tier: chunk_ids clients actually read. Bounded and lossy on
         # purpose -- an observation is a hint about what someone is looking at
         # *now*, so a backlog of stale ones is worth less than the newest few.
+        # When it overflows the *oldest* entry goes, never the arriving one.
         # Nothing is decoded on the producer side; that work belongs off the
         # serving thread.
         self._demand: queue.Queue[bytes] = queue.Queue(
@@ -151,13 +152,28 @@ class PrecacheWorker:
         never raises: everything the decision needs is recoverable from the
         chunk_id later, on the worker thread.
 
-        Dropping on a full queue is the intended behaviour, not a failure. An
-        observation is a guess about what someone is looking at right now; if
-        they are moving faster than the worker warms, the newest guesses are
-        worth more than a queue of stale ones.
+        Losing observations on a full queue is the intended behaviour, not a
+        failure -- but which one is lost matters. A full queue means the client
+        is moving faster than the worker warms, so what the queue holds is the
+        *stale* guesses and what is arriving is where the client is now.
+        Evicting the oldest keeps the tier tracking the client instead of
+        pinning it to wherever they were when the worker fell behind.
         """
         if not self._cfg.demand_enabled or self._stop.is_set():
             return
+        try:
+            self._demand.put_nowait(chunk_id)
+            return
+        except queue.Full:
+            pass
+        # One eviction, one retry, then give up: the producer owns a serving
+        # thread and must not spin. A racing consumer or producer can take the
+        # slot back in between, which only costs this one hint -- and the queue
+        # stays bounded either way.
+        try:
+            self._demand.get_nowait()
+        except queue.Empty:
+            pass
         try:
             self._demand.put_nowait(chunk_id)
         except queue.Full:

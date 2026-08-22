@@ -822,6 +822,22 @@ class TestDemandTier:
         finally:
             server.shutdown()
 
+    def test_a_full_queue_drops_the_oldest_observation_not_the_newest(self):
+        """Overflow means the client outran the worker, so the queue holds the
+        stale guesses and the arriving one is where the client actually is.
+        Keeping the backlog and rejecting the newcomer would pin the tier to
+        wherever the client was when the worker fell behind.
+        """
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            worker = self._worker(server, demand_queue_max=2)
+            for i in range(20):
+                worker.observe_read(b"chunk-%d" % i)
+            drained = [worker._demand.get_nowait() for _ in range(2)]
+            assert drained == [b"chunk-18", b"chunk-19"]
+        finally:
+            server.shutdown()
+
     def test_observe_read_ignores_everything_when_disabled(self):
         server = TensorFlightServer("grpc://localhost:0")
         try:
