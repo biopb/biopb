@@ -968,6 +968,80 @@ class TestDemandTier:
             CacheManager.get_instance().close()
             CacheManager.reset()
 
+    def test_a_pass_stopped_at_high_water_is_retried_by_the_next_read(self, tmp_path):
+        """Cache pressure is a moment, not a verdict on the level.
+
+        Remembering a level the worker never actually warmed would leave the
+        source's siblings cold for the rest of the session -- until 512 other
+        levels evict the entry -- which is the exact failure the demand tier
+        exists to prevent.
+        """
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            cid = self._observed_chunk_id(adapter, (4, 4))
+            cm = CacheManager.get_instance()
+
+            worker._has_headroom = lambda: False
+            worker._process_demand(cid)
+            assert cm.stats().misses == 0, "nothing should have been warmed"
+            assert not worker._demand_done, "a level nobody warmed was remembered"
+
+            # Pressure passes; the next read of that level warms it for real.
+            worker._has_headroom = lambda: True
+            worker._process_demand(cid)
+            assert cm.stats().misses > 0, "the retry did not warm"
+            assert worker._demand_done, "a completed warm was not remembered"
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_a_source_skipped_as_non_resident_stays_retryable(self, tmp_path):
+        """The cloud provider can rehydrate at any time (#174), and the next
+        read of the source is exactly when it has."""
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            worker.should_warm = lambda source_id: False
+            worker._process_demand(self._observed_chunk_id(adapter, (4, 4)))
+            assert not worker._demand_done
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_an_adapter_that_raises_leaves_the_level_retryable(self, tmp_path):
+        """A transient adapter failure must not cost the level its next
+        chance."""
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(server, tmp_path, "src")
+            worker = self._worker(server)
+            cid = self._observed_chunk_id(adapter, (4, 4))
+
+            def boom(*a, **kw):
+                raise RuntimeError("transient")
+
+            adapter.list_tensor_descriptors = boom
+            worker._process_demand(cid)
+            assert not worker._demand_done
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
     def test_demand_memory_is_bounded_so_eviction_can_be_re_warmed(self, tmp_path):
         """An unbounded memory would turn an eviction into a permanent cold spot."""
         import biopb_tensor_server.serving.precache as precache_mod
@@ -1052,6 +1126,7 @@ class TestSkipUnscaledLevel:
 
     def _warm_one_tensor(self, tmp_path, shape, labels, scale, chunks=None):
         """Warm one tensor at *scale*; return the cache's miss count."""
+        import biopb_tensor_server.serving.precache as precache_mod
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
@@ -1063,10 +1138,10 @@ class TestSkipUnscaledLevel:
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             cm = CacheManager.get_instance()
             td = adapter.list_tensor_descriptors()[0]
-            stopped = worker._process_tensor(
+            outcome = worker._process_tensor(
                 adapter, td, cm, scale_hint=list(scale), reduction_method="area"
             )
-            assert stopped is False
+            assert outcome is not precache_mod._Outcome.HALTED
             return cm.stats().misses
         finally:
             server.shutdown()

@@ -39,6 +39,7 @@ first read then warms that source's other tensors.
 
 from __future__ import annotations
 
+import enum
 import logging
 import queue
 import threading
@@ -68,6 +69,22 @@ _POLL_INTERVAL_SECONDS = 0.2
 # Sized to cover a browsing session's working set without pinning the memory of
 # a warm that the cache has since evicted.
 _DEMAND_MEMORY = 512
+
+
+class _Outcome(enum.Enum):
+    """How far a warm got, which decides whether it is worth remembering.
+
+    Only ``COMPLETE`` earns a place in ``_demand_done``. The distinction is
+    load-bearing: the conditions that cut a pass short -- cache above high
+    water, a cloud source re-dehydrated, an adapter that raised -- are all
+    *transient*, and remembering one would ignore that level for the rest of
+    the session (until 512 other levels evict the entry), which is exactly the
+    cold sibling the demand tier exists to prevent.
+    """
+
+    COMPLETE = "complete"  # nothing left to warm here; remember it
+    INCOMPLETE = "incomplete"  # this tensor did not finish; keep going, retry later
+    HALTED = "halted"  # abandon the whole pass (cache full, or shutting down)
 
 
 class PrecacheWorker:
@@ -107,6 +124,11 @@ class PrecacheWorker:
         # globally, so a level warmed hours ago may be long gone. An unbounded
         # set would remember warming it and refuse to ever warm it again, which
         # turns a cache eviction into a permanent cold spot.
+        #
+        # For the same reason an entry only survives a warm that *finished*
+        # (_Outcome): a key held here for a pass that high water, a
+        # non-resident source or an adapter error cut short would be a cold
+        # spot the tier promised to fix.
         self._demand_done: OrderedDict[Tuple[str, Tuple[int, ...], str], None] = (
             OrderedDict()
         )
@@ -222,6 +244,9 @@ class PrecacheWorker:
 
         source_id = array_id.split("/")[0]
         key = (source_id, scale, method)
+        # Claim the key before warming so the observations that pile up while
+        # this pass runs collapse into it, then keep the claim only if the pass
+        # actually finished -- see _Outcome.
         with self._demand_lock:
             if key in self._demand_done:
                 return
@@ -229,8 +254,9 @@ class PrecacheWorker:
             while len(self._demand_done) > _DEMAND_MEMORY:
                 self._demand_done.popitem(last=False)
 
+        complete = False
         try:
-            self._process_source(
+            complete = self._process_source(
                 source_id,
                 scale_hint=list(scale),
                 reduction_method=method,
@@ -238,6 +264,10 @@ class PrecacheWorker:
             )
         except Exception:
             logger.exception("precache: demand warm failed for %s", source_id)
+        finally:
+            if not complete:
+                with self._demand_lock:
+                    self._demand_done.pop(key, None)
 
     # -- gates -------------------------------------------------------------
 
@@ -283,18 +313,21 @@ class PrecacheWorker:
         scale_hint: List[int],
         reduction_method: str,
         first_array_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Warm every tensor of a source at an observed level.
 
         ``scale_hint``/``reduction_method`` are the level a client was seen
         reading -- there is no server-chosen fallback, which is the point.
         ``first_array_id`` moves one tensor to the front: the one the client is
-        actually looking at, whose unread planes matter more than any sibling."""
+        actually looking at, whose unread planes matter more than any sibling.
+
+        Returns True only when every tensor was carried as far as it can go, so
+        the caller knows whether this level is worth remembering."""
         # Runtime file-backend gate: the "only run if file-based caching"
         # condition, enforced regardless of config.
         if not self._file_backend_active():
             logger.debug("precache: file backend not active, skipping %s", source_id)
-            return
+            return False
         # Residency gate (#174): under a cloud root, skip a source whose member
         # files have been re-dehydrated since registration. Reading them would
         # recall content the cloud=true policy is meant to keep offline. Coarse
@@ -304,12 +337,14 @@ class PrecacheWorker:
             logger.debug(
                 "precache: source %s not resident (cloud), skipping warm", source_id
             )
-            return
+            # Not remembered: the provider can rehydrate these files at any
+            # time, and the next read of one is exactly when it has.
+            return False
         cache_manager = CacheManager.get_instance()
 
         source_adapter = self._server.sources.get(source_id)
         if source_adapter is None:
-            return
+            return False
 
         # Skip non-local (remote) sources entirely (biopb/biopb#299). Warming a
         # remote-tensor proxy source would speculatively pull every chunk across
@@ -326,7 +361,9 @@ class PrecacheWorker:
             logger.debug(
                 "precache: skipping non-local source %s (read directly)", source_id
             )
-            return
+            # A source's URL does not change under us, so this skip is final
+            # and worth remembering -- unlike the gates above it.
+            return True
 
         try:
             descriptors = source_adapter.list_tensor_descriptors()
@@ -334,24 +371,31 @@ class PrecacheWorker:
             logger.exception(
                 "precache: list_tensor_descriptors failed for %s", source_id
             )
-            return
+            return False
 
         if first_array_id is not None:
             descriptors = sorted(
                 descriptors, key=lambda d: d.array_id != first_array_id
             )
 
+        complete = True
         for td in descriptors:
             if self._stop.is_set():
-                return
-            if self._process_tensor(
+                return False
+            outcome = self._process_tensor(
                 source_adapter,
                 td,
                 cache_manager,
                 scale_hint=scale_hint,
                 reduction_method=reduction_method,
-            ):
-                return  # cache filled up; the rest can warm on their own reads
+            )
+            if outcome is _Outcome.HALTED:
+                # Cache filled up (or shutdown): the rest warm on their own
+                # reads, and this level stays retryable so they can.
+                return False
+            if outcome is _Outcome.INCOMPLETE:
+                complete = False
+        return complete and not self._stop.is_set()
 
     def _process_tensor(
         self,
@@ -360,8 +404,8 @@ class PrecacheWorker:
         cache_manager,
         scale_hint: List[int],
         reduction_method: str,
-    ) -> bool:
-        """Warm one tensor at an observed level. True if it stopped early."""
+    ) -> _Outcome:
+        """Warm one tensor at an observed level."""
         # The client passes the descriptor's array_id verbatim as tensor_id
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
@@ -369,7 +413,7 @@ class PrecacheWorker:
             tensor_adapter = source_adapter.get_tensor_adapter(tensor_id)
         except Exception:
             logger.exception("precache: get_tensor_adapter failed for %s", tensor_id)
-            return False
+            return _Outcome.INCOMPLETE
         # Skip a tensor that ships its own multi-resolution pyramid (e.g. a
         # well-formed OME-Zarr image, or a pyramidal qptiff/ndtiff series): it
         # already serves overviews cheaply from its native coarse levels, so
@@ -382,14 +426,14 @@ class PrecacheWorker:
                     "precache: skipping tensor %s (serves overviews natively)",
                     tensor_id,
                 )
-                return False
+                return _Outcome.COMPLETE
         except Exception:
             logger.exception("precache: has_native_pyramid failed for %s", tensor_id)
         try:
             base_desc = tensor_adapter.get_tensor_descriptor()
         except Exception:
             logger.exception("precache: get_tensor_descriptor failed for %s", tensor_id)
-            return False
+            return _Outcome.INCOMPLETE
 
         # A sibling of a different rank cannot use this level: warming it would
         # produce chunk_ids nobody asks for. Drop rather than coerce.
@@ -400,7 +444,8 @@ class PrecacheWorker:
                 len(base_desc.shape),
                 tensor_id,
             )
-            return False
+            # A rank mismatch is a property of the tensor, not a bad moment.
+            return _Outcome.COMPLETE
         level_scale = list(scale_hint)
         level_method = reduction_method
 
@@ -418,7 +463,7 @@ class PrecacheWorker:
                 "precache: skipping tensor %s (level is full resolution)",
                 tensor_id,
             )
-            return False
+            return _Outcome.COMPLETE
 
         # Build the request descriptor exactly as get_flight_info does, so the
         # read plan's scaled chunk_ids match what the client will fetch.
@@ -442,21 +487,23 @@ class PrecacheWorker:
             )
         except Exception:
             logger.exception("precache: get_read_plan failed for %s", tensor_id)
-            return False
+            return _Outcome.INCOMPLETE
 
         endpoints = read_plan.chunk_endpoints
         warmed = 0
         for ce in endpoints:
             if self._stop.is_set():
-                return False
+                return _Outcome.HALTED
             if not self._has_headroom():
                 # Speculative work must never evict what live reads just put in.
+                # Transient by nature -- the cache drains -- so the level stays
+                # retryable rather than being written off for the session.
                 logger.debug("precache: warm stopped, cache at high water")
-                return True
+                return _Outcome.HALTED
             # Debounce + preempt between chunks: wait for the server to be idle
             # before warming each chunk.
             if not self._wait_until_idle():
-                return False
+                return _Outcome.HALTED
             try:
                 tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
                 warmed += 1
@@ -471,4 +518,6 @@ class PrecacheWorker:
             tensor_id,
             level_scale,
         )
-        return False
+        # A chunk that failed is one a later read should get another chance at;
+        # the ones already warmed make the retry cheap.
+        return _Outcome.COMPLETE if warmed == len(endpoints) else _Outcome.INCOMPLETE
