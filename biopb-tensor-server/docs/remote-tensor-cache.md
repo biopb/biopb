@@ -130,8 +130,11 @@ own upstream. Multi-upstream + local sources coexist in the one flat
 
 - **Source layer** — `list_tensor_descriptors` / `get_source_descriptor` /
   `get_native_pyramid_levels` mirror the upstream with `array_id` rewritten
-  local-ward. `source_url` is a display-friendly `grpc://<alias>:<upstream_id>`
-  (`_source_url`); the real endpoint stays on `_upstream_location` for dialing.
+  local-ward. `source_url` is a display-friendly `<scheme>://<alias>:<upstream_id>`
+  (`_source_url`, folded to `<scheme>://<alias>/<upstream-path>` once a re-list
+  seeds the upstream path) — the configured `alias` and the upstream's own
+  `grpc`/`grpcs` scheme, never the dial authority; the real endpoint stays on
+  `_upstream_location` for dialing.
   `is_resident()` tracks reachability (`_reachable`) — overridden `True` because a
   `grpc://` url is a remote scheme the base would wrongly call non-resident.
 - **Tensor layer** — `get_tensor_descriptor` mirrors upstream under the local

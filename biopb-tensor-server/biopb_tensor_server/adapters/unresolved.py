@@ -302,6 +302,7 @@ class UnresolvedSourceAdapter(SourceAdapter):
             dim_labels=dim_labels,
             dataset=dataset,
             credentials_profile=self._config.credentials_profile,
+            alias=self._config.alias,
         )
         try:
             # Normalize here rather than at registration: this proxy is what the
