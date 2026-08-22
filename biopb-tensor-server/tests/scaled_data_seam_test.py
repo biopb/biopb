@@ -131,3 +131,133 @@ class TestSeamIsDeclared:
         """
         assert "get_scaled_data" in _TENSOR_SCOPED_API
         assert hasattr(TensorAdapter, "get_scaled_data")
+
+
+class TestBandedDefault:
+    """The banded default (#640 phase 1.5).
+
+    Reading the extent in row bands is not only a residency measure -- it is loop
+    tiling against L3, worth ~2x on data already in RAM. But it is only worth
+    anything if it is bit-identical, so that is what is pinned here: banding
+    changes when bytes are read, never which pixel comes out.
+    """
+
+    @pytest.fixture
+    def banded(self, adapter, monkeypatch):
+        """`adapter`, but opted in, and counting its reads."""
+        reads = []
+        original = adapter.get_data
+
+        def counted(bounds):
+            reads.append((tuple(bounds.start), tuple(bounds.stop)))
+            return original(bounds)
+
+        monkeypatch.setattr(adapter, "get_data", counted)
+        monkeypatch.setattr(type(adapter), "BANDED_SCALED_READ", True)
+        return adapter, reads
+
+    @pytest.mark.parametrize("method", ["area", "nearest"])
+    @pytest.mark.parametrize(
+        "scale,stop",
+        [
+            ((2, 2), (64, 64)),  # aligned
+            ((4, 4), (64, 64)),
+            ((8, 8), (64, 64)),
+            ((4, 4), (30, 30)),  # ragged on BOTH axes -- the edge pad path
+            ((4, 4), (62, 64)),  # ragged only on rows
+            ((1, 4), (64, 64)),  # row scale 1: every band is block-aligned
+            ((8, 1), (64, 64)),  # column scale 1
+        ],
+    )
+    def test_banded_is_bit_identical(self, banded, monkeypatch, method, scale, stop):
+        """The invariant. A band budget small enough to force several bands.
+
+        The ragged cases matter most: only the LAST band may be short, and it is
+        the one place downsample_block's edge-replicate pad applies -- exactly
+        where it applies for the unbanded read.
+        """
+        import biopb_tensor_server.core.adapter_base as ab
+
+        adapter, reads = banded
+        bounds = _bounds((0, 0), stop)
+        expected = _ds.downsample_block(adapter.get_data(bounds), scale, method)
+        reads.clear()
+
+        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        actual = adapter.get_scaled_data(bounds, scale, method)
+
+        assert len(reads) > 1, "budget should have forced more than one band"
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert np.array_equal(actual, expected)
+
+    def test_bands_land_on_block_boundaries(self, banded, monkeypatch):
+        """A band that split a reduction block would fold its halves separately.
+
+        Checked on the reads themselves rather than only on the output, because a
+        misaligned band can still produce correct-looking pixels on uniform data.
+        """
+        import biopb_tensor_server.core.adapter_base as ab
+
+        adapter, reads = banded
+        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
+
+        assert len(reads) > 1
+        for start, stop in reads[:-1]:
+            assert (stop[0] - start[0]) % 8 == 0, "interior band split a block"
+        # Only the last may be ragged, and here the extent divides evenly anyway.
+        assert reads[-1][1][0] == 64
+
+    def test_bands_span_the_full_width(self, banded, monkeypatch):
+        """Never into tiles: #816 measured square retiling at +1.7 s."""
+        import biopb_tensor_server.core.adapter_base as ab
+
+        adapter, reads = banded
+        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
+
+        assert all((start[1], stop[1]) == (0, 64) for start, stop in reads)
+
+    def test_result_is_owned_even_for_nearest(self, banded, monkeypatch):
+        """Contract 4. downsample_block hands back a strided VIEW for nearest.
+
+        A view reaching the chunk cache would pin its full-resolution base, which
+        is the memory the banding exists to bound.
+        """
+        import biopb_tensor_server.core.adapter_base as ab
+
+        adapter, _ = banded
+        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+
+        out = adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "nearest")
+
+        assert out.base is None
+
+    def test_extent_inside_the_budget_reads_once(self, banded):
+        """Banding a chunk that already fits is pure overhead."""
+        adapter, reads = banded
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
+
+        assert len(reads) == 1
+
+    def test_off_by_default(self, adapter, monkeypatch):
+        """Opt-in: the flag asserts a property of the reader, so it defaults off."""
+        reads = []
+        original = adapter.get_data
+        monkeypatch.setattr(
+            adapter, "get_data", lambda b: (reads.append(b), original(b))[1]
+        )
+        import biopb_tensor_server.core.adapter_base as ab
+
+        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+
+        assert TensorAdapter.BANDED_SCALED_READ is False
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
+        assert len(reads) == 1
