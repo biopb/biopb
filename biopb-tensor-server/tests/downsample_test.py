@@ -78,14 +78,37 @@ _SHAPES = [
     (1, 1, 1, 64, 64),
     (1, 1, 1, 63, 65),
     (1, 2, 3, 33, 17),
+    (48, 48),
     (2, 8, 8),
     (16,),
 ]
+# Every list sweeps block sizes across _STRIDED_ADD_MAX_BLOCK, since the two
+# kernels are selected by block size alone: a scale whose product is <= 256
+# reduces by strided adds, above it by reshape-sum, and both sides have to land
+# on the same pixels.
 _SCALES = {
     # (1, 1, 1, 64, 64) etc: the realistic case -- unit axes plus a 4x4 XY block.
-    5: [(1, 1, 1, 4, 4), (1, 1, 1, 1, 1), (1, 1, 2, 8, 16), (1, 1, 1, 64, 2)],
-    3: [(1, 2, 2), (2, 8, 8), (1, 1, 4)],
-    1: [(4,), (1,), (16,)],
+    5: [
+        (1, 1, 1, 4, 4),  # block 16, strided
+        (1, 1, 1, 1, 1),  # block 1, strided (and a no-op)
+        (1, 1, 2, 8, 16),  # block 256, strided, at the gate
+        (1, 1, 1, 64, 2),  # block 128, strided
+        (1, 1, 1, 32, 32),  # block 1024, reshape-sum
+    ],
+    3: [
+        (1, 2, 2),  # block 4, strided
+        (2, 8, 8),  # block 128, strided
+        (1, 1, 4),  # block 4, strided
+        (4, 4, 4),  # block 64, strided
+        (2, 16, 16),  # block 512, reshape-sum
+    ],
+    2: [
+        (4, 4),  # block 16, strided
+        (8, 8),  # block 64, strided
+        (16, 16),  # block 256, strided, at the gate
+        (32, 32),  # block 1024, reshape-sum
+    ],
+    1: [(4,), (1,), (16,), (512,)],
 }
 _DTYPES = [
     "uint8",
@@ -158,6 +181,112 @@ def test_non_power_of_two_scale_matches_legacy(dtype, scale_hint):
 
     assert np.array_equal(actual, expected)
     assert _ds._plan_integer_area(np.dtype(dtype), scale_hint)[0] is None
+
+
+class TestStridedAddKernel:
+    """The strided-add kernel and the gate that selects it (#640 phase 0).
+
+    `_area_reduce_strided` sums the same block by walking one strided slice per
+    intra-block offset instead of reshaping and summing an axis at a time.
+    Integer addition is exact and order-independent, so the two are the *same*
+    sum; only the traversal differs, and everything here pins that.
+    """
+
+    _INTEGER_DTYPES = [d for d in _DTYPES if d not in ("float32", "float64", "bool")]
+    # 16 / 64 / 256: the realistic browse range, ending on the gate itself.
+    _BLOCK_SCALES = [(1, 1, 1, 4, 4), (1, 1, 1, 8, 8), (1, 1, 1, 16, 16)]
+
+    @pytest.mark.parametrize("scale_hint", _BLOCK_SCALES)
+    @pytest.mark.parametrize("dtype", _INTEGER_DTYPES)
+    @pytest.mark.parametrize("extreme", ["min", "max"])
+    def test_saturated_input_is_bit_identical(self, dtype, scale_hint, extreme):
+        """Every element at iinfo.min / iinfo.max -- the worst case for the sum.
+
+        Random data almost never saturates an accumulator; a uniform extreme
+        does it on the first block, which is the only way an undersized
+        accumulator shows up. It would wrap silently, so the check is against
+        the oracle *and* against the accumulator's own maximum.
+        """
+        info = np.iinfo(dtype)
+        value = info.min if extreme == "min" else info.max
+        data = np.full((1, 1, 1, 32, 32), value, dtype=dtype)
+
+        assert np.array_equal(
+            _ds.downsample_block(data, scale_hint, "area"),
+            legacy_downsample_block(data, scale_hint, "area"),
+        )
+
+        accumulator, block_size = _ds._plan_integer_area(np.dtype(dtype), scale_hint)
+        if accumulator is None:
+            return  # 64-bit inputs stay on the float path; nothing to size
+        assert abs(int(value)) * block_size <= int(np.iinfo(accumulator).max)
+
+    @pytest.mark.parametrize(
+        "shape,scale_hint",
+        [
+            ((1, 1, 1, 64, 64), (1, 1, 1, 4, 4)),  # block 16
+            ((1, 1, 1, 63, 65), (1, 1, 1, 8, 8)),  # block 64, ragged both axes
+            ((1, 1, 1, 64, 64), (1, 1, 1, 32, 32)),  # block 1024, above the gate
+            ((2, 8, 8), (2, 8, 8)),  # 3D, block 128
+            ((48, 48), (16, 16)),  # 2D, block 256
+        ],
+    )
+    @pytest.mark.parametrize("dtype", ["uint8", "uint16", "uint32", "int8", "int16"])
+    def test_kernels_agree_regardless_of_the_gate(self, shape, scale_hint, dtype):
+        """Both kernels, run directly, on both sides of where the gate sends them.
+
+        The gate is a performance choice; correctness must not depend on which
+        side of it an input lands, or moving the bound would move pixels.
+        """
+        seed = zlib.crc32(repr((shape, scale_hint, dtype)).encode())
+        data = _sample(dtype, shape, seed=seed)
+        padded = _ds._pad_array_edge(
+            data, _ds._pad_shape_to_scale_multiple(shape, scale_hint)
+        )
+        accumulator, _ = _ds._plan_integer_area(np.dtype(dtype), scale_hint)
+        assert accumulator is not None
+
+        strided = _ds._area_reduce_strided(padded, scale_hint, accumulator)
+        reshaped = _ds._area_reduce_integer(padded, scale_hint, accumulator)
+
+        assert strided.dtype == reshaped.dtype == accumulator
+        assert np.array_equal(strided, reshaped)
+
+    @pytest.mark.parametrize(
+        "scale_hint,expects_strided",
+        [
+            ((1, 1, 1, 4, 4), True),  # 16
+            ((1, 1, 1, 16, 16), True),  # 256 -- the gate is inclusive
+            ((1, 1, 1, 16, 32), False),  # 512
+            ((1, 1, 1, 32, 32), False),  # 1024, the browser's opening read
+        ],
+    )
+    def test_gate_routes_by_block_size(self, monkeypatch, scale_hint, expects_strided):
+        """Which kernel runs is decided by block size alone.
+
+        Pinned because the reason for the bound is invisible in the output: the
+        two agree bit for bit, so a gate that drifted would only show up as the
+        2x regression on the coarse read a user is already waiting on.
+        """
+        assert _ds._STRIDED_ADD_MAX_BLOCK == 256
+        called = []
+        for name in ("_area_reduce_strided", "_area_reduce_integer"):
+            original = getattr(_ds, name)
+            monkeypatch.setattr(
+                _ds,
+                name,
+                lambda *args, _n=name, _f=original, **kwargs: (
+                    called.append(_n),
+                    _f(*args, **kwargs),
+                )[1],
+            )
+
+        _ds.downsample_block(
+            np.zeros((1, 1, 1, 64, 64), dtype="uint16"), scale_hint, "area"
+        )
+
+        expected = "_area_reduce_strided" if expects_strided else "_area_reduce_integer"
+        assert called == [expected]
 
 
 class TestIntegerAccumulatorSizing:
