@@ -740,6 +740,14 @@ class TensorAdapter(SourceAdapter):
         """Read data within bounds from the backend.
         Subclasses should call super().get_data(bounds) to validate bounds,
         then read data from their backend.
+
+        The returned array's memory MUST NOT have its lifetime tied to a
+        closable handle. A transpose or slice view over an array this adapter
+        owns is fine; a view onto a reader-owned mmap that ``_handle_reaper``
+        can close is not -- the caller may hold it well past the adapter's lock,
+        and ``core/normalize.py`` transposes it without copying. An adapter
+        reading through a mapping copies before returning.
+
         Args:
             bounds: Chunk bounds (start, stop coordinates per axis)
         Returns:
@@ -750,6 +758,49 @@ class TensorAdapter(SourceAdapter):
         desc = self.get_tensor_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
+
+    def get_scaled_data(
+        self,
+        bounds: ChunkBounds,
+        scale_hint: Tuple[int, ...],
+        reduction_method: str,
+    ) -> np.ndarray:
+        """Read ``bounds`` and reduce it by ``scale_hint`` in one step.
+
+        The default reads the whole extent and reduces it -- exactly what
+        ``resolve_chunk_data`` did inline before this seam existed. An adapter
+        whose reader can deliver the extent in pieces (an ND2 frame, a TIFF
+        page, a CZI plane) overrides this and folds each piece as it arrives, so
+        the full-resolution extent is never resident -- and so no view onto a
+        reader-owned mapping ever leaves the adapter's lock.
+
+        An override must hold to all of:
+
+        1. **Shape** -- ``ceil((stop - start) / scale)`` per axis, identical to
+           :func:`downsample_block`'s output, edge padding included.
+        2. **Dtype** -- ``get_output_dtype(base_dtype, method)``, i.e. the
+           input's own.
+        3. **Values** -- bit-identical to
+           ``downsample_block(self.get_data(bounds), scale_hint, method)``.
+           Anything that cannot be is not an override: it is a different
+           reduction, and must not be reached for a method it does not compute
+           (CZI's ``read(zoom=)`` matches ``nearest`` and differs from ``area``
+           in 100% of pixels).
+        4. **Ownership** -- an owned array. In particular a fused ``nearest``
+           must materialise: only the default may return the strided view
+           ``TestZeroCopyContract`` pins, because only there is the base array
+           already owned and already off the reader.
+        5. **Fallback** -- anything the fused path cannot express bit-identically
+           calls ``super().get_scaled_data(...)`` rather than approximating.
+
+        Args:
+            bounds: Chunk bounds, in this adapter's own axis order.
+            scale_hint: Per-axis reduction factor, same order as ``bounds``.
+            reduction_method: Normalized method, decoded from the chunk_id.
+        Returns:
+            The reduced array.
+        """
+        return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
 
     @staticmethod
     def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
@@ -853,15 +904,18 @@ class TensorAdapter(SourceAdapter):
         )
 
         def compute_fn():
-            result_arr = self.get_data(bounds)
-
             if is_scaled_chunk_flag:
-                scale_hint = decode_scale_info(chunk_id)
                 # The requested reduction_method rides in the chunk_id (#578), so a
-                # do_get honors it; a method-free (old/area) scaled chunk_id decodes
-                # to the default. Crop + downsample (bounds aligned via floor_div).
-                reduction_method = decode_reduction_method(chunk_id)
-                result_arr = downsample_block(result_arr, scale_hint, reduction_method)
+                # do_get honors it; a byte-free (pre-#578) scaled chunk_id decodes
+                # to area. Read and reduce through one call so an adapter that can
+                # do both at once never materializes the full-resolution extent.
+                result_arr = self.get_scaled_data(
+                    bounds,
+                    decode_scale_info(chunk_id),
+                    decode_reduction_method(chunk_id),
+                )
+            else:
+                result_arr = self.get_data(bounds)
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
             # string, wrapped zero-copy. This preserves the exact dtype including
@@ -871,9 +925,10 @@ class TensorAdapter(SourceAdapter):
             return result, result_arr.nbytes
 
         if should_cache:
-            # The reduction method is advisory: requests differing only in
-            # method share one entry, so precache-warmed chunks serve any
-            # method at the same bounds/scale (biopb/biopb#76).
+            # The method is part of the key, not advisory: since #578 the
+            # chunk_id carries a method byte and cache_key_for_chunk_id keeps
+            # it, so a nearest read cannot be served an area chunk (this
+            # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(cache_key, compute_fn)
             data = entry.data
@@ -1263,6 +1318,7 @@ _TENSOR_SCOPED_API = frozenset(
         "get_tensor_descriptor",
         "get_transfer_chunk_size",
         "get_data",
+        "get_scaled_data",
         "get_arrow_schema",
         "resolve_chunk_data",
         "get_read_plan",
