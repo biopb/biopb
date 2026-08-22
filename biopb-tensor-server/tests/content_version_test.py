@@ -6,17 +6,20 @@ new bytes gets a fresh cache key instead of serving a stale cached chunk. Covers
 - the codec is backward-compatible (unversioned chunk_ids / cache keys are
   byte-identical to pre-#178) and every codec function is wrapper-aware;
 - cache_key_for_chunk_id keeps the version (version-sensitive) while the inner
-  projection is unchanged and an area (default) read stays byte-identical;
-- the compact reduction_method suffix (biopb/biopb#578): a non-default method
-  rides in the scaled chunk_id and keys distinctly, area adds no byte;
+  projection is unchanged;
+- the compact reduction_method suffix (biopb/biopb#578): EVERY computed method
+  rides in the scaled chunk_id as its own code byte and keys distinctly, so the
+  identifier never depends on which method is the request default;
 - _get_read_plan wraps all minted chunk_ids with a source's content_version;
 - content_version_from_path yields a cheap stat signal and OmeTiffAdapter adopts it.
 """
 
 import os
+import struct
 import tempfile
 import time
 
+import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.adapter_base import _get_read_plan
@@ -110,16 +113,21 @@ class TestCacheKey:
             cache_key_for_chunk_id(wrap_content_version(legacy, b"v2"))
         )
 
-    def test_legacy_method_suffix_maps_to_identity_key(self):
+    def test_legacy_method_suffix_strips_to_the_method_free_key(self):
         # An OLD-format scaled chunk_id carried a trailing (uint16 len + method)
-        # suffix; cache_key_for_chunk_id strips it, so it maps to exactly the same
-        # key as the new identity chunk_id -- no cache wipe on the #178 wire change.
-        identity = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
-        legacy_with_method = identity + b"\x00\x03max"  # uint16(3) + b"max"
-        assert cache_key_for_chunk_id(legacy_with_method) == identity
+        # suffix; cache_key_for_chunk_id still strips it, landing on the pre-#578
+        # method-free key. That key is now ORPHANED rather than shared: this
+        # server mints a method byte on every scaled read, so nothing looks it up
+        # again (accepted deliberately -- no format-version bump, no wipe).
+        method_free = _method_free_scaled("src/t", _bounds(), (2, 2))
+        legacy_with_method = method_free + b"\x00\x03max"  # uint16(3) + b"max"
+        assert cache_key_for_chunk_id(legacy_with_method) == method_free
         assert cache_key_for_chunk_id(
             wrap_content_version(legacy_with_method, CV)
-        ) == cache_key_for_chunk_id(wrap_content_version(identity, CV))
+        ) == cache_key_for_chunk_id(wrap_content_version(method_free, CV))
+
+        area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
+        assert cache_key_for_chunk_id(area) != cache_key_for_chunk_id(method_free)
 
 
 # ==============================================================================
@@ -127,41 +135,83 @@ class TestCacheKey:
 # ==============================================================================
 
 
-class TestReductionMethodSuffix:
-    def test_area_is_byte_identical_to_method_free(self):
-        # The default (area) adds no byte, so an area scaled chunk_id equals the
-        # pre-#578 method-free form -- its cache entries are NOT invalidated.
-        method_free = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
-        area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
-        assert area == method_free
-        assert decode_reduction_method(area) == "area"
+def _method_free_scaled(array_id, bounds, scale_hint):
+    """A pre-#578 scaled chunk_id: scale_hint and NO method byte.
 
-    def test_nearest_carries_one_byte_and_decodes_back(self):
+    Built by hand rather than by calling the encoder without a method, because
+    the encoder now codes every method -- there is no argument that reproduces
+    the old byte-free form, which is the whole point of the change.
+    """
+    return encode_chunk_id(array_id, bounds) + struct.pack(
+        f">{len(scale_hint)}q", *scale_hint
+    )
+
+
+class TestReductionMethodSuffix:
+    def test_every_method_carries_its_own_byte(self):
+        """No method is spelled by the ABSENCE of a byte.
+
+        This is what decouples the identifier from the request default: while
+        one method encoded byte-free, moving the default re-read every id
+        already written and made the old default unreachable (an explicit
+        request for it encoded byte-free and decoded back as the new default).
+        """
+        base = _method_free_scaled("src/t", _bounds(), (2, 2))
         area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
         nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
-        assert len(nearest) == len(area) + 1  # exactly one method byte
+
+        assert len(area) == len(base) + 1
+        assert len(nearest) == len(base) + 1
+        assert area[:-1] == nearest[:-1] == base  # differ ONLY in the method byte
+        assert area[-1] != nearest[-1]
+        assert decode_reduction_method(area) == "area"
         assert decode_reduction_method(nearest) == "nearest"
-        # The suffix does not disturb scale/bounds/scaled detection.
+
+    def test_area_is_not_byte_identical_to_the_pre_change_form(self):
+        """The accepted cost: pre-#578 area entries are orphaned, not shared.
+
+        Unreachable rather than invalidated -- nothing looks them up and nothing
+        rewrites them, so they are reclaimed by ordinary segment LRU. Taken in
+        preference to a CACHE_FILE_FORMAT_VERSION bump and a wipe.
+        """
+        area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
+        assert area != _method_free_scaled("src/t", _bounds(), (2, 2))
+
+    def test_method_byte_does_not_disturb_the_rest_of_the_codec(self):
+        nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
         assert decode_scale_info(nearest) == (2, 2)
         assert is_scaled_chunk(nearest)
         assert decode_chunk_id(nearest)[0] == "src/t"
 
     def test_aliases_normalize_before_encoding(self):
-        # stride -> nearest (adds the byte); mean -> area (no byte).
+        # stride -> nearest, mean -> area; both code to their own byte.
         stride = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "stride")
         mean = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "mean")
         assert decode_reduction_method(stride) == "nearest"
-        assert mean == encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        assert decode_reduction_method(mean) == "area"
+        assert mean == encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
 
-    def test_cache_key_distinguishes_method_but_area_survives(self):
-        method_free = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+    def test_precompute_cannot_be_encoded(self):
+        """Only computed methods have a code; precompute never reaches here.
+
+        get_read_plan intercepts it and re-plans against the native level's own
+        store -- an unscaled read identified by its array_id. Raising beats a
+        byte-free fallback, which would be indistinguishable from a pre-#578
+        chunk_id and would be served as area.
+        """
+        with pytest.raises(ValueError, match="No chunk_id code"):
+            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "precompute")
+        with pytest.raises(ValueError, match="No chunk_id code"):
+            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "precomputed")
+
+    def test_cache_key_distinguishes_method(self):
         area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
         nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
-        # area keys identically to the old method-free entry (no invalidation)...
-        assert cache_key_for_chunk_id(area) == cache_key_for_chunk_id(method_free)
-        # ...while nearest keys distinctly (reverses the #76 collision).
+        # Reverses the #76 collision: a nearest read can no longer be served an
+        # area chunk, in either direction.
         assert cache_key_for_chunk_id(nearest) != cache_key_for_chunk_id(area)
         assert cache_key_for_chunk_id(nearest) == nearest  # method byte kept
+        assert cache_key_for_chunk_id(area) == area
 
     def test_method_survives_content_version_wrapping(self):
         nearest = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "nearest")
@@ -170,11 +220,18 @@ class TestReductionMethodSuffix:
         assert decode_scale_info(wrapped) == (2, 2)
         assert content_version_of(wrapped) == CV
 
-    def test_method_free_and_nonscaled_decode_to_default(self):
+    def test_method_free_and_nonscaled_decode_to_the_compat_anchor(self):
+        """A byte-free id can only predate the mandatory byte, and that was area.
+
+        Compatibility only -- an old cache entry, an id a client still holds, or
+        one a proxy forwarded from an older upstream. It must stay pinned to
+        "area" whatever the current request default is, or all of those get
+        re-read as the wrong method: same cache key, different pixels, no error.
+        """
         assert decode_reduction_method(encode_chunk_id("src/t", _bounds())) == "area"
-        method_free = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2))
+        method_free = _method_free_scaled("src/t", _bounds(), (2, 2))
         assert decode_reduction_method(method_free) == "area"
-        # A legacy uint16-len method suffix is not the compact byte -> default.
+        # A legacy uint16-len method suffix is not the compact byte -> anchor.
         legacy = method_free + b"\x00\x03max"
         assert decode_reduction_method(legacy) == "area"
 
@@ -260,6 +317,40 @@ def _base_desc():
 
 
 class TestReadPlanWiring:
+    def test_unspecified_method_mints_the_request_default(self):
+        """An unspecified reduction_method resolves at plan time and is minted.
+
+        The end of the chain the flip actually changes: the client sends no
+        method, ``normalize_reduction_method`` resolves it, and the chunk_id
+        says which one -- so ``resolve_chunk_data`` downsamples with it rather
+        than inferring it from an absent byte.
+        """
+        request = TensorDescriptor(scale_hint=[2, 2])
+        plan = _get_read_plan(_base_desc(), request, (5, 5))
+
+        assert plan.chunk_endpoints
+        assert all(is_scaled_chunk(ep.chunk_id) for ep in plan.chunk_endpoints)
+        assert all(
+            decode_reduction_method(ep.chunk_id) == "nearest"
+            for ep in plan.chunk_endpoints
+        )
+
+    def test_explicit_method_survives_planning(self):
+        """The other half: asking for area gets area, not the default.
+
+        Regression guard. While area encoded byte-free, an explicit
+        ``reduction_method="mean"`` round trip came back a strided pick -- the
+        id could not distinguish "area was asked for" from "nothing was asked".
+        """
+        request = TensorDescriptor(scale_hint=[2, 2], reduction_method="mean")
+        plan = _get_read_plan(_base_desc(), request, (5, 5))
+
+        assert plan.chunk_endpoints
+        assert all(
+            decode_reduction_method(ep.chunk_id) == "area"
+            for ep in plan.chunk_endpoints
+        )
+
     def test_none_version_mints_legacy_chunk_ids(self):
         plan = _get_read_plan(_base_desc(), TensorDescriptor(), (5, 5))
         assert plan.chunk_endpoints

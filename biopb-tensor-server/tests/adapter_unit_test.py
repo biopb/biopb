@@ -170,11 +170,23 @@ class TestReductionMethodNormalization:
         assert _ds.normalize_reduction_method("mean") == "area"
         assert _ds.normalize_reduction_method("precomputed") == "precompute"
 
-    def test_default_is_area(self):
-        """Unspecified method resolves to area, matching PyramidConfig and
-        the advertised pyramid levels (descriptor consistency, biopb#76)."""
-        assert _ds.normalize_reduction_method("") == "area"
-        assert _ds.normalize_reduction_method(None) == "area"
+    def test_default_is_nearest(self):
+        """Unspecified method resolves to nearest: the cheapest reduction, and
+        the one that gets cheaper as the level gets coarser."""
+        assert _ds.normalize_reduction_method("") == "nearest"
+        assert _ds.normalize_reduction_method(None) == "nearest"
+
+    def test_request_default_does_not_move_the_chunk_id_anchor(self):
+        """An absent method byte still means area, whatever the request default is.
+
+        The two are separate constants because byte-free chunk IDs already exist
+        as cache keys and on the wire. Tying their historical meaning to the request
+        default would reinterpret those IDs whenever the default changes.
+        """
+        assert _ds.CHUNK_ID_IMPLICIT_REDUCTION_METHOD == "area"
+        assert (
+            _ds.normalize_reduction_method("") != _ds.CHUNK_ID_IMPLICIT_REDUCTION_METHOD
+        )
 
     def test_linear_aliases_to_area_with_warning(self, caplog):
         import logging
