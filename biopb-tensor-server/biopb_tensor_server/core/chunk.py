@@ -72,8 +72,8 @@ logger = logging.getLogger(__name__)
 #
 # A byte-free scaled chunk_id (old server, old cache, or a proxy forwarding from
 # an older upstream) stays readable and decodes to area -- see
-# CHUNK_ID_IMPLICIT_REDUCTION_METHOD. A cold downsample with no request in scope
-# uses the server default; see core.adapter_base.resolve_chunk_data.
+# CHUNK_ID_IMPLICIT_REDUCTION_METHOD. Current scaled ids carry an explicit method,
+# and cold compute uses that decoded method in core.adapter_base.resolve_chunk_data.
 #
 # content_version wrapper (biopb/biopb#178)
 # -----------------------------------------

@@ -179,10 +179,9 @@ class TestReductionMethodNormalization:
     def test_request_default_does_not_move_the_chunk_id_anchor(self):
         """An absent method byte still means area, whatever the request default is.
 
-        The two are separate constants because those bytes are the cache key
-        *and* the encoder omits the byte for exactly the anchor method -- tying
-        them together re-reads every chunk_id already written and makes the
-        non-anchor method unreachable.
+        The two are separate constants because byte-free chunk IDs already exist
+        as cache keys and on the wire. Tying their historical meaning to the request
+        default would reinterpret those IDs whenever the default changes.
         """
         assert _ds.CHUNK_ID_IMPLICIT_REDUCTION_METHOD == "area"
         assert (
