@@ -19,14 +19,27 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Default matches PyramidConfig.reduction_method so an unspecified-method
-# request agrees with the advertised pyramid levels and what precache warms.
-_DEFAULT_REDUCTION_METHOD = "area"
-# Public alias: since reduction_method left the chunk_id (biopb/biopb#178) it is
-# advisory (the cache key never distinguished it, #76), so a cold compute that has
-# no request in scope -- resolve_chunk_data on the do_get path -- downsamples with
-# this default.
-DEFAULT_REDUCTION_METHOD = _DEFAULT_REDUCTION_METHOD
+# What an unspecified reduction_method resolves to. "nearest" is a strided pick:
+# it never touches the bytes it discards, so it is the cheapest reduction at
+# every scale and the only one that gets cheaper as the level gets coarser (at
+# scale 32 it copies 1/1024 of the extent). It aliases where "area" averages,
+# which is the trade being made -- a client that wants the averaged pixels asks
+# for "area" explicitly.
+#
+_DEFAULT_REDUCTION_METHOD = "nearest"
+
+# What an ABSENT method byte in a scaled chunk_id means (core/chunk.py). Not a
+# policy default and not tied to the line above: it is a fact about bytes already
+# written, and it is frozen.
+#
+# The encoder now carries a code byte for every computed method, so nothing this
+# server mints is byte-free. A byte-free scaled chunk_id can therefore only come
+# from before that change -- an old cache entry, an id a client still holds, or
+# one a remote proxy forwarded from an older upstream -- and everything from
+# before that change was area. Repointing this at the current request default
+# would re-read all of them as the wrong method: same cache key, different
+# pixels, no error.
+CHUNK_ID_IMPLICIT_REDUCTION_METHOD = "area"
 _SUPPORTED_REDUCTION_METHODS = {"nearest", "area", "precompute"}
 _METHOD_ALIASES = {
     "stride": "nearest",

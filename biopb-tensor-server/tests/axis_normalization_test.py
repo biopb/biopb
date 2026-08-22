@@ -412,6 +412,11 @@ class TestNormalizedDescriptorAndData:
 
             read_opt = TensorReadOption(tensor_id="src")
             read_opt.scale_hint[:] = [2, 2, 1]  # canonical: z/2, y/2, x untouched
+            # Asked for explicitly: this test is about the permutation agreeing
+            # across scale_hint / chunk_id / result, and the expected value below
+            # is a block mean. Leaving it to the request default would make it
+            # fail for an unrelated reason the day that default moves.
+            read_opt.reduction_method = "area"
             plan = adapter.plan_flight_info(read_opt, PyramidConfig())
             assert list(plan.descriptor.shape) == [32, 16, 4]
             assert list(plan.descriptor.scale_hint) == [2, 2, 1]
