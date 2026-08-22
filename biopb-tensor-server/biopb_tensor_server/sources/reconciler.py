@@ -561,6 +561,10 @@ class Reconciler:
         extra_config = {}
         if upstream.credentials_profile:
             extra_config["credentials_profile"] = upstream.credentials_profile
+        # The proxy's display authority; without it every mirrored source_url
+        # exposes the upstream host:port instead of the alias (biopb/biopb#788).
+        if alias:
+            extra_config["alias"] = alias
         for source_id in sorted(added):
             up_id = desired[source_id]
             self._commit_add_claim(
@@ -817,6 +821,7 @@ class Reconciler:
                 dim_labels=claim.dim_labels,
                 dataset=claim.extra_config.get("dataset"),
                 credentials_profile=claim.extra_config.get("credentials_profile"),
+                alias=claim.extra_config.get("alias"),
             )
 
             if self._claim_is_unresolved(claim):

@@ -339,18 +339,21 @@ class RemoteTensorAdapter(TensorAdapter):
         self._source_type = "tensor-server"
         self._tensor_name = tensor_name
         self._alias = alias
+        _parts = urlsplit(upstream_location)
+        # Display scheme: whatever the upstream was configured with (grpc://,
+        # grpcs://, grpc+tls://). Hardcoding grpc:// advertised a TLS upstream as
+        # plaintext (biopb/biopb#788).
+        self._scheme = _parts.scheme or "grpc"
         # Display authority for the catalog source_url: the alias, or the
         # host:port when there is none. (self._upstream_location keeps the real
         # endpoint for dialing.)
-        self._authority = alias or (
-            urlsplit(upstream_location).netloc or upstream_location
-        )
+        self._authority = alias or (_parts.netloc or upstream_location)
         # Display-friendly catalog source_url. Until the upstream's real path is
         # seeded (seed_catalog, biopb/biopb#297), fall back to the endpoint + the
         # upstream source_id -- grpc://lab:experiment1 (aliased) or
         # grpc://lab-store:8815:experiment1 (no alias) -- which is at least more
         # legible than the bare endpoint shared by every source of an upstream.
-        self._source_url = f"grpc://{self._authority}:{upstream_source_id}"
+        self._source_url = f"{self._scheme}://{self._authority}:{upstream_source_id}"
 
         self._upstream_location = upstream_location
         self._upstream_source_id = upstream_source_id
@@ -491,7 +494,8 @@ class RemoteTensorAdapter(TensorAdapter):
         """Build the catalog ``source_url`` so a browser can tree a mirror by path.
 
         Embeds the upstream source's REAL location under the (aliased) endpoint --
-        ``grpc://<authority>/<remote-path>`` -- so a client nests mirrored sources
+        ``<scheme>://<authority>/<remote-path>``, keeping the upstream's own
+        grpc/grpcs scheme -- so a client nests mirrored sources
         by their upstream filepath beneath an endpoint root, instead of collapsing
         every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297).
         The upstream url is a normalized catalog url (e.g.
@@ -503,8 +507,8 @@ class RemoteTensorAdapter(TensorAdapter):
             parts = urlsplit(upstream_source_url)
             remote = (parts.netloc + parts.path).strip("/")
             if remote:
-                return f"grpc://{self._authority}/{remote}"
-        return f"grpc://{self._authority}:{self._upstream_source_id}"
+                return f"{self._scheme}://{self._authority}/{remote}"
+        return f"{self._scheme}://{self._authority}:{self._upstream_source_id}"
 
     def seed_catalog(
         self,
