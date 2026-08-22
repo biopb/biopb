@@ -19,6 +19,7 @@ import struct
 import tempfile
 import time
 
+import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.adapter_base import _get_read_plan
@@ -189,6 +190,19 @@ class TestReductionMethodSuffix:
         assert decode_reduction_method(stride) == "nearest"
         assert decode_reduction_method(mean) == "area"
         assert mean == encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")
+
+    def test_precompute_cannot_be_encoded(self):
+        """Only computed methods have a code; precompute never reaches here.
+
+        get_read_plan intercepts it and re-plans against the native level's own
+        store -- an unscaled read identified by its array_id. Raising beats a
+        byte-free fallback, which would be indistinguishable from a pre-#578
+        chunk_id and would be served as area.
+        """
+        with pytest.raises(ValueError, match="No chunk_id code"):
+            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "precompute")
+        with pytest.raises(ValueError, match="No chunk_id code"):
+            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "precomputed")
 
     def test_cache_key_distinguishes_method(self):
         area = encode_chunk_id_with_scale("src/t", _bounds(), (2, 2), "area")

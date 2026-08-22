@@ -292,8 +292,12 @@ def get_bounds_from_chunk_id(chunk_id: bytes) -> ChunkBounds:
 # fallback, which is "area", so a mandatory-area id read by an old peer still
 # lands on area.
 #
-# A method with no code here (only "precompute", which never reaches a computed
-# scaled read) still encodes byte-free and decodes as area, exactly as before.
+# Only the COMPUTED methods are coded. "precompute" is not one: get_read_plan
+# intercepts it and re-plans against the native level's own store, an unscaled
+# read identified by its array_id (source_id/{level}), so it never reaches this
+# encoder. Reaching it anyway is a routing bug and raises -- falling back to a
+# byte-free id would mint something indistinguishable from a pre-#578 chunk_id
+# and serve it as area.
 _SCALED_METHOD_BYTE = {"nearest": b"\x01", "area": b"\x02"}
 _SCALED_METHOD_BY_BYTE = {1: "nearest", 2: "area"}
 
@@ -323,9 +327,15 @@ def encode_chunk_id_with_scale(
     """
     base = encode_chunk_id(array_id, bounds)
     scale_payload = struct.pack(f">{len(scale_hint)}q", *scale_hint)
-    method_suffix = _SCALED_METHOD_BYTE.get(
-        normalize_reduction_method(reduction_method), b""
-    )
+    normalized = normalize_reduction_method(reduction_method)
+    try:
+        method_suffix = _SCALED_METHOD_BYTE[normalized]
+    except KeyError:
+        raise ValueError(
+            f"No chunk_id code for reduction_method {normalized!r}: a scaled "
+            "chunk_id can only carry a computed method. 'precompute' is routed "
+            "to its native level by get_read_plan and must not reach here."
+        ) from None
     return base + scale_payload + method_suffix
 
 
