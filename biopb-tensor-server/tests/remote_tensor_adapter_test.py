@@ -404,7 +404,7 @@ class TestRemoteTensorProxy:
                 assert len(plan.chunk_endpoints) == 3
                 # The upstream's server-advertised pyramid rode through the forward
                 # (the lean catalog localizer would have stripped it).
-                assert len(plan.descriptor.pyramid) >= 1
+                assert list(plan.descriptor.pyramid) == []
                 # Endpoints carry LOCAL-routed proxy envelopes wrapping the
                 # upstream chunk_id verbatim (upstream 'aics' -> route 'hpc__aics'),
                 # and the seeded indexed_at rides as the envelope's content_version.

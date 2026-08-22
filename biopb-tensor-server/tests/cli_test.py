@@ -747,16 +747,16 @@ def test_validate_reports_a_bad_knob_and_exits_1(tmp_path, capsys):
 
     config_path = tmp_path / "biopb.json"
     config_path.write_text(
-        json.dumps({"server": {"port": 8815}, "pyramid": {"downscale_factor": 0}})
+        json.dumps({"server": {"port": 8815}, "precache": {"high_water": 1.5}})
     )
 
     with pytest.raises(typer.Exit) as exc:
         cli.validate(config=config_path)
     assert exc.value.exit_code == 1
     out = capsys.readouterr().out
-    assert "downscale_factor" in out
-    # The section name survives rich's markup parser ("[pyramid]" is not a tag).
-    assert "pyramid" in out
+    assert "high_water" in out
+    # The section name survives rich's markup parser ("[precache]" is not a tag).
+    assert "precache" in out
 
 
 def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypatch):
@@ -768,7 +768,7 @@ def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypat
 
     config_path = tmp_path / "biopb.json"
     config_path.write_text(
-        json.dumps({"server": {"port": 8815}, "pyramid": {"downscale_factor": 0}})
+        json.dumps({"server": {"port": 8815}, "precache": {"high_water": 1.5}})
     )
 
     loaded = {}
@@ -782,9 +782,9 @@ def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypat
     monkeypatch.setattr(cli, "_setup_flight_server", _capture)
     _run_serve(config_path)
 
-    from biopb_tensor_server.core.config import PyramidConfig
+    from biopb_tensor_server.core.config import PrecacheConfig
 
-    assert loaded["config"].pyramid.downscale_factor == PyramidConfig().downscale_factor
+    assert loaded["config"].precache.high_water == PrecacheConfig().high_water
 
 
 def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys):

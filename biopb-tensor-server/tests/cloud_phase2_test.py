@@ -739,7 +739,7 @@ class TestPrecacheSkipsUnresolved:
         worker = PrecacheWorker(_Srv(), PrecacheConfig())
         # Past the file-backend gate so the real source-processing logic runs.
         monkeypatch.setattr(worker, "_file_backend_active", lambda: True)
-        assert worker._process_source("s1") is False
+        worker._process_source("s1", scale_hint=[4, 4], reduction_method="area")
         assert proxy.is_resolved is False
 
 

@@ -731,7 +731,7 @@ class TestReadPathTifffileAuthoritative:
             TensorReadOption(with_pyramid=True), PyramidConfig()
         )
         assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]
-        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid (opt-in)
+        assert list(plan.descriptor.pyramid) == []  # no native levels here
 
         bounds = ChunkBounds(start=[0, 1, 0, 0, 0], stop=[1, 2, 1, 64, 64])
         arr = np.asarray(scene.get_data(bounds))

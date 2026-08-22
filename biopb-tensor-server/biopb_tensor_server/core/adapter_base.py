@@ -38,7 +38,6 @@ from biopb_tensor_server.core.chunk import (
     MAX_READ_BLOCK_BYTES,
     ChunkEndpoint,
     _version_header,
-    build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
     decode_chunk_id,
@@ -1098,9 +1097,7 @@ class TensorAdapter(SourceAdapter):
         # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
         if read_opt.with_pyramid:
-            read_plan.descriptor.pyramid.extend(
-                self._advertised_pyramid(base_desc, pyramid_config)
-            )
+            read_plan.descriptor.pyramid.extend(self._advertised_pyramid(base_desc))
         self._fill_physical_scale(read_plan.descriptor)
         return read_plan
 
@@ -1108,8 +1105,8 @@ class TensorAdapter(SourceAdapter):
         """Native (precomputed on-disk) pyramid levels for this tensor, or None.
 
         Returns ``None`` for formats without a real on-disk pyramid (the default),
-        in which case the server advertises a *computed* pyramid via
-        ``chunk.build_pyramid_plan``. Formats that store downsampled levels
+        in which case the server advertises no pyramid at all and the client
+        picks its own ladder. Formats that store downsampled levels
         natively (e.g. OME-Zarr multiscales) override this to return one
         ``PyramidLevel`` per native dataset, each with ``native=True`` and
         ``reduction_method="precompute"`` so the client requests the on-disk level
@@ -1124,25 +1121,34 @@ class TensorAdapter(SourceAdapter):
 
         Derived by default from :meth:`get_native_pyramid_levels` -- a tensor
         has a native pyramid iff it advertises native levels -- so a new format
-        need only override the levels method. The precache worker skips a tensor
+        need only override the levels method. The cache warmer skips a tensor
         that reports True: it already serves overviews cheaply from its own coarse
         levels. Adapters may override this with a cheaper check that avoids
         enumerating level shapes (e.g. OME-Zarr reads its root ``.zattrs``).
         """
         return self.get_native_pyramid_levels() is not None
 
-    def _advertised_pyramid(
-        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
-    ) -> List[PyramidLevel]:
+    def _advertised_pyramid(self, base_desc: TensorDescriptor) -> List[PyramidLevel]:
         """The resolution-pyramid levels to advertise for this tensor.
 
-        Native (precomputed on-disk) levels when the tensor ships them, else a
-        computed pyramid from the server's ``[pyramid]`` knobs (``pyramid_config``,
-        threaded in because adapters are constructed without the server's config).
-        Cheap (arithmetic + already-memoized level adapters), so it is recomputed
-        per open rather than cached. Consumed by ``plan_flight_info``.
+        **Native levels only.** A tensor without an on-disk pyramid advertises
+        nothing, and the client picks its own ladder.
+
+        The server used to advertise a *computed* pyramid here too, but that
+        level list carried no information: it was arithmetic over ``shape``,
+        ``dim_labels`` and three config constants the client already has, so it
+        expressed a policy rather than knowledge -- and a policy the server is
+        not positioned to choose, since different viewers need different
+        ladders (a Viv-based viewer requires strict 2x steps and stops once a
+        plane fits one tile; the server's plan stepped 4x and stopped at
+        ``threshold``). Which levels physically exist on disk is the one thing
+        only the server knows, so it is the one thing worth advertising.
+
+        Empty is a meaningful answer here and the proto already says so: an empty
+        ``pyramid`` means "decide client-side". Cheap (already-memoized level
+        adapters), so recomputed per open rather than cached. Consumed by
+        ``plan_flight_info``.
         """
-        levels = None
         try:
             levels = self.get_native_pyramid_levels()
         except Exception:
@@ -1150,17 +1156,7 @@ class TensorAdapter(SourceAdapter):
                 "pyramid: native enumeration failed for %s", base_desc.array_id
             )
             levels = None
-        if levels is None:
-            cfg = pyramid_config
-            levels = build_pyramid_plan(
-                list(base_desc.shape),
-                list(base_desc.dim_labels),
-                reduction_method=cfg.reduction_method,
-                threshold=cfg.threshold,
-                downscale_factor=cfg.downscale_factor,
-                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-            )
-        return levels
+        return levels or []
 
     def get_tensor_metadata(self) -> Optional[dict]:
         """Per-tensor metadata fields the source-level catalog row does not carry.
