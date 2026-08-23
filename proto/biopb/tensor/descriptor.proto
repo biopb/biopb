@@ -98,27 +98,13 @@ message TensorDescriptor {
   // Empty string if no metadata available.
   string metadata_json = 9;
 
-  // The tensor's *native* resolution levels: the downsampled datasets that
-  // physically exist in the file (e.g. an OME-Zarr multiscales group), ordered
-  // finest first, with level 0 at full resolution (scale_hint all 1s). A client
-  // reads each level via the normal scale_hint read path.
-  //
-  // EMPTY IS THE COMMON CASE and does not mean "old server": most formats ship
-  // no pyramid, and the server does not invent one. It used to advertise a
-  // *computed* ladder here, but that list was arithmetic over shape/dim_labels
-  // plus a few server constants -- facts the client already has -- so it
-  // expressed a downsampling policy rather than knowledge, and no single policy
-  // suits every client (a Viv-based viewer needs strict 2x steps; another may
-  // want 4x). Which levels exist on disk is the one thing only the server can
-  // answer, so it is the only thing advertised here.
-  //
-  // So: non-empty means "these levels are cheap, they are already stored";
-  // empty means "downsample on the fly at whatever scale_hint you choose".
-  // Either way the scale_hint read path accepts any scale, advertised or not --
-  // this field never restricts what a client may request.
-  //
-  // Populated only by GetFlightInfo, and only when TensorReadOption.with_pyramid
-  // is set (left empty in ListFlights, like metadata_json).
+  // Server-advertised resolution pyramid: the ordered levels the server
+  // recommends reading this tensor at, coarsest decision made server-side so
+  // native (precomputed) pyramids are honored and the precache worker and
+  // client request the same scales. Level 0 is full resolution
+  // (scale_hint all 1s). A client reads each level via the normal scale_hint
+  // read path. Populated only by GetFlightInfo (left empty in ListFlights,
+  // like metadata_json); empty also means "old server / decide client-side".
   repeated PyramidLevel pyramid = 10;
 
   // Per-dimension physical pixel size, aligned 1:1 with dim_labels/shape
@@ -143,26 +129,22 @@ message TensorDescriptor {
   reserved "chunk_array_id";
 }
 
-// One natively-stored resolution level of a tensor.
+// One resolution level of a tensor's server-advertised pyramid.
 message PyramidLevel {
   // Per-dimension integer downsampling factors vs. full resolution.
   // Level 0 is [1, 1, ...]; matches TensorDescriptor.scale_hint semantics.
   repeated int64 scale_hint = 1;
 
-  // Method to request this level. Always "precompute" for an advertised level,
-  // which routes the read to the on-disk dataset instead of downsampling.
-  // ("area" and "nearest" remain valid on a read request for any scale_hint;
-  // they are simply never what an advertised level asks for.)
+  // Method to request this level: "area" | "nearest" | "precompute".
+  // "precompute" means the server serves a native on-disk level (see `native`).
   string reduction_method = 2;
 
   // Logical (downsampled) shape of this level -- what a read of this level
   // returns, so the client can size the level without a probe read.
   repeated int64 shape = 3;
 
-  // True for every level advertised here, since only natively-stored levels
-  // are. Retained so a client written against the earlier contract -- when a
-  // server-computed ladder could also appear, marked false -- keeps working
-  // unchanged, and so the distinction stays expressible on the wire.
+  // True if this level is served from a precomputed on-disk pyramid (e.g. an
+  // OME-Zarr multiscales dataset) rather than downsampled on the fly.
   bool native = 4;
 }
 

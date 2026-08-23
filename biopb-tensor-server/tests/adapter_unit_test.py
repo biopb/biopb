@@ -201,13 +201,11 @@ class TestReductionMethodNormalization:
         with pytest.raises(ValueError, match="Unsupported reduction method"):
             _ds.normalize_reduction_method("cubic")
 
-    def test_linear_alias_still_folds_to_area_on_a_read(self):
-        # "linear" was a config value once (PyramidConfig.reduction_method, gone
-        # with the computed ladder in biopb/biopb#89). It remains live protocol
-        # vocabulary a client may send on a read, so the read path still folds it.
-        from biopb_tensor_server.core.downsample import normalize_reduction_method
+    def test_pyramid_config_accepts_linear_alias(self):
+        from biopb_tensor_server.core.config import PyramidConfig
 
-        assert normalize_reduction_method("linear") == "area"
+        # Tolerated deprecated alias: old configs must keep validating.
+        PyramidConfig(reduction_method="linear")
 
 
 class TestAdvisoryReductionCacheKey:
@@ -630,11 +628,11 @@ class TestTransferChunkSize:
         """
         from biopb_tensor_server.core.chunk import (
             MAX_ARROW_BATCH_BYTES,
+            ceil_div,
             compute_transfer_chunk_size,
             estimate_chunk_bytes,
             scaled_virtual_chunk_size,
         )
-        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = (1, 1, 320, 960, 1000)
         labels = ["t", "c", "z", "y", "x"]
@@ -771,10 +769,10 @@ class TestTransferChunkSize:
         """
         from biopb_tensor_server.core.chunk import (
             MAX_READ_BLOCK_BYTES,
+            ceil_div,
             estimate_chunk_bytes,
             scaled_virtual_chunk_size,
         )
-        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = (1, 4, 512, 14234, 14234)
         labels = ["t", "c", "z", "y", "x"]
