@@ -91,18 +91,17 @@ and `remove_source` (below).
 `GetFlightInfo` fills `pyramid` with an ordered list of `PyramidLevel`
 (`scale_hint`, `reduction_method`, logical `shape`, `native`).
 
-Only **native** levels are advertised (`TensorFlightServer._advertised_pyramid`):
-data formats that ship a real on-disk pyramid override
-`TensorAdapter.get_native_pyramid_levels()` (`OmeZarrAdapter` and
-`QptiffAdapter`) to return one `native=True`, `reduction_method="precompute"`
-level per on-disk resolution. Everything else advertises an **empty** pyramid --
-the common case, not a sign of an old server.
+Two sources of pyramid specs (`TensorFlightServer._advertised_pyramid`):
 
-Which levels physically exist is the one thing only the server knows; a computed
-ladder would just be arithmetic the client can do itself, and picking its stopping
-rule is a policy the server isn't positioned to choose (biopb/biopb#818). An empty
-`pyramid` never restricts a client: `scale_hint` reads accept any scale,
-advertised or not.
+- **Native** — data formats that ship a real on-disk pyramid override
+  `TensorAdapter.get_native_pyramid_levels()` (`OmeZarrAdapter` and
+  `QptiffAdapter`) to return one `native=True`, `reduction_method="precompute"`
+  level per on-disk resolution.
+- **Computed** — everything else gets `chunk.build_pyramid_plan(...)`, a full
+  pyramid (level 0 → coarsest) generated from the authoritative `[pyramid]`
+  config knobs (`threshold` / `downscale_factor` / `pixel_budget_cubic_root`).
+  The precache worker warms the *coarsest* of this same plan (opt-in:
+  `[precache] enabled` ships off).
 
 ---
 

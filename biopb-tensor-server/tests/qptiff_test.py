@@ -202,13 +202,14 @@ class TestQptiffAdapter:
             finally:
                 adapter.close()
 
-    def test_single_level_advertises_no_pyramid(self):
-        # A QPTIFF with no on-disk pyramid (1 level) must NOT advertise one: a
-        # pyramid needs >=2 levels, so has_native_pyramid is False and
-        # get_native_pyramid_levels is None. Since only native levels are
-        # advertised (biopb/biopb#89), the descriptor then carries none at all
-        # and the client picks its own ladder. A wrong True here would instead
-        # publish levels this file cannot serve from disk.
+    def test_single_level_advertises_computed_not_native_pyramid(self):
+        # A QPTIFF with no on-disk pyramid (1 level) must NOT advertise a native
+        # pyramid: a pyramid needs >=2 levels, so has_native_pyramid is False and
+        # get_native_pyramid_levels is None, dropping it onto the server's computed
+        # path (like OME-Zarr single-level). The precache worker keys on
+        # has_native_pyramid, so a wrong True here would suppress overview warming.
+        from biopb_tensor_server.core.config import PyramidConfig
+
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "flat.qptiff"
             data = create_synthetic_qptiff(p, n_channels=2, base=256, n_levels=1)
@@ -221,7 +222,19 @@ class TestQptiffAdapter:
                 desc = adapter.get_tensor_descriptor()
                 # Forced low threshold -> the computed plan has >=2 levels, all
                 # native=False / reduction=area (on-the-fly downsample from level 0).
-                assert adapter._advertised_pyramid(desc) == []
+                cfg = PyramidConfig(
+                    reduction_method="area",
+                    threshold=64,
+                    downscale_factor=4,
+                    pixel_budget_cubic_root=512,
+                )
+                levels = adapter._advertised_pyramid(desc, cfg)
+                assert len(levels) >= 2
+                assert all(not lv.native for lv in levels)
+                assert [list(lv.scale_hint) for lv in levels] == [
+                    [1, 1, 1],
+                    [1, 4, 4],
+                ]
                 # Full read still round-trips through the base (non-precompute) path.
                 full = adapter.get_data(
                     ChunkBounds(start=[0, 0, 0], stop=list(desc.shape))

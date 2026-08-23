@@ -8,7 +8,8 @@ adapters that can read at a finer granularity than the extent.
 
 #640 was written before #797 (ND2 dask bypass), #643 / #686 (integer and float
 accumulators in `downsample_block`), #809-#812 (adapter-owned transfer grid) and
-#818 (demand tier). Its headline — 420.7 ms -> 95.3 ms, 4.4x — measured the dask
+#818 (demand tier, since reverted -- speculative precache is back, off by
+default). Its headline — 420.7 ms -> 95.3 ms, 4.4x — measured the dask
 read path that no longer exists on ND2. Everything below is measured on today's
 `dev`.
 
@@ -99,9 +100,11 @@ different risk:
   strided-add kernel at the scales clients actually open at. No seam change, no
   adapter change, bit-identical, helps every format *and* #816.
 - **W2 — a bounded working set.** Reduce band by band so the extent is never
-  resident. This is what the demand tier (#818) needs: it walks whole sources at
-  the observed level, so peak resident per in-flight read is the OOM lever
-  (#641's 5.4 GB field observation), not latency.
+  resident. This is what a cache warmer needs: the precache worker plans with no
+  `slice_hint`, so it walks whole tensors at the coarsest level and peak resident
+  per in-flight read is the OOM lever (#641's 5.4 GB field observation), not
+  latency. (Written against #818's demand tier, which warmed at the *observed*
+  level; the revert changed which level, not the shape of the problem.)
 - **W3 — no full-resolution intermediate at all.** Fold the adapter's own native
   read units (an ND2 frame, a TIFF page, a CZI plane) straight into the output.
   Subsumes W2 for the adapters that can do it, and is the only one that needs
@@ -204,8 +207,8 @@ _STRIDED_ADD_MAX_BLOCK = 256   # blocks <= 256 win at every realistic input size
 Why bound it at all, when blocks <= 256 covers the levels a client browses
 through: **the coarse end is not rare, it is the first thing requested.** The
 tensor browser opens a 14234-wide scene at scale 32 (#818's `_tile_levels`
-comparison), and that open is both the blank-screen event and the level the
-demand tier then warms. Block 1024 loses 2x at every size, so an ungated kernel
+comparison), and that open is both the blank-screen event and roughly where the
+precache worker's coarsest level lands. Block 1024 loses 2x at every size, so an ungated kernel
 would regress precisely the read a user waits on. The absolute numbers there are
 small (76 vs 102 ms on 256 MiB) — which is the argument for keeping the bound
 cheap rather than for removing it. Block 512 is untested; 256 stays on the
@@ -731,15 +734,20 @@ walks the full-resolution bytes band by band, so it could split each band into
 grid-aligned tiles and cache them on the way past — #808's payoff with **zero**
 read amplification, since the bytes are read either way. The cost is cache
 *space*, not time: 128 MiB of full-resolution entries per scaled chunk, which
-would have the demand tier hydrate whole sources at full resolution. It would
+would have the cache warmer hydrate whole sources at full resolution. It would
 need its own budget before it could be turned on.
-### #818 (demand tier)
 
-This is the workload: an observed scaled read warms the whole source at that
-level (20.1 GB decoded for a 200-frame timelapse). Fusion does not shorten that
-walk, it bounds what it holds while walking — anonymous residency per in-flight
-read goes from the extent (up to `max_read_block_mb`) to one band, which is the
-half of peak RSS a server OOMs on (§1).
+### #818 (demand tier, reverted)
+
+The tier is gone, the workload it named is not. A cache warm plans with no
+`slice_hint`, so it walks the whole tensor at one level in one pass — #818
+measured 20.1 GB decoded for a 200-frame timelapse at the observed level, and
+the restored precache worker does the same walk at the coarsest one. Fusion does
+not shorten that walk, it bounds what it holds while walking — anonymous
+residency per in-flight read goes from the extent (up to `max_read_block_mb`) to
+one band, which is the half of peak RSS a server OOMs on (§1). Precache shipping
+off by default lowers how often that walk happens, not what it costs when it
+does.
 
 ### #639 / #643 / #686
 

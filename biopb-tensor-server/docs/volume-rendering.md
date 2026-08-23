@@ -2,7 +2,7 @@
 
 **Status:** proposed. Nothing implemented.
 **Component:** `web/` (viewer SPA); `biopb-tensor-server` (HTTP sidecar `/api/slice`,
-`/api/tile_info`; scaled reads in `core/adapter_base.py`).
+`/api/tile_info`; `core/chunk.py` pyramid).
 **Related:** `remote-viewer-tiles.md` (the 2-D tiled viewer this sits beside),
 `http-server.md`.
 
@@ -23,12 +23,12 @@ and it is close to what the data plane already serves.
 
 Three facts, all already true, which is why stage 1 needs almost no backend work.
 
-**A scaled read is 3-D aware.** Nothing bounds a client's `scale_hint`, and it is
-per-axis: asking for Z reduced alongside X and Y is an ordinary read, not a
-special path. (This document predates biopb/biopb#818, which deleted the
-server-side ladder — `compute_pyramid_scale_hints` and friends — precisely because
-choosing the stopping rule was the caller's business. Picking the level that fits
-a texture budget is now this feature's own arithmetic, which is where it belongs.)
+**The pyramid is 3-D aware.** `compute_pyramid_scale_hints` (`core/chunk.py:573`)
+downsamples Z alongside X and Y against a *cubic* budget
+(`Lx*Ly*Lz <= PRECACHE_PIXEL_BUDGET_CUBIC_ROOT**3`), not a plane budget — the loop
+was written for volumes. It is already parameterised on
+`threshold` / `downscale_factor` / `pixel_budget_cubic_root`; the `PRECACHE_*`
+constants are a default *policy*, not the algorithm.
 
 **Reduction works on any axis.** `downsample_block` (`core/downsample.py:228`)
 area-averages over an arbitrary per-axis `scale_hint`, with an exact-integer

@@ -1035,16 +1035,16 @@ class TestAdminConfigRoutes:
     def test_put_rejects_invalid_value_with_422_and_field_path(self, admin_client):
         tc, config_path = admin_client
         before = config_path.read_text()
-        # high_water of 1.5 is out of range (#34) -> schema rejects it.
+        # downscale_factor of 1 is out of range (#34) -> schema rejects it.
         r = tc.put(
             "/api/config",
-            json={"precache": {"high_water": 1.5}},
+            json={"pyramid": {"downscale_factor": 1}},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
         assert r.status_code == 422
         body = r.json()
         assert body["errors"]
-        assert any("high_water" in err["path"] for err in body["errors"])
+        assert any("downscale_factor" in err["path"] for err in body["errors"])
         # Nothing written: disk untouched.
         assert config_path.read_text() == before
 

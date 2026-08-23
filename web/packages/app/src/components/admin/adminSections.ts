@@ -71,22 +71,20 @@ export const ADMIN_NAV: AdminNavItem[] = [
   },
   {
     id: "pyramid",
-    label: "Reduced-resolution reads",
+    label: "Pyramid",
     description:
-      "Bounds how much source data one reduced-resolution read may load at " +
-      "once. The server no longer chooses a level ladder -- viewers pick their " +
-      "own zoom levels, and only levels already stored in the file are offered.",
+      "How the server builds reduced-resolution levels so large images render " +
+      "quickly when zoomed out.",
     kind: "fields",
     section: "pyramid",
-    commonFields: ["max_read_block_mb"],
+    commonFields: ["reduction_method", "threshold"],
   },
   {
     id: "precache",
     label: "Precache",
     description:
-      "Background warming of what clients actually read: after a scaled read, " +
-      "the rest of that source is warmed at the same scale while the server is " +
-      "idle, so moving to another plane or channel is fast.",
+      "Background warming of the coarsest pyramid level while the server is idle, " +
+      "so the first view of a source is fast.",
     kind: "fields",
     section: "precache",
     commonFields: ["enabled"],

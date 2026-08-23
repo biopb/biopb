@@ -155,8 +155,9 @@ def test_installer_default_config_validates(validator):
 @pytest.mark.parametrize(
     "cfg",
     [
-        {"precache": {"high_water": 0.0}},  # boundary (min)
-        {"precache": {"high_water": 1.0}},  # boundary (max)
+        {"pyramid": {"downscale_factor": 2}},  # boundary (min)
+        {"precache": {"backlog_high_water": 0.0}},  # boundary (min)
+        {"precache": {"backlog_high_water": 1.0}},  # boundary (max)
         {"metadata_db": {"query_timeout_ms": 1}},  # boundary (min)
         {"server": {"log_level": "info"}},  # case-insensitive enum stays lenient
         {"cache": {"backend": "memory"}},
@@ -176,7 +177,10 @@ def test_accepts_valid(validator, cfg):
     [
         {"metadata_db": {"query_timeout_ms": 0}},
         {"cache": {"backend": "bogus"}},
-        {"precache": {"high_water": 2}},
+        {"pyramid": {"downscale_factor": 1}},  # silently single-level before
+        {"pyramid": {"downscale_factor": 0}},  # ZeroDivisionError before
+        {"pyramid": {"pixel_budget_cubic_root": 0}},  # infinite loop before
+        {"precache": {"backlog_high_water": 2}},
         {"cache": {"file_max_total_gb": 0}},
         {"sources": [{"type": "zarr"}]},  # missing required url
         {"sources": [{"url": "/d", "type": "madeup"}]},  # type not in enum
@@ -188,11 +192,11 @@ def test_rejects_invalid(validator, cfg):
 
 def test_schema_matches_dataclass_validation_on_known_bad():
     """A value the schema rejects is also one the dataclass validator flags --
-    the two share _CONSTRAINTS, so they must agree. Spot-checked on the
-    precache high_water=2 case (its own _Range(0.0, 1.0))."""
-    c = _CONSTRAINTS["PrecacheConfig"]["high_water"]
-    assert isinstance(c, _Range) and c.max == 1.0
-    assert not c.ok(2)  # dataclass side rejects
+    the two share _CONSTRAINTS, so they must agree. Spot-checked on the pyramid
+    downscale_factor=1 case (its own _Range(min=2))."""
+    c = _CONSTRAINTS["PyramidConfig"]["downscale_factor"]
+    assert isinstance(c, _Range) and c.min == 2
+    assert not c.ok(1)  # dataclass side rejects
     # schema side rejects (covered by test_rejects_invalid); this ties them.
 
 
@@ -257,16 +261,8 @@ def test_legacy_aliases_present_and_marked_deprecated(schema):
     assert server["poll_interval"]["deprecated"] is True
     precache = _section_props(schema, "precache")
     assert precache["downscale_factor"]["deprecated"] is True
-    # It carries no bound any more: the knob is not merely misplaced, it is
-    # ignored outright (biopb/biopb#89), so constraining it would imply the
-    # value still does something.
-    assert "minimum" not in precache["downscale_factor"]
-    # The tiers retired in the same change are tolerated the same way.
-    assert precache["backlog_enabled"]["deprecated"] is True
-    assert precache["backlog_high_water"]["deprecated"] is True
-    pyramid = _section_props(schema, "pyramid")
-    assert pyramid["reduction_method"]["deprecated"] is True
-    assert "deprecated" not in pyramid["max_read_block_mb"]
+    # the back-compat pyramid knob keeps its bound under [precache] too
+    assert precache["downscale_factor"]["minimum"] == 2
     assert schema["properties"]["sources"]["items"]["properties"]["path"]["deprecated"]
     # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
     assert schema["properties"]["sources"]["items"]["properties"]["source_id"][

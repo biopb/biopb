@@ -52,12 +52,32 @@ def _default_of(section, field):
 @pytest.mark.parametrize(
     "raw, section, field",
     [
-        ({"pyramid": {"max_read_block_mb": 0}}, "pyramid", "max_read_block_mb"),
+        ({"pyramid": {"downscale_factor": 0}}, "pyramid", "downscale_factor"),
+        ({"pyramid": {"downscale_factor": 1}}, "pyramid", "downscale_factor"),
+        (
+            {"pyramid": {"pixel_budget_cubic_root": 0}},
+            "pyramid",
+            "pixel_budget_cubic_root",
+        ),
+        ({"pyramid": {"threshold": 0}}, "pyramid", "threshold"),
+        ({"pyramid": {"reduction_method": "bogus"}}, "pyramid", "reduction_method"),
+        # "precompute" is protocol vocabulary (request a native on-disk level),
+        # not a way to compute a pyramid level -- invalid as config.
+        (
+            {"pyramid": {"reduction_method": "precompute"}},
+            "pyramid",
+            "reduction_method",
+        ),
+        (
+            {"pyramid": {"reduction_method": "PRECOMPUTED"}},
+            "pyramid",
+            "reduction_method",
+        ),
         ({"cache": {"backend": "bogus"}}, "cache", "backend"),
         ({"cache": {"max_bytes": 0}}, "cache", "memory_max_bytes"),
         ({"cache": {"file_max_total_gb": -1}}, "cache", "file_max_total_bytes"),
-        ({"precache": {"high_water": 1.5}}, "precache", "high_water"),
-        ({"precache": {"high_water": -0.1}}, "precache", "high_water"),
+        ({"precache": {"backlog_high_water": 1.5}}, "precache", "backlog_high_water"),
+        ({"precache": {"backlog_high_water": -0.1}}, "precache", "backlog_high_water"),
         (
             {"metadata_db": {"max_query_results": 0}},
             "metadata_db",
@@ -81,9 +101,9 @@ def test_bad_value_is_clamped_with_a_warning(raw, section, field, caplog):
 
 def test_warning_describes_accepted_range_and_enum_and_the_default_used(caplog):
     with caplog.at_level(logging.WARNING):
-        parse_config({"precache": {"high_water": 1.5}, "cache": {"backend": "bad"}})
+        parse_config({"pyramid": {"downscale_factor": 0}, "cache": {"backend": "bad"}})
     joined = "\n".join(_violations(caplog))
-    assert "<= 1.0" in joined  # range
+    assert ">= 2" in joined  # range
     assert "file" in joined and "memory" in joined  # enum members
     assert "using the default" in joined  # what actually ran
 
@@ -110,17 +130,38 @@ def test_valid_defaults_do_not_warn(caplog):
         # port 0 = bind an OS-assigned ephemeral port (a sentinel, not a typo).
         ({"server": {"rescan_interval": 0}}, "server", "rescan_interval", 0.0),
         ({"server": {"log_level": "debug"}}, "server", "log_level", "debug"),
+        # reduction_method aliases + case-insensitivity (the computable subset;
+        # "precompute" is protocol-only, tested above).
+        (
+            {"pyramid": {"reduction_method": "mean"}},
+            "pyramid",
+            "reduction_method",
+            "mean",
+        ),
+        (
+            {"pyramid": {"reduction_method": "STRIDE"}},
+            "pyramid",
+            "reduction_method",
+            "STRIDE",
+        ),
+        # "linear" is a tolerated deprecated alias (folds to "area" at read time).
+        (
+            {"pyramid": {"reduction_method": "linear"}},
+            "pyramid",
+            "reduction_method",
+            "linear",
+        ),
         # boundaries are inclusive.
         (
-            {"precache": {"high_water": 0.0}},
+            {"precache": {"backlog_high_water": 0.0}},
             "precache",
-            "high_water",
+            "backlog_high_water",
             0.0,
         ),
         (
-            {"precache": {"high_water": 1.0}},
+            {"precache": {"backlog_high_water": 1.0}},
             "precache",
-            "high_water",
+            "backlog_high_water",
             1.0,
         ),
     ],
@@ -139,21 +180,21 @@ def test_every_bad_section_is_reported_not_just_the_first(caplog):
         config = parse_config(
             {
                 "server": {"rescan_interval": -5},
-                "precache": {"high_water": 2.0},
+                "pyramid": {"downscale_factor": 0},
                 "cache": {"backend": "nope"},
             }
         )
     joined = "\n".join(_violations(caplog))
     assert "server.rescan_interval" in joined
-    assert "precache.high_water" in joined
+    assert "pyramid.downscale_factor" in joined
     assert "cache.backend" in joined
     assert (
         config.rescan_interval,
-        config.precache.high_water,
+        config.pyramid.downscale_factor,
         config.cache.backend,
     ) == (
         ServerConfig().rescan_interval,
-        PrecacheConfig().high_water,
+        PyramidConfig().downscale_factor,
         CacheConfig().backend,
     )
 
@@ -176,9 +217,9 @@ def test_validate_config_dict_flags_case_insensitive_enum():
     assert "log_level" in problems[0]["message"]
 
 
-def test_validate_config_dict_flags_a_bad_enum():
-    problems = validate_config_dict({"cache": {"backend": "bogus"}})
-    assert [p["path"] for p in problems] == [["cache", "backend"]]
+def test_validate_config_dict_flags_reduction_method():
+    problems = validate_config_dict({"pyramid": {"reduction_method": "bogus"}})
+    assert [p["path"] for p in problems] == [["pyramid", "reduction_method"]]
 
 
 def test_validate_config_dict_uses_ondisk_paths():
@@ -324,6 +365,19 @@ def test_empty_config_reproduces_dataclass_defaults():
                 f"{getattr(section_obj, name)!r}, dataclass default is "
                 f"{getattr(defaults, name)!r}"
             )
+
+
+def test_speculative_warming_ships_off():
+    """Precache defaults to off, and an explicit opt-in still turns it on.
+
+    Not a value the other defaults test can catch: it compares parse_config({})
+    against the dataclass, so both halves flipping together stays green. The
+    shipped answer is a policy call -- speculative warming only pays off on a
+    cache large enough to keep what it warms, which the 4 GiB default is not --
+    so it is pinned here rather than left to whoever last edited the dataclass.
+    """
+    assert parse_config({}).precache.enabled is False
+    assert parse_config({"precache": {"enabled": True}}).precache.enabled is True
 
 
 def test_present_keys_override_defaults_only_where_set():
