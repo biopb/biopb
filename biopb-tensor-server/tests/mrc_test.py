@@ -86,10 +86,30 @@ class TestMrcAdapterClaim:
 class TestMrcAdapter:
     """Tests for MrcAdapter functionality."""
 
+    @pytest.fixture(autouse=True)
+    def _release_mappings(self):
+        """Close every adapter a test built, before its tmpdir is removed.
+
+        Not hygiene -- required. The mapping is now held past the read, and on
+        Windows a mapped file cannot be deleted, so ``TemporaryDirectory``
+        cleanup would raise. That is the biopb/biopb#71 pin itself, reachable
+        from the tests now that the mapping outlives the read; the fix in both
+        places is the same, which is to have an owner that lets go.
+        """
+        self._adapters = []
+        yield
+        for adapter in self._adapters:
+            try:
+                adapter.close()
+            except Exception:
+                pass
+
     def _adapter(self, tmpdir, **kw):
         p = Path(tmpdir) / "vol.mrc"
         data = create_synthetic_mrc(p, **kw)
-        return MrcAdapter.create_from_config(SourceConfig(url=str(p))), data
+        adapter = MrcAdapter.create_from_config(SourceConfig(url=str(p)))
+        self._adapters.append(adapter)
+        return adapter, data
 
     def test_descriptor(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -386,6 +386,27 @@ class TestQptiffHandleReaper:
     reaper, which this adapter got neither of.
     """
 
+    @pytest.fixture(autouse=True)
+    def _release_handles(self):
+        """Close every adapter a test built, before its tmpdir is removed.
+
+        On Windows an open file cannot be deleted, so a handle left warm past the
+        read would fail ``TemporaryDirectory`` cleanup -- the same pin this pool
+        exists to bound, reachable from the tests.
+        """
+        self._adapters = []
+        yield
+        for adapter in self._adapters:
+            try:
+                adapter.close()
+            except Exception:
+                pass
+
+    def _open(self, path):
+        adapter = _adapter(path)
+        self._adapters.append(adapter)
+        return adapter
+
     def _read(self, adapter, stop=(1, 8, 8)):
         return adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=list(stop)))
 
@@ -395,7 +416,7 @@ class TestQptiffHandleReaper:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "s.qptiff"
             expected = create_synthetic_qptiff(path)
-            adapter = _adapter(path)
+            adapter = self._open(path)
             self._read(adapter)
             assert adapter._tiff is not None
             assert adapter in list(qptiff_module._handle_reaper._adapters)
@@ -418,7 +439,7 @@ class TestQptiffHandleReaper:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "s.qptiff"
             create_synthetic_qptiff(path)
-            adapter = _adapter(path)
+            adapter = self._open(path)
             self._read(adapter)
             adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
             adapter._active_reads = 1
@@ -441,7 +462,7 @@ class TestQptiffHandleReaper:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "s.qptiff"
             create_synthetic_qptiff(path)
-            adapter = _adapter(path)
+            adapter = self._open(path)
             level = adapter.get_level_adapter("1")
             bounds = ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8])
             before = level.get_data(bounds)
@@ -457,7 +478,7 @@ class TestQptiffHandleReaper:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "s.qptiff"
             create_synthetic_qptiff(path)
-            adapter = _adapter(path)
+            adapter = self._open(path)
             level = adapter.get_level_adapter("1")
             seen = []
             real = adapter._end_read
