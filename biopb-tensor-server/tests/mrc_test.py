@@ -88,13 +88,14 @@ class TestMrcAdapter:
 
     @pytest.fixture(autouse=True)
     def _release_mappings(self):
-        """Close every adapter a test built, before its tmpdir is removed.
+        """Close every adapter a test built, so no mapping outlives its test.
 
-        Not hygiene -- required. The mapping is now held past the read, and on
-        Windows a mapped file cannot be deleted, so ``TemporaryDirectory``
-        cleanup would raise. That is the biopb/biopb#71 pin itself, reachable
-        from the tests now that the mapping outlives the read; the fix in both
-        places is the same, which is to have an owner that lets go.
+        Bounds the pin across the suite rather than rescuing tmpdir cleanup --
+        this runs after the test body, so a ``with TemporaryDirectory()`` inside
+        one has already been removed by the time it does. That removal succeeds:
+        an ``np.memmap`` does not block deletion on Windows (the whole suite
+        passes there), unlike the tifffile handle in ``qptiff_test``, whose tests
+        take ``tmp_path`` for exactly that reason.
         """
         self._adapters = []
         yield
