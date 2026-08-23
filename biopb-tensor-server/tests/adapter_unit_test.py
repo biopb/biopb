@@ -641,8 +641,8 @@ class TestTransferChunkSize:
         )
         scale = (1, 1, 4, 3, 2)
 
-        # A memory ceiling far above anything real must not let the delivered
-        # chunk drift past the transfer target.
+        # Nothing bounds the extent any more, so the delivered chunk staying at
+        # the transfer target has to come from transfer*scale alone.
         virtual = scaled_virtual_chunk_size(
             transfer,
             shape,
@@ -650,7 +650,6 @@ class TestTransferChunkSize:
             "<u2",
             labels,
             "<u2",
-            max_read_block_bytes=8 * 1024 * 1024 * 1024,
         )
         logical = tuple(
             ceil_div(extent, factor)
@@ -760,40 +759,35 @@ class TestTransferChunkSize:
                 assert virtual[axis] % scale[axis] == 0, (scale, axis, virtual)
                 assert virtual[axis] % transfer[axis] == 0, (scale, axis, virtual)
 
-    def test_oversized_lcm_unit_gives_up_alignment_not_the_memory_bound(self):
-        """Nothing bounds a client's scale_hint, and a scale coprime with the
-        transfer extent makes lcm() explode -- (5, 7, 11) against a
-        64x2048x2048 transfer chunk asks for a 129 GB block. The unit must fall
-        back to the scale alone, which still tiles, rather than handing an
-        unbounded allocation to get_data.
+    def test_a_scale_coprime_with_the_transfer_extent_still_tiles(self):
+        """This used to be the lcm explosion: (5, 7, 11) against a
+        64x2048x2048 transfer chunk asked for a 129 GB block, and the unit had
+        to fall back to the scale alone to stay bounded.
+
+        ``transfer * scale`` cannot explode -- it is the product, not the least
+        common multiple -- so the only thing left to check is the invariant that
+        the fallback existed to protect: consecutive logical chunks abut exactly
+        in the *reduced* grid, with no overlap and no gap.
         """
-        from biopb_tensor_server.core.chunk import (
-            MAX_READ_BLOCK_BYTES,
-            ceil_div,
-            estimate_chunk_bytes,
-            scaled_virtual_chunk_size,
-        )
+        from biopb_tensor_server.core.chunk import scaled_virtual_chunk_size
+        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = (1, 4, 512, 14234, 14234)
         labels = ["t", "c", "z", "y", "x"]
         transfer = (1, 1, 64, 2048, 2048)
         scale = (1, 1, 5, 7, 11)
 
-        virtual = scaled_virtual_chunk_size(
-            transfer, shape, scale, "<u2", labels, "<u2"
-        )
-        assert estimate_chunk_bytes(virtual, "<u2") <= MAX_READ_BLOCK_BYTES
+        virtual = scaled_virtual_chunk_size(transfer, shape, scale, "<u2", labels)
 
-        # Giving up transfer-grid alignment must not cost the tiling invariant:
-        # consecutive logical chunks still abut exactly, with no overlap or gap.
         for axis in range(len(shape)):
+            assert virtual[axis] % scale[axis] == 0 or virtual[axis] == shape[axis]
             expected = 0
             index = 0
             while index * virtual[axis] < shape[axis]:
-                start = index * virtual[axis]
-                stop = min(start + virtual[axis], shape[axis])
-                assert start // scale[axis] == expected
-                expected = ceil_div(stop, scale[axis])
+                start_at = index * virtual[axis]
+                stop_at = min(start_at + virtual[axis], shape[axis])
+                assert start_at // scale[axis] == expected
+                expected = ceil_div(stop_at, scale[axis])
                 index += 1
 
     def test_scaled_read_block_is_bounded_by_transfer_times_scale(self):
@@ -821,7 +815,6 @@ class TestTransferChunkSize:
             "uint8",
             labels,
             "uint8",
-            max_read_block_bytes=8 * 1024 * 1024 * 1024,
         )
         assert all(
             extent <= min(t * sc, dim)

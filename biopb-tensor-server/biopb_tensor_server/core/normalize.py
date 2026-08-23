@@ -485,15 +485,12 @@ class NormalizingAdapter(TensorAdapter):
     def get_read_plan(
         self,
         request_desc: TensorDescriptor,
-        max_read_block_bytes: Optional[int] = None,
     ) -> TensorReadPlan:
         perm = self.perm
         if perm is None:
-            return self._inner.get_read_plan(request_desc, max_read_block_bytes)
+            return self._inner.get_read_plan(request_desc)
         native_request = _permute_descriptor(request_desc, _invert(perm))
-        return self._permute_plan(
-            self._inner.get_read_plan(native_request, max_read_block_bytes), perm
-        )
+        return self._permute_plan(self._inner.get_read_plan(native_request), perm)
 
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig

@@ -181,6 +181,21 @@ class ZarrAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
 
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The store's own chunk: reading any part of one decodes all of it.
+
+        Inherited by ``OmeZarrAdapter``, ``_HcsFieldAdapter`` and
+        ``_QptiffLevelAdapter``, which all read through a zarr array. A rank that
+        does not match the declared shape means this adapter presents a different
+        axis space than the store's, so the block is not comparable and no floor
+        is claimed.
+        """
+        array = getattr(self, "zarr_array", None)
+        chunks = getattr(array, "chunks", None)
+        if not chunks or len(chunks) != len(self.zarr_array.shape):
+            return None
+        return tuple(int(size) for size in chunks)
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from zarr array.
 

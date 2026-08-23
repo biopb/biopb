@@ -35,7 +35,6 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import (
-    MAX_READ_BLOCK_BYTES,
     ChunkEndpoint,
     _version_header,
     build_pyramid_plan,
@@ -61,6 +60,10 @@ from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
     TensorNotFound,
     WriteNotSupportedError,
+)
+from biopb_tensor_server.core.stream_reduce import (
+    stream_reduce,
+    streaming_unit,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,122 +222,6 @@ def catalog_entry(desc: TensorDescriptor) -> TensorDescriptor:
         shape=desc.shape,
         dtype=desc.dtype,
     )
-
-
-# Band budget for the default banded scaled read (biopb/biopb#640 phase 1.5).
-#
-# A cache size, deliberately not a config knob. Banding is not only a residency
-# measure -- it is loop tiling against L3, worth 2.05x on an array already in RAM
-# with byte-identical arithmetic, because reducing a whole extent makes two passes
-# over it (materialize, then re-read from DRAM) while a band is still in cache
-# when the reduction touches it. Swept on contiguous uint16 at scale 4/8, the
-# ratio against the unbanded reduction rises to 2.06x/1.79x at 8 MiB and falls off
-# both sides: under ~2 MiB per-band overhead bites (0.85x, an actual loss), over
-# ~16 MiB the band stops fitting in cache (1.20x at 64 MiB).
-#
-# The right value is a property of the cache hierarchy, not an operator
-# preference, which is why it is a constant: tuning it would be guessing at L3.
-# The config surface for "how much may one read materialize" is already taken by
-# PyramidConfig.max_read_block_mb, which bounds the same residency by shrinking
-# the chunk at plan time -- more round trips on a latency-bound path. Two dials
-# for one outcome is worse than none.
-_SCALED_READ_BAND_BYTES = 8 * 1024 * 1024
-
-
-def _banded_scaled_read(
-    read: Any,
-    bounds: ChunkBounds,
-    scale_hint: Tuple[int, ...],
-    reduction_method: str,
-    itemsize: int,
-) -> np.ndarray:
-    """Read ``bounds`` in row bands and reduce each, never holding the extent.
-
-    ``read`` is the adapter's own ``get_data``. Bit-identical to
-    ``downsample_block(read(bounds), scale_hint, method)``, which is the whole
-    point -- it is reached by the base ``get_scaled_data``, so a divergence here
-    would be a divergence in served pixels for every adapter that opts in.
-
-    Two properties carry that identity:
-
-    - **Bands land on block boundaries.** Band height is a whole multiple of the
-      row scale, so no reduction block is split across two bands. Folding the
-      halves of a split block independently would produce a different pixel.
-    - **Only the last band is ragged**, which is the one place
-      ``downsample_block``'s edge-replicate pad applies -- exactly where it
-      applies for the unbanded read, since the extent's end is the tensor's end.
-      Every earlier band is an exact multiple and pads not at all.
-
-    Bands run along the row axis (``ndim - 2``) and span the full width. Never
-    into tiles: #816 measured square retiling on a 14234-wide frame at +1.7 s,
-    because a 1182-wide tile out of it is 1182 memcpys of ~7 kB.
-
-    ``nearest`` takes this same path, and for it banding is a memory trade rather
-    than a speed win: there is no arithmetic pass for the read to fuse with, so
-    it costs ~10% (1.8 -> 2.0 ms on a 128 MiB extent) where ``area`` gains 2.1x.
-    It is still worth taking, and for the sharper reason -- unbanded,
-    ``downsample_block`` returns a strided VIEW that pins the whole
-    full-resolution base until ``pack_chunk_batch`` materializes it, so peak
-    residency is the extent. Banded it is one band. What banding cannot do for
-    ``nearest`` is read FEWER bytes; skipping the discarded rows needs the reader
-    itself (phase 2), since doing it here would mean one call per picked row.
-
-    Falls back to a single whole-extent read when banding cannot pay: fewer than
-    two axes, an extent already inside the budget, or a row scale so large that
-    one aligned band already exceeds it.
-    """
-    start = [int(v) for v in bounds.start]
-    stop = [int(v) for v in bounds.stop]
-    ndim = len(start)
-    extent = [hi - lo for lo, hi in zip(start, stop, strict=True)]
-
-    if ndim < 2 or any(size <= 0 for size in extent):
-        return downsample_block(read(bounds), scale_hint, reduction_method)
-
-    row_axis = ndim - 2
-    row_scale = int(scale_hint[row_axis])
-    # Bytes per source row: every axis but the row axis, at the descriptor's
-    # itemsize. An adapter whose get_data casts would size its bands off the
-    # source width -- a band-size detail, never a correctness one.
-    other = 1
-    for axis, size in enumerate(extent):
-        if axis != row_axis:
-            other *= size
-    row_bytes = other * itemsize
-    if row_bytes <= 0:
-        return downsample_block(read(bounds), scale_hint, reduction_method)
-
-    rows_per_band = max(1, _SCALED_READ_BAND_BYTES // row_bytes)
-    # Round DOWN to a whole number of blocks, but never to zero: a band shorter
-    # than one block would split every block it touches.
-    rows_per_band = max(row_scale, (rows_per_band // row_scale) * row_scale)
-    if rows_per_band >= extent[row_axis]:
-        return downsample_block(read(bounds), scale_hint, reduction_method)
-
-    out = None
-    out_row = 0
-    for offset in range(0, extent[row_axis], rows_per_band):
-        band_start = list(start)
-        band_stop = list(stop)
-        band_start[row_axis] = start[row_axis] + offset
-        band_stop[row_axis] = min(
-            start[row_axis] + offset + rows_per_band, stop[row_axis]
-        )
-        band = read(ChunkBounds(start=band_start, stop=band_stop))
-        reduced = downsample_block(band, scale_hint, reduction_method)
-        if out is None:
-            shape = list(reduced.shape)
-            shape[row_axis] = ceil_div(extent[row_axis], row_scale)
-            out = np.empty(tuple(shape), dtype=reduced.dtype)
-        # Assigning into the output is also what materializes a `nearest` band:
-        # downsample_block hands back a strided view over the band, and the
-        # contract requires an owned result.
-        window = [slice(None)] * ndim
-        window[row_axis] = slice(out_row, out_row + reduced.shape[row_axis])
-        out[tuple(window)] = reduced
-        out_row += reduced.shape[row_axis]
-
-    return out
 
 
 @dataclass
@@ -876,14 +763,27 @@ class TensorAdapter(SourceAdapter):
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
 
-    #: Whether the default :meth:`get_scaled_data` may read this adapter's extent
-    #: in row bands instead of whole (biopb/biopb#640 phase 1.5). Opt-in per
-    #: adapter class because it asserts a property of the *reader*: that a band
-    #: read costs proportionally less than the extent read. True for mmap and
-    #: uncompressed backends; false wherever the reader must decode a whole plane
-    #: per call, where banding would multiply decode work by the band count.
-    #: An adapter that overrides get_scaled_data ignores this by construction.
-    BANDED_SCALED_READ: bool = False
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """Smallest region this backend reads without amplification, or ``None``.
+
+        A zarr or HDF5 chunk, a TIFF tile: a read of any part of one costs the
+        whole one. ``None`` -- the default, and correct for every contiguous or
+        mmap-backed reader -- means any sub-region is directly addressable, so a
+        streamed read may use whatever unit it likes.
+
+        Declared rather than sniffed because the streaming scaled read
+        (:func:`~.stream_reduce.streaming_unit`) floors its unit here, and
+        getting it wrong is silent: too small a value costs nothing, too large a
+        value only enlarges the working set, and omitting a real one costs a
+        re-read per unit overlapping each stored block -- 3.2x on an OME-Zarr
+        whose chunks are larger than the transfer target.
+
+        This is the *physical* block, not the grid the adapter declares in
+        ``chunk_shape``: the two differ exactly where it matters, since an
+        adapter seeds its transfer grid from the physical block and then grows it
+        to the transfer target.
+        """
+        return None
 
     def get_scaled_data(
         self,
@@ -893,14 +793,18 @@ class TensorAdapter(SourceAdapter):
     ) -> np.ndarray:
         """Read ``bounds`` and reduce it by ``scale_hint`` in one step.
 
-        The default reads the whole extent and reduces it -- exactly what
-        ``resolve_chunk_data`` did inline before this seam existed -- unless
-        :attr:`BANDED_SCALED_READ` is set, in which case it reads and folds row
-        bands so the extent is never resident (see :func:`_banded_scaled_read`).
-        An adapter whose reader can deliver the extent in pieces (an ND2 frame, a
-        TIFF page, a CZI plane) overrides this instead and folds each piece as it
-        arrives, so no view onto a reader-owned mapping ever leaves the adapter's
-        lock.
+        The default streams the extent through the transfer grid, reducing each
+        unit as it arrives, so peak residency is one unit rather than the extent
+        (see :mod:`~.stream_reduce`). An extent that is already one unit is read
+        and reduced whole, which is what every unscaled read and most small
+        scaled ones do. A float ``area``, whose staged means cannot be
+        accumulated bit-identically, also falls back to the whole extent.
+
+        An adapter whose reader can deliver the extent in pieces more cheaply
+        than ``get_data`` can (a CZI ``read(zoom=)``, a native pyramid level)
+        overrides this instead, so no view onto a reader-owned mapping ever
+        leaves the adapter's lock. Overriding to bound memory is no longer a
+        reason: the default already does.
 
         An override must hold to all of:
 
@@ -915,9 +819,10 @@ class TensorAdapter(SourceAdapter):
            (CZI's ``read(zoom=)`` matches ``nearest`` and differs from ``area``
            in 100% of pixels).
         4. **Ownership** -- an owned array. In particular a fused ``nearest``
-           must materialise: only the default may return the strided view
-           ``TestZeroCopyContract`` pins, because only there is the base array
-           already owned and already off the reader.
+           must materialise: only the default's single-unit path may return the
+           strided view ``TestZeroCopyContract`` pins, because only there is the
+           base array already owned and already off the reader. The streamed
+           path materialises by construction, writing picks into its own output.
         5. **Fallback** -- anything the fused path cannot express bit-identically
            calls ``super().get_scaled_data(...)`` rather than approximating.
 
@@ -928,14 +833,39 @@ class TensorAdapter(SourceAdapter):
         Returns:
             The reduced array.
         """
-        if self.BANDED_SCALED_READ:
-            return _banded_scaled_read(
-                self.get_data,
-                bounds,
-                scale_hint,
-                reduction_method,
-                np.dtype(self.get_tensor_descriptor().dtype).itemsize,
+        descriptor = self.get_tensor_descriptor()
+        tensor_shape = tuple(int(dim) for dim in descriptor.shape)
+        start = tuple(int(value) for value in bounds.start)
+        stop = tuple(int(value) for value in bounds.stop)
+        extent = tuple(hi - lo for lo, hi in zip(start, stop, strict=True))
+        unit = streaming_unit(
+            extent,
+            self.get_transfer_chunk_size(),
+            self.read_block_shape(),
+            scale_hint,
+            np.dtype(descriptor.dtype).itemsize,
+        )
+
+        if all(hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)):
+            return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
+
+        def fetch(unit_start, unit_stop):
+            return self.get_data(
+                ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
+
+        streamed = stream_reduce(
+            fetch,
+            start,
+            stop,
+            tensor_shape,
+            unit,
+            scale_hint,
+            reduction_method,
+            descriptor.dtype,
+        )
+        if streamed is not None:
+            return streamed
         return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
 
     @staticmethod
@@ -1074,11 +1004,7 @@ class TensorAdapter(SourceAdapter):
 
         return data
 
-    def get_read_plan(
-        self,
-        request_desc: TensorDescriptor,
-        max_read_block_bytes: Optional[int] = None,
-    ) -> TensorReadPlan:
+    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
         """Generate a read plan for the requested tensor descriptor.
 
         A native-pyramid adapter routes a ``precompute`` + ``scale_hint`` read to
@@ -1089,10 +1015,6 @@ class TensorAdapter(SourceAdapter):
         Args:
             request_desc: TensorDescriptor from the client's read request, which may
                           include slice_hint and scale_hint/reduction_method directly.
-            max_read_block_bytes: Ceiling on the source bytes one computed-scale
-                          chunk may materialize
-                          (``PyramidConfig.max_read_block_mb``). ``None`` takes
-                          the module default; unscaled reads ignore it.
         Returns:
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
         """
@@ -1112,7 +1034,6 @@ class TensorAdapter(SourceAdapter):
             request_desc,
             chunk_size,
             content_version=self.content_version,
-            max_read_block_bytes=max_read_block_bytes,
         )
 
     # ---- native-pyramid precompute routing ---------------------------------
@@ -1271,7 +1192,6 @@ class TensorAdapter(SourceAdapter):
                 request_desc.reduction_method = read_opt.reduction_method
             read_plan = self.get_read_plan(
                 request_desc,
-                max_read_block_bytes=pyramid_config.max_read_block_mb * 1024 * 1024,
             )
         else:
             # Describe-only still exposes the server's transfer grid, never the
@@ -1454,10 +1374,8 @@ _SOURCE_SCOPED_API = frozenset(
 )
 _TENSOR_SCOPED_API = frozenset(
     {
-        # Not a method: the banded-read opt-in is part of the tensor-scoped
-        # surface an adapter subclass sets, and _public_api covers attributes.
-        "BANDED_SCALED_READ",
         "get_tensor_descriptor",
+        "read_block_shape",
         "get_transfer_chunk_size",
         "get_data",
         "get_scaled_data",
@@ -1516,7 +1434,6 @@ def _get_read_plan(
     request_desc: TensorDescriptor,
     chunk_size: Tuple[int, ...],
     content_version: Optional[bytes] = None,
-    max_read_block_bytes: Optional[int] = None,
 ) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
@@ -1551,11 +1468,8 @@ def _get_read_plan(
         output_dtype = base_desc.dtype
     else:
         # Scale the read extent up with the scale factor so the *delivered*
-        # chunk lands on the transfer target. Taking a least-common-multiple
-        # against the scale is a no-op whenever the scale divides the transfer
-        # extent -- the common power-of-two case -- which left every scaled read
-        # doing full-resolution work per round trip for a fraction of the
-        # payload (biopb/biopb#805).
+        # chunk lands on the transfer target, rather than at 1/scale of it per
+        # axis for identical read work (biopb/biopb#805).
         virtual_chunk_size = scaled_virtual_chunk_size(
             transfer_chunk_size,
             base_shape,
@@ -1563,11 +1477,6 @@ def _get_read_plan(
             base_desc.dtype,
             list(base_desc.dim_labels),
             get_output_dtype(base_desc.dtype, reduction_method),
-            max_read_block_bytes=(
-                MAX_READ_BLOCK_BYTES
-                if max_read_block_bytes is None
-                else int(max_read_block_bytes)
-            ),
         )
         # ceil_div, not //: clamping the extent to the tensor leaves a partial
         # scale block on axes whose length is not a whole multiple of the scale.

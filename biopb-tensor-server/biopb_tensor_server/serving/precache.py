@@ -407,13 +407,7 @@ class PrecacheWorker:
         request_desc.reduction_method = coarsest.reduction_method
 
         try:
-            # Same budget as the serve path: the grid decides the chunk_ids,
-            # so a precache planning on a different budget would warm chunks
-            # no read ever asks for.
-            read_plan = tensor_adapter.get_read_plan(
-                request_desc,
-                max_read_block_bytes=self._pyramid_cfg.max_read_block_mb * 1024 * 1024,
-            )
+            read_plan = tensor_adapter.get_read_plan(request_desc)
         except Exception:
             logger.exception("precache: get_read_plan failed for %s", tensor_id)
             return False
