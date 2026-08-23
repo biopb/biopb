@@ -29,7 +29,6 @@ from biopb_tensor_server.core.downsample import (
     downsample_block,
 )
 from biopb_tensor_server.core.stream_reduce import (
-    _CONTIGUOUS_BAND_BYTES,
     covering_units,
     stream_reduce,
     streaming_unit,
@@ -228,58 +227,35 @@ class TestCoveringUnits:
 
 
 class TestStreamingUnit:
-    """A unit is the largest sequential run the backend can deliver.
+    """One rule: the transfer grid, on block boundaries, clamped to the extent.
 
-    Which shape that is depends on the layout, and the two disasters this rule
-    exists to avoid are symmetric: bands on a chunked store re-read stored chunks
-    (7.1x), square tiles on a contiguous one read strided (1.3x on a cold plane).
+    Uniform across backends on purpose (biopb/biopb#640). A reader that would
+    rather have another shape -- a contiguous one wants full-width bands, a
+    coarse-chunked one wants its tile floored at the stored block -- says so in
+    a phase-2 adapter override; nothing here branches on the layout.
     """
 
-    def test_chunked_store_takes_the_transfer_grid(self):
-        unit = streaming_unit((8192, 8192), (2048, 2048), (512, 512), (8, 8), 2)
-        assert unit == (2048, 2048)
+    def test_unit_is_the_transfer_grid(self):
+        assert streaming_unit((8192, 8192), (2048, 2048), (8, 8)) == (2048, 2048)
 
-    def test_chunked_store_floors_at_a_block_larger_than_the_grid(self):
-        """The 3.2x case: a stored chunk bigger than the transfer target."""
-        unit = streaming_unit((8192, 8192), (2048, 2048), (4096, 4096), (8, 8), 2)
-        assert unit == (4096, 4096)
+    def test_unit_never_exceeds_the_extent(self):
+        assert streaming_unit((1000, 1000), (2048, 2048), (8, 8)) == (1000, 1000)
 
-    def test_floor_rounds_up_to_a_whole_multiple_of_the_grid(self):
-        """A unit boundary must not land inside a stored block."""
-        unit = streaming_unit((16384, 16384), (2048, 2048), (3000, 3000), (8, 8), 2)
-        assert unit == (4096, 4096)
-        assert unit[0] % 2048 == 0
+    def test_a_grid_below_the_scale_grows_to_one_block(self):
+        """A tile has to hold whole blocks; below one, it becomes one."""
+        assert streaming_unit((8192, 8192), (4, 4), (8, 8)) == (8, 8)
 
-    def test_chunked_unit_never_exceeds_the_extent(self):
-        assert streaming_unit((1000, 1000), (2048, 2048), (4096, 4096), (8, 8), 2) == (
-            1000,
-            1000,
-        )
+    def test_a_grid_that_straddles_a_block_rounds_up(self):
+        """So the fold can use downsample.py's kernels instead of reduceat."""
+        assert streaming_unit((8192, 8192), (1182, 1182), (8, 8)) == (1184, 1184)
 
-    def test_contiguous_store_takes_a_full_width_band(self):
-        """Full width: a narrower unit reads strided, at 1.3x on a cold plane."""
-        unit = streaming_unit((14234, 14234), (1182, 1182), None, (8, 8), 2)
-        assert unit[1] == 14234, "band must span the full width"
-        assert unit[0] < 14234, "band must not be the whole extent"
-
-    def test_band_depth_fills_the_budget(self):
-        unit = streaming_unit((14234, 14234), (1182, 1182), None, (8, 8), 2)
-        assert unit[0] * 14234 * 2 <= _CONTIGUOUS_BAND_BYTES
-        assert (unit[0] + 8) * 14234 * 2 > _CONTIGUOUS_BAND_BYTES
-
-    def test_band_depth_is_a_whole_number_of_blocks(self):
-        """So the fold can use the shared kernels instead of reduceat."""
-        for scale in (2, 4, 8, 32):
-            unit = streaming_unit((14234, 14234), (1182, 1182), None, (scale, scale), 2)
-            assert unit[0] % scale == 0
-
-    def test_band_spans_every_axis_but_rows(self):
-        """An interleaved ND2 keeps C whole: only the row axis is divided."""
+    def test_rounding_is_per_axis(self):
+        """Anisotropic scales and grids do not interact across axes."""
         extent = (1, 3, 1, 14234, 14234)
-        unit = streaming_unit(extent, (1, 3, 1, 1182, 1182), None, (1, 1, 1, 8, 8), 2)
-        assert unit[:3] == (1, 3, 1)
-        assert unit[4] == 14234
-        assert unit[3] < 14234
+        unit = streaming_unit(extent, (1, 3, 1, 1182, 1182), (1, 1, 1, 8, 48))
+        assert unit == (1, 3, 1, 1184, 1200)
 
-    def test_band_never_exceeds_the_extent(self):
-        assert streaming_unit((64, 64), (32, 32), None, (4, 4), 2) == (64, 64)
+    def test_an_axis_the_grid_spans_is_left_at_the_extent(self):
+        """Rounding it would only shave a sliver off the end to read separately."""
+        assert streaming_unit((64, 64), (32, 32), (5, 5)) == (35, 35)
+        assert streaming_unit((30, 30), (32, 32), (4, 4)) == (30, 30)

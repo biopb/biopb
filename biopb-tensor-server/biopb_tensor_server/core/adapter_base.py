@@ -763,36 +763,6 @@ class TensorAdapter(SourceAdapter):
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
 
-    @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
-        """Smallest region this backend reads without amplification, or ``None``.
-
-        A zarr or HDF5 chunk, a TIFF tile: a read of any part of one costs the
-        whole one. ``None`` -- the default, and correct for every contiguous or
-        mmap-backed reader -- means any sub-region is directly addressable, so a
-        streamed read may use whatever unit it likes.
-
-        Declared rather than sniffed because the streaming scaled read
-        (:func:`~.stream_reduce.streaming_unit`) floors its unit here, and
-        getting it wrong is silent: too small a value costs nothing, too large a
-        value only enlarges the working set, and omitting a real one costs a
-        re-read per unit overlapping each stored block -- 3.2x on an OME-Zarr
-        whose chunks are larger than the transfer target.
-
-        This is the *physical* block, not the grid the adapter declares in
-        ``chunk_shape``: the two differ exactly where it matters, since an
-        adapter seeds its transfer grid from the physical block and then grows it
-        to the transfer target.
-
-        A property rather than a class attribute because the answer is per
-        *instance*, not per class -- a tiled and a striped TIFF are the same
-        adapter with different answers -- and derived live rather than captured
-        in ``__init__`` (the way ``content_version`` is) because an adapter may
-        not hold its store yet: ``_QptiffLevelAdapter`` re-resolves its array on
-        every read, so there is nothing to capture at construction.
-        """
-        return None
-
     def get_scaled_data(
         self,
         bounds: ChunkBounds,
@@ -801,12 +771,11 @@ class TensorAdapter(SourceAdapter):
     ) -> np.ndarray:
         """Read ``bounds`` and reduce it by ``scale_hint`` in one step.
 
-        The default streams the extent through the transfer grid, reducing each
-        unit as it arrives, so peak residency is one unit rather than the extent
-        (see :mod:`~.stream_reduce`). An extent that is already one unit is read
-        and reduced whole, which is what every unscaled read and most small
-        scaled ones do. A float ``area``, whose staged means cannot be
-        accumulated bit-identically, also falls back to the whole extent.
+        The default streams the extent in tiles of the transfer grid, reducing
+        each tile as it arrives, so peak residency is one tile rather than the
+        extent (see :mod:`~.stream_reduce`). An extent that is already one tile
+        is read and reduced whole, which is what every unscaled read and most
+        small scaled ones do.
 
         An adapter whose reader can deliver the extent in pieces more cheaply
         than ``get_data`` can (a CZI ``read(zoom=)``, a native pyramid level)
@@ -846,13 +815,7 @@ class TensorAdapter(SourceAdapter):
         start = tuple(int(value) for value in bounds.start)
         stop = tuple(int(value) for value in bounds.stop)
         extent = tuple(hi - lo for lo, hi in zip(start, stop, strict=True))
-        unit = streaming_unit(
-            extent,
-            self.get_transfer_chunk_size(),
-            self.read_block_shape,
-            scale_hint,
-            np.dtype(descriptor.dtype).itemsize,
-        )
+        unit = streaming_unit(extent, self.get_transfer_chunk_size(), scale_hint)
 
         if all(hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)):
             return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
@@ -862,7 +825,7 @@ class TensorAdapter(SourceAdapter):
                 ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
 
-        streamed = stream_reduce(
+        return stream_reduce(
             fetch,
             start,
             stop,
@@ -872,9 +835,6 @@ class TensorAdapter(SourceAdapter):
             reduction_method,
             descriptor.dtype,
         )
-        if streamed is not None:
-            return streamed
-        return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
 
     @staticmethod
     def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
@@ -1383,7 +1343,6 @@ _SOURCE_SCOPED_API = frozenset(
 _TENSOR_SCOPED_API = frozenset(
     {
         "get_tensor_descriptor",
-        "read_block_shape",
         "get_transfer_chunk_size",
         "get_data",
         "get_scaled_data",

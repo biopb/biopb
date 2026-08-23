@@ -142,9 +142,10 @@ class TestStreamingDefault:
     and in what shape, never which pixel comes out, so bit-identity is what is
     pinned here.
 
-    The unit is the transfer grid rather than a byte budget, because the grid is
-    the tiling the read plan and the chunk cache already use: a unit is then
-    never a partial read of anything the store stores.
+    The tile is the transfer grid rather than a byte budget, because the grid is
+    the tiling the read plan and the chunk cache already use. It is the same
+    tile for every backend; what a particular reader would rather have is a
+    phase-2 adapter override, not a branch here.
     """
 
     @pytest.fixture
@@ -161,22 +162,9 @@ class TestStreamingDefault:
         return adapter, reads
 
     @staticmethod
-    def _chunked(monkeypatch, adapter, grid, block=None):
-        """Drive the chunked branch: unit is `grid`, floored at `block`."""
+    def _grid(monkeypatch, adapter, grid):
+        """Set the transfer grid, which is the tile the stream reads in."""
         monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
-        monkeypatch.setattr(
-            type(adapter), "read_block_shape", property(lambda self: block or grid)
-        )
-
-    @staticmethod
-    def _contiguous(monkeypatch, adapter, budget):
-        """Drive the contiguous branch: unit is a full-width band under `budget`."""
-        import biopb_tensor_server.core.stream_reduce as sr
-
-        monkeypatch.setattr(
-            type(adapter), "read_block_shape", property(lambda self: None)
-        )
-        monkeypatch.setattr(sr, "_CONTIGUOUS_BAND_BYTES", budget)
 
     @pytest.mark.parametrize("method", ["area", "nearest"])
     @pytest.mark.parametrize(
@@ -204,7 +192,7 @@ class TestStreamingDefault:
         expected = _ds.downsample_block(adapter.get_data(bounds), scale, method)
         reads.clear()
 
-        self._chunked(monkeypatch, adapter, (12, 12))
+        self._grid(monkeypatch, adapter, (12, 12))
         actual = adapter.get_scaled_data(bounds, scale, method)
 
         assert len(reads) > 1, "grid should have forced more than one unit"
@@ -219,7 +207,7 @@ class TestStreamingDefault:
         for ``nearest``, and for ``area`` would double-count silently.
         """
         adapter, reads = counted
-        self._chunked(monkeypatch, adapter, (16, 16))
+        self._grid(monkeypatch, adapter, (16, 16))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
@@ -229,22 +217,22 @@ class TestStreamingDefault:
             seen[start[0] : stop[0], start[1] : stop[1]] += 1
         assert (seen == 1).all(), "units must tile without gap or overlap"
 
-    def test_unit_floors_at_the_stores_own_block(self, counted, monkeypatch):
-        """A grid finer than the stored chunk would re-read it once per unit.
+    def test_a_grid_below_the_scale_grows_to_a_whole_block(self, counted, monkeypatch):
+        """A tile smaller than one reduction block cannot be read on its own.
 
-        Measured at 3.2x on an OME-Zarr whose chunks exceed the transfer target,
-        which is the whole reason the floor exists.
+        It would reduce a fraction of a block and land a different pixel, so the
+        tile rounds up to the block rather than the grid being taken literally.
         """
         adapter, reads = counted
-        self._chunked(monkeypatch, adapter, (16, 16), block=(32, 32))
+        self._grid(monkeypatch, adapter, (4, 4))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
 
         assert reads, "expected at least one read"
         for start, stop in reads:
-            assert stop[0] - start[0] == 32, "unit did not float up to the block"
-            assert start[0] % 32 == 0, "unit boundary landed inside a stored block"
+            assert stop[0] - start[0] == 8, "tile did not grow to a whole block"
+            assert start[0] % 8 == 0, "tile boundary landed inside a block"
 
     def test_result_is_owned_even_for_nearest(self, counted, monkeypatch):
         """Contract 4. ``downsample_block`` hands back a strided VIEW for nearest.
@@ -253,7 +241,7 @@ class TestStreamingDefault:
         is the memory streaming exists to bound.
         """
         adapter, _ = counted
-        self._chunked(monkeypatch, adapter, (16, 16))
+        self._grid(monkeypatch, adapter, (16, 16))
 
         out = adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "nearest")
 
@@ -262,7 +250,7 @@ class TestStreamingDefault:
     def test_extent_inside_one_unit_reads_once(self, counted, monkeypatch):
         """Streaming an extent that already fits is pure overhead."""
         adapter, reads = counted
-        self._chunked(monkeypatch, adapter, (64, 64))
+        self._grid(monkeypatch, adapter, (64, 64))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
@@ -272,44 +260,13 @@ class TestStreamingDefault:
     def test_streaming_needs_no_opt_in(self, counted, monkeypatch):
         """It is the default: no flag, and nothing for an adapter to set."""
         adapter, reads = counted
-        self._chunked(monkeypatch, adapter, (16, 16))
+        self._grid(monkeypatch, adapter, (16, 16))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
 
         assert len(reads) > 1
         assert not hasattr(TensorAdapter, "BANDED_SCALED_READ")
-
-    def test_contiguous_backend_reads_full_width_bands(self, counted, monkeypatch):
-        """A contiguous reader addresses any sub-region, so a unit is a run of rows.
-
-        Square tiles out of a wide frame read strided: 1.3x on a cold ND2 plane.
-        """
-        adapter, reads = counted
-        self._contiguous(monkeypatch, adapter, 64 * 2 * 8)  # 8 rows per band
-        reads.clear()
-
-        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
-
-        assert len(reads) > 1, "budget should have forced more than one band"
-        assert all((start[1], stop[1]) == (0, 64) for start, stop in reads), (
-            "a band must span the full width"
-        )
-
-    def test_band_depth_is_a_whole_number_of_blocks(self, counted, monkeypatch):
-        """Not for correctness -- straddling folds correctly -- but for the kernel.
-
-        An aligned unit uses downsample.py's block-sum kernels; a straddling one
-        falls to reduceat, which is 1.3-4.1x slower.
-        """
-        adapter, reads = counted
-        self._contiguous(monkeypatch, adapter, 64 * 2 * 10)  # 10 rows -> snaps to 8
-        reads.clear()
-
-        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
-
-        for start, stop in reads[:-1]:
-            assert (stop[0] - start[0]) % 4 == 0, "interior band split a block"
 
     def test_float_area_streams_like_any_other(self, monkeypatch):
         """Staged float means used to be the one reduction that could not stream.
@@ -332,7 +289,7 @@ class TestStreamingDefault:
             adapter = ZarrAdapter(
                 zarr.open_array(f"{tmp}/f.zarr", mode="r"), "src", ["y", "x"]
             )
-            self._chunked(monkeypatch, adapter, (16, 16))
+            self._grid(monkeypatch, adapter, (16, 16))
             reads = []
             original = adapter.get_data
             adapter.get_data = lambda b: (
