@@ -364,22 +364,137 @@ Measured on the ND2 chunk above (band = 256 source rows, ~7 MiB):
 | banded + reshape-sum | 263.5 ms / 7 MiB | **184.4 ms** / 12 MiB |
 | banded + strided adds | **64.8 ms** / 7 MiB | 322.3 ms / 12 MiB |
 
-Banding never lost, and with the Phase 0 kernel selection (strided adds below
-block 64, reshape-sum above) it wins at both ends while cutting resident memory
-by 18-32x.
+Banding never lost, and with the Phase 0 kernel selection it wins at both ends
+while cutting resident memory by 18-32x.
 
-Two constraints on making it the default:
+### Bounded memory is not the main reason
+
+An earlier draft presented banding as a memory measure that happens not to cost
+time. That undersells it: **banding is a throughput win in its own right, and it
+has nothing to do with the OS.** On an array already in RAM — no file, no mmap,
+no page cache — with byte-identical arithmetic:
+
+| scale | band | whole | banded | |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 4 MiB | 61.5 ms | 30.1 ms | **2.05x** |
+| 4 | 16 MiB | 61.5 ms | 30.0 ms | **2.05x** |
+| 4 | 64 MiB | 61.5 ms | 51.4 ms | 1.20x |
+| 32 | 4 MiB | 37.5 ms | 37.3 ms | 1.01x |
+
+This is loop tiling against L3, not paging. Reducing the whole extent makes two
+passes over it — `get_data` materialises it, then the reduction re-reads it from
+DRAM. Banding fuses them: each band is still in L3 when the reduction touches it.
+The 64 MiB row is the control — one band over this box's 32 MiB L3 collapses the
+win to 1.20x. It would hold identically on tmpfs or a RAM-backed array.
+
+At scale 32 it is neutral (1.01-1.04x): reshape-sum already streams, so there is
+little locality left to recover. The win lives in the 2-8 band, which is where
+the extents are largest and where clients zoom.
+
+### The band budget is a cache size, not a knob
+
+Swept on contiguous `uint16`, ratio against the unbanded reduction:
+
+| band | 0.5 | 1 | 2 | 4 | **8** | 16 | 32 | 64 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| scale 4 | 1.45x | 1.68x | 1.90x | 2.03x | **2.06x** | 2.05x | 1.71x | 1.20x |
+| scale 8 | 0.85x | 1.17x | 1.42x | 1.69x | **1.79x** | 1.88x | 1.78x | 1.55x |
+
+Both ends are real: under ~2 MiB per-band overhead starts to bite (0.85x — an
+actual loss), over ~16 MiB the band stops fitting in cache. **8 MiB**, which is
+also the ~7 MiB band the table above was measured with. An earlier draft proposed
+~32 MiB; that is exactly this box's L3 and already past the knee.
+
+So it is a constant, not a setting. The right value is a property of the cache
+hierarchy, and an operator tuning it would be guessing at L3. If it ever has to
+move it should be *derived* from cache size, not configured.
+
+### It does not become a second `max_read_block_mb`
+
+`PyramidConfig.max_read_block_mb` (default 512) already exists for this concern —
+"Ceiling, in MiB, on the source pixels one computed-scale chunk may materialize.
+A resident-memory bound, not a throughput knob". It reaches that bound by a
+different route: it clamps the virtual chunk size at plan time
+(`scaled_virtual_chunk_size`), so a memory-constrained server gets **smaller
+chunks and more round trips** — and this read path is latency-bound, capped
+around 5.4k Flight dispatches/s.
+
+Banding bounds the same residency by streaming instead, at no round-trip cost.
+The two must not both become knobs for one concern. Once an adapter bands, the
+extent is never resident, so `max_read_block_mb`'s justification no longer
+applies to it and the clamp is only costing round trips: a banded adapter should
+be allowed to **relax** that ceiling. That is a throughput win this plan can
+claim on top of the memory one, and it is the reason the band budget stays
+internal — the config surface for "how much may one read materialize" is already
+taken, and adding a second one would leave an operator with two dials for one
+outcome and no way to tell them apart.
+
+Any config here is better spent on an escape hatch (force-disable banding while
+debugging) than on a tuning dial.
+
+### Constraints on making it the default
 
 - **Band along rows, never into tiles.** #816 measured square retiling on this
   exact file at +1.7 s: a 1182-wide tile out of a 14234-wide frame is 1182
   memcpys of ~7 kB. Full-width bands keep the rows long.
+- **Bands must land on block boundaries.** A band that splits a reduction block
+  would fold the two halves independently and produce a different pixel, so band
+  height is a whole multiple of the row scale. Only the last band may be ragged,
+  and that is the one place `downsample_block`'s edge-replicate pad applies —
+  which is exactly where it applies for the unbanded read, since the extent ends
+  where the tensor does. That is what keeps the banded path bit-identical rather
+  than merely close.
+- **`nearest` bands too, and it is a memory trade there, not a speed win.**
+  Measured through `pack_chunk_batch` on a 128 MiB extent: `area` 62.0 -> 29.7 ms
+  (2.09x), `nearest` 1.8 -> 2.0 ms (0.90x). There is no arithmetic pass for the
+  read to fuse with, so the locality win does not exist. Take it anyway: unbanded
+  `nearest` returns a strided view that pins the full-resolution base until
+  `pack_chunk_batch` materialises it, so its peak IS the extent — and `nearest`
+  is now the default method. What banding cannot give `nearest` is fewer bytes
+  read; that needs the reader to skip rows (§6), since doing it generically would
+  mean one call per picked row.
 - **Only where a band read is proportionally cheaper than the extent read.**
   True for mmap/uncompressed sources (ND2, MRC, plain TIFF via the `aszarr` page
   store, zarr, HDF5). False where the reader must decode a whole plane per call
-  — banding there multiplies decode work by the band count. So this is opt-in:
-  a class flag (`BANDED_SCALED_READ`) plus a band budget (~32 MiB), not a
-  behaviour change for every adapter at once. An adapter that already overrides
-  `get_scaled_data` (Phase 2) ignores it.
+  — banding there multiplies decode work by the band count. So this is opt-in: a
+  class flag (`BANDED_SCALED_READ`), not a behaviour change for every adapter at
+  once. An adapter that already overrides `get_scaled_data` (Phase 2) ignores it
+  by construction, since it never calls `super()`.
+
+  The flag stays a class attribute rather than config on purpose: it asserts a
+  property of the *reader* ("a band read costs proportionally less than the
+  extent read"), which an operator has no way to know — nobody outside the code
+  knows whether libCZI decodes a whole plane per call.
+
+- **Two gaps, stated rather than assumed.** Every number here is warm page cache,
+  median of 3; the cold path is unmeasured (banding should still win there, since
+  compute on band N overlaps readahead of band N+1, but it is not measured).
+  And the flag is keyed on the adapter class while the cost model is really about
+  *storage*: an ND2 on NFS — which is what biopb.org runs — is still mmap-able,
+  but a band read there is not free. `core/fs_detect.py` already classifies this
+  (`network_filesystem_type`), and the band decision should consult it before this
+  is turned on for a network-backed source.
+
+  Estimated rather than measured (no network mount on the dev box), and an
+  earlier draft of this section overstated it. Banding does **not** multiply round
+  trips: NFS already splits any read into `rsize`-sized RPCs, so a 128 MiB extent
+  is ~128 RPCs whether it arrives as one call or as 17 bands. What it adds is
+  per-call overhead, bounded by `(bands - 1) x RTT` in the worst case where
+  readahead does not cover a band boundary — and since bands are contiguous and
+  ascending, the pattern stays sequential and readahead should mostly survive.
+
+  The extents in §1 band into 17 (scale 4, 128 MiB) and 50 (scale 32, 385 MiB),
+  so 16 and 49 extra calls: roughly 8 ms and 25 ms on a LAN mount at ~0.5 ms RTT,
+  0.2-0.5 s on a WAN one at ~10 ms. Against the ~34 ms the scale-4 reduce saves
+  (63 -> 29 ms), **the crossover is around 2 ms RTT**. At scale 32 there is no
+  time saving to offset with at all (0.96x), so there banding on NFS is purely
+  memory-for-latency: 49 x RTT to take peak residency from 385 MiB to 8 MiB.
+
+  Two things would make it worse than this estimate: a multi-channel extent makes
+  each band several discontiguous runs (51 instead of 3 for `[1, 3, 1, Y, X]`),
+  which is the likeliest way to lose readahead; and an adapter whose `get_data`
+  does per-call work — open, stat, seek, decode — swamps any filesystem effect,
+  which is the case `BANDED_SCALED_READ` exists to exclude.
 
 ## 6. Phase 2 — per-adapter fusion
 
