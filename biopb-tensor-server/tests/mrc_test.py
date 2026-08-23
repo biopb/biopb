@@ -113,16 +113,110 @@ class TestMrcAdapter:
             with pytest.raises((ValueError, OSError)):
                 MrcAdapter.create_from_config(SourceConfig(url=str(p)))
 
-    def test_holds_no_mapping_between_reads(self):
-        """No long-lived mapping (biopb/biopb#71): the file is pinned only for the
-        duration of a read, so deleting a catalogued volume frees its blocks."""
+    @staticmethod
+    def _mapped() -> bool:
+        """Whether this process currently maps an .mrc, straight from the kernel."""
+        maps = Path("/proc/self/maps")
+        if not maps.exists():  # non-Linux: no mapping table to inspect
+            pytest.skip("/proc/self/maps unavailable")
+        return ".mrc" in maps.read_text()
+
+    def test_catalogued_but_unread_source_maps_nothing(self):
+        """Constructing probes the layout, then lets go: a source that is
+        registered and never read pins nothing (biopb/biopb#71)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._adapter(tmpdir, shape=(4, 8, 8))
+            assert self._mapped() is False
+
+    def test_holds_one_mapping_across_reads(self):
+        """A fresh mapping per read arrives with an empty page table, so the copy
+        re-faults every page it touches even from page cache -- 3.2x on a warm
+        1.6 GB volume. One mapping serves every read instead."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
+            bounds = ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8])
+            adapter.get_data(bounds)
+            first = adapter._persistent_map
+            adapter.get_data(bounds)
+            assert first is not None
+            assert adapter._persistent_map is first  # reused, not remapped
+            assert self._mapped() is True
+
+    def test_close_releases_the_mapping(self):
+        """What #71 was protecting is kept, bounded rather than absent: the pin
+        ends (Windows undeletable, POSIX unlink-frees-nothing) instead of lasting
+        as long as the source stays catalogued."""
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
             adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
-            maps = Path("/proc/self/maps")
-            if not maps.exists():  # non-Linux: no mapping table to inspect
-                pytest.skip("/proc/self/maps unavailable")
-            assert ".mrc" not in maps.read_text()
+            assert self._mapped() is True
+            adapter.close()
+            assert adapter._persistent_map is None
+            assert self._mapped() is False
+
+    def test_reaper_releases_an_idle_mapping_and_the_next_read_remaps(self):
+        from biopb_tensor_server.adapters import mrc as mrc_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
+            bounds = ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8])
+            adapter.get_data(bounds)
+            assert adapter._persistent_map is not None
+
+            adapter._persistent_last_access -= mrc_module._mapping_reaper.ttl + 1
+            mrc_module._mapping_reaper._sweep()
+            assert adapter._persistent_map is None
+            assert self._mapped() is False
+
+            # A remap is transparent: same pixels, nothing to invalidate (unlike
+            # ND2, an MRC mapping carries no derived index).
+            np.testing.assert_array_equal(adapter.get_data(bounds), data)
+            assert adapter._persistent_map is not None
+
+    def test_a_read_in_flight_blocks_the_reap(self):
+        """Reads copy OUTSIDE _io_lock so they stay parallel, which is exactly
+        why the count is needed: unmapping under a copy would fault, not raise."""
+        from biopb_tensor_server.adapters import mrc as mrc_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
+            adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
+            adapter._persistent_last_access -= mrc_module._mapping_reaper.ttl + 1
+            adapter._active_reads = 1  # a copy mid-flight, lock not held
+            try:
+                mrc_module._mapping_reaper._sweep()
+                assert adapter._persistent_map is not None
+                adapter.close()  # explicit close defers to the same guard
+                assert adapter._persistent_map is not None
+            finally:
+                adapter._active_reads = 0
+
+    def test_concurrent_reads_do_not_serialize_on_the_io_lock(self):
+        """#71's parallel-read property, kept: the lock is held only to hand out
+        the mapping and take the count, never across the copy."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
+            bounds = ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8])
+            adapter.get_data(bounds)  # establish the mapping
+            results = []
+            with adapter._io_lock:
+                # A reader that took the lock for its whole read would deadlock
+                # here; this one only needs it released before the copy.
+                pass
+            barrier = threading.Barrier(4)
+
+            def read():
+                barrier.wait()
+                results.append(adapter.get_data(bounds))
+
+            threads = [threading.Thread(target=read) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert len(results) == 4
+            for r in results:
+                np.testing.assert_array_equal(r, data)
 
     def test_get_data_subregion(self):
         with tempfile.TemporaryDirectory() as tmpdir:
