@@ -388,7 +388,9 @@ class TestNdTiffReaperReopen:
         from biopb_tensor_server.adapters import ndtiff as nd
         from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 
-        fresh = IdleHandleReaper(ttl_seconds=10.0, thread_name="ndtiff-test")
+        fresh = IdleHandleReaper(
+            ttl_seconds=10.0, thread_name="ndtiff-test", max_handles=64
+        )
         monkeypatch.setattr(nd, "_dataset_reaper", fresh)
         adapter, _, opens = self._adapter()
         # Backdate last access so the sweep sees it as idle, then drive one sweep.

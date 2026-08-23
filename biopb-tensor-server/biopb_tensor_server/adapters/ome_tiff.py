@@ -333,7 +333,13 @@ def _fast_ome_metadata(
 # large files badly. Only OME-TIFF scene adapters register, so the pool holds only
 # those instances. The TTL is set from ``ServerConfig.handle_reaper_ttl`` at
 # startup; see :mod:`biopb_tensor_server.adapters._handle_reaper`.
-_store_reaper = IdleHandleReaper(DEFAULT_HANDLE_REAPER_TTL, "tiff-store-reaper")
+# One handle here is a parsed IFD table, and reopening it is the expensive case
+# _handle_reaper is written for (~615 ms extrapolated at 50k pages), so the TTL
+# is the long default. The cap is generous for the same reason: evicting one
+# costs the most of any pool.
+_store_reaper = IdleHandleReaper(
+    DEFAULT_HANDLE_REAPER_TTL, "tiff-store-reaper", max_handles=32
+)
 
 
 def _parallel_read_enabled() -> bool:

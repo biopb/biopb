@@ -62,7 +62,13 @@ if TYPE_CHECKING:
 # than pinning for the catalog's whole lifetime. The next read after a lull pays
 # one reopen. The TTL is set from ``ServerConfig.handle_reaper_ttl`` at startup;
 # see :mod:`biopb_tensor_server.adapters._handle_reaper`.
-_dataset_reaper = IdleHandleReaper(DEFAULT_HANDLE_REAPER_TTL, "ndtiff-dataset-reaper")
+# The reopen unit is the whole acquisition, so the TTL is the long default --
+# but so is the *pin*: NDTiffDataset eagerly opens every NDTiffStack_*.tif, so
+# one warm handle here can hold thousands of file descriptors where every other
+# pool holds one. That asymmetry, not the reopen cost, sets the cap.
+_dataset_reaper = IdleHandleReaper(
+    DEFAULT_HANDLE_REAPER_TTL, "ndtiff-dataset-reaper", max_handles=4
+)
 
 
 # =============================================================================

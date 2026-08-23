@@ -49,14 +49,19 @@ class _FakeND2File:
     loop_indices_value: tuple[dict[str, int], ...] = ()
     loop_indices_accesses = 0
     closed = False
+    opens = 0
 
     def __init__(self, _path: str):
         type(self).closed = False
+        type(self).opens += 1
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_exc):
+        self.close()
+
+    def close(self):
         type(self).closed = True
 
     def read_frame(self, frame_index: int) -> np.ndarray:
@@ -66,6 +71,12 @@ class _FakeND2File:
     def loop_indices(self):
         type(self).loop_indices_accesses += 1
         return self.loop_indices_value
+
+
+def _touch(tmp_path):
+    path = tmp_path / "source.nd2"
+    path.touch()
+    return path
 
 
 def _adapter(tmp_path, data, labels, chunks):
@@ -113,9 +124,18 @@ def test_nikon_direct_read_maps_scene_t_and_z_and_copies_crop(tmp_path, monkeypa
 
     expected = (data + 10_000)[0:2, 1:2, 1:3, 1:4, 2:5]
     assert np.array_equal(actual, expected)
+    # The reader is held across reads, but nothing it owns escapes: the crop is
+    # copied into an array the caller owns, so a reap between reads is safe.
     assert actual.flags.owndata
-    assert _FakeND2File.closed
+    assert not _FakeND2File.closed
+    assert adapter._shared_handle._reader is not None
+    # One reader for both reads, so the frame map is built once.
     assert _FakeND2File.loop_indices_accesses == 1
+
+    # ...and released on close, which is what bounds the steady-state pin.
+    adapter.close()
+    assert _FakeND2File.closed
+    assert adapter._shared_handle._reader is None
     # The frame ND2 hands back -- all channels, whole Y/X, one T and one Z --
     # seeds the transfer grid; the grid is whole frames of it (biopb/biopb#809).
     grid = list(adapter.get_tensor_descriptor().chunk_shape)
@@ -390,3 +410,72 @@ def test_source_listing_publishes_no_grid(tmp_path, monkeypatch, fast_path):
     # ... and the scene that IS bound answers it, C whole (biopb/biopb#806).
     served = _adapter(tmp_path, data, "TCZYX", chunks).get_transfer_chunk_size()
     assert served[1] == 4
+
+
+def test_nd2_scene_adapters_share_one_reader(tmp_path, monkeypatch):
+    """One handle per file, not per scene.
+
+    The reader is per file while adapters are per scene, so a reader per scene
+    would map the same file once per scene to serve reads already serialized
+    behind the one ``_io_lock`` they share. ND040 has 18 of them.
+    """
+    shape = (1, 1, 1, 2, 2)
+    data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    _FakeND2File.frames = [data[0, :, 0].copy(), data[0, :, 0].copy() + 100]
+    _FakeND2File.loop_indices_value = ({"P": 0}, {"P": 1})
+    _FakeND2File.opens = 0
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+
+    source = NikonAdapter(
+        _FakeBioImage(data, "TCZYX", ((1,), (1,), (1,), (2,), (2,))),
+        scene_index=None,
+        source_id="source",
+        source_url=str(_touch(tmp_path)),
+    )
+    handle = source._shared_handle_for_scenes()
+    scene_a = source.__class__(
+        source._bio_image,
+        scene_index=0,
+        source_id="source",
+        source_url=source._source_url,
+        io_lock=source._io_lock,
+        shared_handle=handle,
+    )
+    scene_b = source.__class__(
+        source._bio_image,
+        scene_index=1,
+        source_id="source",
+        source_url=source._source_url,
+        io_lock=source._io_lock,
+        shared_handle=handle,
+    )
+    assert scene_a._reader_handle() is scene_b._reader_handle()
+    # ...and it is the source's lock they fence against, not one of their own.
+    assert scene_a._reader_handle()._io_lock is source._io_lock
+
+
+def test_nd2_frame_map_is_rebuilt_after_the_reader_is_reaped(tmp_path, monkeypatch):
+    """A scene's frame map indexes into a specific reader.
+
+    Reusing it across a reap would not fail -- it would read the wrong frames
+    out of a remapped file, with no error.
+    """
+    shape = (1, 1, 1, 2, 2)
+    data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    _FakeND2File.frames = [data[0, :, 0].copy()]
+    _FakeND2File.loop_indices_value = ({"P": 1},)
+    _FakeND2File.loop_indices_accesses = 0
+    monkeypatch.setattr(nd2, "ND2File", _FakeND2File)
+
+    adapter = _adapter(tmp_path, data, "TCZYX", ((1,), (1,), (1,), (2,), (2,)))
+    bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 2, 2])
+    adapter.get_data(bounds)
+    adapter.get_data(bounds)
+    assert _FakeND2File.loop_indices_accesses == 1  # one reader, one build
+
+    handle = adapter._reader_handle()
+    with adapter._io_lock:
+        handle._release_persistent_handle()  # the reaper, deterministically
+    adapter.get_data(bounds)
+    assert handle.generation == 2
+    assert _FakeND2File.loop_indices_accesses == 2  # rebuilt, not reused
