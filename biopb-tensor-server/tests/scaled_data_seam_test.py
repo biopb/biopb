@@ -164,14 +164,18 @@ class TestStreamingDefault:
     def _chunked(monkeypatch, adapter, grid, block=None):
         """Drive the chunked branch: unit is `grid`, floored at `block`."""
         monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
-        monkeypatch.setattr(adapter, "read_block_shape", lambda: block or grid)
+        monkeypatch.setattr(
+            type(adapter), "read_block_shape", property(lambda self: block or grid)
+        )
 
     @staticmethod
     def _contiguous(monkeypatch, adapter, budget):
         """Drive the contiguous branch: unit is a full-width band under `budget`."""
         import biopb_tensor_server.core.stream_reduce as sr
 
-        monkeypatch.setattr(adapter, "read_block_shape", lambda: None)
+        monkeypatch.setattr(
+            type(adapter), "read_block_shape", property(lambda self: None)
+        )
         monkeypatch.setattr(sr, "_CONTIGUOUS_BAND_BYTES", budget)
 
     @pytest.mark.parametrize("method", ["area", "nearest"])

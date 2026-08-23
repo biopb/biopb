@@ -148,6 +148,7 @@ class Hdf5Adapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "hdf5"
 
+    @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The dataset's HDF5 chunk, or ``None`` where it is contiguous.
 

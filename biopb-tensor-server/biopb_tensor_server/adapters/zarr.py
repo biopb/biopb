@@ -181,6 +181,7 @@ class ZarrAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
 
+    @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The store's own chunk: reading any part of one decodes all of it.
 
@@ -189,10 +190,18 @@ class ZarrAdapter(TensorAdapter):
         does not match the declared shape means this adapter presents a different
         axis space than the store's, so the block is not comparable and no floor
         is claimed.
+
+        ``None`` also where the array is not bound yet -- ``_QptiffLevelAdapter``
+        before its first read, since it re-resolves its array from the parent per
+        read rather than holding one. That answer reads a tiled store as
+        contiguous, and is unreachable only because a native level is served by
+        ``precompute``, whose chunk_ids are unscaled and so never reach
+        ``get_scaled_data``. A level serving a computed sub-scale would have to
+        fill this from the parent's level metadata instead.
         """
         array = getattr(self, "zarr_array", None)
         chunks = getattr(array, "chunks", None)
-        if not chunks or len(chunks) != len(self.zarr_array.shape):
+        if not chunks or len(chunks) != len(array.shape):
             return None
         return tuple(int(size) for size in chunks)
 

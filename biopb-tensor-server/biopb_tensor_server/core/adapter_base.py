@@ -763,6 +763,7 @@ class TensorAdapter(SourceAdapter):
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
 
+    @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """Smallest region this backend reads without amplification, or ``None``.
 
@@ -782,6 +783,13 @@ class TensorAdapter(SourceAdapter):
         ``chunk_shape``: the two differ exactly where it matters, since an
         adapter seeds its transfer grid from the physical block and then grows it
         to the transfer target.
+
+        A property rather than a class attribute because the answer is per
+        *instance*, not per class -- a tiled and a striped TIFF are the same
+        adapter with different answers -- and derived live rather than captured
+        in ``__init__`` (the way ``content_version`` is) because an adapter may
+        not hold its store yet: ``_QptiffLevelAdapter`` re-resolves its array on
+        every read, so there is nothing to capture at construction.
         """
         return None
 
@@ -841,7 +849,7 @@ class TensorAdapter(SourceAdapter):
         unit = streaming_unit(
             extent,
             self.get_transfer_chunk_size(),
-            self.read_block_shape(),
+            self.read_block_shape,
             scale_hint,
             np.dtype(descriptor.dtype).itemsize,
         )
