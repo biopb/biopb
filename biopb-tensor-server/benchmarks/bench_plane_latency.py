@@ -82,6 +82,13 @@ def _open_adapter(path: Path):
             from biopb_tensor_server.adapters.tifffile_adapter import TiffAdapter
 
             source = TiffAdapter(str(path), "bench")
+    elif path.name.lower().endswith(".zarr") or suffix == ".zarr":
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        source = OmeZarrAdapter.create_from_config(
+            SourceConfig(url=str(path), source_id="bench")
+        )
     else:
         sys.exit(f"no adapter wired for {suffix} in this benchmark")
 
@@ -120,23 +127,37 @@ def _evict(path: Path) -> None:
     import gc
 
     gc.collect()
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    finally:
-        os.close(fd)
+    for member in _source_files(path):
+        fd = os.open(str(member), os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+
+def _source_files(path: Path) -> list[Path]:
+    """Every file backing this source.
+
+    A source is not always one file: a zarr store is a directory of chunk files,
+    and warming or evicting only the top-level path there is a no-op that leaves
+    the whole store resident.
+    """
+    if path.is_dir():
+        return sorted(f for f in path.rglob("*") if f.is_file())
+    return [path]
 
 
 def _warm(path: Path) -> None:
     """Pull the whole source into page cache.
 
-    Sequentially, over the file rather than through the adapter: warming only
-    the chunks the plan happens to touch leaves the rest cold and reports a
-    half-cold read as warm.
+    Over the files rather than through the adapter: warming only the chunks the
+    plan happens to touch leaves the rest cold and reports a half-cold read as
+    warm.
     """
-    with open(path, "rb") as handle:
-        while handle.read(16 << 20):
-            pass
+    for member in _source_files(path):
+        with open(member, "rb") as handle:
+            while handle.read(16 << 20):
+                pass
 
 
 def _one_cell(path, open_adapter, descriptor, scale, method, cold, rounds):
@@ -225,15 +246,26 @@ def main() -> None:
     for state in args.state.split(","):
         for method in args.method.split(","):
             for scale in (int(s) for s in args.scale.split(",")):
-                row = _one_cell(
-                    args.file,
-                    open_adapter,
-                    descriptor,
-                    scale,
-                    method,
-                    state == "cold",
-                    args.rounds,
-                )
+                try:
+                    row = _one_cell(
+                        args.file,
+                        open_adapter,
+                        descriptor,
+                        scale,
+                        method,
+                        state == "cold",
+                        args.rounds,
+                    )
+                except Exception as exc:
+                    # One unsupported cell must not take the sweep with it:
+                    # `precompute` legitimately has no level at some scales, and
+                    # that is a result, not a crash.
+                    print(
+                        f"{state:6} {method:8} {scale:>5} "
+                        f"{type(exc).__name__}: {str(exc)[:60]}",
+                        flush=True,
+                    )
+                    continue
                 latency = (
                     f"{row['latency_ms']:>8.0f}ms"
                     if row["verified"]
