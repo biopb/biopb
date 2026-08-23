@@ -689,10 +689,13 @@ class ServerConfig:
     handle_reaper_ttl: float = field(
         default=150.0,
         metadata={
-            "help": "Seconds an idle persistent file handle (OME-TIFF store, "
-            "NDTiff acquisition) is kept warm before it is closed; the next read "
-            "reopens it (0 disables reaping). Adapters that reopen per read "
-            "(hdf5, mrc, ...) are unaffected."
+            "help": "Ceiling, in seconds, on how long an idle persistent file "
+            "handle (OME-TIFF store, NDTiff acquisition, CZI or ND2 reader) is "
+            "kept warm before it is closed; the next read reopens it (0 disables "
+            "reaping). A ceiling, not an assignment: each format keeps its own "
+            "shorter value where reopening it is cheap, so raising this never "
+            "lengthens a pin. Adapters that reopen per read (hdf5, mrc, ...) are "
+            "unaffected."
         },
     )
     stability_window: float = field(

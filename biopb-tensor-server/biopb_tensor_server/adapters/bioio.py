@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import threading
+import time
 from itertools import product
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -35,6 +36,9 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._handle_reaper import (
+    IdleHandleReaper,
+)
 from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.chunk import (
@@ -226,6 +230,7 @@ class _BioioAdapterBase(TensorAdapter):
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
         metadata_cache: Optional[Any] = None,
+        shared_handle: Optional[Any] = None,
     ):
         """Initialize bioio adapter.
 
@@ -270,7 +275,14 @@ class _BioioAdapterBase(TensorAdapter):
 
         self._dask_data = None  # scene-level dask array, bound below
         self._scene_descriptor = None
+        # (generation, frame map) -- the map is per SCENE, but it indexes into a
+        # reader shared by every scene of this source, so a reopen invalidates it.
         self._nd2_frame_index_cache: Any = _FRAME_INDEX_UNCACHED
+        self._nd2_frame_index_generation = -1
+        # A reader/handle shared with this source's other scene adapters, for
+        # subclasses that keep one warm. None here means "not shared yet";
+        # whoever needs it makes it (see NikonAdapter._reader_handle).
+        self._shared_handle: Any = shared_handle
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -558,12 +570,22 @@ class _BioioAdapterBase(TensorAdapter):
             source_url=self._source_url,
             io_lock=self._io_lock,
             metadata_cache=self._metadata_cache,
+            shared_handle=self._shared_handle_for_scenes(),
         )
         # Set tensor context in the adapter
         adapter._tensor_name = tensor_id
         self._tensor_adapters[tensor_id] = adapter
 
         return adapter
+
+    def _shared_handle_for_scenes(self) -> Any:
+        """The handle this source's scene adapters should share, if any.
+
+        None for every format that reopens per read. A subclass keeping one
+        reader warm returns it here so its scenes share one, rather than each
+        opening its own against the same file.
+        """
+        return None
 
     def get_metadata(self) -> dict:
         """Return OME metadata as a dict (bioio ``ome_metadata`` model_dump).
@@ -700,6 +722,92 @@ class LeicaAdapter(_BioioAdapterBase):
                 is_remote=ctx.is_remote,
             )
         return None
+
+
+# One pool for ND2 readers, separate from the OME-TIFF and NDTiff pools so each
+# is bounded on its own terms. See :mod:`_handle_reaper`.
+#
+# ND2 is the case that module's "reopen per read" default does not cover, and it
+# is also the case its long TTL does not fit. The default is argued from open
+# cost, and for ND2 the open really is free: 169 open/close pairs on a 21 GB file
+# measure 16 ms. What a held ND2 reader saves is not the open but the *mapping*.
+# ``nd2.read_frame`` returns a zero-copy view onto the reader's mmap, so a reopen
+# hands every call a fresh mapping with an empty page table, and the crop then
+# re-faults every row it touches even though the bytes are already in page cache.
+# The bill scales with rows revisited, not bytes delivered: tiling one
+# 14234x14234 scene on the 1182 transfer grid touches each row once per column of
+# tiles, and 169 reads that way cost 203k minor faults and 1.65 s warm where the
+# same pixels through one held reader cost 18.5k and 0.30 s.
+#
+# That is why the TTL is seconds rather than minutes. A warm page table is worth
+# only as long as the read that built it -- across an idle gap the next read
+# faults in whatever *it* touches regardless, so holding buys nothing and keeps a
+# whole-file mapping pinned. 5 s spans one logical read with margin: a full-scene
+# read of ND040 measures 4.4 s wall with the handle held.
+_ND2_READER_TTL = 5.0
+
+_nd2_reader_reaper = IdleHandleReaper(
+    _ND2_READER_TTL, "nd2-reader-reaper", max_handles=8
+)
+
+
+class _Nd2Reader:
+    """One ND2 reader, shared by every scene adapter of one source.
+
+    The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle` is
+    this object rather than the adapter because the handle is per *file* while
+    adapters are per scene. ND040 has 18 scenes, and a reader per scene would map
+    the same 21.8 GB file 18 times to serve reads that are already serialized
+    behind the one ``_io_lock`` they share.
+    """
+
+    def __init__(self, source_url: str, io_lock) -> None:
+        self._source_url = source_url
+        # The source's lock, shared with every scene adapter -- so the fence the
+        # reaper takes is the same one reads hold.
+        self._io_lock = io_lock
+        self._reader: Any = None
+        # Reads hold ``_io_lock`` end to end, so none is ever in flight when the
+        # reaper takes it.
+        self._active_reads = 0
+        self._persistent_last_access = 0.0
+        # Bumped on every open. A scene's frame map indexes into a specific
+        # reader; after a reap the offsets belong to a closed mapping, so the map
+        # is rebuilt rather than reused.
+        self.generation = 0
+
+    def acquire(self) -> Any:
+        """Open (or reuse) the reader. Caller holds ``_io_lock``."""
+        # Stamped before register, so this handle sorts newest and a cap eviction
+        # triggered by its own register never picks it.
+        self._persistent_last_access = time.monotonic()
+        if self._reader is None:
+            import nd2
+
+            self._reader = nd2.ND2File(self._source_url)
+            self.generation += 1
+            _nd2_reader_reaper.register(self)
+        return self._reader
+
+    def _release_persistent_handle(self) -> None:
+        """Close the reader and permit a later reopen.
+
+        Caller holds ``_io_lock`` (read path / reaper) or is the GC finalizer.
+        Safe to call repeatedly.
+        """
+        reader, self._reader = self._reader, None
+        _nd2_reader_reaper.discard(self)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                logger.debug("error closing persistent ND2 reader", exc_info=True)
+
+    def __del__(self):
+        try:
+            self._release_persistent_handle()
+        except Exception:
+            pass
 
 
 class NikonAdapter(_BioioAdapterBase):
@@ -862,8 +970,6 @@ class NikonAdapter(_BioioAdapterBase):
         if not self._source_url or not os.path.isfile(self._source_url):
             return self._get_data_via_bioio(bounds)
 
-        import nd2
-
         desc = self.get_tensor_descriptor()
         labels = [label.upper() for label in desc.dim_labels]
         if len(labels) != len(desc.shape) or not {"Y", "X"}.issubset(labels):
@@ -887,52 +993,122 @@ class NikonAdapter(_BioioAdapterBase):
             for label, size in zip(labels, shape, strict=True)
         )
 
-        with self._io_lock, nd2.ND2File(self._source_url) as reader:
-            frame_indices = self._nd2_frame_indices(reader)
-            requested_frames = []
-            for coordinates in product(*sequence_ranges):
-                coordinate_by_label = {
-                    labels[axis]: coordinate
-                    for axis, coordinate in zip(sequence_axes, coordinates, strict=True)
-                }
-                key = (
-                    coordinate_by_label.get("T", 0),
-                    coordinate_by_label.get("Z", 0),
+        handle = self._reader_handle()
+        with self._io_lock:
+            reader = handle.acquire()
+            try:
+                output = self._read_frames_into(
+                    reader,
+                    handle,
+                    labels,
+                    starts,
+                    stops,
+                    output,
+                    sequence_axes,
+                    sequence_ranges,
+                    frame_shape,
                 )
-                requested_frames.append((coordinate_by_label, key))
-
-            # BioIO serves what the direct path cannot address: a scene whose
-            # frames have no T/Z map, or a coordinate the ND2 experiment never
-            # enumerated. Decided here but acted on below, once _io_lock is
-            # released -- _get_data_via_bioio takes that same lock.
-            fallback_to_bioio = frame_indices is None or any(
-                key not in frame_indices for _, key in requested_frames
-            )
-            if not fallback_to_bioio:
-                for coordinate_by_label, key in requested_frames:
-                    frame_index = frame_indices[key]
-                    frame = reader.read_frame(frame_index).reshape(frame_shape)
-
-                    source_slices = []
-                    output_slices = []
-                    for axis, label in enumerate(labels):
-                        if label in {"T", "Z"}:
-                            coordinate = coordinate_by_label[label]
-                            source_slices.append(slice(0, 1))
-                            output_slices.append(
-                                slice(
-                                    coordinate - starts[axis],
-                                    coordinate - starts[axis] + 1,
-                                )
-                            )
-                        else:
-                            source_slices.append(slice(starts[axis], stops[axis]))
-                            output_slices.append(slice(None))
-                    output[tuple(output_slices)] = frame[tuple(source_slices)]
+            except Exception:
+                # A half-open reader is not reusable; drop it so the next read
+                # reopens rather than failing on the same handle.
+                handle._release_persistent_handle()
+                raise
+        fallback_to_bioio = output is None
 
         if fallback_to_bioio:
             return self._get_data_via_bioio(bounds)
         return output
+
+    def _read_frames_into(
+        self,
+        reader,
+        handle,
+        labels,
+        starts,
+        stops,
+        output,
+        sequence_axes,
+        sequence_ranges,
+        frame_shape,
+    ):
+        """Copy the requested subregion out of ``reader``. None -> use BioIO.
+
+        Caller holds ``_io_lock``, which is also what fences the persistent
+        reader against the reaper: every view taken here is copied into
+        ``output`` before the lock is released, so no reader-backed memory
+        outlives the call even though the reader itself now does.
+        """
+        frame_indices = self._nd2_frame_indices(reader, handle)
+        requested_frames = []
+        for coordinates in product(*sequence_ranges):
+            coordinate_by_label = {
+                labels[axis]: coordinate
+                for axis, coordinate in zip(sequence_axes, coordinates, strict=True)
+            }
+            key = (
+                coordinate_by_label.get("T", 0),
+                coordinate_by_label.get("Z", 0),
+            )
+            requested_frames.append((coordinate_by_label, key))
+
+        # BioIO serves what the direct path cannot address: a scene whose
+        # frames have no T/Z map, or a coordinate the ND2 experiment never
+        # enumerated. Decided here but acted on below, once _io_lock is
+        # released -- _get_data_via_bioio takes that same lock.
+        fallback_to_bioio = frame_indices is None or any(
+            key not in frame_indices for _, key in requested_frames
+        )
+        if not fallback_to_bioio:
+            for coordinate_by_label, key in requested_frames:
+                frame_index = frame_indices[key]
+                frame = reader.read_frame(frame_index).reshape(frame_shape)
+
+                source_slices = []
+                output_slices = []
+                for axis, label in enumerate(labels):
+                    if label in {"T", "Z"}:
+                        coordinate = coordinate_by_label[label]
+                        source_slices.append(slice(0, 1))
+                        output_slices.append(
+                            slice(
+                                coordinate - starts[axis],
+                                coordinate - starts[axis] + 1,
+                            )
+                        )
+                    else:
+                        source_slices.append(slice(starts[axis], stops[axis]))
+                        output_slices.append(slice(None))
+                output[tuple(output_slices)] = frame[tuple(source_slices)]
+
+        return None if fallback_to_bioio else output
+
+    def _reader_handle(self) -> "_Nd2Reader":
+        """This source's shared reader, made on first use.
+
+        Scene adapters receive it from the source-level adapter
+        (``_shared_handle_for_scenes``); one constructed directly -- a test, a
+        benchmark -- makes its own.
+        """
+        if self._shared_handle is None:
+            self._shared_handle = _Nd2Reader(self._source_url, self._io_lock)
+        return self._shared_handle
+
+    def _shared_handle_for_scenes(self) -> Any:
+        return self._reader_handle()
+
+    def close(self) -> None:
+        """Release this source's reader, including its scene adapters'.
+
+        They share one, so closing it here closes it for all of them; the next
+        read on any of them reopens.
+        """
+        for adapter in list(self._tensor_adapters.values()):
+            close = getattr(adapter, "close", None)
+            if close is not None:
+                close()
+        if self._shared_handle is not None:
+            with self._io_lock:
+                self._shared_handle._release_persistent_handle()
 
     def _get_data_via_bioio(self, bounds: ChunkBounds) -> np.ndarray:
         """Use an ephemeral BioIO Dask array for unsupported direct-read cases."""
@@ -944,16 +1120,27 @@ class NikonAdapter(_BioioAdapterBase):
             finally:
                 self._release_bioio_dask_cache()
 
-    def _nd2_frame_indices(self, reader: Any) -> Optional[dict[tuple[int, int], int]]:
+    def _nd2_frame_indices(
+        self, reader: Any, handle: "_Nd2Reader"
+    ) -> Optional[dict[tuple[int, int], int]]:
         """Map this BioIO scene's T/Z coordinates to ND2 sequence indices.
 
         Returns None when two frames share a (T, Z) coordinate. An unknown or
         custom acquisition loop collapses onto one T/Z pair, so the direct path
         cannot tell those frames apart; the caller reads the scene through
         BioIO rather than choosing one of them here.
+
+        Cached against the handle's generation: the map indexes into a specific
+        reader, so a reap between reads invalidates it. Rebuilding is one pass
+        over ``loop_indices``; reusing it against a remapped file would not fail,
+        it would read the wrong frames.
         """
-        if self._nd2_frame_index_cache is not _FRAME_INDEX_UNCACHED:
+        if (
+            self._nd2_frame_index_cache is not _FRAME_INDEX_UNCACHED
+            and self._nd2_frame_index_generation == handle.generation
+        ):
             return self._nd2_frame_index_cache
+        self._nd2_frame_index_generation = handle.generation
         result: dict[tuple[int, int], int] = {}
         for frame_index, coordinates in enumerate(reader.loop_indices):
             if int(coordinates.get("P", 0)) != self.scene_index:

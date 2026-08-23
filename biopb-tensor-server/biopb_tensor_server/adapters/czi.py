@@ -94,7 +94,12 @@ _PIXEL_TYPES = {
 
 # One pool for CZI readers, separate from the OME-TIFF store pool so each is
 # retuned and reported on its own.  See :mod:`_handle_reaper`.
-_reader_reaper = IdleHandleReaper(DEFAULT_HANDLE_REAPER_TTL, "czi-reader-reaper")
+# Opening parses the subblock directory (~0.22 us per subblock over a 0.03 ms
+# floor), so reopening is measurably worse than holding -- 1.7x at 40 subblocks,
+# 3.6x at 1000 -- and the TTL is the long default. One handle pins one reader.
+_reader_reaper = IdleHandleReaper(
+    DEFAULT_HANDLE_REAPER_TTL, "czi-reader-reaper", max_handles=32
+)
 
 
 @dataclass(frozen=True)

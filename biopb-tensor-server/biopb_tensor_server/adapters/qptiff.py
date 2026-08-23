@@ -36,6 +36,7 @@ v1 exposes only the baseline pyramidal multichannel image as one tensor
 
 import logging
 import threading
+import time
 import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -43,6 +44,10 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._handle_reaper import (
+    DEFAULT_HANDLE_REAPER_TTL,
+    IdleHandleReaper,
+)
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
@@ -87,6 +92,51 @@ def _default_dim_labels(ndim: int) -> List[str]:
     if ndim == 4:
         return ["c", "z", "y", "x"]
     return [f"dim{i}" for i in range(ndim - 2)] + ["y", "x"]
+
+
+# One pool for QPTIFF handles. Its open is the expensive kind -- a pyramidal
+# whole-slide BigTIFF's IFD table -- so it keeps the long TTL, like the OME-TIFF
+# store pool it most resembles. The cap is tighter because one warm handle here
+# is more than a parsed directory: the ``TiffFile`` plus one live ``aszarr`` store
+# for every pyramid level that has been read.
+#
+# Until this pool existed the handle was simply never released: ``close()`` has no
+# caller anywhere in the package, so a QPTIFF held its ``TiffFile`` and stores from
+# registration until the process exited or the adapter was garbage collected --
+# the pin biopb/biopb#71 removed from hdf5/mrc, and that OME-TIFF bounded with a
+# reaper, which this adapter got neither of.
+_handle_reaper = IdleHandleReaper(
+    DEFAULT_HANDLE_REAPER_TTL, "qptiff-handle-reaper", max_handles=16
+)
+
+
+class _QptiffLevelAdapter(ZarrAdapter):
+    """A native pyramid level's backend, counted against its parent's handle.
+
+    The zarr array this reads through is a view onto the parent's one ``TiffFile``,
+    which the reaper may now close. ``DoGet`` resolves a level adapter and reads
+    through it as two separate steps (serving/server.py), so a sweep landing
+    between them would otherwise read a closed store -- and the parent's own
+    ``_active_reads`` count would not see it, because the read never goes through
+    the parent.
+
+    So the array is re-resolved from the parent on every read rather than captured
+    once: a reap since the last read replaced it, and this adapter may well have
+    outlived that (the parent's cache is cleared on release, but a caller already
+    holding one has not noticed).
+    """
+
+    def __init__(self, parent: "QptiffAdapter", level: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._parent = parent
+        self._level = level
+
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        self.zarr_array = self._parent._begin_level_read(self._level)
+        try:
+            return super().get_data(bounds)
+        finally:
+            self._parent._end_read()
 
 
 class QptiffAdapter(TensorAdapter):
@@ -166,6 +216,12 @@ class QptiffAdapter(TensorAdapter):
         self._level_adapters: dict = {}  # level -> ZarrAdapter (native-level backend)
         self._cached_descriptor: Optional[TensorDescriptor] = None
 
+        # ReapableHandle state. Reads decode WITHOUT ``_io_lock`` (see
+        # _read_level), so ``_active_reads`` -- not the lock -- is what stops a
+        # sweep closing the store under a decode in flight.
+        self._persistent_last_access = 0.0
+        self._active_reads = 0
+
     # ---- tifffile handle / level stores ------------------------------------
 
     def _local_path(self) -> str:
@@ -179,6 +235,10 @@ class QptiffAdapter(TensorAdapter):
 
             self._tiff = tifffile.TiffFile(self._local_path())
             self._series = self._tiff.series[0]
+            # Stamped before register so this adapter sorts newest and a cap
+            # eviction triggered by its own register never picks it.
+            self._persistent_last_access = time.monotonic()
+            _handle_reaper.register(self)
         return self._series
 
     def _level_store(self, level: int):
@@ -217,12 +277,50 @@ class QptiffAdapter(TensorAdapter):
         # (imagecodecs: LZW for Akoya component data, JPEG for RGB overviews, ...)
         # is per-tile into a fresh buffer, so concurrent reads cannot race. Copy
         # out so the result is independent of the store.
-        za, _ = self._level_store(level)
-        return np.asarray(za[slices])
+        za = self._begin_level_read(level)
+        try:
+            return np.asarray(za[slices])
+        finally:
+            self._end_read()
+
+    def _begin_level_read(self, level: int):
+        """Open (or reuse) a level's store and mark a read in flight.
+
+        Holds ``_io_lock`` only for the open/cache and the count, never across
+        the decode -- that is the property ``_read_level`` documents and this
+        keeps. Incrementing under the lock is what makes the count sound: the
+        reaper tests it under the same lock, so a read already handed a store is
+        visible before a sweep can decide to close it.
+        """
+        with self._io_lock:
+            za, _ = self._level_store(level)
+            self._persistent_last_access = time.monotonic()
+            self._active_reads += 1
+            return za
+
+    def _end_read(self) -> None:
+        with self._io_lock:
+            self._active_reads -= 1
+            self._persistent_last_access = time.monotonic()
+
+    def _release_persistent_handle(self) -> None:
+        """Close the handle and permit a later reopen.
+
+        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
+        hook. Caller holds ``_io_lock`` and has established ``_active_reads == 0``.
+        """
+        _handle_reaper.discard(self)
+        self._close_handles()
 
     def close(self) -> None:
+        """Release the handle now rather than waiting for the reaper.
+
+        Defers to a decode in flight for the same reason a sweep does: the store
+        it is reading through would go out from under it.
+        """
         with self._io_lock:
-            self._close_handles()
+            if self._active_reads == 0:
+                self._release_persistent_handle()
 
     def _close_handles(self) -> None:
         """Close the tifffile handle + per-level stores; allow a later reopen.
@@ -234,6 +332,7 @@ class QptiffAdapter(TensorAdapter):
         finalizer running after a half-finished ``__init__`` can't raise. Safe to
         call repeatedly.
         """
+        _handle_reaper.discard(self)
         stores = getattr(self, "_level_stores", None) or {}
         tiff = getattr(self, "_tiff", None)
         self._level_stores = {}
@@ -376,7 +475,9 @@ class QptiffAdapter(TensorAdapter):
         if cached is not None:
             return cached
         za, _ = self._level_store(level)
-        level_adapter = ZarrAdapter(
+        level_adapter = _QptiffLevelAdapter(
+            self,
+            level,
             za,
             source_id=self.source_id,
             dim_labels=list(self.get_tensor_descriptor().dim_labels),

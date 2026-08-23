@@ -253,7 +253,7 @@ def test_idle_reader_is_reaped(tmp_path):
     scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 1, 8, 8]))
     assert scene._persistent_reader is not None
 
-    scene._persistent_last_access -= czi_module._reader_reaper._ttl + 1
+    scene._persistent_last_access -= czi_module._reader_reaper.ttl + 1
     czi_module._reader_reaper._sweep()
     assert scene._persistent_reader is None
 
