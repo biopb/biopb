@@ -92,6 +92,16 @@ _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
             "(always on); this flag is ignored. Drop it from your config.",
         ),
     },
+    "pyramid": {
+        # Same tolerated-no-op treatment: the ladder knobs are live, only the
+        # read ceiling is gone (biopb/biopb#640).
+        "max_read_block_mb": (
+            "number",
+            "Removed (biopb/biopb#640): a scaled read streams its extent in "
+            "tiles rather than materializing it, so there is no block to "
+            "bound. Ignored.",
+        ),
+    },
 }
 
 # Default instances give each field's runtime value -> its JSON type. Defaults

@@ -148,6 +148,15 @@ class Hdf5Adapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "hdf5"
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The dataset's HDF5 chunk, or ``None`` where it is contiguous.
+
+        ``None`` is the right answer for a contiguous dataset rather than a
+        missing one: any hyperslab of it is read directly.
+        """
+        return self._chunks
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from HDF5 dataset.
 

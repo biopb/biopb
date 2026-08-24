@@ -263,6 +263,9 @@ def test_legacy_aliases_present_and_marked_deprecated(schema):
     assert precache["downscale_factor"]["deprecated"] is True
     # the back-compat pyramid knob keeps its bound under [precache] too
     assert precache["downscale_factor"]["minimum"] == 2
+    # The pyramid ladder is live again (#826 reverted #818); the one knob
+    # retired here is the read ceiling a streamed scaled read no longer needs.
+    assert _section_props(schema, "pyramid")["max_read_block_mb"]["deprecated"] is True
     assert schema["properties"]["sources"]["items"]["properties"]["path"]["deprecated"]
     # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
     assert schema["properties"]["sources"]["items"]["properties"]["source_id"][

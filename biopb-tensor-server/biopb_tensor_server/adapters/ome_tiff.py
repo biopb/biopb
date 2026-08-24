@@ -469,6 +469,29 @@ class OmeTiffAdapter(TensorAdapter):
 
     # ---- reads --------------------------------------------------------------
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One whole page -- the same expression that seeds the grid below.
+
+        The read path opens ``series.aszarr(level=0, chunkmode="page")``, and
+        ``ZarrTiffStore._getitem`` serves any request from that mode by calling
+        ``page.asarray()``: the entire page is decoded and the window sliced out
+        of it. Measured flat in the request -- a 256^2 window costs 108 ms
+        against 166 ms for the whole 8192^2 page -- and nothing caches the
+        result, so N tiles cost N page decodes.
+
+        Page mode is not a mistake to route around: it exists to coalesce many
+        small striles into one buffered pass (9x on one-row strips) and to decode
+        striles concurrently (2.4x on JPEG tiles, which the serial per-tile path
+        gives up). It is the right mode for reading a page, so the page is the
+        block.
+        """
+        descriptor = self.get_tensor_descriptor()
+        return tuple(
+            int(size) if str(label).upper() in {"Y", "X", "S"} else 1
+            for label, size in zip(descriptor.dim_labels, descriptor.shape, strict=True)
+        )
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's tifffile aszarr store.
 

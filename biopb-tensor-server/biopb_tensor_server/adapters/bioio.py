@@ -30,7 +30,7 @@ import os
 import threading
 import time
 from itertools import product
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -304,6 +304,18 @@ class _BioioAdapterBase(TensorAdapter):
         else:
             # Source-level: no bound reader; dim_labels is the default for scenes.
             self.dim_labels = dim_labels
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The dask block -- the ``native=`` seed, and what a slice materialises.
+
+        ``get_data`` slices the scene's dask array, which computes whole blocks
+        whatever window is asked for. A subclass whose reader beats that -- one
+        that reads off a mapping rather than through Dask -- overrides this with
+        ``None``; see :class:`NikonAdapter`.
+        """
+        block = self._native_block(self._dask_data)
+        return tuple(int(size) for size in block) if block else None
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's bioio dask array.
@@ -815,6 +827,19 @@ class NikonAdapter(_BioioAdapterBase):
 
     SOURCE_TYPE = "nikon"
     RETAIN_SCENE_DASK = False
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """None: ``nd2.read_frame`` returns a view onto the reader's mmap.
+
+        The crop that follows copies only the rows asked for, so no part of a
+        frame is read to deliver another part. Deliberately *not* the whole C/Y/X
+        frame :meth:`_native_block` seeds the grid with -- that is the reader's
+        indexing granularity, not its I/O granularity, and flooring a tile there
+        would make every scaled read materialise a 1.1 GiB frame on a 14234^2
+        scene, which is the residency streaming exists to bound.
+        """
+        return None
 
     def _processed_metadata(self) -> Any:
         """Return BioIO's processed metadata, degrading to empty on failure."""

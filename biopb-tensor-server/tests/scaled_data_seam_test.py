@@ -133,28 +133,47 @@ class TestSeamIsDeclared:
         assert hasattr(TensorAdapter, "get_scaled_data")
 
 
-class TestBandedDefault:
-    """The banded default (#640 phase 1.5).
+class TestStreamingDefault:
+    """The streaming default (biopb/biopb#640 phase 2).
 
-    Reading the extent in row bands is not only a residency measure -- it is loop
-    tiling against L3, worth ~2x on data already in RAM. But it is only worth
-    anything if it is bit-identical, so that is what is pinned here: banding
-    changes when bytes are read, never which pixel comes out.
+    The default reduces an extent unit by unit, so peak residency is one unit
+    rather than the extent -- which is what lets a scaled chunk be planned
+    without a memory ceiling shaping it. Streaming changes when bytes are read
+    and in what shape, never which pixel comes out, so bit-identity is what is
+    pinned here.
+
+    The tile is the transfer grid rather than a byte budget, because the grid is
+    the tiling the read plan and the chunk cache already use. It is the same
+    tile for every backend; what a particular reader would rather have is a
+    phase-2 adapter override, not a branch here.
     """
 
     @pytest.fixture
-    def banded(self, adapter, monkeypatch):
-        """`adapter`, but opted in, and counting its reads."""
+    def counted(self, adapter, monkeypatch):
+        """`adapter`, counting the reads its scaled path issues."""
         reads = []
         original = adapter.get_data
 
-        def counted(bounds):
+        def counting(bounds):
             reads.append((tuple(bounds.start), tuple(bounds.stop)))
             return original(bounds)
 
-        monkeypatch.setattr(adapter, "get_data", counted)
-        monkeypatch.setattr(type(adapter), "BANDED_SCALED_READ", True)
+        monkeypatch.setattr(adapter, "get_data", counting)
         return adapter, reads
+
+    @staticmethod
+    def _grid(monkeypatch, adapter, grid, block=None):
+        """Set the transfer grid, and what the backend is quantized to.
+
+        ``block=None`` drives the unquantized path, where the tile is the grid.
+        The fixture is a real ``ZarrAdapter`` whose store would otherwise floor
+        the tile at its own 16x16 chunk -- correct behaviour, but it would mask
+        the grid these cases are choosing.
+        """
+        monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
+        monkeypatch.setattr(
+            type(adapter), "read_block_shape", property(lambda self: block)
+        )
 
     @pytest.mark.parametrize("method", ["area", "nearest"])
     @pytest.mark.parametrize(
@@ -165,99 +184,162 @@ class TestBandedDefault:
             ((8, 8), (64, 64)),
             ((4, 4), (30, 30)),  # ragged on BOTH axes -- the edge pad path
             ((4, 4), (62, 64)),  # ragged only on rows
-            ((1, 4), (64, 64)),  # row scale 1: every band is block-aligned
+            ((1, 4), (64, 64)),  # row scale 1
             ((8, 1), (64, 64)),  # column scale 1
+            ((8, 8), (64, 64)),  # unit 12 does not divide by the scale
         ],
     )
-    def test_banded_is_bit_identical(self, banded, monkeypatch, method, scale, stop):
-        """The invariant. A band budget small enough to force several bands.
+    def test_streamed_is_bit_identical(self, counted, monkeypatch, method, scale, stop):
+        """The invariant, through the seam, with a grid small enough to force units.
 
-        The ragged cases matter most: only the LAST band may be short, and it is
-        the one place downsample_block's edge-replicate pad applies -- exactly
-        where it applies for the unbanded read.
+        The ragged cases matter most: the extent's own end is the one place
+        ``downsample_block``'s edge-replicate pad applies, and the unit that ends
+        there has to carry it.
         """
-        import biopb_tensor_server.core.adapter_base as ab
-
-        adapter, reads = banded
+        adapter, reads = counted
         bounds = _bounds((0, 0), stop)
         expected = _ds.downsample_block(adapter.get_data(bounds), scale, method)
         reads.clear()
 
-        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        self._grid(monkeypatch, adapter, (12, 12))
         actual = adapter.get_scaled_data(bounds, scale, method)
 
-        assert len(reads) > 1, "budget should have forced more than one band"
+        assert len(reads) > 1, "grid should have forced more than one unit"
         assert actual.shape == expected.shape
         assert actual.dtype == expected.dtype
         assert np.array_equal(actual, expected)
 
-    def test_bands_land_on_block_boundaries(self, banded, monkeypatch):
-        """A band that split a reduction block would fold its halves separately.
+    def test_units_tile_the_extent_without_overlap(self, counted, monkeypatch):
+        """Checked on the reads, not only the output.
 
-        Checked on the reads themselves rather than only on the output, because a
-        misaligned band can still produce correct-looking pixels on uniform data.
+        A unit that re-read a region would still produce correct-looking pixels
+        for ``nearest``, and for ``area`` would double-count silently.
         """
-        import biopb_tensor_server.core.adapter_base as ab
-
-        adapter, reads = banded
-        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (16, 16))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
 
-        assert len(reads) > 1
-        for start, stop in reads[:-1]:
-            assert (stop[0] - start[0]) % 8 == 0, "interior band split a block"
-        # Only the last may be ragged, and here the extent divides evenly anyway.
-        assert reads[-1][1][0] == 64
+        seen = np.zeros((64, 64), dtype=int)
+        for start, stop in reads:
+            seen[start[0] : stop[0], start[1] : stop[1]] += 1
+        assert (seen == 1).all(), "units must tile without gap or overlap"
 
-    def test_bands_span_the_full_width(self, banded, monkeypatch):
-        """Never into tiles: #816 measured square retiling at +1.7 s."""
-        import biopb_tensor_server.core.adapter_base as ab
+    def test_a_grid_below_the_scale_grows_to_a_whole_block(self, counted, monkeypatch):
+        """A tile smaller than one reduction block cannot be read on its own.
 
-        adapter, reads = banded
-        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        It would reduce a fraction of a block and land a different pixel, so the
+        tile rounds up to the block rather than the grid being taken literally.
+        """
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (4, 4))
         reads.clear()
 
-        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
 
-        assert all((start[1], stop[1]) == (0, 64) for start, stop in reads)
+        assert reads, "expected at least one read"
+        for start, stop in reads:
+            assert stop[0] - start[0] == 8, "tile did not grow to a whole block"
+            assert start[0] % 8 == 0, "tile boundary landed inside a block"
 
-    def test_result_is_owned_even_for_nearest(self, banded, monkeypatch):
-        """Contract 4. downsample_block hands back a strided VIEW for nearest.
+    def test_a_block_above_the_grid_floors_the_tile(self, counted, monkeypatch):
+        """The dividing case: a tile inside a stored block re-reads that block.
+
+        Measured at 8-11x on a page-mode OME-TIFF and ~3x on a coarsely chunked
+        OME-Zarr, which is the whole reason the floor exists.
+        """
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (16, 16), block=(32, 32))
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
+
+        assert reads, "expected at least one read"
+        for start, stop in reads:
+            assert stop[0] - start[0] == 32, "tile was not raised to the block"
+            assert start[0] % 32 == 0, "tile boundary landed inside a stored block"
+
+    def test_a_block_below_the_grid_is_the_identity(self, counted, monkeypatch):
+        """The coalescing case: the grid is already a whole multiple of it."""
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (16, 16), block=(8, 8))
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
+
+        assert {stop[0] - start[0] for start, stop in reads} == {16}
+
+    def test_the_real_store_declares_its_own_chunk(self, adapter):
+        """Not monkeypatched: the fixture's zarr array reports its chunk grid."""
+        assert adapter.read_block_shape == adapter.zarr_array.chunks
+
+    def test_result_is_owned_even_for_nearest(self, counted, monkeypatch):
+        """Contract 4. ``downsample_block`` hands back a strided VIEW for nearest.
 
         A view reaching the chunk cache would pin its full-resolution base, which
-        is the memory the banding exists to bound.
+        is the memory streaming exists to bound.
         """
-        import biopb_tensor_server.core.adapter_base as ab
-
-        adapter, _ = banded
-        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
+        adapter, _ = counted
+        self._grid(monkeypatch, adapter, (16, 16))
 
         out = adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "nearest")
 
         assert out.base is None
 
-    def test_extent_inside_the_budget_reads_once(self, banded):
-        """Banding a chunk that already fits is pure overhead."""
-        adapter, reads = banded
+    def test_extent_inside_one_unit_reads_once(self, counted, monkeypatch):
+        """Streaming an extent that already fits is pure overhead."""
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (64, 64))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
 
         assert len(reads) == 1
 
-    def test_off_by_default(self, adapter, monkeypatch):
-        """Opt-in: the flag asserts a property of the reader, so it defaults off."""
-        reads = []
-        original = adapter.get_data
-        monkeypatch.setattr(
-            adapter, "get_data", lambda b: (reads.append(b), original(b))[1]
-        )
-        import biopb_tensor_server.core.adapter_base as ab
+    def test_streaming_needs_no_opt_in(self, counted, monkeypatch):
+        """It is the default: no flag, and nothing for an adapter to set."""
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (16, 16))
+        reads.clear()
 
-        monkeypatch.setattr(ab, "_SCALED_READ_BAND_BYTES", 256)
-
-        assert TensorAdapter.BANDED_SCALED_READ is False
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
-        assert len(reads) == 1
+
+        assert len(reads) > 1
+        assert not hasattr(TensorAdapter, "BANDED_SCALED_READ")
+
+    def test_float_area_streams_like_any_other(self, monkeypatch):
+        """Staged float means used to be the one reduction that could not stream.
+
+        They neither commute nor associate, so no accumulator can carry them
+        across units -- but whole blocks inside a unit need no accumulator, and
+        that is what block-aligned units guarantee. There is no longer any
+        reduction that has to read the extent whole.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            src = np.arange(64 * 64, dtype=np.float32).reshape(64, 64) % 997.0
+            arr = zarr.open_array(
+                f"{tmp}/f.zarr",
+                mode="w",
+                shape=(64, 64),
+                chunks=(16, 16),
+                dtype="float32",
+            )
+            arr[:] = src
+            adapter = ZarrAdapter(
+                zarr.open_array(f"{tmp}/f.zarr", mode="r"), "src", ["y", "x"]
+            )
+            self._grid(monkeypatch, adapter, (16, 16))
+            reads = []
+            original = adapter.get_data
+            adapter.get_data = lambda b: (
+                reads.append((tuple(b.start), tuple(b.stop))),
+                original(b),
+            )[1]
+            bounds = _bounds((0, 0), (64, 64))
+
+            out = adapter.get_scaled_data(bounds, (4, 4), "area")
+
+            assert len(reads) > 1, "a float area must stream, not read whole"
+            assert out.dtype == np.dtype("float32")
+            assert np.array_equal(out, _ds.downsample_block(src, (4, 4), "area"))

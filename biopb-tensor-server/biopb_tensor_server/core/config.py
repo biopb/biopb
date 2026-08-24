@@ -567,16 +567,6 @@ class PyramidConfig:
             "(Lx*Ly*Lz <= this**3); bounds a whole-volume 3-D read."
         },
     )
-    max_read_block_mb: int = field(
-        default=512,
-        metadata={
-            "help": "Ceiling, in MiB, on the source pixels one computed-scale "
-            "chunk may materialize. A resident-memory bound, not a throughput "
-            "knob: lower it on a memory-constrained server, raise it if reads "
-            "have headroom. The delivered chunk is separately bounded by the "
-            "Arrow wire ceiling."
-        },
-    )
 
 
 @dataclass

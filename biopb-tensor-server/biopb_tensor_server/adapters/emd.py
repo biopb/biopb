@@ -23,7 +23,7 @@ Chunk ID format:
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import dask.array as da
 import numpy as np
@@ -243,6 +243,12 @@ class EmdAdapter(TensorAdapter):
         adapter._tensor_name = field
         self._tensor_adapters[field] = adapter
         return adapter
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The dask block -- the ``native=`` seed of this field's grid."""
+        chunksize = getattr(self._data, "chunksize", None)
+        return tuple(int(size) for size in chunksize) if chunksize else None
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region from this signal's dask array (native h5py read)."""

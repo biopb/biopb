@@ -587,6 +587,11 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
                         bool(page.is_tiled),
                         page.tilewidth,
                         page.tilelength,
+                        # The actual strile: (tilelength, tilewidth) tiled,
+                        # (rowsperstrip, width) striped. The strip height is not
+                        # derivable from the tile fields, and it is what a
+                        # striped page is really quantized to.
+                        tuple(int(size) for size in page.chunks[-2:]),
                     )
             except OSError:
                 raise  # transport / recall failure -- retryable, do not swallow
@@ -655,8 +660,9 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # Tile / chunk geometry from members[0] (best effort; tiling may vary
         # across members, but the chunk grid is only a hint -- get_data reads each
         # file's own zarr and pads to the requested extent regardless).
-        _, _, _, _, m0_tiled, m0_tw, m0_tl = probes[members[0]]
+        _, _, _, _, m0_tiled, m0_tw, m0_tl, m0_strile = probes[members[0]]
         self.is_tiled = m0_tiled
+        self._strile = list(m0_strile)
         if self.is_tiled:
             self.tile_width = m0_tw
             self.tile_length = m0_tl
@@ -738,6 +744,21 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             )
             plane[: ry - ys, : rx - xs] = data
         return plane
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One strile: the tile when tiled, one strip's rows when striped.
+
+        Not the ``native=`` seed, which is the coarser per-page block
+        (``_spatial_chunk``, a whole page for a striped file). Reads go through
+        ``series.aszarr()`` in its default chunkmode, whose chunk is the strile,
+        so that is what a read is really quantized to -- and reporting the page
+        instead would floor every tile at a whole plane and read one where a
+        band of strips was asked for.
+        """
+        return tuple(
+            [1] * (len(self.full_shape) - 2) + [int(size) for size in self._strile]
+        )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.
@@ -1187,6 +1208,9 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             self._width = first_page.shape[1]
 
             # Tile info
+            # The strile is what a read is quantized to, tiled or striped; the
+            # transfer grid keeps seeding from the coarser per-page block.
+            self._strile = [int(size) for size in first_page.chunks[-2:]]
             if first_page.is_tiled:
                 self.is_tiled = True
                 self.tile_width = first_page.tilewidth
@@ -1292,6 +1316,21 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [catalog_entry(self.get_tensor_descriptor())]
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One strile: the tile when tiled, one strip's rows when striped.
+
+        Not the ``native=`` seed, which is the coarser per-page block
+        (``_spatial_chunk``, a whole page for a striped file). Reads go through
+        ``series.aszarr()`` in its default chunkmode, whose chunk is the strile,
+        so that is what a read is really quantized to -- and reporting the page
+        instead would floor every tile at a whole plane and read one where a
+        band of strips was asked for.
+        """
+        return tuple(
+            [1] * (len(self.full_shape) - 2) + [int(size) for size in self._strile]
+        )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.

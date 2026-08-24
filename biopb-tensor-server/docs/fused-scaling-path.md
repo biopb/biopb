@@ -113,13 +113,14 @@ different risk:
 
 ## 2. Where the code is today
 
+Phases 0 and 1 have landed; this section describes the tree as it now stands.
+
 ```python
-# core/adapter_base.py:855 -- resolve_chunk_data.compute_fn
-result_arr = self.get_data(bounds)
+# core/adapter_base.py -- resolve_chunk_data.compute_fn
 if is_scaled_chunk_flag:
-    scale_hint = decode_scale_info(chunk_id)
-    reduction_method = decode_reduction_method(chunk_id)
-    result_arr = downsample_block(result_arr, scale_hint, reduction_method)
+    result_arr = self.get_scaled_data(bounds, scale_hint, reduction_method)
+else:
+    result_arr = self.get_data(bounds)
 result = pack_chunk_batch(result_arr)
 ```
 
@@ -137,9 +138,11 @@ change smaller than #640 assumed:
   normalisation for free; no scale hint has to be permuted by hand.
 - **`RemoteTensorAdapter` and `CachedSourceAdapter` never reach it.** The first
   forwards the chunk_id upstream; the second has no backend (`get_data` raises).
-- **The extent is a multiple of the scale except at the tensor edge.**
-  `scaled_virtual_chunk_size` grows it in whole `lcm(transfer, scale)` units, so
-  ragged blocks only occur where the extent ends on the tensor's own end.
+- **The extent is a multiple of the scale except at the tensor edge.** Still
+  true, by a simpler route than when this was written: `scaled_virtual_chunk_size`
+  is now `transfer * scale` clamped to the tensor (§12), with no byte target, no
+  coalescing and no `lcm` — so ragged blocks still only occur where the extent
+  ends on the tensor's own end.
 
 ## 3. Phase 0 — the block-sum kernel (no seam change)
 
@@ -354,10 +357,20 @@ class ScaledReducer:
 `compose.py` then imports from here, and the two paths cannot drift on which
 inputs qualify.
 
-## 5. Phase 1.5 — a banded default (optional, per adapter)
+## 5. Phase 1.5 — row bands (shipped, then withdrawn; now a deferred shape)
 
-W2 without any per-format code: the base `get_scaled_data` splits `bounds` into
-row bands, calls its own `get_data` per band, and folds each.
+**Status.** Shipped in #824 behind a `BANDED_SCALED_READ` class flag that no
+adapter ever set, and removed in #825 when streaming became the default. The
+measurements below stand and the reasoning was sound; what it got wrong was the
+*mechanism*, and instructively so — see the note at the end of this section.
+
+A row band remains the shape a **contiguous** reader wants, and taking it is
+still worth 1852 -> 592 ms warm on an ND2 at area/8. It is deferred, not
+rejected: `read_block_shape is None` (§12) now identifies exactly the adapters
+it applies to, so it no longer needs a flag of its own.
+
+The idea was W2 without any per-format code: the base `get_scaled_data` splits
+`bounds` into row bands, calls its own `get_data` per band, and folds each.
 
 Measured on the ND2 chunk above (band = 256 source rows, ~7 MiB):
 
@@ -414,21 +427,24 @@ move it should be *derived* from cache size, not configured.
 
 ### It does not become a second `max_read_block_mb`
 
-`PyramidConfig.max_read_block_mb` (default 512) already exists for this concern —
+**Settled, and in this section's favour:** #825 removed `max_read_block_mb`
+outright rather than relaxing it. The argument below is why. It stands as
+written, with the ceiling now in the past tense.
+
+`PyramidConfig.max_read_block_mb` (default 512) existed for this concern —
 "Ceiling, in MiB, on the source pixels one computed-scale chunk may materialize.
-A resident-memory bound, not a throughput knob". It reaches that bound by a
-different route: it clamps the virtual chunk size at plan time
-(`scaled_virtual_chunk_size`), so a memory-constrained server gets **smaller
+A resident-memory bound, not a throughput knob". It reached that bound by a
+different route: it clamped the virtual chunk size at plan time
+(`scaled_virtual_chunk_size`), so a memory-constrained server got **smaller
 chunks and more round trips** — and this read path is latency-bound, capped
 around 5.4k Flight dispatches/s.
 
-Banding bounds the same residency by streaming instead, at no round-trip cost.
-The two must not both become knobs for one concern. Once an adapter bands, the
+Streaming bounds the same residency without a plan-time clamp, at no round-trip
+cost. The two must not both become knobs for one concern. Once a read streams, the
 extent is never resident, so `max_read_block_mb`'s justification no longer
-applies to it and the clamp is only costing round trips: a banded adapter should
-be allowed to **relax** that ceiling. That is a throughput win this plan can
-claim on top of the memory one, and it is the reason the band budget stays
-internal — the config surface for "how much may one read materialize" is already
+applied and the clamp was only costing round trips: it should be **relaxed** —
+and in the event, removed. That is a throughput win this plan can claim on top
+of the memory one, and it is the reason the band budget stays internal — the config surface for "how much may one read materialize" is already
 taken, and adding a second one would leave an operator with two dials for one
 outcome and no way to tell them apart.
 
@@ -457,17 +473,25 @@ debugging) than on a tuning dial.
   read; that needs the reader to skip rows (§6), since doing it generically would
   mean one call per picked row.
 - **Only where a band read is proportionally cheaper than the extent read.**
-  True for mmap/uncompressed sources (ND2, MRC, plain TIFF via the `aszarr` page
-  store, zarr, HDF5). False where the reader must decode a whole plane per call
-  — banding there multiplies decode work by the band count. So this is opt-in: a
-  class flag (`BANDED_SCALED_READ`), not a behaviour change for every adapter at
-  once. An adapter that already overrides `get_scaled_data` (Phase 2) ignores it
-  by construction, since it never calls `super()`.
+  True for mmap sources (ND2, MRC, NIfTI). False where the reader must decode a
+  whole plane per call — banding there multiplies decode work by the band count.
 
-  The flag stays a class attribute rather than config on purpose: it asserts a
-  property of the *reader* ("a band read costs proportionally less than the
-  extent read"), which an operator has no way to know — nobody outside the code
-  knows whether libCZI decodes a whole plane per call.
+  This bullet is the one that matters, and it turned out to be the whole
+  problem rather than a caveat on it. Two things it got wrong: it put plain TIFF
+  "via the `aszarr` page store" and zarr/HDF5 on the *cheap* side, when a
+  page-mode TIFF is the single worst case there is (§12.3, a flat cost per read
+  regardless of size) and a coarsely chunked zarr is nearly as bad; and it made
+  the property a per-class flag, which is unfalsifiable by omission — an adapter
+  that says nothing gets the aggressive answer silently, since every value stays
+  bit-identical either way.
+
+  §12 keeps the economics and replaces the mechanism: the adapter reports the
+  granularity its reads are quantized to, the streaming tile is floored at it,
+  and a classification test refuses to let a new adapter default in unlisted.
+  The instinct that "an operator has no way to know whether libCZI decodes a
+  whole plane per call" was right — and so was the choice of libCZI as the
+  example, since it turned out to be one of the three adapters whose answer is
+  not its own `native=` seed.
 
 - **Two gaps, stated rather than assumed.** Every number here is warm page cache,
   median of 3; the cold path is unmeasured (banding should still win there, since
@@ -497,7 +521,7 @@ debugging) than on a tuning dial.
   each band several discontiguous runs (51 instead of 3 for `[1, 3, 1, Y, X]`),
   which is the likeliest way to lose readahead; and an adapter whose `get_data`
   does per-call work — open, stat, seek, decode — swamps any filesystem effect,
-  which is the case `BANDED_SCALED_READ` exists to exclude.
+  which is the case a declared read granularity (§12) exists to exclude.
 
 ## 6. Phase 2 — per-adapter fusion
 
@@ -632,7 +656,7 @@ become the reason the pyramid route never lands.
 
 ## 7. Tests
 
-- **Kernel (Phase 0).** Extend the existing `legacy_downsample_block` sweep in
+- **Kernel (Phase 0).** *Shipped.* Extend the existing `legacy_downsample_block` sweep in
   `tests/downsample_test.py` across the block-size crossover, 2D and 3D, every
   integer dtype. No new oracle.
 - **Kernel overflow.** A saturated case per dtype — every element at `iinfo.max`,
@@ -641,7 +665,7 @@ become the reason the pyramid route never lands.
   strided kernel needs the same cases pointed at it, because its failure mode is
   a silent wrap rather than an exception. This is the test that fails if someone
   later replaces the sized accumulator with a literal `np.uint32`.
-- **Seam (Phase 1).** A spy asserting `resolve_chunk_data` routes a scaled
+- **Seam (Phase 1).** *Shipped* (`tests/scaled_data_seam_test.py`). A spy asserting `resolve_chunk_data` routes a scaled
   chunk_id through `get_scaled_data` and an unscaled one through `get_data`; and
   that the base implementation is byte-identical to the old inline path.
 - **Differential suite (Phase 2), new `tests/scaled_read_test.py`.** For every
@@ -662,12 +686,15 @@ become the reason the pyramid route never lands.
 - **Scaled sequence axes.** A `nearest` read with `scale_hint > 1` on T or Z must
   read only the contributing frames — assert on the reader's call count, not on
   pixels, since reading and discarding gives the same answer.
-- **Fallback.** Float `area`, scale 3, and `precompute` must reach
-  `super().get_scaled_data` — assert by spying on `downsample_block`, not by
-  comparing pixels (which would pass either way).
-- **Memory.** A precache/demand-tier test that peak allocation during a warm
-  pass stays bounded by the band budget rather than tracking
-  `max_read_block_mb`.
+- **Fallback.** *Mostly obsolete.* Float `area` and non-dyadic scales no longer
+  fall back at all: block-aligned tiles make the streamed fold bit-identical for
+  them, so there is nothing left to decline (`tests/stream_reduce_test.py` sweeps
+  exactly those cases). The bullet survives only for `precompute`, and only for a
+  Phase-2 adapter that overrides the method — assert by spying on
+  `downsample_block`, not by comparing pixels, which would pass either way.
+- **Memory.** Still wanted, with both of its original referents gone: peak
+  allocation during a warm precache pass should be bounded by one streaming tile
+  (§12), there being no band budget and no `max_read_block_mb` left to track.
 
 ## 8. Benchmarks
 
@@ -744,8 +771,8 @@ The tier is gone, the workload it named is not. A cache warm plans with no
 measured 20.1 GB decoded for a 200-frame timelapse at the observed level, and
 the restored precache worker does the same walk at the coarsest one. Fusion does
 not shorten that walk, it bounds what it holds while walking — anonymous
-residency per in-flight read goes from the extent (up to `max_read_block_mb`) to
-one band, which is the half of peak RSS a server OOMs on (§1). Precache shipping
+residency per in-flight read goes from the whole extent to one streaming tile,
+which is the half of peak RSS a server OOMs on (§1). Precache shipping
 off by default lowers how often that walk happens, not what it costs when it
 does.
 
@@ -757,30 +784,39 @@ integer path those PRs introduced.
 
 ## 10. Sequencing
 
-| PR | content | risk | independent? |
+| PR | content | risk | status |
 | --- | --- | --- | --- |
-| 1 | Phase 0 kernel + gate + sweep | low (existing bit-identity oracle) | yes |
-| 2 | `get_scaled_data` seam, ABC contract, `ScaledReducer` extracted from `compose.py` | low (default preserves behaviour) | needs 1 for the kernel, not for correctness |
-| 3a | ND2 fused `nearest` (strided pick) | low-medium — exact by construction, no accumulator | needs 2 |
-| 3b | ND2 fused `area` (banded fold) | medium (lock scope, frame indexing, edge pads) | needs 2, 3a |
-| 4 | banded default + opt-in flag | medium (per-adapter read economics) | needs 2 |
-| 5 | OME-TIFF / TIFF per-page fold | medium | needs 2 |
-| 6a | CZI fused `nearest` via `read(zoom=)` behind the method gate | low-medium; measured 6.5-11.2x | needs 2 |
-| 6b | CZI banded ROI fold for `area` | medium | needs 1 (for the kernel gate) and 2 |
-| 6c | CZI native pyramid route (`precompute`) | medium; blocked on a pyramidal fixture | needs 2 |
+| 1 | Phase 0 kernel + gate + sweep | low (existing bit-identity oracle) | **shipped** (#820) |
+| 2 | `get_scaled_data` seam + ABC contract | low (default preserves behaviour) | **shipped** (#824) |
+| 2b | streaming default, the planner rule, read-granularity floor (§12) | medium | **shipped** (#825) |
+| 4 | banded default + opt-in flag | medium (per-adapter read economics) | **superseded** — shipped in #824, withdrawn in #825; the shape survives as a deferred optimization (§5) |
+| 5 | OME-TIFF / TIFF per-page fold | medium | **largely subsumed** — the page floor already makes the tile one page |
+| 3a | ND2 fused `nearest` (strided pick) | low-medium — exact by construction, no accumulator | remaining |
+| 6a | CZI fused `nearest` via `read(zoom=)` behind the method gate | low-medium; measured 6.5-11.2x | remaining |
+| 3b | ND2 fused `area` (banded fold) | medium (lock scope, frame indexing, edge pads) | remaining; needs 3a |
+| 6b | CZI banded ROI fold for `area` | medium | remaining |
+| 4b | row bands for contiguous readers, keyed on `read_block_shape is None` | low — no new declaration needed | remaining; 1852 -> 592 ms on ND2 at area/8 |
+| 6c | CZI native pyramid route (`precompute`) | medium; blocked on a pyramidal fixture | remaining |
 
-By payoff per unit of risk the order is **1, 2, 3a, 6a, 3b/6b, 4, 5, 6c** — PR 1
-because it is the broadest win and gated by an oracle that already exists, then
-the seam, then the two `nearest` fusions (largest ratios, exact by construction).
-6a no longer carries a client-opt-in question: the default flip landed first, so
-both `nearest` fusions sit on the path an unqualified read already takes.
+What is left is **3a, 6a, 3b/6b, 4b, 6c** — the two `nearest` fusions first
+(largest ratios, exact by construction), then the `area` folds, then the band
+shape, then the pyramid route. Neither `nearest` fusion carries a client-opt-in
+question: the default flip landed first, so both sit on the path an unqualified
+read already takes.
+
+Phase 2's case has narrowed since this table was written. Half its argument was
+bounded memory, and streaming now delivers that generically for every adapter —
+so what remains is purely speed, and should be justified per adapter on that
+basis alone.
 
 ## 11. Non-goals and open questions
 
-- **`max_read_block_mb` should probably grow once memory is bounded** — its
-  whole job is capping resident bytes, and a fused read no longer holds them.
-  Bigger extents mean fewer chunk_ids and fewer reads. Deliberately out of scope
-  here: it changes minted chunk_ids and therefore cache keys.
+- ~~**`max_read_block_mb` should probably grow once memory is bounded**~~ —
+  **resolved** in #825, and by deletion rather than by growth. Once a scaled read
+  streams its extent there are no resident bytes to cap, so the knob went, along
+  with `MAX_READ_BLOCK_BYTES` and the parameter threading it. The chunk_id /
+  cache-key churn this bullet worried about did happen and was the point: the
+  extent rule is now `transfer * scale` clamped.
 - **`_pad_array_edge`'s whole-array copy** at tensor edges (§3).
 - **float32 `area` fusion.** Staged means do not reassociate; there is no
   bit-identical streamed form. Would need an explicit accuracy trade, as #686
@@ -790,8 +826,97 @@ both `nearest` fusions sit on the path an unqualified read already takes.
   skips. The measured wins are warm-cache, so they are memcpy and cache-line
   wins that are certain; the cold-read saving is plausible and unmeasured. Worth
   a cold-cache arm in the bench before quoting an I/O number.
-- **Measured on two formats, warm cache.** ND2 (real file) and CZI (synthetic,
-  no stored pyramid) are measured; the TIFF/zarr rows in §6 are still inference
-  from their read shapes, and #640's own closing caveat ("worth measuring per adapter before generalizing") still
-  applies. `docs/dask-bypass-benchmarks.md` is the precedent for doing that
-  measurement before the code.
+- **Measured per format — partly discharged.** ND2 (real file) and CZI
+  (synthetic, no stored pyramid) were measured for §6; #825 added TIFF and zarr,
+  cold and warm, via `benchmarks/bench_plane_latency.py` (§12.2), which is what
+  turned the §5 inference about "plain TIFF via the `aszarr` page store" into a
+  measured 8-11x the other way. #640's closing caveat — *worth measuring per
+  adapter before generalizing* — has now been paid twice and was right both
+  times. Still unmeasured: DICOM, NDTiff, and the non-ND2 BioIO formats, whose
+  §12 declarations are reasoned from their read paths rather than benchmarked.
+
+## 12. Read granularity — the declaration, and where each adapter stands
+
+The streamed scaled read (§4) tiles an extent at the transfer grid. That grid is
+*derived* from the backend's own read granularity: an adapter passes it as
+`native=` and `compute_transfer_chunk_size` either **coalesces** it up to the
+8 MiB target or **divides** it down. Only dividing is a problem — the tile then
+lands inside a block the backend can only read whole, and every tile overlapping
+it pays for all of it. So `read_block_shape` reports that granularity and the
+tile is floored at it, which is the identity wherever coalescing happened.
+
+Unfloored, dividing cost **8-11x** on a tiled 8192² OME-TIFF page and **~3x** on
+an OME-Zarr chunked at 4096² (compressed and raw alike). Floored, both return to
+parity or better; see §12.2.
+
+**The declaration is a judgement, not the seed.** The seed is an *upper bound* on
+granularity and several readers beat it, so each adapter answers "what can my
+reader not read below?" rather than copying `native=`:
+
+| adapter | `native=` seed | declared block | why they differ |
+| --- | --- | --- | --- |
+| `ZarrAdapter` (+ `OmeZarr`, `_HcsField`, `_QptiffLevel`) | store chunk | store chunk | — |
+| `Hdf5Adapter` | dataset chunk | dataset chunk, `None` when contiguous | a contiguous hyperslab is read directly |
+| `OmeTiffAdapter` (+ `_TifffileAdapterBase`, `Tiff`, `Lsm`) | whole page | whole page | — |
+| `TiffSequenceAdapter`, `MicroManagerLegacyAdapter` | per-page block (page when striped) | **one strile** | reads go through `aszarr()`'s default chunkmode, whose chunk is the strile; the seed's page would floor a band of strips at a whole plane |
+| `DicomAdapter`, `DicomSeriesAdapter` | one frame | one frame | — |
+| `NdTiffAdapter`, `EmdAdapter`, `_BioioAdapterBase` | dask block | dask block | a slice materialises whole blocks |
+| `CziAdapter` | one plane | **`None`** | a libCZI ROI read composes only the subblocks it touches; the seed exists to stop a transfer chunk spanning planes, and the real granularity (the subblock) could only coalesce |
+| `NikonAdapter` (ND2) | whole C/Y/X frame | **`None`** | `read_frame` returns an mmap view and the crop copies only what is asked; flooring at the frame would make every scaled read materialise 1.1 GiB on a 14234² scene |
+| `MrcAdapter`, `NiftiAdapter` | — | `None` | mmap; a crop costs its own pages |
+| `RemoteTensorAdapter`, `CachedSourceAdapter` | — | `None` | arbitrary bounds forwarded upstream / served by chunk_id only |
+
+Declaring wrongly is **silent** — every value stays bit-identical, the read
+merely costs more — so `tests/adapter_read_block_test.py` requires every
+`TensorAdapter` subclass to appear in one list or the other, with its reason. A
+new adapter cannot inherit the base `None` by accident.
+
+### 12.1 Divide or coalesce, on real sources
+
+| source | adapter | grid | block | | tile @ scale 8 |
+| --- | --- | --- | --- | --- | --- |
+| `input_t35.tif` | `TiffAdapter` | 5032² | 5032² | coalesce | 5032² |
+| `big8k.ome.tif` (tiled) | `OmeTiffAdapter` | 2048² | 8192² | **divide** | 8192² |
+| `striped.ome.tif` | `OmeTiffAdapter` | 2048² | 4096² | **divide** | 4096² |
+| coarse OME-Zarr | `OmeZarrAdapter` | 2048² | 4096² | **divide** | 4096² |
+| `flat-blosc` OME-Zarr | `OmeZarrAdapter` | 2048² | 512² | coalesce | 2048² |
+| `ND040.nd2` | `NikonAdapter` | 1182² | none | — | 1184² |
+
+### 12.2 Effect, first-read latency for one X/Y plane
+
+Warm, `benchmarks/bench_plane_latency.py`, against `dev` in the same session:
+
+| source | `dev` | tile, unfloored | tile, floored |
+| --- | ---: | ---: | ---: |
+| tiled OME-TIFF 8192² | 154-206 ms | 1719-1800 ms | 157-206 ms |
+| coarse OME-Zarr, raw | 89-144 ms | 273-313 ms | **84-123 ms** |
+| coarse OME-Zarr, blosc | 118-175 ms | 369-416 ms | **94-131 ms** |
+| `input_t35.tif` cold nearest/32 | 1227 ms, 483 MiB, 10 Z | 50 ms | **46 ms, 48 MiB, 1 Z** |
+| `ND040.nd2` warm area/8 | 1944 ms | 677 ms | 677 ms |
+
+### 12.3 Why OME-TIFF's block really is the whole page
+
+`ZarrTiffStore._getitem` branches on chunkmode. Under `chunkmode="page"` it calls
+`page.asarray()` — the entire page is decoded and the window sliced out of it —
+so cost is flat in the request: a 256² window costs 108 ms against 166 ms for
+the whole 8192² page. Nothing caches the result (`FileCache` holds file handles,
+`TiffPages._cache` holds parsed IFDs, `ZarrStore._store` holds only `.zarray`
+metadata, and no `LRUStoreCache` wraps the array), so N tiles cost N page
+decodes.
+
+Switching to the default `STRILE` chunkmode makes reads proportional and was
+measured 74x cheaper for a 2048² window — but it is **not** a general
+improvement, because page mode buys two things a per-strile path gives up:
+
+| layout (4096², whole page) | page mode | `STRILE` |
+| --- | ---: | ---: |
+| strips of 1 row | 12.6 ms | 114.5 ms |
+| tiles 512, uncompressed | 38.7 ms | 21.9 ms |
+| tiles 512, zlib | 49.6 ms | 77.7 ms |
+| tiles 512, JPEG | 35.5 ms | 85.7 ms |
+
+Coalescing (4096 one-row strips become one buffered pass, 9x) and **threaded
+decode** (`maxworkers` applies only to chunkmode=2). Forcing `maxworkers=1`
+reproduces the `STRILE` figure exactly — 79.3 ms zlib, 87.6 ms JPEG — so the
+gap is lost decode parallelism, not extra work. Page mode is the right mode for
+reading a page; the page is therefore the block.

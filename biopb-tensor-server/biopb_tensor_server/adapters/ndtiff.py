@@ -408,6 +408,15 @@ class NdTiffAdapter(TensorAdapter):
         """List all tensors - single tensor source."""
         return [catalog_entry(self.get_tensor_descriptor())]
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One plane -- the ``native=`` seed above, and the dask block behind it.
+
+        A read slices the dask array, which materialises whole blocks whatever
+        window is asked for.
+        """
+        return tuple([1] * (len(self._shape) - 2) + list(self._shape[-2:]))
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the dask array.
 

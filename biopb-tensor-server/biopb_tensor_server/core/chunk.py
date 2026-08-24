@@ -11,7 +11,6 @@ import logging
 import os
 import struct
 from dataclasses import dataclass
-from math import lcm
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -795,96 +794,49 @@ def compute_safe_chunk_size(
     return tuple(safe_size)
 
 
-# Hard ceiling on the source region a single scaled chunk materializes
-# server-side. This is a resident-memory bound, not a throughput target -- the
-# read block wants to be as large as the reduction allows, and this is what
-# stops it from being unbounded. It bounds a working set rather than an Arrow
-# batch, so it is far larger than PREFERRED_ARROW_BATCH_BYTES.
-MAX_READ_BLOCK_BYTES = 512 * 1024 * 1024
-
-
 def scaled_virtual_chunk_size(
     transfer_chunk_size: Tuple[int, ...],
     tensor_shape: Tuple[int, ...],
     scale_hint: Tuple[int, ...],
     dtype: str,
-    dim_labels: Optional[List[str]],
+    dim_labels: Optional[List[str]] = None,
     output_dtype: Optional[str] = None,
-    max_read_block_bytes: int = MAX_READ_BLOCK_BYTES,
-    maximum_bytes: int = MAX_ARROW_BATCH_BYTES,
 ) -> Tuple[int, ...]:
-    """Size the source extent one scaled chunk reads.
+    """Size the source extent one scaled chunk reads: ``transfer * scale``.
 
-    A scaled chunk reads ``virtual`` source elements to deliver ``virtual //
-    scale`` of them, so pinning the read extent to the full-resolution transfer
-    size shrinks the payload by the scale factor per axis while doing identical
-    read work -- a 1/32 read delivered 1/1024 of the transfer target
-    (biopb/biopb#805). Growing the extent in whole units restores it.
+    A scaled chunk reads ``extent`` source elements to deliver ``extent //
+    scale`` of them, so pinning the extent to the full-resolution transfer size
+    shrinks the payload by the scale factor per axis while doing identical read
+    work -- a 1/32 read delivered 1/1024 of the transfer target
+    (biopb/biopb#805). Multiplying by the scale restores it exactly: the
+    delivered chunk is the transfer chunk, and the endpoint count falls with the
+    scale because each chunk covers ``scale`` times more source per axis.
 
-    The extent is therefore bounded by ``transfer * scale`` per axis, so the
-    delivered chunk stays at the transfer target and the endpoint count falls
-    with the scale, and separately by ``max_read_block_bytes``, so a deep level
-    cannot take that to an unbounded read.
+    The product is a multiple of both the scale and the transfer extent, so
+    chunks tile without splitting a reduction block and stay aligned to the grid
+    the adapter reports. Clamping to the tensor keeps that: the clamp can only
+    bite on the last chunk of an axis, which ends at the tensor's end anyway.
 
-    Growth happens in whole units of ``lcm(transfer, scale)`` -- a multiple of
-    the scale, so the logical chunks tile without overlapping, and a multiple of
-    the transfer extent, so reads stay aligned to the grid the adapter reports.
-    It is clamped by ``max_read_block_bytes``, which exists to bound resident
-    memory rather than to tune throughput. Nothing holds a minimum endpoint
-    count: ``transfer * scale`` already pins the delivered chunk to the transfer
-    target, so a read that fits in one chunk is one chunk.
+    **Nothing else shapes it** -- no byte target, no coalescing, no memory
+    ceiling -- because ``get_scaled_data`` streams the extent rather than
+    materialising it (``core/stream_reduce.py``): residency is one unit, so the
+    extent is free to be as large as the tensor. What a byte target used to buy,
+    a delivered chunk at the transfer size, ``transfer * scale`` gives exactly;
+    what it cost was growth along whatever axis happened to be free once the
+    scaled axes saturated against the tensor. On a 12-plane TIFF at scale 32
+    that was ten Z planes -- 483 MiB read to deliver one requested plane's
+    0.05 MiB, where this reads 48 MiB.
 
-    Growth uses the generic axis priority, but it moves in whole units, so an
-    adapter that folded its physical layout into the transfer grid keeps it
-    here: an interleaved ND2's ``[1, C, 1, y, x]`` unit can only be multiplied,
-    never cut, so C stays whole through a scaled read too (biopb/biopb#809).
+    ``dim_labels`` and ``output_dtype`` are vestigial: they described where the
+    coalescing was allowed to grow and how wide the result would land, and
+    nothing grows any more.
     """
-    unit = tuple(
-        min(lcm(int(transfer), max(1, int(scale))), int(shape))
-        for transfer, scale, shape in zip(
+    return tuple(
+        min(max(1, int(transfer)) * max(1, int(scale)), int(dim))
+        for transfer, scale, dim in zip(
             transfer_chunk_size, scale_hint, tensor_shape, strict=True
         )
     )
-    scale_product = 1
-    for scale in scale_hint:
-        scale_product *= max(1, int(scale))
-    # Ceiling 1, and the one that decides the shape of a normal read: enough
-    # source pixels to reduce to a transfer-sized chunk, and no more. Without it
-    # the block grows to whatever memory allows and the *delivered* chunk
-    # overshoots the target compute_transfer_chunk_size picked -- at a 512 MiB
-    # memory ceiling a 1/2 read delivered 62.9 MB against an 8 MB target. It is
-    # also what makes the endpoint count fall with the scale: a 1/S read has 1/S
-    # the output pixels, so at a fixed delivered size it needs 1/S the reads.
-    scaled_target = estimate_chunk_bytes(transfer_chunk_size, dtype) * scale_product
-    # Ceiling 2: resident memory, the operator's knob.
-    # Ceiling 3: a backstop. The reduced block crosses the wire, so it must clear
-    # the Arrow bound. scaled_target already implies this while get_output_dtype
-    # preserves width, but it takes a reduction_method, so a future widening
-    # method would not silently breach the wire.
-    source_itemsize = np.dtype(dtype).itemsize
-    result_itemsize = np.dtype(output_dtype or dtype).itemsize
-    wire_limit = (
-        maximum_bytes * scale_product * source_itemsize // max(1, result_itemsize)
-    )
-    # An lcm unit can exceed the hard limits on its own: nothing bounds a
-    # client's scale_hint, and a scale coprime with the transfer extent makes
-    # lcm() explode -- scale (5, 7, 11) against a 64x2048x2048 transfer chunk
-    # asks for a 129 GB block. Alignment to the transfer grid is a performance
-    # nicety; any multiple of the scale tiles correctly. So drop the alignment
-    # rather than the memory bound.
-    hard_limit = min(max_read_block_bytes, wire_limit)
-    if estimate_chunk_bytes(unit, dtype) > hard_limit:
-        unit = tuple(
-            min(max(1, int(scale)), int(extent))
-            for scale, extent in zip(scale_hint, tensor_shape, strict=True)
-        )
-    # One output element per axis is the floor -- below it a chunk delivers
-    # nothing -- so an extreme scale can still exceed the limits here.
-    target_bytes = max(
-        estimate_chunk_bytes(unit, dtype),
-        min(scaled_target, max_read_block_bytes, wire_limit),
-    )
-    return _coalesce_chunk_size(unit, tensor_shape, dtype, dim_labels, target_bytes)
 
 
 def default_transfer_chunk_shape(
