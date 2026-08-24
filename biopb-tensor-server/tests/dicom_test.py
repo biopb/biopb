@@ -328,6 +328,123 @@ class TestDicomAdapter:
             assert adapter._dtype == "int16"
 
 
+class TestDicomAdapterReads:
+    """get_data decodes per frame and the adapter retains no pixels (#821)."""
+
+    def test_single_frame_subregion(self):
+        import pydicom
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcm_path = Path(tmpdir) / "test.dcm"
+            expected = np.random.randint(0, 4000, size=(24, 32), dtype="uint16")
+            create_synthetic_dicom(dcm_path, rows=24, cols=32, pixel_data=expected)
+
+            adapter = DicomAdapter(
+                pydicom.dcmread(str(dcm_path), stop_before_pixels=True),
+                "test_source",
+                source_url=str(dcm_path),
+            )
+            got = adapter.get_data(ChunkBounds(start=[4, 5], stop=[20, 30]))
+            assert np.array_equal(got, expected[4:20, 5:30])
+
+    def test_multiframe_subregion(self):
+        import pydicom
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcm_path = Path(tmpdir) / "multiframe.dcm"
+            expected = np.random.randint(0, 4000, size=(6, 16, 20), dtype="uint16")
+            create_synthetic_dicom(
+                dcm_path, rows=16, cols=20, pixel_data=expected, multi_frame=6
+            )
+
+            adapter = DicomAdapter(
+                pydicom.dcmread(str(dcm_path), stop_before_pixels=True),
+                "test_multiframe",
+                source_url=str(dcm_path),
+            )
+            got = adapter.get_data(ChunkBounds(start=[1, 2, 3], stop=[4, 10, 15]))
+            assert np.array_equal(got, expected[1:4, 2:10, 3:15])
+            full = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[6, 16, 20]))
+            assert np.array_equal(full, expected)
+
+    def test_registered_source_retains_no_pixels(self):
+        """A catalogued source -- read or unread -- holds headers only.
+
+        The regression this guards: ``create_from_config`` used to read with
+        pixels and ``get_data`` used to go through ``Dataset.pixel_array``, which
+        memoizes the decode of every frame onto the retained dataset.
+        """
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.core.config import SourceConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcm_path = Path(tmpdir) / "multiframe.dcm"
+            create_synthetic_dicom(dcm_path, rows=16, cols=16, multi_frame=8)
+
+            adapter = DicomAdapter.create_from_config(
+                SourceConfig(url=str(dcm_path), type="dicom", source_id="mf")
+            )
+            assert "PixelData" not in adapter.ds
+
+            adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 16, 16]))
+            assert "PixelData" not in adapter.ds
+            # pydicom seeds `_pixel_array` to None; a memoized decode is a value.
+            assert adapter.ds._pixel_array is None
+
+    def test_read_decodes_only_the_covered_frames(self, monkeypatch):
+        """A one-frame request decodes one frame, not the whole study."""
+        import pydicom.pixels
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.core.config import SourceConfig
+
+        real_iter_pixels = pydicom.pixels.iter_pixels
+        decoded = []
+
+        def counting_iter_pixels(src, **kwargs):
+            for frame in real_iter_pixels(src, **kwargs):
+                decoded.append(frame)
+                yield frame
+
+        monkeypatch.setattr(pydicom.pixels, "iter_pixels", counting_iter_pixels)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcm_path = Path(tmpdir) / "multiframe.dcm"
+            create_synthetic_dicom(dcm_path, rows=16, cols=16, multi_frame=32)
+
+            adapter = DicomAdapter.create_from_config(
+                SourceConfig(url=str(dcm_path), type="dicom", source_id="mf")
+            )
+            adapter.get_data(ChunkBounds(start=[5, 0, 0], stop=[6, 16, 16]))
+            assert len(decoded) == 1
+
+            decoded.clear()
+            adapter.get_data(ChunkBounds(start=[5, 0, 0], stop=[9, 16, 16]))
+            assert len(decoded) == 4
+
+    def test_pixel_bearing_dataset_is_stripped(self):
+        """Constructing from a full dataset keeps the header, drops the pixels."""
+        import pydicom
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcm_path = Path(tmpdir) / "test.dcm"
+            expected = np.random.randint(0, 4000, size=(16, 16), dtype="uint16")
+            create_synthetic_dicom(
+                dcm_path, rows=16, cols=16, pixel_data=expected, patient_id="P1"
+            )
+
+            adapter = DicomAdapter(pydicom.dcmread(str(dcm_path)), "test_source")
+
+            assert "PixelData" not in adapter.ds
+            # Header survives the strip: shape, metadata and the read path.
+            assert adapter._shape == (16, 16)
+            assert adapter.get_metadata()["patient"]["PatientID"] == "P1"
+            got = adapter.get_data(ChunkBounds(start=[0, 0], stop=[16, 16]))
+            assert np.array_equal(got, expected)
+
+
 class TestDicomSeriesAdapterClaim:
     """Tests for DicomSeriesAdapter.claim()."""
 
@@ -500,6 +617,38 @@ class TestDicomSeriesAdapter:
             assert metadata["series"]["num_slices"] == num_slices
             assert metadata["spatial"]["pixel_spacing_mm"] == [0.5, 0.5]
             assert metadata["patient"]["PatientID"] == "PATIENT123"
+
+
+class TestDicomSeriesAdapterReads:
+    """get_data stacks the covered slice files (#821)."""
+
+    def test_single_and_multi_slice(self):
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from pydicom.uid import generate_uid
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            series_uid = generate_uid()
+            slices = []
+            for i in range(4):
+                data = np.random.randint(0, 4000, size=(12, 14), dtype="uint16")
+                slices.append(data)
+                create_synthetic_dicom(
+                    Path(tmpdir) / f"slice_{i}.dcm",
+                    rows=12,
+                    cols=14,
+                    pixel_data=data,
+                    series_uid=series_uid,
+                    instance_number=i,
+                )
+            volume = np.stack(slices)
+
+            adapter = DicomSeriesAdapter(tmpdir, "series")
+
+            one = adapter.get_data(ChunkBounds(start=[2, 0, 0], stop=[3, 12, 14]))
+            assert np.array_equal(one, volume[2])
+
+            many = adapter.get_data(ChunkBounds(start=[1, 2, 3], stop=[4, 10, 12]))
+            assert np.array_equal(many, volume[1:4, 2:10, 3:12])
 
 
 class TestDicomContentVersion:
