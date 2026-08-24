@@ -464,6 +464,16 @@ class DicomAdapter(TensorAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [catalog_entry(self.get_tensor_descriptor())]
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One frame, which is the least ``pixel_array`` can hand back.
+
+        ``get_data`` decodes through ``ds.pixel_array`` and slices the result, so
+        a window costs at least its frame; a multi-frame dataset decodes more
+        still, which pydicom's own caching of ``pixel_array`` then absorbs.
+        """
+        return tuple([1] * (len(self._shape) - 2) + list(self._shape[-2:]))
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM pixel data.
 
@@ -747,6 +757,11 @@ class DicomSeriesAdapter(TensorAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [catalog_entry(self.get_tensor_descriptor())]
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One slice -- the ``native=`` seed above, and pydicom's decode unit."""
+        return tuple([1] * (len(self._shape) - 2) + [self._rows, self._cols])
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM series.

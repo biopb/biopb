@@ -162,9 +162,18 @@ class TestStreamingDefault:
         return adapter, reads
 
     @staticmethod
-    def _grid(monkeypatch, adapter, grid):
-        """Set the transfer grid, which is the tile the stream reads in."""
+    def _grid(monkeypatch, adapter, grid, block=None):
+        """Set the transfer grid, and what the backend is quantized to.
+
+        ``block=None`` drives the unquantized path, where the tile is the grid.
+        The fixture is a real ``ZarrAdapter`` whose store would otherwise floor
+        the tile at its own 16x16 chunk -- correct behaviour, but it would mask
+        the grid these cases are choosing.
+        """
         monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
+        monkeypatch.setattr(
+            type(adapter), "read_block_shape", property(lambda self: block)
+        )
 
     @pytest.mark.parametrize("method", ["area", "nearest"])
     @pytest.mark.parametrize(
@@ -233,6 +242,37 @@ class TestStreamingDefault:
         for start, stop in reads:
             assert stop[0] - start[0] == 8, "tile did not grow to a whole block"
             assert start[0] % 8 == 0, "tile boundary landed inside a block"
+
+    def test_a_block_above_the_grid_floors_the_tile(self, counted, monkeypatch):
+        """The dividing case: a tile inside a stored block re-reads that block.
+
+        Measured at 8-11x on a page-mode OME-TIFF and ~3x on a coarsely chunked
+        OME-Zarr, which is the whole reason the floor exists.
+        """
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (16, 16), block=(32, 32))
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
+
+        assert reads, "expected at least one read"
+        for start, stop in reads:
+            assert stop[0] - start[0] == 32, "tile was not raised to the block"
+            assert start[0] % 32 == 0, "tile boundary landed inside a stored block"
+
+    def test_a_block_below_the_grid_is_the_identity(self, counted, monkeypatch):
+        """The coalescing case: the grid is already a whole multiple of it."""
+        adapter, reads = counted
+        self._grid(monkeypatch, adapter, (16, 16), block=(8, 8))
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
+
+        assert {stop[0] - start[0] for start, stop in reads} == {16}
+
+    def test_the_real_store_declares_its_own_chunk(self, adapter):
+        """Not monkeypatched: the fixture's zarr array reports its chunk grid."""
+        assert adapter.read_block_shape == adapter.zarr_array.chunks
 
     def test_result_is_owned_even_for_nearest(self, counted, monkeypatch):
         """Contract 4. ``downsample_block`` hands back a strided VIEW for nearest.

@@ -227,35 +227,61 @@ class TestCoveringUnits:
 
 
 class TestStreamingUnit:
-    """One rule: the transfer grid, on block boundaries, clamped to the extent.
+    """The transfer grid, floored at the backend's read granularity.
 
-    Uniform across backends on purpose (biopb/biopb#640). A reader that would
-    rather have another shape -- a contiguous one wants full-width bands, a
-    coarse-chunked one wants its tile floored at the stored block -- says so in
-    a phase-2 adapter override; nothing here branches on the layout.
+    The grid is derived from that granularity by coalescing it up to the
+    transfer target or dividing it down; only dividing leaves a tile inside a
+    block, and the floor exists for exactly that case (biopb/biopb#640).
     """
 
-    def test_unit_is_the_transfer_grid(self):
-        assert streaming_unit((8192, 8192), (2048, 2048), (8, 8)) == (2048, 2048)
+    def test_unit_is_the_transfer_grid_when_nothing_is_quantized(self):
+        assert streaming_unit((8192, 8192), (2048, 2048), None, (8, 8)) == (2048, 2048)
+
+    def test_a_block_below_the_grid_is_the_identity(self):
+        """The coalescing case: the grid is already a whole multiple of it."""
+        assert streaming_unit((8192, 8192), (2048, 2048), (512, 512), (8, 8)) == (
+            2048,
+            2048,
+        )
+
+    def test_a_block_above_the_grid_raises_the_unit(self):
+        """The dividing case: 8-11x on a page-mode OME-TIFF without this."""
+        assert streaming_unit((8192, 8192), (2048, 2048), (4096, 4096), (8, 8)) == (
+            4096,
+            4096,
+        )
+
+    def test_the_floor_lands_on_a_whole_multiple_of_the_grid(self):
+        """Units step by the grid, so they never drift off an aligned start."""
+        unit = streaming_unit((16384, 16384), (2048, 2048), (3000, 3000), (8, 8))
+        assert unit == (4096, 4096)
+        assert unit[0] % 2048 == 0
+        assert unit[0] >= 3000
 
     def test_unit_never_exceeds_the_extent(self):
-        assert streaming_unit((1000, 1000), (2048, 2048), (8, 8)) == (1000, 1000)
+        """An extent below the block is one read either way."""
+        assert streaming_unit((1000, 1000), (2048, 2048), (4096, 4096), (8, 8)) == (
+            1000,
+            1000,
+        )
 
     def test_a_grid_below_the_scale_grows_to_one_block(self):
-        """A tile has to hold whole blocks; below one, it becomes one."""
-        assert streaming_unit((8192, 8192), (4, 4), (8, 8)) == (8, 8)
+        assert streaming_unit((8192, 8192), (4, 4), None, (8, 8)) == (8, 8)
 
     def test_a_grid_that_straddles_a_block_rounds_up(self):
-        """So the fold can use downsample.py's kernels instead of reduceat."""
-        assert streaming_unit((8192, 8192), (1182, 1182), (8, 8)) == (1184, 1184)
+        """So the fold uses downsample.py's kernels instead of reduceat."""
+        assert streaming_unit((8192, 8192), (1182, 1182), None, (8, 8)) == (1184, 1184)
 
     def test_rounding_is_per_axis(self):
-        """Anisotropic scales and grids do not interact across axes."""
         extent = (1, 3, 1, 14234, 14234)
-        unit = streaming_unit(extent, (1, 3, 1, 1182, 1182), (1, 1, 1, 8, 48))
+        unit = streaming_unit(extent, (1, 3, 1, 1182, 1182), None, (1, 1, 1, 8, 48))
         assert unit == (1, 3, 1, 1184, 1200)
 
+    def test_the_floor_is_per_axis(self):
+        """A store chunked coarsely on one axis only raises that axis."""
+        unit = streaming_unit((8192, 8192), (2048, 2048), (8192, 256), (8, 8))
+        assert unit == (8192, 2048)
+
     def test_an_axis_the_grid_spans_is_left_at_the_extent(self):
-        """Rounding it would only shave a sliver off the end to read separately."""
-        assert streaming_unit((64, 64), (32, 32), (5, 5)) == (35, 35)
-        assert streaming_unit((30, 30), (32, 32), (4, 4)) == (30, 30)
+        assert streaming_unit((64, 64), (32, 32), None, (5, 5)) == (35, 35)
+        assert streaming_unit((30, 30), (32, 32), None, (4, 4)) == (30, 30)

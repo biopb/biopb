@@ -181,6 +181,26 @@ class ZarrAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The store's chunk -- the ``native=`` seed of the grid below.
+
+        Inherited by ``OmeZarrAdapter``, ``_HcsFieldAdapter`` and
+        ``_QptiffLevelAdapter``, which all read through a zarr array. A rank that
+        does not match the array means this adapter presents a different axis
+        space than the store's, so the block is not comparable and none is
+        claimed. ``None`` also before the array is bound -- ``_QptiffLevelAdapter``
+        re-resolves its array per read -- which reads a tiled store as
+        unquantized; reachable only if a native level ever serves a computed
+        sub-scale, since ``precompute`` chunk_ids are unscaled and never arrive
+        here.
+        """
+        array = getattr(self, "zarr_array", None)
+        chunks = getattr(array, "chunks", None)
+        if not chunks or len(chunks) != len(array.shape):
+            return None
+        return tuple(int(size) for size in chunks)
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from zarr array.
 

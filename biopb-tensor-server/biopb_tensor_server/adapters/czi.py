@@ -438,6 +438,19 @@ class CziAdapter(TensorAdapter):
 
     # ---- reads --------------------------------------------------------------
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """None: a libCZI ROI read composes only the subblocks it touches.
+
+        Deliberately *not* the ``native=`` plane that seeds the transfer grid.
+        That seed is an alignment hint -- it keeps a transfer chunk from spanning
+        planes -- while the granularity a read is actually quantized to is the
+        subblock, which is far below the transfer target and so could only
+        coalesce, never divide. Reporting the plane here would floor every tile
+        at a whole plane and read one where a window was asked for.
+        """
+        return None
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read the requested region, one libCZI read per plane coordinate."""
         if self.scene_position is None:

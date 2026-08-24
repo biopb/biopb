@@ -19,26 +19,26 @@ The one thing it costs is that :func:`streaming_unit` may not choose freely: a
 tile is rounded up to a whole number of blocks. For the dyadic scales and
 power-of-two grids that reach this in practice, that rounding is a no-op.
 
-**The tile is the transfer grid**, one rule for every backend. That is the
-simple thing rather than the fast thing, deliberately: what a backend would
-rather have differs by layout, is worth multiples, and belongs in a phase-2
-per-adapter override rather than in a layout branch here. Both known directions
-are measured and waiting:
+**The tile is the transfer grid, floored at the backend's read granularity.**
+The grid is already derived from that granularity -- an adapter passes it as
+``native=`` and the sizer either coalesces it up to the transfer target or
+divides it down -- so the floor binds only in the dividing case, and is the
+identity everywhere else. Dividing is what hurts: the tile lands inside a block
+the backend can only read whole, so every tile overlapping it pays for the
+whole. Unfloored, that is 1726 ms against 165 ms on a tiled 8192^2 OME-TIFF page
+(``aszarr(chunkmode="page")``, whose block is the entire page: 16 tiles, 16
+whole-page decodes) and 3x on an OME-Zarr chunked at 4096^2, compressed or not.
 
-- A **contiguous** reader -- an ND2 frame, an MRC mmap -- wants a full-width row
-  band, because a tile out of a wide frame reads strided and a band is one
-  sequential run. Worth 1852 -> 592 ms warm on an ND2 at area/8.
-- A **chunked** store whose blocks exceed the transfer grid wants its tile
-  floored at that block, because otherwise every block is fetched and decoded
-  once per tile overlapping it. Measured at 260 ms against 125 ms read whole on
-  a 4096-chunk zarr, and -- the sharp one -- 1726 ms against 165 ms on a tiled
-  8192^2 OME-TIFF page, whose ``aszarr(chunkmode="page")`` block is the *entire
-  page*: 16 tiles, 16 whole-page decodes.
+The granularity is an *upper bound*, not a fact about every reader: an mmap
+beats it, delivering any crop for the cost of its own pages. Those adapters --
+ND2, MRC, NIfTI -- report no block, and their tile stays the grid. That is why
+the floor is not simply read off ``native=``: ``NikonAdapter`` seeds its grid
+with a whole 1.1 GiB C/Y/X frame it never reads whole, and flooring there would
+restore precisely the residency this module exists to remove.
 
-Neither is expressible without the adapter declaring what its reads are granular
-in, which is what phase 2 adds. Until then a page-mode reader pays that floor's
-absence, knowingly: the cost is bounded, proportional to plane size, and visible
-in the benchmark rather than silent.
+One shape is still deferred: a contiguous reader would rather have a full-width
+row band than a tile, since a tile out of a wide frame reads strided. Worth
+1852 -> 592 ms warm on an ND2 at area/8, and unrelated to the floor.
 
 Self-contained in the style of ``downsample.py``: no protobuf, no Arrow, no
 cache. The caller injects ``fetch``.
@@ -47,7 +47,7 @@ cache. The caller injects ``fetch``.
 from __future__ import annotations
 
 import itertools
-from typing import Callable, Iterator, Sequence, Tuple
+from typing import Callable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -65,18 +65,43 @@ def _whole_blocks(size: int, scale: int) -> int:
 def streaming_unit(
     extent: Sequence[int],
     transfer_chunk: Sequence[int],
+    read_block: Optional[Sequence[int]],
     scale_hint: Sequence[int],
 ) -> Tuple[int, ...]:
-    """The region one ``fetch`` covers: the transfer grid, on block boundaries.
+    """The region one ``fetch`` covers: the transfer grid, floored at ``read_block``.
 
-    Rounded up to a whole number of reduction blocks, which is what
-    :func:`stream_reduce` requires, and clamped to the extent -- an axis the tile
-    already spans is covered by a single tile, so there is no boundary on it to
-    place and rounding would only shave a sliver off the end to read separately.
+    The transfer grid is derived from the backend's own read granularity by
+    either *coalescing* it (grid a whole multiple of the block) or *dividing* it
+    (grid a fraction of the block), and only dividing is a problem: the tile then
+    lands inside a block the backend can only read whole, and every tile
+    overlapping it pays for all of it. So a tile is raised to the granularity
+    whenever the grid divided it -- which is the identity everywhere coalescing
+    happened, i.e. for most stores most of the time.
+
+    It is raised to a whole *multiple of the grid* rather than to the block
+    itself, which is what keeps units aligned: ``start`` is a multiple of the
+    scaled chunk size and therefore of the grid, so grid-sized steps never drift
+    off it. Where the block is not itself a multiple of the grid a unit can still
+    straddle one block boundary, costing at most ``1 + block/unit`` -- bounded,
+    and far below the k-fold that dividing costs unfloored.
+
+    ``read_block`` is ``None`` for a backend with no granularity to speak of --
+    an mmap, whose crop costs its own pages and nothing more.
+
+    The result is a whole number of reduction blocks, which is what
+    :func:`stream_reduce` requires, and is clamped to the extent: an axis the
+    tile already spans is covered by one tile, so there is no boundary on it to
+    place, and an extent smaller than the block is a single read either way.
     """
+    unit = [max(1, int(size)) for size in transfer_chunk]
+    if read_block is not None:
+        for axis, block in enumerate(read_block):
+            block = max(1, int(block))
+            if block > unit[axis]:
+                unit[axis] = ceil_div(block, unit[axis]) * unit[axis]
     return tuple(
         min(_whole_blocks(size, scale), int(dim))
-        for size, scale, dim in zip(transfer_chunk, scale_hint, extent, strict=True)
+        for size, scale, dim in zip(unit, scale_hint, extent, strict=True)
     )
 
 

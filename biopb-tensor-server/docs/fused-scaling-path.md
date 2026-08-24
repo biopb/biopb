@@ -795,3 +795,89 @@ both `nearest` fusions sit on the path an unqualified read already takes.
   from their read shapes, and #640's own closing caveat ("worth measuring per adapter before generalizing") still
   applies. `docs/dask-bypass-benchmarks.md` is the precedent for doing that
   measurement before the code.
+
+## 12. Read granularity — the declaration, and where each adapter stands
+
+The streamed scaled read (§4) tiles an extent at the transfer grid. That grid is
+*derived* from the backend's own read granularity: an adapter passes it as
+`native=` and `compute_transfer_chunk_size` either **coalesces** it up to the
+8 MiB target or **divides** it down. Only dividing is a problem — the tile then
+lands inside a block the backend can only read whole, and every tile overlapping
+it pays for all of it. So `read_block_shape` reports that granularity and the
+tile is floored at it, which is the identity wherever coalescing happened.
+
+Unfloored, dividing cost **8-11x** on a tiled 8192² OME-TIFF page and **~3x** on
+an OME-Zarr chunked at 4096² (compressed and raw alike). Floored, both return to
+parity or better; see §12.2.
+
+**The declaration is a judgement, not the seed.** The seed is an *upper bound* on
+granularity and several readers beat it, so each adapter answers "what can my
+reader not read below?" rather than copying `native=`:
+
+| adapter | `native=` seed | declared block | why they differ |
+| --- | --- | --- | --- |
+| `ZarrAdapter` (+ `OmeZarr`, `_HcsField`, `_QptiffLevel`) | store chunk | store chunk | — |
+| `Hdf5Adapter` | dataset chunk | dataset chunk, `None` when contiguous | a contiguous hyperslab is read directly |
+| `OmeTiffAdapter` (+ `_TifffileAdapterBase`, `Tiff`, `Lsm`) | whole page | whole page | — |
+| `TiffSequenceAdapter`, `MicroManagerLegacyAdapter` | per-page block (page when striped) | **one strile** | reads go through `aszarr()`'s default chunkmode, whose chunk is the strile; the seed's page would floor a band of strips at a whole plane |
+| `DicomAdapter`, `DicomSeriesAdapter` | one frame | one frame | — |
+| `NdTiffAdapter`, `EmdAdapter`, `_BioioAdapterBase` | dask block | dask block | a slice materialises whole blocks |
+| `CziAdapter` | one plane | **`None`** | a libCZI ROI read composes only the subblocks it touches; the seed exists to stop a transfer chunk spanning planes, and the real granularity (the subblock) could only coalesce |
+| `NikonAdapter` (ND2) | whole C/Y/X frame | **`None`** | `read_frame` returns an mmap view and the crop copies only what is asked; flooring at the frame would make every scaled read materialise 1.1 GiB on a 14234² scene |
+| `MrcAdapter`, `NiftiAdapter` | — | `None` | mmap; a crop costs its own pages |
+| `RemoteTensorAdapter`, `CachedSourceAdapter` | — | `None` | arbitrary bounds forwarded upstream / served by chunk_id only |
+
+Declaring wrongly is **silent** — every value stays bit-identical, the read
+merely costs more — so `tests/adapter_read_block_test.py` requires every
+`TensorAdapter` subclass to appear in one list or the other, with its reason. A
+new adapter cannot inherit the base `None` by accident.
+
+### 12.1 Divide or coalesce, on real sources
+
+| source | adapter | grid | block | | tile @ scale 8 |
+| --- | --- | --- | --- | --- | --- |
+| `input_t35.tif` | `TiffAdapter` | 5032² | 5032² | coalesce | 5032² |
+| `big8k.ome.tif` (tiled) | `OmeTiffAdapter` | 2048² | 8192² | **divide** | 8192² |
+| `striped.ome.tif` | `OmeTiffAdapter` | 2048² | 4096² | **divide** | 4096² |
+| coarse OME-Zarr | `OmeZarrAdapter` | 2048² | 4096² | **divide** | 4096² |
+| `flat-blosc` OME-Zarr | `OmeZarrAdapter` | 2048² | 512² | coalesce | 2048² |
+| `ND040.nd2` | `NikonAdapter` | 1182² | none | — | 1184² |
+
+### 12.2 Effect, first-read latency for one X/Y plane
+
+Warm, `benchmarks/bench_plane_latency.py`, against `dev` in the same session:
+
+| source | `dev` | tile, unfloored | tile, floored |
+| --- | ---: | ---: | ---: |
+| tiled OME-TIFF 8192² | 154-206 ms | 1719-1800 ms | 157-206 ms |
+| coarse OME-Zarr, raw | 89-144 ms | 273-313 ms | **84-123 ms** |
+| coarse OME-Zarr, blosc | 118-175 ms | 369-416 ms | **94-131 ms** |
+| `input_t35.tif` cold nearest/32 | 1227 ms, 483 MiB, 10 Z | 50 ms | **46 ms, 48 MiB, 1 Z** |
+| `ND040.nd2` warm area/8 | 1944 ms | 677 ms | 677 ms |
+
+### 12.3 Why OME-TIFF's block really is the whole page
+
+`ZarrTiffStore._getitem` branches on chunkmode. Under `chunkmode="page"` it calls
+`page.asarray()` — the entire page is decoded and the window sliced out of it —
+so cost is flat in the request: a 256² window costs 108 ms against 166 ms for
+the whole 8192² page. Nothing caches the result (`FileCache` holds file handles,
+`TiffPages._cache` holds parsed IFDs, `ZarrStore._store` holds only `.zarray`
+metadata, and no `LRUStoreCache` wraps the array), so N tiles cost N page
+decodes.
+
+Switching to the default `STRILE` chunkmode makes reads proportional and was
+measured 74x cheaper for a 2048² window — but it is **not** a general
+improvement, because page mode buys two things a per-strile path gives up:
+
+| layout (4096², whole page) | page mode | `STRILE` |
+| --- | ---: | ---: |
+| strips of 1 row | 12.6 ms | 114.5 ms |
+| tiles 512, uncompressed | 38.7 ms | 21.9 ms |
+| tiles 512, zlib | 49.6 ms | 77.7 ms |
+| tiles 512, JPEG | 35.5 ms | 85.7 ms |
+
+Coalescing (4096 one-row strips become one buffered pass, 9x) and **threaded
+decode** (`maxworkers` applies only to chunkmode=2). Forcing `maxworkers=1`
+reproduces the `STRILE` figure exactly — 79.3 ms zlib, 87.6 ms JPEG — so the
+gap is lost decode parallelism, not extra work. Page mode is the right mode for
+reading a page; the page is therefore the block.

@@ -763,6 +763,41 @@ class TensorAdapter(SourceAdapter):
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """What this backend's reads are quantized to, or ``None`` for none.
+
+        A zarr chunk, an HDF5 chunk, a TIFF page: reading any part of one costs
+        the whole one. The streamed scaled read floors its tile here
+        (:func:`~.stream_reduce.streaming_unit`), because the transfer grid is
+        derived from this same granularity by *dividing* it whenever it exceeds
+        the transfer target -- and a tile inside a block re-reads that block once
+        per tile. Unfloored that is 8-11x on a tiled 8192^2 OME-TIFF page and ~3x
+        on an OME-Zarr chunked at 4096^2.
+
+        **This is the ``native=`` seed the adapter already passes to**
+        :func:`~.chunk.default_transfer_chunk_shape`, not a second fact -- state
+        them from one expression so they cannot drift.
+
+        ``None`` claims something stronger than "unknown": that no part of a read
+        is wasted, which is true of an mmap and of a backend that forwards
+        arbitrary bounds. Declaring it wrongly is silent -- every value stays
+        bit-identical, the read just costs more -- so ``adapter_read_block_test``
+        requires every adapter class to appear in one list or the other rather
+        than letting a new one default in.
+
+        Note the seed is an upper bound on granularity and a reader may beat it:
+        ``NikonAdapter`` seeds its grid with a whole C/Y/X ND2 frame (1.1 GiB on
+        a 14234^2 scene) that ``read_frame`` hands back as an mmap view, then
+        crops -- so it declares ``None`` and is right to.
+
+        A property rather than a class attribute because the answer is per
+        *instance* -- a tiled and a striped TIFF are the same adapter with
+        different answers -- and derived live rather than captured in
+        ``__init__`` because an adapter may not hold its store yet.
+        """
+        return None
+
     def get_scaled_data(
         self,
         bounds: ChunkBounds,
@@ -771,11 +806,12 @@ class TensorAdapter(SourceAdapter):
     ) -> np.ndarray:
         """Read ``bounds`` and reduce it by ``scale_hint`` in one step.
 
-        The default streams the extent in tiles of the transfer grid, reducing
-        each tile as it arrives, so peak residency is one tile rather than the
-        extent (see :mod:`~.stream_reduce`). An extent that is already one tile
-        is read and reduced whole, which is what every unscaled read and most
-        small scaled ones do.
+        The default streams the extent in tiles of the transfer grid, floored at
+        :attr:`read_block_shape`, reducing each tile as it arrives, so peak
+        residency is one tile rather than the extent (see
+        :mod:`~.stream_reduce`). An extent that is already one tile is read and
+        reduced whole, which is what every unscaled read and most small scaled
+        ones do.
 
         An adapter whose reader can deliver the extent in pieces more cheaply
         than ``get_data`` can (a CZI ``read(zoom=)``, a native pyramid level)
@@ -815,7 +851,9 @@ class TensorAdapter(SourceAdapter):
         start = tuple(int(value) for value in bounds.start)
         stop = tuple(int(value) for value in bounds.stop)
         extent = tuple(hi - lo for lo, hi in zip(start, stop, strict=True))
-        unit = streaming_unit(extent, self.get_transfer_chunk_size(), scale_hint)
+        unit = streaming_unit(
+            extent, self.get_transfer_chunk_size(), self.read_block_shape, scale_hint
+        )
 
         if all(hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)):
             return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
@@ -1344,6 +1382,7 @@ _TENSOR_SCOPED_API = frozenset(
     {
         "get_tensor_descriptor",
         "get_transfer_chunk_size",
+        "read_block_shape",
         "get_data",
         "get_scaled_data",
         "get_arrow_schema",
