@@ -256,18 +256,33 @@ export interface TileInfo {
   tile_size: number;
   /** Wire indices of the display plane; `s` is set only for interleaved RGB(A). */
   plane: { y: number; x: number; s: number | null };
-  /** Wire index of each slider axis, or null when the tensor has no such axis. */
+  /** Wire index of each *named* slider axis, or null when nothing names it. */
   selectable: { t: number | null; z: number | null; c: number | null };
   /**
-   * Non-plane axes with extent > 1 that `t`/`z`/`c` cannot reach.
+   * Non-plane axes with extent > 1 that `t`/`z`/`c` cannot *name*.
    *
-   * Served at index 0, with the rest of the axis unreachable through the tile
-   * route — an unlabelled axis, or the second of two sharing a label. Empty for
-   * an ordinary TCZYX tensor. Worth surfacing rather than ignoring: the viewer
-   * is showing one position of several and nothing else says so.
+   * An unlabelled axis, a TIFF sequence's opaque file axis (`i`), or the second
+   * of two sharing a label. Empty for an ordinary TCZYX tensor.
+   *
+   * Naming is not addressing: these are selectable, via `TileRequest.sel`. What
+   * the list says is that they must be reached positionally, and that there is
+   * no semantic title for the slider — so show `label`, the name the source
+   * itself gave, rather than deriving `Z` from the axis's position. That
+   * derivation is a guess, and the server declines to make it for a reason
+   * (`biopb-tensor-server/biopb_tensor_server/core/axes.py`); making it here
+   * instead only moves it somewhere less visible.
    */
-  pinned: Array<{ axis: number; label: string; extent: number }>;
+  sel_axes: TileAxis[];
   levels: TileLevel[];
+}
+
+/** A non-plane axis addressed by its wire index, with the source's own name. */
+export interface TileAxis {
+  /** Wire index, i.e. position in `dim_labels`/`shape`. */
+  axis: number;
+  /** The source's label for it. May be empty, or shared with another axis. */
+  label: string;
+  extent: number;
 }
 
 /** Address of one tile. Omitted selection axes default to index 0. */
@@ -284,6 +299,15 @@ export interface TileRequest {
   t?: number;
   z?: number;
   c?: number;
+  /**
+   * Axes selected by wire index: `[[0, 154]]` becomes `?sel=0:154`.
+   *
+   * For the axes `t`/`z`/`c` cannot name — everything in
+   * `TileInfo.sel_axes`. An axis the server *does* name must be sent under that
+   * name instead; sending it both ways is refused (422), because one axis with
+   * two spellings in one URL is two cache entries for one tile.
+   */
+  sel?: Array<[number, number]>;
   reduction_method?: string;
 }
 

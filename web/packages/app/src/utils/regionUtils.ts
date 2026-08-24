@@ -334,4 +334,5 @@ export function computeImageCSS(
 }
 
 // Re-export from tensor-flight-client for convenience
-export { buildAxisMap } from "@biopb/tensor-flight-client";
+export { buildAxisMap, sliderAxes } from "@biopb/tensor-flight-client";
+export type { SliderAxis } from "@biopb/tensor-flight-client";

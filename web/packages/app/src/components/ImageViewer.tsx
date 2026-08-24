@@ -5,6 +5,7 @@ import { useAppStore } from "../store";
 import { useRenderWebSocket, type RenderParams } from "../hooks/useRenderWebSocket";
 import {
   buildAxisMap,
+  sliderAxes,
   computeImageCSS,
   computeInitialViewportState,
   clampViewportToBounds,
@@ -13,6 +14,7 @@ import {
   computeSliceRange,
   shouldReload,
   type AxisMap,
+  type SliderAxis,
   type LoadedRegion,
   type ViewportState,
 } from "../utils/regionUtils";
@@ -143,6 +145,18 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const axisMapRef = useRef(axisMap);
   axisMapRef.current = axisMap;
 
+  // The navigable axes, by wire index. Separate from `axisMap` -- which stays
+  // for the plane and the scale hint -- because its positional fallback renames
+  // what it cannot identify, and an axis the source calls `i` must be read from
+  // the slider the user actually moved, not from `slice.z`.
+  const sliceAxesRef = useRef<Map<number, SliderAxis>>(new Map());
+  sliceAxesRef.current = useMemo(() => {
+    if (!descriptor) return new Map<number, SliderAxis>();
+    return new Map(
+      sliderAxes(descriptor.dim_labels, descriptor.shape).map((a) => [a.axis, a]),
+    );
+  }, [descriptor]);
+
   // Build render params (uses refs - stable)
   const buildRenderParams = useCallback(
     (
@@ -163,22 +177,26 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         if (i === am.y) {
           sliceStart.push(sliceRange.y[0]);
           sliceStop.push(sliceRange.y[1]);
-        } else if (i === am.x) {
+          continue;
+        }
+        if (i === am.x) {
           sliceStart.push(sliceRange.x[0]);
           sliceStop.push(sliceRange.x[1]);
-        } else if (i === am.t) {
-          sliceStart.push(currentSlice.t);
-          sliceStop.push(currentSlice.t + 1);
-        } else if (i === am.z) {
-          sliceStart.push(currentSlice.z);
-          sliceStop.push(currentSlice.z + 1);
-        } else if (i === am.c) {
-          sliceStart.push(currentSlice.c);
-          sliceStop.push(currentSlice.c + 1);
-        } else {
-          sliceStart.push(0);
-          sliceStop.push(desc.shape[i] ?? 1);
+          continue;
         }
+        const axis = sliceAxesRef.current.get(i);
+        if (axis) {
+          const want = axis.named ? currentSlice[axis.named] : currentSlice.axes[axis.key] ?? 0;
+          // Clamped for the same reason the tiled viewer clamps: the store
+          // carries a slice position across a source change.
+          const at = Math.min(Math.max(0, want), Math.max(0, axis.extent - 1));
+          sliceStart.push(at);
+          sliceStop.push(at + 1);
+          continue;
+        }
+        // The interleaved samples axis: composited, not selected one at a time.
+        sliceStart.push(0);
+        sliceStop.push(desc.shape[i] ?? 1);
       }
 
       // Resolve color: if "auto", guess from the channel name, grey until it

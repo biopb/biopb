@@ -10,6 +10,16 @@ export interface SliceState {
   t: number;
   z: number;
   c: number;
+  /**
+   * Index chosen on each axis `t`/`z`/`c` cannot name, keyed by `SliderAxis.key`
+   * (`a0`, `a3`, ...).
+   *
+   * A TIFF sequence's `i`, a plate's `POS`, the second of two axes sharing a
+   * label: navigable, but with no semantic name to hold them under. Reset with
+   * t/z/c on a source change, and for the same reason — a key means "axis 0 of
+   * the tensor in view", so it does not survive one.
+   */
+  axes: Record<string, number>;
   reductionMethod: string;
   percentileScale: number;  // 0 = min-max, 1 = 1-99 percentile, 2 = 2-98 percentile
   useMinMax: boolean;  // When true, use full min-max range (0-100 percentile)
@@ -112,6 +122,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     t: 0,
     z: 0,
     c: 0,
+    axes: {},
     reductionMethod: "area",
     percentileScale: 1,  // Default 1-99 percentile
     useMinMax: false,
@@ -171,7 +182,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const src = sources.find((s) => s.source_id === sourceId);
     const tid = tensorId ?? src?.tensors[0]?.array_id ?? null;
     set({ activeSourceId: sourceId, activeTensorId: tid });
-    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0 } }));
+    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
   },
 
   setSlice(partial) {

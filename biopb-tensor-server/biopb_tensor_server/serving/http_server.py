@@ -754,16 +754,21 @@ def _plane_axes_set(y_idx: int, x_idx: int, s_idx: Optional[int]) -> set:
     return {y_idx, x_idx} | ({s_idx} if s_idx is not None else set())
 
 
-def _unaddressable_axes(
+def _unnamed_axes(
     dim_labels: List[str], shape: List[int], plane: set
 ) -> List[Dict[str, Any]]:
-    """Non-plane axes with extent > 1 that ``t``/``z``/``c`` cannot reach.
+    """Non-plane axes with extent > 1 that ``t``/``z``/``c`` cannot *name*.
 
-    Such an axis is served at index 0 and the rest of it is unreachable through
-    this route -- true of an unlabelled axis (``POS``), and of the second of two
-    axes sharing a label, since ``labeled_axis_index`` takes the first. That is
-    a real limit on what the tile API can address, so publish it instead of
-    leaving a client to infer it by diffing ``dim_labels`` against
+    An unlabelled axis (``POS``), a domain-specific one (a TIFF sequence's
+    ``i``), the second of two axes sharing a label -- ``labeled_axis_index``
+    takes the first, so the second has no name to be reached by.
+
+    Naming is not addressing: these are selectable through the ``sel``
+    parameter, which addresses an axis by its wire index and needs no name at
+    all. What this list says is that a client wanting one of them must use
+    ``sel``, and that it has no semantic title to put on the slider -- so it
+    should show the label the source gave (``i``), not invent ``Z``. Publishing
+    it beats leaving a client to infer it by diffing ``dim_labels`` against
     ``selectable``.
     """
     from biopb_tensor_server.core.axes import labeled_axis_index
@@ -780,10 +785,76 @@ def _unaddressable_axes(
     ]
 
 
+# A module-level singleton rather than a call in the signature's default: the
+# annotation is a container type, which is the shape B008 is there to catch.
+# Declared (rather than read off `request.query_params`) so the parameter still
+# appears in the OpenAPI schema.
+_SEL_QUERY = Query(
+    None,
+    description="Select an axis by wire index: repeatable, '<axis>:<index>'.",
+)
+
+# One ``sel`` entry: an axis's wire index and the index chosen on it.
+_SEL_RE = re.compile(r"^(\d{1,3}):(\d{1,12})$")
+
+# More entries than any tensor has axes is a malformed request, not a big one.
+_SEL_MAX_ENTRIES = 32
+
+
+def _parse_sel(sel: Sequence[str]) -> Dict[int, int]:
+    """``sel=<axis>:<index>`` repetitions -> ``{axis index: chosen index}``.
+
+    Positional because there is nothing else to address these axes *by*: they
+    are exactly the axes with no name (:func:`_unnamed_axes`), and inventing one
+    server-side would be the guess ``core.axes`` declines to make. The wire index
+    is unambiguous, stable, and already what the client reads out of
+    ``tile_info``.
+
+    Syntax only here -- what the axes mean is :func:`_resolve_tile_selection`'s
+    job, which is where the plane and the named axes are known. A repeat of the
+    same axis is refused rather than last-wins: two different answers to one
+    question is a client bug, and silently picking one hides it behind an ETag
+    that varies with the discarded number.
+    """
+    if len(sel) > _SEL_MAX_ENTRIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"too many 'sel' parameters ({len(sel)}; max {_SEL_MAX_ENTRIES})",
+        )
+    out: Dict[int, int] = {}
+    for item in sel:
+        match = _SEL_RE.match(item.strip())
+        if match is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"malformed 'sel' parameter {item!r}; "
+                    f"expected '<axis>:<index>', e.g. 'sel=0:37'"
+                ),
+            )
+        axis, want = int(match.group(1)), int(match.group(2))
+        if axis in out:
+            raise HTTPException(
+                status_code=422,
+                detail=f"axis {axis} selected twice ('sel={axis}:{out[axis]}' and {item!r})",
+            )
+        out[axis] = want
+    return out
+
+
 def _resolve_tile_selection(
-    dim_labels: List[str], shape: List[int], plane: set, selection: Dict[str, int]
+    dim_labels: List[str],
+    shape: List[int],
+    plane: set,
+    selection: Dict[str, int],
+    positional: Optional[Dict[int, int]] = None,
 ) -> Dict[int, int]:
     """``{axis index: chosen index}`` for every non-plane axis, or 422.
+
+    Two ways in, resolving to one answer. ``selection`` names an axis
+    semantically (``t``/``z``/``c``) and is the readable form for the TCZYX
+    tensors that are most of the catalog; ``positional`` (from ``sel``) names it
+    by wire index, which is the only handle an axis with no semantic name has.
 
     Validation has to iterate the *parameters* as well as the axes. Checking
     only axes -- which is what the loop building the slices did -- silently
@@ -795,8 +866,14 @@ def _resolve_tile_selection(
 
     Index 0 is exempt because it is the default every client sends; only a
     non-zero request for an axis that does not exist is a mistake worth
-    refusing. That is the same rule the Viv adapter applies client-side, so the
-    two agree on what is addressable.
+    refusing. ``sel`` gets no such exemption -- it is never a default, so
+    ``sel=9:0`` on a 3-D tensor is a client addressing an axis it believes
+    exists, and saying so is more useful than serving the plane it happened to
+    ask around.
+
+    An axis reachable both ways is refused rather than merged, even when the two
+    agree: one axis with two spellings in one URL is two cache keys for one
+    tile, and letting them disagree would make which one wins a silent policy.
 
     Extents are the full-resolution ones, which is correct at every level:
     ``scale_hint`` is 1 on non-plane axes, so pyramid depth never changes them.
@@ -804,6 +881,7 @@ def _resolve_tile_selection(
     from biopb_tensor_server.core.axes import labeled_axis_index
 
     named = {axis: labeled_axis_index(dim_labels, axis) for axis in ("t", "z", "c")}
+    positional = positional or {}
 
     for axis, want in selection.items():
         axis_idx = named.get(axis)
@@ -816,11 +894,39 @@ def _resolve_tile_selection(
                 ),
             )
 
+    by_index = {idx: axis for axis, idx in named.items() if idx is not None}
+    for idx in positional:
+        if not 0 <= idx < len(shape):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"'sel' names axis {idx}, which this tensor does not have "
+                    f"(it has {len(shape)}: 0..{len(shape) - 1})"
+                ),
+            )
+        if idx in plane:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"axis {idx} ('{dim_labels[idx] if idx < len(dim_labels) else '?'}') "
+                    f"is part of the tile plane and cannot be selected; the tile "
+                    f"*is* that axis"
+                ),
+            )
+        if idx in by_index:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"axis {idx} is named '{by_index[idx]}' by this tensor; select it "
+                    f"as '{by_index[idx]}={positional[idx]}', not 'sel={idx}:{positional[idx]}'"
+                ),
+            )
+
     resolved: Dict[int, int] = {}
     for idx in range(len(shape)):
         if idx in plane:
             continue
-        want = 0
+        want = positional.get(idx, 0)
         for axis, axis_idx in named.items():
             if axis_idx == idx:
                 want = int(selection.get(axis, 0))
@@ -1255,7 +1361,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
             "selectable": {
                 axis: labeled_axis_index(dim_labels, axis) for axis in ("t", "z", "c")
             },
-            "pinned": _unaddressable_axes(
+            "sel_axes": _unnamed_axes(
                 dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
             ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
@@ -1273,6 +1379,7 @@ async def get_tile(
     t: int = Query(0, ge=0),
     z: int = Query(0, ge=0),
     c: int = Query(0, ge=0),
+    sel: Optional[List[str]] = _SEL_QUERY,
     fmt: str = Query("raw", pattern="^(raw|png|jpeg)$"),
     lo: float = Query(1.0, ge=0.0, le=100.0),
     hi: float = Query(99.0, ge=0.0, le=100.0),
@@ -1287,6 +1394,16 @@ async def get_tile(
     re-fetching pixels it had already seen on every pan and every reload.
     Everything that decides the bytes is in the URL, so the response carries an
     ETag and revalidates cheaply.
+
+    The plane is chosen by ``t``/``z``/``c`` where the tensor's labels name
+    those axes, and by ``sel=<axis>:<index>`` -- repeatable, addressing an axis
+    by its wire index -- where they do not. The second exists because the first
+    cannot express a TIFF sequence's ``i`` or a plate's ``POS``: those axes have
+    no name to be selected by, and the server will not invent one (``core.axes``
+    on why a positional guess must not become a wire assertion). Before ``sel``
+    they were served at index 0 with the rest of the axis unreachable, which
+    made a 155-file sequence a one-frame tensor to every tiled client.
+    ``/api/tile_info`` lists them under ``sel_axes``.
 
     ``fmt`` selects the transport, not a different viewer: ``raw`` ships the
     tile's own dtype for client-side (WebGL) contrast and blending, while
@@ -1352,6 +1469,7 @@ async def get_tile(
         shape,
         _plane_axes_set(y_idx, x_idx, s_idx),
         {"t": t, "z": z, "c": c},
+        _parse_sel(sel or []),
     )
 
     render_identity = (
@@ -1365,9 +1483,12 @@ async def get_tile(
             ("level", level),
             ("col", col),
             ("row", row),
-            ("t", t),
-            ("z", z),
-            ("c", c),
+            # The *resolved* selection, not the raw parameters: two URLs that
+            # address the same plane by different spellings (`z=3` where the
+            # labels name axis 0 'z', `sel=0:3` where they do not) must not mint
+            # two cache entries for one tile, and a parameter the resolution
+            # ignored must not vary the key at all.
+            ("sel", ",".join(f"{i}:{v}" for i, v in sorted(resolved.items()))),
             ("fmt", fmt),
             ("red", reduction_method or ""),
             ("edge", edge),

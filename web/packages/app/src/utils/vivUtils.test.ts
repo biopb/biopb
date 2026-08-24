@@ -11,7 +11,6 @@ import {
   gammaFromOctaves,
   octavesFromGamma,
   percentileBounds,
-  pinnedNotice,
   samplesPerPixel,
   tileCacheSize,
   vivColor,
@@ -27,11 +26,22 @@ const TCZYX: TileInfo = {
   tile_size: 512,
   plane: { y: 3, x: 4, s: null },
   selectable: { t: 0, c: 1, z: 2 },
-  pinned: [],
+  sel_axes: [],
   levels: [
     { level: 0, scale: 1, height: 1024, width: 1024, cols: 2, rows: 2 },
     { level: 1, scale: 2, height: 512, width: 512, cols: 1, rows: 1 },
   ],
+};
+
+/** 155 single-page TIFFs on an opaque file axis: the case `sel` exists for. */
+const SEQUENCE: TileInfo = {
+  ...TCZYX,
+  array_id: "tiff-sequence_6bc95fdaaeb2",
+  dim_labels: ["i", "y", "x"],
+  shape: [155, 1024, 1344],
+  plane: { y: 1, x: 2, s: null },
+  selectable: { t: null, z: null, c: null },
+  sel_axes: [{ axis: 0, label: "i", extent: 155 }],
 };
 
 const RGB: TileInfo = {
@@ -192,18 +202,44 @@ describe("tileCacheSize", () => {
 });
 
 describe("vivSelection", () => {
+  const at = (t: number, z: number, c: number, axes: Record<string, number> = {}) => ({
+    t,
+    z,
+    c,
+    axes,
+  });
+
   it("names only the axes the tensor has", () => {
-    expect(vivSelection(TCZYX, { t: 1, z: 2, c: 0 })).toEqual({ t: 1, z: 2, c: 0 });
-    expect(vivSelection(PLAIN_2D, { t: 0, z: 0, c: 0 })).toEqual({});
+    expect(vivSelection(TCZYX, at(1, 2, 0))).toEqual({ t: 1, z: 2, c: 0 });
+    expect(vivSelection(PLAIN_2D, at(0, 0, 0))).toEqual({});
   });
 
   it("clamps a slice position carried over from a larger tensor", () => {
     // The store keeps t/z/c across a source change; unclamped this is a 422 per tile.
-    expect(vivSelection(TCZYX, { t: 99, z: 99, c: 99 })).toEqual({ t: 3, z: 15, c: 2 });
+    expect(vivSelection(TCZYX, at(99, 99, 99))).toEqual({ t: 3, z: 15, c: 2 });
   });
 
   it("clamps a negative index", () => {
-    expect(vivSelection(TCZYX, { t: -1, z: 0, c: 0 }).t).toBe(0);
+    expect(vivSelection(TCZYX, at(-1, 0, 0)).t).toBe(0);
+  });
+
+  it("selects an axis nothing names, under its wire-index key", () => {
+    // Left out entirely before `sel` existed, which is what made a 155-file
+    // TIFF sequence a one-frame image here.
+    expect(vivSelection(SEQUENCE, at(0, 0, 0, { a0: 154 }))).toEqual({ a0: 154 });
+  });
+
+  it("defaults an unvisited unnamed axis to 0", () => {
+    expect(vivSelection(SEQUENCE, at(0, 0, 0))).toEqual({ a0: 0 });
+  });
+
+  it("clamps an unnamed axis too", () => {
+    expect(vivSelection(SEQUENCE, at(0, 0, 0, { a0: 999 }))).toEqual({ a0: 154 });
+  });
+
+  it("does not let t/z/c stand in for an unnamed axis", () => {
+    // buildAxisMap would call this axis `z`. Scrubbing Z must not move it.
+    expect(vivSelection(SEQUENCE, at(0, 7, 0))).toEqual({ a0: 0 });
   });
 });
 
@@ -222,26 +258,5 @@ describe("vivColor", () => {
 
   it("resolves auto from the channel name", () => {
     expect(vivColor("auto", "DAPI")).toEqual([0, 0, 255]);
-  });
-});
-
-describe("pinnedNotice", () => {
-  it("says nothing for an ordinary tensor", () => {
-    expect(pinnedNotice(TCZYX)).toBeNull();
-  });
-
-  it("names the axis and how much of it is out of reach", () => {
-    const notice = pinnedNotice({
-      ...TCZYX,
-      pinned: [{ axis: 0, label: "P", extent: 40 }],
-    });
-    expect(notice).toContain("P");
-    expect(notice).toContain("39");
-  });
-
-  it("falls back to the wire index when the axis is unlabelled", () => {
-    expect(pinnedNotice({ ...TCZYX, pinned: [{ axis: 2, label: "", extent: 5 }] })).toContain(
-      "axis 2",
-    );
   });
 });
