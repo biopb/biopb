@@ -65,6 +65,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class _ZoomShapeMismatch(RuntimeError):
+    """libCZI's ``zoom=`` read did not return the shape the contract requires."""
+
+
 CZI_EXTENSION = ".czi"
 
 # Descriptor axis order.  libCZI addresses a plane by dimension name and hands
@@ -453,6 +458,101 @@ class CziAdapter(TensorAdapter):
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read the requested region, one libCZI read per plane coordinate."""
+        return self._read_planes(bounds, factor=None)
+
+    def get_scaled_data(
+        self,
+        bounds: ChunkBounds,
+        scale_hint: Tuple[int, ...],
+        reduction_method: str,
+    ) -> np.ndarray:
+        """Serve ``nearest`` from libCZI's own ``zoom=``, where it is exact.
+
+        This is the third shape of fused scaling and the only backend that has
+        it: not a stride over what was read (``get_decimated_data``) and not a
+        stored pyramid level (``precompute``), but a decoder that produces the
+        reduced pixels itself. libCZI never materialises the full-resolution
+        extent to do it -- a scale-32 read of a 384 MiB extent adds 0.3 MiB over
+        baseline for a 0.38 MiB chunk -- which is why this is worth an override
+        of its own rather than a capability the default path could drive.
+
+        Gated to ``nearest``, and the gate is not conservatism: ``zoom=`` picks
+        one pixel per block, so it differs from ``area`` in 100% of pixels.
+        Anything the gate rejects falls through to the streamed default
+        (contract rule 5), which is also what a non-pyramidal edge chunk gets.
+
+        Where the file has stored subblock levels, ``get_native_pyramid_levels``
+        + ``reduction_method="precompute"`` is strictly better than this -- it
+        sidesteps the reduction rather than swapping which one runs. This must
+        not become the reason that route never lands (#799).
+        """
+        factor = self._zoom_factor(bounds, scale_hint, reduction_method)
+        if factor is not None:
+            try:
+                return self._read_planes(bounds, factor=factor)
+            except _ZoomShapeMismatch as exc:
+                # The gate is meant to make this unreachable; a libCZI whose
+                # rounding differs from the measured one lands here. Correct
+                # pixels at the default's cost beats failing the read, but it
+                # should be loud enough to find.
+                logger.warning("CZI zoom read declined for %s: %s", self.array_id, exc)
+        return super().get_scaled_data(bounds, scale_hint, reduction_method)
+
+    def _zoom_factor(
+        self,
+        bounds: ChunkBounds,
+        scale_hint: Tuple[int, ...],
+        reduction_method: str,
+    ) -> Optional[int]:
+        """The single ``zoom=`` factor this request maps to, or None to decline.
+
+        Four conditions, and the last is the one that is easy to get wrong.
+        ``zoom=`` returns ``floor(extent / factor)`` where the contract requires
+        ``ceil``, so the two agree exactly when the factor **divides** the
+        extent -- and disagree by one row and column when it does not, which is
+        a shape violation, not a rounding taste. Measured across factors 2, 3,
+        4, 5, 6, 8, 16 and 17: bit-identical to ``downsample_block(..., 'nearest')``
+        on every divisible extent and off by one on every indivisible one.
+
+        Note that makes divisibility the predicate, *not* powers of two. The
+        design doc inferred a power-of-two guard from a single 4096/3 case;
+        3 fails there because 4096 is not a multiple of 3, and 3x on a 510-wide
+        ROI is exact. Non-dyadic scales are in scope.
+        """
+        if self.scene_position is None or reduction_method != "nearest":
+            return None
+
+        layout = self._layout
+        n_plane = len(layout.plane_axes)
+        scales = [max(1, int(scale)) for scale in scale_hint]
+        factor = scales[n_plane]
+        if factor < 2 or scales[n_plane + 1] != factor:
+            # One factor for one read: Y and X must reduce together, and a
+            # scale of 1 has nothing to fetch more cheaply.
+            return None
+        if any(
+            scale != 1
+            for axis, scale in enumerate(scales)
+            if axis not in (n_plane, n_plane + 1)
+        ):
+            # A scaled plane axis is a reduction *across* reads; zoom is inside
+            # one. The default path composes those.
+            return None
+
+        starts = [int(value) for value in bounds.start]
+        stops = [int(value) for value in bounds.stop]
+        for axis in (n_plane, n_plane + 1):
+            if (stops[axis] - starts[axis]) % factor:
+                return None
+        return factor
+
+    def _read_planes(self, bounds: ChunkBounds, factor: Optional[int]) -> np.ndarray:
+        """One libCZI read per plane coordinate, at full resolution or zoomed.
+
+        ``factor`` is None for a plain read and the reduction factor for a
+        ``nearest`` one, where the only differences are the ``zoom=`` argument
+        and a Y/X output that many times smaller.
+        """
         if self.scene_position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
@@ -475,13 +575,17 @@ class CziAdapter(TensorAdapter):
             # Grayscale reads come back as (Y, X, 1); drop that trailing axis.
             sample_slice = 0
 
-        output = np.empty(
-            tuple(stop - start for start, stop in zip(starts, stops, strict=True)),
-            dtype=np.dtype(layout.dtype),
-        )
+        extent = [stop - start for start, stop in zip(starts, stops, strict=True)]
+        if factor is not None:
+            # Divisible by construction (_zoom_factor), so this is the ceil the
+            # contract asks for.
+            extent[n_plane] //= factor
+            extent[n_plane + 1] //= factor
+        output = np.empty(tuple(extent), dtype=np.dtype(layout.dtype))
         coordinate_ranges = [
             range(starts[axis], stops[axis]) for axis in range(n_plane)
         ]
+        zoom = None if factor is None else 1.0 / factor
         with self._io_lock:
             reader = self._acquire_reader()
             try:
@@ -490,12 +594,19 @@ class CziAdapter(TensorAdapter):
                         plane=dict(zip(layout.plane_axes, coordinates, strict=True)),
                         scene=scene.index,
                         roi=roi,
+                        **({} if zoom is None else {"zoom": zoom}),
                     )
                     destination = tuple(
                         coordinate - starts[axis]
                         for axis, coordinate in enumerate(coordinates)
                     )
-                    output[destination] = plane[..., sample_slice]
+                    pixels = plane[..., sample_slice]
+                    if zoom is not None and pixels.shape != output[destination].shape:
+                        raise _ZoomShapeMismatch(
+                            f"zoom={zoom} on roi {roi} returned {pixels.shape}, "
+                            f"expected {output[destination].shape}"
+                        )
+                    output[destination] = pixels
                 self._persistent_last_access = time.monotonic()
             except Exception:
                 # A half-open reader is not reusable; drop it so the next read

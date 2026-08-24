@@ -535,7 +535,7 @@ one-line honourings of a `step`.
 | --- | --- | --- | --- |
 | `read_block_shape` | what is a read quantized to? | floors the streaming tile at it (§12) | every quantized backend |
 | `get_decimated_data` | can a read be strided? | serves `nearest` with it, whole (§6.2) | `MrcAdapter`, `NiftiAdapter`, `NikonAdapter` |
-| *(none yet)* | can the backend scale *during* the read? | would serve `nearest` from a decoder zoom | `CziAdapter` (`read(zoom=)`), a native pyramid |
+| *(no signal — a `get_scaled_data` override)* | can the backend scale *during* the read? | serves `nearest` from the decoder's own zoom (§6.3) | `CziAdapter` (`read(zoom=)`) |
 
 The two shipped signals are near-inverses of each other, for one reason: a
 backend that has to decode a whole block to hand back any of it saves no reading
@@ -544,6 +544,14 @@ bounds. Where nothing is quantized, the skipped elements are never touched at
 all. Both defaults are the safe answer (`None` = "read it and stride it"), which
 is what the withdrawn `BANDED_SCALED_READ` got backwards: its default was the
 *changed* behaviour, so omission was a silent opt-in (§5).
+
+The third mechanism deliberately did **not** become a signal. A capability is
+worth declaring when several backends can answer it and one default path can
+drive them all; libCZI is the only decoder here that scales during the read, and
+the only other candidate — a stored pyramid level — already has its own route
+(`get_native_pyramid_levels()` + `precompute`). An interface with one implementer
+is an interface invented too early, so CZI overrides `get_scaled_data` under the
+contract §4 already documents, which is what that seam is for.
 
 What is left per adapter, after the `nearest` capability shipped:
 
@@ -617,8 +625,10 @@ size or it turns into a time loss at the coarse end.
 **`zoom=` is the largest single win anywhere in this plan** — 6.5x at scale 4 and
 11.2x at scale 32, with peak allocation falling from 512 MiB to 0.5 MiB, because
 libCZI never decodes the full-resolution pixels at all. It stays gated to
-`nearest` (100% of pixels differ from `area`) and needs the power-of-two shape
-guard the comment names (3x -> 1365 vs 1366). Since `nearest` is now the default,
+`nearest` (100% of pixels differ from `area`) and needs a shape guard — though
+**not** the power-of-two one this section inferred from the 3x -> 1365 vs 1366
+case. The real predicate is divisibility (§6.3): 3x fails on 4096 because 4096
+is not a multiple of 3, and is exact on a 510-wide ROI. Since `nearest` is now the default,
 that gate is on the common path rather than an opt-in one.
 
 Unchanged from the posted comment: these fixtures have **no stored pyramid**, so
@@ -748,8 +758,73 @@ principled fix is `MADV_RANDOM` on the mapping being strided, which would make
 the skip real rather than guessing when to avoid it.
 
 
+### 6.3 CZI `zoom=`, shipped: an override, not a signal
+
+`CziAdapter.get_scaled_data` serves `nearest` from `reader.read(zoom=1/f)` and
+falls through to the streamed default for everything else. libCZI never
+materialises the full-resolution extent to do it, which is what makes this a
+different mechanism from a stride rather than a faster spelling of one.
+
+**The gate is divisibility, and this doc previously had it wrong.** `zoom=`
+returns `floor(extent / f)` where the contract (rule 1, §4) requires `ceil`, so
+the two agree exactly when `f` divides the extent and disagree by one row and
+column when it does not. §6.0 read the single 4096/3 datapoint as needing a
+power-of-two guard; 3 fails there because 4096 is not a multiple of 3, not
+because 3 is odd. Measured across factors 2, 3, 4, 5, 6, 8, 16 and 17: exact on
+every divisible extent, off by one on every indivisible one, with the ROI origin
+irrelevant (the pick is relative to the ROI). **Non-dyadic scales are in scope**,
+which a power-of-two guard would have excluded for no reason.
+
+Four conditions, all falling through to the default when unmet:
+
+1. `reduction_method == "nearest"` — `zoom=` picks one pixel per block and
+   differs from `area` in 100% of pixels.
+2. Y and X reduce by the same factor — one read takes one zoom.
+3. Every other axis reduces by 1 — a scaled plane axis is a reduction *across*
+   reads, which is the default path's job.
+4. The factor divides both Y and X extents.
+
+Plus a runtime check that the returned shape is the contract's: the gate is
+meant to make it unreachable, but a libCZI whose rounding differs would
+otherwise serve a chunk one row short. It logs and falls back rather than
+failing the read.
+
+**Measured** on a synthetic 8192^2 x 3C uint16 CZI with no stored pyramid, the
+zoom arm against the streamed default in the same process (identical checksums
+on every row):
+
+| scale | streamed default | `zoom=` | |
+| ---: | ---: | ---: | ---: |
+| 4 | 292.8 ms | **91.5 ms** | 3.2x |
+| 8 | 260.6 ms | **51.7 ms** | 5.0x |
+| 32 | 531.0 ms | **38.9 ms** | **13.6x** |
+
+The ratio grows with depth for the same reason it does on ND2: the extent grows
+with the scale while the output does not.
+
+**§6.0's memory column no longer describes the alternative.** It measured
+`zoom=` against a default that held the full-resolution extent (+640 MiB at
+scale 32); since #825 the default streams, and both arms now sit under 32 MiB
+peak. The memory argument for `zoom=` has been overtaken — what is left is the
+time, and the time got more lopsided, not less.
+
+**This must not become the reason the native-level route never lands.** These
+fixtures have no stored pyramid, so `zoom=` is measured against precisely the
+case where it is *not* the best answer. On a real whole-slide CZI,
+`get_native_pyramid_levels()` + `precompute` sidesteps the reduction instead of
+swapping which one runs, and should beat this outright (#799).
+
+
 ## 7. Tests
 
+- **CZI `zoom=`.** *Shipped* — `TestZoomServesNearest` in
+  `tests/czi_adapter_test.py` asserts bit-identity against the default across
+  factors 2-8 including the non-dyadic 3 and 5, that an indivisible extent
+  declines and yields `ceil` rather than a row-short `floor`, that `area`, a
+  scaled plane axis and unequal Y/X factors all decline, that an off-origin
+  window is exact, that the zoom actually reaches libCZI (without which every
+  other assertion also passes on the fallback path), and that a simulated
+  rounding change falls back instead of failing the read.
 - **The `nearest` capability.** *Shipped* — `tests/decimated_read_test.py`
   classifies every adapter as decimating or not (the same
   fails-if-unlisted guard `adapter_read_block_test` uses), asserts
@@ -896,17 +971,16 @@ integer path those PRs introduced.
 | 4 | banded default + opt-in flag | medium (per-adapter read economics) | **superseded** — shipped in #824, withdrawn in #825; the shape survives as a deferred optimization (§5) |
 | 5 | OME-TIFF / TIFF per-page fold | medium | **largely subsumed** — the page floor already makes the tile one page |
 | 3a | fused `nearest` as an adapter capability (`get_decimated_data`): ND2, MRC, NIfTI | low-medium — exact by construction, no accumulator | **shipped** (§6.2) |
-| 6a | CZI fused `nearest` via `read(zoom=)` behind the method gate | low-medium; measured 6.5-11.2x | remaining |
+| 6a | CZI fused `nearest` via `read(zoom=)` behind the method gate | low-medium; measured 3.2-13.6x | **shipped** (§6.3) |
 | 3b | ND2 fused `area` (banded fold) | medium (lock scope, frame indexing, edge pads) | remaining; needs 3a |
 | 6b | CZI banded ROI fold for `area` | medium | remaining |
 | 4b | row bands for contiguous readers, keyed on `read_block_shape is None` | low — no new declaration needed | remaining; 1852 -> 592 ms on ND2 at area/8 |
 | 6c | CZI native pyramid route (`precompute`) | medium; blocked on a pyramidal fixture | remaining |
 
-What is left is **6a, 3b/6b, 4b, 6c** — the remaining `nearest` fusion (CZI,
-which needs the third signal in §6's table, since a decoder zoom is not a
-stride), then the `area` folds, then the band shape, then the pyramid route.
-Neither `nearest` fusion carries a client-opt-in question: the default flip
-landed first, so both sit on the path an unqualified read already takes.
+What is left is **3b/6b, 4b, 6c** — the `area` folds, the band shape, and the
+pyramid route. Both `nearest` fusions have landed, neither carrying a
+client-opt-in question: the default flip went first, so both sit on the path an
+unqualified read already takes.
 
 Phase 2's case has narrowed since this table was written. Half its argument was
 bounded memory, and streaming now delivers that generically for every adapter —
