@@ -527,7 +527,7 @@ class TestZoomServesNearest:
     def test_an_interior_window_zooms_from_its_own_origin(self, tmp_path):
         """The pick is relative to the ROI, so an off-origin chunk is exact."""
         adapter, _ = self._adapter(tmp_path)
-        bounds = self._bounds((0, 0, 0, 8, 24), (1, 1, 1, 104, 120))
+        bounds = self._bounds((0, 0, 0, 7, 23), (1, 1, 1, 103, 119))
         scale = (1, 1, 1, 8, 8)
 
         assert adapter._zoom_factor(bounds, scale, "nearest") == 8
@@ -544,14 +544,15 @@ class TestZoomServesNearest:
         bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
         scale = (1, 1, 1, 4, 4)
 
-        real_read_planes = adapter._read_planes
+        reader = adapter._acquire_reader()
+        reader_type = type(reader)
+        real_read = reader_type.read
 
-        def truncating(bounds_, factor):
-            if factor is None:
-                return real_read_planes(bounds_, factor)
-            raise czi_module._ZoomShapeMismatch("simulated rounding change")
+        def truncating(self, **kw):
+            plane = real_read(self, **kw)
+            return plane[:-1, :-1] if kw.get("zoom") is not None else plane
 
-        monkeypatch.setattr(adapter, "_read_planes", truncating)
+        monkeypatch.setattr(reader_type, "read", truncating)
         out = adapter.get_scaled_data(bounds, scale, "nearest")
         assert np.array_equal(
             out, downsample_block(adapter.get_data(bounds), scale, "nearest")
