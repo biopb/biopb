@@ -523,19 +523,44 @@ debugging) than on a tuning dial.
   does per-call work — open, stat, seek, decode — swamps any filesystem effect,
   which is the case a declared read granularity (§12) exists to exclude.
 
-## 6. Phase 2 — per-adapter fusion
+## 6. Phase 2 — capabilities the default path acts on
+
+Restated after §12, which changed what this phase is. An adapter does not
+implement fusion; it **declares what its reads can do**, and one default path
+acts on the declaration. That reframing is not cosmetic — it is what collapsed
+the table below from five bespoke implementations to two properties and three
+one-line honourings of a `step`.
+
+| signal | the question it answers | what the default path does with it | who says yes |
+| --- | --- | --- | --- |
+| `read_block_shape` | what is a read quantized to? | floors the streaming tile at it (§12) | every quantized backend |
+| `get_decimated_data` | can a read be strided? | serves `nearest` with it, whole (§6.2) | `MrcAdapter`, `NiftiAdapter`, `NikonAdapter` |
+| *(none yet)* | can the backend scale *during* the read? | would serve `nearest` from a decoder zoom | `CziAdapter` (`read(zoom=)`), a native pyramid |
+
+The two shipped signals are near-inverses of each other, for one reason: a
+backend that has to decode a whole block to hand back any of it saves no reading
+by skipping elements inside it — only a memcpy, which the streamed path already
+bounds. Where nothing is quantized, the skipped elements are never touched at
+all. Both defaults are the safe answer (`None` = "read it and stride it"), which
+is what the withdrawn `BANDED_SCALED_READ` got backwards: its default was the
+*changed* behaviour, so omission was a silent opt-in (§5).
+
+What is left per adapter, after the `nearest` capability shipped:
 
 | adapter | native unit | technique | gate | expected |
 | --- | --- | --- | --- | --- |
-| `NikonAdapter` (ND2) | sequence frame, mmap, zero-copy | fold row bands of `read_frame(seq)[slices]` inside `with self._io_lock, nd2.ND2File(...)`; strided pick for `nearest` | direct path available (`_nd2_frame_indices` not None, labels in TCZYXS) | **`area` 331 -> 112 ms, anon +192 -> +40 MiB; `nearest` 84 -> 20 ms at scale 4 and 225 -> 11 ms at scale 32, anon +385 -> +1.2 MiB. Measured, pixels identical** (§1) |
+| `NikonAdapter` (ND2) | sequence frame, mmap, zero-copy | **`nearest` shipped** as a strided `read_frame(seq)[slices]` (§6.2). `area` would still want row bands folded inside the lock | — | `area` 331 -> 112 ms, anon +192 -> +40 MiB, measured in §1 but no longer the main prize: streaming already bounds the residency it was buying |
 | `CziAdapter` | one `reader.read(plane=, roi=)` per plane, owned buffer | band-wise ROI reads folded as they arrive; `read(zoom=1/f)` for `nearest` | `zoom=` is bit-identical to **`nearest` only** (100% of pixels differ from `area`); needs a power-of-two shape guard (3x -> 1365 vs 1366) | **`area` 387 -> 150 ms, +274 -> +104 MiB at scale 4; `nearest` via `zoom=` 131 -> 26 ms at scale 4 and 384 -> 37 ms, +641 -> +0.3 MiB at scale 32. Measured, identical** (§6.0) |
 | `OmeTiffAdapter` / `TiffAdapter` / `LsmAdapter` | one TIFF page per plane (`aszarr`, `chunkmode="page"`) | fold per page inside `_read_region` | none beyond `can_fuse` | kernel + bounded memory; unmeasured |
 | `ZarrAdapter` / `OmeZarrAdapter` | store chunk | prefer the native pyramid (`precompute`); fold per store chunk otherwise | `can_fuse` | overlaps #816; low priority |
-| `NdTiffAdapter`, `DicomAdapter`, `Hdf5Adapter`, `MrcAdapter`, `NiftiAdapter`, `EmdAdapter` | — | default path; Phase 0 kernel only | — | 2.5-4.7x on the reduce at scale <= 8 |
+| `MrcAdapter`, `NiftiAdapter` | mmap / lazy dataobj slice | **`nearest` shipped** — the same slice with a step | — | untested on real data (no MRC or NIfTI in this catalog); the ND2 ratios are the model |
+| `NdTiffAdapter`, `DicomAdapter`, `Hdf5Adapter`, `EmdAdapter` | — | default path; Phase 0 kernel only | — | 2.5-4.7x on the reduce at scale <= 8 |
 
-ND2 first: it is measured, it is the format this catalog is dominated by (151
-sources, 1.62 GB per frame on the plates), and the fused fold sits inside a lock
-scope that already exists.
+What remains here is `area`, and its case has narrowed. Half of what Phase 2 was
+for was bounded memory, which #825's streaming now gives every adapter without a
+declaration; the other half was speed, which is where the `area` rows above
+still stand. CZI's `zoom=` is the one unclaimed `nearest` win and it needs the
+third signal, not this one.
 
 ### 6.0 CZI, measured
 
@@ -654,7 +679,86 @@ It is blocked on a genuinely pyramidal CZI fixture (pylibCZIrw's writer emits
 none; same gap as #799). Do not let the `zoom=` route (opt-in, `nearest`-only)
 become the reason the pyramid route never lands.
 
+### 6.2 Fused `nearest`, shipped and measured
+
+`downsample_block(data, scale, "nearest")` is `data[::scale]` and nothing else,
+so the whole reduction is expressible as a *read*: `get_decimated_data(bounds,
+step)`, which an adapter answers with `None` (the default) or with the strided
+slice it can already express. `get_scaled_data` asks before it sizes a tile,
+because a decimated read makes tiling moot — the result *is* the output, so
+residency is bounded at the chunk without streaming anything.
+
+Three adapters honour it, and each was a one-line change to an existing slice:
+`MrcAdapter` (`mm[slices]`), `NiftiAdapter` (`dataobj[slices]`), `NikonAdapter`
+(`read_frame(seq)[slices]`, plus a step on the frame loop so a scaled T or Z
+axis skips frames rather than decoding and discarding them). That the change was
+this small is the argument for the capability framing: what ND2 needed was never
+fusion logic, it was permission to pass a step down.
+
+**Measured**, `bench_plane_latency.py`, `nearest`, against `dev` at 7e2a3231,
+same session. `r4.nd2` (3789^2, 4C, 110 MiB extent):
+
+| scale | cold `dev` | cold fused | cold bytes | warm `dev` | warm fused |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 4 | 123 ms | **97 ms** | 110 -> 110 MiB | 46 ms | **22 ms** |
+| 8 | 115 ms | *152 ms* | 110 -> 79 MiB | 40 ms | **13 ms** |
+| 16 | 114 ms | **83 ms** | 110 -> 41 MiB | 38 ms | **10 ms** |
+| 32 | 113 ms | **47 ms** | 110 -> 20 MiB | 38 ms | **8 ms** |
+
+`ND010.nd2` (14234^2, 4C, 1.5 GiB extent — the plate format this catalog is
+dominated by):
+
+| scale | cold `dev` | cold fused | cold bytes | warm `dev` | warm fused |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 8 | 1854 ms | **1058 ms** | 1546 -> 667 MiB | 470 ms | **83 ms** |
+| 32 | 1629 ms | **270 ms** | 1546 -> 167 MiB | 424 ms | **17 ms** |
+
+Warm is 3-5.7x everywhere and 25x at scale 32 on the large file, and it is the
+easy half: no bytes are read either way, so the win is the full-resolution
+memcpy that no longer happens.
+
+**Cold answers §11's open question, and not entirely in fusion's favour.** One
+cell is a regression: `r4.nd2` at scale 8 reads 1.4x fewer bytes and takes 1.3x
+longer (150-152 ms across two runs of 3 and 5 rounds — reproducible, not noise).
+The effective rate tells the story: every strided cold read here runs at
+~440-630 MiB/s against ~890-970 MiB/s sequential, so **a strided read gives up
+about half its throughput, and fusion wins cold only where it skips more than
+2x the bytes.**
+
+Whether it skips anything is a readahead question, and the six cold rows fit one
+predicate: the gap the step leaves, `(step - 1) x row_bytes`, against the
+kernel's readahead window (128 KiB by default here).
+
+- `r4` row = 7578 B. At scale 8 the gap is 53 KiB — inside the window, so the
+  kernel faults the skipped rows anyway (110 -> 79 MiB, not 110 -> 14) and the
+  strided penalty is paid for almost nothing. At 16 the gap is 111 KiB and at 32
+  it is 235 KiB, and the bytes fall accordingly.
+- `ND010` row = 28 KiB, so even scale 8 leaves a 199 KiB gap — past the window,
+  and it wins cold.
+- Scale 4 skips no I/O on either file (110 -> 110 MiB) and is still faster,
+  which isolates the memcpy half of the win.
+
+Shipped unconditionally anyway, and the reasoning should be on the record: the
+loss is cold-only, bounded near 1.3x, and confined to a band whose width depends
+on the row length, while the win is 3-5.7x warm on everything and 6x cold at the
+coarse scales a client actually opens at. Gating it would mean predicting a
+kernel tunable from inside the adapter — the same unfalsifiable cost declaration
+that sank `BANDED_SCALED_READ` (§5). If the band is ever worth closing, the
+principled fix is `MADV_RANDOM` on the mapping being strided, which would make
+the skip real rather than guessing when to avoid it.
+
+
 ## 7. Tests
+
+- **The `nearest` capability.** *Shipped* — `tests/decimated_read_test.py`
+  classifies every adapter as decimating or not (the same
+  fails-if-unlisted guard `adapter_read_block_test` uses), asserts
+  `get_decimated_data == get_data(...)[::step]` on real MRC and NIfTI files and
+  on the ND2 direct-read path, including off-origin ragged extents whose length
+  is not a multiple of the step, asserts the ND2 frame loop
+  *decodes* only the frames the step lands on, and pins the seam: `nearest`
+  asks, `area` never does, scale 1 never does, and declining leaves the streamed
+  answer unchanged.
 
 - **Kernel (Phase 0).** *Shipped.* Extend the existing `legacy_downsample_block` sweep in
   `tests/downsample_test.py` across the block-size crossover, 2D and 3D, every
@@ -791,18 +895,18 @@ integer path those PRs introduced.
 | 2b | streaming default, the planner rule, read-granularity floor (§12) | medium | **shipped** (#825) |
 | 4 | banded default + opt-in flag | medium (per-adapter read economics) | **superseded** — shipped in #824, withdrawn in #825; the shape survives as a deferred optimization (§5) |
 | 5 | OME-TIFF / TIFF per-page fold | medium | **largely subsumed** — the page floor already makes the tile one page |
-| 3a | ND2 fused `nearest` (strided pick) | low-medium — exact by construction, no accumulator | remaining |
+| 3a | fused `nearest` as an adapter capability (`get_decimated_data`): ND2, MRC, NIfTI | low-medium — exact by construction, no accumulator | **shipped** (§6.2) |
 | 6a | CZI fused `nearest` via `read(zoom=)` behind the method gate | low-medium; measured 6.5-11.2x | remaining |
 | 3b | ND2 fused `area` (banded fold) | medium (lock scope, frame indexing, edge pads) | remaining; needs 3a |
 | 6b | CZI banded ROI fold for `area` | medium | remaining |
 | 4b | row bands for contiguous readers, keyed on `read_block_shape is None` | low — no new declaration needed | remaining; 1852 -> 592 ms on ND2 at area/8 |
 | 6c | CZI native pyramid route (`precompute`) | medium; blocked on a pyramidal fixture | remaining |
 
-What is left is **3a, 6a, 3b/6b, 4b, 6c** — the two `nearest` fusions first
-(largest ratios, exact by construction), then the `area` folds, then the band
-shape, then the pyramid route. Neither `nearest` fusion carries a client-opt-in
-question: the default flip landed first, so both sit on the path an unqualified
-read already takes.
+What is left is **6a, 3b/6b, 4b, 6c** — the remaining `nearest` fusion (CZI,
+which needs the third signal in §6's table, since a decoder zoom is not a
+stride), then the `area` folds, then the band shape, then the pyramid route.
+Neither `nearest` fusion carries a client-opt-in question: the default flip
+landed first, so both sit on the path an unqualified read already takes.
 
 Phase 2's case has narrowed since this table was written. Half its argument was
 bounded memory, and streaming now delivers that generically for every adapter —
@@ -821,11 +925,12 @@ basis alone.
 - **float32 `area` fusion.** Staged means do not reassociate; there is no
   bit-identical streamed form. Would need an explicit accuracy trade, as #686
   took for the accumulator width.
-- **`nearest`'s byte-skipping is partly an OS question.** The fused pick touches
-  1/scale of the rows, but page-cache readahead may fault a good deal of what it
-  skips. The measured wins are warm-cache, so they are memcpy and cache-line
-  wins that are certain; the cold-read saving is plausible and unmeasured. Worth
-  a cold-cache arm in the bench before quoting an I/O number.
+- ~~**`nearest`'s byte-skipping is partly an OS question.**~~ **Answered**
+  (§6.2): it is largely an OS question, and the answer is a readahead window.
+  The pick skips real I/O only once `(step - 1) x row_bytes` exceeds it — below
+  that the kernel faults the skipped rows anyway and the strided read still
+  gives up about half its sequential throughput, which is a measured *loss* in
+  one band. The warm wins (3-5.7x) were the certain ones and stand.
 - **Measured per format — partly discharged.** ND2 (real file) and CZI
   (synthetic, no stored pyramid) were measured for §6; #825 added TIFF and zarr,
   cold and warm, via `benchmarks/bench_plane_latency.py` (§12.2), which is what
@@ -833,7 +938,9 @@ basis alone.
   measured 8-11x the other way. #640's closing caveat — *worth measuring per
   adapter before generalizing* — has now been paid twice and was right both
   times. Still unmeasured: DICOM, NDTiff, and the non-ND2 BioIO formats, whose
-  §12 declarations are reasoned from their read paths rather than benchmarked.
+  §12 declarations are reasoned from their read paths rather than benchmarked,
+  and MRC and NIfTI, which now declare a *decimation* capability with no file of
+  either format in this catalog to measure it on (§6.2).
 
 ## 12. Read granularity — the declaration, and where each adapter stands
 

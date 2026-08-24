@@ -798,6 +798,50 @@ class TensorAdapter(SourceAdapter):
         """
         return None
 
+    def get_decimated_data(
+        self, bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """Every ``step``-th element of ``bounds``, or ``None`` to decline.
+
+        ``None`` is the default and means "read the extent and stride it", which
+        is what the caller does anyway. An adapter implements this only where a
+        strided read costs in proportion to what it *returns* rather than to the
+        extent it spans -- and that is exactly what a ``nearest`` reduction is:
+        ``data[::step]``, element 0 of every block, needing none of the elements
+        it skips.
+
+        The candidates are the backends that already report no
+        :attr:`read_block_shape`, and the two answers correlate for one reason:
+        a quantized backend has to decode a whole block to hand back any of it,
+        so skipping elements inside it saves no reading -- only a memcpy, which
+        the streamed path already bounds. Where nothing is quantized, the skipped
+        elements are never touched at all. That is the one reduction where fusing
+        removes *reads* and not just heap: ``area`` has to visit every source
+        element whatever it does with them.
+
+        Declaring this where the backend cannot honour it cheaply is silent in
+        the same way :attr:`read_block_shape` is -- every value stays
+        bit-identical, the read merely costs more -- so ``decimated_read_test``
+        requires every adapter class to appear in one list or the other.
+
+        An implementation must hold to all of:
+
+        1. **Shape** -- ``len(range(start, stop, step))`` per axis, which is what
+           ``downsample_block``'s ``nearest`` returns for the same extent.
+        2. **Values** -- bit-identical to ``get_data(bounds)[::step]``. A pick is
+           exact by construction for every dtype and every scale, so unlike
+           ``area`` there is no accuracy trade hiding here.
+        3. **Ownership** -- an owned array, exactly as :meth:`get_data` must
+           return: no view onto a reader-owned mapping may escape.
+
+        Args:
+            bounds: Chunk bounds, in this adapter's own axis order.
+            step: Per-axis stride, same order and length as ``bounds``.
+        Returns:
+            The picked array, or ``None`` to leave the caller on its own path.
+        """
+        return None
+
     def get_scaled_data(
         self,
         bounds: ChunkBounds,
@@ -812,6 +856,11 @@ class TensorAdapter(SourceAdapter):
         :mod:`~.stream_reduce`). An extent that is already one tile is read and
         reduced whole, which is what every unscaled read and most small scaled
         ones do.
+
+        ``nearest`` takes a shorter route where the backend offers one: it is a
+        pick, so :meth:`get_decimated_data` expresses it whole, and an adapter
+        implements that one method rather than this one. Streaming does not
+        apply there -- a decimated read already materialises exactly the output.
 
         An adapter whose reader can deliver the extent in pieces more cheaply
         than ``get_data`` can (a CZI ``read(zoom=)``, a native pyramid level)
@@ -846,6 +895,16 @@ class TensorAdapter(SourceAdapter):
         Returns:
             The reduced array.
         """
+        step = tuple(max(1, int(scale)) for scale in scale_hint)
+        if reduction_method == "nearest" and any(size > 1 for size in step):
+            # A pick needs none of what it skips, so a backend that can stride
+            # its own read never touches those bytes. Tried before the tile is
+            # sized because it makes tiling moot: the result IS the output, so
+            # residency is bounded at the chunk without streaming anything.
+            picked = self.get_decimated_data(bounds, step)
+            if picked is not None:
+                return picked
+
         descriptor = self.get_tensor_descriptor()
         tensor_shape = tuple(int(dim) for dim in descriptor.shape)
         start = tuple(int(value) for value in bounds.start)
@@ -885,6 +944,21 @@ class TensorAdapter(SourceAdapter):
         return tuple(
             slice(int(s), int(e))
             for s, e in zip(bounds.start, bounds.stop, strict=True)
+        )
+
+    @staticmethod
+    def _bounds_to_strided_slices(
+        bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Tuple[slice, ...]:
+        """:meth:`_bounds_to_slices` with a per-axis stride, for a decimated read.
+
+        Kept next to its unstrided sibling so the two index a store identically
+        apart from the step -- which is the whole of what makes a fused
+        ``nearest`` bit-identical to reading the extent and slicing it.
+        """
+        return tuple(
+            slice(int(s), int(e), max(1, int(size)))
+            for s, e, size in zip(bounds.start, bounds.stop, step, strict=True)
         )
 
     def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
@@ -1384,6 +1458,7 @@ _TENSOR_SCOPED_API = frozenset(
         "get_transfer_chunk_size",
         "read_block_shape",
         "get_data",
+        "get_decimated_data",
         "get_scaled_data",
         "get_arrow_schema",
         "resolve_chunk_data",
