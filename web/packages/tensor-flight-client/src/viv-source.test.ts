@@ -322,6 +322,29 @@ describe("PixelSource.getTile", () => {
     expect(client.tile.mock.calls[0]![0].sel).toEqual([[0, 154]]);
   });
 
+  it("refuses a tensor whose unnamed axis this server cannot reach", () => {
+    // An old server sends `pinned` and no `sel_axes`. Without this probe it
+    // answers `?sel=0:154` with index 0's pixels and a 200, so the viewer scrolls
+    // through 155 copies of frame 0 with nothing on screen saying so.
+    const { sel_axes: _dropped, ...oldServer } = SEQUENCE_INFO;
+    expect(() => pixelSourcesFromInfo(stubClient(), oldServer as TileInfo)).toThrow(
+      /cannot select: i \(155 positions\)/,
+    );
+  });
+
+  it("still tiles a fully named tensor against such a server", () => {
+    // The refusal is about the axis, not the server: TCZYX needs no `sel`.
+    const { sel_axes: _dropped, ...oldServer } = INFO;
+    expect(() => pixelSourcesFromInfo(stubClient(), oldServer as TileInfo)).not.toThrow();
+  });
+
+  it("ignores an unnamed axis of extent 1, which needs no selection", () => {
+    const { sel_axes: _dropped, ...oldServer } = SEQUENCE_INFO;
+    expect(() =>
+      pixelSourcesFromInfo(stubClient(), { ...oldServer, shape: [1, 1024, 1344] } as TileInfo),
+    ).not.toThrow();
+  });
+
   it("refuses a non-zero index on an axis the tensor does not have", async () => {
     const info: TileInfo = {
       ...INFO,

@@ -120,6 +120,42 @@ export function vivLabels(info: TileInfo): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Server capability
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this server's tile route can address an axis by wire index (`sel`).
+ *
+ * `sel_axes` is the marker because it arrived with `sel` in the same change: a
+ * server that publishes the list is a server that accepts the parameter, and one
+ * that predates both sends `pinned` instead and leaves this `undefined`.
+ *
+ * The probe is needed because the failure is otherwise **silent**. Starlette
+ * drops undeclared query parameters, so an old server answers `?sel=0:154` with
+ * index 0's pixels, HTTP 200, and an ETag identical to every other frame's — the
+ * viewer shows one plane of 155 and nothing anywhere says so. That is the exact
+ * failure `_resolve_tile_selection` already refuses one level down ("a client
+ * told it got a plane it did not get"), and version skew is not a reason to
+ * accept it: a browser holding a cached bundle, or a sidecar upgraded on its own
+ * schedule, reaches this without anyone doing anything unusual.
+ *
+ * Deliberately a *capability* question and not a *tensor* one. A TCZYX tensor
+ * needs no `sel` and still tiles perfectly against an old server; only a tensor
+ * with an axis nothing names is affected.
+ */
+export function supportsSelParameter(info: TileInfo): boolean {
+  return Array.isArray(info.sel_axes);
+}
+
+/** The unnamed axes this server cannot reach, or `[]` when it can reach them. */
+function unreachableAxes(info: TileInfo) {
+  if (supportsSelParameter(info)) return [];
+  return sliderAxes(info.dim_labels, info.shape).filter(
+    (axis) => !axis.named && axis.extent > 1,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
@@ -319,6 +355,22 @@ export function pixelSourcesFromInfo(
   info: TileInfo,
   options: TensorPixelSourceOptions = {},
 ): PixelSource<string[]>[] {
+  const unreachable = unreachableAxes(info);
+  if (unreachable.length) {
+    // Refusing the tensor, not the axis: the caller falls back to the
+    // server-rendered viewer, which addresses axes positionally through
+    // `slice_start` and has always served these planes correctly. So the answer
+    // to an old server is a working viewer plus a stated reason, rather than a
+    // slider that scrolls through 155 copies of frame 0.
+    const named = unreachable
+      .map((axis) => `${axis.title} (${axis.extent} positions)`)
+      .join(", ");
+    throw new Error(
+      `Tensor ${info.array_id} has an axis this server's tile route cannot ` +
+        `select: ${named}. Addressing it needs the \`sel\` parameter, which this ` +
+        `server predates — it would answer every position with index 0.`,
+    );
+  }
   const labels = vivLabels(info);
   const dtype = vivDtype(info.dtype);
   // Shared across the levels of this image, so a selection change supersedes
@@ -557,7 +609,19 @@ function tileSelection(
       sel.push([axis.axis, index]);
     }
   }
-  if (sel.length) out.sel = sel;
+  if (sel.length) {
+    // Unreachable through `pixelSourcesFromInfo`, which refuses such a tensor
+    // up front. Kept because the cost of being wrong here is silent wrong
+    // pixels: this also covers the drift path above, where a *named* axis falls
+    // through to `sel` because the two sides disagree about its name.
+    if (!supportsSelParameter(info)) {
+      throw new Error(
+        `Tensor ${info.array_id} needs the \`sel\` parameter to select ` +
+          `axis ${sel.map(([axis]) => axis).join(", ")}, which this server predates`,
+      );
+    }
+    out.sel = sel;
+  }
   return out;
 }
 
