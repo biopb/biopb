@@ -267,8 +267,24 @@ class NiftiAdapter(TensorAdapter):
             RuntimeError: If the source has been closed.
         """
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        return self._read_slices(self._bounds_to_slices(bounds))
 
+    def get_decimated_data(
+        self, bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """The same lazy slice, strided: nibabel reads what the step lands on.
+
+        ``ArrayProxy.__getitem__`` goes through ``nibabel.fileslice``, which
+        plans the read from the slice itself -- seeking past a gap once it is
+        wider than its threshold, reading through it when seeking would cost
+        more. So a strided read is never worse than reading the extent and
+        striding it, and on a coarse scale it is a small fraction of the I/O.
+        """
+        super().get_data(bounds)
+        return self._read_slices(self._bounds_to_strided_slices(bounds, step))
+
+    def _read_slices(self, slices: Tuple[slice, ...]) -> np.ndarray:
+        """Read ``slices`` from the lazy dataobj, scaled to float64."""
         # Take the image reference once, then check it: close() races a read only
         # by nulling this attribute, and the read of a reference is atomic under
         # the GIL, so a local ref is either the image or None -- never torn. That

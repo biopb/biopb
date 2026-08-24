@@ -988,31 +988,57 @@ class NikonAdapter(_BioioAdapterBase):
         access directly. Only the requested subregion is copied, while the ND2
         file is open, so no reader-backed view escapes this method.
         """
+        return self._read(bounds, (1,) * len(bounds.start))
+
+    def get_decimated_data(
+        self, bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """The same read, strided -- the one place a scaled read skips bytes.
+
+        The step reaches two different things. On T and Z it selects *frames*,
+        so a scale-8 Z read decodes an eighth of them and the rest are never
+        touched at all. Inside a frame it is a stride into the mmap view, so the
+        crop copies one element per block instead of the block.
+
+        Correct for the same reason the unstrided read is: every element still
+        comes from the frame the sequence map puts it in, and the copy still
+        lands in this method's own output before the lock drops.
+        """
+        return self._read(bounds, step)
+
+    def _read(self, bounds: ChunkBounds, step: Tuple[int, ...]) -> np.ndarray:
+        """``bounds`` at ``step``; a step of ones is the plain read."""
         if self.scene_index is None:
             raise ValueError("Cannot get data from source-level adapter")
 
         TensorAdapter.get_data(self, bounds)
         if not self._source_url or not os.path.isfile(self._source_url):
-            return self._get_data_via_bioio(bounds)
+            return self._get_data_via_bioio(bounds, step)
 
         desc = self.get_tensor_descriptor()
         labels = [label.upper() for label in desc.dim_labels]
         if len(labels) != len(desc.shape) or not {"Y", "X"}.issubset(labels):
-            return self._get_data_via_bioio(bounds)
+            return self._get_data_via_bioio(bounds, step)
         if any(label not in {"T", "C", "Z", "Y", "X", "S"} for label in labels):
-            return self._get_data_via_bioio(bounds)
+            return self._get_data_via_bioio(bounds, step)
         shape = tuple(int(dim) for dim in desc.shape)
         starts = tuple(int(value) for value in bounds.start)
         stops = tuple(int(value) for value in bounds.stop)
+        steps = tuple(max(1, int(size)) for size in step)
         output = np.empty(
-            tuple(stop - start for start, stop in zip(starts, stops, strict=True)),
+            tuple(
+                len(range(start, stop, size))
+                for start, stop, size in zip(starts, stops, steps, strict=True)
+            ),
             dtype=np.dtype(desc.dtype),
         )
 
         sequence_axes = [
             axis for axis, label in enumerate(labels) if label in {"T", "Z"}
         ]
-        sequence_ranges = [range(starts[axis], stops[axis]) for axis in sequence_axes]
+        sequence_ranges = [
+            range(starts[axis], stops[axis], steps[axis]) for axis in sequence_axes
+        ]
         frame_shape = tuple(
             1 if label in {"T", "Z"} else size
             for label, size in zip(labels, shape, strict=True)
@@ -1028,6 +1054,7 @@ class NikonAdapter(_BioioAdapterBase):
                     labels,
                     starts,
                     stops,
+                    steps,
                     output,
                     sequence_axes,
                     sequence_ranges,
@@ -1041,7 +1068,7 @@ class NikonAdapter(_BioioAdapterBase):
         fallback_to_bioio = output is None
 
         if fallback_to_bioio:
-            return self._get_data_via_bioio(bounds)
+            return self._get_data_via_bioio(bounds, step)
         return output
 
     def _read_frames_into(
@@ -1051,6 +1078,7 @@ class NikonAdapter(_BioioAdapterBase):
         labels,
         starts,
         stops,
+        steps,
         output,
         sequence_axes,
         sequence_ranges,
@@ -1092,16 +1120,16 @@ class NikonAdapter(_BioioAdapterBase):
                 output_slices = []
                 for axis, label in enumerate(labels):
                     if label in {"T", "Z"}:
+                        # The coordinate is one the sequence range stepped to,
+                        # so this divides exactly.
                         coordinate = coordinate_by_label[label]
+                        index = (coordinate - starts[axis]) // steps[axis]
                         source_slices.append(slice(0, 1))
-                        output_slices.append(
-                            slice(
-                                coordinate - starts[axis],
-                                coordinate - starts[axis] + 1,
-                            )
-                        )
+                        output_slices.append(slice(index, index + 1))
                     else:
-                        source_slices.append(slice(starts[axis], stops[axis]))
+                        source_slices.append(
+                            slice(starts[axis], stops[axis], steps[axis])
+                        )
                         output_slices.append(slice(None))
                 output[tuple(output_slices)] = frame[tuple(source_slices)]
 
@@ -1135,9 +1163,21 @@ class NikonAdapter(_BioioAdapterBase):
             with self._io_lock:
                 self._shared_handle._release_persistent_handle()
 
-    def _get_data_via_bioio(self, bounds: ChunkBounds) -> np.ndarray:
-        """Use an ephemeral BioIO Dask array for unsupported direct-read cases."""
-        slices = self._bounds_to_slices(bounds)
+    def _get_data_via_bioio(
+        self, bounds: ChunkBounds, step: Optional[Tuple[int, ...]] = None
+    ) -> np.ndarray:
+        """Use an ephemeral BioIO Dask array for unsupported direct-read cases.
+
+        A step is honoured but not accelerated: dask materialises whichever
+        blocks the stride lands in. That keeps a decimated read correct on the
+        scenes the direct path cannot address, at the cost the caller would have
+        paid reading the extent and striding it.
+        """
+        slices = (
+            self._bounds_to_slices(bounds)
+            if step is None
+            else self._bounds_to_strided_slices(bounds, step)
+        )
         with self._io_lock:
             self._bio_image.set_scene(self.scene_index)
             try:

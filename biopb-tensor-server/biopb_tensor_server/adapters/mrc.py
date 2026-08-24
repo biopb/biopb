@@ -47,7 +47,7 @@ Single chunk strategy - base class handles splitting for oversized arrays.
 
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -247,15 +247,35 @@ class MrcAdapter(TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
-        # The copy runs OUTSIDE _io_lock, which is the property #71 established
-        # and this keeps: a read-only np.memmap has no shared cursor (unlike a
-        # seekable file handle), indexing computes byte offsets directly and the
-        # copy lands in a fresh buffer, so parallel do_get chunk reads of one MRC
-        # source still run at once. Sharing the mapping does not change that --
-        # what it changes is that unmapping is now someone else's decision, so
-        # the read has to be counted while it is in flight. Copy out (np.array)
-        # so the result outlives the mapping either way.
+        return self._copy_out(self._bounds_to_slices(bounds))
+
+    def get_decimated_data(
+        self, bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """A strided slice of the same mapping: only the picked elements copy.
+
+        Indexing a memmap computes byte offsets, so the step costs nothing to
+        express and the copy shrinks by the product of the strides -- a scale-8
+        pick of a 3D extent moves 1/512 of the bytes. What it does not shrink is
+        what the kernel faults: a stride finer than a page still touches every
+        page it steps across, which is why the saving is memcpy-and-cache first
+        and I/O only where the stride outruns the readahead.
+        """
+        super().get_data(bounds)
+        return self._copy_out(self._bounds_to_strided_slices(bounds, step))
+
+    def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:
+        """Copy ``slices`` out of the shared mapping, counting the read.
+
+        The copy runs OUTSIDE _io_lock, which is the property #71 established
+        and this keeps: a read-only np.memmap has no shared cursor (unlike a
+        seekable file handle), indexing computes byte offsets directly and the
+        copy lands in a fresh buffer, so parallel do_get chunk reads of one MRC
+        source still run at once. Sharing the mapping does not change that --
+        what it changes is that unmapping is now someone else's decision, so
+        the read has to be counted while it is in flight. Copy out (np.array)
+        so the result outlives the mapping either way.
+        """
         mm = self._begin_read()
         try:
             return np.array(mm[slices])
