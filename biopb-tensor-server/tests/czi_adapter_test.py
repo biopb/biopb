@@ -11,6 +11,7 @@ from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     LiveLocalContext,
 )
+from biopb_tensor_server.core.downsample import downsample_block
 
 pytest.importorskip("pylibCZIrw")
 
@@ -435,3 +436,145 @@ def test_unopenable_file_raises_instead_of_falling_back(tmp_path):
     with pytest.raises(Exception) as excinfo:
         CziAdapter.create_from_config(_source(path))
     assert not isinstance(excinfo.value, AssertionError)
+
+
+class TestZoomServesNearest:
+    """``get_scaled_data`` routes ``nearest`` to libCZI's ``zoom=`` (#640).
+
+    The gate is divisibility, not powers of two: ``zoom=`` returns
+    ``floor(extent / factor)`` where the contract requires ``ceil``, so the two
+    agree exactly when the factor divides the extent. Every assertion here is
+    bit-identity against the default path, which is the only thing that makes
+    swapping in a different decoder legitimate.
+    """
+
+    @staticmethod
+    def _bounds(start, stop):
+        return ChunkBounds(start=list(start), stop=list(stop))
+
+    def _adapter(self, tmp_path, shape=(120, 120), **kw):
+        path, expected = create_zeiss_czi(
+            str(tmp_path), n_t=1, n_c=1, n_z=1, image_shape=shape, **kw
+        )
+        source = _native(path)
+        descriptor = source.list_tensor_descriptors()[0]
+        return source.get_tensor_adapter(descriptor.array_id.split("/")[-1]), expected
+
+    @pytest.mark.parametrize("factor", [2, 3, 4, 5, 6, 8])
+    def test_zoom_is_bit_identical_to_the_default(self, tmp_path, factor):
+        """Non-dyadic factors included -- 3 and 5 divide 120 and are exact."""
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
+        scale = (1, 1, 1, factor, factor)
+
+        # Without this the assertions below pass on the fallback path too.
+        assert adapter._zoom_factor(bounds, scale, "nearest") == factor
+        fused = adapter.get_scaled_data(bounds, scale, "nearest")
+        expected = downsample_block(adapter.get_data(bounds), scale, "nearest")
+
+        assert fused.shape == expected.shape
+        assert fused.dtype == expected.dtype
+        assert np.array_equal(fused, expected)
+
+    def test_an_indivisible_extent_falls_back(self, tmp_path, monkeypatch):
+        """The one-off shape: ``floor`` and ``ceil`` disagree, so decline.
+
+        Asserted through the fallback actually running, because a silent
+        one-row-short result is exactly what this gate exists to prevent.
+        """
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 118, 118))
+        scale = (1, 1, 1, 8, 8)
+        assert adapter._zoom_factor(bounds, scale, "nearest") is None
+
+        out = adapter.get_scaled_data(bounds, scale, "nearest")
+        assert out.shape[-2:] == (15, 15)  # ceil(118 / 8), not floor
+        assert np.array_equal(
+            out, downsample_block(adapter.get_data(bounds), scale, "nearest")
+        )
+
+    def test_area_never_zooms(self, tmp_path):
+        """``zoom=`` picks one pixel per block: 100% of pixels differ from area."""
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
+        scale = (1, 1, 1, 4, 4)
+        assert adapter._zoom_factor(bounds, scale, "area") is None
+        assert np.array_equal(
+            adapter.get_scaled_data(bounds, scale, "area"),
+            downsample_block(adapter.get_data(bounds), scale, "area"),
+        )
+
+    def test_a_scaled_plane_axis_declines(self, tmp_path):
+        """Reducing across reads is the default path's job, not one read's."""
+        path, _ = create_zeiss_czi(
+            str(tmp_path), n_t=1, n_c=1, n_z=4, image_shape=(120, 120)
+        )
+        source = _native(path)
+        descriptor = source.list_tensor_descriptors()[0]
+        adapter = source.get_tensor_adapter(descriptor.array_id.split("/")[-1])
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 4, 120, 120))
+
+        assert adapter._zoom_factor(bounds, (1, 1, 2, 4, 4), "nearest") is None
+        assert adapter._zoom_factor(bounds, (1, 1, 1, 4, 4), "nearest") == 4
+
+    def test_unequal_y_and_x_factors_decline(self, tmp_path):
+        """One read takes one zoom; two factors are two reductions."""
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
+        assert adapter._zoom_factor(bounds, (1, 1, 1, 4, 2), "nearest") is None
+        assert adapter._zoom_factor(bounds, (1, 1, 1, 1, 1), "nearest") is None
+
+    def test_an_interior_window_zooms_from_its_own_origin(self, tmp_path):
+        """The pick is relative to the ROI, so an off-origin chunk is exact."""
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 7, 23), (1, 1, 1, 103, 119))
+        scale = (1, 1, 1, 8, 8)
+
+        assert adapter._zoom_factor(bounds, scale, "nearest") == 8
+        assert np.array_equal(
+            adapter.get_scaled_data(bounds, scale, "nearest"),
+            downsample_block(adapter.get_data(bounds), scale, "nearest"),
+        )
+
+    def test_a_shape_disagreement_falls_back_rather_than_failing(
+        self, tmp_path, monkeypatch
+    ):
+        """If libCZI ever rounds differently, serve correct pixels anyway."""
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
+        scale = (1, 1, 1, 4, 4)
+
+        reader = adapter._acquire_reader()
+        reader_type = type(reader)
+        real_read = reader_type.read
+
+        def truncating(self, **kw):
+            plane = real_read(self, **kw)
+            return plane[:-1, :-1] if kw.get("zoom") is not None else plane
+
+        monkeypatch.setattr(reader_type, "read", truncating)
+        out = adapter.get_scaled_data(bounds, scale, "nearest")
+        assert np.array_equal(
+            out, downsample_block(adapter.get_data(bounds), scale, "nearest")
+        )
+
+    def test_the_zoom_reaches_libczi(self, tmp_path, monkeypatch):
+        """The wiring, not the arithmetic: one zoomed read per plane, no more."""
+        adapter, _ = self._adapter(tmp_path)
+        bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
+
+        zooms = []
+        reader = adapter._acquire_reader()
+        real_read = reader.read
+        monkeypatch.setattr(
+            type(reader),
+            "read",
+            lambda self, **kw: (zooms.append(kw.get("zoom")), real_read(**kw))[1],
+        )
+
+        adapter.get_scaled_data(bounds, (1, 1, 1, 8, 8), "nearest")
+        assert zooms == [1.0 / 8]
+
+        zooms.clear()
+        adapter.get_scaled_data(bounds, (1, 1, 1, 8, 8), "area")
+        assert zooms == [None]
