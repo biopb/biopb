@@ -4,6 +4,7 @@ Handles single DICOM files and multi-file DICOM series using pydicom.
 """
 
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -136,6 +137,34 @@ def _dicom_physical_scale(ds, dim_labels) -> Optional[Tuple[List[float], List[st
         {"y": row_sp, "x": col_sp, "z": z_sp, "frame": z_sp},
         "mm",
     )
+
+
+def _dicom_header_only(ds):
+    """``ds`` without its pixel data, copied only if it carries any.
+
+    An adapter outlives every read, so whatever it holds is held for the
+    catalog's lifetime. A pixel-bearing ``Dataset`` costs the raw ``PixelData``
+    bytes, and pydicom memoizes the decode of *every* frame onto the dataset the
+    first time anything touches ``pixel_array`` -- so one read of one sub-region
+    would pin raw + decoded forever (#821). Adapters here decode per frame
+    straight from the file instead, and keep headers only.
+    """
+    from pydicom.dataset import Dataset
+
+    # Group 7FE0 is the pixel data elements (PixelData / FloatPixelData /
+    # DoubleFloatPixelData) plus the extended offset table -- the same stop
+    # point pydicom's ``stop_before_pixels`` uses.
+    if not any(elem.tag.group == 0x7FE0 for elem in ds):
+        return ds
+
+    header = Dataset()
+    file_meta = getattr(ds, "file_meta", None)
+    if file_meta is not None:
+        header.file_meta = file_meta
+    for elem in ds:
+        if elem.tag.group != 0x7FE0:
+            header.add(elem)
+    return header
 
 
 def _dicom_common_metadata(ds) -> dict:
@@ -293,7 +322,12 @@ class DicomAdapter(TensorAdapter):
     - Single frame: Single chunk for entire 2D image
     - Multi-frame: One chunk per frame (NumberOfFrames > 1)
 
-    Uses pydicom for DICOM parsing and pixel data access.
+    Uses pydicom for DICOM parsing and pixel data access. The adapter retains
+    only the header (see :func:`_dicom_header_only`); every read decodes the
+    frames it covers straight from the file via ``pydicom.pixels``, so a
+    catalogued-but-unread source costs nothing and a one-frame request does not
+    pay to decode the whole study (#821). Re-reads are absorbed by the chunk
+    cache above the adapter, not by retaining pixels here.
     """
 
     @classmethod
@@ -370,6 +404,10 @@ class DicomAdapter(TensorAdapter):
         """
         import pydicom
 
+        fs = fs_path = None
+        # Header-only: the descriptor needs Rows/Columns/NumberOfFrames/
+        # BitsStored/PixelRepresentation and nothing else, and reads reopen the
+        # file per call, so a registered source holds no pixel bytes (#821).
         if source.is_remote:
             # Remote storage: use fsspec file-like object
             from fsspec.core import url_to_fs
@@ -383,12 +421,19 @@ class DicomAdapter(TensorAdapter):
 
             fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
             with fs.open(fs_path, mode="rb") as fobj:
-                ds = pydicom.dcmread(fobj)
+                ds = pydicom.dcmread(fobj, stop_before_pixels=True)
         else:
             # Local filesystem
-            ds = pydicom.dcmread(str(source.url))
+            ds = pydicom.dcmread(str(source.url), stop_before_pixels=True)
 
-        return cls(ds, source.source_id, source.dim_labels, source_url=str(source.url))
+        return cls(
+            ds,
+            source.source_id,
+            source.dim_labels,
+            source_url=str(source.url),
+            remote_fs=fs,
+            remote_path=fs_path,
+        )
 
     def __init__(
         self,
@@ -396,16 +441,22 @@ class DicomAdapter(TensorAdapter):
         source_id: str,
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
+        remote_fs: Optional[Any] = None,
+        remote_path: Optional[str] = None,
     ):
         """Initialize DICOM adapter.
 
         Args:
-            dicom_dataset: pydicom Dataset object
+            dicom_dataset: pydicom Dataset object. Only its header is retained;
+                any pixel data it carries is dropped (#821).
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
             source_url: Optional source URL (overrides filename-derived path)
+            remote_fs: Optional fsspec filesystem that reads reopen the file
+                on; ``None`` for a local source
+            remote_path: Path within ``remote_fs``; local sources leave both
+                ``None`` and reads go through ``_source_url``.
         """
-        self.ds = dicom_dataset
         self.source_id = source_id
         self._io_lock = threading.Lock()
 
@@ -416,6 +467,12 @@ class DicomAdapter(TensorAdapter):
             self._source_url = str(dicom_dataset.filename)
         else:
             self._source_url = ""
+
+        # Reads reopen the file, so the retained dataset can be -- and is made
+        # to be -- headers only, whatever the caller handed us.
+        self._remote_fs = remote_fs
+        self._remote_path = remote_path
+        self.ds = _dicom_header_only(dicom_dataset)
         # Cheap content_version from the file's stat signature (#178): O(1),
         # folded into minted chunk_ids so a re-saved file gets a fresh cache
         # namespace. None (unresolved / non-file url) leaves the source unversioned.
@@ -466,16 +523,37 @@ class DicomAdapter(TensorAdapter):
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
-        """One frame, which is the least ``pixel_array`` can hand back.
+        """One frame, which is the least a decode can hand back.
 
-        ``get_data`` decodes through ``ds.pixel_array`` and slices the result, so
-        a window costs at least its frame; a multi-frame dataset decodes more
-        still, which pydicom's own caching of ``pixel_array`` then absorbs.
+        ``get_data`` decodes per frame and crops, so a Y/X window costs its whole
+        frame -- but only the frames the bounds cover, not the dataset (#821).
+        Before that this understated the cost: the first read decoded every
+        frame, and pydicom's memo on the dataset is what made the rest look free.
         """
         return tuple([1] * (len(self._shape) - 2) + list(self._shape[-2:]))
 
+    @contextmanager
+    def _pixel_source(self):
+        """Yield something ``pydicom.pixels`` can stream frames from.
+
+        A path for a local source (pydicom opens and closes it around the read);
+        a fresh fsspec handle for a remote one. Nothing is held between reads --
+        both decoders seek to the pixel data and stream the frames they were
+        asked for, so a reopen costs a header parse, not a download.
+        """
+        if self._remote_fs is not None:
+            with self._remote_fs.open(self._remote_path, mode="rb") as fobj:
+                yield fobj
+        else:
+            yield str(self._source_url)
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM pixel data.
+
+        Only the frames the bounds cover are decoded: ``pydicom.pixels`` parses
+        the header once, seeks to the pixel data and decodes frame by frame, so
+        a single-frame request out of a 300-frame study costs one frame rather
+        than all of them (#821).
 
         Args:
             bounds: Chunk bounds (start, stop coordinates per axis)
@@ -486,13 +564,20 @@ class DicomAdapter(TensorAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
+        from pydicom.pixels import iter_pixels, pixel_array
+
         super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
 
         # Serialize IO for thread safety
-        with self._io_lock:
-            pixel_data = self.ds.pixel_array
-            return pixel_data[slices]
+        with self._io_lock, self._pixel_source() as src:
+            if not self._is_multiframe:
+                return pixel_array(src, index=0)[slices]
+
+            frames = iter_pixels(
+                src, indices=range(int(bounds.start[0]), int(bounds.stop[0]))
+            )
+            return np.stack([frame[slices[1:]] for frame in frames])
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (mm) from this file's ``PixelSpacing`` etc."""
@@ -518,6 +603,10 @@ class DicomSeriesAdapter(TensorAdapter):
     Multi-node claim: claims directory + all DICOM files in the series.
 
     Chunk strategy: One chunk per slice (file), shape = [1, H, W]
+
+    Reads decode one frame per covered slice file directly from disk and retain
+    nothing; repeat reads are absorbed by the chunk cache above the adapter
+    (#821).
     """
 
     @classmethod
@@ -777,7 +866,7 @@ class DicomSeriesAdapter(TensorAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
-        import pydicom
+        from pydicom.pixels import pixel_array
 
         super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
@@ -790,24 +879,23 @@ class DicomSeriesAdapter(TensorAdapter):
         )
         dtype = np.dtype(self._dtype)
 
+        # ``pixel_array(path, index=0)`` streams the one frame out of the file
+        # rather than building a Dataset that holds the raw bytes *and* pydicom's
+        # memoized decode of them (#821); one frame per covered slice file.
         # Serialize IO for thread safety
         with self._io_lock:
             if slice_stop - slice_start == 1:
                 # Single slice - read directly
                 dcm_file = self.dicom_files[slice_start]
-                ds = pydicom.dcmread(str(dcm_file))
-                pixel_data = ds.pixel_array
                 # Apply spatial slices
-                return pixel_data[slices[1:]]
+                return pixel_array(str(dcm_file), index=0)[slices[1:]]
             else:
                 # Multiple slices - read each and stack
                 result = np.zeros(out_shape, dtype=dtype)
                 for i, slice_idx in enumerate(range(slice_start, slice_stop)):
                     dcm_file = self.dicom_files[slice_idx]
-                    ds = pydicom.dcmread(str(dcm_file))
-                    pixel_data = ds.pixel_array
                     # Apply spatial slices and assign to result
-                    result[i] = pixel_data[slices[1:]]
+                    result[i] = pixel_array(str(dcm_file), index=0)[slices[1:]]
                 return result
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
