@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pyarrow.flight as flight
 import pytest
 from biopb_tensor_server.serving.http_server import (
     _split_array_version,
@@ -76,12 +77,19 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     mc.list_sources.return_value = {src.source_id: src}
 
     def get_descriptor(array_id, **_kwargs):
+        """What GetFlightInfo actually does, including the parts that bite.
+
+        A bare source_id resolves to the source's DEFAULT tensor whatever the
+        count -- the server defaults rather than refusing, so the refusal is the
+        caller's job -- and an unknown field is a terminal ``FlightServerError``
+        (pyarrow has no NOT_FOUND class).
+        """
         for tensor in src.tensors:
             if tensor.array_id == array_id:
                 return tensor
-        if array_id == src.source_id and len(src.tensors) == 1:
+        if array_id == src.source_id:
             return src.tensors[0]
-        raise KeyError(array_id)
+        raise flight.FlightServerError(f"Tensor not found: {array_id}")
 
     mc.get_descriptor.side_effect = get_descriptor
     mc.get_source_metadata.return_value = {"ome_ngff": {"version": "0.4"}}
@@ -714,8 +722,14 @@ class TestSliceAddressing:
         assert "source_id" not in call.kwargs
         assert "tensor_id" not in call.kwargs
 
-    def test_a_bare_source_id_on_a_multi_tensor_source_is_refused(self):
-        # Not tensors[0]: guessing is what let geometry and the read disagree.
+    def test_a_bare_source_id_reads_the_tensor_the_server_bound(self):
+        """Not a sidecar refusal: array_id policy belongs to the Flight server.
+
+        It defaults a bare source_id to the source's default tensor, and the
+        answer says which. What #75 was actually about is that the read must go
+        to *that* tensor rather than re-deriving one -- so the assertion is on
+        the id the read carries, not on a status code.
+        """
         tensors = [
             _make_tensor_desc(array_id="multi/a"),
             _make_tensor_desc(array_id="multi/b"),
@@ -731,10 +745,8 @@ class TestSliceAddressing:
             with TestClient(app, raise_server_exceptions=True) as tc:
                 r = tc.post("/api/slice", json={"array_id": "multi"})
 
-        assert r.status_code == 404
-        detail = r.json()["detail"]
-        assert "multi/a" in detail and "multi/b" in detail
-        mock_fc.get_tensor.assert_not_called()
+        assert r.status_code == 200
+        assert mock_fc.get_tensor.call_args.args[0] == "multi/a"
 
     def test_the_old_pair_is_rejected_rather_than_guessed_at(self, auth_client):
         # 422 from the model: a body without array_id names no tensor, and
@@ -2072,13 +2084,14 @@ class TestTileArrayIdAddressing:
                     == "plate/A01/0"
                 )
 
-    def test_a_bare_id_is_refused_for_a_multi_tensor_source(self):
-        # biopb/biopb#75: refuse rather than guess. It used to return tensor[0].
+    def test_a_bare_id_publishes_the_qualified_id_the_server_chose(self):
+        # The server defaults; the sidecar reports which tensor that was rather
+        # than refusing. First contact is where the ambiguity ends: the viewer
+        # threads the qualified id back through every tile after.
         with _multi_tensor_client() as (tc, _):
-            r = tc.get("/api/tile_info/multi")
-            assert r.status_code == 404
-            detail = r.json()["detail"]
-            assert "multi/Image:0" in detail and "multi/Image:1" in detail
+            info = tc.get("/api/tile_info/multi").json()
+            assert info["array_id"] == "multi/Image:0"
+            assert info["shape"] == [1, 1, 1, 512, 512]
 
     def test_a_bare_id_still_works_for_a_single_tensor_source(self):
         # For a single-tensor source the bare source_id *is* the array_id.
@@ -2109,7 +2122,7 @@ class TestTileArrayIdAddressing:
         # something else; the ignored query param cannot change the tensor.
         with _multi_tensor_client() as (tc, _):
             r = tc.get("/api/tile_info/multi", params={"tensor_id": "Image:1"})
-            assert r.status_code == 404
+            assert r.json()["array_id"] == "multi/Image:0"
 
 
 # ===========================================================================
@@ -2227,12 +2240,11 @@ class TestVersionedTileRequests:
         assert etags[0] != etags[1]
 
     def test_a_stale_source_listing_cannot_weaken_the_check(self):
-        """The guarantee must survive biopb/biopb#834 caching the listing.
+        """The token is read off the *bound descriptor*, never off the listing.
 
-        The listing is the expensive part of a tile request and the obvious
-        thing to memoize. So the token is read off the *bound descriptor*
-        (fetch-per-call by contract), never off the listing -- here the listing
-        is frozen at the old version and the check still holds.
+        Here the listing is frozen at the old version and the check still holds.
+        That independence is what let biopb/biopb#834 take the listing off the
+        resolution path entirely.
         """
         old, new = b"1700000000:4096", b"1700009999:5120"
 
@@ -2292,3 +2304,126 @@ class TestVersionedTileRequests:
             stale = tc.post("/api/slice", json={"array_id": "tiled@deadbeef/Image:0"})
         assert ok.status_code == 200
         assert stale.status_code == 404
+
+
+# ===========================================================================
+# Unit tests — a tile resolves by targeted fetch, not a catalog scan (#834)
+# ===========================================================================
+
+
+class TestTileResolutionCostsOneFetch:
+    """Listing every source to look up the one id the request already carries
+    was a second RPC on every tile, and the catalog is the expensive half."""
+
+    def test_a_qualified_tile_never_lists_the_catalog(self):
+        with _multi_tensor_client() as (tc, mock_fc):
+            mock_fc.reset_mock()
+            assert tc.get("/api/tile/multi/Image:1").status_code == 200
+            assert mock_fc.get_descriptor.call_count == 1
+            mock_fc.list_sources.assert_not_called()
+
+    def test_a_bare_id_needs_no_listing_either(self):
+        """bioio names a lone scene `<source>/Image:0`, so the server answers a
+        bare source_id with an array_id that differs from it. Deciding whether
+        that was legitimate would take a tensor count, i.e. a listing -- and the
+        sidecar does not decide it. The server's answer is the answer.
+        """
+        with _versioned_tile_client(b"1700000000:4096") as (tc, mock_fc):
+            mock_fc.reset_mock()
+            body = tc.get("/api/tile_info/tiled").json()
+            assert body["array_id"].startswith("tiled@")
+            mock_fc.list_sources.assert_not_called()
+
+    def test_the_published_id_carries_the_qualified_tensor(self):
+        # First contact ends the ambiguity: tile_info hands back the qualified
+        # id, and every tile after it addresses that tensor by name.
+        with _versioned_tile_client(b"1700000000:4096") as (tc, mock_fc):
+            array_id = _published_array_id(tc)
+            mock_fc.reset_mock()
+            assert tc.get(f"/api/tile/{array_id}").status_code == 200
+            mock_fc.list_sources.assert_not_called()
+
+    def test_a_dead_backend_is_a_502_not_a_404(self):
+        # The fetch now owns the 404, so its except clause must not swallow a
+        # transport failure -- "this tensor is gone" and "the server is down"
+        # are opposite answers for a viewer holding a tile URL.
+        with _multi_tensor_client() as (tc, mock_fc):
+            mock_fc.get_descriptor.side_effect = flight.FlightUnavailableError(
+                "connection refused"
+            )
+            assert tc.get("/api/tile/multi/Image:1").status_code == 502
+
+    def test_an_unresolved_cloud_source_stays_a_404(self):
+        # The client raises its resolve-directive (a ValueError) where the
+        # listing used to return a source with no tensors. Same 404 either way.
+        with _multi_tensor_client() as (tc, mock_fc):
+            mock_fc.get_descriptor.side_effect = ValueError(
+                "Source 'multi' is unresolved (no tensors listed yet)."
+            )
+            assert tc.get("/api/tile/multi/Image:1").status_code == 404
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestIntegrationLoneQualifiedTensor:
+    """A real server whose single tensor is named `<source>/Image:0`.
+
+    The shape the targeted fetch cannot decide on its own (biopb/biopb#834), and
+    the common one: bioio names a lone scene, so most non-Zarr sources look like
+    this. Worth a real Flight server rather than a mocked client, because what
+    is being checked is precisely what GetFlightInfo answers.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+        z = zarr.open_array(
+            str(tmp_path / "lone.zarr"),
+            mode="w",
+            shape=(3, 32, 32),
+            chunks=(1, 16, 16),
+            dtype="uint16",
+        )
+        z[:] = np.zeros((3, 32, 32), dtype="uint16")
+        adapter = ZarrAdapter(z, "lone", ["z", "y", "x"])
+        # One tensor, carrying a name: array_id becomes "lone/Image:0".
+        adapter._tensor_name = "Image:0"
+
+        server = TensorFlightServer("grpc://127.0.0.1:0")
+        server.register_source("lone", adapter)
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(0.5)
+        self._loc = f"grpc://localhost:{server.port}"
+        self._server = server
+        yield
+        try:
+            self._server.shutdown()
+        except Exception:
+            pass
+
+    @contextmanager
+    def _tc(self):
+        with TestClient(create_app(flight_location=self._loc, token=None)) as tc:
+            yield tc
+
+    def test_the_bare_source_id_resolves_to_the_named_tensor(self):
+        with self._tc() as tc:
+            r = tc.get("/api/tile_info/lone")
+        assert r.status_code == 200, r.text
+        assert _split_array_version(r.json()["array_id"])[0] == "lone/Image:0"
+
+    def test_the_qualified_id_resolves_too(self):
+        with self._tc() as tc:
+            r = tc.get("/api/tile_info/lone/Image:0")
+        assert r.status_code == 200, r.text
+
+    def test_a_tile_comes_back_for_the_qualified_id(self):
+        with self._tc() as tc:
+            array_id = tc.get("/api/tile_info/lone").json()["array_id"]
+            r = tc.get(f"/api/tile/{array_id}")
+        assert r.status_code == 200, r.text
+
+    def test_an_unknown_field_is_still_a_404(self):
+        with self._tc() as tc:
+            assert tc.get("/api/tile_info/lone/Nope").status_code == 404
