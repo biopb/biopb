@@ -133,6 +133,27 @@ def _job_outputs(snap):
     return outputs
 
 
+def _intent_cell(snap):
+    """Markdown cell carrying the *why* recorded with a job, or ``None``.
+
+    The code is the one thing an execute_code session records natively; the goal
+    behind it exists only in the caller's head, and nowhere in the export unless
+    it was passed in. Rendered as its own cell above the code rather than folded
+    into the header comment so it survives being read as prose — and so a chat
+    loop, which will fill this field with the user's own turn, has a cell shape
+    already waiting for it.
+
+    Optional and free text: a job with no intent gets no cell, which is why this
+    returns ``None`` rather than an empty one.
+    """
+    intent = (snap.get("intent") or "").strip()
+    if not intent:
+        return None
+    job_id = snap.get("job_id", "?")
+    origin = snap.get("origin") or "agent"
+    return _markdown_cell(f"**{job_id}** · {origin} — {intent}")
+
+
 def _job_cell(snap):
     job_id = snap.get("job_id", "?")
     status = snap.get("status", "?")
@@ -155,6 +176,10 @@ def _job_cell(snap):
             "biopb": {
                 "job_id": job_id,
                 "origin": origin,
+                # Stripped, like _intent_cell: a whitespace-only intent must
+                # not survive in the metadata as one that exists while the
+                # rendered note says it does not.
+                "intent": (snap.get("intent") or "").strip(),
                 "status": status,
                 "elapsed": elapsed,
                 "created": snap.get("created"),
@@ -170,7 +195,9 @@ _INTRO = (
     "This notebook is an **audit record** of an `execute_code` session. The "
     "first code cell rebuilds the namespace (`np`, `da`, `client`, `ops`, and an "
     "empty `viewer`) on a best-effort basis; each cell below is one job, with its "
-    "recorded output.\n\n"
+    "recorded output. A job that was submitted with a stated intent carries it "
+    "as the markdown note above the code — the only record of *why* a cell was "
+    "run, and present only where whoever ran it supplied one.\n\n"
     "**Runnability caveats.** External state is not captured: tensor-server "
     "source ids and napari viewer layers from the live session do not exist on a "
     "fresh kernel, so any cell that chains `ops` source ids or reads `viewer` "
@@ -197,7 +224,11 @@ def build_notebook(jobs):
 
     cells = [_markdown_cell(_TITLE + "\n" + intro), _code_cell(BOOTSTRAP_SRC)]
     if jobs:
-        cells.extend(_job_cell(s) for s in jobs)
+        for snap in jobs:
+            note = _intent_cell(snap)
+            if note is not None:
+                cells.append(note)
+            cells.append(_job_cell(snap))
     else:
         cells.append(_markdown_cell("_No jobs were recorded in this session._"))
 

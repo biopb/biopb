@@ -61,6 +61,32 @@ def test_a_user_cell_is_attributed_in_the_export():
     assert kinds == {"stream", "execute_result"}
 
 
+def test_intent_becomes_a_markdown_cell_above_its_code():
+    # The code is the only thing the session records natively; why it was run
+    # exists nowhere unless it was passed in. It gets its own cell so it reads
+    # as prose, and so a chat turn has a shape waiting for it.
+    nb = _notebook.build_notebook([_snap(intent="find the drift between t0 and t1")])
+    kinds = [c["cell_type"] for c in nb["cells"]]
+    assert kinds[-2:] == ["markdown", "code"]
+    note = "".join(nb["cells"][-2]["source"])
+    assert "find the drift between t0 and t1" in note
+    assert "job-1" in note and "agent" in note
+    assert (
+        nb["cells"][-1]["metadata"]["biopb"]["intent"]
+        == "find the drift between t0 and t1"
+    )
+
+
+def test_a_job_without_intent_gets_no_note_cell():
+    # Optional, and an empty note would be worse than none: the export must not
+    # grow a blank cell per job for a field nobody filled. A record predating
+    # the field has no key at all, which must read the same as an empty one.
+    for snap in (_snap(), _snap(intent=""), _snap(intent="   ")):
+        nb = _notebook.build_notebook([snap])
+        assert [c["cell_type"] for c in nb["cells"]] == ["markdown", "code", "code"]
+        assert nb["cells"][-1]["metadata"]["biopb"]["intent"] == ""
+
+
 def test_interrupted_job_kept_as_code_with_reason_in_output():
     reason = "Interrupted by user via the observe web UI."
     nb = _notebook.build_notebook(

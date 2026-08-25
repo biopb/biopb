@@ -105,6 +105,12 @@ or remove a layer, or import something you did not.
 * **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
   only your own). Do not reach for `restart_kernel` to get around that: it would
   destroy the user's variables and layers along with yours.
+* **But no second agent.** The user is the only other writer you will meet: whichever
+  agent runs code first holds the kernel until it restarts, and another client is
+  refused by everything that changes kernel state — `execute_code`, `interrupt_kernel`,
+  `restart_kernel` — keeping only the read-only tools. So a namespace change you did
+  not make came from the person, and the note above is the whole story. If you are the
+  one refused, say so and let the user decide; the restart is theirs.
 
 Reading pixels, moving them between the server / a layer / your own variables,
 and the round trip for data too large to hold: `guide://data`.

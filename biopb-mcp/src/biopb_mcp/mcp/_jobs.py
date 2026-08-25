@@ -13,12 +13,18 @@ Design notes
 * **One job at a time.** A second :func:`submit` while a job is running is
   rejected with the running job id (the single shared viewer / namespace makes
   concurrent mutation unsafe).
-* **Two writers, serialized.** Jobs carry an ``origin`` — ``"agent"`` (the
-  ``execute_code`` tool) or ``"user"`` (a cell run from the observe page). They
-  share this one runner, so the rejection above is also what keeps the human and
-  the agent off each other's toes: no preemption, no queue, one ordering of
-  writes to the namespace. :func:`user_digest` is how the agent finds out its
-  namespace changed under it; see ``docs/user-console.md``.
+* **Several writers, serialized.** Jobs carry an ``origin`` — see
+  :class:`_Job`. They share this one runner, so the rejection above is also what
+  keeps the writers off each other's toes: no preemption, no queue, one ordering
+  of writes to the namespace. :func:`foreign_digest` is how the ``execute_code``
+  agent finds out its namespace changed under it; see ``docs/user-console.md``.
+* **One agent per kernel.** Serializing two *agents* would order their writes
+  without making them mean anything — neither can see the other's model of the
+  namespace. So the first non-user submitter claims the kernel and a second is
+  refused (:func:`submit`); a human's cell is never gated. Everything that
+  changes kernel state is gated the same way — running a job, stopping one
+  (:func:`interrupt_current`), restarting the kernel (server-side) — while the
+  read-only tools stay open to anyone, since they mutate nothing.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
   main thread.  GUI mutations from the worker thread are marshaled via
   :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
@@ -79,6 +85,13 @@ _jobs_by_thread = {}  # thread ident -> _Job (active worker threads only)
 _job_seq = 0
 _lock = threading.RLock()
 
+# The one agent allowed to run code in this kernel, claimed by whoever submits
+# first and held until the kernel restarts (see :func:`submit`). An opaque id
+# supplied by the caller plus a label for the refusal message; ``None`` means
+# unclaimed.
+_owner = None
+_owner_label = ""
+
 
 class _Job:
     __slots__ = (
@@ -91,6 +104,7 @@ class _Job:
         "cancel_reason",
         "interrupted",
         "origin",
+        "intent",
         "seen_by_agent",
         "thread",
         "started",
@@ -98,7 +112,7 @@ class _Job:
         "finished",
     )
 
-    def __init__(self, job_id, code="", origin="agent"):
+    def __init__(self, job_id, code="", origin="agent", intent=""):
         self.job_id = job_id
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
@@ -118,13 +132,25 @@ class _Job:
         # result, instead of an unexplained cancellation. None for agent-driven
         # or untagged stops.
         self.cancel_reason = None
-        # Who started this job: "agent" (the execute_code tool) or "user" (a cell
-        # from the observe page). Set at submit and never inferred later — a job
-        # outlives the request that started it, and poll/export read this long
-        # after that request is gone.
+        # Who started this job:
+        #   "agent" — the execute_code tool, driven by an external MCP client
+        #   "user"  — a cell run by a human from the observe page
+        #   "chat"  — the in-process chat loop (docs/chat-client-evaluation.md)
+        # Set at submit and never inferred later — a job outlives the request
+        # that started it, and poll/export read this long after that request is
+        # gone. "chat" has no writer yet and is declared ahead of one on
+        # purpose: origin is the provenance an export is read by, and a value
+        # introduced after the fact cannot relabel the records made without it.
         self.origin = origin
-        # Whether the agent has been told about this *user* job (via
-        # user_digest). Unset on an agent's own jobs, which need no notice.
+        # Why this job was run, in the words of whoever asked for it — the
+        # agent's own statement of purpose under "agent", the user's turn once
+        # a chat loop fills it. Free text, optional and unvalidated: it is
+        # best-effort provenance for the notebook export, never a control input.
+        self.intent = intent
+        # Whether the execute_code agent has been told about this *foreign* job
+        # (via foreign_digest). Unset on the agent's own jobs, which need no
+        # notice. One flag, because there is one reader; a second in-process
+        # reader would need this per-reader, not a bool.
         self.seen_by_agent = False
         self.thread = None
         self.started = time.monotonic()
@@ -147,6 +173,7 @@ class _Job:
             "error_text": self.error_text,
             "cancel_reason": self.cancel_reason,
             "origin": self.origin,
+            "intent": self.intent,
             "elapsed": self.elapsed(),
             "created": self.started_wall,
         }
@@ -309,32 +336,80 @@ def _has_running_job():
     return any(j.status == "running" for j in _jobs.values())
 
 
+def _foreign(job):
+    """Whether *job* was written by someone other than the ``execute_code`` agent.
+
+    The rules that keep the writers apart — the digest, the eviction hold, the
+    interrupt refusal — are all about *whose* job it is from that agent's point
+    of view, and every one of them was written when "not the agent" and "the
+    user" were the same set. They are not once a chat loop submits, so the test
+    is spelled out here rather than inlined as ``origin == "user"``.
+    """
+    return job.origin != "agent"
+
+
 def _prune():
-    # Evict oldest-first, but never a user job the agent has not been told about
-    # yet: that digest entry is the agent's only notice that its namespace
+    # Evict oldest-first, but never a foreign job the agent has not been told
+    # about yet: that digest entry is the agent's only notice that its namespace
     # changed under it, and evicting the record silently drops the notice. So
-    # the cap can be exceeded — bounded by how many cells a human types between
-    # two agent calls, which is small.
+    # the cap can be exceeded — bounded by how many cells another writer runs
+    # between two agent calls, which is small.
     terminal = [
         jid
         for jid, j in _jobs.items()
-        if j.status != "running" and not (j.origin == "user" and not j.seen_by_agent)
+        if j.status != "running" and not (_foreign(j) and not j.seen_by_agent)
     ]
     while len(_jobs) > _MAX_RETAINED_JOBS and terminal:
         del _jobs[terminal.pop(0)]
 
 
-def submit(code, origin="agent"):
+def submit(code, origin="agent", intent="", writer=None, writer_label=""):
     """Start *code* in a background thread; return ``{"job_id": ...}`` or, if a
     job is already running, ``{"error": "busy", "running_job_id": ...,
     "running_job_origin": ...}``.
 
-    *origin* is ``"agent"`` or ``"user"`` (see :class:`_Job`). The busy return
+    *origin* and *intent* are recorded on the job and never acted on beyond the
+    rules in :class:`_Job`; see there for the origin vocabulary. The busy return
     carries the running job's origin because the caller's advice depends on it:
-    the agent may stop its *own* job, but a user's cell is not its to stop.
+    the agent may stop its *own* job, but another writer's is not its to stop.
+
+    **One agent per kernel.** *writer* is an opaque id for the client asking.
+    The first non-user submitter claims the kernel; a later submit under a
+    *different* id is refused with ``{"error": "not_owner", "owner": <label>}``.
+    Two agents sharing one namespace is not a race the runner can serialize away
+    — the writes land in a defined order and still mean nothing, because neither
+    agent can see the other's model of what the variables and layers are. So it
+    fails loudly at the door instead. The claim is dropped by :func:`reset`, i.e.
+    it lasts for the life of the kernel.
+
+    Two deliberate holes. A **human** cell (``origin="user"``) is never gated:
+    the person at the machine has standing here that no client does, and the
+    observe console has no identity to gate on anyway. And a caller with
+    ``writer=None`` — a direct in-process call, or a transport that yields no
+    client id — neither claims nor is checked, since there is nothing to tell
+    two of them apart with.
+
+    **The recovery belongs to the human, not to a second agent.** Every tool
+    that changes kernel state is gated the same way — ``interrupt_current`` here,
+    ``restart_kernel`` server-side — so a client that does not hold the kernel
+    cannot take it by force; it keeps the read-only tools and nothing else. What
+    frees a claim is the kernel going away: the person at the machine restarting
+    from the observe page (never gated), or the session ending. That is the same
+    principle as the ``origin="user"`` exemption, applied to recovery.
     """
-    global _job_seq
+    global _job_seq, _owner, _owner_label
     with _lock:
+        if origin != "user" and writer is not None:
+            if _owner is None:
+                _owner, _owner_label = writer, writer_label
+            elif writer != _owner:
+                # The id as well as the label: the caller mirrors the claim, and
+                # a refusal is its chance to correct a mirror that guessed wrong.
+                return {
+                    "error": "not_owner",
+                    "owner": _owner_label,
+                    "owner_id": _owner,
+                }
         # Re-assert the thread-aware stream wrap (idempotent) so a job thread's
         # output is captured even if something replaced sys.stdout since
         # install() — and so it works under pytest's per-phase capture.
@@ -348,7 +423,7 @@ def submit(code, origin="agent"):
                 }
         _job_seq += 1
         job_id = f"job-{_job_seq}"
-        job = _Job(job_id, code, origin=origin)
+        job = _Job(job_id, code, origin=origin, intent=intent)
         _jobs[job_id] = job
         _prune()
         thread = threading.Thread(
@@ -425,7 +500,7 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt_current(reason=None, requester="user"):
+def interrupt_current(reason=None, requester="user", writer=None):
     """Force-stop the running job: cooperative cancel *plus* a ``KeyboardInterrupt``
     raised directly into the job's worker thread.
 
@@ -439,23 +514,38 @@ def interrupt_current(reason=None, requester="user"):
 
     *requester* is who is asking — ``"user"`` (the observe UI, the default: a
     person may stop anything running in their own session) or ``"agent"``. An
-    **agent is refused a user-origin job** (``{"refused": "user_job"}``): the
-    stop would be silent, since attribution runs one way only — a user stop
-    reaches the agent through ``cancel_reason``, but the human would see nothing
-    beyond an unexplained ``interrupted`` badge. The human has the observe UI and
-    can stop their own work; the agent has no consent to. ``restart_kernel``
-    stays open to the agent — it is the advertised guaranteed stop, and it is
-    destructive by announcement rather than silently.
+    **agent is refused a job it did not start** (``{"refused": "foreign_job"}``):
+    the stop would be silent, since attribution runs one way only — a user stop
+    reaches the agent through ``cancel_reason``, but the other writer would see
+    nothing beyond an unexplained ``interrupted`` badge. The human has the
+    observe UI and can stop their own work; the agent has no consent to.
+
+    *writer* is the asking client's id, checked against the kernel's one-agent
+    claim (:func:`submit`): a client that does not hold this kernel cannot stop
+    what runs in it (``{"refused": "not_owner"}``). Stopping a job is a change to
+    kernel state, so it is gated like running one; only the read-only tools stay
+    open to a second client. As in :func:`submit`, a caller with ``writer=None``
+    is not checked — there is nothing to compare.
     """
     job = _running_job()
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
-    if requester == "agent" and job.origin == "user":
+    if requester == "agent" and writer is not None and _owner not in (None, writer):
         return {
             "job_id": job.job_id,
             "interrupted": False,
             "status": "running",
-            "refused": "user_job",
+            "refused": "not_owner",
+        }
+    if requester == "agent" and _foreign(job):
+        return {
+            "job_id": job.job_id,
+            "interrupted": False,
+            "status": "running",
+            "refused": "foreign_job",
+            # Whose job it is, so the caller can name the writer. "Foreign" is
+            # no longer a synonym for "the user's" -- see _foreign().
+            "origin": job.origin,
         }
     job.interrupted = True  # finalize as "interrupted"
     _cancel(job.job_id, reason=reason)
@@ -491,17 +581,20 @@ def jobs_summary():
     ]
 
 
-def user_digest():
-    """User-run jobs the agent has not been told about yet, oldest-first.
+def foreign_digest():
+    """Jobs the ``execute_code`` agent did not start and has not been told about
+    yet, oldest-first.
 
-    Returns ``[{"job_id", "status", "elapsed"}, ...]``. This is the agent's only
-    notice that a second writer touched its namespace — a redefined variable, a
-    deleted layer — so it is read on every agent-facing round trip and rendered
-    into that call's result (``_server._user_activity_note``). Pull, not push:
+    Returns ``[{"job_id", "status", "elapsed", "origin"}, ...]``; *origin* is
+    carried because the caller words the notice differently for a person than
+    for another agent. This is the agent's only notice that a second writer
+    touched its namespace — a redefined variable, a deleted layer — so it is
+    read on every agent-facing round trip and rendered into that call's result
+    (``_server._foreign_activity_note``). Pull, not push:
     an MCP server->client notification is not reliably surfaced mid-turn, and
     when the agent is idle there is no turn to interrupt.
 
-    A pure read: marking entries reported is :func:`ack_user_digest`, a
+    A pure read: marking entries reported is :func:`ack_foreign_digest`, a
     **separate** call the caller makes only once the notice has actually reached
     it. Acking here instead would consume the notice on a round trip whose reply
     never arrived — ``execute_interactive`` sends before it starts its clock, so
@@ -510,19 +603,33 @@ def user_digest():
     """
     with _lock:
         return [
-            {"job_id": j.job_id, "status": j.status, "elapsed": j.elapsed()}
+            {
+                "job_id": j.job_id,
+                "status": j.status,
+                "elapsed": j.elapsed(),
+                "origin": j.origin,
+            }
             for j in _jobs.values()
-            if j.origin == "user" and not j.seen_by_agent
+            if _foreign(j) and not j.seen_by_agent
         ]
 
 
-def ack_user_digest(job_ids):
+def ack_foreign_digest(job_ids, writer=None):
     """Mark the jobs in *job_ids* as reported; return how many were marked.
+
+    **Only the kernel's owner can discharge a notice.** Reading the digest is
+    open to anyone — a second client watching the session is welcome to see that
+    a cell ran — but ``seen_by_agent`` records that *the agent working here* has
+    been told, and it is promised the notice exactly once. A bystander's
+    ``poll_job`` acking it would retire a notice the owner never received, which
+    is the one failure this whole split exists to prevent. A caller with
+    ``writer=None`` is the in-process case and acks as before; an unclaimed
+    kernel has no owner to defer to.
 
     *job_ids* is what the caller actually told the agent **and reported as
     terminal** — never the whole digest. The status is deliberately **not**
     consulted here: a job reported ``running`` that finished a moment later must
-    stay pending, because "the user ran job-7 (running)" is not the final status
+    stay pending, because "job-7 ran (running)" is not the final status
     the agent is promised exactly once. Re-reading the status instead would ack
     precisely that job and retire it unheard — the race this split exists to
     close. A status is monotone into terminal, so an id reported terminal is
@@ -530,9 +637,11 @@ def ack_user_digest(job_ids):
     """
     wanted = set(job_ids)
     with _lock:
+        if writer is not None and _owner not in (None, writer):
+            return 0
         acked = 0
         for job in _jobs.values():
-            if job.origin == "user" and not job.seen_by_agent and job.job_id in wanted:
+            if _foreign(job) and not job.seen_by_agent and job.job_id in wanted:
                 job.seen_by_agent = True
                 acked += 1
         return acked
@@ -548,11 +657,25 @@ def export():
     return [j.snapshot() for j in _jobs.values()]
 
 
+def owner():
+    """``{"owner": <id or None>, "label": <str>}`` — who holds this kernel."""
+    with _lock:
+        return {"owner": _owner, "label": _owner_label}
+
+
 def reset():
-    """Drop all job records (used on kernel restart / re-bootstrap)."""
+    """Drop all job records and release the kernel's agent claim (used on kernel
+    restart / re-bootstrap).
+
+    Releasing here is what makes the claim last exactly one kernel lifetime:
+    :func:`install` calls this on every bootstrap, and a hard restart replaces
+    the process and its module state outright.
+    """
+    global _owner, _owner_label
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
+        _owner, _owner_label = None, ""
 
 
 # -- viewer wrapping --------------------------------------------------------

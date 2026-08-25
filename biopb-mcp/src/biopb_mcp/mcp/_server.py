@@ -348,9 +348,14 @@ except Exception as _e:
 
 
 def set_kernel_host(host: KernelHost):
-    """Register the kernel host the tools dispatch to."""
+    """Register the kernel host the tools dispatch to.
+
+    A different host is a different kernel, so the mirrored one-agent claim goes
+    with the old one rather than being inherited by the new.
+    """
     global _kernel_host
     _kernel_host = host
+    clear_claim()
 
 
 def set_promote_after(seconds: float):
@@ -455,15 +460,117 @@ def _window_note(window_alive) -> str:
     return ""
 
 
-def _user_digest(host) -> list:
-    """The user-run cells the agent has not been told about, or ``[]``.
+# This process's mirror of the kernel's one-agent claim: the last client whose
+# code the kernel actually accepted, or None while unclaimed.
+#
+# The kernel owns the claim -- ``_jobs.submit`` is the choke point and the only
+# thing that can enforce it atomically. But ``restart_kernel`` cannot be gated
+# from inside the kernel it destroys, and asking the kernel who owns it first is
+# both a check-then-act race and *fail-open on a busy kernel*: a round trip that
+# comes back "busy" would read as "no owner", and a kernel busy running the
+# holder's job is exactly when a stray restart costs the most. Every claim
+# passes through this process, so mirroring it here answers the question with no
+# round trip and no window.
+#
+# Set from the kernel's own decision wherever a reply arrives: any submit the
+# kernel did not refuse came from the holder, and a refusal names the holder
+# outright, so assigning on both keeps the mirror true through a restart that
+# happened somewhere else (the observe page's, which clears it explicitly).
+#
+# **Recorded before the submit is sent, not after.** A reply can be lost while
+# the kernel goes on to claim and run the code anyway -- ``execute_interactive``
+# hands the request over before it starts its clock, so a timed-out call is still
+# queued and executes when the main thread frees up. Setting the mirror only on
+# the way back would leave it empty while the kernel is genuinely held, and an
+# empty mirror lets a stranger restart the session that just started. The window
+# is claimed first and corrected from whatever the kernel says, so the failure
+# direction is "held by the client that asked" rather than "held by nobody".
+_claimed_by: str | None = None
 
-    A pure read — see :func:`_ack_user_digest` for why the ack is a second call.
+
+def _note_claim(writer):
+    """Record that the kernel is held by *writer* (ignores ``None``)."""
+    global _claimed_by
+    if writer is not None:
+        _claimed_by = writer
+
+
+def _presume_claim(writer):
+    """Take the claim for *writer* only if this process has not seen one.
+
+    Guarded on "not seen": a client the kernel is about to refuse must never
+    overwrite a holder already known here, and it will be corrected by the
+    refusal in any case.
+    """
+    if _claimed_by is None:
+        _note_claim(writer)
+
+
+def clear_claim():
+    """Forget the mirrored claim, for a caller that just replaced the kernel."""
+    global _claimed_by
+    _claimed_by = None
+
+
+# Refusal for a client that does not hold this kernel's one-agent claim
+# (_jobs.submit). Shared by every state-changing tool so the agent gets one
+# explanation rather than three, and so the recovery named is the same in all of
+# them: the person at the machine, never a second agent.
+_NOT_OWNER_MSG = (
+    "This kernel is already in use by another client{held_by}, and only one "
+    "agent runs code in a session. Two of you writing to the same namespace and "
+    "viewer would order the writes without either being able to see what the "
+    "other believes is there. Reading tools (poll_job, server_status, "
+    "take_screenshot, inspect_object) still work, so you can watch. You cannot "
+    "take the session over — restarting it is the user's to do, from the observe "
+    "page. Tell them what you wanted and let them decide."
+)
+
+
+def _client_identity():
+    """``(id, label)`` for the MCP client behind this call, or ``(None, "")``.
+
+    The streamable-http transport mints a per-connection ``mcp-session-id``, so
+    two clients reaching one session child are distinguishable even though the
+    tool surface itself is stateless — this is the id the kernel's one-agent
+    claim is keyed on (``_jobs.submit``). ``clientInfo.name`` from the initialize
+    handshake rides along as a label, purely so a refusal can name who holds the
+    kernel.
+
+    Read through ``mcp.get_context()`` rather than a ``Context`` tool parameter:
+    the parameter form is excluded from the advertised input schema, but it also
+    makes the function uncallable without one, and every in-process caller (the
+    tests today, an in-process chat loop later) has no request at all. Outside a
+    request this yields no identity, which ``submit`` reads as "nothing to claim
+    with" and lets through.
+    """
+    try:
+        rc = mcp.get_context().request_context
+    except Exception:  # noqa: BLE001 - no request, or an SDK shape we don't know
+        return None, ""
+    request = getattr(rc, "request", None)
+    ident = request.headers.get("mcp-session-id") if request is not None else None
+    session = getattr(rc, "session", None)
+    if not ident and session is not None:
+        # A client that negotiated no transport session still gets one identity
+        # per connection: the ServerSession object is per-connection and lives
+        # as long as it does, which is all the claim needs.
+        ident = f"conn-{id(session):x}"
+    params = getattr(session, "client_params", None)
+    label = getattr(getattr(params, "clientInfo", None), "name", "") or ""
+    return ident, label
+
+
+def _foreign_digest(host) -> list:
+    """The cells run by another writer that the agent has not been told about,
+    or ``[]``.
+
+    A pure read — see :func:`_ack_foreign_digest` for why the ack is a second call.
     Auxiliary, like the window-liveness probe: a kernel that answers with
     anything but the expected list yields no digest rather than breaking the
     result the agent actually asked for.
     """
-    digest, _res, _w = _run_job_call(host, "user_digest()")
+    digest, _res, _w = _run_job_call(host, "foreign_digest()")
     if not digest or not isinstance(digest, list):
         return []
     if not all(isinstance(d, dict) and "job_id" in d for d in digest):
@@ -471,7 +578,7 @@ def _user_digest(host) -> list:
     return digest
 
 
-def _ack_user_digest(host, digest) -> None:
+def _ack_foreign_digest(host, digest, writer=None) -> None:
     """Retire the *terminal* entries of *digest*, once the note carrying them is
     on its way back to the agent.
 
@@ -485,13 +592,21 @@ def _ack_user_digest(host, digest) -> None:
     Running entries are excluded here rather than in the kernel: they were
     reported as ``running``, which is not the final status the agent is promised,
     so they must stay pending even if they have finished since.
+
+    *writer* is the asking client, passed through so the kernel can refuse an ack
+    from a client that does not hold it: a second client's ``poll_job`` may
+    *read* the digest, but discharging a notice the holder has not received
+    would defeat the exactly-once promise this split exists to keep.
     """
     ids = [d["job_id"] for d in digest if d.get("status") != "running"]
     if ids:
-        _run_job_call(host, "ack_user_digest(" + repr(ids) + ")")
+        _run_job_call(
+            host,
+            "ack_foreign_digest(" + repr(ids) + ", writer=" + repr(writer) + ")",
+        )
 
 
-def _render_user_note(digest) -> str:
+def _render_foreign_note(digest) -> str:
     """The digest as a line appended to an agent-facing result, or ``""``.
 
     The agent is not the only writer of this namespace: a person can run code
@@ -509,9 +624,21 @@ def _render_user_note(digest) -> str:
     """
     if not digest:
         return ""
-    listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    # Older kernels' digest entries carry no origin; they could only ever have
+    # been user cells, so read a missing one as "user" rather than dropping the
+    # attribution.
+    origins = {(d.get("origin") or "user") for d in digest}
+    if origins == {"user"}:
+        who = "The user"
+        listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    else:
+        who = "Another writer"
+        listed = ", ".join(
+            f"{d['job_id']} ({d.get('status')}, {d.get('origin') or 'user'})"
+            for d in digest
+        )
     return (
-        "\n\nⓘ The user ran code in this kernel: "
+        f"\n\nⓘ {who} ran code in this kernel: "
         f"{listed}. A finished cell is reported once; a running one repeats "
         "until it ends, so a repeat is not a new cell. Read them with poll_job. "
         "Variables and layers may have changed — re-check with dir() / "
@@ -519,12 +646,17 @@ def _render_user_note(digest) -> str:
     )
 
 
-def _user_activity_note(host) -> str:
-    """Read, render, and retire the user-activity notice, in that order."""
-    digest = _user_digest(host)
-    note = _render_user_note(digest)
+def _foreign_activity_note(host) -> str:
+    """Read, render, and retire the activity notice, in that order.
+
+    Retiring is the holder's alone (see :func:`_ack_foreign_digest`): a second
+    client reaching a read-only tool still gets shown what ran, but does not
+    consume the notice out from under the agent actually working here.
+    """
+    digest = _foreign_digest(host)
+    note = _render_foreign_note(digest)
     if note:
-        _ack_user_digest(host, digest)
+        _ack_foreign_digest(host, digest, _client_identity()[0])
     return note
 
 
@@ -684,8 +816,14 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
 
 @mcp.tool()
-def execute_code(python_code: str) -> str:
+def execute_code(python_code: str, intent: str = "") -> str:
     """Execute Python code in the napari kernel.
+
+    intent: one short sentence on *why* you are running this cell — the goal you
+    are pursuing for the user, not a restatement of what the code does. It is
+    recorded with the job and written into the session's notebook export, which
+    is otherwise a log of code with no record of what anyone was trying to
+    achieve. Leave it empty rather than padding it.
 
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
     namespace: viewer (with an add_tensor method), client(image data access), and ops (a
@@ -698,6 +836,13 @@ def execute_code(python_code: str) -> str:
     watch it with take_screenshot / server_status, and stop it with
     interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
     runs at a time.
+
+    Only one *agent* runs code in a kernel, too: whoever calls this first holds
+    it until the kernel restarts. A second client is refused here and by every
+    other tool that changes kernel state (interrupt_kernel, restart_kernel), and
+    keeps only the read-only ones. The person at the machine is exempt — they
+    can run cells from the observe page while you work, which is what the
+    user-activity notice on these results is telling you about.
 
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
@@ -731,40 +876,65 @@ def execute_code(python_code: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    # Read once at entry, append to whichever path returns below.
-    digest = _user_digest(host)
-    user_note = _render_user_note(digest)
-    if user_note:
-        _ack_user_digest(host, digest)
+    writer, writer_label = _client_identity()
 
+    # Read once at entry, append to whichever path returns below.
+    digest = _foreign_digest(host)
+    foreign_note = _render_foreign_note(digest)
+    if foreign_note:
+        _ack_foreign_digest(host, digest, writer)
+
+    # Before the call, not after: a lost reply must not leave the kernel claimed
+    # while this process still reads as unclaimed. See _claimed_by.
+    _presume_claim(writer)
     submitted, res, window_alive = _run_job_call(
-        host, "submit(" + repr(python_code) + ")"
+        host,
+        "submit("
+        + repr(python_code)
+        + ", intent="
+        + repr(intent)
+        + ", writer="
+        + repr(writer)
+        + ", writer_label="
+        + repr(writer_label)
+        + ")",
     )
     if submitted is None:
-        return _format_execute_result(res) + user_note
+        return _format_execute_result(res) + foreign_note
+    if submitted.get("error") == "not_owner":
+        # The authority speaking: whatever this process presumed above, the
+        # kernel just named the real holder.
+        _note_claim(submitted.get("owner_id"))
+        held_by = submitted.get("owner") or ""
+        held_by = f" ({held_by})" if held_by else ""
+        return _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note
+    # Anything the kernel did not refuse came from the holder, "busy" included:
+    # submit() decides the claim before it looks at what is running.
+    _note_claim(writer)
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
         # Whose job is running decides the advice. Telling the agent to
-        # "stop it with interrupt_kernel" while a *person* is running a cell
+        # "stop it with interrupt_kernel" while *someone else* is running a cell
         # would have it kill their work; interrupt_kernel refuses that anyway
         # (_jobs.interrupt_current), so the wording must not send it there.
-        if submitted.get("running_job_origin") == "user":
-            # A running user job stays in the digest by design, so the note is
+        running_origin = submitted.get("running_job_origin")
+        if running_origin and running_origin != "agent":
+            # A running foreign job stays in the digest by design, so the note is
             # about to report the very job this branch is reporting. Drop it
-            # when that is *all* it says; keep it when the user also finished
-            # other cells, since those were acked above and will not be offered
-            # again.
+            # when that is *all* it says; keep it when other cells also finished,
+            # since those were acked above and will not be offered again.
             if [d.get("job_id") for d in digest] == [running]:
-                user_note = ""
+                foreign_note = ""
+            who = "The user" if running_origin == "user" else "Another writer"
             return (
-                f"The user is running a cell ({running}) in this kernel. Only one "
+                f"{who} is running a cell ({running}) in this kernel. Only one "
                 f"job runs at a time — wait for it and poll_job('{running}'); do "
-                "not interrupt it." + user_note
+                "not interrupt it." + foreign_note
             )
         return (
             f"A job ({running}) is already running. Poll it with "
             f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another." + user_note
+            "restart_kernel before starting another." + foreign_note
         )
 
     job_id = submitted["job_id"]
@@ -774,10 +944,12 @@ def execute_code(python_code: str) -> str:
         time.sleep(0.4)
         snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
-            return _format_execute_result(res) + user_note
+            return _format_execute_result(res) + foreign_note
         if snap.get("status") != "running":
             # terminal: inline result
-            return _format_execute_result(snap) + _window_note(window_alive) + user_note
+            return (
+                _format_execute_result(snap) + _window_note(window_alive) + foreign_note
+            )
 
     # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
@@ -788,7 +960,7 @@ def execute_code(python_code: str) -> str:
         "Partial output:\n"
         + (partial or "(none yet)")
         + _window_note(window_alive)
-        + user_note
+        + foreign_note
     )
 
 
@@ -804,14 +976,14 @@ def poll_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    user_note = _user_activity_note(host)
+    foreign_note = _foreign_activity_note(host)
     snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
     if snap is None:
-        return _format_execute_result(res) + user_note
+        return _format_execute_result(res) + foreign_note
     if snap.get("status") == "unknown":
-        return f"No such job '{job_id}'." + user_note
+        return f"No such job '{job_id}'." + foreign_note
     note = _window_note(window_alive) if snap.get("status") != "running" else ""
-    return _format_job_status(snap) + note + user_note
+    return _format_job_status(snap) + note + foreign_note
 
 
 @mcp.tool()
@@ -854,15 +1026,27 @@ def interrupt_kernel() -> str:
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
-    data, res, _w = _run_job_call(host, "interrupt_current(requester='agent')")
+    writer, _label = _client_identity()
+    data, res, _w = _run_job_call(
+        host, "interrupt_current(requester='agent', writer=" + repr(writer) + ")"
+    )
     if data is None:
         return _format_execute_result(res)
-    if data.get("refused") == "user_job":
+    if data.get("refused") == "not_owner":
+        return _NOT_OWNER_MSG.format(held_by="")
+    if data.get("refused") == "foreign_job":
         running = data.get("job_id")
+        # "Foreign" is not a synonym for "the user's": it is anything this agent
+        # did not start. Naming the wrong writer would tell the agent to wait on
+        # a person who is not there.
+        by = (
+            "the user" if (data.get("origin") or "user") == "user" else "another writer"
+        )
+        who = "The user" if by == "the user" else "Whoever started it"
         return (
-            f"Refused: {running} was started by the user, not by you — it is not "
-            f"yours to stop. Wait for it and poll_job('{running}'). (The user can "
-            "stop their own cell from the observe page.)"
+            f"Refused: {running} was started by {by}, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{running}'). ({who} can "
+            "stop it.)"
         )
     if data.get("interrupted"):
         return (
@@ -917,14 +1101,25 @@ def restart_kernel() -> str:
     beforehand. So it is not the way past a refused interrupt_kernel or a kernel
     busy with a user cell: neither is a runaway. Use it when the kernel is truly
     wedged, and prefer asking first when someone is working in it.
+
+    It is also not the way past a kernel held by another client: if you do not
+    hold this one, this is refused too, and restarting it is the user's to do.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
+    # Gated like every other state change, and this is the sharpest of them: a
+    # restart discards the holder's whole session. Decided against the local
+    # mirror (_claimed_by) rather than a round trip to the kernel, so a kernel
+    # too busy to answer cannot be mistaken for an unclaimed one.
+    writer, _label = _client_identity()
+    if _claimed_by is not None and writer is not None and writer != _claimed_by:
+        return _NOT_OWNER_MSG.format(held_by="")
     try:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
+    clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
@@ -1032,7 +1227,7 @@ def server_status() -> str:
 
     # Only on this path: the early returns above are all "kernel not usable",
     # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + _user_activity_note(host)
+    return "\n".join(lines) + _foreign_activity_note(host)
 
 
 # ---------------------------------------------------------------------------
