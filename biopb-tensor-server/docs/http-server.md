@@ -97,10 +97,19 @@ Design rationale in `remote-viewer-tiles.md`; this is the contract.
 authoritative; `source_id` is only the slash-free routing prefix. The path is `{array_id:path}`, so a field
 containing `/` (HCS `plate/A01/0`) is captured whole, percent-encoded or not.
 
-A bare source_id remains valid for a **single-tensor** source, which is what the
-policy says its array_id *is*. For a multi-tensor source it is **404**, listing the
-available array_ids, rather than silently resolving to the first tensor
-(biopb/biopb#75).
+Resolution is **one targeted `GetFlightInfo`** — the catalog is never listed to
+look up an id the request already carries (biopb/biopb#834).
+
+**array_id policy is the Flight server's.** A bare source_id resolves to whatever
+that server binds for it — its default tensor — and the sidecar does not
+second-guess it with a tensor count of its own. The answer carries the array_id
+it resolved to, and that is the id the sidecar reports and reads from, so the
+geometry and the read cannot come from two derivations. That agreement is what
+biopb/biopb#75 was about; a status code was only ever a proxy for it.
+
+So `/api/tile_info/{source_id}` on a multi-tensor source is a **200** publishing
+the qualified array_id the server chose, not a 404. First contact is where the
+ambiguity ends — the viewer threads that id back through every tile after.
 
 ### Content-versioned array_ids
 
@@ -139,11 +148,11 @@ versioned URL changes on its own when content changes; this is what stops the
 *unversioned* URL — stable across a re-index — from revalidating to a 304 for
 bytes that changed.
 
-> The token is read off the **descriptor**, never the source listing. That is
-> what keeps the guarantee independent of biopb/biopb#834: the listing is the
-> expensive part of a tile request and the obvious thing to cache, while
-> `GetFlightInfo` is fetch-per-call by contract. A test pins it — a listing
-> frozen at a superseded version still yields a 404.
+> The token is read off the **descriptor**, never the source listing —
+> `GetFlightInfo` is fetch-per-call by contract, while the listing was the
+> expensive part and the obvious thing to cache. That independence is what let
+> biopb/biopb#834 drop the listing from the resolution path. A test pins it: a
+> listing frozen at a superseded version still yields a 404.
 
 `GET /api/tile_info/{array_id}` reports everything needed to address the tensor as
 a tile grid — shaped to drop into a Viv `PixelSource[]`:
@@ -287,8 +296,8 @@ else has yielded.
 `array_id` is required and is the whole address — `my-zarr` for a single-tensor
 source, `my-zarr/well_A1` for a multi-tensor one. It resolves through the same
 lookup the tile routes use, so one id cannot name two tensors depending on which
-route asked: a bare source_id on a multi-tensor source is **404** listing the
-available array_ids, not the first tensor (biopb/biopb#75).
+route asked, and the read is issued for the array_id that lookup came back with
+(biopb/biopb#75).
 
 A bare within-source field (`well_A1`) is **not** accepted; send the qualified
 form. There is **no `"0"` sentinel** either: a single-tensor source's `array_id`

@@ -85,8 +85,9 @@ function sourceOf(arrayId: string): string {
  *
  * A bare source_id resolves only when the source holds exactly one tensor,
  * which is what the identity policy says its array_id *is*. On a multi-tensor
- * source it stays unresolved rather than guessing tensors[0] — the same refusal
- * the server makes (biopb/biopb#75).
+ * source it stays unresolved rather than guessing tensors[0] (biopb/biopb#75).
+ * This is a lookup in a listing already in hand, with no server answer to defer
+ * to — unlike the sidecar, which asks and reports what it is told.
  */
 function descriptorIn(source: DataSourceDescriptor, arrayId: string) {
   const exact = source.tensors.find((t) => t.array_id === arrayId);

@@ -543,9 +543,9 @@ def _descriptor_version_token(td: Any) -> Optional[str]:
 
     Taken from the descriptor rather than the source listing on purpose: this is
     the freshest thing in the request (``get_descriptor`` is fetch-per-call by
-    contract), while the listing is the expensive part and a natural thing to
-    cache (biopb/biopb#834). Hanging a freshness guarantee off the call someone
-    will want to memoize is how the guarantee quietly stops holding.
+    contract), while the listing was the expensive part and the obvious thing to
+    memoize. It is off the resolution path entirely now (biopb/biopb#834), which
+    is exactly why the guarantee could not have hung on it.
 
     Read by truthiness rather than ``HasField``: an unset proto3 field, a
     zero-length token and a server too old to carry the field at all are the
@@ -594,9 +594,11 @@ def _tensor_desc_by_array_id(
     derivations of one identity could disagree -- a bare multi-tensor id gave
     tensor[0]'s shape while the read went to the source's own default.
 
-    A bare source_id stays valid for a single-tensor source, which is what the
-    policy says its array_id *is*. For a multi-tensor source it is refused
-    rather than guessed (biopb/biopb#75); the caller turns ``None`` into a 404.
+    A bare source_id resolves to whatever the Flight server binds for it -- its
+    default tensor. The sidecar does not second-guess that: array_id policy is
+    the server's, and the answer comes back carrying the array_id it resolved
+    to, which is the one this hands onward. The geometry and the read therefore
+    come from one derivation, which is what biopb/biopb#75 was really about.
 
     A **content-versioned** array_id (`source@token[/field]`, biopb/biopb#780)
     resolves only while its token is the current one. A superseded token names
@@ -606,22 +608,17 @@ def _tensor_desc_by_array_id(
     again", and the 404 lists the ids that do exist.
 
     The token compared against comes from the *descriptor*, not the listing, so
-    making the listing cheaper or cached (biopb/biopb#834) cannot weaken this.
+    the listing being cheap, cached or absent cannot weaken this.
     """
     array_id, asked_version = _split_array_version(array_id)
-    sources = client.list_sources()
-    desc = sources.get(array_id.split("/", 1)[0])
-    if desc is None:
-        return None, None
-
-    bound = None
-    for td in desc.tensors:
-        if td.array_id == array_id:
-            bound = client.get_descriptor(array_id, with_pyramid=False)
-            break
-    if bound is None and array_id == desc.source_id and len(desc.tensors) == 1:
+    try:
         bound = client.get_descriptor(array_id, with_pyramid=False)
-    if bound is None:
+    except (flight.FlightServerError, ValueError):
+        # The two terminal answers: a Flight-side addressing refusal (NOT_FOUND
+        # / INVALID_ARGUMENT ride FlightServerError -- pyarrow exposes no typed
+        # class for either), and the client's own directive for an unresolved
+        # cloud source. Both are 404s, as they were when the listing answered
+        # them. A dead backend raises neither, and still reaches the 502.
         return None, None
 
     current = _descriptor_version_token(bound)
