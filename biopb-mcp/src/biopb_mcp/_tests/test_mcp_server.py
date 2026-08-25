@@ -5,6 +5,7 @@ The tools dispatch into a child kernel; here that kernel is replaced by a
 exercise the server-side formatting/extraction without a real kernel.
 """
 
+import asyncio
 import base64
 import json
 import sys
@@ -1094,3 +1095,71 @@ class TestDataGuide:
         viewer_guide = _server._resources.VIEWER
         assert "layer.data.shape" not in viewer_guide
         assert "layer.multiscale" in viewer_guide
+
+
+class TestToolReturnShape:
+    """What an *in-process* caller gets back from a tool call, per tool.
+
+    A caller inside the session child (a built-in chat loop, say) reaches the
+    tools below the layer that builds a ``CallToolResult``, and FastMCP hands it
+    one of two shapes there: a bare ``list[ContentBlock]``, or a
+    ``(blocks, structured)`` tuple. Both are declared —
+    ``lowlevel/server.py`` names them ``UnstructuredContent`` and
+    ``CombinationContent`` — and the low-level server collapses them on the way
+    to the wire.
+
+    Which shape a tool yields is decided by its **return annotation**: an
+    annotation FastMCP can build an output schema from gets the tuple, and one
+    it cannot gets the bare list. That makes the split easy to change by
+    accident — retyping ``find_skills`` from ``list`` to ``list[dict]`` would
+    silently move it, and reshape what an in-process caller receives without
+    touching a line of that caller. It is also the wire contract: the same
+    annotation decides whether an ``outputSchema`` is advertised to real MCP
+    clients on ``tools/list``.
+
+    So this pins both halves together. It is a change-detector on purpose: if it
+    fails, the question to ask is whether the wire contract change was intended,
+    not how to make the assertion pass.
+    """
+
+    #: (tool, minimal kwargs, declares an outputSchema / returns the tuple)
+    SHAPES = [
+        ("find_skills", {}, False),
+        ("take_screenshot", {}, False),
+        ("execute_code", {"python_code": "1"}, True),
+        ("poll_job", {"job_id": "job-1"}, True),
+        ("inspect_object", {"object_path": "np"}, True),
+        ("interrupt_kernel", {}, True),
+        ("start_kernel", {}, True),
+        ("restart_kernel", {}, True),
+        ("server_status", {}, True),
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _no_kernel(self, monkeypatch):
+        # Shape follows the annotation, not the runtime: with no host every tool
+        # returns its not-ready answer, in the shape it always uses. Forced to
+        # None so a stray MagicMock host from another test cannot reach a code
+        # path that formats one.
+        monkeypatch.setattr(_server, "_kernel_host", None)
+
+    def test_every_tool_is_covered(self):
+        """A new tool must land in the table above, with its shape chosen."""
+        listed = {t.name for t in asyncio.run(_server.mcp.list_tools())}
+        assert listed == {name for name, _, _ in self.SHAPES}
+
+    @pytest.mark.parametrize("name,kwargs,structured", SHAPES)
+    def test_output_schema_matches_the_table(self, name, kwargs, structured):
+        tool = {t.name: t for t in asyncio.run(_server.mcp.list_tools())}[name]
+        assert (tool.outputSchema is not None) is structured
+
+    @pytest.mark.parametrize("name,kwargs,structured", SHAPES)
+    def test_dispatch_shape_follows_the_schema(self, name, kwargs, structured):
+        result = asyncio.run(
+            _server.mcp._tool_manager.call_tool(name, kwargs, convert_result=True)
+        )
+        assert isinstance(result, tuple) is structured
+        blocks = result[0] if isinstance(result, tuple) else result
+        # Either way the content blocks are the first thing a caller wants, and
+        # there is always at least one.
+        assert len(blocks) >= 1
