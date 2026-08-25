@@ -498,18 +498,88 @@ _TILE_TARGET_EDGE = 512
 # `Vary: Authorization` is belt-and-braces for a cache that stores it anyway:
 # entries then key on the credential instead of colliding across users.
 #
-# An hour rather than `immutable` because tile content is only stable while the
-# array_id is: re-indexing a source today reuses the id, so a year-long cache
-# would pin stale pixels in every browser that saw them. Lengthening this needs
-# the version in the array_id namespace (the policy compact-grid settled on);
-# `public` needs a different auth model altogether, e.g. signed URLs that put
-# the grant in the cache key.
+# Two policies, chosen by whether the request's array_id carried a content
+# version (biopb/biopb#780).
+#
+# Versioned: the URL names the content, so its bytes cannot change under it --
+# a re-index mints a different array_id and the old URL 404s instead of
+# answering stale pixels. `immutable` is then honest, and it is worth more than
+# the saved round trip: every revalidation skipped also skips a whole-catalog
+# listing (biopb/biopb#834).
+#
+# Unversioned: a source whose URL cannot be stat'd has no version to publish, so
+# nothing distinguishes its content across a re-index and an hour is the old
+# hedge, kept. Absence is "no claim", never "unchanged".
+#
+# `public` needs a different auth model altogether (signed URLs that put the
+# grant in the cache key), regardless of versioning.
 _TILE_CACHE_CONTROL_TEMPLATE = "private, max-age={max_age}"
 _TILE_MAX_AGE = 3600
+_TILE_IMMUTABLE_MAX_AGE = 31_536_000  # a year; `immutable` is the real signal
+_TILE_IMMUTABLE_CACHE_CONTROL = f"private, max-age={_TILE_IMMUTABLE_MAX_AGE}, immutable"
+
+# Separates the source_id from its content version in the HTTP-only versioned
+# array_id form, `source_id "@" token [ "/" field ]` (descriptor.proto). A
+# source_id is `<type>_<hex>` and can never contain this; a *field* may, which
+# is why only the half before the first "/" is ever parsed.
+_VERSION_SEP = "@"
 
 
-def _tensor_desc_by_array_id(client: TensorFlightClient, array_id: str) -> Any:
-    """The authoritative TensorDescriptor named by *array_id*, or ``None``.
+def _version_token(content_version: bytes) -> str:
+    """A short, URL-safe token standing for *content_version*.
+
+    Hashed rather than passed through: the raw token is a stat signature
+    (`mtime_ns:size`) whose length varies and whose contents leak an mtime into
+    every tile URL and access log. Eight hex characters is 32 bits -- collisions
+    matter only between two versions OF ONE SOURCE, where the alternative to a
+    collision is today's behaviour (no versioning at all), so the trade is
+    strictly favourable.
+    """
+    return hashlib.sha256(content_version).hexdigest()[:8]
+
+
+def _source_version_token(source_desc: Any) -> Optional[str]:
+    """The current version token for a source, or None when it publishes none.
+
+    Read by truthiness rather than ``HasField``: an unset proto3 field, a
+    zero-length token and a server too old to carry the field at all are the
+    same thing here -- no claim about content.
+    """
+    version = getattr(source_desc, "content_version", None)
+    return _version_token(version) if version else None
+
+
+def _split_array_version(array_id: str) -> Tuple[str, Optional[str]]:
+    """``(array_id without its version, token | None)``.
+
+    Only the source half is parsed: `plate_a1b2@9f1c4e2b/A01/0` yields
+    `("plate_a1b2/A01/0", "9f1c4e2b")`, while a field containing "@" is left
+    alone.
+    """
+    head, slash, field = array_id.partition("/")
+    source, sep, token = head.partition(_VERSION_SEP)
+    if not sep:
+        return array_id, None
+    return source + slash + field, token
+
+
+def _versioned_array_id(array_id: str, token: Optional[str]) -> str:
+    """*array_id* with *token* spliced into its source half, or unchanged."""
+    if not token:
+        return array_id
+    source, slash, field = array_id.partition("/")
+    return f"{source}{_VERSION_SEP}{token}{slash}{field}"
+
+
+def _tensor_desc_by_array_id(
+    client: TensorFlightClient, array_id: str
+) -> Tuple[Any, Optional[str]]:
+    """``(TensorDescriptor, current version token)`` for *array_id*.
+
+    The descriptor is ``None`` when nothing answers to the id. The token is the
+    source's *current* one -- returned alongside rather than looked up again by
+    each caller, because the source listing this needs is the expensive part of
+    a tile request (biopb/biopb#834) and asking twice would double it.
 
     Addressed by array_id ALONE, per the identity policy at the top of
     ``proto/biopb/tensor/descriptor.proto``: array_id is globally unique and
@@ -522,22 +592,44 @@ def _tensor_desc_by_array_id(client: TensorFlightClient, array_id: str) -> Any:
     A bare source_id stays valid for a single-tensor source, which is what the
     policy says its array_id *is*. For a multi-tensor source it is refused
     rather than guessed (biopb/biopb#75); the caller turns ``None`` into a 404.
+
+    A **content-versioned** array_id (`source@token[/field]`, biopb/biopb#780)
+    resolves only while its token is the source's current one. A superseded
+    token names content this server no longer has, so it resolves to nothing --
+    a 404 like any other id that names no tensor, not a distinct status. The
+    caller does not have to distinguish them: a stale bookmark and a typo both
+    want "ask again", and the 404 lists the ids that do exist.
+
+    Correctness here rests on the descriptor being fetched fresh -- ``client``
+    caches nothing, so the token compared against is always current. If a
+    descriptor cache is ever added for the per-request listing cost
+    (biopb/biopb#834), this check inherits its staleness and can serve a
+    superseded tile as current. The two must be decided together.
     """
+    array_id, asked_version = _split_array_version(array_id)
     sources = client.list_sources()
     desc = sources.get(array_id.split("/", 1)[0])
     if desc is None:
-        return None
+        return None, None
+    current = _source_version_token(desc)
+    if asked_version is not None and asked_version != current:
+        return None, current
     for td in desc.tensors:
         if td.array_id == array_id:
-            return client.get_descriptor(array_id, with_pyramid=False)
+            return client.get_descriptor(array_id, with_pyramid=False), current
     if array_id == desc.source_id and len(desc.tensors) == 1:
-        return client.get_descriptor(array_id, with_pyramid=False)
-    return None
+        return client.get_descriptor(array_id, with_pyramid=False), current
+    return None, current
 
 
 def _tensor_candidates(client: TensorFlightClient, array_id: str) -> List[str]:
-    """array_ids of the source *array_id* points at, for a 404 that helps."""
-    desc = client.list_sources().get(array_id.split("/", 1)[0])
+    """array_ids of the source *array_id* points at, for a 404 that helps.
+
+    Unversioned ids: they are what the catalog holds, and an unversioned request
+    resolves fine (it just gets the hour-long cache policy rather than
+    ``immutable``). The canonical versioned form comes from ``tile_info``.
+    """
+    desc = client.list_sources().get(_split_array_version(array_id)[0].split("/", 1)[0])
     return [td.array_id for td in desc.tensors] if desc else []
 
 
@@ -1228,7 +1320,10 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
     ctx.check_token(request)
     try:
         client = ctx.get_client()
-        td = _tensor_desc_by_array_id(client, array_id)
+        # Published here and nowhere else: the viewer threads this array_id
+        # through every subsequent tile URL, so the versioned form IS the
+        # delivery mechanism -- no new field, no client change (biopb/biopb#780).
+        td, version = _tensor_desc_by_array_id(client, array_id)
         candidates = [] if td is not None else _tensor_candidates(client, array_id)
     except HTTPException:
         raise
@@ -1255,7 +1350,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
 
     return JSONResponse(
         {
-            "array_id": td.array_id,
+            "array_id": _versioned_array_id(td.array_id, version),
             "dim_labels": dim_labels,
             "shape": shape,
             "chunk_shape": [int(d) for d in td.chunk_shape],
@@ -1324,6 +1419,10 @@ async def get_tile(
     ctx.check_token(request)
     t0 = time.monotonic()
 
+    # Parsed once and used twice: it decides the ETag and the cache policy, and
+    # the two must not be able to disagree about whether this URL is versioned.
+    _, asked_version = _split_array_version(array_id)
+
     if fmt != "raw":
         # 410, not 400: the form was valid and is now withdrawn, which is what a
         # caller pinned to an older server needs to be told apart from a typo.
@@ -1344,7 +1443,9 @@ async def get_tile(
 
     try:
         client = await run_in_threadpool(ctx.get_client)
-        td = await run_in_threadpool(_tensor_desc_by_array_id, client, array_id)
+        td, current_version = await run_in_threadpool(
+            _tensor_desc_by_array_id, client, array_id
+        )
         candidates = (
             []
             if td is not None
@@ -1399,11 +1500,23 @@ async def get_tile(
             ("sel", ",".join(f"{i}:{v}" for i, v in sorted(resolved.items()))),
             ("red", reduction_method or ""),
             ("edge", edge),
+            # The source's CURRENT version, not the one the caller asked for.
+            # The versioned URL already changes on a re-index; this is what
+            # stops the *unversioned* URL -- stable across re-index -- from
+            # answering 304 for bytes that changed. Empty when the source
+            # publishes no version, which keeps exactly today's semantics.
+            ("cv", current_version or ""),
         ],
     )
+    # The resolution above already refused a superseded token, so a token that
+    # is still here is current -- and the URL therefore names its own content.
     cache_headers = {
         "ETag": etag,
-        "Cache-Control": _TILE_CACHE_CONTROL_TEMPLATE.format(max_age=_TILE_MAX_AGE),
+        "Cache-Control": (
+            _TILE_IMMUTABLE_CACHE_CONTROL
+            if asked_version is not None
+            else _TILE_CACHE_CONTROL_TEMPLATE.format(max_age=_TILE_MAX_AGE)
+        ),
         "Vary": "Authorization",
         "X-Tile-Size": str(edge),
         "X-Tile-Level": str(level),
@@ -1503,7 +1616,7 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         # The same resolution the tile routes use, so one id cannot mean two
         # tensors depending on which route asked. It also refuses a bare
         # source_id on a multi-tensor source rather than guessing (#75).
-        td = _tensor_desc_by_array_id(client, req.array_id)
+        td, _ = _tensor_desc_by_array_id(client, req.array_id)
         if td is None:
             raise HTTPException(
                 status_code=404,

@@ -33,6 +33,15 @@ option java_package = "biopb.tensor";
 //     so an embedded '/' is just payload (safe). A Flight ticket carries no
 //     source_id field, so recovering source_id from a chunk's array_id uses the
 //     same split-on-the-first-'/' rule.
+//
+// VERSIONED FORM (HTTP only). The HTTP sidecar publishes a content-versioned
+// array_id, `source_id "@" token [ "/" field ]`, so a browser cache keyed on a
+// tile URL cannot outlive the content it holds (biopb/biopb#780). The token is
+// derived from DataSourceDescriptor.content_version. This form exists ONLY
+// above the Flight wire: the sidecar strips it before every Flight call, and no
+// adapter, chunk_id, catalog row or descriptor ever carries it. A '@' is legal
+// in a field name and is untouched -- only the source_id half is parsed for it,
+// and a source_id can never contain '@' (it is `<type>_<hex>`).
 // ============================================================================
 
 // Encoded into FlightDescriptor.cmd bytes (identifies the tensor)
@@ -275,6 +284,25 @@ message DataSourceDescriptor {
   // (residency unknown); a resident local source sets it true, a remote
   // (fsspec) source false until its pixels are materialized locally.
   optional bool data_resident = 6;
+
+  // Opaque per-source generation token, sampled once at (re-)registration
+  // (biopb/biopb#178): the stat signature `mtime_ns:size` for a file/dir
+  // source, `iat:<ts>` for a caching proxy's mirror. Two descriptors carrying
+  // DIFFERENT tokens for one source_id describe different content; two carrying
+  // the SAME token describe the same content. It is not ordered -- newer is not
+  // "greater" -- and it is not a hash of the bytes, so an in-place edit that
+  // preserves mtime and size is invisible to it.
+  //
+  // Absent means "no claim", not "unchanged": a source whose URL cannot be
+  // stat'd (cloud, unresolved) leaves it unset, and consumers must degrade to
+  // whatever freshness policy they used before rather than treating absence as
+  // a stable version. Servers predating this field also leave it unset.
+  //
+  // Consumers use it to namespace caches they cannot otherwise invalidate. The
+  // chunk cache already folds it into chunk_id; the HTTP sidecar folds it into
+  // the array_id it publishes, so a browser cache keyed on a tile URL cannot
+  // outlive the content (biopb/biopb#780).
+  optional bytes content_version = 7;
 }
 
 // Progress heartbeat for an in-flight "resolve" Flight action. Resolving a

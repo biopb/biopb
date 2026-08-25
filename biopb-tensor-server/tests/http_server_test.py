@@ -14,8 +14,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from biopb_tensor_server.serving.http_server import (
+    _split_array_version,
     _tile_edge,
     _tile_levels,
+    _versioned_array_id,
     create_app,
 )
 from fastapi.testclient import TestClient
@@ -51,6 +53,7 @@ def _make_source_desc(
     source_id: str = "src0",
     source_url: str = "/data/src0",
     tensors=None,
+    content_version: bytes | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         source_id=source_id,
@@ -58,6 +61,7 @@ def _make_source_desc(
         source_type="zarr",
         metadata_json=None,
         tensors=tensors or [_make_tensor_desc()],
+        content_version=content_version,
     )
 
 
@@ -1364,7 +1368,7 @@ class TestCreateAppSupervisedFromEnv:
 # ===========================================================================
 
 
-def _tile_source_desc() -> SimpleNamespace:
+def _tile_source_desc(content_version: bytes | None = None) -> SimpleNamespace:
     """A realistic tiled tensor: TCZYX uint16, 1024x1024 plane, 512x512 chunks."""
     td = SimpleNamespace(
         array_id="tiled/Image:0",
@@ -1379,6 +1383,7 @@ def _tile_source_desc() -> SimpleNamespace:
         source_type="zarr",
         metadata_json=None,
         tensors=[td],
+        content_version=content_version,
     )
 
 
@@ -2103,3 +2108,144 @@ class TestTileArrayIdAddressing:
         with _multi_tensor_client() as (tc, _):
             r = tc.get("/api/tile_info/multi", params={"tensor_id": "Image:1"})
             assert r.status_code == 404
+
+
+# ===========================================================================
+# Unit tests — the content version rides the array_id namespace (#780)
+# ===========================================================================
+
+
+@contextmanager
+def _versioned_tile_client(content_version):
+    """A tile client whose source publishes *content_version* (or None)."""
+    mock_fc = _build_mock_client(_tile_source_desc(content_version))
+    lazy = MagicMock()
+    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        with TestClient(create_app(token=None), raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+def _published_array_id(tc, requested="tiled"):
+    r = tc.get(f"/api/tile_info/{requested}")
+    assert r.status_code == 200, r.text
+    return r.json()["array_id"]
+
+
+class TestVersionTokenCodec:
+    """Splicing a version into an array_id must not disturb the field half."""
+
+    def test_it_round_trips(self):
+        versioned = _versioned_array_id("plate_a1b2/A01/0", "9f1c4e2b")
+        assert versioned == "plate_a1b2@9f1c4e2b/A01/0"
+        assert _split_array_version(versioned) == ("plate_a1b2/A01/0", "9f1c4e2b")
+
+    def test_an_unversioned_id_is_unchanged(self):
+        assert _split_array_version("plate_a1b2/A01/0") == ("plate_a1b2/A01/0", None)
+
+    def test_an_at_sign_in_a_field_is_not_a_version(self):
+        # Only the source half is parsed: a source_id is `<type>_<hex>` and can
+        # never contain "@", but a field may.
+        assert _split_array_version("src_a1/weird@name") == ("src_a1/weird@name", None)
+
+    def test_no_token_means_no_splice(self):
+        assert _versioned_array_id("src_a1/f", None) == "src_a1/f"
+
+
+class TestTileInfoPublishesTheVersion:
+    def test_a_versioned_source_gets_a_versioned_array_id(self):
+        with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+            array_id = _published_array_id(tc)
+        assert array_id.startswith("tiled@")
+        assert _split_array_version(array_id) == (
+            "tiled/Image:0",
+            array_id.split("@")[1][:8],
+        )
+
+    def test_an_unversioned_source_is_published_bare(self):
+        # A URL that cannot be stat'd publishes no claim about its content.
+        with _versioned_tile_client(None) as (tc, _):
+            assert _published_array_id(tc) == "tiled/Image:0"
+
+
+class TestVersionedTileRequests:
+    def test_the_published_id_serves_tiles_and_goes_immutable(self):
+        with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+            array_id = _published_array_id(tc)
+            r = tc.get(f"/api/tile/{array_id}")
+        assert r.status_code == 200
+        assert "immutable" in r.headers["cache-control"]
+
+    def test_an_unversioned_request_keeps_the_hour_hedge(self):
+        with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+            r = tc.get("/api/tile/tiled/Image:0")
+        assert r.status_code == 200
+        assert "immutable" not in r.headers["cache-control"]
+        assert "max-age=3600" in r.headers["cache-control"]
+
+    def test_a_superseded_version_is_a_404_and_costs_no_read(self):
+        with _versioned_tile_client(b"1700000000:4096") as (tc, mock_fc):
+            stale = _published_array_id(tc)
+        # Same source, re-indexed: the token it published is no longer current.
+        with _versioned_tile_client(b"1700009999:5120") as (tc, mock_fc):
+            before = mock_fc.get_tensor.call_count
+            r = tc.get(f"/api/tile/{stale}")
+            assert r.status_code == 404, r.text
+            assert mock_fc.get_tensor.call_count == before
+            # The 404 still names what does exist, as every other one does.
+            assert "tiled/Image:0" in r.json()["detail"]
+
+    def test_a_re_index_mints_a_different_id(self):
+        with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+            before = _published_array_id(tc)
+        with _versioned_tile_client(b"1700009999:5120") as (tc, _):
+            after = _published_array_id(tc)
+        assert before != after
+
+    def test_an_unchanged_re_index_keeps_the_id(self):
+        # The token is content, not a timestamp: re-registering identical
+        # content must not evict every browser's cache.
+        ids = []
+        for _ in range(2):
+            with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+                ids.append(_published_array_id(tc))
+        assert ids[0] == ids[1]
+
+    def test_the_etag_follows_the_content_not_just_the_url(self):
+        # The unversioned URL is stable across a re-index, so only the ETag can
+        # stop a revalidation answering 304 for bytes that changed.
+        etags = []
+        for cv in (b"1700000000:4096", b"1700009999:5120"):
+            with _versioned_tile_client(cv) as (tc, _):
+                etags.append(tc.get("/api/tile/tiled/Image:0").headers["ETag"])
+        assert etags[0] != etags[1]
+
+    def test_the_clients_percent_encoded_spelling_resolves_identically(self):
+        # `encodeArrayId` in the TS client encodes per segment, so "@" arrives as
+        # %40. Both spellings must be ONE cache entry, not two -- same ETag, same
+        # policy -- or the versioned id would fragment the browser cache it
+        # exists to protect.
+        from urllib.parse import quote
+
+        with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+            array_id = _published_array_id(tc)
+            encoded = "/".join(quote(seg, safe="") for seg in array_id.split("/"))
+            assert "%40" in encoded
+            raw = tc.get(f"/api/tile/{array_id}")
+            enc = tc.get(f"/api/tile/{encoded}")
+        assert raw.status_code == enc.status_code == 200
+        assert raw.headers["ETag"] == enc.headers["ETag"]
+        assert raw.headers["cache-control"] == enc.headers["cache-control"]
+
+    def test_slice_resolves_a_versioned_id_too(self):
+        # One resolution point (#766), so the version works on every route.
+        with _versioned_tile_client(b"1700000000:4096") as (tc, _):
+            array_id = _published_array_id(tc)
+            ok = tc.post("/api/slice", json={"array_id": array_id})
+            stale = tc.post("/api/slice", json={"array_id": "tiled@deadbeef/Image:0"})
+        assert ok.status_code == 200
+        assert stale.status_code == 404
