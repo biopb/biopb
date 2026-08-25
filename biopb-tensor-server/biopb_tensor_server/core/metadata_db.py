@@ -203,13 +203,6 @@ class MetadataDatabase:
                 -- both. FALSE is the conservative default (unknown -> treat as
                 -- non-resident; still discoverable via `WHERE NOT data_resident`).
                 data_resident BOOLEAN NOT NULL DEFAULT FALSE,
-                -- Per-source generation token (biopb/biopb#178), sampled once at
-                -- (re-)registration. NULL for a source whose URL cannot be
-                -- stat'd -- absent means "no claim", not "unchanged", so it must
-                -- stay distinguishable from a real value. BLOB because the
-                -- adapter's token is bytes; today's producers are ASCII, but the
-                -- field is opaque by contract.
-                content_version BLOB,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
                 -- per tensor, so multi-field / HCS sources are queryable per
                 -- tensor instead of via the first-tensor projection only. Only
@@ -435,8 +428,8 @@ class MetadataDatabase:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident, tensors, content_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 [
                     source_id,
@@ -448,9 +441,6 @@ class MetadataDatabase:
                     shape_summary,
                     source_desc.data_resident,
                     tensors,
-                    source_desc.content_version
-                    if source_desc.HasField("content_version")
-                    else None,
                 ],
             )
 
@@ -552,7 +542,7 @@ class MetadataDatabase:
 
         sql = (
             "SELECT source_id, source_url, source_type, data_resident, tensors, "
-            "content_version, COUNT(*) OVER () AS total_count "
+            "COUNT(*) OVER () AS total_count "
             "FROM sources ORDER BY source_id"
         )
         params: list = []
@@ -565,15 +555,7 @@ class MetadataDatabase:
         total = rows[0][-1] if rows else 0
 
         descriptors: List[DataSourceDescriptor] = []
-        for (
-            source_id,
-            source_url,
-            source_type,
-            data_resident,
-            tensors,
-            content_version,
-            _,
-        ) in rows:
+        for source_id, source_url, source_type, data_resident, tensors, _ in rows:
             tensor_descs = [
                 TensorDescriptor(
                     array_id=t["array_id"],
@@ -591,12 +573,6 @@ class MetadataDatabase:
                     tensors=tensor_descs,
                     metadata_json="",  # lean; filled by GetFlightInfo
                     data_resident=bool(data_resident),
-                    # NULL stays unset: absent is "no claim", not "unchanged".
-                    **(
-                        {"content_version": bytes(content_version)}
-                        if content_version is not None
-                        else {}
-                    ),
                 )
             )
         return descriptors, total

@@ -1315,6 +1315,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
             source_adapter = self.sources.get(source_id)
 
+            # A serving field, filled from the bound adapter (biopb/biopb#780).
+            # Deliberately here rather than on the catalog listing: consumers use
+            # it to decide whether a cache entry is still valid, and this call is
+            # fetch-per-call by contract while a listing is a natural thing to
+            # cache. None stays unset -- absent is "no claim", not "unchanged".
+            if source_adapter is not None and source_adapter.content_version:
+                read_plan.descriptor.content_version = source_adapter.content_version
+
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
                 # One scheme (biopb/biopb#253): the source-level metadata is

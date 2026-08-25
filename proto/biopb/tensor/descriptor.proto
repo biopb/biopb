@@ -136,6 +136,32 @@ message TensorDescriptor {
   // reused.
   reserved 13;
   reserved "chunk_array_id";
+
+  // Opaque per-source generation token, sampled once at (re-)registration
+  // (biopb/biopb#178): the stat signature `mtime_ns:size` for a file/dir
+  // source, `iat:<ts>` for a caching proxy's mirror. Two descriptors carrying
+  // DIFFERENT tokens for one source describe different content; two carrying
+  // the SAME token describe the same content. It is not ordered -- newer is not
+  // "greater" -- and it is not a hash of the bytes, so an in-place edit that
+  // preserves mtime and size is invisible to it.
+  //
+  // A SERVING field, like chunk_shape and pyramid: filled by GetFlightInfo from
+  // the bound adapter, left empty on the structural DataSourceDescriptor.tensors
+  // entries. It is a source-level property repeated on the tensor deliberately
+  // -- consumers need it on the freshest thing in the request, and GetFlightInfo
+  // is fetch-per-call by contract while a catalog listing is a natural thing to
+  // cache (biopb/biopb#834).
+  //
+  // Absent means "no claim", not "unchanged": a source whose URL cannot be
+  // stat'd (cloud, unresolved) leaves it unset, and consumers must degrade to
+  // whatever freshness policy they used before rather than treating absence as
+  // a stable version. Servers predating this field also leave it unset.
+  //
+  // Consumers use it to namespace caches they cannot otherwise invalidate. The
+  // chunk cache already folds it into chunk_id; the HTTP sidecar folds it into
+  // the array_id it publishes, so a browser cache keyed on a tile URL cannot
+  // outlive the content (biopb/biopb#780).
+  optional bytes content_version = 14;
 }
 
 // One resolution level of a tensor's server-advertised pyramid.
@@ -284,25 +310,6 @@ message DataSourceDescriptor {
   // (residency unknown); a resident local source sets it true, a remote
   // (fsspec) source false until its pixels are materialized locally.
   optional bool data_resident = 6;
-
-  // Opaque per-source generation token, sampled once at (re-)registration
-  // (biopb/biopb#178): the stat signature `mtime_ns:size` for a file/dir
-  // source, `iat:<ts>` for a caching proxy's mirror. Two descriptors carrying
-  // DIFFERENT tokens for one source_id describe different content; two carrying
-  // the SAME token describe the same content. It is not ordered -- newer is not
-  // "greater" -- and it is not a hash of the bytes, so an in-place edit that
-  // preserves mtime and size is invisible to it.
-  //
-  // Absent means "no claim", not "unchanged": a source whose URL cannot be
-  // stat'd (cloud, unresolved) leaves it unset, and consumers must degrade to
-  // whatever freshness policy they used before rather than treating absence as
-  // a stable version. Servers predating this field also leave it unset.
-  //
-  // Consumers use it to namespace caches they cannot otherwise invalidate. The
-  // chunk cache already folds it into chunk_id; the HTTP sidecar folds it into
-  // the array_id it publishes, so a browser cache keyed on a tile URL cannot
-  // outlive the content (biopb/biopb#780).
-  optional bytes content_version = 7;
 }
 
 // Progress heartbeat for an in-flight "resolve" Flight action. Resolving a

@@ -538,14 +538,20 @@ def _version_token(content_version: bytes) -> str:
     return hashlib.sha256(content_version).hexdigest()[:8]
 
 
-def _source_version_token(source_desc: Any) -> Optional[str]:
-    """The current version token for a source, or None when it publishes none.
+def _descriptor_version_token(td: Any) -> Optional[str]:
+    """The version token carried by a bound TensorDescriptor, or None.
+
+    Taken from the descriptor rather than the source listing on purpose: this is
+    the freshest thing in the request (``get_descriptor`` is fetch-per-call by
+    contract), while the listing is the expensive part and a natural thing to
+    cache (biopb/biopb#834). Hanging a freshness guarantee off the call someone
+    will want to memoize is how the guarantee quietly stops holding.
 
     Read by truthiness rather than ``HasField``: an unset proto3 field, a
     zero-length token and a server too old to carry the field at all are the
     same thing here -- no claim about content.
     """
-    version = getattr(source_desc, "content_version", None)
+    version = getattr(td, "content_version", None)
     return _version_token(version) if version else None
 
 
@@ -577,9 +583,8 @@ def _tensor_desc_by_array_id(
     """``(TensorDescriptor, current version token)`` for *array_id*.
 
     The descriptor is ``None`` when nothing answers to the id. The token is the
-    source's *current* one -- returned alongside rather than looked up again by
-    each caller, because the source listing this needs is the expensive part of
-    a tile request (biopb/biopb#834) and asking twice would double it.
+    tensor's *current* one, read off the descriptor this already fetched, so no
+    caller has to ask for it separately.
 
     Addressed by array_id ALONE, per the identity policy at the top of
     ``proto/biopb/tensor/descriptor.proto``: array_id is globally unique and
@@ -594,32 +599,38 @@ def _tensor_desc_by_array_id(
     rather than guessed (biopb/biopb#75); the caller turns ``None`` into a 404.
 
     A **content-versioned** array_id (`source@token[/field]`, biopb/biopb#780)
-    resolves only while its token is the source's current one. A superseded
-    token names content this server no longer has, so it resolves to nothing --
-    a 404 like any other id that names no tensor, not a distinct status. The
-    caller does not have to distinguish them: a stale bookmark and a typo both
-    want "ask again", and the 404 lists the ids that do exist.
+    resolves only while its token is the current one. A superseded token names
+    content this server no longer has, so it resolves to nothing -- a 404 like
+    any other id that names no tensor, not a distinct status. The caller does
+    not have to distinguish them: a stale bookmark and a typo both want "ask
+    again", and the 404 lists the ids that do exist.
 
-    Correctness here rests on the descriptor being fetched fresh -- ``client``
-    caches nothing, so the token compared against is always current. If a
-    descriptor cache is ever added for the per-request listing cost
-    (biopb/biopb#834), this check inherits its staleness and can serve a
-    superseded tile as current. The two must be decided together.
+    The token compared against comes from the *descriptor*, not the listing, so
+    making the listing cheaper or cached (biopb/biopb#834) cannot weaken this.
     """
     array_id, asked_version = _split_array_version(array_id)
     sources = client.list_sources()
     desc = sources.get(array_id.split("/", 1)[0])
     if desc is None:
         return None, None
-    current = _source_version_token(desc)
-    if asked_version is not None and asked_version != current:
-        return None, current
+
+    bound = None
     for td in desc.tensors:
         if td.array_id == array_id:
-            return client.get_descriptor(array_id, with_pyramid=False), current
-    if array_id == desc.source_id and len(desc.tensors) == 1:
-        return client.get_descriptor(array_id, with_pyramid=False), current
-    return None, current
+            bound = client.get_descriptor(array_id, with_pyramid=False)
+            break
+    if bound is None and array_id == desc.source_id and len(desc.tensors) == 1:
+        bound = client.get_descriptor(array_id, with_pyramid=False)
+    if bound is None:
+        return None, None
+
+    current = _descriptor_version_token(bound)
+    # Checked after the fetch rather than before, because the version lives on
+    # the bound descriptor. That costs one descriptor read on the reject path,
+    # which is cold -- a superseded id is a stale bookmark, not a hot loop.
+    if asked_version is not None and asked_version != current:
+        return None, current
+    return bound, current
 
 
 def _tensor_candidates(client: TensorFlightClient, array_id: str) -> List[str]:

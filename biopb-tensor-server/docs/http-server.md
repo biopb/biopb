@@ -104,10 +104,16 @@ available array_ids, rather than silently resolving to the first tensor
 
 ### Content-versioned array_ids
 
-`/api/tile_info` publishes `source_id "@" token [ "/" field ]` when the source
+`/api/tile_info` publishes `source_id "@" token [ "/" field ]` when the tensor
 carries a `content_version` — e.g. `zarr_a3f2@9f1c4e2b/Image:0`. The token is the
 first 8 hex of `sha256(content_version)`; the raw value is a stat signature whose
 mtime has no business in every tile URL and access log.
+
+`content_version` is a **serving field** on `TensorDescriptor`, like `chunk_shape`
+and `pyramid`: filled by `GetFlightInfo` from the bound adapter, empty on the
+structural `DataSourceDescriptor.tensors[]` entries. It is a source-level property
+repeated on the tensor deliberately — the check has to read the freshest thing in
+the request.
 
 This exists **only above the Flight wire**. The sidecar strips it before every
 Flight call; no adapter, chunk_id, catalog row or descriptor carries it. A `@` in
@@ -133,10 +139,11 @@ versioned URL changes on its own when content changes; this is what stops the
 *unversioned* URL — stable across a re-index — from revalidating to a 304 for
 bytes that changed.
 
-> The resolution is correct because the sidecar caches no descriptors: the token
-> compared against is always fetched fresh. Adding a descriptor cache for the
-> per-request listing cost (biopb/biopb#834) would make this check inherit that
-> cache's staleness. The two have to be decided together.
+> The token is read off the **descriptor**, never the source listing. That is
+> what keeps the guarantee independent of biopb/biopb#834: the listing is the
+> expensive part of a tile request and the obvious thing to cache, while
+> `GetFlightInfo` is fetch-per-call by contract. A test pins it — a listing
+> frozen at a superseded version still yields a 404.
 
 `GET /api/tile_info/{array_id}` reports everything needed to address the tensor as
 a tile grid — shaped to drop into a Viv `PixelSource[]`:

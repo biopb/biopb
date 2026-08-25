@@ -467,14 +467,6 @@ class SourceAdapter(ABC):
             tensors=[catalog_entry(t) for t in self.list_tensor_descriptors()],
             metadata_json="",  # filled by GetFlightInfo()
             data_resident=self.is_resident(),
-            # None stays unset rather than becoming b"": absent means "no claim"
-            # (an unstat-able URL), which consumers must not read as a stable
-            # version. See the field comment in descriptor.proto.
-            **(
-                {"content_version": self.content_version}
-                if self.content_version is not None
-                else {}
-            ),
         )
 
     def resolve(self) -> DataSourceDescriptor:

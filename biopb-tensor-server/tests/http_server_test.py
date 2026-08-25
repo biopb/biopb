@@ -53,7 +53,6 @@ def _make_source_desc(
     source_id: str = "src0",
     source_url: str = "/data/src0",
     tensors=None,
-    content_version: bytes | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         source_id=source_id,
@@ -61,7 +60,6 @@ def _make_source_desc(
         source_type="zarr",
         metadata_json=None,
         tensors=tensors or [_make_tensor_desc()],
-        content_version=content_version,
     )
 
 
@@ -1369,13 +1367,18 @@ class TestCreateAppSupervisedFromEnv:
 
 
 def _tile_source_desc(content_version: bytes | None = None) -> SimpleNamespace:
-    """A realistic tiled tensor: TCZYX uint16, 1024x1024 plane, 512x512 chunks."""
+    """A realistic tiled tensor: TCZYX uint16, 1024x1024 plane, 512x512 chunks.
+
+    ``content_version`` rides the TENSOR descriptor: it is a serving field,
+    filled by GetFlightInfo and empty on a catalog listing entry.
+    """
     td = SimpleNamespace(
         array_id="tiled/Image:0",
         shape=[1, 3, 16, 1024, 1024],
         chunk_shape=[1, 1, 1, 512, 512],
         dtype="uint16",
         dim_labels=["t", "c", "z", "y", "x"],
+        content_version=content_version,
     )
     return SimpleNamespace(
         source_id="tiled",
@@ -1383,7 +1386,6 @@ def _tile_source_desc(content_version: bytes | None = None) -> SimpleNamespace:
         source_type="zarr",
         metadata_json=None,
         tensors=[td],
-        content_version=content_version,
     )
 
 
@@ -2223,6 +2225,47 @@ class TestVersionedTileRequests:
             with _versioned_tile_client(cv) as (tc, _):
                 etags.append(tc.get("/api/tile/tiled/Image:0").headers["ETag"])
         assert etags[0] != etags[1]
+
+    def test_a_stale_source_listing_cannot_weaken_the_check(self):
+        """The guarantee must survive biopb/biopb#834 caching the listing.
+
+        The listing is the expensive part of a tile request and the obvious
+        thing to memoize. So the token is read off the *bound descriptor*
+        (fetch-per-call by contract), never off the listing -- here the listing
+        is frozen at the old version and the check still holds.
+        """
+        old, new = b"1700000000:4096", b"1700009999:5120"
+
+        def client(listing_cv, descriptor_cv):
+            mock_fc = _build_mock_client(_tile_source_desc(listing_cv))
+            fresh = _tile_source_desc(descriptor_cv).tensors[0]
+            mock_fc.get_descriptor.side_effect = lambda aid, **k: fresh
+            lazy = MagicMock()
+            lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
+            mock_fc.get_tensor.return_value = lazy
+            return mock_fc
+
+        def serve(mock_fc, fn):
+            with patch(
+                "biopb_tensor_server.serving.http_server.TensorFlightClient",
+                return_value=mock_fc,
+            ):
+                with TestClient(
+                    create_app(token=None), raise_server_exceptions=True
+                ) as tc:
+                    return fn(tc)
+
+        published = serve(client(old, old), _published_array_id)
+        # Content moved on. The listing is stale (memoized at `old`); only the
+        # descriptor knows.
+        stale_listing = client(old, new)
+        assert (
+            serve(
+                stale_listing, lambda tc: tc.get(f"/api/tile/{published}").status_code
+            )
+            == 404
+        )
+        assert serve(client(old, new), _published_array_id) != published
 
     def test_the_clients_percent_encoded_spelling_resolves_identically(self):
         # `encodeArrayId` in the TS client encodes per segment, so "@" arrives as
