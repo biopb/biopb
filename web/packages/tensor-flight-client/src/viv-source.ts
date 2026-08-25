@@ -513,8 +513,7 @@ function makeSource(
         async (shared) => {
           const arr = await client.slice(
             {
-              source_id: info.array_id.split("/", 1)[0]!,
-              tensor_id: info.array_id,
+              array_id: info.array_id,
               slice_start: start,
               slice_stop: stop,
               scale_hint: scaleHint,

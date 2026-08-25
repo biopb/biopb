@@ -4,7 +4,7 @@
  * Usage:
  *   const client = new TensorFlightClient("http://localhost:8816", token);
  *   const sources = await client.listSources();
- *   const arr = client.getTensor("my-source", "tensor-0");
+ *   const arr = client.getTensor("my-source/tensor-0");
  *   const data = await arr.compute({ z: 5, c: 0, scaleHint: [1,1,1,8,8] });
  */
 
@@ -60,15 +60,41 @@ export class TensorFlightClient {
    * This method is synchronous-first for the cache-hit path; the returned
    * TensorArray only issues network requests when .compute() is called.
    */
-  getTensor(sourceId: string, tensorId: string): TensorArray {
-    const cached = this._sources.get(sourceId);
+  getTensor(arrayId: string): TensorArray {
+    const cached = this._sources.get(sourceOf(arrayId));
     if (cached) {
-      const td = cached.tensors.find((t) => t.array_id === tensorId);
-      if (td) return new TensorArray(this._http, sourceId, td);
+      const td = descriptorIn(cached, arrayId);
+      if (td) return new TensorArray(this._http, td);
     }
     // Return a "pending" proxy — actual descriptor resolved lazily
-    return new LazyTensorArray(this._http, sourceId, tensorId, this._sources);
+    return new LazyTensorArray(this._http, arrayId, this._sources);
   }
+}
+
+// ---------------------------------------------------------------------------
+// array_id resolution
+// ---------------------------------------------------------------------------
+
+/** The routing prefix of an array_id: everything before the first `/`. */
+function sourceOf(arrayId: string): string {
+  return arrayId.split("/", 1)[0]!;
+}
+
+/**
+ * The descriptor `arrayId` names within `source`, or undefined.
+ *
+ * A bare source_id resolves only when the source holds exactly one tensor,
+ * which is what the identity policy says its array_id *is*. On a multi-tensor
+ * source it stays unresolved rather than guessing tensors[0] — the same refusal
+ * the server makes (biopb/biopb#75).
+ */
+function descriptorIn(source: DataSourceDescriptor, arrayId: string) {
+  const exact = source.tensors.find((t) => t.array_id === arrayId);
+  if (exact) return exact;
+  if (arrayId === source.source_id && source.tensors.length === 1) {
+    return source.tensors[0];
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -82,26 +108,23 @@ export class TensorFlightClient {
 class LazyTensorArray extends TensorArray {
   /** Single shared resolution promise — prevents concurrent duplicate getSource() calls. */
   private _resolvePromise: Promise<void> | null = null;
-  private readonly _pendingSourceId: string;
-  private readonly _pendingTensorId: string;
+  private readonly _pendingArrayId: string;
   private readonly _sourceCache: Map<string, DataSourceDescriptor>;
 
   constructor(
     client: TensorHttpClient,
-    sourceId: string,
-    tensorId: string,
+    arrayId: string,
     sourceCache: Map<string, DataSourceDescriptor>,
   ) {
     // Placeholder descriptor — replaced on first compute() via _doResolve()
-    super(client, sourceId, {
-      array_id: tensorId,
+    super(client, {
+      array_id: arrayId,
       dim_labels: [],
       shape: [],
       chunk_shape: [],
       dtype: "uint8",
     });
-    this._pendingSourceId = sourceId;
-    this._pendingTensorId = tensorId;
+    this._pendingArrayId = arrayId;
     this._sourceCache = sourceCache;
   }
 
@@ -112,12 +135,13 @@ class LazyTensorArray extends TensorArray {
   }
 
   private async _doResolve(): Promise<void> {
-    const source = await this._client.getSource(this._pendingSourceId);
+    const source = await this._client.getSource(sourceOf(this._pendingArrayId));
     this._sourceCache.set(source.source_id, source);
-    const td = source.tensors.find((t) => t.array_id === this._pendingTensorId);
+    const td = descriptorIn(source, this._pendingArrayId);
     if (!td) {
       throw new Error(
-        `Tensor '${this._pendingTensorId}' not found in source '${this._pendingSourceId}'`,
+        `No tensor '${this._pendingArrayId}' (source has ` +
+          `${source.tensors.map((t) => t.array_id).join(", ") || "none"})`,
       );
     }
     this._descriptor = td;

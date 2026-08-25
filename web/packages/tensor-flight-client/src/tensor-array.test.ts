@@ -347,7 +347,7 @@ describe("TensorArray.compute", () => {
 
   it("sends full extent when no options provided", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute();
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.slice_start).toEqual([0, 0, 0]);
@@ -356,7 +356,7 @@ describe("TensorArray.compute", () => {
 
   it("clamps out-of-range slice stops to shape", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute({ z: [0, 999], y: [0, 999], x: [0, 999] });
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.slice_stop).toEqual([10, 128, 256]);
@@ -364,7 +364,7 @@ describe("TensorArray.compute", () => {
 
   it("sends scalar z as single-index range [z, z+1]", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute({ z: 3 });
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.slice_start![0]).toBe(3);
@@ -373,25 +373,27 @@ describe("TensorArray.compute", () => {
 
   it("includes scale_hint and reduction_method in request", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute({ scaleHint: [1, 2, 2], reductionMethod: "area" });
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.scale_hint).toEqual([1, 2, 2]);
     expect(callArg.reduction_method).toBe("area");
   });
 
-  it("sets correct source_id and tensor_id", async () => {
+  it("addresses the read by the descriptor's own array_id", async () => {
+    // Not a rebuilt one: the descriptor is what the geometry came from, so
+    // deriving the read's address separately is how the two came to disagree.
     const client = makeClient();
-    const ta = new TensorArray(client, "my-source", desc);
+    const ta = new TensorArray(client, makeDesc(["z", "y", "x"], [10, 128, 256], "uint16", "my-source/Image:0"));
     await ta.compute();
     const callArg = (client.slice as Mock).mock.calls[0]![0];
-    expect(callArg.source_id).toBe("my-source");
-    expect(callArg.tensor_id).toBe("t0");
+    expect(callArg.array_id).toBe("my-source/Image:0");
+    expect(callArg.source_id).toBeUndefined();
   });
 
   it("exposes ndim, shape, dtype from descriptor", () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     expect(ta.ndim).toBe(3);
     expect(ta.shape).toEqual([10, 128, 256]);
     expect(ta.dtype).toBe("uint16");
@@ -400,7 +402,7 @@ describe("TensorArray.compute", () => {
   it("propagates client errors", async () => {
     const client = makeClient();
     (client.slice as Mock).mockRejectedValueOnce(new Error("network error"));
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await expect(ta.compute()).rejects.toThrow("network error");
   });
 });

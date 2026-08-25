@@ -8,7 +8,7 @@
  * Usage:
  *   const client = new TensorHttpClient("http://localhost:8816", token);
  *   const sources = await client.listSources();
- *   const arr = await client.slice({ source_id: "...", tensor_id: "...", ... });
+ *   const arr = await client.slice({ array_id: "my-source/tensor-0", ... });
  */
 
 import type {
@@ -527,8 +527,7 @@ export class TensorHttpClient {
    * (`GET /api/tile_info`).
    *
    * Addressed by `array_id` alone (`source_id` for a single-tensor source,
-   * `source_id/field` otherwise) -- the tensor identity policy, not the
-   * deprecated `(source_id, tensor_id)` pair the slice/render routes still take.
+   * `source_id/field` otherwise), as every route on this client now is.
    *
    * Fetch once per tensor and keep it: `tile_size` comes from the stored
    * `chunk_shape`, so it varies per tensor and must not be assumed.

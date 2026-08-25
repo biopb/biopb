@@ -320,10 +320,7 @@ describe("TensorHttpClient.slice", () => {
       binaryResponse(buf, [10, 128, 256], "uint16", ["z", "y", "x"]),
     );
     const c = new TensorHttpClient(BASE, TOKEN);
-    const result: TypedNdArray = await c.slice({
-      source_id: "src0",
-      tensor_id: "t0",
-    });
+    const result: TypedNdArray = await c.slice({ array_id: "src0/t0" });
     expect(result.shape).toEqual([10, 128, 256]);
     expect(result.dtype).toBe("uint16");
     expect(result.dimLabels).toEqual(["z", "y", "x"]);
@@ -334,7 +331,7 @@ describe("TensorHttpClient.slice", () => {
     const buf = makeBuffer(4);
     mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
     const c = new TensorHttpClient(BASE, TOKEN);
-    await c.slice({ source_id: "s", tensor_id: "t" });
+    await c.slice({ array_id: "s/t" });
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(opts.method).toBe("POST");
   });
@@ -344,15 +341,14 @@ describe("TensorHttpClient.slice", () => {
     mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
     const c = new TensorHttpClient(BASE, TOKEN);
     const req = {
-      source_id: "src0",
-      tensor_id: "t0",
+      array_id: "src0/t0",
       slice_start: [0, 0, 0],
       slice_stop: [1, 10, 10],
     };
     await c.slice(req);
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(opts.body as string);
-    expect(body.source_id).toBe("src0");
+    expect(body.array_id).toBe("src0/t0");
     expect(body.slice_start).toEqual([0, 0, 0]);
   });
 
@@ -364,7 +360,7 @@ describe("TensorHttpClient.slice", () => {
       }),
     );
     const c = new TensorHttpClient(BASE, TOKEN);
-    const err = await c.slice({ source_id: "s", tensor_id: "t" }).catch((e) => e);
+    const err = await c.slice({ array_id: "s/t" }).catch((e) => e);
     expect(err).toBeInstanceOf(TensorApiError);
     expect((err as TensorApiError).status).toBe(502);
   });
@@ -373,7 +369,7 @@ describe("TensorHttpClient.slice", () => {
     const buf = makeBuffer(4);
     mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 2], "float32", []));
     const c = new TensorHttpClient(BASE, TOKEN);
-    const result = await c.slice({ source_id: "s", tensor_id: "t" });
+    const result = await c.slice({ array_id: "s/t" });
     expect(result.dimLabels).toEqual([]);
   });
 
@@ -387,7 +383,7 @@ describe("TensorHttpClient.slice", () => {
     );
 
     const c = new TensorHttpClient(BASE, TOKEN);
-    const result = await c.slice({ source_id: "s", tensor_id: "t" });
+    const result = await c.slice({ array_id: "s/t" });
 
     expect(result.shape).toEqual([]);
     expect(result.dtype).toBe("");
@@ -570,7 +566,7 @@ describe("client-side cancellation", () => {
         (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
       }));
     const ctrl = new AbortController();
-    const p = c.slice({ source_id: "src0", tensor_id: "t0" }, { signal: ctrl.signal });
+    const p = c.slice({ array_id: "src0/t0" }, { signal: ctrl.signal });
     ctrl.abort();
     // A tile the user panned away from must not surface as a server failure.
     await expect(p).rejects.toBeInstanceOf(TensorAbortError);

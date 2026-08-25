@@ -93,9 +93,8 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 Design rationale in `remote-viewer-tiles.md`; this is the contract.
 
 **Addressed by `array_id` alone**, per the identity policy at the top of
-`proto/biopb/tensor/descriptor.proto` — not the `(source_id, tensor_id)` pair the
-older routes here take. array_id is globally unique and authoritative; `source_id`
-is only the slash-free routing prefix. The path is `{array_id:path}`, so a field
+`proto/biopb/tensor/descriptor.proto`. array_id is globally unique and
+authoritative; `source_id` is only the slash-free routing prefix. The path is `{array_id:path}`, so a field
 containing `/` (HCS `plate/A01/0`) is captured whole, percent-encoded or not.
 
 A bare source_id remains valid for a **single-tensor** source, which is what the
@@ -230,8 +229,7 @@ else has yielded.
 
 ```json
 {
-  "source_id":        "my-zarr",
-  "tensor_id":        "my-zarr",
+  "array_id":         "my-zarr",
   "slice_start":      [0, 0, 0],
   "slice_stop":       [1, 512, 512],
   "scale_hint":       [1, 2, 2],
@@ -240,14 +238,19 @@ else has yielded.
 }
 ```
 
-`source_id` and `tensor_id` are both required. `tensor_id` is normalized to the
-**`array_id`** — the sole tensor identity (see the policy at the top of
-`proto/biopb/tensor/descriptor.proto`) — by `_request_array_id`, which accepts
-all three shapes a caller may send: the qualified `array_id` verbatim
-(`my-zarr` for a single-tensor source, `my-zarr/well_A1` for a multi-tensor one),
-a bare within-source field (`well_A1` → `my-zarr/well_A1`), or a value equal to
-`source_id`. There is **no `"0"` sentinel**: a single-tensor source's `array_id`
-*is* its `source_id`, so sending `"0"` addresses a field literally named `0`.
+`array_id` is required and is the whole address — `my-zarr` for a single-tensor
+source, `my-zarr/well_A1` for a multi-tensor one. It resolves through the same
+lookup the tile routes use, so one id cannot name two tensors depending on which
+route asked: a bare source_id on a multi-tensor source is **404** listing the
+available array_ids, not the first tensor (biopb/biopb#75).
+
+A bare within-source field (`well_A1`) is **not** accepted; send the qualified
+form. There is **no `"0"` sentinel** either: a single-tensor source's `array_id`
+*is* its `source_id`, so `"0"` addresses a field literally named `0`.
+
+> The route took a `(source_id, tensor_id)` pair until biopb/biopb#766. The split
+> was rejoined before every read, and two derivations of one identity could
+> disagree. A body carrying the old pair and no `array_id` is a **422**.
 
 **Response:**
 - `Content-Type: application/octet-stream` — C-contiguous `numpy.tobytes()`

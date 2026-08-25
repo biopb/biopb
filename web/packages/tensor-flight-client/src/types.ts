@@ -28,8 +28,12 @@ export interface DataSourceDescriptor {
 
 /** Parameters for a single array-slice request. */
 export interface SliceRequest {
-  source_id: string;
-  tensor_id: string;
+  /**
+   * The tensor's whole address: `source_id` for a single-tensor source,
+   * `source_id/field` otherwise. Not a `(source_id, tensor_id)` pair — that
+   * split had to be rejoined server-side before every read.
+   */
+  array_id: string;
   /** Per-dimension start indices (inclusive). */
   slice_start?: number[];
   /** Per-dimension stop indices (exclusive). */
