@@ -1,8 +1,16 @@
 # A built-in chat client — evaluation
 
-**Status: evaluation only.** Nothing here is implemented and no decision has been
-taken. Evaluated 2026-08-24 against `1d542391`; the in-process loop spike below
-was run 2026-08-25 and settles the hand-roll-vs-vendor question.
+**Status: evaluation; the loop itself is not built.** Evaluated 2026-08-24
+against `1d542391`; the in-process loop spike below was run 2026-08-25 and
+settles the hand-roll-vs-vendor question.
+
+Three things have since been settled and are marked where they are argued:
+chat runs in **local mode only** (*Where chat may run*); the loop must not take
+`execute_code`'s promote window (*the one tool not to take as-is*); and
+`_PROXY_TIMEOUT` is **not** a constraint, correcting an earlier draft of this
+document. Two prerequisites have landed — `--view` session registration
+(biopb/biopb#836) and the job-record groundwork the loop will fill,
+`origin="chat"` plus a per-cell `intent` (biopb/biopb#843).
 
 Today biopb reaches an AI agent one way: the user runs their own MCP client
 (Claude Code, Cursor, …), which spawns `biopb-mcp` over stdio. That excludes
@@ -122,6 +130,38 @@ the contract external agents see, not for this. What is worth adding either way
 is a test pinning the shape per tool, so a FastMCP bump or a casual annotation
 change fails loudly instead of silently reshaping what the loop receives.
 
+### `execute_code` is the one tool not to take as-is
+
+It carries a wire-shaped parameter that the rule above would otherwise import by
+accident. `kernel.promote_after` (10 s, `biopb-mcp/src/biopb_mcp/_config.py:260`)
+makes `execute_code` wait that long for the job to finish before handing back a
+handle. Over streamable HTTP that is a latency optimization — a poll is a whole
+round trip, so inlining a fast result saves one. **In-process the saving is
+zero**: a poll is a function call.
+
+For a chat surface it is not neutral, it is a cost. The model is blocked on the
+tool result, so the stream emits nothing for those seconds: a frozen cursor, then
+a wall of text. And it is the common case rather than the rare one — most cells in
+an image-analysis session (a segmentation, a `compute()`) run past 10 s and
+promote anyway, having paid the wait first.
+
+It cannot simply be turned down. `_promote_after` is a **process global**
+(`mcp/_server.py:28`), set once by the launcher from config
+(`mcp/__main__.py:386`) and shared with any external harness attached to the same
+session — for which 10 s is the right value. Lowering it for chat changes the
+contract the MCP agent is working under.
+
+The shape that follows: the loop submits with **no** promote window and streams
+the job's partial stdout as it accumulates. `_jobs` already buffers stdout per job
+and `poll_job` already returns it as partial output, so this is polling a
+`StringIO` in-process — free at a few hundred ms. It is strictly better than
+waiting, because the user watches prints appear instead of a stalled cursor.
+
+So either the in-process dispatch takes a per-call override, or the loop calls
+kernel submit/poll directly and leaves `execute_code` to the MCP surface. Worth
+writing down: it reads as an inconsistency with "call the tools as Python
+functions" otherwise, and it is the only tool where that rule needs an exception.
+
 ## What the harness does not give us
 
 Roughly 230 of `_session.py`'s 804 lines are reusable client mechanics; the rest
@@ -140,7 +180,7 @@ Genuinely absent, and needed:
 | Conversation history | unbounded; no summarization or context-length handling |
 | Cancellation | `_jobs.interrupt_current` exists; the loop never exposes it |
 | Vision | wiring only — see the spike; `ImageContent` reaches a model fine in-process |
-| Key custody | nothing; keys come from env / `.env` (`_models.py:41-47`) |
+| Key custody | nothing; keys come from env / `.env` (`_models.py:41-47`) — bounded by *Where chat may run* below: local mode only, so the keys never face a public origin |
 | Cost guards | no token accounting, no retry/429 handling |
 | Tool-output truncation | informal only, no general guard |
 | `instructions` as system prompt | captured at `_session.py:718`, never used |
@@ -227,6 +267,37 @@ already is via `napari[all]`). The risks are integration, not size: WebEngine
 must be initialized before `QApplication` when it lives in a plugin (which a
 napari dock widget is), and napari#2584 reports a VisPy OpenGL context conflict —
 macOS-only, 2021, PyQt5 / napari 0.4.7, **unverified on napari 0.7 + PyQt6**.
+
+## Where chat may run — local mode only
+
+**Decided: chat is off when the control is `--remote`.** Not a new gate; the same
+one the user console already argued for and built, reached by the same reasoning.
+
+`_SESSION_ALLOWED_ROOTS = {"api"}` (`biopb-control/.../_control.py:123`) is an
+allowlist whose purpose is to keep `/mcp` — "an RCE hole on the public origin",
+per `session_proxy`'s own comment — off the proxied origin. A chat route is a
+**second execute-capable surface**, so it inherits the console's shape: its own
+path root, proxied only while the control is loopback-bound, with the switch that
+makes it reachable being the same switch that guards it (`console_enabled`, and
+`observe.console_enabled` as the opt-out precedent — a knob may narrow the
+surface, never widen it past the public-bind refusal).
+
+Reusing the data-plane token instead was already rejected for the console
+(`biopb-mcp/docs/user-console.md`, *Why not "just gate it with the token"*): that
+token authorizes reading pixels and restarting the plane, lives in a
+same-uid-readable credential file, and rides the render WebSocket as `?token=`
+into logs. Those properties are fine for "view my data" and wrong for "run code as
+me". If a remote chat is ever wanted it needs a **distinct** credential.
+
+Chat adds one thing the console did not, and it is worth stating because it is not
+covered by any argument above: the loop **spends the user's model credits**. A
+leaked viewing credential becoming a shell was already the objection; it becoming
+a billable shell is a second one, and it is the only part of the surface where the
+damage is not bounded by what the machine can reach.
+
+The useful consequence is that **key custody becomes a local problem**. The keys
+live on the machine the user is sitting at, alongside the napari window, and never
+have to survive a public origin.
 
 ## Design constraint: do not make the model read pixels
 
@@ -569,10 +640,26 @@ that the proxy is therefore a streaming passthrough. It polls
 (`web/packages/app/src/pages/ObservePage.tsx:154-162`); no `text/event-stream`
 exists anywhere in the tree. The passthrough capability is real
 (`biopb-control/src/biopb_control/_control.py:1151-1156`, with a pure-ASGI auth
-middleware at `:435-439` chosen so it does not buffer), but `_PROXY_TIMEOUT`'s
-300 s read bound is documented at `:552-559` as assuming no SSE path — a long
-tool call between tokens would 502. Fix the sentence before a chat design leans
-on it.
+middleware at `:435-439` chosen so it does not buffer).
+
+**`_PROXY_TIMEOUT` is not a constraint on chat — an earlier draft of this document
+said it was, and that was wrong.** The claim was that a long tool call between
+tokens would exceed the 300 s read bound and 502. It cannot: no biopb tool blocks
+anywhere near that. `execute_code` promotes to a job handle at
+`kernel.promote_after` (10 s); the longest-blocking tool is `start_kernel`,
+bounded by `kernel.startup_timeout` (60 s POSIX, 120 s Windows); `execute_timeout`
+is 120 s. The bound is per read-event rather than total, so it is a keep-alive
+requirement, and a loop streaming a running job's partial stdout (see
+*`execute_code` is the one tool not to take as-is*) has no inter-chunk gap at all.
+The proxy already streams — `StreamingResponse(resp.aiter_raw(), …)` at both
+sites. And with chat local-only, it may not traverse the proxy in the first place.
+
+What *is* worth fixing is the comment's stated reason. `:552-559` justifies the
+number by "no long-poll / SSE / chunked-with-gaps path, so a large slice/render
+streams without inter-chunk stalls". That premise stops being true the moment
+anything streams, and the next person tuning the value would be reasoning from
+it. Correct the justification; leave the number, which has now been re-derived
+against the numbers above.
 
 ## Prerequisite
 
@@ -593,6 +680,12 @@ Hand-rolled in-process, with the harness's reusable parts lifted: on the order o
 streaming, history management, key custody and cost guards rather than by the
 loop. A demo — no streaming, env-var key, existing observe page plus an input box
 — is a few days.
+
+Two of those four have since been narrowed. Key custody is a local-mode problem
+(*Where chat may run*), so an env-var key is not merely the demo's shortcut but a
+defensible v1. And streaming is partly a job-runner question rather than a model
+one: the loop must submit without the promote window and stream partial stdout,
+which is most of what a user watching a cell run actually wants to see.
 
 One spike remains: `QWebEngineView` in a napari 0.7 / PyQt6 dock widget on Linux,
 which settles napari#2584 and the plugin initialization order before anything
