@@ -28,20 +28,17 @@ classifiers = [
 # dependency-light core SDK (for the shared control-endpoint location,
 # biopb._endpoints) plus a light ASGI stack for the Layer-3 single-origin
 # web front (biopb_control._control): Starlette + uvicorn serve the origin,
-# httpx + websockets reverse-proxy the supervised tensor server's HTTP sidecar.
+# httpx reverse-proxies the supervised tensor server's HTTP sidecar.
 # None of these drag in napari / dask / Qt / pyarrow / tensor-server / mcp, so
 # the lean-control discipline holds.
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "biopb",
     "starlette>=0.37",
-    # >=0.34 for the sansio websockets server impl (ws="websockets-sansio"),
-    # which keeps the /ws/render proxy off the deprecated websockets.legacy path.
+    # No websockets extra: the control proxies HTTP only and runs uvicorn with
+    # ws="none", so neither a server impl nor a client library is pulled in.
     "uvicorn>=0.34",
     "httpx>=0.27",
-    # >=13 for websockets.asyncio.client (the modern client the proxy dials the
-    # tensor sidecar's /ws/render with).
-    "websockets>=13",
 ]
 
 # Test/dev deps live in a PEP 735 group (kept out of published metadata), same

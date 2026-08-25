@@ -66,7 +66,7 @@ namespace, which would collide at the root. So the control serves
 | `/`, `/viewer`, `/admin`, `/assets/*` | control-served `web/` SPA | in-process |
 | `/api/*` | control's own API (status, sessions, data-plane verbs) | in-process |
 | `/health` | bare liveness | in-process |
-| `/data_plane/api/*`, `/data_plane/ws/render` | tensor sidecar (API-only) | loopback proxy |
+| `/data_plane/api/*` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
 | `/session/<id>/console/*` | that session's user console — **loopback-bound control only** | loopback proxy |

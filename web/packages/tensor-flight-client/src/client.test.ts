@@ -847,8 +847,8 @@ describe("cancellation scope", () => {
 describe("isTransportError", () => {
   it("calls a timeout transport, because it decided nothing about the tensor", () => {
     // The 408 this client synthesises when its own budget expires. Treating it
-    // as "this tensor cannot be tiled" is what downgraded a whole tensor to the
-    // server-rendered viewer whenever the backend was briefly slow.
+    // as "this tensor cannot be tiled" is what cost a whole tensor its viewer
+    // whenever the backend was briefly slow.
     expect(isTransportError(new TensorApiError(408, "Timeout after 8000ms (/api/tile_info/x)"))).toBe(true);
   });
 
@@ -964,7 +964,7 @@ describe("TensorNetworkError", () => {
 describe("tile_info's timeout budget", () => {
   it("is its own, not the catalog budget", () => {
     // It gates the whole tiled viewer, so expiring early does not fail one
-    // request -- it downgrades the tensor to the server-rendered path.
+    // request -- it costs the tensor its viewer entirely.
     const c = new TensorHttpClient(BASE, TOKEN);
     expect(c.tileInfoTimeoutMs).toBeGreaterThan(c.metadataTimeoutMs);
   });

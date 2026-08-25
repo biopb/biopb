@@ -73,12 +73,10 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels and selectable axes for one tensor |
 | `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (`fmt=raw\|png\|jpeg`) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
-| `POST` | `/api/render` | ✓ | Server-rendered RGB image of a slice |
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
 | `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker (local only — see the auth caveat) |
-| `WS` | `/ws/render` | ✓ | Streaming render: JSON `{action:"render", params}` in, `render_start` metadata + binary image out, repeatable |
 
 > **Route ordering:** `/api/sources/{id}/metadata` and `/ticket/{ticket_hex}` are
 > registered *before* the greedy `{source_id:path}` catch-all to avoid Starlette
@@ -89,11 +87,6 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 > there and is **not** a usable grid. The transfer grid belongs to the tensor the
 > server binds to serve a read, so ask `/api/tile_info/{array_id}` for it
 > (biopb/biopb#812).
-
-`/ws/render` takes its token from the `Authorization` / `X-Biopb-Token` header
-**or a `token` query parameter**, since browsers cannot set custom headers on a
-WebSocket handshake; an unauthorized socket is closed with code `4001`. It holds
-no session state — each render is an independent request/response.
 
 ## Tile endpoints
 
@@ -215,7 +208,7 @@ into a cheap 304 by a stale or forged `If-None-Match`.
 
 ## Cancellation
 
-The read routes (`/api/tile`, `/api/slice`, `/api/render`) check
+The read routes (`/api/tile`, `/api/slice`) check
 `request.is_disconnected()` before starting a read and return **499** when the
 caller has already hung up, counted as `cancelled_reads` in `/api/diagnostics`.
 This reclaims *queued* work only — neither the Flight read nor the dask graph is
@@ -225,8 +218,8 @@ interruptible, so a client that leaves mid-compute is not noticed.
 not just for latency: a read blocking the event loop denies it the turn it needs
 to observe other callers' disconnects, which silently defeats the check for every
 request queued behind it (`remote-viewer-tiles.md` has the measurements).
-`/api/slice` and `/api/render` still compute on the loop, so their check only
-fires when something else has yielded.
+`/api/slice` still computes on the loop, so its check only fires when something
+else has yielded.
 
 ## Slice endpoint
 
@@ -284,9 +277,9 @@ All error messages are passed through `_redact()` before storage:
 Both `create_app(cors_origins=None)` and the CLI launcher default to the loopback
 variants of the sidecar's own bind: `http://localhost:8814`,
 `http://127.0.0.1:8814`, `http://[::1]:8814` (substituting the actual
-`--web-host:--web-port`). That covers the control front reaching the data API and
-`/ws/render` over loopback. No web app is bundled with this package, so there is
-no frontend origin in the default set.
+`--web-host:--web-port`). That covers the control front reaching the data API
+over loopback. No web app is bundled with this package, so there is no frontend
+origin in the default set.
 
 A browser app served on another origin must be allowed explicitly: the
 `cors_origins` argument to `create_app`, or `--cors` (repeatable) on the CLI

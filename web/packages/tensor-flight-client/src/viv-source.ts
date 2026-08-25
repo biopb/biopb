@@ -357,11 +357,12 @@ export function pixelSourcesFromInfo(
 ): PixelSource<string[]>[] {
   const unreachable = unreachableAxes(info);
   if (unreachable.length) {
-    // Refusing the tensor, not the axis: the caller falls back to the
-    // server-rendered viewer, which addresses axes positionally through
-    // `slice_start` and has always served these planes correctly. So the answer
-    // to an old server is a working viewer plus a stated reason, rather than a
-    // slider that scrolls through 155 copies of frame 0.
+    // Refusing the tensor, not the axis. There is no second viewer to fall
+    // back to any more, so this costs the tensor its display against an old
+    // server -- accepted deliberately: the alternative is a slider that scrolls
+    // through 155 copies of frame 0, and silently wrong pixels are worse than a
+    // stated refusal. The window is a new SPA against an older sidecar; both
+    // ship from the same release.
     const named = unreachable
       .map((axis) => `${axis.title} (${axis.extent} positions)`)
       .join(", ");

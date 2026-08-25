@@ -1,23 +1,21 @@
 "use client";
 
 /**
- * Picks which viewer the pane gets.
+ * Hosts the tiled viewer and says what happened when it cannot start.
  *
- * The tiled Viv viewer is the target and handles everything that reaches it, but
- * it cannot cover every case: it needs WebGL2, a dtype with a GPU equivalent, a
- * canonical `[..., Y, X, S]` axis order, and a server new enough to serve
- * `/api/tile_info`. The server-rendered viewer has none of those requirements,
- * so it stays as the fallback rather than being replaced outright.
+ * The tiled Viv viewer is the only viewer. It needs WebGL2, a dtype with a GPU
+ * equivalent, and a server new enough to serve `/api/tile_info` — so there are
+ * tensors and browsers it cannot show, and this pane's job is to name the reason
+ * rather than to substitute a second viewer for it.
  *
- * Those are all facts about the tensor or the browser, and they stay decided.
- * A slow or failing *server* is not one of them: it says nothing about whether
- * the tensor can be tiled, so it must not retire the tiled viewer for the rest
- * of the visit. The two are tracked apart — see {@link FallbackKind}.
+ * That reason splits two ways, and the split is what {@link ViewerErrorKind}
+ * carries. A fact about the tensor or the browser stays decided: re-running the
+ * same load would fail the same way. A server that did not answer says nothing
+ * about whether the tensor can be tiled, so it is offered again.
  */
 
 import { Component, Suspense, lazy, useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { ImageViewer } from "./ImageViewer";
 
 // deck.gl + luma.gl are the app's largest dependency by a wide margin, and only
 // this pane uses them. Splitting them out keeps them off the admin and observe
@@ -55,7 +53,7 @@ function hasWebGL2(): boolean {
  * with its child.
  */
 class TileViewerBoundary extends Component<
-  { children: ReactNode; onError: (reason: string, kind: FallbackKind) => void },
+  { children: ReactNode; onError: (reason: string, kind: ViewerErrorKind) => void },
   { failed: boolean }
 > {
   state = { failed: false };
@@ -77,27 +75,27 @@ class TileViewerBoundary extends Component<
 }
 
 /**
- * Why the pane is showing the server-rendered viewer.
+ * Why the viewer could not start.
  *
  * `"capability"` is a settled fact — this browser or this tensor cannot drive
  * the tiled path — and is not worth re-testing until something changes.
  * `"transport"` means the server did not answer; the tiled path was never ruled
  * out, so it stays offered.
  */
-export type FallbackKind = "capability" | "transport";
+export type ViewerErrorKind = "capability" | "transport";
 
-interface Fallback {
+interface ViewerError {
   reason: string;
-  kind: FallbackKind;
+  kind: ViewerErrorKind;
 }
 
-const noWebGL2: Fallback = {
+const noWebGL2: ViewerError = {
   reason: "WebGL2 is unavailable in this browser",
   kind: "capability",
 };
 
 export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
-  const [fallback, setFallback] = useState<Fallback | null>(
+  const [failure, setFailure] = useState<ViewerError | null>(
     hasWebGL2() ? null : noWebGL2,
   );
   // Bumped to remount the tiled viewer on a manual retry. The tensor has not
@@ -107,37 +105,33 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
   // A new tensor gets a fresh verdict: the previous one may have failed for a
   // reason that is specific to it (dtype, axis order).
   useEffect(() => {
-    setFallback(hasWebGL2() ? null : noWebGL2);
+    setFailure(hasWebGL2() ? null : noWebGL2);
   }, [sourceId, tensorId]);
 
   const onUnsupported = useCallback(
-    (reason: string, kind: FallbackKind) => setFallback({ reason, kind }),
+    (reason: string, kind: ViewerErrorKind) => setFailure({ reason, kind }),
     [],
   );
 
   const retry = useCallback(() => {
-    setFallback(null);
+    setFailure(null);
     setAttempt((n) => n + 1);
   }, []);
 
-  if (fallback !== null) {
+  if (failure !== null) {
     return (
-      <>
-        <ImageViewer sourceId={sourceId} tensorId={tensorId} />
-        <div className="viewer-fallback-note">
-          {fallback.kind === "transport" ? (
-            <>
-              server-rendered — the server did not answer in time, so the tiled
-              viewer could not start.{" "}
-              <button type="button" className="viewer-fallback-retry" onClick={retry}>
-                Try again
-              </button>
-            </>
-          ) : (
-            <>server-rendered — {fallback.reason}</>
-          )}
-        </div>
-      </>
+      <div className="viewer-unavailable">
+        {failure.kind === "transport" ? (
+          <>
+            The server did not answer in time, so the viewer could not start.{" "}
+            <button type="button" className="viewer-retry" onClick={retry}>
+              Try again
+            </button>
+          </>
+        ) : (
+          <>This tensor cannot be displayed — {failure.reason}</>
+        )}
+      </div>
     );
   }
 

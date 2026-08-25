@@ -1,7 +1,9 @@
-"""Tests for the webapp render path, focused on interleaved RGB(A) samples.
+"""Tests for the server-side compositor, focused on interleaved RGB(A) samples.
 
-The server render (`ws/render` / `/api/render`) reduces an N-D tensor to a 2-D
-Y/X plane and pseudo-colors it -- built for selecting one T/Z/C plane at a time.
+``renderer.py`` reduces an N-D tensor to a 2-D Y/X plane and pseudo-colors it --
+built for selecting one T/Z/C plane at a time. Its one remaining caller is
+``GET /api/tile?fmt=png|jpeg``; the ``ws/render`` / ``/api/render`` routes it was
+written for are gone.
 An RGB OME-TIFF arrives as a 6-D ``TCZYXS`` block whose trailing ``S`` axis holds
 the color components of a single pixel, which must be composited into RGB, not
 collapsed to one plane. Before the fix ``extract_yx_slice`` collapsed the ``S``

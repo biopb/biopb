@@ -5,9 +5,9 @@
  *
  * Pixels arrive as raw tiles and contrast is applied in the shader, so panning
  * refetches only the tiles that came into view and a contrast drag costs no
- * round trip at all. That is the difference from {@link ImageViewer}, which asks
- * the server to re-render the whole region on every interaction — fine on
- * loopback, unusable across a WAN.
+ * round trip at all. That is what retired the server-rendered viewer this
+ * replaced, which asked the server to re-render the whole region on every
+ * interaction — fine on loopback, unusable across a WAN.
  *
  * Default-exported so the route can `lazy()` it: deck.gl and luma.gl are by far
  * the largest thing the app depends on and no other page needs them.
@@ -32,7 +32,7 @@ import {
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
-import type { FallbackKind } from "./ViewerPane";
+import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
 import {
   clampGamma,
@@ -56,14 +56,13 @@ interface TileViewerProps {
    * The tiled viewer gave up. `kind` says whether that is a fact about the
    * tensor ("capability": no tile route, an unsupported dtype, a non-canonical
    * axis order) or about the moment ("transport": the server timed out or
-   * failed). The caller falls back to the rendered-image viewer either way, but
-   * only the first is worth making permanent.
+   * failed). The pane reports both; only the second is worth offering again.
    */
-  onUnsupported: (reason: string, kind: FallbackKind) => void;
+  onUnsupported: (reason: string, kind: ViewerErrorKind) => void;
 }
 
 /**
- * Slice navigation: hold one of these and scroll. Matches {@link ImageViewer}.
+ * Slice navigation: hold one of these and scroll.
  *
  * Only the named axes get a key, because there is no letter to press for an
  * axis called `i` or `POS` that would not collide with something. Those are
@@ -446,7 +445,7 @@ function useElementSize(ref: RefObject<HTMLElement | null>) {
 }
 
 /**
- * Hold t/z/c and scroll to step that axis, as the rendered-image viewer does.
+ * Hold t/z/c and scroll to step that axis.
  *
  * Capture phase on the pane: deck.gl listens on the canvas below, so stopping
  * the event here is what keeps a slice scroll from also zooming. The whole

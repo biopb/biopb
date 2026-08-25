@@ -20,8 +20,6 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
-  RenderRequest,
-  RenderResult,
   SliceRequest,
   TileImageRequest,
   TileInfo,
@@ -78,8 +76,8 @@ export class TensorAbortError extends Error {
  * The viewer needs the distinction: a tensor that cannot be rendered a given way
  * is a permanent fact about that tensor, while a timeout or a 5xx says nothing
  * about it at all and is very likely to succeed on a second try. Treating the
- * two alike downgrades a whole tensor to the fallback renderer because the
- * backend was briefly busy.
+ * two alike costs a whole tensor its viewer because the backend was briefly
+ * busy.
  *
  * A caller abort is neither -- it is the caller's own doing, and callers discard
  * it before they get here.
@@ -236,8 +234,8 @@ export class TensorHttpClient {
    * Deliberately not {@link metadataTimeoutMs}: that budget is sized for small
    * catalog calls, where giving up quickly costs a list and nothing else. This
    * one call is the gate on the whole tiled viewer -- nothing renders until it
-   * returns -- so expiring early does not fail one request, it downgrades the
-   * tensor to the server-rendered path. Sized like the other read-path budget
+   * returns -- so expiring early does not fail one request, it costs the tensor
+   * its viewer entirely. Sized like the other read-path budget
    * ({@link chunkTimeoutMs}) instead, and paired with a retry in the viewer.
    */
   tileInfoTimeoutMs = 8_000;
@@ -616,36 +614,6 @@ export class TensorHttpClient {
     consume: (res: Response) => Promise<T>,
   ): Promise<T> {
     return this.send(path, { method: "GET", headers: this.headers() }, timeoutMs, opts, consume);
-  }
-
-  // -------------------------------------------------------------------------
-  // Render (backend image rendering)
-  // -------------------------------------------------------------------------
-
-  /**
-   * Fetch a rendered image from the backend.
-   *
-   * Uses server-side VTK/PIL rendering to produce PNG/JPEG output.
-   * For raw format, returns RGBA bytes (4 bytes per pixel, uint8).
-   * This is an alternative to slice() + frontend rendering.
-   *
-   * @throws {TensorApiError} on HTTP error, timeout, or if rendering not enabled.
-   * @throws {TensorAbortError} if `opts.signal` fired.
-   */
-  async render(req: RenderRequest, opts?: RequestOptions): Promise<RenderResult> {
-    // Use longer timeout for rendering (may be slower than raw slice)
-    return this.fetchBinary("/api/render", req, this.chunkTimeoutMs * 2, opts, async (res) => {
-      const width = parseInt(res.headers.get("X-Image-Width") ?? "0", 10);
-      const height = parseInt(res.headers.get("X-Image-Height") ?? "0", 10);
-      const percentileLoValue = parseFloat(res.headers.get("X-Percentile-Lo-Value") ?? "0");
-      const percentileHiValue = parseFloat(res.headers.get("X-Percentile-Hi-Value") ?? "1");
-      const format = res.headers.get("X-Image-Format") ?? req.output_format ?? "jpeg";
-
-      // For raw format, use arrayBuffer; for png/jpeg, use blob
-      const blob = format === "raw" ? await res.arrayBuffer() : await res.blob();
-
-      return { blob, width, height, percentileLoValue, percentileHiValue, format };
-    });
   }
 
   // -------------------------------------------------------------------------

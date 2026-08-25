@@ -1697,9 +1697,9 @@ def launch(
         else:
             # No web app is bundled here, so there is no frontend origin to derive
             # by default. The control front reaches this sidecar over loopback for
-            # the data API + /ws/render, so allow all loopback variants of the
-            # server's own address; a browser app on any other origin must be
-            # allowed explicitly via --cors.
+            # the data API, so allow all loopback variants of the server's own
+            # address; a browser app on any other origin must be allowed
+            # explicitly via --cors.
             from urllib.parse import urlparse as _urlparse
 
             _loopback_aliases: dict = {

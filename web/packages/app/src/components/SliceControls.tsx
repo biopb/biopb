@@ -12,7 +12,7 @@ import {
 } from "../utils/colorUtils";
 import { GAMMA_OCTAVES, gammaFromOctaves, octavesFromGamma } from "../utils/vivUtils";
 
-// Debounce delay for slider updates (matches ImageViewer's keyboard+wheel debounce)
+// Debounce delay for slider updates (matches the viewer's keyboard+wheel debounce)
 const SLIDER_DEBOUNCE_MS = 150;
 
 interface SliceControlsProps {
@@ -48,7 +48,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // through log2/exp and drift off the position the user put it at.
   const [localOctaves, setLocalOctaves] = useState(() => octavesFromGamma(slice.gamma));
 
-  // Sync local state when store slice changes (e.g., from keyboard navigation in ImageViewer)
+  // Sync local state when store slice changes (e.g., from wheel navigation in the viewer)
   useEffect(() => {
     setLocalAxes({ t: slice.t, z: slice.z, c: slice.c, ...slice.axes });
     setLocalPercentile(slice.percentileScale);

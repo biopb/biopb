@@ -78,7 +78,7 @@ export const TIPS: Tip[] = [
   },
   {
     id: "transport-retry",
-    text: "“Server did not answer in time” is not a verdict on the image — the Try again button re-runs it on the tiled viewer.",
+    text: "“The server did not answer in time” is not a verdict on the image — the Try again button asks for it afresh.",
   },
   {
     id: "indexing",
