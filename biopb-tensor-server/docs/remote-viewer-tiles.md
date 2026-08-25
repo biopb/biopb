@@ -1,20 +1,23 @@
 # Remote data viewer — client-side rendering over a tile API
 
-**Status:** partially implemented. The tile API (`GET /api/tile_info`, `GET /api/tile`),
-server-side cancellation, client `AbortSignal` plumbing and the Viv `PixelSource`
-adapter have landed. **Viv is now the committed framework** (0.22.1, deck.gl/luma.gl
-`~9.3.3`). The viewer component itself has not been built.
+**Status:** implemented. The tile API (`GET /api/tile_info`, `GET /api/tile`),
+server-side cancellation, client `AbortSignal` plumbing, the Viv `PixelSource`
+adapter and the viewer component have all landed. **Viv is the committed
+framework** (0.22.1, deck.gl/luma.gl `~9.3.3`), and the tiled viewer is now the
+only one — see "Retiring the server-rendered viewer".
 **Component:** `biopb-tensor-server` (HTTP sidecar, tile route); `web/` (viewer SPA);
 `biopb-control` (proxy hop — see `biopb/biopb#762`).
 **Related:** `http-server.md`, `remote-tensor-cache.md`, `../../docs/url-prefix.md`.
 
 ## Why
 
-The viewer SPA renders server-side. `ws/render` takes a region plus a `scale_hint`,
-composites it (percentile contrast, colormap) with PIL/VTK, and pushes a PNG/JPEG
-over the socket; the client pans and zooms locally with a CSS transform against the
-returned `loaded_region` rect until `shouldReload()` decides the viewport drifted,
-then debounces a new render.
+The viewer SPA used to render server-side. `ws/render` took a region plus a
+`scale_hint`, composited it (percentile contrast, colormap) with PIL, and pushed a
+PNG/JPEG over the socket; the client panned and zoomed locally with a CSS transform
+against the returned `loaded_region` rect until `shouldReload()` decided the
+viewport had drifted, then debounced a new render. (That path is gone — see
+"Retiring the server-rendered viewer" below — but it is what the tile design was
+answering.)
 
 That is the right shape for a **local** server and the wrong shape for a remote one:
 
@@ -160,7 +163,7 @@ a version in the cache key (same conclusion as the compact-grid work: `chunk_id`
 an opaque server-side token) — so `immutable` and a long `max-age` wait on that
 versioning, since re-indexing currently reuses the id.
 
-**Auth stays out of the URL.** `ws/render` passes `?token=`; do not carry that over.
+**Auth stays out of the URL.** `ws/render` passed `?token=`; that was not carried over.
 A token in a tile URL means one cache entry per token and tokens in access logs. Use
 the `Authorization` header — the client is on `fetch` anyway, and the browser caches
 by URL, so tokens can rotate without invalidating anything.
@@ -227,10 +230,10 @@ correct in unit tests.
 `is_disconnected()` itself is not the problem — a single poll detects a departed
 client reliably once the loop is free to see the close.
 
-`/api/slice` and `/api/render` carry the same pre-read check but still compute on
-the loop, so their cancellation only fires when something else has yielded. They
-benefit indirectly (tile reads now free the loop) but should move to a threadpool
-before their check can be relied on.
+`/api/slice` carries the same pre-read check but still computes on the loop, so its
+cancellation only fires when something else has yielded. It benefits indirectly
+(tile reads now free the loop) but should move to a threadpool before its check can
+be relied on.
 
 ## Chunk size vs tile size
 
@@ -412,6 +415,34 @@ Reproduce with `proxybench.py` / `cpuprobe2.py` (measurement fixture:
 `ome-tiff_dace9c2e5006/Image:0`, `<u2`, `[1,3,16,512,512]`, chunk `[1,1,1,512,512]` —
 a 512×512 slice is exactly 524288 B).
 
+## Retiring the server-rendered viewer
+
+The two viewers coexisted while the tiled one was proving itself. Once it was,
+keeping the other one cost more than it returned, and `POST /api/render`,
+`WS /ws/render`, the `ImageViewer` component and the control's websocket proxy were
+deleted together (~2,000 lines, and `websockets` left `biopb-control`'s dependency
+list — `/ws/render` was its only WebSocket route).
+
+What the audit found, and what decided it:
+
+- **Two of the four stated fallback reasons no longer fire.** `core/axes.py::plane_axes`
+  is positional by construction, so `tile_info.plane` always reports the canonical
+  trailing indices and the "non-canonical axis order" refusal is unreachable against
+  any server this repo ships. The `sel`-capability refusal is version skew and
+  self-liquidating.
+- **What remains is dtype coverage.** Viv holds u1/i1/u2/i2/u4/i4/f4/f8; `int64`,
+  `float16`, `bool` and complex have no GPU equivalent and now cost the tensor its
+  display rather than degrading to a second viewer.
+- **The cheap way to close that gap is already built.** `GET /api/tile?fmt=png|jpeg`
+  serves server-composited tiles through the same `renderer.py`, and
+  `client.tileImage()` exists but is unwired. That is a *tiled* server-render — it
+  keeps deck.gl and drops only GPU contrast — and is a far better answer for an
+  `int64` label image than a whole second viewer with its own websocket. Wire it
+  before the dtype gap is worth worrying about.
+
+The cost accepted knowingly: a browser without WebGL2, or a tensor with an
+unsupported dtype, now gets a stated refusal instead of a working picture.
+
 ## Deferred
 
 - **Server-side hydrate-ahead.** Cold-chunk latency amplification is about the
@@ -579,15 +610,14 @@ Aborts must reject with Viv's `SIGNAL_ABORTED` (`"__vivSignalAborted"`), not an
 `catch(e => { if (e !== SIGNAL_ABORTED) throw e })`, so anything else is rethrown
 inside a `.catch` nobody follows.
 
-**A slow server is not an untileable tensor.** The pane falls back to the
-server-rendered viewer for things that are settled — no WebGL2, a dtype with no
-GPU equivalent, a non-canonical axis order, a server too old for the tile routes.
-`tile_info` failures used to join that list: it opens the load, it ran on the
-*catalog* timeout (3 s), and its synthesised 408 reached `onUnsupported` looking
-exactly like an unsupported dtype. One slow response therefore retired the tiled
-viewer for that tensor until the user navigated away and back — handing them the
-WAN-hostile render path precisely when the deployment was under stress, with the
-badge blaming the tensor (`TensorApi 408: Timeout after 3000ms`, measured).
+**A slow server is not an untileable tensor.** The pane reports a settled refusal
+for things that are facts — no WebGL2, a dtype with no GPU equivalent, a server
+too old for the tile routes. `tile_info`
+failures used to join that list: it opens the load, it ran on the *catalog* timeout
+(3 s), and its synthesised 408 reached `onUnsupported` looking exactly like an
+unsupported dtype. One slow response therefore retired the tiled viewer for that
+tensor until the user navigated away and back — with the badge blaming the tensor
+(`TensorApi 408: Timeout after 3000ms`, measured).
 
 Three things separate the cases. `isTransportError` splits "the server did not
 answer" (408, 429, 5xx, `TensorNetworkError`) from "this tensor cannot be rendered
@@ -713,10 +743,10 @@ reads as an extensions change and recompiles every layer's shader.
 
 **Gamma goes on the intensity, not on the RGB.** `pow(i*c) != pow(i)*c`, so
 applying the exponent after the colour multiplier would shift hue as the slider
-moved. Both viewers apply it to the normalized intensity, after the contrast
-window and before the colour — the tiled one in the hook above, the server-rendered
-one in `renderer.apply_gamma`. A test pins the difference (`0x804000` at half
-intensity: 91, not 128).
+moved. Both implementations apply it to the normalized intensity, after the
+contrast window and before the colour — the shader in the hook above, the server's
+own compositor in `renderer.apply_gamma`. A test pins the difference (`0x804000` at
+half intensity: 91, not 128).
 
 **The control is in octaves.** Halving and doubling are equal and opposite
 corrections, so they belong the same distance from neutral; on a linear 0.25–4

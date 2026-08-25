@@ -236,9 +236,15 @@ def apply_gamma(normalized: np.ndarray, gamma: float) -> None:
 
     Gamma is an exponent on the *normalized* intensity, applied after the
     contrast window and before any color multiplier -- the same order the
-    browser's tiled viewer uses in its shader, so the two viewers agree on what
-    a given gamma looks like. Applying it to the final RGB instead would shift
-    hue as gamma moved, since ``pow(i*c) != pow(i)*c``.
+    viewer's shader uses, so a curve baked here and one applied on the GPU mean
+    the same thing. Applying it to the final RGB instead would shift hue as
+    gamma moved, since ``pow(i*c) != pow(i)*c``.
+
+    **No caller passes a gamma today.** ``/api/render`` was the only route that
+    did, and it is gone; ``GET /api/tile?fmt=png|jpeg`` composites without one.
+    Kept because that tile format is where a server-rendered path would return
+    (see ``docs/remote-viewer-tiles.md``), and the curve has to match the shader
+    when it does.
     """
     if gamma == 1.0:
         return
@@ -249,7 +255,7 @@ def apply_gamma(normalized: np.ndarray, gamma: float) -> None:
 
 #: Two octaves either side of neutral -- the range of the viewer's gamma slider
 #: (``GAMMA_OCTAVES`` in web/packages/app/src/utils/vivUtils.ts). Both ends clamp
-#: to the same values there, so a stored gamma means one thing in both viewers.
+#: to the same values there, so a stored gamma means one thing on either side.
 GAMMA_MIN = 0.25
 GAMMA_MAX = 4.0
 

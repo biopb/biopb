@@ -75,13 +75,12 @@ export default defineConfig({
   },
   server: {
     // `pnpm dev` runs against a live control on :8813. Forward the API namespaces
-    // the SPA calls: the control's own /api/*, the proxied data plane /data_plane/*
-    // (incl. the /data_plane/ws/render websocket), and each session's
-    // /session/<id>/api/*. The viewer defaults to the proxied plane in dev
-    // (ClientBootstrap), so no env var is needed.
+    // the SPA calls: the control's own /api/*, the proxied data plane
+    // /data_plane/*, and each session's /session/<id>/api/*. The viewer defaults
+    // to the proxied plane in dev (ClientBootstrap), so no env var is needed.
     proxy: {
       [`^${rx}/api`]: control,
-      [`^${rx}/data_plane`]: { ...control, ws: true },
+      [`^${rx}/data_plane`]: control,
       // /health is unauthenticated and outside /api, and auth.ts reads it twice
       // — authRequired() and consoleEnabled(). Unproxied it fell to the SPA
       // fallback, and since both callers treat any failure as false, dev

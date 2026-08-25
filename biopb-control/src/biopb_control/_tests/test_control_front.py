@@ -3,15 +3,14 @@
 Concerns beyond the health/ensure control API (covered in ``test_supervisor``):
 (1) the control's own routes win, (2) the ``/data_plane`` namespace faithfully
 reverse-proxies to the tensor web sidecar -- method, path, query, headers,
-request/response bodies, and the ``/ws/render`` WebSocket -- with the mount
-prefix stripped, and (3) the control is the single web origin: it serves the
+request/response bodies -- with the mount prefix stripped, and (3) the control is the single web origin: it serves the
 built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
 links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
 as real files, and (4) which session-child roots it will proxy at all — ``api``
 always, the ``console`` (an RCE into that session's kernel) only on a
-loopback-bound control, ``/mcp`` never. A trivial stdlib HTTP server and a
-``websockets`` echo server stand in for the tensor sidecar so no real tensor
-server is needed; a tmp bundle stands in for ``web/packages/app/dist``.
+loopback-bound control, ``/mcp`` never. A trivial stdlib HTTP server stands in
+for the tensor sidecar so no real tensor server is needed; a tmp bundle stands
+in for ``web/packages/app/dist``.
 """
 
 import json
@@ -24,9 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import pytest
-import websockets.sync.server
 from biopb import _sessions
-from websockets.sync.client import connect as ws_connect
 
 from biopb_control._control import (
     _SESSION_ALLOWED_ROOTS,
@@ -892,32 +889,6 @@ def test_api_algorithms_is_token_gated(tokened_control, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# WebSocket proxy (/ws/render)
-# --------------------------------------------------------------------------- #
-@pytest.fixture
-def ws_upstream():
-    """A websockets echo server standing in for the tensor /ws/render channel.
-
-    On each text message it replies with a text frame then a binary frame,
-    exercising both directions and both frame types through the proxy.
-    """
-
-    def handler(conn):
-        for message in conn:
-            conn.send(f"echo:{message}")
-            conn.send(b"\x00\x01\x02")
-
-    server = websockets.sync.server.serve(handler, "127.0.0.1", 0)
-    host, port = server.socket.getsockname()[:2]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        server.shutdown()
-
-
-# --------------------------------------------------------------------------- #
 # Per-session observe proxy (/session/<id>/*)
 # --------------------------------------------------------------------------- #
 def _register_session(session_id, upstream_url):
@@ -1196,28 +1167,6 @@ def subprocess_dead_pid():
     return p.pid
 
 
-def test_websocket_render_is_proxied(ws_upstream, tmp_path):
-    spec = DataPlaneSpec(
-        config=tmp_path / "config.json",
-        grpc_port=_free_port(),
-        server_log=tmp_path / "server.log",
-    )
-    sup = DataPlaneSupervisor(spec)
-    api_port = _free_port()
-    server, _thread = serve_control_api(
-        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=ws_upstream
-    )
-    try:
-        with ws_connect(
-            f"ws://127.0.0.1:{api_port}/data_plane/ws/render?token=t"
-        ) as ws:
-            ws.send("hello")
-            assert ws.recv() == "echo:hello"  # text both ways
-            assert ws.recv() == b"\x00\x01\x02"  # binary upstream -> client
-    finally:
-        server.shutdown()
-
-
 # --------------------------------------------------------------------------- #
 # --url-prefix: publishing this origin under a reverse-proxy path prefix
 # (biopb/biopb#728 — an Open OnDemand /node/<host>/<port>/ route).
@@ -1482,31 +1431,6 @@ def test_prefixed_session_api_is_still_token_gated(tokened_prefixed_control, ups
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{tokened_prefixed_control}{_PREFIX}/session/s-gated/api/jobs")
     assert exc.value.code == 401
-
-
-def test_prefixed_websocket_render_is_proxied(ws_upstream, tmp_path):
-    # The render WebSocket is a `websocket` scope, not `http` -- it has to be
-    # stripped too, or the browser's ${apiBase}/ws/render never connects.
-    spec = DataPlaneSpec(
-        config=tmp_path / "config.json",
-        grpc_port=_free_port(),
-        server_log=tmp_path / "server.log",
-        url_prefix=_PREFIX,
-    )
-    sup = DataPlaneSupervisor(spec)
-    api_port = _free_port()
-    server, _thread = serve_control_api(
-        "127.0.0.1", api_port, sup, ensure_timeout=8.0, data_web_url=ws_upstream
-    )
-    try:
-        with ws_connect(
-            f"ws://127.0.0.1:{api_port}{_PREFIX}/data_plane/ws/render?token=t"
-        ) as ws:
-            ws.send("hello")
-            assert ws.recv() == "echo:hello"
-            assert ws.recv() == b"\x00\x01\x02"
-    finally:
-        server.shutdown()
 
 
 def test_no_prefix_serves_the_shell_verbatim(control):

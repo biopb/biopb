@@ -78,7 +78,7 @@ export const TIPS: Tip[] = [
   },
   {
     id: "transport-retry",
-    text: "“Server did not answer in time” is not a verdict on the image — the Try again button re-runs it on the tiled viewer.",
+    text: "“The viewer could not start” is often a slow server, not a bad image — Try again re-runs it.",
   },
   {
     id: "indexing",

@@ -1340,53 +1340,6 @@ class TestCreateAppSupervisedFromEnv:
 
 
 # ===========================================================================
-# WebSocket render endpoint (/ws/render)
-#
-# The render pipeline itself is exercised by the HTTP /api/render path; these
-# lock in the auth + message-dispatch behaviour that the refactor split out of
-# the monolithic websocket handler (biopb/biopb#181).
-# ===========================================================================
-
-
-class TestWebSocketRender:
-    def test_unknown_action_returns_error(self, dev_client):
-        tc, _ = dev_client
-        with tc.websocket_connect("/ws/render") as ws:
-            ws.send_json({"action": "nope"})
-            msg = ws.receive_json()
-        assert msg["action"] == "error"
-        assert msg["message"] == "Unknown action: nope"
-
-    def test_invalid_params_returns_error(self, dev_client):
-        tc, _ = dev_client
-        with tc.websocket_connect("/ws/render") as ws:
-            # RenderRequest requires source_id/tensor_id → validation error
-            ws.send_json({"action": "render", "params": {}})
-            msg = ws.receive_json()
-        assert msg["action"] == "error"
-        assert msg["message"].startswith("Invalid params")
-
-    def test_missing_token_rejected(self, auth_client):
-        from fastapi import WebSocketDisconnect
-
-        tc, _ = auth_client
-        # Token enforced (auth_client) and none supplied → server closes 4001.
-        with pytest.raises(WebSocketDisconnect) as excinfo:
-            with tc.websocket_connect("/ws/render") as ws:
-                ws.receive_json()
-        assert excinfo.value.code == 4001
-
-    def test_valid_query_token_accepts(self, auth_client):
-        tc, _ = auth_client
-        # Token via query param (browsers can't set WS headers).
-        with tc.websocket_connect(f"/ws/render?token={_TOKEN}") as ws:
-            ws.send_json({"action": "nope"})
-            msg = ws.receive_json()
-        assert msg["action"] == "error"
-        assert msg["message"] == "Unknown action: nope"
-
-
-# ===========================================================================
 # Unit tests — tile addressing (GET /api/tile_info, GET /api/tile)
 # ===========================================================================
 
@@ -1730,14 +1683,6 @@ class TestCancellation:
         assert r.status_code == 499
         assert mock_fc.get_tensor.call_count == before
 
-    def test_render_skips_the_read_and_answers_499(self, dev_client):
-        tc, mock_fc = dev_client
-        before = mock_fc.get_tensor.call_count
-        with patch("starlette.requests.Request.is_disconnected", _disconnected):
-            r = tc.post("/api/render", json={"source_id": "src0", "tensor_id": "t0"})
-        assert r.status_code == 499
-        assert mock_fc.get_tensor.call_count == before
-
     def test_cancellations_are_counted_in_diagnostics(self, tile_client):
         tc, _ = tile_client
         # Read the counter off the context, not /api/diagnostics: that route is
@@ -1754,45 +1699,6 @@ class TestCancellation:
         before = mock_fc.get_tensor.call_count
         assert tc.get("/api/tile/tiled").status_code == 200
         assert mock_fc.get_tensor.call_count == before + 1
-
-
-# ===========================================================================
-# Gamma reaches the renderer
-# ===========================================================================
-
-
-class TestRenderGamma:
-    """The display curve is a request field, not a server setting.
-
-    The math lives in renderer_test; what is worth pinning here is the wiring —
-    a field can be added to the request model and then never passed on, which
-    looks exactly like a gamma slider that does nothing.
-    """
-
-    def _spy(self, tc, body):
-        from biopb_tensor_server.serving import renderer
-
-        seen = {}
-        real = renderer.render_array_to_image_bytes
-
-        def spy(**kwargs):
-            seen.update(kwargs)
-            return real(**kwargs)
-
-        with patch.object(renderer, "render_array_to_image_bytes", spy):
-            r = tc.post("/api/render", json=body)
-        assert r.status_code == 200, r.text
-        return seen
-
-    def test_gamma_is_forwarded(self, dev_client):
-        tc, _ = dev_client
-        seen = self._spy(tc, {"source_id": "src0", "tensor_id": "t0", "gamma": 0.5})
-        assert seen["gamma"] == 0.5
-
-    def test_omitting_it_renders_linear(self, dev_client):
-        tc, _ = dev_client
-        seen = self._spy(tc, {"source_id": "src0", "tensor_id": "t0"})
-        assert seen["gamma"] == 1.0
 
 
 # ===========================================================================

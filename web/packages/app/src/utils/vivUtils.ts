@@ -111,8 +111,9 @@ export function octavesFromGamma(gamma: number): number {
 /**
  * A gamma safe to hand a shader or `np.power`.
  *
- * The server clamps to the same range (`renderer.clamp_gamma`), so the two
- * viewers cannot disagree about what a stored value means. Zero and negatives
+ * The server clamps to the same range (`renderer.clamp_gamma`), so a shader
+ * ramp and a server-rendered tile cannot disagree about what a stored value
+ * means. Zero and negatives
  * are not dim -- as an exponent they are a uniform white plane -- and a value
  * that is not a number at all did not come from this control, so it reads as
  * neutral rather than as one end of the track.

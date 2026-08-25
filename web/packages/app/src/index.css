@@ -401,22 +401,20 @@ html, body {
 
 .viewer-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: #000; }
 
-/* Says which viewer you are looking at, but only when it is the fallback:
-   the tiled one is the normal case and needs no label. */
-.viewer-fallback-note {
-  position: absolute; top: 8px; right: 8px; z-index: 3;
-  background: rgba(0, 0, 0, 0.65); border-radius: 4px;
-  color: #94a3b8; font-size: 11px; padding: 3px 8px; pointer-events: none;
+/* Fills the pane rather than sitting in a corner: when the viewer cannot start
+   there is no image underneath for a badge to annotate. */
+.viewer-unavailable {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0 2rem; text-align: center;
+  color: #94a3b8; font-size: 13px; line-height: 1.5;
 }
 
-/* The note itself stays click-through so it never blocks the canvas; the retry
-   control is the one part that has to take a click. */
-.viewer-fallback-retry {
-  pointer-events: auto;
+.viewer-retry {
   background: none; border: 1px solid #475569; border-radius: 3px;
   color: #cbd5e1; font: inherit; padding: 1px 6px; margin-left: 2px; cursor: pointer;
 }
-.viewer-fallback-retry:hover { border-color: #64748b; color: #e2e8f0; }
+.viewer-retry:hover { border-color: #64748b; color: #e2e8f0; }
 
 .meta-panel {
   background: #141820;

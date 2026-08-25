@@ -614,7 +614,6 @@ dependencies = [
     { name = "httpx" },
     { name = "starlette" },
     { name = "uvicorn" },
-    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -628,7 +627,6 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "starlette", specifier = ">=0.37" },
     { name = "uvicorn", specifier = ">=0.34" },
-    { name = "websockets", specifier = ">=13" },
 ]
 
 [package.metadata.requires-dev]

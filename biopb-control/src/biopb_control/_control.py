@@ -35,9 +35,9 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      whole origin under a reverse-proxy path
                                      prefix at run time; see
                                      ``docs/url-prefix.md``.
-- ``/data_plane/{api,ws,livez,...}`` is reverse-proxied to the supervised tensor
+- ``/data_plane/{api,livez,...}`` is reverse-proxied to the supervised tensor
   server's HTTP sidecar — a ``Mount`` that strips its prefix, so the sidecar
-  (which serves ``/api/*`` + ``/ws/render`` at its own root) needs no knowledge of
+  (which serves ``/api/*`` at its own root) needs no knowledge of
   the ``/data_plane`` namespace. The sidecar no longer serves static assets (the
   control owns the whole UI), so there is no ``/data_plane/viewer`` mount. Auth
   headers pass straight through; the sidecar re-validates.
@@ -47,7 +47,7 @@ The three ``/api/*`` namespaces therefore never collide: the control's own API i
 is ``/session/<id>/api/*``.
 
 Keeping the control lean (invariant I2) still holds: the ASGI stack
-(starlette/uvicorn/httpx/websockets) is light and pulls in no napari/dask/Qt/
+(starlette/uvicorn/httpx) is light and pulls in no napari/dask/Qt/
 pyarrow, and the tensor server is still a *supervised subprocess* the control
 never imports — the proxy reaches it over loopback like any other client.
 
@@ -102,10 +102,8 @@ from starlette.responses import (
     Response,
     StreamingResponse,
 )
-from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
-from starlette.websockets import WebSocket
-from websockets.asyncio.client import connect as ws_connect
 
 from ._supervisor import DataPlaneSupervisor
 
@@ -346,7 +344,7 @@ class _URLPrefixMiddleware:
     ``get_route_path`` subtracts ``root_path`` from ``path`` only when the path
     still starts with it — so a stripped path plus a ``root_path`` makes that
     subtraction silently no-op inside ``/data_plane`` and ``/session/{id}``, and
-    the sub-app sees its own mount prefix again (``/ws/render`` stops matching).
+    the sub-app sees its own mount prefix again (its routes stop matching).
     The un-stripped variant would work for routing but hands
     ``_ControlAuthMiddleware`` a prefixed path, which is the bypass above. Nothing
     here builds absolute URLs from ``root_path`` — the browser side is carried by
@@ -643,9 +641,6 @@ def build_app(
     """
     session_roots = _session_proxy_roots(console_enabled)
     url_prefix = normalize_url_prefix(url_prefix)
-    ws_base = data_web_url.replace("http://", "ws://", 1).replace(
-        "https://", "wss://", 1
-    )
 
     # The built SPA bundle the control serves at its root (None / missing ->
     # API-only: the control still answers /health + /api/* + the proxies, but
@@ -1083,23 +1078,6 @@ def build_app(
             background=BackgroundTask(resp.aclose),
         )
 
-    async def ws_proxy(client_ws: WebSocket) -> None:
-        # The dataviewer's render channel; the sidecar serves it at /ws/render.
-        # Token travels as a ?token= query param (browsers can't set WS headers),
-        # so forwarding the query authenticates.
-        await client_ws.accept()
-        target = ws_base + "/ws/render"
-        if client_ws.url.query:
-            target += "?" + client_ws.url.query
-        try:
-            async with ws_connect(target, max_size=None) as upstream:
-                await _pump_websocket(client_ws, upstream)
-        except Exception as exc:  # noqa: BLE001 - upstream down / handshake failed
-            logger.info("ws proxy to %s failed: %s", target, exc)
-        finally:
-            with contextlib.suppress(Exception):
-                await client_ws.close()
-
     async def session_proxy(request: Request) -> Response:
         # The outer Mount captured {session_id}; the inner catch-all captured the
         # rest into {path} (both survive in path_params). Resolve the session to a
@@ -1193,14 +1171,12 @@ def build_app(
         return _serve_shell()
 
     # One sub-app proxying to the sidecar root, mounted at /data_plane (the data
-    # plane's /api, /ws/render, health). It strips its prefix, so the sidecar
-    # needs no knowledge of the namespace. (The dataviewer's static assets are no
-    # longer proxied out of the sidecar — the control serves the whole SPA itself,
-    # so there is no /data_plane/viewer mount.) /ws/render must precede the
-    # catch-all.
+    # plane's /api, health). It strips its prefix, so the sidecar needs no
+    # knowledge of the namespace. (The dataviewer's static assets are no longer
+    # proxied out of the sidecar — the control serves the whole SPA itself, so
+    # there is no /data_plane/viewer mount.)
     sidecar = Starlette(
         routes=[
-            WebSocketRoute("/ws/render", ws_proxy),
             Route(
                 "/{path:path}",
                 proxy,
@@ -1273,43 +1249,6 @@ def build_app(
     return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
-async def _pump_websocket(client_ws: WebSocket, upstream) -> None:
-    """Bidirectionally shuttle frames between the browser and the tensor server.
-
-    Runs both directions concurrently and tears both down as soon as either
-    side closes, so neither a client disconnect nor an upstream close leaks a
-    half-open pump task.
-    """
-
-    async def client_to_upstream() -> None:
-        while True:
-            msg = await client_ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                return
-            if msg.get("text") is not None:
-                await upstream.send(msg["text"])
-            elif msg.get("bytes") is not None:
-                await upstream.send(msg["bytes"])
-
-    async def upstream_to_client() -> None:
-        async for message in upstream:
-            if isinstance(message, str):
-                await client_ws.send_text(message)
-            else:
-                await client_ws.send_bytes(message)
-
-    tasks = [
-        asyncio.ensure_future(client_to_upstream()),
-        asyncio.ensure_future(upstream_to_client()),
-    ]
-    try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
 class _ControlServer:
     """Shutdown handle the caller holds for teardown.
 
@@ -1354,10 +1293,10 @@ def serve_control_api(
     # only when the origin is same-machine. Derived from *this* listener's bind
     # through the shared predicate, not from --remote or the plane's bind: what
     # decides is who can reach this web front. Deliberately not gated by the
-    # token instead — the data-plane token authorizes reading pixels, is readable
-    # from the local credential file by design (biopb/biopb#470), and rides the
-    # render WebSocket as a query param; fine for viewing, and not a credential
-    # to trade for a shell. Remote console, if ever wanted, needs its own.
+    # token instead — the data-plane token authorizes reading pixels and is
+    # readable from the local credential file by design (biopb/biopb#470); fine
+    # for viewing, and not a credential to trade for a shell. Remote console, if
+    # ever wanted, needs its own.
     console_enabled = not _web_auth.host_is_public_bind(host)
     app = build_app(
         supervisor,
@@ -1393,11 +1332,9 @@ def serve_control_api(
         app,
         log_level="warning",
         access_log=False,
-        # The modern (non-legacy) websockets server impl, so the /ws/render proxy
-        # server side doesn't pull in websockets.legacy (deprecated, dropped in a
-        # future websockets release). Our upstream WS client already uses the
-        # asyncio API (ws_connect above).
-        ws="websockets-sansio",
+        # No websocket routes: the control proxies HTTP only, so uvicorn need not
+        # load a websockets impl at all.
+        ws="none",
     )
     server = uvicorn.Server(config)
 

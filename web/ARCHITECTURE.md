@@ -92,10 +92,10 @@ GET /api/tile_info/{array_id} → PixelSource[] (viv-source.ts, one per level)
   → Viv / deck.gl TileLayer → GET /api/tile/{array_id}?level&col&row&t&z&c
 ```
 
-**Server-rendered (`ImageViewer`, the fallback).** The server renders a whole
-region and pushes it over `/ws/render` per repaint. Reached when the tiled path
-cannot be: no WebGL2, a dtype with no GPU equivalent, a non-canonical axis order,
-or a server without the tile routes.
+There is no second viewer. Where the tiled path cannot run — no WebGL2, a dtype
+with no GPU equivalent, a server without the tile routes — `ViewerPane` states the
+reason instead of substituting a server-rendered one; the `/ws/render` viewer that
+used to fill that role is gone.
 
 Design and measurements: `../biopb-tensor-server/docs/remote-viewer-tiles.md`.
 

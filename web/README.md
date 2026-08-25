@@ -47,8 +47,7 @@ pnpm install                     # in web/
 pnpm dev                         # Vite dev server (HMR) on :5173
 ```
 
-`pnpm dev` proxies `/api`, `/data_plane` (incl. the `/data_plane/ws/render`
-websocket), and `/session` to a live control on `http://localhost:8813` (start
+`pnpm dev` proxies `/api`, `/data_plane`, and `/session` to a live control on `http://localhost:8813` (start
 one with `biopb control start`). In dev the viewer defaults its data plane to the
 proxied `/data_plane`, so plain `pnpm dev` renders end-to-end against that control
 — no env var needed, in dev or in a build.

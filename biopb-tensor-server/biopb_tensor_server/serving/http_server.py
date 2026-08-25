@@ -18,8 +18,6 @@ Endpoints (token required):
   GET  /api/tile_info/{source_id}    — tile grid + pyramid levels for a tensor
   GET  /api/tile/{source_id}         — one tile, cacheable (raw | png | jpeg)
   POST /api/slice                    — fetch array slice as binary
-  POST /api/render                   — server-rendered RGB image of a slice
-  WS   /ws/render                    — streaming render channel
   GET  /api/config                   — current config (secrets redacted)
   PUT  /api/config                   — update config (same-origin guarded)
   GET  /api/admin/status             — server/catalog status for the admin page
@@ -36,7 +34,6 @@ Authentication:
 
 from __future__ import annotations
 
-import asyncio
 import collections
 import hashlib
 import logging
@@ -51,7 +48,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
-from biopb.tensor.client import TensorFlightClient, _request_crop_slices
+from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
     APIRouter,
@@ -60,8 +57,6 @@ from fastapi import (
     Query,
     Request,
     Response,
-    WebSocket,
-    WebSocketDisconnect,
 )
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -312,29 +307,6 @@ class SliceRequest(BaseModel):
 
 class QuerySourcesRequest(BaseModel):
     sql: str
-
-
-class RenderRequest(BaseModel):
-    """Request for backend-rendered image output.
-
-    Returns PNG/JPEG image instead of raw numpy bytes.
-    Uses VTK or PIL for rendering on the server side.
-    """
-
-    source_id: str
-    tensor_id: str
-    slice_start: Optional[List[int]] = None
-    slice_stop: Optional[List[int]] = None
-    scale_hint: Optional[List[int]] = None
-    reduction_method: Optional[str] = None
-    percentile_lo: float = 1.0
-    percentile_hi: float = 99.0
-    color: str = "auto"  # preset name or hex (#rrggbb)
-    channel_name: Optional[str] = None  # for auto color resolution
-    use_min_max: bool = False  # use full min-max range instead of percentiles
-    gamma: float = 1.0  # exponent on the normalized intensity; 1.0 is linear
-    output_format: str = "png"  # "png" or "jpeg"
-    pixel_budget: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1662,342 +1634,6 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         )
 
 
-# -- Render (image output) --------------------------------------------------
-
-
-@_router.post("/api/render")
-async def render_tensor(req: RenderRequest, request: Request) -> Response:
-    """Render a tensor slice and return PNG/JPEG image.
-
-    Backend rendering using VTK or PIL. Returns compressed image
-    instead of raw bytes, potentially more efficient for large datasets.
-
-    Response headers:
-      X-Image-Width        — width of rendered image
-      X-Image-Height       — height of rendered image
-      X-Percentile-Lo-Value — actual computed lo percentile value
-      X-Percentile-Hi-Value — actual computed hi percentile value
-
-    Response body:
-      PNG or JPEG image bytes.
-    """
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-
-    logger.debug(
-        f"render: source={req.source_id}, tensor={req.tensor_id}, "
-        f"slice={req.slice_start}-{req.slice_stop}, scale={req.scale_hint}, "
-        f"percentiles={req.percentile_lo}-{req.percentile_hi}, "
-        f"color={req.color}, format={req.output_format}"
-    )
-
-    if req.pixel_budget is not None:
-        ctx.diag.pixel_budget = req.pixel_budget
-
-    await _abort_if_client_gone(request, ctx)
-
-    try:
-        client = ctx.get_client()
-        slice_hint = _build_slice_hint(req.slice_start, req.slice_stop)
-
-        arr_lazy = client.get_tensor(
-            _request_array_id(req.source_id, req.tensor_id),
-            slice_hint=slice_hint,
-            scale_hint=req.scale_hint or None,
-            reduction_method=req.reduction_method or None,
-        )
-
-        # Compute (blocking)
-        t0_compute = time.monotonic()
-        arr: np.ndarray = arr_lazy.compute()
-        compute_ms = (time.monotonic() - t0_compute) * 1000
-
-        # Dim labels from descriptor, with a shape-based fallback
-        dim_labels = _dim_labels_for(client, req.source_id, req.tensor_id)
-        if not dim_labels:
-            dim_labels = [f"d{i}" for i in range(arr.ndim)]
-
-        logger.debug(
-            f"render: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B, "
-            f"dim_labels={dim_labels}, compute_time={compute_ms:.1f}ms"
-        )
-
-        # Import renderer
-        from .renderer import render_array_to_image_bytes
-
-        t0_render = time.monotonic()
-        image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes(
-            arr=arr,
-            dim_labels=dim_labels,
-            percentile_lo=req.percentile_lo if not req.use_min_max else 0.0,
-            percentile_hi=req.percentile_hi if not req.use_min_max else 100.0,
-            color=req.color,
-            channel_name=req.channel_name,
-            gamma=req.gamma,
-            output_format=req.output_format,
-        )
-        render_ms = (time.monotonic() - t0_render) * 1000
-
-        elapsed = (time.monotonic() - t0) * 1000
-        ctx.diag.latency.record(elapsed)
-        logger.debug(
-            f"render: image size={width}x{height}, "
-            f"bytes={len(image_bytes)}, total={elapsed:.1f}ms, "
-            f"compute={compute_ms:.1f}ms, render={render_ms:.1f}ms"
-        )
-
-        headers = {
-            "X-Image-Width": str(width),
-            "X-Image-Height": str(height),
-            "X-Percentile-Lo-Value": str(lo_val),
-            "X-Percentile-Hi-Value": str(hi_val),
-            "X-Image-Format": req.output_format.lower(),  # Tell client format used
-        }
-
-        return Response(
-            content=image_bytes,
-            media_type=_image_media_type(req.output_format),
-            headers=headers,
-        )
-
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail=f"Rendering not available: {exc}")
-    except Exception as exc:
-        import traceback
-
-        tb = traceback.format_exc()
-        ctx.diag.mark_error("RENDER_FAILED", str(exc))
-        logger.error(f"render failed: {exc}\n{tb}")
-        raise HTTPException(
-            status_code=502, detail=f"Render error: {type(exc).__name__}: {exc}"
-        )
-
-
-# -- WebSocket render endpoint ----------------------------------------------
-
-
-def _ws_authorized(websocket: WebSocket, ctx: _SidecarContext) -> bool:
-    """Validate the websocket token from headers or the ``token`` query param.
-
-    Browsers can't set custom headers on a WebSocket handshake, so the shared
-    ``biopb._web_auth`` policy accepts the ``?token=`` fallback here; a ``None``
-    token (local mode) is the falsy-``expected`` bypass.
-    """
-    expected = ctx.token
-    return _web_auth.token_valid_with_query(
-        websocket.headers.get, websocket.query_params.get, expected
-    )
-
-
-def _ws_crop_to_request(dask_arr: Any, ctx_: Any, y_idx: int, x_idx: int) -> Any:
-    """Crop the uncropped dask array back to the originally-requested bounds on
-    every axis except Y/X, accounting for the realized slice start and scale."""
-    if ctx_.original_slice_hint is None or not ctx_.descriptor.HasField("slice_hint"):
-        return dask_arr
-    scale = list(ctx_.read_opt.scale_hint) if ctx_.read_opt.scale_hint else None
-    return dask_arr[
-        _request_crop_slices(
-            len(ctx_.descriptor.shape),
-            ctx_.original_slice_hint,
-            ctx_.descriptor.slice_hint,
-            scale,
-            keep_axes=(y_idx, x_idx),
-        )
-    ]
-
-
-def _ws_loaded_region(
-    ctx_: Any, dim_labels: List[str], y_idx: int, x_idx: int
-) -> Optional[Dict[str, Any]]:
-    """Loaded-region metadata from the realized (not requested) slice bounds."""
-    if not ctx_.descriptor.HasField("slice_hint"):
-        return None
-    realized = ctx_.descriptor.slice_hint
-    return {
-        "x": int(realized.start[x_idx]),
-        "y": int(realized.start[y_idx]),
-        "width": int(realized.stop[x_idx] - realized.start[x_idx]),
-        "height": int(realized.stop[y_idx] - realized.start[y_idx]),
-        "scale_factors": list(ctx_.descriptor.scale_hint)
-        if ctx_.descriptor.scale_hint
-        else [1] * len(dim_labels),
-    }
-
-
-async def _ws_render_one(
-    websocket: WebSocket, ctx: _SidecarContext, params: RenderRequest
-) -> None:
-    """Render a single websocket request and stream metadata + image bytes."""
-    t0 = time.monotonic()
-    logger.info(
-        f"ws/render: source={params.source_id}, tensor={params.tensor_id}, "
-        f"slice={params.slice_start}-{params.slice_stop}, scale={params.scale_hint}"
-    )
-
-    if params.pixel_budget is not None:
-        ctx.diag.pixel_budget = params.pixel_budget
-
-    try:
-        client = ctx.get_client()
-        slice_hint = _build_slice_hint(params.slice_start, params.slice_stop)
-
-        # Get tensor context (includes realized slice bounds), build the
-        # uncropped dask array from its endpoints.
-        cctx = client._get_tensor_context(
-            _request_array_id(params.source_id, params.tensor_id),
-            slice_hint=slice_hint,
-            scale_hint=params.scale_hint or None,
-            reduction_method=params.reduction_method or None,
-        )
-        dask_arr = client._build_dask_array(
-            desc=cctx.descriptor,
-            chunks=[ep[0] for ep in cctx.endpoints],
-            chunk_bounds=[ep[1] for ep in cctx.endpoints],
-        )
-
-        dim_labels: List[str] = list(cctx.descriptor.dim_labels)
-        if not dim_labels:
-            dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
-
-        # The same plane the renderer will reduce to, resolved the same way --
-        # this crop and that reduction must agree on which axis is Y, or the
-        # request and the picture disagree silently. Sharing plane_axes is what
-        # makes that structural; it also covers the samples axis, which the
-        # hand-rolled fallback here did not (a 6-D RGB TCZYXS with unrecognized
-        # labels picked X/S as Y/X).
-        from biopb_tensor_server.core.axes import plane_axes
-
-        y_idx, x_idx, _ = plane_axes(dim_labels, dask_arr.shape)
-
-        # Slice to the originally requested bounds (except y/x) before computing.
-        dask_arr = _ws_crop_to_request(dask_arr, cctx, y_idx, x_idx)
-
-        t0_compute = time.monotonic()
-        arr: np.ndarray = await asyncio.get_event_loop().run_in_executor(
-            None, dask_arr.compute
-        )
-        compute_ms = (time.monotonic() - t0_compute) * 1000
-
-        loaded_region = _ws_loaded_region(cctx, dim_labels, y_idx, x_idx)
-
-        # Import renderer
-        from .renderer import render_array_to_image_bytes
-
-        t0_render = time.monotonic()
-        image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes(
-            arr=arr,
-            dim_labels=dim_labels,
-            percentile_lo=params.percentile_lo if not params.use_min_max else 0.0,
-            percentile_hi=params.percentile_hi if not params.use_min_max else 100.0,
-            color=params.color,
-            channel_name=params.channel_name,
-            gamma=params.gamma,
-            output_format=params.output_format,
-        )
-        render_ms = (time.monotonic() - t0_render) * 1000
-
-        format_lower = params.output_format.lower()
-        elapsed = (time.monotonic() - t0) * 1000
-        ctx.diag.latency.record(elapsed)
-        logger.info(
-            f"ws/render: done {width}x{height} {format_lower} "
-            f"total={elapsed:.0f}ms compute={compute_ms:.0f}ms render={render_ms:.0f}ms"
-        )
-
-        # Send metadata JSON first, then the binary image data
-        render_start_msg = {
-            "action": "render_start",
-            "width": width,
-            "height": height,
-            "format": format_lower,
-            "percentile_lo_value": lo_val,
-            "percentile_hi_value": hi_val,
-        }
-        if loaded_region is not None:
-            render_start_msg["loaded_region"] = loaded_region
-        await websocket.send_json(render_start_msg)
-        await websocket.send_bytes(image_bytes)
-
-    except HTTPException as exc:
-        # slice_start/slice_stop length mismatch (preserves the original text)
-        await websocket.send_json({"action": "error", "message": exc.detail})
-    except ValueError as exc:
-        await websocket.send_json({"action": "error", "message": str(exc)})
-    except ImportError as exc:
-        await websocket.send_json(
-            {"action": "error", "message": f"Rendering not available: {exc}"}
-        )
-    except Exception as exc:
-        import traceback
-
-        tb = traceback.format_exc()
-        ctx.diag.mark_error("WS_RENDER_FAILED", str(exc))
-        logger.error(f"ws/render failed: {exc}\n{tb}")
-        await websocket.send_json(
-            {"action": "error", "message": f"Render error: {type(exc).__name__}"}
-        )
-
-
-async def _ws_dispatch(
-    websocket: WebSocket, ctx: _SidecarContext, data: Dict[str, Any]
-) -> None:
-    """Validate one received message and route a render request."""
-    action = data.get("action")
-    if action != "render":
-        await websocket.send_json(
-            {"action": "error", "message": f"Unknown action: {action}"}
-        )
-        return
-    try:
-        params = RenderRequest(**data.get("params", {}))
-    except Exception as e:
-        await websocket.send_json(
-            {"action": "error", "message": f"Invalid params: {e}"}
-        )
-        return
-    await _ws_render_one(websocket, ctx, params)
-
-
-@_router.websocket("/ws/render")
-async def websocket_render(websocket: WebSocket) -> None:
-    """WebSocket endpoint for rendering tensor slices.
-
-    Protocol:
-      1. Client connects, sends nothing
-      2. Server validates token from headers or query params
-      3. Client sends JSON: { action: "render", params: RenderRequest }
-      4. Server sends JSON metadata: { action: "render_start", width, height, format }
-      5. Server sends binary: JPEG/PNG image bytes
-      6. Repeat steps 3-5 for subsequent requests
-
-    No session state — WebSocket is purely request/response. Token is accepted
-    from the Authorization header, X-Biopb-Token header, or a "token" query
-    parameter (for browsers that can't send custom headers).
-    """
-    ctx = websocket.app.state.sidecar
-    if not _ws_authorized(websocket, ctx):
-        await websocket.close(code=4001, reason="Invalid or missing token")
-        return
-
-    await websocket.accept()
-    logger.info("ws/render: client connected")
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            await _ws_dispatch(websocket, ctx, data)
-    except WebSocketDisconnect:
-        logger.info("ws/render: client disconnected")
-    except Exception as exc:
-        logger.error(f"ws/render: unexpected error: {exc}")
-        await websocket.close(code=1011, reason="Internal error")
-
-
 # -- Admin: config read/write, status, restart (biopb/biopb#237) ------------
 
 
@@ -2253,7 +1889,7 @@ def create_app(
     module-level route ``_router``. All request logic lives in the module-level
     handlers, which read their context off ``app.state.sidecar``. The sidecar is
     API-only — the web UI is served by the control front, the single web origin,
-    which proxies here for the data API and /ws/render.
+    which proxies here for the data API.
 
     Args:
         flight_location: Arrow Flight server to connect to.
@@ -2316,7 +1952,6 @@ def create_app(
             "X-Tile-Row",
         ],
     )
-    # Note: WebSocket CORS is handled by the browser during the handshake.
 
     @app.exception_handler(_ClientGone)
     async def _client_gone_handler(request: Request, exc: _ClientGone) -> Response:
