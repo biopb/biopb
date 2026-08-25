@@ -4,6 +4,7 @@ These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing
 and the stdio-vs-http dispatch) without starting a real kernel or viewer.
 """
 
+import os
 import sys
 
 import pytest
@@ -13,7 +14,9 @@ from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
     _parse_args,
+    _register_view_session,
     _setup_observe,
+    _unregister_session,
     main,
 )
 
@@ -200,3 +203,65 @@ class TestSetupObserve:
         cfg = {"observe": {"enabled": True}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
+
+
+class TestViewSessionRegistration:
+    """`biopb mcp view` has no shim, so it publishes itself into the shared
+    registry the control reads (`biopb._sessions`). Without this an agentless
+    viewer is invisible: no dashboard entry, no observe page, no
+    `/session/<id>/*` proxying."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_registry(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
+
+    def test_registers_a_routable_record(self):
+        from biopb import _sessions
+
+        session_id = _register_view_session(45678)
+        assert session_id is not None
+        rec = _sessions.read_session(session_id)
+        # Everything the control needs to route /session/<id>/* here.
+        assert rec["port"] == 45678
+        assert rec["host"] == "127.0.0.1"
+        assert rec["pid"] == os.getpid()
+        assert rec["mcp_url"] == "http://127.0.0.1:45678/mcp"
+
+    def test_registered_session_is_listed_as_live(self):
+        from biopb import _sessions
+
+        session_id = _register_view_session(45678)
+        # Our own pid owns the record, so the liveness prune must keep it --
+        # this is what makes the session show up on the dashboard at all.
+        assert session_id in [r["session_id"] for r in _sessions.list_sessions()]
+
+    def test_unregister_removes_the_record(self):
+        from biopb import _sessions
+
+        session_id = _register_view_session(45678)
+        _unregister_session(session_id)
+        assert _sessions.read_session(session_id) is None
+
+    def test_unregister_none_is_a_noop(self):
+        # The teardown path runs on every exit, including one where the publish
+        # failed or never ran (Ctrl-C during the viewer's bring-up).
+        _unregister_session(None)
+
+    def test_publish_failure_costs_only_discoverability(self, monkeypatch):
+        from biopb import _sessions
+
+        def _boom(*a, **k):
+            raise OSError("read-only state dir")
+
+        monkeypatch.setattr(_sessions, "register", _boom)
+        # No exception out of the launcher, and nothing to de-register.
+        assert _register_view_session(45678) is None
+
+    def test_unregister_failure_does_not_break_teardown(self, monkeypatch):
+        from biopb import _sessions
+
+        def _boom(*a, **k):
+            raise OSError("gone")
+
+        monkeypatch.setattr(_sessions, "unregister", _boom)
+        _unregister_session("20260101-000000-1")

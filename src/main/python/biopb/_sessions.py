@@ -2,9 +2,10 @@
 
 Two independent processes need to agree on where the ephemeral MCP sessions are:
 
-- ``biopb-mcp``'s stdio **shim**, which spawns a private http session child on a
-  dynamic port and must *publish* (session id → port + pid) so the session is
-  discoverable, and
+- ``biopb-mcp``'s session side, which must *publish* (session id → port + pid)
+  so the session is discoverable. Two writers land here: the stdio **shim**
+  publishes the private http child it spawns on a dynamic port, and an agentless
+  ``biopb mcp view`` session — which has no shim — publishes itself; and
 - the **control plane** (``biopb-control``), which reads this registry to list
   live sessions (``/api/sessions``) and reverse-proxy ``/session/<id>/*`` to the
   right port.
@@ -78,10 +79,26 @@ def sessions_dir() -> Path:
 _UNSAFE_ID_CHARS = frozenset({"/", "\\", ":", "\x00"})
 
 
+def new_session_id() -> str:
+    """Mint an id for a session about to be registered: ``<timestamp>-<pid>``.
+
+    Sortable (so a listing is chronological) and unique per registering process.
+    Lives here, beside :func:`_is_safe_session_id` and the record layout, because
+    there is now more than one writer — the stdio shim publishes the child it
+    owns, and an agentless ``biopb mcp view`` session publishes itself — and two
+    id formats would be two things for a reader to recognise.
+
+    ``os.getpid()`` is the *registering* process, which is the shim in the first
+    case and the session itself in the second. The id is only an identifier; the
+    pid a reader prunes on is the one passed to :func:`register`.
+    """
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+
+
 def _is_safe_session_id(session_id: str) -> bool:
     """Whether ``session_id`` is a bare filename stem safe to splice into a path.
 
-    Real ids are ``<timestamp>-<pid>`` (`_new_session_id`), but ``resolve`` /
+    Real ids are ``<timestamp>-<pid>`` (:func:`new_session_id`), but ``resolve`` /
     ``read_session`` / ``unregister`` are reachable with an id taken straight from
     a ``/session/<id>/...`` URL, so the core module self-sanitizes rather than
     trusting the caller (biopb/biopb#422): reject anything that isn't a single,
