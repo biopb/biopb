@@ -292,6 +292,75 @@ class TestExecuteCode:
         assert _server._claimed_by == "sess-A"
 
 
+class TestConcurrency:
+    def test_a_second_turn_is_refused_not_queued(self, chat_host):
+        # Same rule as _jobs.submit, for the same reason: a queued turn would be
+        # composed against a conversation its sender has not seen the end of.
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow(messages, tools):
+            started.set()
+            await release.wait()
+            return {"content": "first"}
+
+        async def scenario():
+            first = asyncio.create_task(_chat.run_turn("one", slow))
+            await started.wait()
+            with pytest.raises(_chat.TurnInProgress):
+                await _chat.run_turn("two", _scripted({"content": "second"}))
+            release.set()
+            await first
+            # The refused turn left no trace: no half-written user message for a
+            # view to render and no history for the next turn to inherit.
+            return [m["content"] for m in _chat.history()]
+
+        assert asyncio.run(scenario()) == ["one", "first"]
+
+    def test_the_lock_is_released_when_a_turn_raises(self, chat_host):
+        async def boom(messages, tools):
+            raise RuntimeError("provider exploded")
+
+        async def scenario():
+            with pytest.raises(RuntimeError):
+                await _chat.run_turn("one", boom)
+            # A failed turn must not wedge the session for good.
+            await _chat.run_turn("two", _scripted({"content": "ok"}))
+
+        asyncio.run(scenario())
+        assert _chat.history()[-1]["content"] == "ok"
+
+    def test_a_running_job_does_not_block_the_event_loop(self, chat_host):
+        # This process also serves /mcp to any attached client and /api/* to the
+        # observe page. A turn that sleeps or blocks on kernel round trips would
+        # stall both for as long as the cell runs -- minutes, for real work.
+        chat_host.script_job([("running", "a\n"), ("running", "ab\n"), ("ok", "abc\n")])
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="go()")]},
+            {"content": "done"},
+        )
+
+        async def scenario():
+            ticks = 0
+            stop = False
+
+            async def other_work():
+                nonlocal ticks
+                while not stop:
+                    ticks += 1
+                    await asyncio.sleep(0)
+
+            ticker = asyncio.create_task(other_work())
+            await _chat.run_turn("go", model)
+            stop = True
+            await ticker
+            return ticks
+
+        # If anything in the turn blocked, the loop never came back to the
+        # ticker and this is 1.
+        assert asyncio.run(scenario()) > 1
+
+
 class TestGuards:
     def test_the_loop_identifies_itself_to_every_tool(self, chat_host):
         # Not just to submit: interrupt_kernel and restart_kernel gate on the

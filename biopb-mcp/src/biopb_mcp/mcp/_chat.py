@@ -30,6 +30,7 @@ Design notes
   testable with no key and no network, and keeps provider choice out of it.
 """
 
+import asyncio
 import json
 import time
 
@@ -56,6 +57,22 @@ _POLL_INTERVAL = 0.3
 # session, survives kernel restarts, and dies with this process.
 _messages: list = []
 _seq = 0
+
+# One turn at a time, for the same reason the kernel runs one job at a time.
+# Two turns would interleave into the one thread and each compose against a
+# history the other is still writing -- and both would reach for the same
+# kernel. Held for the whole turn, not per tool call.
+_turn_lock = asyncio.Lock()
+
+
+class TurnInProgress(RuntimeError):
+    """Raised when a turn is asked for while one is already running.
+
+    Refused rather than queued, matching ``_jobs.submit``: a queued turn would
+    be composed against a conversation its sender has not seen the end of, which
+    is an ordering nobody can inspect. The transport reports it the way the user
+    console reports a busy kernel -- as state, with a 409.
+    """
 
 
 def reset():
@@ -97,6 +114,20 @@ def _last_user_text():
 # ---------------------------------------------------------------------------
 
 
+async def _job_call(host, snippet):
+    """``_server._run_job_call`` off the event loop.
+
+    The round trip blocks: it waits on the kernel's lock (up to
+    ``kernel.busy_lock_timeout``) and then on the reply. One of those in an
+    ``/api/*`` handler is a blip; a chat turn makes one per poll for as long as
+    a job runs, and this process is also serving ``/mcp`` to any attached client
+    and the observe page to the user. So it goes to a thread, which the kernel
+    host already expects -- its lock exists because the tools and the observe
+    API already reach it concurrently.
+    """
+    return await asyncio.to_thread(_server._run_job_call, host, snippet)
+
+
 def _clean_schema(schema):
     """The tool's input schema, minus the keys some providers reject.
 
@@ -136,7 +167,7 @@ async def _dispatch(name, arguments, on_progress):
     fails loudly rather than quietly reshaping what the loop receives.
     """
     if name == "execute_code":
-        return _run_code(arguments, on_progress), []
+        return await _run_code(arguments, on_progress), []
     result = await _server.mcp._tool_manager.call_tool(
         name, arguments, convert_result=True
     )
@@ -145,7 +176,7 @@ async def _dispatch(name, arguments, on_progress):
     return text, [b for b in blocks if isinstance(b, ImageContent)]
 
 
-def _run_code(arguments, on_progress):
+async def _run_code(arguments, on_progress):
     """``execute_code`` without the promote window, streaming partial output.
 
     The tool waits ``promote_after`` seconds before handing back a job handle,
@@ -168,7 +199,7 @@ def _run_code(arguments, on_progress):
     # does it: a lost reply must not leave the kernel held while this process
     # reads as unclaimed.
     _server._presume_claim(WRITER_ID)
-    submitted, res, _w = _server._run_job_call(
+    submitted, res, _w = await _job_call(
         host,
         "submit("
         + repr(code)
@@ -196,8 +227,8 @@ def _run_code(arguments, on_progress):
     job_id = submitted["job_id"]
     seen = 0
     while True:
-        time.sleep(_POLL_INTERVAL)
-        snap, res, _w = _server._run_job_call(host, "poll(" + repr(job_id) + ")")
+        await asyncio.sleep(_POLL_INTERVAL)
+        snap, res, _w = await _job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
             return _server._format_execute_result(res)
         out = snap.get("stdout") or ""
@@ -272,7 +303,18 @@ async def run_turn(user_text, model, on_progress=None):
     *on_progress* receives partial output from a running cell as it arrives. It
     is what makes a long job legible in a chat window instead of a stalled
     cursor; a transport will hand it a stream, tests hand it a list.
+
+    Raises :class:`TurnInProgress` if a turn is already running. Checking the
+    lock before taking it is safe on the one event loop this process runs:
+    acquiring a free lock does not yield, so nothing can slip between.
     """
+    if _turn_lock.locked():
+        raise TurnInProgress("a turn is already running in this session")
+    async with _turn_lock:
+        return await _run_turn(user_text, model, on_progress)
+
+
+async def _run_turn(user_text, model, on_progress):
     # Before the append: the user's own turn is one of the new messages a view
     # has to render, not context it already had.
     start = len(_messages)
