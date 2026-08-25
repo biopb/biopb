@@ -63,10 +63,11 @@ class TileViewerBoundary extends Component<
   }
 
   componentDidCatch(error: Error) {
-    // "capability": a throw out of deck.gl is about this tensor and this GPU,
-    // and re-running the same render would reproduce it. Retrying is the user's
-    // call, not something to do automatically.
-    this.props.onError(error.message || "the tiled viewer failed to start", "capability");
+    // Retryable, because this boundary cannot tell a deck.gl throw about the
+    // tensor from a rejected `import()` of the viewer chunk. Only the first
+    // deserves a dead end, and a retry costs one remount. Verified refusals
+    // arrive through `onUnsupported` already classified.
+    this.props.onError(error.message || "it failed to start", "transport");
   }
 
   render() {
@@ -77,10 +78,9 @@ class TileViewerBoundary extends Component<
 /**
  * Why the viewer could not start.
  *
- * `"capability"` is a settled fact — this browser or this tensor cannot drive
- * the tiled path — and is not worth re-testing until something changes.
- * `"transport"` means the server did not answer; the tiled path was never ruled
- * out, so it stays offered.
+ * `"capability"` is a settled fact about this browser or tensor, not worth
+ * re-testing. `"transport"` is anything that might go the other way next time,
+ * so it gets a retry.
  */
 export type ViewerErrorKind = "capability" | "transport";
 
@@ -102,8 +102,8 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
   // changed, so `key={tensorId}` alone would hand back the same instance.
   const [attempt, setAttempt] = useState(0);
 
-  // A new tensor gets a fresh verdict: the previous one may have failed for a
-  // reason that is specific to it (dtype, axis order).
+  // A new tensor gets a fresh verdict: the last one may have failed for a
+  // reason specific to it.
   useEffect(() => {
     setFailure(hasWebGL2() ? null : noWebGL2);
   }, [sourceId, tensorId]);
@@ -123,7 +123,7 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
       <div className="viewer-unavailable">
         {failure.kind === "transport" ? (
           <>
-            The server did not answer in time, so the viewer could not start.{" "}
+            The viewer could not start — {failure.reason}{" "}
             <button type="button" className="viewer-retry" onClick={retry}>
               Try again
             </button>

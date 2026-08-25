@@ -53,10 +53,9 @@ interface TileViewerProps {
   /** The tensor's whole address; `source_id` for a single-tensor source. */
   arrayId: string;
   /**
-   * The tiled viewer gave up. `kind` says whether that is a fact about the
-   * tensor ("capability": no tile route, an unsupported dtype, a non-canonical
-   * axis order) or about the moment ("transport": the server timed out or
-   * failed). The pane reports both; only the second is worth offering again.
+   * The tiled viewer gave up. `kind` separates a fact about the tensor
+   * ("capability": no tile route, an unsupported dtype) from a bad moment
+   * ("transport": the server timed out). Only the second is worth retrying.
    */
   onUnsupported: (reason: string, kind: ViewerErrorKind) => void;
 }

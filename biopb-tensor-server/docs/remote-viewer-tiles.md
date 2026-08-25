@@ -1,9 +1,10 @@
 # Remote data viewer — client-side rendering over a tile API
 
-**Status:** partially implemented. The tile API (`GET /api/tile_info`, `GET /api/tile`),
-server-side cancellation, client `AbortSignal` plumbing and the Viv `PixelSource`
-adapter have landed. **Viv is now the committed framework** (0.22.1, deck.gl/luma.gl
-`~9.3.3`). The viewer component itself has not been built.
+**Status:** implemented. The tile API (`GET /api/tile_info`, `GET /api/tile`),
+server-side cancellation, client `AbortSignal` plumbing, the Viv `PixelSource`
+adapter and the viewer component have all landed. **Viv is the committed
+framework** (0.22.1, deck.gl/luma.gl `~9.3.3`), and the tiled viewer is now the
+only one — see "Retiring the server-rendered viewer".
 **Component:** `biopb-tensor-server` (HTTP sidecar, tile route); `web/` (viewer SPA);
 `biopb-control` (proxy hop — see `biopb/biopb#762`).
 **Related:** `http-server.md`, `remote-tensor-cache.md`, `../../docs/url-prefix.md`.
@@ -610,8 +611,8 @@ Aborts must reject with Viv's `SIGNAL_ABORTED` (`"__vivSignalAborted"`), not an
 inside a `.catch` nobody follows.
 
 **A slow server is not an untileable tensor.** The pane reports a settled refusal
-for things that are facts — no WebGL2, a dtype with no GPU equivalent, a
-non-canonical axis order, a server too old for the tile routes. `tile_info`
+for things that are facts — no WebGL2, a dtype with no GPU equivalent, a server
+too old for the tile routes. `tile_info`
 failures used to join that list: it opens the load, it ran on the *catalog* timeout
 (3 s), and its synthesised 408 reached `onUnsupported` looking exactly like an
 unsupported dtype. One slow response therefore retired the tiled viewer for that
