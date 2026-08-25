@@ -382,6 +382,60 @@ class TestJobOrigin:
         assert self._wait(jid)["status"] == "interrupted"
 
 
+class TestKernelOwner:
+    """One agent per kernel: the first non-user submitter claims it."""
+
+    _wait = staticmethod(_wait_job)
+
+    def test_first_agent_claims_and_a_second_is_refused(self, runner):
+        jid = _jobs.submit("a = 1", writer="sess-A", writer_label="claude-code")[
+            "job_id"
+        ]
+        self._wait(jid)
+        assert _jobs.owner() == {"owner": "sess-A", "label": "claude-code"}
+
+        refused = _jobs.submit("b = 2", writer="sess-B")
+        assert refused == {"error": "not_owner", "owner": "claude-code"}
+        # Refused at the door: no record, so nothing to poll or export either.
+        assert [j["code"] for j in _jobs.export()] == ["a = 1"]
+
+        # The owner keeps working.
+        assert (
+            self._wait(_jobs.submit("c = 3", writer="sess-A")["job_id"])["status"]
+            == "ok"
+        )
+
+    def test_a_human_cell_is_never_gated(self, runner):
+        # The person at the machine has standing no client does -- and the
+        # observe console has no identity to gate on in the first place.
+        self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
+        jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+        assert _jobs._jobs[jid].status == "ok"
+        # Running one does not steal the claim from the agent that holds it.
+        assert _jobs.owner()["owner"] == "sess-A"
+
+    def test_a_caller_with_no_identity_neither_claims_nor_is_checked(self, runner):
+        # Direct in-process calls (these tests, an in-process chat loop) have no
+        # request and no client id; there is nothing to tell two of them apart
+        # with, so the rule does not apply rather than misfiring.
+        self._wait(_jobs.submit("a = 1")["job_id"])
+        assert _jobs.owner()["owner"] is None
+        self._wait(_jobs.submit("b = 2")["job_id"])
+
+        # ...and an identified client can still claim afterwards.
+        self._wait(_jobs.submit("c = 3", writer="sess-A")["job_id"])
+        assert _jobs.owner()["owner"] == "sess-A"
+
+    def test_reset_releases_the_claim(self, runner):
+        # install() calls reset() on every bootstrap, so the claim lasts exactly
+        # one kernel lifetime -- restart_kernel is the documented takeover.
+        self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
+        _jobs.reset()
+        assert _jobs.owner()["owner"] is None
+        self._wait(_jobs.submit("b = 2", writer="sess-B")["job_id"])
+        assert _jobs.owner()["owner"] == "sess-B"
+
+
 class TestJobIntent:
     """The `intent` field: recorded with the job, never acted on."""
 

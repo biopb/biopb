@@ -18,6 +18,11 @@ Design notes
   keeps the writers off each other's toes: no preemption, no queue, one ordering
   of writes to the namespace. :func:`foreign_digest` is how the ``execute_code``
   agent finds out its namespace changed under it; see ``docs/user-console.md``.
+* **One agent per kernel.** Serializing two *agents* would order their writes
+  without making them mean anything — neither can see the other's model of the
+  namespace. So the first non-user submitter claims the kernel and a second is
+  refused (:func:`submit`); a human's cell is never gated. Only code execution
+  is: reading tools stay open to anyone, since they mutate nothing.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
   main thread.  GUI mutations from the worker thread are marshaled via
   :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
@@ -77,6 +82,13 @@ _jobs = {}  # job_id -> _Job
 _jobs_by_thread = {}  # thread ident -> _Job (active worker threads only)
 _job_seq = 0
 _lock = threading.RLock()
+
+# The one agent allowed to run code in this kernel, claimed by whoever submits
+# first and held until the kernel restarts (see :func:`submit`). An opaque id
+# supplied by the caller plus a label for the refusal message; ``None`` means
+# unclaimed.
+_owner = None
+_owner_label = ""
 
 
 class _Job:
@@ -349,7 +361,7 @@ def _prune():
         del _jobs[terminal.pop(0)]
 
 
-def submit(code, origin="agent", intent=""):
+def submit(code, origin="agent", intent="", writer=None, writer_label=""):
     """Start *code* in a background thread; return ``{"job_id": ...}`` or, if a
     job is already running, ``{"error": "busy", "running_job_id": ...,
     "running_job_origin": ...}``.
@@ -358,9 +370,35 @@ def submit(code, origin="agent", intent=""):
     rules in :class:`_Job`; see there for the origin vocabulary. The busy return
     carries the running job's origin because the caller's advice depends on it:
     the agent may stop its *own* job, but another writer's is not its to stop.
+
+    **One agent per kernel.** *writer* is an opaque id for the client asking.
+    The first non-user submitter claims the kernel; a later submit under a
+    *different* id is refused with ``{"error": "not_owner", "owner": <label>}``.
+    Two agents sharing one namespace is not a race the runner can serialize away
+    — the writes land in a defined order and still mean nothing, because neither
+    agent can see the other's model of what the variables and layers are. So it
+    fails loudly at the door instead. The claim is dropped by :func:`reset`, i.e.
+    it lasts for the life of the kernel.
+
+    Two deliberate holes. A **human** cell (``origin="user"``) is never gated:
+    the person at the machine has standing here that no client does, and the
+    observe console has no identity to gate on anyway. And a caller with
+    ``writer=None`` — a direct in-process call, or a transport that yields no
+    client id — neither claims nor is checked, since there is nothing to tell
+    two of them apart with.
+
+    This is a mistake-preventer, not a boundary: ``restart_kernel`` clears the
+    claim, so an agent that insists can still take the session over. It is
+    destructive by announcement, which is the posture every other sharp edge
+    here takes.
     """
-    global _job_seq
+    global _job_seq, _owner, _owner_label
     with _lock:
+        if origin != "user" and writer is not None:
+            if _owner is None:
+                _owner, _owner_label = writer, writer_label
+            elif writer != _owner:
+                return {"error": "not_owner", "owner": _owner_label}
         # Re-assert the thread-aware stream wrap (idempotent) so a job thread's
         # output is captured even if something replaced sys.stdout since
         # install() — and so it works under pytest's per-phase capture.
@@ -582,11 +620,25 @@ def export():
     return [j.snapshot() for j in _jobs.values()]
 
 
+def owner():
+    """``{"owner": <id or None>, "label": <str>}`` — who holds this kernel."""
+    with _lock:
+        return {"owner": _owner, "label": _owner_label}
+
+
 def reset():
-    """Drop all job records (used on kernel restart / re-bootstrap)."""
+    """Drop all job records and release the kernel's agent claim (used on kernel
+    restart / re-bootstrap).
+
+    Releasing here is what makes the claim last exactly one kernel lifetime:
+    :func:`install` calls this on every bootstrap, and a hard restart replaces
+    the process and its module state outright.
+    """
+    global _owner, _owner_label
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
+        _owner, _owner_label = None, ""
 
 
 # -- viewer wrapping --------------------------------------------------------

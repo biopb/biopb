@@ -396,6 +396,33 @@ class TestExecuteCode:
         ]
         assert "intent='isolate the nuclei channel'" in snippet
 
+    def test_refusal_when_another_client_holds_the_kernel(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(error="not_owner", owner="claude-code"),
+        )
+        result = _server.execute_code("x = 1")
+        assert "already in use by another client (claude-code)" in result
+        # It must be told what still works and what taking over costs, or it
+        # will read the refusal as a broken kernel and reach for restart.
+        assert "poll_job" in result and "restart_kernel" in result
+        assert "ask the user" in result
+
+    def test_writer_identity_rides_the_submit_snippet(self, server_with_host):
+        # Outside a request there is no client, so nothing is claimed -- the
+        # kernel reads writer=None as "nothing to tell two callers apart with".
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
+        )
+        _server.set_promote_after(0.0)
+        _server.execute_code("x = 1")
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "_jobs.submit(" in c[0][0]
+        ]
+        assert "writer=None" in snippet
+
     def test_intent_is_optional(self, server_with_host):
         # Every existing MCP client calls execute_code with one argument.
         _install_replies(
@@ -1217,3 +1244,42 @@ class TestToolReturnShape:
         # Either way the content blocks are the first thing a caller wants, and
         # there is always at least one.
         assert len(blocks) >= 1
+
+
+class TestClientIdentity:
+    """What the kernel's one-agent claim is keyed on.
+
+    Read through ``mcp.get_context()`` rather than a ``Context`` tool parameter,
+    so the tools stay callable in-process; these fake the context the SDK would
+    install around a real request.
+    """
+
+    @staticmethod
+    def _ctx(headers, client_name="claude-code"):
+        info = type("Info", (), {"name": client_name})()
+        params = type("Params", (), {"clientInfo": info})()
+        session = type("Session", (), {"client_params": params})()
+        request = type("Request", (), {"headers": headers})()
+        rc = type("RC", (), {"request": request, "session": session})()
+        return type("Ctx", (), {"request_context": rc})()
+
+    def test_reads_the_transport_session_id(self, monkeypatch):
+        # Two clients on one session child differ here and nowhere else: the
+        # tool surface is stateless, so this header is the only thing that
+        # tells them apart.
+        monkeypatch.setattr(
+            _server.mcp, "get_context", lambda: self._ctx({"mcp-session-id": "abc123"})
+        )
+        assert _server._client_identity() == ("abc123", "claude-code")
+
+    def test_falls_back_to_the_connection_when_the_header_is_absent(self, monkeypatch):
+        # A client that negotiated no transport session still gets one identity
+        # per connection, which is all the claim needs.
+        monkeypatch.setattr(_server.mcp, "get_context", lambda: self._ctx({}))
+        ident, label = _server._client_identity()
+        assert ident.startswith("conn-") and label == "claude-code"
+
+    def test_no_request_yields_no_identity(self):
+        # An in-process call (these tests; a chat loop later) has no client, and
+        # submit() reads that as "nothing to claim with" rather than refusing.
+        assert _server._client_identity() == (None, "")

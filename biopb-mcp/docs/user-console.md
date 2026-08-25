@@ -149,10 +149,21 @@ consequence of that one field.
 > **Since:** `origin` also admits `"chat"` (the in-process chat loop,
 > `docs/chat-client-evaluation.md`). Every rule stated below as "user-owned" is
 > implemented as *not agent-owned* (`_jobs._foreign`), so it holds for any writer
-> that is not the `execute_code` agent. Two things do **not** generalize: the
-> `seen_by_agent` flag assumes a single reader, so a second in-process reader
-> needs it per-reader; and the observe page is written for a human reader, where
-> "you" still means `"user"` alone.
+> that is not the `execute_code` agent.
+>
+> The writer count is nonetheless still **two**, and now by construction: the
+> first non-user submitter claims the kernel and a second agent's `execute_code`
+> is refused (`_jobs.submit`, keyed on the client id `_server._client_identity`
+> reads off the transport). Serializing two *agents* would order their writes
+> without making them mean anything — neither can see the other's model of the
+> namespace — so that case fails at the door rather than being scheduled. The
+> human is never gated, which is also the only workable choice: the console
+> carries no client identity to gate on.
+>
+> Consequences worth keeping in view: `seen_by_agent` stays a single flag
+> because there is provably one agent reader; the observe page's "you" still
+> means `"user"` alone; and `restart_kernel` clears the claim, so the rule is a
+> mistake-preventer, not a boundary.
 
 **The notebook export becomes a real audit.** Cell provenance is recorded rather than
 implied, and the interleaving is already correct — `export()` is job-ordered.

@@ -455,6 +455,40 @@ def _window_note(window_alive) -> str:
     return ""
 
 
+def _client_identity():
+    """``(id, label)`` for the MCP client behind this call, or ``(None, "")``.
+
+    The streamable-http transport mints a per-connection ``mcp-session-id``, so
+    two clients reaching one session child are distinguishable even though the
+    tool surface itself is stateless — this is the id the kernel's one-agent
+    claim is keyed on (``_jobs.submit``). ``clientInfo.name`` from the initialize
+    handshake rides along as a label, purely so a refusal can name who holds the
+    kernel.
+
+    Read through ``mcp.get_context()`` rather than a ``Context`` tool parameter:
+    the parameter form is excluded from the advertised input schema, but it also
+    makes the function uncallable without one, and every in-process caller (the
+    tests today, an in-process chat loop later) has no request at all. Outside a
+    request this yields no identity, which ``submit`` reads as "nothing to claim
+    with" and lets through.
+    """
+    try:
+        rc = mcp.get_context().request_context
+    except Exception:  # noqa: BLE001 - no request, or an SDK shape we don't know
+        return None, ""
+    request = getattr(rc, "request", None)
+    ident = request.headers.get("mcp-session-id") if request is not None else None
+    session = getattr(rc, "session", None)
+    if not ident and session is not None:
+        # A client that negotiated no transport session still gets one identity
+        # per connection: the ServerSession object is per-connection and lives
+        # as long as it does, which is all the claim needs.
+        ident = f"conn-{id(session):x}"
+    params = getattr(session, "client_params", None)
+    label = getattr(getattr(params, "clientInfo", None), "name", "") or ""
+    return ident, label
+
+
 def _foreign_digest(host) -> list:
     """The cells run by another writer that the agent has not been told about,
     or ``[]``.
@@ -718,6 +752,12 @@ def execute_code(python_code: str, intent: str = "") -> str:
     interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
     runs at a time.
 
+    Only one *agent* runs code in a kernel, too: whoever calls this first holds
+    it until the kernel restarts, and a second client is refused here (its
+    read-only tools keep working). The person at the machine is exempt — they
+    can run cells from the observe page while you work, which is what the
+    user-activity notice on these results is telling you about.
+
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
 
@@ -756,11 +796,34 @@ def execute_code(python_code: str, intent: str = "") -> str:
     if foreign_note:
         _ack_foreign_digest(host, digest)
 
+    writer, writer_label = _client_identity()
     submitted, res, window_alive = _run_job_call(
-        host, "submit(" + repr(python_code) + ", intent=" + repr(intent) + ")"
+        host,
+        "submit("
+        + repr(python_code)
+        + ", intent="
+        + repr(intent)
+        + ", writer="
+        + repr(writer)
+        + ", writer_label="
+        + repr(writer_label)
+        + ")",
     )
     if submitted is None:
         return _format_execute_result(res) + foreign_note
+    if submitted.get("error") == "not_owner":
+        held_by = submitted.get("owner") or ""
+        held_by = f" ({held_by})" if held_by else ""
+        return (
+            f"This kernel is already in use by another client{held_by}, and only "
+            "one agent runs code in a session. Two of you writing to the same "
+            "namespace and viewer would order the writes without either being "
+            "able to see what the other believes is there. Reading tools "
+            "(poll_job, server_status, take_screenshot, inspect_object) still "
+            "work, so you can watch. Taking the session over means "
+            "restart_kernel, which destroys the current variables and layers — "
+            "ask the user before you do that." + foreign_note
+        )
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
         # Whose job is running decides the advice. Telling the agent to

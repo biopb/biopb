@@ -26,6 +26,17 @@ is a third writer of that same class and inherits the design rather than
 reopening it — `origin="chat"` and the `intent` field are already in `_jobs`,
 so the loop fills a record that exists rather than adding one.
 
+**And it is a third writer, not a third *agent*.** The kernel now admits one
+agent per lifetime: the first non-user submitter claims it and a second client's
+`execute_code` is refused (`_jobs.submit`). So a chat loop and an attached MCP
+harness are **mutually exclusive** for code execution — whichever runs first
+holds the session, the other keeps its read-only tools, and `restart_kernel` is
+the announced takeover. That is a deliberate product call rather than a
+limitation to design around: two agents in one namespace can be serialized but
+not reconciled, because neither can see the other's model of what the variables
+and layers are. The loop must therefore supply a stable writer id of its own,
+which in-process it trivially can.
+
 **A working agent loop, in the test tree.** `_tests/agentbench/` drives a real
 session with a real model: MCP client, schema translation, tool dispatch,
 conversation loop, trace. It is benchmark-shaped, not product-shaped — see
