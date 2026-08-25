@@ -27,15 +27,20 @@ reopening it — `origin="chat"` and the `intent` field are already in `_jobs`,
 so the loop fills a record that exists rather than adding one.
 
 **And it is a third writer, not a third *agent*.** The kernel now admits one
-agent per lifetime: the first non-user submitter claims it and a second client's
-`execute_code` is refused (`_jobs.submit`). So a chat loop and an attached MCP
-harness are **mutually exclusive** for code execution — whichever runs first
-holds the session, the other keeps its read-only tools, and `restart_kernel` is
-the announced takeover. That is a deliberate product call rather than a
-limitation to design around: two agents in one namespace can be serialized but
-not reconciled, because neither can see the other's model of what the variables
-and layers are. The loop must therefore supply a stable writer id of its own,
-which in-process it trivially can.
+agent per lifetime: the first non-user submitter claims it, and a second client
+is refused by everything that changes kernel state — `execute_code`,
+`interrupt_kernel`, `restart_kernel` — keeping only the read-only tools. So a
+chat loop and an attached MCP harness are **mutually exclusive**: whichever runs
+first holds the session, and the other cannot take it. That is a deliberate
+product call rather than a limitation to design around — two agents in one
+namespace can be serialized but not reconciled, because neither can see the
+other's model of what the variables and layers are.
+
+Two things follow for the loop. It must supply a stable writer id of its own,
+which in-process it trivially can. And **the recovery is the user's**: the
+observe page's restart is never gated, so the chat UI is the natural place to
+surface "another client holds this kernel — restart it?" rather than leaving a
+refused agent to explain itself in prose.
 
 **A working agent loop, in the test tree.** `_tests/agentbench/` drives a real
 session with a real model: MCP client, schema translation, tool dispatch,

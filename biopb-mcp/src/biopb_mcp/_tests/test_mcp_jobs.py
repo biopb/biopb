@@ -426,6 +426,38 @@ class TestKernelOwner:
         self._wait(_jobs.submit("c = 3", writer="sess-A")["job_id"])
         assert _jobs.owner()["owner"] == "sess-A"
 
+    def test_a_non_owner_cannot_stop_the_owners_job(self, runner):
+        # Stopping a job changes kernel state, so it is gated like running one.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
+        )["job_id"]
+        try:
+            assert _jobs.interrupt_current(requester="agent", writer="sess-B") == {
+                "job_id": jid,
+                "interrupted": False,
+                "status": "running",
+                "refused": "not_owner",
+            }
+            # The owner still can, and so can the human (the default requester).
+            assert (
+                _jobs.interrupt_current(requester="agent", writer="sess-A")[
+                    "interrupted"
+                ]
+                is True
+            )
+        finally:
+            _jobs.interrupt_current()
+        assert self._wait(jid)["status"] == "interrupted"
+
+    def test_the_human_can_always_stop_a_held_kernel(self, runner):
+        # The recovery belongs to the person at the machine: requester="user" is
+        # the observe UI, and it is never gated on the claim.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
+        )["job_id"]
+        assert _jobs.interrupt_current(reason="stopped by Bob")["interrupted"] is True
+        assert self._wait(jid)["status"] == "interrupted"
+
     def test_reset_releases_the_claim(self, runner):
         # install() calls reset() on every bootstrap, so the claim lasts exactly
         # one kernel lifetime -- restart_kernel is the documented takeover.

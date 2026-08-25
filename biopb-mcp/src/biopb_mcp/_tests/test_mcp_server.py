@@ -403,10 +403,13 @@ class TestExecuteCode:
         )
         result = _server.execute_code("x = 1")
         assert "already in use by another client (claude-code)" in result
-        # It must be told what still works and what taking over costs, or it
-        # will read the refusal as a broken kernel and reach for restart.
-        assert "poll_job" in result and "restart_kernel" in result
-        assert "ask the user" in result
+        # It must be told what still works, or it reads the refusal as a broken
+        # kernel...
+        assert "poll_job" in result
+        # ...and it must not be pointed at restart_kernel, which is refused for
+        # the same reason: naming it here would send the agent to try anyway.
+        assert "restart_kernel" not in result
+        assert "the user's to do" in result
 
     def test_writer_identity_rides_the_submit_snippet(self, server_with_host):
         # Outside a request there is no client, so nothing is claimed -- the
@@ -795,6 +798,52 @@ class TestInterruptRestart:
             if "interrupt_current(" in c[0][0]
         ]
         assert "requester='agent'" in snippet
+
+    def test_interrupt_refused_when_another_client_holds_the_kernel(
+        self, server_with_host
+    ):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                job_id="job-3",
+                interrupted=False,
+                status="running",
+                refused="not_owner",
+            ),
+        )
+        result = _server.interrupt_kernel()
+        assert "already in use by another client" in result
+        # The recovery named must be the person, not restart_kernel -- which is
+        # refused for the same reason and would read as the way around this.
+        assert "the user's to do" in result
+
+    def test_restart_refused_when_another_client_holds_the_kernel(
+        self, server_with_host
+    ):
+        _install_replies(
+            server_with_host,
+            returns=_job_envelope({"owner": "sess-A", "label": "claude-code"}),
+        )
+        # This client has no identity of its own, so nothing is refused...
+        assert "Kernel restarted" in _server.restart_kernel()
+        server_with_host.restart.assert_called_once()
+
+        # ...but an identified stranger is, and the kernel is left alone.
+        server_with_host.restart.reset_mock()
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+            result = _server.restart_kernel()
+        assert "already in use by another client (claude-code)" in result
+        server_with_host.restart.assert_not_called()
+
+    def test_restart_allowed_when_the_kernel_cannot_answer(self, server_with_host):
+        # A kernel too broken to report its owner has no live namespace to
+        # protect, and restart is the one tool that fixes it -- an unreadable
+        # claim must not wedge it.
+        _install_replies(server_with_host, returns=_result(status="error"))
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+            assert "Kernel restarted" in _server.restart_kernel()
 
     def test_interrupt_refused_on_a_user_job(self, server_with_host):
         _install_replies(

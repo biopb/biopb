@@ -455,6 +455,21 @@ def _window_note(window_alive) -> str:
     return ""
 
 
+# Refusal for a client that does not hold this kernel's one-agent claim
+# (_jobs.submit). Shared by every state-changing tool so the agent gets one
+# explanation rather than three, and so the recovery named is the same in all of
+# them: the person at the machine, never a second agent.
+_NOT_OWNER_MSG = (
+    "This kernel is already in use by another client{held_by}, and only one "
+    "agent runs code in a session. Two of you writing to the same namespace and "
+    "viewer would order the writes without either being able to see what the "
+    "other believes is there. Reading tools (poll_job, server_status, "
+    "take_screenshot, inspect_object) still work, so you can watch. You cannot "
+    "take the session over — restarting it is the user's to do, from the observe "
+    "page. Tell them what you wanted and let them decide."
+)
+
+
 def _client_identity():
     """``(id, label)`` for the MCP client behind this call, or ``(None, "")``.
 
@@ -753,8 +768,9 @@ def execute_code(python_code: str, intent: str = "") -> str:
     runs at a time.
 
     Only one *agent* runs code in a kernel, too: whoever calls this first holds
-    it until the kernel restarts, and a second client is refused here (its
-    read-only tools keep working). The person at the machine is exempt — they
+    it until the kernel restarts. A second client is refused here and by every
+    other tool that changes kernel state (interrupt_kernel, restart_kernel), and
+    keeps only the read-only ones. The person at the machine is exempt — they
     can run cells from the observe page while you work, which is what the
     user-activity notice on these results is telling you about.
 
@@ -814,16 +830,7 @@ def execute_code(python_code: str, intent: str = "") -> str:
     if submitted.get("error") == "not_owner":
         held_by = submitted.get("owner") or ""
         held_by = f" ({held_by})" if held_by else ""
-        return (
-            f"This kernel is already in use by another client{held_by}, and only "
-            "one agent runs code in a session. Two of you writing to the same "
-            "namespace and viewer would order the writes without either being "
-            "able to see what the other believes is there. Reading tools "
-            "(poll_job, server_status, take_screenshot, inspect_object) still "
-            "work, so you can watch. Taking the session over means "
-            "restart_kernel, which destroys the current variables and layers — "
-            "ask the user before you do that." + foreign_note
-        )
+        return _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
         # Whose job is running decides the advice. Telling the agent to
@@ -939,9 +946,14 @@ def interrupt_kernel() -> str:
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
-    data, res, _w = _run_job_call(host, "interrupt_current(requester='agent')")
+    writer, _label = _client_identity()
+    data, res, _w = _run_job_call(
+        host, "interrupt_current(requester='agent', writer=" + repr(writer) + ")"
+    )
     if data is None:
         return _format_execute_result(res)
+    if data.get("refused") == "not_owner":
+        return _NOT_OWNER_MSG.format(held_by="")
     if data.get("refused") == "foreign_job":
         running = data.get("job_id")
         return (
@@ -1002,10 +1014,25 @@ def restart_kernel() -> str:
     beforehand. So it is not the way past a refused interrupt_kernel or a kernel
     busy with a user cell: neither is a runaway. Use it when the kernel is truly
     wedged, and prefer asking first when someone is working in it.
+
+    It is also not the way past a kernel held by another client: if you do not
+    hold this one, this is refused too, and restarting it is the user's to do.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
+    # Gated like every other state change, and this is the sharpest of them: a
+    # restart would discard the holder's whole session. Read the claim from the
+    # kernel rather than caching it here -- a kernel that cannot answer has no
+    # live namespace to protect, so an unreadable claim allows the restart
+    # instead of wedging the one tool that recovers a broken kernel.
+    writer, _label = _client_identity()
+    held, _res, _w = _run_job_call(host, "owner()")
+    if isinstance(held, dict) and writer is not None:
+        held_id = held.get("owner")
+        if held_id is not None and held_id != writer:
+            label = held.get("label") or ""
+            return _NOT_OWNER_MSG.format(held_by=f" ({label})" if label else "")
     try:
         host.restart()
     except Exception as exc:

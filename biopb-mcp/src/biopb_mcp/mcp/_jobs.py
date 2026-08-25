@@ -21,8 +21,10 @@ Design notes
 * **One agent per kernel.** Serializing two *agents* would order their writes
   without making them mean anything — neither can see the other's model of the
   namespace. So the first non-user submitter claims the kernel and a second is
-  refused (:func:`submit`); a human's cell is never gated. Only code execution
-  is: reading tools stay open to anyone, since they mutate nothing.
+  refused (:func:`submit`); a human's cell is never gated. Everything that
+  changes kernel state is gated the same way — running a job, stopping one
+  (:func:`interrupt_current`), restarting the kernel (server-side) — while the
+  read-only tools stay open to anyone, since they mutate nothing.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
   main thread.  GUI mutations from the worker thread are marshaled via
   :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
@@ -387,10 +389,13 @@ def submit(code, origin="agent", intent="", writer=None, writer_label=""):
     client id — neither claims nor is checked, since there is nothing to tell
     two of them apart with.
 
-    This is a mistake-preventer, not a boundary: ``restart_kernel`` clears the
-    claim, so an agent that insists can still take the session over. It is
-    destructive by announcement, which is the posture every other sharp edge
-    here takes.
+    **The recovery belongs to the human, not to a second agent.** Every tool
+    that changes kernel state is gated the same way — ``interrupt_current`` here,
+    ``restart_kernel`` server-side — so a client that does not hold the kernel
+    cannot take it by force; it keeps the read-only tools and nothing else. What
+    frees a claim is the kernel going away: the person at the machine restarting
+    from the observe page (never gated), or the session ending. That is the same
+    principle as the ``origin="user"`` exemption, applied to recovery.
     """
     global _job_seq, _owner, _owner_label
     with _lock:
@@ -489,7 +494,7 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt_current(reason=None, requester="user"):
+def interrupt_current(reason=None, requester="user", writer=None):
     """Force-stop the running job: cooperative cancel *plus* a ``KeyboardInterrupt``
     raised directly into the job's worker thread.
 
@@ -508,12 +513,24 @@ def interrupt_current(reason=None, requester="user"):
     reaches the agent through ``cancel_reason``, but the other writer would see
     nothing beyond an unexplained ``interrupted`` badge. The human has the
     observe UI and can stop their own work; the agent has no consent to.
-    ``restart_kernel`` stays open to the agent — it is the advertised guaranteed
-    stop, and it is destructive by announcement rather than silently.
+
+    *writer* is the asking client's id, checked against the kernel's one-agent
+    claim (:func:`submit`): a client that does not hold this kernel cannot stop
+    what runs in it (``{"refused": "not_owner"}``). Stopping a job is a change to
+    kernel state, so it is gated like running one; only the read-only tools stay
+    open to a second client. As in :func:`submit`, a caller with ``writer=None``
+    is not checked — there is nothing to compare.
     """
     job = _running_job()
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
+    if requester == "agent" and writer is not None and _owner not in (None, writer):
+        return {
+            "job_id": job.job_id,
+            "interrupted": False,
+            "status": "running",
+            "refused": "not_owner",
+        }
     if requester == "agent" and _foreign(job):
         return {
             "job_id": job.job_id,

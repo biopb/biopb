@@ -160,10 +160,16 @@ consequence of that one field.
 > human is never gated, which is also the only workable choice: the console
 > carries no client identity to gate on.
 >
+> Every tool that changes kernel state is gated the same way — running a job,
+> `interrupt_kernel`, `restart_kernel` — so a client that does not hold the
+> kernel keeps the read-only tools and nothing else. **The recovery is the
+> human's**, which is the `origin="user"` exemption applied to a second
+> question: the observe page's restart is never gated, so a stale claim is
+> cleared by the person at the machine rather than seized by a second agent.
+>
 > Consequences worth keeping in view: `seen_by_agent` stays a single flag
-> because there is provably one agent reader; the observe page's "you" still
-> means `"user"` alone; and `restart_kernel` clears the claim, so the rule is a
-> mistake-preventer, not a boundary.
+> because there is provably one agent reader; and the observe page's "you" still
+> means `"user"` alone.
 
 **The notebook export becomes a real audit.** Cell provenance is recorded rather than
 implied, and the interleaving is already correct — `export()` is job-ordered.
