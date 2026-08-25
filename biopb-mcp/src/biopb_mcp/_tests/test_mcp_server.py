@@ -866,6 +866,54 @@ class TestInterruptRestart:
         server_with_host.restart.assert_called_once()
         assert _server._claimed_by is None
 
+    def test_a_lost_submit_reply_still_leaves_the_kernel_claimed(
+        self, server_with_host
+    ):
+        # execute_interactive hands the request over before it starts its clock,
+        # so a timed-out submit still runs -- the kernel claims and starts the
+        # job while this process sees nothing come back. Recording the claim only
+        # on the way back would leave the mirror empty and let a stranger restart
+        # the session that just began.
+        _install_replies(server_with_host, returns=_result(status="timeout"))
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-A", "claude-code"))
+            _server.execute_code("x = 1")
+        assert _server._claimed_by == "sess-A"
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+            assert "already in use" in _server.restart_kernel()
+        server_with_host.restart.assert_not_called()
+
+    def test_a_refusal_corrects_a_mirror_that_guessed_wrong(self, server_with_host):
+        # The presumed claim is only a guess when this process has seen none. The
+        # kernel's refusal names the real holder, and that must win -- otherwise
+        # a stranger's first call would leave itself recorded as the owner.
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                error="not_owner", owner="claude-code", owner_id="sess-A"
+            ),
+        )
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+            assert "already in use" in _server.execute_code("x = 1")
+        assert _server._claimed_by == "sess-A"
+
+    def test_a_known_holder_is_not_overwritten_by_a_stranger(self, server_with_host):
+        # The presumption is guarded on "no claim seen yet"; a stranger arriving
+        # after the holder is known must not take the mirror even for the length
+        # of one call, since a lost reply would freeze it that way.
+        _server._claimed_by = "sess-A"
+        try:
+            _install_replies(server_with_host, returns=_result(status="timeout"))
+            with pytest.MonkeyPatch().context() as mp:
+                mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+                _server.execute_code("x = 1")
+            assert _server._claimed_by == "sess-A"
+        finally:
+            _server.clear_claim()
+
     def test_restart_is_not_gated_on_a_kernel_round_trip(self, server_with_host):
         # A busy kernel must never read as an unclaimed one: asking it who owns
         # it would fail *open* exactly when the holder has a job running, which

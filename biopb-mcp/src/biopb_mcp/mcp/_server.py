@@ -472,18 +472,38 @@ def _window_note(window_alive) -> str:
 # passes through this process, so mirroring it here answers the question with no
 # round trip and no window.
 #
-# Set from the kernel's own decision rather than predicted: any submit the kernel
-# did not refuse came from the holder, so assigning on every acceptance keeps the
-# mirror true through a restart that happened somewhere else (the observe page's,
-# which clears it explicitly).
+# Set from the kernel's own decision wherever a reply arrives: any submit the
+# kernel did not refuse came from the holder, and a refusal names the holder
+# outright, so assigning on both keeps the mirror true through a restart that
+# happened somewhere else (the observe page's, which clears it explicitly).
+#
+# **Recorded before the submit is sent, not after.** A reply can be lost while
+# the kernel goes on to claim and run the code anyway -- ``execute_interactive``
+# hands the request over before it starts its clock, so a timed-out call is still
+# queued and executes when the main thread frees up. Setting the mirror only on
+# the way back would leave it empty while the kernel is genuinely held, and an
+# empty mirror lets a stranger restart the session that just started. The window
+# is claimed first and corrected from whatever the kernel says, so the failure
+# direction is "held by the client that asked" rather than "held by nobody".
 _claimed_by: str | None = None
 
 
 def _note_claim(writer):
-    """Record that the kernel accepted code from *writer*."""
+    """Record that the kernel is held by *writer* (ignores ``None``)."""
     global _claimed_by
     if writer is not None:
         _claimed_by = writer
+
+
+def _presume_claim(writer):
+    """Take the claim for *writer* only if this process has not seen one.
+
+    Guarded on "not seen": a client the kernel is about to refuse must never
+    overwrite a holder already known here, and it will be corrected by the
+    refusal in any case.
+    """
+    if _claimed_by is None:
+        _note_claim(writer)
 
 
 def clear_claim():
@@ -864,6 +884,9 @@ def execute_code(python_code: str, intent: str = "") -> str:
     if foreign_note:
         _ack_foreign_digest(host, digest, writer)
 
+    # Before the call, not after: a lost reply must not leave the kernel claimed
+    # while this process still reads as unclaimed. See _claimed_by.
+    _presume_claim(writer)
     submitted, res, window_alive = _run_job_call(
         host,
         "submit("
@@ -879,6 +902,9 @@ def execute_code(python_code: str, intent: str = "") -> str:
     if submitted is None:
         return _format_execute_result(res) + foreign_note
     if submitted.get("error") == "not_owner":
+        # The authority speaking: whatever this process presumed above, the
+        # kernel just named the real holder.
+        _note_claim(submitted.get("owner_id"))
         held_by = submitted.get("owner") or ""
         held_by = f" ({held_by})" if held_by else ""
         return _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note

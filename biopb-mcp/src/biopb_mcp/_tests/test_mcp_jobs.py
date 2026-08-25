@@ -397,7 +397,13 @@ class TestKernelOwner:
         assert _jobs.owner() == {"owner": "sess-A", "label": "claude-code"}
 
         refused = _jobs.submit("b = 2", writer="sess-B")
-        assert refused == {"error": "not_owner", "owner": "claude-code"}
+        # The id as well as the label: the server mirrors the claim, and a
+        # refusal is its chance to correct a mirror that guessed wrong.
+        assert refused == {
+            "error": "not_owner",
+            "owner": "claude-code",
+            "owner_id": "sess-A",
+        }
         # Refused at the door: no record, so nothing to poll or export either.
         assert [j["code"] for j in _jobs.export()] == ["a = 1"]
 

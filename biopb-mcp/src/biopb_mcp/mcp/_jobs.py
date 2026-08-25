@@ -403,7 +403,13 @@ def submit(code, origin="agent", intent="", writer=None, writer_label=""):
             if _owner is None:
                 _owner, _owner_label = writer, writer_label
             elif writer != _owner:
-                return {"error": "not_owner", "owner": _owner_label}
+                # The id as well as the label: the caller mirrors the claim, and
+                # a refusal is its chance to correct a mirror that guessed wrong.
+                return {
+                    "error": "not_owner",
+                    "owner": _owner_label,
+                    "owner_id": _owner,
+                }
         # Re-assert the thread-aware stream wrap (idempotent) so a job thread's
         # output is captured even if something replaced sys.stdout since
         # install() — and so it works under pytest's per-phase capture.
