@@ -123,8 +123,14 @@ authenticated, for itself and for everything it fronts.
 
 Each session writes a JSON record — host, port, pid, `/mcp` url — into a state dir
 once it is reachable, and removes it on reap; the control reads that dir. The
-contract is a stdlib-only core-SDK module (I2): the session's shim writes, the
+contract is a stdlib-only core-SDK module (I2): the session side writes, the
 control reads, and neither imports the other.
+
+There are two writers, because there are two ways a session comes to exist. A
+shim-owned child is published by its **shim**, which owns its reap and so its
+de-registration. An agentless `biopb mcp view` session has no shim, so it
+**publishes itself** and drops its record on the way out. Either way the control
+only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a
 recycled pid, caught by a create-time token — so a dead session expires to a clean

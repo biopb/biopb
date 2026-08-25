@@ -64,6 +64,31 @@ class TestUnregister:
         reg.unregister("never")  # must not raise
 
 
+class TestNewSessionId:
+    """The id format is the registry's own, because it now has two writers: the
+    stdio shim (publishing the child it owns) and an agentless ``biopb mcp
+    view`` session (publishing itself)."""
+
+    def test_shape_is_timestamp_and_pid(self):
+        sid = reg.new_session_id()
+        stamp, _, pid = sid.rpartition("-")
+        assert pid == str(os.getpid())
+        # <date>-<time>, both fixed width, so ids sort chronologically as text.
+        date, _, clock = stamp.partition("-")
+        assert len(date) == 8 and date.isdigit()
+        assert len(clock) == 6 and clock.isdigit()
+
+    def test_is_safe_to_use_as_a_filename_stem(self):
+        # The one caller-facing guarantee: register() rejects unsafe ids, so a
+        # minted id must never be one.
+        assert reg._is_safe_session_id(reg.new_session_id())
+
+    def test_minted_id_registers(self):
+        sid = reg.new_session_id()
+        reg.register(sid, port=1234, pid=_live_pid())
+        assert reg.read_session(sid)["session_id"] == sid
+
+
 class TestSessionIdSafety:
     """A session id becomes a filename stem and is reachable from a
     ``/session/<id>/...`` URL, so the module self-sanitizes (biopb/biopb#422).

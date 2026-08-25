@@ -117,11 +117,6 @@ def _session_command():
     return [*cmd, "--transport", "http", "--port", "0"]
 
 
-def _new_session_id():
-    """A sortable, unique id for this shim session: ``<timestamp>-<shim-pid>``."""
-    return time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
-
-
 def _session_log_path(config, session_id):
     """Where this session's child logs. Per-session by default; a single shared
     file when ``transport.kernel_log`` is set (opt back into the old behavior).
@@ -240,7 +235,7 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     # Per-session logfile (not the shared mcp-server.log): concurrent sessions no
     # longer interleave. Prune older ones to the configured cap after opening the
     # new one (it is newest, so it survives).
-    session_id = _new_session_id()
+    session_id = _sessions.new_session_id()
     log_path = _session_log_path(config, session_id)
     log, logged_to_file = open_child_log(log_path)
     if logged_to_file and not get_setting(config, "transport.kernel_log"):

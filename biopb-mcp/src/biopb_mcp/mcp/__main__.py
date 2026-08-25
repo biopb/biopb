@@ -63,6 +63,56 @@ def _report_port(path, port):
         logger.warning("Could not write port report file %s", path, exc_info=True)
 
 
+def _register_view_session(port):
+    """Publish this agentless viewer in the session registry; return its id.
+
+    The control lists live sessions and proxies ``/session/<id>/*`` from this
+    registry, so a session nobody publishes is a session with no observe page
+    and no dashboard entry. The stdio shim publishes the child it owns
+    (``_shim.spawn_session``); a `biopb mcp view` session has no shim, so it
+    publishes itself.
+
+    Best-effort, and broadly caught for the same reason the shim's publish is
+    (biopb/biopb#422): a registry write failure — a serialization error, an
+    unwritable state dir — must cost the viewer its discoverability and nothing
+    else. Returns ``None`` in that case, leaving the caller nothing to
+    de-register.
+    """
+    from biopb import _sessions
+
+    try:
+        session_id = _sessions.new_session_id()
+        _sessions.register(
+            session_id,
+            port=port,
+            pid=os.getpid(),
+            mcp_url=f"http://127.0.0.1:{port}/mcp",
+        )
+    except Exception:
+        logger.warning("Could not register this session", exc_info=True)
+        return None
+    logger.info("Registered session %s for the control plane.", session_id)
+    return session_id
+
+
+def _unregister_session(session_id):
+    """Drop ``session_id``'s routing record. No-op when it was never registered.
+
+    Best-effort like the publish: teardown must not fail because a record was
+    already gone. The registry's own pid-liveness prune
+    (:func:`biopb._sessions.list_sessions`) is the backstop for a kill abrupt
+    enough that this never runs.
+    """
+    if session_id is None:
+        return
+    from biopb import _sessions
+
+    try:
+        _sessions.unregister(session_id)
+    except Exception:
+        logger.warning("Could not unregister session %s", session_id, exc_info=True)
+
+
 def _parse_args(argv, default_transport, default_port):
     """Parse launcher CLI args (separated out so it is unit-testable)."""
     parser = argparse.ArgumentParser(
@@ -397,6 +447,11 @@ def _serve_http(config, port, view=False):
                 flush=True,
             )
 
+    # Set by the registration below; read by _shutdown. Declared here because the
+    # signal handlers are installed before that point, so this name has to exist
+    # even on a Ctrl-C that arrives during the viewer's bring-up.
+    session_id = None
+
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
         server loop returning: reap the kernel, close the session-child-owned
@@ -409,6 +464,13 @@ def _serve_http(config, port, view=False):
         The launcher's only remaining job is to exit, so exit immediately.
         """
         logger.info("Shutting down (%s).", reason)
+        # Drop the routing record before anything else, so a control stops
+        # routing here while this process can still refuse a connection cleanly
+        # rather than after it has stopped answering. Teardown and
+        # de-registration are one path, as they are in the shim's _reap_session;
+        # the registry's own pid-liveness prune is the backstop for a kill this
+        # never runs for.
+        _unregister_session(session_id)
         host.shutdown()
         # After the kernel is reaped (no clients left attached): stop the
         # session-child-owned cluster, then rmtree its now-idle spill dir. This
@@ -440,6 +502,15 @@ def _serve_http(config, port, view=False):
         except Exception:
             logger.exception("Failed to open the viewer; exiting")
             return 1  # atexit reaps the kernel/cluster and cleans the spill dir
+
+    # Only the agentless viewer registers *itself*: a shim-owned child is
+    # published by the shim that owns its reap (and so its de-registration), and
+    # a direct `--transport http` launch binds the configured fixed port its
+    # operator already knows. Done last, with the kernel up and the serve loop
+    # the next statement, so a record implies a session that is all but
+    # answering.
+    if view and not shim_owned:
+        session_id = _register_view_session(port)
 
     _server.run(
         port,
