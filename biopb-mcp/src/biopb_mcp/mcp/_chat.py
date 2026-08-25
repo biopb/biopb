@@ -44,6 +44,13 @@ from . import _server
 WRITER_ID = "biopb-chat"
 WRITER_LABEL = "chat"
 
+#: Name of the synthesized tool that reads ``guide://`` and ``skill://``.
+#: Resources are an MCP concept with no function-calling equivalent, so a model
+#: driven by this loop cannot reach them unless one is invented -- and the
+#: session instructions and ``find_skills`` both send it there, so without this
+#: the agent is told to read documents it has no way to open.
+RESOURCE_TOOL = "read_resource"
+
 #: Cap on tool-call rounds within one turn. A model that keeps calling tools
 #: without answering is not converging, and the user is sitting there watching.
 _MAX_TOOL_ROUNDS = 12
@@ -138,13 +145,80 @@ def _clean_schema(schema):
     return {k: v for k, v in (schema or {}).items() if k not in ("$schema", "title")}
 
 
+async def _resource_tool():
+    """A function-calling tool for the resource surface, built from the registry.
+
+    An MCP client reads ``guide://kernel`` through ``resources/read``; a model
+    speaking function-calling has no such verb, so the loop hands it one. This
+    is not a convenience — ``_BASE_INSTRUCTIONS`` tells the agent to read the
+    guides before non-trivial work and ``find_skills`` answers with
+    ``skill://<id>``, so an agent without it is instructed to open documents it
+    cannot reach, and will answer from guesswork instead.
+
+    The catalogue in the description is generated, not written down, for the
+    same reason the tool list is: a hand-kept copy is what silently stops
+    matching what is registered.
+    """
+    listed = await _server.mcp.list_resources()
+    templates = await _server.mcp.list_resource_templates()
+    lines = [f"- {r.uri} — {r.description or ''}".rstrip() for r in listed]
+    lines += [f"- {t.uriTemplate} — {t.description or ''}".rstrip() for t in templates]
+    return {
+        "type": "function",
+        "function": {
+            "name": RESOURCE_TOOL,
+            "description": (
+                "Read one of this session's reference documents. The guides are "
+                "what the session instructions mean by 'read guide://...' — read "
+                "the relevant one before non-trivial work rather than guessing "
+                "at the API. A curated workflow's steps come from "
+                "skill://<skill_id>, and find_skills is what gives you the id.\n"
+                + "\n".join(lines)
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "description": "e.g. guide://data or skill://drift-correction",
+                    }
+                },
+                "required": ["uri"],
+            },
+        },
+    }
+
+
+async def _read_resource(uri):
+    """Resolve *uri*, or say why it did not resolve.
+
+    A bad URI is the model's mistake to correct on the next round, not the
+    turn's end -- so it comes back as a tool result like any other.
+    """
+    try:
+        parts = list(await _server.mcp.read_resource(uri))
+    except Exception as exc:  # noqa: BLE001 - unknown uri, or the reader raised
+        return f"Could not read {uri!r}: {exc}"
+    out = []
+    for part in parts:
+        content = part.content
+        out.append(
+            content.decode("utf-8", "replace")
+            if isinstance(content, bytes)
+            else str(content)
+        )
+    return "\n".join(out)
+
+
 async def tool_payload():
     """The function-calling tool list, generated from the live MCP registry.
 
     Read from ``list_tools()`` rather than declared here: a hand-written copy is
     the one thing that can silently stop matching the tools that actually run.
+    The resource reader is appended because the registry has no such tool to
+    generate from -- see :func:`_resource_tool`.
     """
-    return [
+    return [await _resource_tool()] + [
         {
             "type": "function",
             "function": {
@@ -166,6 +240,8 @@ async def _dispatch(name, arguments, on_progress):
     to a ``CallToolResult``. A test pins the shape per tool, so a FastMCP bump
     fails loudly rather than quietly reshaping what the loop receives.
     """
+    if name == RESOURCE_TOOL:
+        return await _read_resource(arguments.get("uri") or ""), []
     if name == "execute_code":
         return await _run_code(arguments, on_progress), []
     result = await _server.mcp._tool_manager.call_tool(

@@ -168,7 +168,10 @@ class TestToolSurface:
         payload = asyncio.run(_chat.tool_payload())
         names = {t["function"]["name"] for t in payload}
         listed = {t.name for t in asyncio.run(_server.mcp.list_tools())}
-        assert names == listed
+        # Every registered tool, and exactly one thing that is not one: the
+        # resource reader, which has no registry entry to generate from. Pinned
+        # as equality so a second hand-written tool cannot creep in unnoticed.
+        assert names == listed | {_chat.RESOURCE_TOOL}
         # $schema/title are pydantic's and several providers reject them.
         for tool in payload:
             assert "$schema" not in tool["function"]["parameters"]
@@ -204,6 +207,59 @@ class TestToolSurface:
         assert sent["content"][1]["image_url"]["url"].startswith(
             "data:image/png;base64,"
         )
+
+
+class TestResources:
+    """The resource surface, which function-calling has no verb for.
+
+    Both halves of the borrowed system prompt point at it -- the guides by URI
+    and, through find_skills, the skills -- so an agent that cannot reach it is
+    being told to open documents it has no way to open.
+    """
+
+    def test_the_reader_is_offered_and_lists_what_is_registered(self, chat_host):
+        payload = asyncio.run(_chat.tool_payload())
+        reader = [t for t in payload if t["function"]["name"] == _chat.RESOURCE_TOOL]
+        assert len(reader) == 1
+        described = reader[0]["function"]["description"]
+        # Generated from the registry, so it cannot drift from what exists.
+        for res in asyncio.run(_server.mcp.list_resources()):
+            assert str(res.uri) in described
+        for tpl in asyncio.run(_server.mcp.list_resource_templates()):
+            assert tpl.uriTemplate in described
+
+    def test_a_guide_reads_back(self, chat_host):
+        text, images = asyncio.run(
+            _chat._dispatch(_chat.RESOURCE_TOOL, {"uri": "guide://data"}, None)
+        )
+        assert images == []
+        assert text == _server.get_data_guide()
+
+    def test_the_skill_template_resolves(self, chat_host):
+        # find_skills answers with ids and nothing else, so this is the half
+        # that makes a curated workflow reachable at all.
+        from biopb_mcp.mcp import _skills
+
+        skill_id = _skills.load_catalog()[0]["id"]
+        text, _images = asyncio.run(
+            _chat._dispatch(_chat.RESOURCE_TOOL, {"uri": f"skill://{skill_id}"}, None)
+        )
+        assert text.strip()
+
+    def test_an_unknown_uri_is_a_tool_result_not_a_dead_turn(self, chat_host):
+        # The model's mistake to correct on the next round, like any other bad
+        # argument -- not an exception that ends the conversation.
+        model = _scripted(
+            {
+                "content": "",
+                "tool_calls": [_call(_chat.RESOURCE_TOOL, uri="guide://nope")],
+            },
+            {"content": "I will read guide://data instead"},
+        )
+        asyncio.run(_chat.run_turn("what ops exist?", model))
+        tool_msg = [m for m in _chat.history() if m["role"] == "tool"][0]
+        assert "Could not read" in tool_msg["content"]
+        assert _chat.history()[-1]["content"].startswith("I will read")
 
 
 class TestExecuteCode:
