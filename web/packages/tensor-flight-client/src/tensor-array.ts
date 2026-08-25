@@ -286,7 +286,6 @@ function toRange(
  */
 export class TensorArray {
   protected _descriptor: TensorDescriptor;
-  readonly sourceId: string;
   protected _axisMap: AxisMap;
   protected _axisMapAmbiguous: boolean;
   protected readonly _client: TensorHttpClient;
@@ -295,13 +294,8 @@ export class TensorArray {
   get axisMap(): AxisMap { return this._axisMap; }
   get axisMapAmbiguous(): boolean { return this._axisMapAmbiguous; }
 
-  constructor(
-    client: TensorHttpClient,
-    sourceId: string,
-    descriptor: TensorDescriptor,
-  ) {
+  constructor(client: TensorHttpClient, descriptor: TensorDescriptor) {
     this._client = client;
-    this.sourceId = sourceId;
     this._descriptor = descriptor;
     this._axisMap = buildAxisMap(descriptor.dim_labels);
     this._axisMapAmbiguous = isAxisMapAmbiguous(descriptor.dim_labels);
@@ -347,8 +341,7 @@ export class TensorArray {
     setAxis(this.axisMap.x, options.x);
 
     const req: SliceRequest = {
-      source_id: this.sourceId,
-      tensor_id: this.descriptor.array_id,
+      array_id: this.descriptor.array_id,
       slice_start: sliceStart,
       slice_stop: sliceStop,
       scale_hint: options.scaleHint,

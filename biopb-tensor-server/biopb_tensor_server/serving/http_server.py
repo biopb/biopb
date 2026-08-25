@@ -15,9 +15,9 @@ Endpoints (token required):
   GET  /api/sources/{source_id}/metadata          — parsed metadata_json
   GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
   GET  /api/sources/{source_id}      — single DataSourceDescriptor
-  GET  /api/tile_info/{source_id}    — tile grid + pyramid levels for a tensor
-  GET  /api/tile/{source_id}         — one tile, cacheable (raw | png | jpeg)
-  POST /api/slice                    — fetch array slice as binary
+  GET  /api/tile_info/{array_id}     — tile grid + pyramid levels for a tensor
+  GET  /api/tile/{array_id}          — one tile, cacheable (raw | png | jpeg)
+  POST /api/slice                    — fetch array slice as binary (body: array_id)
   GET  /api/config                   — current config (secrets redacted)
   PUT  /api/config                   — update config (same-origin guarded)
   GET  /api/admin/status             — server/catalog status for the admin page
@@ -251,53 +251,17 @@ def _redact(text: Optional[str]) -> Optional[str]:
     return text
 
 
-def _tensor_matches(td_array_id: str, req_tensor_id: str, source_id: str) -> bool:
-    """Whether *req_tensor_id* refers to the descriptor whose array_id is
-    *td_array_id*, tolerant of identity-policy forms.
-
-    A catalog descriptor carries the globally-unique array_id (``source_id`` or
-    ``source_id/field``), but a browser/TS caller may address a tensor by the
-    bare within-source ``field``. Compare after reducing both sides to the field
-    (strip a leading ``source_id/``) so the lookup matches either form. Used only
-    for the best-effort dim-label attachment, never for the read itself.
-    """
-    if td_array_id == req_tensor_id:
-        return True
-    prefix = f"{source_id}/"
-
-    def field(value: str) -> str:
-        return value[len(prefix) :] if value.startswith(prefix) else value
-
-    return field(td_array_id) == field(req_tensor_id)
-
-
-def _request_array_id(source_id: str, tensor_id: Optional[str]) -> str:
-    """Build the globally-unique array_id (identity policy) from a request's
-    separate ``(source_id, tensor_id)`` fields.
-
-    A tensor is addressed by its array_id ALONE -- ``source_id`` for a
-    single-tensor source or ``source_id/field`` for a multi-tensor one (see the
-    policy at the top of ``proto/biopb/tensor/descriptor.proto``). The TS client
-    sends the array_id verbatim in ``tensor_id``; a browser/HTTP caller may
-    tolerantly send a bare within-source ``field`` (or nothing). Normalize all
-    three to the qualified array_id so the read goes through the array_id-first
-    SDK path without the deprecated ``(source_id, tensor_id)`` addressing.
-    """
-    if not tensor_id or tensor_id == source_id:
-        return source_id
-    if tensor_id.startswith(f"{source_id}/"):
-        return tensor_id
-    return f"{source_id}/{tensor_id}"
-
-
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
 
 
 class SliceRequest(BaseModel):
-    source_id: str
-    tensor_id: str
+    # The whole address (identity policy, descriptor.proto): ``source_id`` for a
+    # single-tensor source, ``source_id/field`` otherwise. Not a
+    # ``(source_id, tensor_id)`` pair -- that split had to be rejoined before
+    # every read, and let geometry and the read resolve to different tensors.
+    array_id: str
     slice_start: Optional[List[int]] = None
     slice_stop: Optional[List[int]] = None
     scale_hint: Optional[List[int]] = None
@@ -472,27 +436,6 @@ def _build_slice_hint(
     return tuple(slice(s, e) for s, e in zip(slice_start, slice_stop, strict=True))
 
 
-def _dim_labels_for(
-    client: TensorFlightClient,
-    source_id: str,
-    tensor_id: Optional[str],
-) -> List[str]:
-    """Look up a tensor's dim labels from the client's cached descriptors.
-
-    Returns ``[]`` when not found (callers apply their own fallback). Mirrors
-    the inline lookup the slice/render handlers used against ``client._sources``.
-    """
-    try:
-        sources = client._sources  # type: ignore[attr-defined]
-        if source_id in sources:
-            for td in sources[source_id].tensors:
-                if _tensor_matches(td.array_id, tensor_id, source_id):
-                    return list(td.dim_labels)
-    except Exception:
-        pass
-    return []
-
-
 def _normalize_array(arr: np.ndarray) -> np.ndarray:
     """Coerce to native byte order + C-contiguous for predictable wire bytes."""
     if arr.dtype.byteorder not in ("=", "|"):
@@ -570,12 +513,11 @@ def _tensor_desc_by_array_id(client: TensorFlightClient, array_id: str) -> Any:
 
     Addressed by array_id ALONE, per the identity policy at the top of
     ``proto/biopb/tensor/descriptor.proto``: array_id is globally unique and
-    authoritative, ``source_id`` is only the slash-free routing prefix. The
-    older routes here take a ``(source_id, tensor_id)`` pair and rejoin it with
-    :func:`_request_array_id` before reading -- a split made only to be undone,
-    and one that let geometry and the read resolve differently (a bare
-    multi-tensor id gave tensor[0]'s shape while the read went to the source's
-    own default).
+    authoritative, ``source_id`` is only the slash-free routing prefix. Every
+    route resolves here, which is the point: the routes that once took a
+    ``(source_id, tensor_id)`` pair rejoined it before each read, and two
+    derivations of one identity could disagree -- a bare multi-tensor id gave
+    tensor[0]'s shape while the read went to the source's own default.
 
     A bare source_id stays valid for a single-tensor source, which is what the
     policy says its array_id *is*. For a multi-tensor source it is refused
@@ -1546,7 +1488,7 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
     t0 = time.monotonic()
 
     logger.debug(
-        f"slice: source={req.source_id}, tensor={req.tensor_id}, "
+        f"slice: array={req.array_id}, "
         f"slice={req.slice_start}-{req.slice_stop}, scale={req.scale_hint}, method={req.reduction_method}"
     )
 
@@ -1557,11 +1499,25 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
 
     try:
         client = ctx.get_client()
+
+        # The same resolution the tile routes use, so one id cannot mean two
+        # tensors depending on which route asked. It also refuses a bare
+        # source_id on a multi-tensor source rather than guessing (#75).
+        td = _tensor_desc_by_array_id(client, req.array_id)
+        if td is None:
+            raise HTTPException(
+                status_code=404,
+                detail=_no_such_tensor(
+                    req.array_id, _tensor_candidates(client, req.array_id)
+                ),
+            )
+
         slice_hint = _build_slice_hint(req.slice_start, req.slice_stop)
 
         # Pass slice_hint to gRPC for optimized slicing (world coordinates)
         arr_lazy = client.get_tensor(
-            _request_array_id(req.source_id, req.tensor_id),
+            # The array_id the descriptor above was read from, not a rebuilt one.
+            td.array_id,
             slice_hint=slice_hint,
             scale_hint=req.scale_hint or None,
             reduction_method=req.reduction_method or None,
@@ -1576,13 +1532,10 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
             f"slice: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms"
         )
 
-        # Attach dim labels from the cached descriptor (empty string if unknown)
         headers = {
             "X-Shape": ",".join(str(d) for d in arr.shape),
             "X-Dtype": str(arr.dtype),
-            "X-Dim-Labels": ",".join(
-                _dim_labels_for(client, req.source_id, req.tensor_id)
-            ),
+            "X-Dim-Labels": ",".join(td.dim_labels),
         }
 
         return Response(

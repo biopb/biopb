@@ -14,7 +14,6 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from biopb_tensor_server.serving.http_server import (
-    _request_array_id,
     _tile_edge,
     _tile_levels,
     create_app,
@@ -34,7 +33,7 @@ _WRONG = "totally-wrong-token-xy"
 
 
 def _make_tensor_desc(
-    array_id: str = "t0",
+    array_id: str = "src0",
     shape=(4, 8, 16),
     dtype: str = "uint16",
     dim_labels=None,
@@ -307,7 +306,7 @@ class TestAuthentication:
 
     def test_slice_requires_token(self, auth_client):
         tc, _ = auth_client
-        payload = {"source_id": "src0", "tensor_id": "t0"}
+        payload = {"array_id": "src0"}
         r = tc.post("/api/slice", json=payload)
         assert r.status_code == 401
 
@@ -315,7 +314,7 @@ class TestAuthentication:
 class TestCorsHeaders:
     def test_slice_exposes_shape_dtype_headers_for_browser(self, dev_client):
         tc, _ = dev_client
-        payload = {"source_id": "src0", "tensor_id": "t0"}
+        payload = {"array_id": "src0"}
         r = tc.post(
             "/api/slice",
             json=payload,
@@ -350,7 +349,7 @@ class TestSourcesEndpoints:
         tc, _ = auth_client
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         tensor = r.json()[0]["tensors"][0]
-        assert tensor["array_id"] == "t0"
+        assert tensor["array_id"] == "src0"
         assert tensor["shape"] == [4, 8, 16]
         assert tensor["dtype"] == "uint16"
         assert tensor["dim_labels"] == ["z", "y", "x"]
@@ -385,7 +384,7 @@ class TestSourcesEndpoints:
 
 class TestSliceEndpoint:
     def _post_slice(self, tc, extra_headers=None, **kwargs):
-        payload = {"source_id": "src0", "tensor_id": "t0", **kwargs}
+        payload = {"array_id": "src0", **kwargs}
         headers = {**_bearer(_TOKEN), **(extra_headers or {})}
         return tc.post("/api/slice", json=payload, headers=headers)
 
@@ -412,11 +411,13 @@ class TestSliceEndpoint:
         labels = r.headers["x-dim-labels"].split(",")
         assert labels == ["z", "y", "x"]
 
-    def test_slice_xdimlabels_qualified_catalog_bare_request(self):
-        """Identity policy: the catalog descriptor carries the qualified
-        array_id ("src0/t0"), but a browser may address the tensor by the bare
-        field ("t0"). The best-effort dim-label lookup must still match and
-        attach X-Dim-Labels (it is tolerant of both forms)."""
+    def test_slice_addresses_a_qualified_tensor_by_its_whole_array_id(self):
+        """The catalog descriptor's array_id is the address, whole.
+
+        The bare within-source field used to be tolerated and rejoined; it is
+        now a 404, because a name that resolves one way for the read and another
+        for the geometry is how the two came to disagree.
+        """
         qualified = _make_source_desc(
             tensors=[_make_tensor_desc(array_id="src0/t0", dim_labels=["z", "y", "x"])]
         )
@@ -427,13 +428,19 @@ class TestSliceEndpoint:
         ):
             app = create_app(token=_TOKEN)
             with TestClient(app, raise_server_exceptions=True) as tc:
-                r = tc.post(
+                ok = tc.post(
                     "/api/slice",
-                    json={"source_id": "src0", "tensor_id": "t0"},
+                    json={"array_id": "src0/t0"},
                     headers=_bearer(_TOKEN),
                 )
-        assert r.status_code == 200
-        assert r.headers["x-dim-labels"].split(",") == ["z", "y", "x"]
+                bare = tc.post(
+                    "/api/slice",
+                    json={"array_id": "t0"},
+                    headers=_bearer(_TOKEN),
+                )
+        assert ok.status_code == 200
+        assert ok.headers["x-dim-labels"].split(",") == ["z", "y", "x"]
+        assert bare.status_code == 404
 
     def test_slice_body_bytesize_matches_shape(self, auth_client):
         tc, _ = auth_client
@@ -485,7 +492,7 @@ class TestSliceEndpoint:
     def test_slice_flight_error_returns_502(self, auth_client):
         tc, mock_fc = auth_client
         mock_fc.get_tensor.side_effect = RuntimeError("Flight connection lost")
-        payload = {"source_id": "src0", "tensor_id": "t0"}
+        payload = {"array_id": "src0"}
         r = tc.post("/api/slice", json=payload, headers=_bearer(_TOKEN))
         assert r.status_code == 502
         # Reset side effect for subsequent tests
@@ -493,7 +500,7 @@ class TestSliceEndpoint:
 
     def test_slice_without_auth_returns_401(self, auth_client):
         tc, _ = auth_client
-        r = tc.post("/api/slice", json={"source_id": "src0", "tensor_id": "t0"})
+        r = tc.post("/api/slice", json={"array_id": "src0"})
         assert r.status_code == 401
 
     def test_slice_passes_slice_hint_to_backend(self, auth_client):
@@ -684,42 +691,60 @@ class TestRedact:
             assert "[REDACTED]" in last_msg
 
 
-class TestRequestArrayId:
-    """The sidecar must address tensors by array_id alone (identity policy), not
-    the deprecated ``(source_id, tensor_id)`` pair. See biopb/biopb#75."""
+class TestSliceAddressing:
+    """The slice route resolves an array_id the way the tile routes do.
 
-    def test_qualified_array_id_passthrough(self):
-        # TS client sends descriptor.array_id verbatim in tensor_id.
-        assert _request_array_id("src", "src/fieldA") == "src/fieldA"
+    One resolution point, so a single id cannot mean two tensors depending on
+    which route asked. See biopb/biopb#766, #75.
+    """
 
-    def test_bare_field_is_qualified(self):
-        # A browser/HTTP caller may send only the within-source field.
-        assert _request_array_id("src", "fieldA") == "src/fieldA"
-
-    def test_single_tensor_collapses_to_source_id(self):
-        # Single-tensor source: array_id == source_id (no sentinel field).
-        assert _request_array_id("src", "src") == "src"
-        assert _request_array_id("src", "") == "src"
-        assert _request_array_id("src", None) == "src"
-
-    def test_slice_endpoint_uses_array_id_first_form(self, auth_client):
-        """The slice endpoint passes array_id positionally, never the deprecated
-        source_id=/tensor_id= keywords."""
+    def test_it_reads_the_array_id_the_descriptor_came_from(self, auth_client):
         tc, mock_fc = auth_client
         lazy = MagicMock()
         lazy.compute.return_value = np.zeros((2, 4, 8), dtype="uint16")
         mock_fc.get_tensor.return_value = lazy
 
-        r = tc.post(
-            "/api/slice",
-            json={"source_id": "src", "tensor_id": "src/fieldA"},
-            headers=_bearer(_TOKEN),
-        )
+        r = tc.post("/api/slice", json={"array_id": "src0"}, headers=_bearer(_TOKEN))
+
         assert r.status_code == 200
         call = mock_fc.get_tensor.call_args
-        assert call.args[0] == "src/fieldA"
+        assert call.args[0] == "src0"
         assert "source_id" not in call.kwargs
         assert "tensor_id" not in call.kwargs
+
+    def test_a_bare_source_id_on_a_multi_tensor_source_is_refused(self):
+        # Not tensors[0]: guessing is what let geometry and the read disagree.
+        tensors = [
+            _make_tensor_desc(array_id="multi/a"),
+            _make_tensor_desc(array_id="multi/b"),
+        ]
+        mock_fc = _build_mock_client(
+            _make_source_desc(source_id="multi", tensors=tensors)
+        )
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post("/api/slice", json={"array_id": "multi"})
+
+        assert r.status_code == 404
+        detail = r.json()["detail"]
+        assert "multi/a" in detail and "multi/b" in detail
+        mock_fc.get_tensor.assert_not_called()
+
+    def test_the_old_pair_is_rejected_rather_than_guessed_at(self, auth_client):
+        # 422 from the model: a body without array_id names no tensor, and
+        # inventing one from source_id/tensor_id is the split this route left.
+        tc, mock_fc = auth_client
+        r = tc.post(
+            "/api/slice",
+            json={"source_id": "src0", "tensor_id": "t0"},
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 422
+        mock_fc.get_tensor.assert_not_called()
 
 
 # ===========================================================================
@@ -800,15 +825,13 @@ class TestIntegration:
 
     def test_integration_slice_roundtrip(self):
         with self._make_tc() as tc:
-            # Discover the actual source_id/tensor_id from the server
+            # The array_id a real server advertises is the whole address.
             src_r = tc.get("/api/sources", headers=_bearer(_TOKEN))
             assert src_r.status_code == 200
-            src = src_r.json()[0]
-            source_id = src["source_id"]
-            tensor_id = src["tensors"][0]["array_id"]
+            array_id = src_r.json()[0]["tensors"][0]["array_id"]
             r = tc.post(
                 "/api/slice",
-                json={"source_id": source_id, "tensor_id": tensor_id},
+                json={"array_id": array_id},
                 headers=_bearer(_TOKEN),
             )
         assert r.status_code == 200
@@ -821,14 +844,11 @@ class TestIntegration:
     def test_integration_slice_subregion(self):
         with self._make_tc() as tc:
             src_r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-            src = src_r.json()[0]
-            source_id = src["source_id"]
-            tensor_id = src["tensors"][0]["array_id"]
+            array_id = src_r.json()[0]["tensors"][0]["array_id"]
             r = tc.post(
                 "/api/slice",
                 json={
-                    "source_id": source_id,
-                    "tensor_id": tensor_id,
+                    "array_id": array_id,
                     "slice_start": [0, 0, 0],
                     "slice_stop": [1, 16, 16],
                 },
@@ -1682,7 +1702,7 @@ class TestCancellation:
         tc, mock_fc = dev_client
         before = mock_fc.get_tensor.call_count
         with patch("starlette.requests.Request.is_disconnected", _disconnected):
-            r = tc.post("/api/slice", json={"source_id": "src0", "tensor_id": "t0"})
+            r = tc.post("/api/slice", json={"array_id": "src0"})
         assert r.status_code == 499
         assert mock_fc.get_tensor.call_count == before
 
