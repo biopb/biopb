@@ -102,6 +102,49 @@ policy says its array_id *is*. For a multi-tensor source it is **404**, listing 
 available array_ids, rather than silently resolving to the first tensor
 (biopb/biopb#75).
 
+### Content-versioned array_ids
+
+`/api/tile_info` publishes `source_id "@" token [ "/" field ]` when the tensor
+carries a `content_version` — e.g. `zarr_a3f2@9f1c4e2b/Image:0`. The token is the
+first 8 hex of `sha256(content_version)`; the raw value is a stat signature whose
+mtime has no business in every tile URL and access log.
+
+`content_version` is a **serving field** on `TensorDescriptor`, like `chunk_shape`
+and `pyramid`: filled by `GetFlightInfo` from the bound adapter, empty on the
+structural `DataSourceDescriptor.tensors[]` entries. It is a source-level property
+repeated on the tensor deliberately — the check has to read the freshest thing in
+the request.
+
+This exists **only above the Flight wire**. The sidecar strips it before every
+Flight call; no adapter, chunk_id, catalog row or descriptor carries it. A `@` in
+a *field* name is untouched — only the half before the first `/` is parsed, and a
+`source_id` is `<type>_<hex>` and can never contain one.
+
+Nothing about the client changes. The viewer already fetches `tile_info` once per
+tensor and threads the `array_id` it answers with through every subsequent tile
+URL, so publishing the versioned form is the whole delivery mechanism.
+
+| request | result |
+|---|---|
+| versioned, current token | 200, `immutable` |
+| versioned, superseded token | **404**, listing the array_ids that exist |
+| unversioned | 200, `max-age=3600` |
+| source publishes no version | 200, `max-age=3600` |
+
+A superseded token is a plain 404, not a distinct status: a stale bookmark and a
+typo both want "ask again", and the 404 already lists what does exist.
+
+The ETag folds in the source's **current** version, not the requested one. The
+versioned URL changes on its own when content changes; this is what stops the
+*unversioned* URL — stable across a re-index — from revalidating to a 304 for
+bytes that changed.
+
+> The token is read off the **descriptor**, never the source listing. That is
+> what keeps the guarantee independent of biopb/biopb#834: the listing is the
+> expensive part of a tile request and the obvious thing to cache, while
+> `GetFlightInfo` is fetch-per-call by contract. A test pins it — a listing
+> frozen at a superseded version still yields a 404.
+
 `GET /api/tile_info/{array_id}` reports everything needed to address the tensor as
 a tile grid — shaped to drop into a Viv `PixelSource[]`:
 
@@ -192,9 +235,12 @@ into a cheap 304 by a stale or forged `If-None-Match`.
 > exhausts memory succeeds. Hence the level gate, and hence it rejects before
 > `get_tensor()` rather than letting the read path discover it.
 
-> Caching is `max-age`, not `immutable`, because a tile's bytes are only stable
-> while its `array_id` is, and re-indexing currently reuses the id. Tighten both
-> together once the version lives in the array_id namespace.
+> **Two cache policies, chosen by the URL.** A tile whose `array_id` carries a
+> content version (below) gets `private, max-age=31536000, immutable` — the URL
+> names its own content, so a re-index mints a different id and the old URL 404s
+> rather than answering stale pixels. A source that publishes no version keeps
+> the old `max-age=3600` hedge: nothing distinguishes its content across a
+> re-index, so an hour is still the honest ceiling.
 
 > **`private`, never `public`.** The URL carries no token — auth is a header, so
 > rotation does not bust the cache — and RFC 9111 §3.5 lets a *shared* cache reuse

@@ -160,8 +160,10 @@ GET /data_plane/api/tile/{source}/{tensor}/{level}/{col}_{row}?fmt=jpeg&t=0&z=42
 **Headers.** `Cache-Control: private, max-age=3600` plus `Vary: Authorization` and an
 `ETag`. Staleness is handled by versioning the `array_id` namespace, **not** by putting
 a version in the cache key (same conclusion as the compact-grid work: `chunk_id` stays
-an opaque server-side token) — so `immutable` and a long `max-age` wait on that
-versioning, since re-indexing currently reuses the id.
+an opaque server-side token). Delivered in biopb/biopb#780: `tile_info` publishes
+`source_id@token[/field]`, so a versioned tile URL goes `immutable` and a re-index
+makes the old URL 404 rather than stale. A source that cannot be stat'd publishes
+no version and keeps the hour-long hedge.
 
 **Auth stays out of the URL.** `ws/render` passed `?token=`; that was not carried over.
 A token in a tile URL means one cache entry per token and tokens in access logs. Use
