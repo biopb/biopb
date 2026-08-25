@@ -188,6 +188,37 @@ def test_assorted_mutations_from_worker(qapp, proxy, vm):
     assert len(vm.layers) == 2
 
 
+def test_overlays_are_wrapped(proxy):
+    """Overlays are handles too, and they are reached by a path of their own.
+
+    They hang off *properties* backed by a private container rather than off
+    pydantic fields, and they subclass psygnal's ``EventedModel`` rather than
+    napari's -- so both the proxy's type check and the graph walk have to name
+    them explicitly.
+    """
+    proxy.add_image(np.zeros((4, 4), np.uint8))
+    assert _is_proxy(proxy.text_overlay)
+    assert _is_proxy(proxy.layers[0].bounding_box)
+
+
+def test_overlay_mutation_from_worker(qapp, proxy, vm):
+    """An overlay mutation off the main thread must be marshaled like any other.
+
+    Asserted on the *event*, not on the resulting value: the value lands either
+    way on a headless model, but it is the emission that reaches a Qt slot, so
+    the emission is what has to happen on the main thread.
+    """
+    fired_on = {}
+    vm.text_overlay.events.visible.connect(
+        lambda *_: fired_on.setdefault("thread", threading.current_thread())
+    )
+
+    _run_in_worker(lambda: setattr(proxy.text_overlay, "visible", True))
+
+    assert vm.text_overlay.visible is True
+    assert fired_on["thread"] is threading.main_thread()
+
+
 # -- fail-loud guard on raw Qt ----------------------------------------------
 
 
@@ -209,6 +240,22 @@ def test_guard_passthrough_on_main_raises_off_thread(qapp):
 # -- tripwire: no napari handle leaks through the proxy ----------------------
 
 
+def _reachable_names(cls):
+    """Public attribute names on *cls* that can hand back a napari sub-object.
+
+    Pydantic fields plus properties: napari publishes the overlays
+    (``viewer.text_overlay`` and friends) as properties over a private dict, so
+    a ``model_fields``-only walk misses them entirely.
+    """
+    names = list(getattr(cls, "model_fields", {}))
+    names += [
+        n
+        for n in dir(cls)
+        if not n.startswith("_") and isinstance(getattr(cls, n, None), property)
+    ]
+    return dict.fromkeys(names)  # de-duped, order preserved
+
+
 def test_no_handle_leaks_through_proxy(proxy):
     """Walk the documented graph *through the proxy* and assert every reachable
     napari handle (EventedModel / Layer / evented container) is wrapped.
@@ -216,10 +263,15 @@ def test_no_handle_leaks_through_proxy(proxy):
     Guards against a re-wrap gap (e.g. a forgotten container dunder) and against
     a future napari sub-object the proxy fails to wrap. Add a representative of
     each Layer subclass so the layer hierarchy is exercised.
+
+    The walk follows *public attribute access*, which is what agent code has --
+    not just ``model_fields``. napari exposes the overlays as properties backed
+    by a private dict, so a field-only walk cannot see them at all.
     """
+    from napari.components.overlays import Overlay
     from napari.layers import Layer
     from napari.utils.events import EventedModel
-    from napari.utils.events.containers import EventedList, Selection
+    from napari.utils.events.containers import EventedDict, EventedList, Selection
 
     proxy.add_image(np.zeros((4, 4), np.uint8))
     proxy.add_labels(np.zeros((4, 4), np.int32))
@@ -227,7 +279,10 @@ def test_no_handle_leaks_through_proxy(proxy):
     proxy.add_shapes([np.array([[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0]])])
     proxy.add_vectors(np.zeros((2, 2, 2)))
 
-    HANDLE = (EventedModel, Layer, EventedList, Selection)
+    # Overlay and EventedDict are listed separately from napari's own
+    # EventedModel: overlays subclass *psygnal's* EventedModel, an unrelated
+    # class, so they are invisible to an ``isinstance(..., EventedModel)`` check.
+    HANDLE = (EventedModel, Overlay, Layer, EventedList, Selection, EventedDict)
     seen: set[int] = set()
     leaks: list[str] = []
 
@@ -241,15 +296,23 @@ def test_no_handle_leaks_through_proxy(proxy):
         seen.add(id(real))
         if not _is_proxy(value):
             return  # inert leaf -- nothing to recurse into
-        for name in getattr(type(real), "model_fields", {}):
+        for name in _reachable_names(type(real)):
             try:
                 child = getattr(value, name)
             except Exception:  # noqa: BLE001 - some fields aren't always live
                 continue
             visit(child, f"{path}.{name}")
-        if isinstance(real, (EventedList, Selection)):
+        # Each container is entered the way its own type allows: a Selection is
+        # a *set* and cannot be indexed, an EventedDict is keyed by name.
+        if isinstance(real, EventedList):
             for i in range(len(real)):
                 visit(value[i], f"{path}[{i}]")
+        elif isinstance(real, EventedDict):
+            for key in list(real):
+                visit(value[key], f"{path}[{key!r}]")
+        elif isinstance(real, Selection):
+            for i, item in enumerate(value):
+                visit(item, f"{path}{{{i}}}")
 
     visit(proxy, "viewer")
     assert not leaks, "napari handles leaked unwrapped:\n  " + "\n  ".join(leaks)

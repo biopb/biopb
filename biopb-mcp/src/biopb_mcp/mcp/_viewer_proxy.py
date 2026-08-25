@@ -24,17 +24,20 @@ only ever holds a proxy that
 
 Completeness of the handle set is enforced by a graph-walk test (see
 ``_tests/test_viewer_proxy.py``), not assumed: a future napari that returns an
-unregistered handle type fails CI instead of segfaulting at runtime. See
-``docs/viewer-thread-safety.md``.
+unregistered handle type fails CI instead of segfaulting at runtime. That walk
+follows *public attribute access* rather than pydantic fields, because napari
+publishes some handles (the overlays) as properties over a private container.
+See ``docs/viewer-thread-safety.md``.
 """
 
 import functools
 import threading
 import weakref
 
+from napari.components.overlays import Overlay
 from napari.layers import Layer
 from napari.utils.events import EventedModel
-from napari.utils.events.containers import EventedList, Selection
+from napari.utils.events.containers import EventedDict, EventedList, Selection
 
 from ._jobs import run_on_main
 
@@ -207,9 +210,12 @@ class _GuardProxy(_ProxyBase):
 def _proxy_cls(obj):
     """The proxy class for *obj*, or ``None`` if it is safe to pass through
     unwrapped (inert Python/numpy data, not Qt-affine)."""
-    if isinstance(obj, (EventedList, Selection)):
+    if isinstance(obj, (EventedList, Selection, EventedDict)):
         return _ContainerProxy
-    if isinstance(obj, (EventedModel, Layer)):
+    # ``Overlay`` is listed alongside napari's ``EventedModel`` rather than
+    # covered by it: overlays subclass *psygnal's* EventedModel, an unrelated
+    # class, so an ``isinstance(obj, EventedModel)`` check does not see them.
+    if isinstance(obj, (EventedModel, Overlay, Layer)):
         return _HandleProxy
     module = type(obj).__module__ or ""
     if module.split(".", 1)[0] in _QT_TOPLEVEL or module.startswith("napari._qt"):

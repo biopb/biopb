@@ -44,15 +44,26 @@ type (so `isinstance` works), `__repr__`/`__eq__`/`__hash__` delegate, `wrap()`
 memoized in a `WeakValueDictionary` by `id(real)` (so identity holds).
 
 **Registry (napari 0.7.0, depth ≤ 2):** 6 evented models + `LayerList` + 8 layer
-classes, all served by **two generic proxy classes** (an `EventedModel` proxy
-covering the layers, a `LayerList` proxy) + the `wrap()` dispatcher — no per-API
-enumeration.
+classes + the overlays, all served by **two generic proxy classes** (an
+`EventedModel` proxy covering the layers, a `LayerList` proxy) + the `wrap()`
+dispatcher — no per-API enumeration.
 
-**Tripwire:** a test BFSes a real offscreen viewer and asserts every reachable
-`EventedModel` / napari `Layer` / `PyQt6`/`vispy` type is in the registry or an
-explicit `INERT`/`GUARDED` allowlist. A future napari that adds a model or list
-method **breaks CI, not production**; the pinned `napari[all]==0.7.0`
-(`versions.json`) means the test certifies exactly the graph that ships.
+The overlays need naming separately in both the dispatcher and the tripwire, for
+two independent reasons, and missing either one hides them completely:
+
+- they subclass **psygnal's** `EventedModel`, not napari's, and the two classes
+  are unrelated — so `isinstance(obj, napari.utils.events.EventedModel)` is
+  `False` for every overlay;
+- napari publishes them as **properties** over a private container
+  (`viewer.text_overlay`, `layer.bounding_box`), so a walk over pydantic fields
+  never reaches them.
+
+**Tripwire:** a test walks a headless viewer *through the proxy* and asserts every
+reachable handle is wrapped. It follows **public attribute access** — fields plus
+properties — because that is what agent code has, and a field-only walk misses the
+overlays for the reason above. A future napari that adds a model or list method
+**breaks CI, not production**; the pinned `napari[all]==0.7.0` (`versions.json`)
+means the test certifies exactly the graph that ships.
 
 ## Gotchas
 
