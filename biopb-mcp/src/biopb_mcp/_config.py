@@ -439,6 +439,48 @@ class ObserveConfig:
 
 
 @dataclass
+class ChatConfig:
+    """The built-in chat client: a session agent for users without an MCP harness.
+
+    The provider key is deliberately **not** here. This file is served whole by
+    the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
+    key in it would be rendered in a browser; it lives in an owner-only
+    credential file instead (``biopb._credentials``, name ``chat-provider.token``)
+    for the same reasons that module was written. What is here is configuration
+    a person may reasonably want to change and no one needs to keep secret.
+    """
+
+    enabled: bool = _h(
+        False,
+        "Offer the built-in chat client. Off by default: it needs a provider key "
+        "and spends the user's own credits, so it is opt-in rather than something "
+        "an install turns on for them.",
+    )
+    model: str = _h(
+        "",
+        "Model id to send, e.g. 'gpt-4o' or 'deepseek-v4'. Empty means chat is "
+        "unconfigured, which reports as such rather than guessing a default that "
+        "would bill the user for a model they did not choose.",
+    )
+    base_url: str = _h(
+        "https://api.openai.com/v1",
+        "OpenAI-compatible chat-completions base URL. Any gateway speaking that "
+        "shape works; '/chat/completions' is appended.",
+    )
+    api_key_env: str = _h(
+        "BIOPB_CHAT_API_KEY",
+        "Environment variable consulted *before* the credential file. For CI and "
+        "development; the file is the supported path, because an env var leaks "
+        "through /proc, `ps e`, and every inherited child.",
+    )
+    request_timeout: float = _h(
+        120.0,
+        "Seconds to wait for one model reply. Covers a slow first token on a "
+        "long conversation, not the tool calls it triggers.",
+    )
+
+
+@dataclass
 class UpdateConfig:
     """Kernel-start auto-updater (#87): offers to re-run the installer on a newer release."""
 
@@ -483,6 +525,7 @@ class McpConfig:
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
     observe: ObserveConfig = field(default_factory=ObserveConfig)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
 
 
@@ -512,6 +555,9 @@ _CONSTRAINTS = {
     "MemoryConfig": {
         "warn_threshold_mb": Range(exclusive_min=0),
         "error_threshold_mb": Range(exclusive_min=0),
+    },
+    "ChatConfig": {
+        "request_timeout": Range(exclusive_min=0),
     },
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),

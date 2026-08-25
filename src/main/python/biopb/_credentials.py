@@ -56,13 +56,19 @@ logger = logging.getLogger(__name__)
 _CREDENTIAL_NAME = "tensor-server.token"
 
 
-def credential_file() -> Path:
-    """Path to the local data-plane credential (``state/biopb/tensor-server.token``).
+def credential_file(name: str = _CREDENTIAL_NAME) -> Path:
+    """Path to a local credential file (default: the data plane's).
 
     Resolved at call time (not cached) so a test that repoints ``Path.home()`` /
     ``$BIOPB_STATE_HOME`` gets an isolated location.
+
+    *name* exists because the reasoning in this module's docstring — owner-only
+    file over env var or API reply — is not specific to the data-plane token.
+    The chat client's provider key is stored the same way, and for a sharper
+    reason: it is a *foreign* credential with billing attached, so a leak reaches
+    past this machine in a way the data-plane token cannot.
     """
-    return state_dir() / _CREDENTIAL_NAME
+    return state_dir() / name
 
 
 def _harden_posix(path: Path) -> None:
@@ -208,8 +214,8 @@ def _harden(path: Path) -> None:
         logger.debug("credential hardening failed for %s: %s", path, exc)
 
 
-def write_credential(token: str) -> Path:
-    """Write *token* to the owner-only credential file; return its path.
+def write_credential(token: str, name: str = _CREDENTIAL_NAME) -> Path:
+    """Write *token* to the owner-only credential file *name*; return its path.
 
     Atomic (sibling temp + ``os.replace`` on the same filesystem) so a concurrent
     reader never sees a half-written file, and hardened to owner-only *before* the
@@ -217,7 +223,7 @@ def write_credential(token: str) -> Path:
     ``mkstemp`` already creates the temp file ``0600``; the explicit harden
     re-asserts it (and does the DACL work on Windows).
     """
-    path = credential_file()
+    path = credential_file(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
@@ -237,15 +243,15 @@ def write_credential(token: str) -> Path:
     return path
 
 
-def read_credential() -> str | None:
-    """Read the data-plane token from the credential file, or ``None``.
+def read_credential(name: str = _CREDENTIAL_NAME) -> str | None:
+    """Read a credential from the owner-only file *name*, or ``None``.
 
     ``None`` on any of: the file is absent (the common tokenless-local case, or no
     control has written one), unreadable, or empty. Best-effort by design — the
     caller falls back to ``BIOPB_TENSOR_TOKEN`` / an actionable error, never
     raises.
     """
-    path = credential_file()
+    path = credential_file(name)
     try:
         token = path.read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
@@ -253,9 +259,9 @@ def read_credential() -> str | None:
     return token or None
 
 
-def remove_credential() -> None:
-    """Remove the credential file if present (best-effort)."""
-    path = credential_file()
+def remove_credential(name: str = _CREDENTIAL_NAME) -> None:
+    """Remove the credential file *name* if present (best-effort)."""
+    path = credential_file(name)
     try:
         path.unlink()
     except FileNotFoundError:
